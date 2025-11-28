@@ -1,0 +1,12 @@
+# Core dependencies
+numpy
+pandas
+scikit-learn
+
+# Visualization
+matplotlib
+seaborn
+
+# Jupyter notebooks
+jupyter
+notebook
