@@ -1,3 +1,6 @@
+# environment
+python-dotenv
+
 # Core dependencies
 numpy
 pandas
@@ -10,3 +13,8 @@ seaborn
 # Jupyter notebooks
 jupyter
 notebook
+
+# API requests
+entsoe-py
+requests
+
