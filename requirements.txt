@@ -5,6 +5,7 @@ python-dotenv
 numpy
 pandas
 scikit-learn
+polars[rtcompat]
 
 # Visualization
 matplotlib
@@ -17,4 +18,3 @@ notebook
 # API requests
 entsoe-py
 requests
-
