@@ -6,14 +6,17 @@ __pycache__/
 # C extensions
 *.so
 
+# DS_Store
+*.DS_Store
+
 # Distribution / packaging
 .Python
 build/
 develop-eggs/
+archive/
 dist/
 downloads/
 eggs/
-data/
 .eggs/
 lib/
 lib64/
