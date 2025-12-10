@@ -23,7 +23,6 @@ THERMAL_PSR_LABELS: dict[str, str] = {
 }
 GEN_THERMAL_COL = "GEN_THERMAL"
 U_THERMAL_COL = "U_THERMAL"
-FLOW_NET_TOTAL_COL = "flow_net_total"
 
 
 def _parse_iso_utc(value: str) -> datetime:
@@ -242,30 +241,23 @@ def _thermal_features_from_generation(generation: pl.DataFrame) -> pl.DataFrame:
     return thermal.select(ordered_cols)
 
 
-def _compute_flow_nets(base: pl.DataFrame, neighbor_codes: Iterable[str]) -> pl.DataFrame:
-    """Compute net flows into DE-LU for each neighbor and total."""
-    if base.is_empty():
-        return base
-
-    df = base
-    for cc in neighbor_codes:
-        import_col = f"flow_import_{cc}"
-        export_col = f"flow_export_{cc}"
-        if import_col not in df.columns:
-            df = df.with_columns(pl.lit(0.0).alias(import_col))
-        if export_col not in df.columns:
-            df = df.with_columns(pl.lit(0.0).alias(export_col))
-
-        df = df.with_columns(
-            (
-                pl.col(import_col).fill_null(0.0) - pl.col(export_col).fill_null(0.0)
-            ).alias(f"flow_net_{cc}")
-        )
-
-    net_cols = [f"flow_net_{cc}" for cc in neighbor_codes if f"flow_net_{cc}" in df.columns]
-    if net_cols:
-        df = df.with_columns(pl.sum_horizontal(net_cols).alias(FLOW_NET_TOTAL_COL))
-    return df
+def _aggregate_hourly_mean(df: pl.DataFrame, metric_name: str) -> pl.DataFrame:
+    """Aggregate a series (any resolution) to hourly mean and keep date parts."""
+    if df.is_empty():
+        return df
+    aggregated = (
+        df.with_columns(pl.col("timestamp").dt.truncate("1h").alias("timestamp"))
+        .group_by("timestamp")
+        .agg(pl.col("value").mean().alias("value"))
+        .with_columns(pl.lit(metric_name).alias("metric"))
+    )
+    return aggregated.with_columns(
+        [
+            pl.col("timestamp").dt.year().alias("year"),
+            pl.col("timestamp").dt.month().alias("month"),
+            pl.col("timestamp").dt.day().alias("day"),
+        ]
+    ).select(["timestamp", "value", "year", "month", "day", "metric"])
 
 
 def combine_metric_responses(responses: Mapping[str, str | bytes]) -> pl.DataFrame:
@@ -286,7 +278,6 @@ def combine_metric_responses(responses: Mapping[str, str | bytes]) -> pl.DataFra
     """
     frames = []
     thermal_features = None
-    neighbor_codes: list[str] = []
     for metric, xml_content in responses.items():
         if metric == "actual_generation_per_type":
             psr_df = _parse_generation_per_type(xml_content, allowed_psr_types=THERMAL_PSR_TYPES)
@@ -297,10 +288,10 @@ def combine_metric_responses(responses: Mapping[str, str | bytes]) -> pl.DataFra
             continue
 
         df = parse_entsoe_timeseries(xml_content, metric_name=metric)
+        if metric.startswith(("flow_import_", "flow_export_")):
+            df = _aggregate_hourly_mean(df, metric)
         if not df.is_empty():
             frames.append(df.with_columns(pl.col("timestamp") + pl.duration(hours=1)))
-        if metric.startswith("flow_import_"):
-            neighbor_codes.append(metric.replace("flow_import_", ""))
 
     base = pl.DataFrame()
     if frames:
@@ -324,9 +315,6 @@ def combine_metric_responses(responses: Mapping[str, str | bytes]) -> pl.DataFra
     if base.is_empty():
         return base
 
-    if neighbor_codes:
-        base = _compute_flow_nets(base, sorted(set(neighbor_codes)))
-
     base = base.sort("timestamp").with_columns(
         [
             pl.col("timestamp").dt.year().alias("year"),
@@ -337,7 +325,5 @@ def combine_metric_responses(responses: Mapping[str, str | bytes]) -> pl.DataFra
 
     metric_cols = [name for name in responses.keys() if name != "actual_generation_per_type" and name in base.columns]
     metric_cols += [col for col in (GEN_THERMAL_COL, U_THERMAL_COL, *THERMAL_PSR_LABELS.values()) if col in base.columns]
-    # Flow nets and total
-    metric_cols += [col for col in base.columns if col.startswith("flow_net_") or col == FLOW_NET_TOTAL_COL]
     ordered_cols = ["timestamp", "year", "month", "day", *metric_cols]
     return base.select(ordered_cols)
