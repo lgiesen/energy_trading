@@ -5,6 +5,7 @@ Metrics produced (columns):
 - installed_generation_per_type
 - activated_balancing_quantities_affr
 - activated_balancing_quantities_mffr
+- flow_net_* for DE-LU neighbors (AT, BE, CH, CZ, DK1, DK2, FR, NL, NO2, PL, SE4) and flow_net_total
 - GEN_THERMAL, U_THERMAL, GEN_FOSSIL_BROWN_COAL_LIGNITE, GEN_FOSSIL_HARD_COAL, GEN_FOSSIL_GAS, GEN_NUCLEAR (thermal generation features)
 
 The resulting DataFrame is aligned on timestamp and includes year/month/day.
@@ -43,14 +44,38 @@ def _build_urls(start: str, end: str, bidding_zone: str, process_year_ahead: str
     pt_realised = "A16"
     bt_afrr = "A96"
     bt_mfrr = "A97"
+    dt_unavailability_generation = "A11"
 
-    return {
+    # Neighboring bidding zones for DE-LU.
+    neighbor_bzn_eic = {
+        "AT": "10YAT-APG------L",
+        "BE": "10YBE----------2",
+        "CH": "10YCH-SWISSGRIDZ",
+        "CZ": "10YCZ-CEPS-----N",
+        "DK1": "10YDK-1--------W",
+        "DK2": "10YDK-2--------M",
+        "FR": "10YFR-RTE------C",
+        "NL": "10YNL----------L",
+        "NO2": "10YNO-2--------T",
+        "PL": "10YPL-AREA-----S",
+        "SE4": "10Y1001A1001A47J",
+    }
+
+    urls = {
         "system_load_forecast": f"{base}&documentType={dt_system_total_load}&processType={pt_day_ahead}&outBiddingZone_Domain={bidding_zone}",
         "actual_generation_per_type": f"{base}&documentType={dt_actual_generation_per_type}&processType={pt_realised}&in_Domain={bidding_zone}",
         "installed_generation_per_type": f"{base}&documentType={dt_installed_generation_per_type}&processType={process_year_ahead}&in_Domain={bidding_zone}",
         "activated_balancing_quantities_affr": f"{base}&documentType={dt_activated_balancing_quantities}&businessType={bt_afrr}&controlArea_Domain={bidding_zone}",
         "activated_balancing_quantities_mffr": f"{base}&documentType={dt_activated_balancing_quantities}&businessType={bt_mfrr}&controlArea_Domain={bidding_zone}",
     }
+
+    # Cross-border flows: import = into DE-LU, export = out of DE-LU.
+    for cc, eic in neighbor_bzn_eic.items():
+        # Observed direction: in_Domain appears to be the receiving side.
+        urls[f"flow_import_{cc}"] = f"{base}&documentType={dt_unavailability_generation}&in_Domain={bidding_zone}&out_Domain={eic}"
+        urls[f"flow_export_{cc}"] = f"{base}&documentType={dt_unavailability_generation}&in_Domain={eic}&out_Domain={bidding_zone}"
+
+    return urls
 
 
 def _make_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
