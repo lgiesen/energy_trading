@@ -5,6 +5,11 @@ Outputs:
 """
 from __future__ import annotations
 
+import warnings
+
+# Suppress urllib3's LibreSSL/OpenSSL compatibility warning on Apple system Python.
+warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL 1.1.1+.*")
+
 import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,8 +17,6 @@ from typing import Dict, Iterable, List, Tuple
 
 import polars as pl
 import requests
-import warnings
-
 from urllib3.exceptions import NotOpenSSLWarning
 
 # SMARD API configuration.
@@ -38,7 +41,6 @@ DATA_MODULES: Dict[str, int] = {
 
 def _make_session(retries: int = 3, backoff: float = 0.3) -> requests.Session:
     """Create a requests session with simple retries."""
-    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(
         max_retries=requests.adapters.Retry(
