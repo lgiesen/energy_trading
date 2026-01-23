@@ -1,4 +1,7 @@
-"""Merge all parquet files in the data directory on timestamp into one table."""
+"""Merge all parquet files in the data directory on timestamp into one table.
+
+Usage: python3 -m ingestion.merge_data --data-dir data --out data/all_merged.parquet
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +12,7 @@ import polars as pl
 
 
 def _load_and_normalize(path: Path) -> pl.DataFrame | None:
-    """Load a parquet and normalize its timestamp column name."""
+    """Load a parquet and normalize its timestamp column name and type."""
     df = pl.read_parquet(path)
     if "timestamp" in df.columns:
         ts_col = "timestamp"
@@ -19,9 +22,16 @@ def _load_and_normalize(path: Path) -> pl.DataFrame | None:
     else:
         return None  # Skip files without a timestamp column.
 
-    # Cast timestamp to datetime if stored as integer milliseconds.
-    if df[ts_col].dtype == pl.Int64:
+    # Cast timestamp to datetime[us, UTC] to avoid join mismatches.
+    ts_dtype = df[ts_col].dtype
+    if ts_dtype == pl.Int64:
         df = df.with_columns(pl.from_epoch(ts_col, time_unit="ms").alias(ts_col))
+    elif isinstance(ts_dtype, pl.datatypes.Datetime):
+        # Align units to microseconds for consistency.
+        df = df.with_columns(pl.col(ts_col).dt.cast_time_unit("us").alias(ts_col))
+    # Add UTC tz if missing.
+    if df[ts_col].dtype == pl.Datetime and df[ts_col].dtype.time_zone is None:  # type: ignore[attr-defined]
+        df = df.with_columns(pl.col(ts_col).dt.replace_time_zone("UTC").alias(ts_col))
     return df
 
 
