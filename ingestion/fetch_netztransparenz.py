@@ -1,4 +1,4 @@
-"""Fetch NRV-Saldo and reBAP data from Netztransparenz and merge on timestamp."""
+"""Fetch NRV-Saldo, reBAP, and aFRR activation from Netztransparenz and merge on timestamp."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,7 @@ import polars as pl
 import requests
 from dotenv import load_dotenv
 
+TOTAL_AFRR_CAPACITY_MW = 2000  # rough national capacity used for activation rate
 
 def _load_env():
     """Load .env by walking up the tree (also checking an energy_trading/ folder)."""
@@ -74,11 +75,23 @@ def _read_csv(text: str) -> pl.DataFrame:
     )
 
 
+def _normalize_cols(df: pl.DataFrame) -> pl.DataFrame:
+    """Trim and lower column names to make parsing resilient."""
+    mapping = {c: c.strip() for c in df.columns}
+    df = df.rename(mapping)
+    mapping_lower = {c: c.lower() for c in df.columns}
+    df = df.rename(mapping_lower)
+    return df
+
+
 def _tidy_nrv(df: pl.DataFrame) -> pl.DataFrame:
+    df = _normalize_cols(df)
     # Use the last column as value if no explicit match.
     value_col = df.columns[-1]
+    date_col = "datum" if "datum" in df.columns else df.columns[0]
+    time_col = "von" if "von" in df.columns else df.columns[1]
     ts = (
-        pl.concat_str([pl.col("Datum"), pl.lit(" "), pl.col("von")])
+        pl.concat_str([pl.col(date_col), pl.lit(" "), pl.col(time_col)])
         .str.to_datetime("%d.%m.%Y %H:%M", strict=False)
         .dt.replace_time_zone("UTC")
         .alias("timestamp_utc")
@@ -101,10 +114,13 @@ def _tidy_nrv(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _tidy_rebap(df: pl.DataFrame) -> pl.DataFrame:
+    df = _normalize_cols(df)
     unter_col = next((c for c in df.columns if "unter" in c.lower()), df.columns[-2])
     ueber_col = next((c for c in df.columns if "ueber" in c.lower()), df.columns[-1])
+    date_col = "datum" if "datum" in df.columns else df.columns[0]
+    time_col = "von" if "von" in df.columns else df.columns[1]
     ts = (
-        pl.concat_str([pl.col("Datum"), pl.lit(" "), pl.col("von")])
+        pl.concat_str([pl.col(date_col), pl.lit(" "), pl.col(time_col)])
         .str.to_datetime("%d.%m.%Y %H:%M", strict=False)
         .dt.replace_time_zone("UTC")
         .alias("timestamp_utc")
@@ -135,16 +151,56 @@ def _tidy_rebap(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _tidy_afrr_activation(df: pl.DataFrame) -> pl.DataFrame:
+    """Parse Aktivierte SRL (aFRR) volumes and derive activation rates."""
+    df = _normalize_cols(df)
+    date_col = "datum" if "datum" in df.columns else df.columns[0]
+    time_col = "von" if "von" in df.columns else df.columns[1]
+    ts = (
+        pl.concat_str([pl.col(date_col), pl.lit(" "), pl.col(time_col)])
+        .str.to_datetime("%d.%m.%Y %H:%M", strict=False)
+        .dt.replace_time_zone("UTC")
+        .alias("timestamp_utc")
+    )
+    pos_col = next((c for c in df.columns if "positiv" in c.lower()), None)
+    neg_col = next((c for c in df.columns if "negativ" in c.lower()), None)
+    if not pos_col or not neg_col:
+        raise RuntimeError("Could not find positive/negative columns in Aktivierte SRL payload.")
+    clean = (
+        df.with_columns(
+            [
+                ts,
+                pl.col(pos_col).cast(pl.Utf8).str.replace(",", ".").cast(pl.Float64, strict=False).alias("activated_volume_pos_mw"),
+                pl.col(neg_col).cast(pl.Utf8).str.replace(",", ".").cast(pl.Float64, strict=False).alias("activated_volume_neg_mw"),
+            ]
+        )
+        .select(["timestamp_utc", "activated_volume_pos_mw", "activated_volume_neg_mw"])
+        .with_columns(
+            [
+                (pl.col("activated_volume_pos_mw") / TOTAL_AFRR_CAPACITY_MW).alias("activation_rate_pos"),
+                (pl.col("activated_volume_neg_mw") / TOTAL_AFRR_CAPACITY_MW).alias("activation_rate_neg"),
+            ]
+        )
+    )
+    return clean
+
+
 def fetch_and_merge(start: str, end: str, token: str, timeout: int = 60) -> pl.DataFrame:
     base_url = "https://ds.netztransparenz.de/api/v1/data"
     nrv_url = f"{base_url}/NrvSaldo/NRVSaldo/Qualitaetsgesichert/{start}/{end}"
     rebap_url = f"{base_url}/NrvSaldo/reBAP/Qualitaetsgesichert/{start}/{end}"
+    afrr_url = f"{base_url}/NrvSaldo/AktivierteSRL/Qualitaetsgesichert/{start}/{end}"
 
     session = _make_session(token)
     nrv_df = _tidy_nrv(_read_csv(_fetch_csv(nrv_url, session, timeout=timeout)))
     rebap_df = _tidy_rebap(_read_csv(_fetch_csv(rebap_url, session, timeout=timeout)))
+    afrr_df = _tidy_afrr_activation(_read_csv(_fetch_csv(afrr_url, session, timeout=timeout)))
 
-    merged = nrv_df.join(rebap_df, on="timestamp_utc", how="full", coalesce=True).sort("timestamp_utc")
+    merged = (
+        nrv_df.join(rebap_df, on="timestamp_utc", how="full", coalesce=True)
+        .join(afrr_df, on="timestamp_utc", how="full", coalesce=True)
+        .sort("timestamp_utc")
+    )
 
     # Drop duplicate metadata columns from the right-hand frame if they exist.
     drop_cols = [c for c in ("Datum_right", "Zeitzone_right", "von_right", "time_right") if c in merged.columns]
@@ -170,6 +226,9 @@ def fetch_and_merge(start: str, end: str, token: str, timeout: int = 60) -> pl.D
 
     # Keep only one datetime column for merging; drop redundant date/time fields if present.
     merged = merged.drop([c for c in ("Datum", "Zeitzone", "time") if c in merged.columns])
+    # Alias for imbalance
+    if "NRV_balance" in merged.columns and "nrv_imbalance" not in merged.columns:
+        merged = merged.with_columns(pl.col("NRV_balance").alias("nrv_imbalance"))
 
     return merged
 

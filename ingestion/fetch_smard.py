@@ -1,4 +1,7 @@
-"""Fetch SMARD load/generation series and store them in one parquet file.
+"""Fetch SMARD load/generation series and store them in one parquet file. 
+
+Usage:
+    python -m ingestion.fetch_smard --start 2022-01-01 --end 2025-12-31 --out energy_trading/data/smard.parquet
 
 Outputs:
     data/smard.parquet (columns for actuals and forecasts, aligned on timestamp).
@@ -36,6 +39,8 @@ DATA_MODULES: Dict[str, int] = {
     "wind_onshore_forecast": 123,
     "wind_offshore_forecast": 3791,
     "solar_forecast": 125,
+    # Market price
+    "da_price_eur": 4169,  # Day-ahead market price DE/LU
 }
 
 
@@ -133,7 +138,14 @@ def fetch_smard(
     if merged is None:
         raise RuntimeError("No SMARD data fetched.")
 
-    return merged.sort("timestamp")
+    merged = merged.sort("timestamp")
+    # Derived aggregates
+    if "wind_onshore_forecast" in merged.columns and "wind_offshore_forecast" in merged.columns:
+        merged = merged.with_columns(
+            (pl.col("wind_onshore_forecast") + pl.col("wind_offshore_forecast")).alias("wind_forecast_de")
+        )
+
+    return merged
 
 
 def main():

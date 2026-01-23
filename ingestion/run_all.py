@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
     parser.add_argument("--entsoe-timeout", dest="entsoe_timeout", type=int, default=120, help="ENTSO-E HTTP timeout seconds (default 120).")
+    parser.add_argument("--entsoe-chunk-days", dest="entsoe_chunk_days", type=int, default=90, help="ENTSO-E chunk size in days to avoid timeouts (default 90).")
+    parser.add_argument("--entsoe-chunk-sleep", dest="entsoe_chunk_sleep", type=float, default=1.0, help="Sleep seconds between ENTSO-E chunks (default 1.0).")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -43,6 +45,8 @@ def main():
         "--start", args.start.replace("-", "") + "0000",
         "--end", args.end.replace("-", "") + "2300",
         "--timeout", str(args.entsoe_timeout),
+        "--chunk-days", str(args.entsoe_chunk_days),
+        "--chunk-sleep", str(args.entsoe_chunk_sleep),
         "--out", str(out_dir / "entsoe.parquet"),
     ])
 

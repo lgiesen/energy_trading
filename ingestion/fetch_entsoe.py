@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
+import time
 from typing import Dict
 
 import polars as pl
@@ -135,13 +137,39 @@ def main():
     parser.add_argument("--process-year-ahead", default="A33", help="Process type for installed capacity (default A33).")
     parser.add_argument("--out", default="data/entsoe.parquet", help="Output parquet path.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP read timeout per request (seconds).")
+    parser.add_argument("--chunk-days", type=int, default=90, help="Chunk size in days to avoid large-range timeouts (0 disables chunking).")
+    parser.add_argument("--chunk-sleep", type=float, default=1.0, help="Seconds to sleep between chunks to be gentle on the API.")
     args = parser.parse_args()
 
     _load_env()
-    df = fetch_and_merge(args.start, args.end, args.bidding_zone, args.process_year_ahead, timeout=args.timeout)
-    if df.is_empty():
-        print("No data parsed.")
-        return
+    if args.chunk_days and args.chunk_days > 0:
+        start_dt = datetime.strptime(args.start, "%Y%m%d%H%M")
+        end_dt = datetime.strptime(args.end, "%Y%m%d%H%M")
+        frames = []
+        cur = start_dt
+        while cur < end_dt:
+            window_end = min(cur + timedelta(days=args.chunk_days), end_dt)
+            s_str = cur.strftime("%Y%m%d%H%M")
+            e_str = window_end.strftime("%Y%m%d%H%M")
+            print(f"Fetching chunk {s_str} -> {e_str}")
+            try:
+                part = fetch_and_merge(s_str, e_str, args.bidding_zone, args.process_year_ahead, timeout=args.timeout)
+                if not part.is_empty():
+                    frames.append(part)
+            except Exception as exc:
+                print(f"Warning: chunk {s_str}->{e_str} failed: {exc}")
+            cur = window_end
+            if args.chunk_sleep and args.chunk_sleep > 0:
+                time.sleep(args.chunk_sleep)
+        if not frames:
+            print("No data parsed (all chunks failed).")
+            return
+        df = pl.concat(frames).unique(subset=["timestamp"], keep="last").sort("timestamp")
+    else:
+        df = fetch_and_merge(args.start, args.end, args.bidding_zone, args.process_year_ahead, timeout=args.timeout)
+        if df.is_empty():
+            print("No data parsed.")
+            return
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
