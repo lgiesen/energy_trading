@@ -13,15 +13,20 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import logging
 from pathlib import Path
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def run(cmd: list[str]):
-    print(f"-> {' '.join(cmd)}")
+    LOGGER.info("-> %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch all datasets and merge in one go.")
     parser.add_argument("--start", default="2022-01-01", help="Start date (YYYY-MM-DD).")
     parser.add_argument("--end", default="2025-12-31", help="End date (YYYY-MM-DD).")
@@ -75,14 +80,22 @@ def main():
             "--out", str(out_dir / "smard.parquet"),
         ])
 
-    # Commodities
+    # yfinance commodities
     if not args.skip_commodities:
         run([
-            py, "-m", "ingestion.fetch_commodities",
+            py, "-m", "ingestion.fetch_yfinance",
             "--start", args.start,
             "--end", args.end,
             "--out", str(out_dir / "commodities.parquet"),
         ])
+
+    # Regelleistung aFRR (hourly, includes net import/export + MOL slope)
+    run([
+        py, "-m", "ingestion.fetch_regelleistung",
+        "--start-year", args.start[:4],
+        "--end-year", args.end[:4],
+        "--out", str(out_dir / "regelleistung.parquet"),
+    ])
 
     # Merge all parquets in out_dir
     run([
@@ -91,7 +104,7 @@ def main():
         "--out", str(Path(args.merged)),
     ])
 
-    print("All tasks completed.")
+    LOGGER.info("All tasks completed.")
 
 
 if __name__ == "__main__":

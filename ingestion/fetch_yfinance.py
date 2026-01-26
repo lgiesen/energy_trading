@@ -1,4 +1,14 @@
-"""Fetch commodity prices (TTF gas, CO2, API2 coal) from Yahoo Finance and store as parquet."""
+"""
+Fetch commodity prices (TTF gas, CO2, API2 coal) from Yahoo Finance and store as parquet.
+
+Usage:
+    python -m ingestion.fetch_yfinance \
+        --start 2022-01-01 --end 2025-12-31 \
+        --out energy_trading/data/commodities.parquet
+
+Outputs:
+    - commodities.parquet with daily prices upsampled to hourly (ffill).
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +17,7 @@ from typing import Dict
 
 import pandas as pd
 import yfinance as yf
+
 # Monkey-patch Timestamp.utcnow to the recommended Timestamp.now('UTC') until yfinance/pandas switch.
 pd.Timestamp.utcnow = staticmethod(lambda: pd.Timestamp.now("UTC"))
 

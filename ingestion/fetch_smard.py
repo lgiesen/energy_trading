@@ -1,14 +1,23 @@
-"""Fetch SMARD load/generation series and store them in one parquet file. 
+"""Fetch SMARD load/generation/price series and store them in one parquet file.
 
 Usage:
-    python -m ingestion.fetch_smard --start 2022-01-01 --end 2025-12-31 --out energy_trading/data/smard.parquet
+    python -m ingestion.fetch_smard \
+        --start 2022-01-01 --end 2025-12-31 \
+        --out energy_trading/data/smard.parquet
 
 Outputs:
-    data/smard.parquet (columns for actuals and forecasts, aligned on timestamp).
+    - smard.parquet with hourly data aligned on timestamp.
+
+Columns (high level):
+    - actuals: load, residual load, wind onshore/offshore, solar
+    - forecasts: day-ahead wind/solar, intraday wind onshore
+    - prices: day-ahead (hourly) + intraday price stats (mean/std/max)
+    - engineered: forecast errors, wind_forecast_de, total_wind_intraday_error
 """
 from __future__ import annotations
 
 import warnings
+import logging
 
 # Suppress urllib3's LibreSSL/OpenSSL compatibility warning on Apple system Python.
 warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL 1.1.1+.*")
@@ -26,6 +35,8 @@ from urllib3.exceptions import NotOpenSSLWarning
 BASE_URL = "https://www.smard.de/app/chart_data"
 DEFAULT_REGION = "DE-LU"
 DEFAULT_RESOLUTION = "hour"
+INTRADAY_RESOLUTION = "quarterhour"
+INTRADAY_PRICE_FILTER_ID = 4169  # Wholesale prices (DE-LU)
 
 # SMARD module IDs.
 DATA_MODULES: Dict[str, int] = {
@@ -41,7 +52,10 @@ DATA_MODULES: Dict[str, int] = {
     "solar_forecast": 125,
     # Market price
     "da_price_eur": 4169,  # Day-ahead market price DE/LU
+    # Intraday forecasts
+    "wind_onshore_forecast_intraday": 715,
 }
+LOGGER = logging.getLogger(__name__)
 
 
 def _make_session(retries: int = 3, backoff: float = 0.3) -> requests.Session:
@@ -111,7 +125,7 @@ def fetch_smard(
         timestamps = _available_timestamps(filter_id, region, resolution, session)
         relevant = [ts for ts in timestamps if ts >= cutoff_ms]
         if not relevant:
-            print(f"Skipping {col_name}: no timestamps found.")
+            LOGGER.warning("Skipping %s: no timestamps found.", col_name)
             continue
 
         records: List[Tuple[int, float]] = []
@@ -120,9 +134,9 @@ def fetch_smard(
                 chunk = _fetch_chunk(filter_id, region, resolution, ts, session)
                 records.extend(chunk)
             except requests.HTTPError as exc:
-                print(f"Warning: failed chunk {ts} for {col_name}: {exc}")
+                LOGGER.warning("Failed chunk %s for %s: %s", ts, col_name, exc)
         if not records:
-            print(f"Skipping {col_name}: no data records.")
+            LOGGER.warning("Skipping %s: no data records.", col_name)
             continue
 
         series_df = _series_to_frame(col_name, records, start_ms, end_ms)
@@ -133,7 +147,7 @@ def fetch_smard(
             # Older Polars versions may produce a duplicate key column named timestamp_right; drop it if present.
             if "timestamp_right" in merged.columns:
                 merged = merged.drop("timestamp_right")
-        print(f"Fetched {len(series_df)} rows for {col_name}.")
+        LOGGER.info("Fetched %s rows for %s.", len(series_df), col_name)
 
     if merged is None:
         raise RuntimeError("No SMARD data fetched.")
@@ -144,11 +158,80 @@ def fetch_smard(
         merged = merged.with_columns(
             (pl.col("wind_onshore_forecast") + pl.col("wind_offshore_forecast")).alias("wind_forecast_de")
         )
+    # Forecast error features: Forecast - Actual
+    if "wind_onshore_forecast" in merged.columns and "wind_onshore_actual" in merged.columns:
+        merged = merged.with_columns(
+            (pl.col("wind_onshore_forecast") - pl.col("wind_onshore_actual")).alias("wind_onshore_error")
+        )
+    if "wind_offshore_forecast" in merged.columns and "wind_offshore_actual" in merged.columns:
+        merged = merged.with_columns(
+            (pl.col("wind_offshore_forecast") - pl.col("wind_offshore_actual")).alias("wind_offshore_error")
+        )
+    if "solar_forecast" in merged.columns and "solar_actual" in merged.columns:
+        merged = merged.with_columns(
+            (pl.col("solar_forecast") - pl.col("solar_actual")).alias("solar_error")
+        )
+
+    # Intraday 15-min prices -> hourly features (mean/std/max)
+    try:
+        filter_id = int(INTRADAY_PRICE_FILTER_ID)
+        timestamps = _available_timestamps(filter_id, region, INTRADAY_RESOLUTION, session)
+        relevant = [ts for ts in timestamps if ts >= cutoff_ms]
+        records: List[Tuple[int, float]] = []
+        for ts in relevant:
+            try:
+                records.extend(_fetch_chunk(filter_id, region, INTRADAY_RESOLUTION, ts, session))
+            except requests.HTTPError as exc:
+                LOGGER.warning("Failed intraday chunk %s: %s", ts, exc)
+        if records:
+            intraday = _series_to_frame("intraday_price_qh", records, start_ms, end_ms)
+            intraday_hourly = (
+                intraday.sort("timestamp")
+                .group_by_dynamic("timestamp", every="1h", closed="left", label="left")
+                .agg(
+                    [
+                        pl.col("intraday_price_qh").mean().alias("intraday_price_mean"),
+                        pl.col("intraday_price_qh").std().alias("intraday_volatility"),
+                        pl.col("intraday_price_qh").max().alias("intraday_max_spike"),
+                    ]
+                )
+                .sort("timestamp")
+            )
+            merged = merged.join(intraday_hourly, on="timestamp", how="full", coalesce=True)
+    except Exception as exc:
+        LOGGER.warning("Intraday price fetch skipped: %s", exc)
+
+    # Intraday forecast errors (Forecast - Actual)
+    if "wind_onshore_forecast_intraday" in merged.columns and "wind_onshore_actual" in merged.columns:
+        merged = merged.with_columns(
+            (pl.col("wind_onshore_forecast_intraday") - pl.col("wind_onshore_actual")).alias(
+                "wind_onshore_intraday_error"
+            )
+        )
+    # Optional fallback: total wind intraday forecast uses offshore day-ahead
+    if (
+        "wind_onshore_forecast_intraday" in merged.columns
+        and "wind_offshore_forecast" in merged.columns
+        and "wind_onshore_actual" in merged.columns
+        and "wind_offshore_actual" in merged.columns
+    ):
+        merged = merged.with_columns(
+            (pl.col("wind_onshore_forecast_intraday") + pl.col("wind_offshore_forecast")).alias(
+                "total_wind_intraday_forecast"
+            )
+        )
+        merged = merged.with_columns(
+            (
+                pl.col("total_wind_intraday_forecast")
+                - (pl.col("wind_onshore_actual") + pl.col("wind_offshore_actual"))
+            ).alias("total_wind_intraday_error")
+        )
 
     return merged
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch SMARD data and store as parquet.")
     parser.add_argument("--start", default="2022-01-01", help="Start date (UTC, inclusive), e.g. 2022-01-01")
     parser.add_argument("--end", default="2025-12-31", help="End date (UTC, inclusive), e.g. 2025-12-31")
@@ -168,7 +251,7 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path, compression="zstd")
-    print(f"Wrote {df.height} rows to {out_path}")
+    LOGGER.info("Wrote %s rows to %s", df.height, out_path)
 
 
 if __name__ == "__main__":

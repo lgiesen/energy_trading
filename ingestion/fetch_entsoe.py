@@ -1,29 +1,40 @@
-"""Fetch ENTSO-E series used in the notebook and merge into one table.
+"""Fetch ENTSO-E series and merge into one table.
 
-Metrics produced (columns):
-- system_load_forecast
-- installed_generation_per_type
-- activated_balancing_quantities_affr
-- activated_balancing_quantities_mffr
-- flow_net_* for DE-LU neighbors (AT, BE, CH, CZ, DK1, DK2, FR, NL, NO2, PL, SE4) and flow_net_total
-- GEN_THERMAL, U_THERMAL, GEN_FOSSIL_BROWN_COAL_LIGNITE, GEN_FOSSIL_HARD_COAL, GEN_FOSSIL_GAS, GEN_NUCLEAR (thermal generation features)
+Usage:
+    python -m ingestion.fetch_entsoe \
+        --start 202201010000 --end 202512312300 \
+        --out energy_trading/data/entsoe.parquet \
+        --timeout 120 --chunk-days 90 --chunk-sleep 1
 
-The resulting DataFrame is aligned on timestamp and includes year/month/day.
+Outputs:
+    - entsoe.parquet with hourly/15-min series aligned on timestamp.
+
+Columns (current):
+    - system_load_forecast
+    - flow_import_* / flow_export_* for DE-LU neighbors (AT, BE, CH, CZ, DK1, DK2, FR, NL, NO2, PL, SE4)
+    - GEN_THERMAL, U_THERMAL, GEN_FOSSIL_BROWN_COAL_LIGNITE, GEN_FOSSIL_HARD_COAL, GEN_FOSSIL_GAS, GEN_NUCLEAR
+
+Notes:
+    - Activated balancing quantities are intentionally not fetched here
+      (covered by Netztransparenz).
+    - Results are trimmed to the requested period when possible.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-import time
 from typing import Dict
 
 import polars as pl
 import requests
+import logging
 from dotenv import load_dotenv
-
 from ingestion.entsoe_parser import combine_metric_responses
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _load_env():
@@ -41,11 +52,10 @@ def _build_urls(start: str, end: str, bidding_zone: str, process_year_ahead: str
     dt_system_total_load = "A65"
     dt_actual_generation_per_type = "A75"
     dt_installed_generation_per_type = "A68"
-    dt_activated_balancing_quantities = "A83"
+    # Activated Balancing Quantities
+    # documentType A83, businessType A96 (aFRR) / A97 (mFRR), no processType
     pt_day_ahead = "A01"
     pt_realised = "A16"
-    bt_afrr = "A96"
-    bt_mfrr = "A97"
     dt_unavailability_generation = "A11"
 
     # Neighboring bidding zones for DE-LU.
@@ -67,8 +77,6 @@ def _build_urls(start: str, end: str, bidding_zone: str, process_year_ahead: str
         "system_load_forecast": f"{base}&documentType={dt_system_total_load}&processType={pt_day_ahead}&outBiddingZone_Domain={bidding_zone}",
         "actual_generation_per_type": f"{base}&documentType={dt_actual_generation_per_type}&processType={pt_realised}&in_Domain={bidding_zone}",
         "installed_generation_per_type": f"{base}&documentType={dt_installed_generation_per_type}&processType={process_year_ahead}&in_Domain={bidding_zone}",
-        "activated_balancing_quantities_affr": f"{base}&documentType={dt_activated_balancing_quantities}&businessType={bt_afrr}&controlArea_Domain={bidding_zone}",
-        "activated_balancing_quantities_mffr": f"{base}&documentType={dt_activated_balancing_quantities}&businessType={bt_mfrr}&controlArea_Domain={bidding_zone}",
     }
 
     # Cross-border flows: import = into DE-LU, export = out of DE-LU.
@@ -124,12 +132,26 @@ def fetch_and_merge(start: str, end: str, bidding_zone: str, process_year_ahead:
         try:
             responses[metric] = _fetch(url, session=session, timeout=timeout)
         except RuntimeError as exc:
-            print(f"Warning: skipping metric '{metric}' due to fetch error: {exc}")
+            LOGGER.warning("Skipping metric '%s' due to fetch error: %s", metric, exc)
     merged = combine_metric_responses(responses)
+    # Trim to requested window (ENTSO-E may return extra boundary data)
+    try:
+        start_dt = pl.datetime(
+            int(start[0:4]), int(start[4:6]), int(start[6:8]), int(start[8:10]), int(start[10:12])
+        ).dt.replace_time_zone("UTC")
+        end_dt = pl.datetime(
+            int(end[0:4]), int(end[4:6]), int(end[6:8]), int(end[8:10]), int(end[10:12])
+        ).dt.replace_time_zone("UTC")
+        if "timestamp" in merged.columns:
+            merged = merged.filter(pl.col("timestamp").is_between(start_dt, end_dt))
+    except Exception:
+        # If parsing fails, leave data as-is.
+        pass
     return merged
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch ENTSO-E data and merge into one table.")
     parser.add_argument("--start", required=True, help="periodStart in UTC, e.g. 202201010000")
     parser.add_argument("--end", required=True, help="periodEnd in UTC, e.g. 202202010000")
@@ -151,30 +173,30 @@ def main():
             window_end = min(cur + timedelta(days=args.chunk_days), end_dt)
             s_str = cur.strftime("%Y%m%d%H%M")
             e_str = window_end.strftime("%Y%m%d%H%M")
-            print(f"Fetching chunk {s_str} -> {e_str}")
+            LOGGER.info("Fetching chunk %s -> %s", s_str, e_str)
             try:
                 part = fetch_and_merge(s_str, e_str, args.bidding_zone, args.process_year_ahead, timeout=args.timeout)
                 if not part.is_empty():
                     frames.append(part)
             except Exception as exc:
-                print(f"Warning: chunk {s_str}->{e_str} failed: {exc}")
+                LOGGER.warning("Chunk %s->%s failed: %s", s_str, e_str, exc)
             cur = window_end
             if args.chunk_sleep and args.chunk_sleep > 0:
                 time.sleep(args.chunk_sleep)
         if not frames:
-            print("No data parsed (all chunks failed).")
+            LOGGER.warning("No data parsed (all chunks failed).")
             return
         df = pl.concat(frames).unique(subset=["timestamp"], keep="last").sort("timestamp")
     else:
         df = fetch_and_merge(args.start, args.end, args.bidding_zone, args.process_year_ahead, timeout=args.timeout)
         if df.is_empty():
-            print("No data parsed.")
+            LOGGER.warning("No data parsed.")
             return
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path, compression="zstd")
-    print(f"Wrote {len(df)} rows to {out_path}")
+    LOGGER.info("Wrote %s rows to %s", len(df), out_path)
 
 
 if __name__ == "__main__":

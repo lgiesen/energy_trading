@@ -10,10 +10,14 @@ polars[rtcompat]
 # Visualization
 matplotlib
 seaborn
+missingno
 
 # Jupyter notebooks
 jupyter
 notebook
+
+# Parquet IO
+pyarrow
 
 # API requests
 entsoe-py

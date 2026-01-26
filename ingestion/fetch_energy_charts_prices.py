@@ -1,6 +1,12 @@
 """Fetch day-ahead power prices from the Energy Charts API for multiple bidding zones.
 
-Produces a wide table with hourly UTC timestamps and one price column per zone.
+Usage:
+    python -m ingestion.fetch_energy_charts_prices \
+        --start 2022-01-01 --end 2025-12-31 \
+        --out data/day_ahead_prices.parquet
+
+Outputs:
+    - day_ahead_prices.parquet with hourly UTC timestamps and one price column per zone.
 """
 from __future__ import annotations
 
