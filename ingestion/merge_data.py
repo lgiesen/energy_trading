@@ -1,6 +1,6 @@
 """Merge all parquet files in the data directory on timestamp into one table.
 
-Usage: python3 -m ingestion.merge_data --data-dir data --out data/all_merged.parquet
+Usage: python -m ingestion.merge_data --data-dir data --out data/all_merged.parquet
 """
 from __future__ import annotations
 
