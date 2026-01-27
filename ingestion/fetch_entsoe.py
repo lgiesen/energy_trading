@@ -11,12 +11,13 @@ Outputs:
 
 Columns (current):
     - system_load_forecast
-    - flow_import_* / flow_export_* for DE-LU neighbors (AT, BE, CH, CZ, DK1, DK2, FR, NL, NO2, PL, SE4)
-    - GEN_THERMAL, U_THERMAL, GEN_FOSSIL_BROWN_COAL_LIGNITE, GEN_FOSSIL_HARD_COAL, GEN_FOSSIL_GAS, GEN_NUCLEAR
 
 Notes:
     - Activated balancing quantities are intentionally not fetched here
       (covered by Netztransparenz).
+    - Cross-border flow imports/exports are intentionally not fetched here
+      (covered by regelleistung net import/export).
+    - Generation-by-type features were dropped due to sparse coverage.
     - Results are trimmed to the requested period when possible.
 """
 from __future__ import annotations
@@ -50,8 +51,6 @@ def _load_env():
 def _build_urls(start: str, end: str, bidding_zone: str, process_year_ahead: str, api_key: str) -> Dict[str, str]:
     base = f"https://web-api.tp.entsoe.eu/api?periodStart={start}&periodEnd={end}&securityToken={api_key}"
     dt_system_total_load = "A65"
-    dt_actual_generation_per_type = "A75"
-    dt_installed_generation_per_type = "A68"
     # Activated Balancing Quantities
     # documentType A83, businessType A96 (aFRR) / A97 (mFRR), no processType
     pt_day_ahead = "A01"
@@ -75,15 +74,7 @@ def _build_urls(start: str, end: str, bidding_zone: str, process_year_ahead: str
 
     urls = {
         "system_load_forecast": f"{base}&documentType={dt_system_total_load}&processType={pt_day_ahead}&outBiddingZone_Domain={bidding_zone}",
-        "actual_generation_per_type": f"{base}&documentType={dt_actual_generation_per_type}&processType={pt_realised}&in_Domain={bidding_zone}",
-        "installed_generation_per_type": f"{base}&documentType={dt_installed_generation_per_type}&processType={process_year_ahead}&in_Domain={bidding_zone}",
     }
-
-    # Cross-border flows: import = into DE-LU, export = out of DE-LU.
-    for cc, eic in neighbor_bzn_eic.items():
-        # Observed direction: in_Domain appears to be the receiving side.
-        urls[f"flow_import_{cc}"] = f"{base}&documentType={dt_unavailability_generation}&in_Domain={bidding_zone}&out_Domain={eic}"
-        urls[f"flow_export_{cc}"] = f"{base}&documentType={dt_unavailability_generation}&in_Domain={eic}&out_Domain={bidding_zone}"
 
     return urls
 

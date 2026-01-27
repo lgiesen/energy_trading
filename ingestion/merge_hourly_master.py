@@ -21,7 +21,7 @@ FILES = [
     "commodities.parquet",
     "smard.parquet",
     "netztransparenz.parquet",
-    "day_ahead_prices.parquet",
+    "energy_charts.parquet",
     "entsoe.parquet",
 ]
 

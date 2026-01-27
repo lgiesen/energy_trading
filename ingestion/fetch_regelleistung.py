@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import io
+import calendar
+import zipfile
 import warnings
 import logging
 from pathlib import Path
@@ -48,45 +50,220 @@ def _parse_product_start(product: str) -> int | None:
     return None
 
 
-def _mol_slope_from_bids(df_bids: pd.DataFrame) -> pd.DataFrame:
-    """Compute MOL slope P500-P100 per DELIVERY_DATE + PRODUCT and expand to hourly."""
+def _parse_date_series(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, dayfirst=True, errors="coerce")
+
+
+def _normalize_col_name(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _normalize_regelleistung_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename legacy German headers to standard English Regelleistung columns."""
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    norm_map = {_normalize_col_name(str(c)): c for c in df.columns}
+
+    # Map legacy German headers to standard English names.
+    mappings: dict[str, list[str]] = {
+        "GERMANY_AVERAGE_ENERGY_PRICE_[EUR/MWh]": [
+            "mittelwertarbeitspreis",
+            "mittelwert_arbeitspreis",
+            "mittelwertarbeitspreis[eur/mwh]",
+        ],
+        "GERMANY_MARGINAL_ENERGY_PRICE_[EUR/MWh]": [
+            "grenzpreis",
+            "grenzpreis[eur/mwh]",
+        ],
+        "GERMANY_MIN_ENERGY_PRICE_[EUR/MWh]": [
+            "minarbeitspreis",
+            "min_arbeitspreis",
+            "minarbeitspreis[eur/mwh]",
+        ],
+        "GERMANY_SUM_OF_OFFERED_CAPACITY_[MW]": [
+            "angeboteneleistung",
+            "angebotene_leistung",
+            "angeboteneleistung[mw]",
+        ],
+    }
+
+    for target, variants in mappings.items():
+        if target in df.columns:
+            continue
+        for variant in variants:
+            col = norm_map.get(_normalize_col_name(variant))
+            if col and col in df.columns:
+                df = df.rename(columns={col: target})
+                break
+    return df
+
+
+def _mol_slope_from_bids(df_bids: pd.DataFrame, market: str) -> pd.DataFrame:
+    """Compute MOL slope P500-P100 per Date+Product+ReserveType."""
     df_bids.columns = df_bids.columns.str.strip()
     date_col = _find_col(df_bids, ["DELIVERY", "DATE"]) or _find_col(df_bids, ["DATUM"]) or df_bids.columns[0]
     prod_col = _find_col(df_bids, ["PRODUCT"]) or _find_col(df_bids, ["PRODUKT"]) or df_bids.columns[1]
-    price_col = _find_col(df_bids, ["PRICE"]) or _find_col(df_bids, ["PREIS"])
-    vol_col = _find_col(df_bids, ["MW"]) or _find_col(df_bids, ["CAPACITY"]) or _find_col(df_bids, ["VOLUME"])
-    if not price_col or not vol_col:
+    res_col = _find_col(df_bids, ["RESERVE"]) or _find_col(df_bids, ["RESERVETYPE"])
+    cap_col = _find_col(df_bids, ["OFFERED", "CAPACITY"]) or _find_col(df_bids, ["CAPACITY", "MW"])
+    if market == "energy":
+        price_col = _find_col(df_bids, ["ENERGY", "PRICE"]) or _find_col(df_bids, ["PRICE"])
+    else:
+        price_col = _find_col(df_bids, ["CAPACITY", "PRICE"]) or _find_col(df_bids, ["PRICE"])
+    if not price_col or not cap_col:
         return pd.DataFrame()
 
-    df_bids = df_bids[[date_col, prod_col, price_col, vol_col]].copy()
+    keep = [date_col, prod_col, price_col, cap_col]
+    if res_col:
+        keep.append(res_col)
+    df_bids = df_bids[keep].copy()
+    df_bids[date_col] = _parse_date_series(df_bids[date_col])
     df_bids[price_col] = pd.to_numeric(df_bids[price_col], errors="coerce")
-    df_bids[vol_col] = pd.to_numeric(df_bids[vol_col], errors="coerce")
-    df_bids = df_bids.dropna(subset=[price_col, vol_col, date_col, prod_col])
+    df_bids[cap_col] = pd.to_numeric(df_bids[cap_col], errors="coerce")
+    df_bids = df_bids.dropna(subset=[date_col, prod_col, price_col, cap_col])
 
+    group_cols = [date_col, prod_col] + ([res_col] if res_col else [])
     rows = []
-    for (d, prod), g in df_bids.groupby([date_col, prod_col]):
+    for keys, g in df_bids.groupby(group_cols):
         g = g.sort_values(price_col)
-        g["cum"] = g[vol_col].cumsum()
-        p100 = g.loc[g["cum"] >= 100, price_col].iloc[0] if (g["cum"] >= 100).any() else g[price_col].max()
-        p500 = g.loc[g["cum"] >= 500, price_col].iloc[0] if (g["cum"] >= 500).any() else g[price_col].max()
-        slope = p500 - p100
-        start_hour = _parse_product_start(prod)
-        if start_hour is None:
-            continue
-        start_ts = pd.to_datetime(d) + pd.to_timedelta(start_hour, unit="h")
-        for i in range(4):
-            rows.append((start_ts + pd.Timedelta(hours=i), slope))
+        g["cum"] = g[cap_col].cumsum()
+        total = g["cum"].iloc[-1]
+        if total < 100:
+            slope = float("nan")
+        else:
+            p100 = float(pd.Series(g[price_col]).iloc[(g["cum"] >= 100).idxmax()]) if (g["cum"] >= 100).any() else float(g[price_col].max())
+            if total < 500:
+                p500 = float(g[price_col].max())
+            else:
+                p500 = float(pd.Series(g[price_col]).iloc[(g["cum"] >= 500).idxmax()])
+            slope = p500 - p100
+        if res_col:
+            d, prod, reserve = keys
+        else:
+            d, prod = keys
+            reserve = "aFRR"
+        rows.append((d, prod, reserve, slope))
 
     if not rows:
         return pd.DataFrame()
-    out = pd.DataFrame(rows, columns=["timestamp", "mol_slope_100_500"])
+    return pd.DataFrame(rows, columns=["date", "product", "reserve_type", "mol_slope"])
+
+
+def _expand_energy_mol(df: pd.DataFrame) -> pd.DataFrame:
+    """Energy market: 15-min products like NEG_001 -> map to hour and average per hour."""
+    if df.empty:
+        return df
+    prod_num = df["product"].str.extract(r"(\\d+)").astype(float)
+    df = df.assign(prod_num=prod_num)
+    df = df.dropna(subset=["prod_num"])
+    df["hour"] = ((df["prod_num"] - 1) // 4).astype(int)
+    df["timestamp"] = pd.to_datetime(df["date"]) + pd.to_timedelta(df["hour"], unit="h")
+    df = df.dropna(subset=["timestamp"])
+    out = (
+        df.groupby(["timestamp", "reserve_type"])["mol_slope"]
+        .mean()
+        .unstack("reserve_type")
+        .add_prefix("energy_mol_slope_")
+        .reset_index()
+    )
+    return out
+
+
+def _expand_capacity_mol(df: pd.DataFrame) -> pd.DataFrame:
+    """Capacity market: 4-hour blocks like NEG_00_04 -> ffill across block hours."""
+    if df.empty:
+        return df
+    start_hour = df["product"].str.extract(r"_(\\d{2})_").astype(float)
+    df = df.assign(start_hour=start_hour).dropna(subset=["start_hour"])
+    df["timestamp"] = pd.to_datetime(df["date"]) + pd.to_timedelta(df["start_hour"].astype(int), unit="h")
+    df = df.dropna(subset=["timestamp"])
+    rows = []
+    for _, r in df.iterrows():
+        for i in range(4):
+            rows.append((r["timestamp"] + pd.Timedelta(hours=i), r["reserve_type"], r["mol_slope"]))
+    out = pd.DataFrame(rows, columns=["timestamp", "reserve_type", "mol_slope"])
+    out = (
+        out.groupby(["timestamp", "reserve_type"])["mol_slope"]
+        .mean()
+        .unstack("reserve_type")
+        .add_prefix("capacity_mol_slope_")
+        .reset_index()
+    )
+    return out
+
+
+def process_mol_slope(data_dir: Path) -> pd.DataFrame:
+    """Process anonymous bid files into hourly MOL slope features."""
+    patterns = [
+        ("energy", "RESULT_LIST_ANONYM_ENERGY_MARKET_*.zip"),
+        ("capacity", "RESULT_LIST_ANONYM_CAPACITY_MARKET_*.zip"),
+        ("energy", "RESULT_LIST_ANONYM_ENERGY_MARKET_*.xlsx"),
+        ("capacity", "RESULT_LIST_ANONYM_CAPACITY_MARKET_*.xlsx"),
+    ]
+    dfs_energy = []
+    dfs_capacity = []
+    for market, pat in patterns:
+        for path in data_dir.rglob(pat):
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path, "r") as zf:
+                    for name in zf.namelist():
+                        if name.lower().endswith((".xlsx", ".xls")):
+                            with zf.open(name) as f:
+                                df = pd.read_excel(f, engine="openpyxl")
+                                mol = _mol_slope_from_bids(df, market=market)
+                                if market == "energy":
+                                    dfs_energy.append(mol)
+                                else:
+                                    dfs_capacity.append(mol)
+            else:
+                df = pd.read_excel(path, engine="openpyxl")
+                mol = _mol_slope_from_bids(df, market=market)
+                if market == "energy":
+                    dfs_energy.append(mol)
+                else:
+                    dfs_capacity.append(mol)
+
+    energy = _expand_energy_mol(pd.concat(dfs_energy, ignore_index=True)) if dfs_energy else pd.DataFrame()
+    capacity = _expand_capacity_mol(pd.concat(dfs_capacity, ignore_index=True)) if dfs_capacity else pd.DataFrame()
+
+    if energy.empty and capacity.empty:
+        return pd.DataFrame()
+
+    out = energy if capacity.empty else energy.merge(capacity, on="timestamp", how="outer")
     out["timestamp"] = (
-        out["timestamp"]
+        pd.to_datetime(out["timestamp"])
         .dt.tz_localize("Europe/Berlin", ambiguous="NaT", nonexistent="NaT")
         .dt.tz_convert("UTC")
     )
     out = out.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
     return out
+
+
+def _download_overview_file(url: str) -> pd.DataFrame:
+    resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
+    return _normalize_regelleistung_columns(df)
+
+
+def _fetch_monthly_overview(year: int, market_type: str) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for month in range(1, 13):
+        last_day = calendar.monthrange(year, month)[1]
+        url = (
+            "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files/"
+            f"RESULT_OVERVIEW_{market_type}_MARKET_aFRR_{year}-{month:02d}-01_{year}-{month:02d}-{last_day:02d}.xlsx"
+        )
+        try:
+            resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        except Exception:
+            LOGGER.warning("Missing monthly %s %04d-%02d overview file.", market_type, year, month)
+            continue
+        df = _normalize_regelleistung_columns(pd.read_excel(io.BytesIO(resp.content), engine="openpyxl"))
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
@@ -96,15 +273,24 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
         f"RESULT_OVERVIEW_{market_type}_MARKET_aFRR_{year}-01-01_{year}-12-31.xlsx"
     )
     LOGGER.info("Downloading %s data for %s...", market_type, year)
+    df = pd.DataFrame()
     try:
-        resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
+        df = _download_overview_file(url)
     except Exception:
-        LOGGER.warning("Skipping %s %s: file not found.", year, market_type)
-        return pd.DataFrame()
+        LOGGER.warning("Yearly %s %s overview file not found.", year, market_type)
 
-    df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
-    df.columns = df.columns.str.strip()
+    # If ENERGY is missing or sparse, try monthly fallbacks.
+    if market_type == "ENERGY" and (df.empty or len(df) < 8000):
+        LOGGER.warning(
+            "Yearly ENERGY file for %s is missing or sparse (%s rows). Falling back to monthly files.",
+            year,
+            len(df),
+        )
+        df = _fetch_monthly_overview(year, market_type)
+
+    if df.empty:
+        LOGGER.warning("Skipping %s %s: no usable data.", year, market_type)
+        return pd.DataFrame()
 
     # --- 1) Dynamic column detection ---
     date_col = _find_col(df, ["DATE"]) or _find_col(df, ["DATUM"]) or df.columns[0]
@@ -178,7 +364,12 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
     if net_series is not None:
         df_pivot = df_pivot.join(net_series, how="left")
 
-    df_pivot = df_pivot.resample("1h").mean()
+    if market_type == "CAPACITY":
+        # Capacity results are block-based; forward-fill to hourly.
+        df_pivot = df_pivot.resample("1h").ffill()
+    else:
+        # Energy results are 15-min products; aggregate to hourly mean.
+        df_pivot = df_pivot.resample("1h").mean()
     return df_pivot
 
 
@@ -192,27 +383,18 @@ def main() -> None:
         default=str(Path(__file__).resolve().parents[1] / "data" / "regelleistung.parquet"),
         help="Output parquet path",
     )
+    parser.add_argument(
+        "--mol-dir",
+        default=str(Path(__file__).resolve().parents[1] / "data"),
+        help="Directory containing RESULT_LIST_ANONYM_* files (zip/xlsx).",
+    )
     args = parser.parse_args()
 
     years = list(range(args.start_year, args.end_year + 1))
     all_years = []
-    all_slopes = []
     for y in years:
         df_cap = fetch_and_parse_regelleistung(y, "CAPACITY")
         df_ene = fetch_and_parse_regelleistung(y, "ENERGY")
-        try:
-            url = (
-                "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files/"
-                f"RESULT_LIST_ANONYM_ENERGY_MARKET_aFRR_{y}-01-01_{y}-12-31.xlsx"
-            )
-            resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            df_bids = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
-            slope_df = _mol_slope_from_bids(df_bids)
-            if not slope_df.empty:
-                all_slopes.append(slope_df)
-        except Exception:
-            LOGGER.warning("Skipping %s MOL slope: file not found or unexpected format.", y)
         if not df_cap.empty or not df_ene.empty:
             all_years.append(pd.concat([df_cap, df_ene], axis=1))
 
@@ -221,11 +403,25 @@ def main() -> None:
         return
 
     df_master = pd.concat(all_years).sort_index()
-    if all_slopes:
-        slope_master = pd.concat(all_slopes).sort_index()
-        df_master = df_master.join(slope_master, how="left")
-        df_master["mol_slope_100_500"] = df_master["mol_slope_100_500"].ffill()
+    mol_df = process_mol_slope(Path(args.mol_dir))
+    if not mol_df.empty:
+        df_master = df_master.join(mol_df, how="left")
     df_master = df_master[~df_master.index.duplicated(keep="first")]
+
+    # Log missing months for activation market (do not impute).
+    if "afrr_activation_avg_price_neg" in df_master.columns:
+        missing = df_master[df_master["afrr_activation_avg_price_neg"].isna()]
+        if not missing.empty:
+            months = (
+                missing.index.to_series()
+                .dt.tz_convert("UTC")
+                .dt.strftime("%Y-%m")
+                .value_counts()
+                .sort_index()
+            )
+            LOGGER.warning("Missing activation market months (afrr_activation_avg_price_neg):")
+            for ym, cnt in months.items():
+                LOGGER.warning("  %s: %s hours missing", ym, cnt)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

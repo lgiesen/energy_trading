@@ -11,8 +11,8 @@ Outputs:
 Columns (high level):
     - actuals: load, residual load, wind onshore/offshore, solar
     - forecasts: day-ahead wind/solar, intraday wind onshore
-    - prices: day-ahead (hourly) + intraday price stats (mean/std/max)
-    - engineered: forecast errors, wind_forecast_de, total_wind_intraday_error
+    - prices: day-ahead (hourly)
+    - engineered: forecast errors, wind_forecast_de, total_wind_intraday_error, system_stress_signal
 """
 from __future__ import annotations
 
@@ -35,8 +35,6 @@ from urllib3.exceptions import NotOpenSSLWarning
 BASE_URL = "https://www.smard.de/app/chart_data"
 DEFAULT_REGION = "DE-LU"
 DEFAULT_RESOLUTION = "hour"
-INTRADAY_RESOLUTION = "quarterhour"
-INTRADAY_PRICE_FILTER_ID = 4169  # Wholesale prices (DE-LU)
 
 # SMARD module IDs.
 DATA_MODULES: Dict[str, int] = {
@@ -153,6 +151,10 @@ def fetch_smard(
         raise RuntimeError("No SMARD data fetched.")
 
     merged = merged.sort("timestamp")
+    # Drop duplicate timestamp_* columns created by joins
+    ts_cols = [c for c in merged.columns if c.startswith("timestamp_") and c != "timestamp"]
+    if ts_cols:
+        merged = merged.drop(ts_cols)
     # Derived aggregates
     if "wind_onshore_forecast" in merged.columns and "wind_offshore_forecast" in merged.columns:
         merged = merged.with_columns(
@@ -171,35 +173,19 @@ def fetch_smard(
         merged = merged.with_columns(
             (pl.col("solar_forecast") - pl.col("solar_actual")).alias("solar_error")
         )
-
-    # Intraday 15-min prices -> hourly features (mean/std/max)
-    try:
-        filter_id = int(INTRADAY_PRICE_FILTER_ID)
-        timestamps = _available_timestamps(filter_id, region, INTRADAY_RESOLUTION, session)
-        relevant = [ts for ts in timestamps if ts >= cutoff_ms]
-        records: List[Tuple[int, float]] = []
-        for ts in relevant:
-            try:
-                records.extend(_fetch_chunk(filter_id, region, INTRADAY_RESOLUTION, ts, session))
-            except requests.HTTPError as exc:
-                LOGGER.warning("Failed intraday chunk %s: %s", ts, exc)
-        if records:
-            intraday = _series_to_frame("intraday_price_qh", records, start_ms, end_ms)
-            intraday_hourly = (
-                intraday.sort("timestamp")
-                .group_by_dynamic("timestamp", every="1h", closed="left", label="left")
-                .agg(
-                    [
-                        pl.col("intraday_price_qh").mean().alias("intraday_price_mean"),
-                        pl.col("intraday_price_qh").std().alias("intraday_volatility"),
-                        pl.col("intraday_price_qh").max().alias("intraday_max_spike"),
-                    ]
-                )
-                .sort("timestamp")
-            )
-            merged = merged.join(intraday_hourly, on="timestamp", how="full", coalesce=True)
-    except Exception as exc:
-        LOGGER.warning("Intraday price fetch skipped: %s", exc)
+    # System stress signal: sum of absolute forecast errors
+    if (
+        "wind_onshore_error" in merged.columns
+        and "wind_offshore_error" in merged.columns
+        and "solar_error" in merged.columns
+    ):
+        merged = merged.with_columns(
+            (
+                pl.col("wind_onshore_error").abs()
+                + pl.col("wind_offshore_error").abs()
+                + pl.col("solar_error").abs()
+            ).alias("system_stress_signal")
+        )
 
     # Intraday forecast errors (Forecast - Actual)
     if "wind_onshore_forecast_intraday" in merged.columns and "wind_onshore_actual" in merged.columns:
@@ -248,6 +234,11 @@ def main():
     end_dt = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
 
     df = fetch_smard(start_dt, end_dt, region=args.region, resolution=args.resolution)
+    # Keep only one UTC and one CET timestamp
+    if "timestamp" in df.columns:
+        df = df.with_columns(pl.col("timestamp").dt.replace_time_zone("UTC").alias("timestamp_utc"))
+        df = df.with_columns(pl.col("timestamp").dt.convert_time_zone("Europe/Berlin").alias("timestamp_cet"))
+        df = df.drop("timestamp")
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path, compression="zstd")

@@ -8,7 +8,7 @@ Outputs:
     - netztransparenz.parquet with hourly data aligned on timestamp_utc.
 
 Includes:
-    - NRV-Saldo (NRV_balance, nrv_imbalance)
+    - NRV-Saldo (NRV_balance)
     - reBAP (reBAP_shortage_surplus)
     - aFRR/mFRR activated volumes (afrr_activated_mw_*, mfrr_activated_mw_*)
     - hourly energy totals (afrr_activated_mwh, mfrr_activated_mwh)
@@ -386,14 +386,19 @@ def fetch_and_merge(
         "Amprion",
         "TenneT TSO",
         "TransnetBW",
+        "50hertz",
+        "amprion",
+        "tennet tso",
+        "transnetbw",
     ]
     merged = merged.drop([c for c in tso_cols if c in merged.columns])
 
     # Keep only one datetime column for merging; drop redundant date/time fields if present.
     merged = merged.drop([c for c in ("Datum", "Zeitzone", "time", "datum", "zeitzone") if c in merged.columns])
     # Alias for imbalance
-    if "NRV_balance" in merged.columns and "nrv_imbalance" not in merged.columns:
-        merged = merged.with_columns(pl.col("NRV_balance").alias("nrv_imbalance"))
+    if "nrv_imbalance" in merged.columns and "NRV_balance" in merged.columns:
+        # Drop legacy alias; NRV_balance is the canonical column.
+        merged = merged.drop("nrv_imbalance")
     # Backward-compatible aliases for aFRR activated volumes
     if "afrr_activated_mw_pos" in merged.columns and "activated_volume_pos_mw" not in merged.columns:
         merged = merged.with_columns(pl.col("afrr_activated_mw_pos").alias("activated_volume_pos_mw"))

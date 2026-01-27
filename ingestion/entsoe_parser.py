@@ -105,9 +105,6 @@ def parse_entsoe_timeseries(xml_content: str | bytes, *, metric_name: str) -> pl
 
     df = pl.DataFrame(points, schema=["timestamp", "value"], orient="row").with_columns(
         [
-            pl.col("timestamp").dt.year().alias("year"),
-            pl.col("timestamp").dt.month().alias("month"),
-            pl.col("timestamp").dt.day().alias("day"),
             pl.lit(metric_name).alias("metric"),
         ]
     )
@@ -251,13 +248,7 @@ def _aggregate_hourly_mean(df: pl.DataFrame, metric_name: str) -> pl.DataFrame:
         .agg(pl.col("value").mean().alias("value"))
         .with_columns(pl.lit(metric_name).alias("metric"))
     )
-    return aggregated.with_columns(
-        [
-            pl.col("timestamp").dt.year().alias("year"),
-            pl.col("timestamp").dt.month().alias("month"),
-            pl.col("timestamp").dt.day().alias("day"),
-        ]
-    ).select(["timestamp", "value", "year", "month", "day", "metric"])
+    return aggregated.select(["timestamp", "value", "metric"])
 
 
 def combine_metric_responses(responses: Mapping[str, str | bytes]) -> pl.DataFrame:
@@ -315,15 +306,9 @@ def combine_metric_responses(responses: Mapping[str, str | bytes]) -> pl.DataFra
     if base.is_empty():
         return base
 
-    base = base.sort("timestamp").with_columns(
-        [
-            pl.col("timestamp").dt.year().alias("year"),
-            pl.col("timestamp").dt.month().alias("month"),
-            pl.col("timestamp").dt.day().alias("day"),
-        ]
-    )
+    base = base.sort("timestamp")
 
     metric_cols = [name for name in responses.keys() if name != "actual_generation_per_type" and name in base.columns]
     metric_cols += [col for col in (GEN_THERMAL_COL, U_THERMAL_COL, *THERMAL_PSR_LABELS.values()) if col in base.columns]
-    ordered_cols = ["timestamp", "year", "month", "day", *metric_cols]
+    ordered_cols = ["timestamp", *metric_cols]
     return base.select(ordered_cols)

@@ -1,4 +1,4 @@
-"""Orchestrate all data fetches and merge in one command.
+"""Collect all data sources and merge them into one parquet.
 
 Runs:
 - ENTSO-E
@@ -31,7 +31,7 @@ def main():
     parser.add_argument("--start", default="2022-01-01", help="Start date (YYYY-MM-DD).")
     parser.add_argument("--end", default="2025-12-31", help="End date (YYYY-MM-DD).")
     parser.add_argument("--out-dir", default="data", help="Output directory for individual parquets.")
-    parser.add_argument("--merged", default="data/all_merged.parquet", help="Merged parquet output.")
+    parser.add_argument("--merged", default="data/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
     parser.add_argument("--entsoe-timeout", dest="entsoe_timeout", type=int, default=120, help="ENTSO-E HTTP timeout seconds (default 120).")
@@ -60,7 +60,7 @@ def main():
         py, "-m", "ingestion.fetch_energy_charts_prices",
         "--start", args.start,
         "--end", args.end,
-        "--out", str(out_dir / "day_ahead_prices.parquet"),
+        "--out", str(out_dir / "energy_charts.parquet"),
     ])
 
     # Netztransparenz (assumes env creds configured)
@@ -68,6 +68,8 @@ def main():
         py, "-m", "ingestion.fetch_netztransparenz",
         "--start", args.start,
         "--end", args.end,
+        "--chunk-days", "60",
+        "--chunk-sleep", "1",
         "--out", str(out_dir / "netztransparenz.parquet"),
     ])
 
