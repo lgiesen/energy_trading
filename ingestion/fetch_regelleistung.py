@@ -296,80 +296,109 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
     date_col = _find_col(df, ["DATE"]) or _find_col(df, ["DATUM"]) or df.columns[0]
     prod_col = _find_col(df, ["PRODUC"]) or _find_col(df, ["PRODUKT"]) or _find_col(df, ["TIME"]) or df.columns[1]
 
-    # --- 2) Timestamp parsing ---
-    if df[prod_col].astype(str).str.contains("_").any():
-        df["quarter_hour_int"] = df[prod_col].str.extract(r"_(\d+)").astype(int)
-        df["time_offset"] = pd.to_timedelta((df["quarter_hour_int"] - 1) * 15, unit="m")
-        df["timestamp"] = pd.to_datetime(df[date_col]) + df["time_offset"]
-        df["Richtung"] = df[prod_col].str.split("_").str[0]
-    else:
-        df["start_time"] = df[prod_col].astype(str).str.split(" - ").str[0]
-        df["timestamp"] = pd.to_datetime(df[date_col].astype(str) + " " + df["start_time"])
-        dir_col = _find_col(df, ["DIRECTION"]) or _find_col(df, ["RICHTUNG"]) or df.columns[2]
-        df["Richtung"] = df[dir_col]
+    # --- 2) Timestamp parsing (mixed formats supported) ---
+    prod_str = df[prod_col].astype(str)
+    mask_block = prod_str.str.contains(r"_\d{2}_\d{2}")
+    mask_qh = prod_str.str.contains(r"_\d{3}") & ~mask_block
 
-    df["timestamp"] = (
-        df["timestamp"]
-        .dt.tz_localize("Europe/Berlin", ambiguous="NaT", nonexistent="NaT")
-        .dt.tz_convert("UTC")
-    )
-    df = df.dropna(subset=["timestamp"])
+    def _process_part(df_part: pd.DataFrame, mode: str) -> pd.DataFrame:
+        if df_part.empty:
+            return pd.DataFrame()
 
-    # --- 3) Feature columns ---
-    val_cols: dict[str, str] = {}
-    if market_type == "ENERGY":
-        marg_col = _find_col(df, ["MARGINAL", "ENERGY", "PRICE"])
-        avg_col = _find_col(df, ["AVERAGE", "ENERGY", "PRICE"])
-        off_col = _find_col(df, ["OFFERED", "CAPACITY"])
-        if marg_col:
-            val_cols[marg_col] = "afrr_activation_price"
-        if avg_col:
-            val_cols[avg_col] = "afrr_activation_avg_price"
-        if off_col:
-            val_cols[off_col] = "afrr_activation_offered_mw"
-    else:
-        marg_col = _find_col(df, ["MARGINAL", "CAPACITY", "PRICE"]) or _find_col(df, ["GRENZWERT"])
-        off_col = _find_col(df, ["OFFERED", "CAPACITY"])
-        if marg_col:
-            val_cols[marg_col] = "afrr_capacity_price"
-        if off_col:
-            val_cols[off_col] = "afrr_capacity_offered_mw"
+        part_prod = df_part[prod_col].astype(str)
+        if mode == "block":
+            df_part["start_hour"] = part_prod.str.extract(r"_(\d{2})_")
+            df_part["start_hour"] = pd.to_numeric(df_part["start_hour"], errors="coerce")
+            df_part = df_part.dropna(subset=["start_hour"])
+            df_part["start_hour"] = df_part["start_hour"].astype(int)
+            df_part["timestamp"] = pd.to_datetime(df_part[date_col]) + pd.to_timedelta(df_part["start_hour"], unit="h")
+            df_part["Richtung"] = part_prod.str.split("_").str[0]
+        elif mode == "qh":
+            df_part["quarter_hour_int"] = part_prod.str.extract(r"_(\d+)").astype(int)
+            df_part["time_offset"] = pd.to_timedelta((df_part["quarter_hour_int"] - 1) * 15, unit="m")
+            df_part["timestamp"] = pd.to_datetime(df_part[date_col]) + df_part["time_offset"]
+            df_part["Richtung"] = part_prod.str.split("_").str[0]
+        else:
+            df_part["start_time"] = df_part[prod_col].astype(str).str.split(" - ").str[0]
+            df_part["timestamp"] = pd.to_datetime(df_part[date_col].astype(str) + " " + df_part["start_time"])
+            dir_col = _find_col(df_part, ["DIRECTION"]) or _find_col(df_part, ["RICHTUNG"]) or df_part.columns[2]
+            df_part["Richtung"] = df_part[dir_col]
 
-    for col in val_cols.keys():
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    # --- 4) European netting (import/export) ---
-    net_col = _find_col(df, ["GERMANY_IMPORT", "EXPORT"])
-    net_series = None
-    if net_col:
-        net_series = (
-            df[["timestamp", net_col]]
-            .assign(**{net_col: pd.to_numeric(df[net_col], errors="coerce")})
-            .groupby("timestamp")[net_col]
-            .mean()
-            .rename("net_import_export_mw")
+        df_part["timestamp"] = (
+            df_part["timestamp"]
+            .dt.tz_localize("Europe/Berlin", ambiguous="NaT", nonexistent="NaT")
+            .dt.tz_convert("UTC")
         )
+        df_part = df_part.dropna(subset=["timestamp"])
 
-    # --- 5) Pivot by direction and resample ---
-    df_clean = df[["timestamp", "Richtung"] + list(val_cols.keys())]
-    df_pivot = df_clean.pivot_table(index="timestamp", columns="Richtung", values=list(val_cols.keys()))
+        # --- 3) Feature columns ---
+        val_cols: dict[str, str] = {}
+        if market_type == "ENERGY":
+            marg_col = _find_col(df_part, ["MARGINAL", "ENERGY", "PRICE"])
+            avg_col = _find_col(df_part, ["AVERAGE", "ENERGY", "PRICE"])
+            off_col = _find_col(df_part, ["OFFERED", "CAPACITY"])
+            if marg_col:
+                val_cols[marg_col] = "afrr_activation_price"
+            if avg_col:
+                val_cols[avg_col] = "afrr_activation_avg_price"
+            if off_col:
+                val_cols[off_col] = "afrr_activation_offered_mw"
+        else:
+            marg_col = _find_col(df_part, ["MARGINAL", "CAPACITY", "PRICE"]) or _find_col(df_part, ["GRENZWERT"])
+            off_col = _find_col(df_part, ["OFFERED", "CAPACITY"])
+            if marg_col:
+                val_cols[marg_col] = "afrr_capacity_price"
+            if off_col:
+                val_cols[off_col] = "afrr_capacity_offered_mw"
 
-    new_cols = []
-    for col in df_pivot.columns:
-        orig_metric = col[0]
-        direction = str(col[1]).replace("ATIVE", "").lower()  # POSITIVE -> pos, NEGATIVE -> neg
-        new_cols.append(f"{val_cols[orig_metric]}_{direction}")
-    df_pivot.columns = new_cols
+        for col in val_cols.keys():
+            df_part[col] = pd.to_numeric(df_part[col], errors="coerce").fillna(0.0)
 
-    if net_series is not None:
-        df_pivot = df_pivot.join(net_series, how="left")
+        # --- 4) European netting (import/export) ---
+        net_col = _find_col(df_part, ["GERMANY_IMPORT", "EXPORT"])
+        net_series = None
+        if net_col:
+            net_series = (
+                df_part[["timestamp", net_col]]
+                .assign(**{net_col: pd.to_numeric(df_part[net_col], errors="coerce")})
+                .groupby("timestamp")[net_col]
+                .mean()
+                .rename("net_import_export_mw")
+            )
 
-    if market_type == "CAPACITY":
-        # Capacity results are block-based; forward-fill to hourly.
-        df_pivot = df_pivot.resample("1h").ffill()
-    else:
-        # Energy results are 15-min products; aggregate to hourly mean.
-        df_pivot = df_pivot.resample("1h").mean()
+        # --- 5) Pivot by direction and resample ---
+        df_clean = df_part[["timestamp", "Richtung"] + list(val_cols.keys())]
+        df_pivot = df_clean.pivot_table(index="timestamp", columns="Richtung", values=list(val_cols.keys()))
+
+        new_cols = []
+        for col in df_pivot.columns:
+            orig_metric = col[0]
+            direction = str(col[1]).replace("ATIVE", "").lower()
+            new_cols.append(f"{val_cols[orig_metric]}_{direction}")
+        df_pivot.columns = new_cols
+
+        if net_series is not None:
+            df_pivot = df_pivot.join(net_series, how="left")
+
+        if market_type == "CAPACITY" or mode == "block":
+            df_pivot = df_pivot.resample("1h").ffill(limit=3)
+        else:
+            df_pivot = df_pivot.resample("1h").mean()
+        return df_pivot
+
+    parts = []
+    if mask_block.any():
+        parts.append(_process_part(df[mask_block].copy(), "block"))
+    if mask_qh.any():
+        parts.append(_process_part(df[mask_qh].copy(), "qh"))
+    if not mask_block.any() and not mask_qh.any():
+        parts.append(_process_part(df.copy(), "other"))
+
+    parts = [p for p in parts if not p.empty]
+    if not parts:
+        return pd.DataFrame()
+    df_pivot = pd.concat(parts).sort_index()
+    df_pivot = df_pivot[~df_pivot.index.duplicated(keep="first")]
     return df_pivot
 
 
