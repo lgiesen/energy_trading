@@ -306,29 +306,31 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
             return pd.DataFrame()
 
         part_prod = df_part[prod_col].astype(str)
+        start_of_day = pd.to_datetime(df_part[date_col]).dt.tz_localize(
+            "Europe/Berlin", ambiguous="infer", nonexistent="shift_forward"
+        )
         if mode == "block":
             df_part["start_hour"] = part_prod.str.extract(r"_(\d{2})_")
             df_part["start_hour"] = pd.to_numeric(df_part["start_hour"], errors="coerce")
             df_part = df_part.dropna(subset=["start_hour"])
             df_part["start_hour"] = df_part["start_hour"].astype(int)
-            df_part["timestamp"] = pd.to_datetime(df_part[date_col]) + pd.to_timedelta(df_part["start_hour"], unit="h")
+            df_part["timestamp"] = start_of_day + pd.to_timedelta(df_part["start_hour"], unit="h")
             df_part["Richtung"] = part_prod.str.split("_").str[0]
         elif mode == "qh":
             df_part["quarter_hour_int"] = part_prod.str.extract(r"_(\d+)").astype(int)
             df_part["time_offset"] = pd.to_timedelta((df_part["quarter_hour_int"] - 1) * 15, unit="m")
-            df_part["timestamp"] = pd.to_datetime(df_part[date_col]) + df_part["time_offset"]
+            df_part["timestamp"] = start_of_day + df_part["time_offset"]
             df_part["Richtung"] = part_prod.str.split("_").str[0]
         else:
             df_part["start_time"] = df_part[prod_col].astype(str).str.split(" - ").str[0]
-            df_part["timestamp"] = pd.to_datetime(df_part[date_col].astype(str) + " " + df_part["start_time"])
+            naive = pd.to_datetime(df_part[date_col].astype(str) + " " + df_part["start_time"])
+            df_part["timestamp"] = naive.dt.tz_localize(
+                "Europe/Berlin", ambiguous="infer", nonexistent="shift_forward"
+            )
             dir_col = _find_col(df_part, ["DIRECTION"]) or _find_col(df_part, ["RICHTUNG"]) or df_part.columns[2]
             df_part["Richtung"] = df_part[dir_col]
 
-        df_part["timestamp"] = (
-            df_part["timestamp"]
-            .dt.tz_localize("Europe/Berlin", ambiguous="NaT", nonexistent="NaT")
-            .dt.tz_convert("UTC")
-        )
+        df_part["timestamp"] = df_part["timestamp"].dt.tz_convert("UTC")
         df_part = df_part.dropna(subset=["timestamp"])
 
         # --- 3) Feature columns ---
