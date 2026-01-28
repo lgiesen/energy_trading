@@ -1,192 +1,133 @@
-"""Fetch ENTSO-E series and merge into one table.
+"""Fetch ENTSO-E load data via entsoe-py and store as parquet.
 
 Usage:
     python -m ingestion.fetch_entsoe \
-        --start 202201010000 --end 202512312300 \
-        --out energy_trading/data/entsoe.parquet \
-        --timeout 120 --chunk-days 90 --chunk-sleep 1
+        --start 2022-01-01 --end 2025-12-31 \
+        --out data/entsoe.parquet
 
 Outputs:
-    - entsoe.parquet with hourly/15-min series aligned on timestamp.
-
-Columns (current):
-    - system_load_forecast
-
-Notes:
-    - Activated balancing quantities are intentionally not fetched here
-      (covered by Netztransparenz).
-    - Cross-border flow imports/exports are intentionally not fetched here
-      (covered by regelleistung net import/export).
-    - Generation-by-type features were dropped due to sparse coverage.
-    - Results are trimmed to the requested period when possible.
+    - entsoe.parquet with hourly UTC timestamps and the following columns:
+        load_actual, load_forecast_da
 """
 from __future__ import annotations
 
 import argparse
-import os
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict
-
-import polars as pl
-import requests
 import logging
-from dotenv import load_dotenv
-from ingestion.entsoe_parser import combine_metric_responses
+import os
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from entsoe import EntsoePandasClient
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_COUNTRY = "DE_LU"
 
 
-def _load_env():
-    """Load .env by walking up the tree (also checking an energy_trading/ folder)."""
-    for base in Path(__file__).resolve().parents:
-        for candidate in (base / ".env", base / "energy_trading" / ".env"):
-            if candidate.exists():
-                load_dotenv(candidate)
-                return candidate
-    return None
+def _load_env_fallback() -> None:
+    """Load ENTSOE_API_KEY from local .env if present."""
+    if os.getenv("ENTSOE_API_KEY"):
+        return
+    candidates = [
+        Path(__file__).resolve().parents[1] / ".env",  # /energy_trading/.env
+        Path(__file__).resolve().parents[2] / ".env",  # repo root .env
+    ]
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "ENTSOE_API_KEY":
+                os.environ.setdefault("ENTSOE_API_KEY", value.strip().strip('"').strip("'"))
+                return
 
 
-def _build_urls(start: str, end: str, bidding_zone: str, process_year_ahead: str, api_key: str) -> Dict[str, str]:
-    base = f"https://web-api.tp.entsoe.eu/api?periodStart={start}&periodEnd={end}&securityToken={api_key}"
-    dt_system_total_load = "A65"
-    # Activated Balancing Quantities
-    # documentType A83, businessType A96 (aFRR) / A97 (mFRR), no processType
-    pt_day_ahead = "A01"
-    pt_realised = "A16"
-    dt_unavailability_generation = "A11"
-
-    # Neighboring bidding zones for DE-LU.
-    neighbor_bzn_eic = {
-        "AT": "10YAT-APG------L",
-        "BE": "10YBE----------2",
-        "CH": "10YCH-SWISSGRIDZ",
-        "CZ": "10YCZ-CEPS-----N",
-        "DK1": "10YDK-1--------W",
-        "DK2": "10YDK-2--------M",
-        "FR": "10YFR-RTE------C",
-        "NL": "10YNL----------L",
-        "NO2": "10YNO-2--------T",
-        "PL": "10YPL-AREA-----S",
-        "SE4": "10Y1001A1001A47J",
-    }
-
-    urls = {
-        "system_load_forecast": f"{base}&documentType={dt_system_total_load}&processType={pt_day_ahead}&outBiddingZone_Domain={bidding_zone}",
-    }
-
-    return urls
+def _to_utc(data: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    idx = data.index
+    if idx.tz is None:
+        data = data.tz_localize("Europe/Berlin", ambiguous="infer", nonexistent="shift_forward")
+    return data.tz_convert("UTC")
 
 
-def _make_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
-    """Create a requests session with simple retry on read timeouts."""
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        max_retries=requests.adapters.Retry(
-            total=retries,
-            read=retries,
-            connect=retries,
-            backoff_factor=backoff,
-            status_forcelist=(500, 502, 503, 504),
-        )
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-
-def _fetch(url: str, session: requests.Session, timeout: int = 60) -> str:
-    resp = session.get(url, timeout=timeout)
+def _safe_fetch(name: str, func):
     try:
-        resp.raise_for_status()
-    except requests.HTTPError as exc:
-        # Surface ENTSO-E error payload to make debugging easier.
-        detail = resp.text[:500] if resp.text else "no response body"
-        raise RuntimeError(f"ENTSO-E request failed ({resp.status_code}): {detail}") from exc
-    return resp.text
+        series = func()
+        if series is None or len(series) == 0:
+            LOGGER.warning("%s returned no data.", name)
+            return None
+        return series
+    except Exception as exc:
+        LOGGER.warning("%s fetch failed: %s", name, exc)
+        return None
 
 
-def fetch_and_merge(start: str, end: str, bidding_zone: str, process_year_ahead: str = "A33", timeout: int = 60) -> pl.DataFrame:
-    """Fetch all required series and merge on timestamp."""
+def _to_series(data: pd.Series | pd.DataFrame, name: str) -> pd.Series | None:
+    if data is None or len(data) == 0:
+        return None
+    data = _to_utc(data)
+    if isinstance(data, pd.DataFrame):
+        if data.shape[1] == 1:
+            data = data.iloc[:, 0]
+        else:
+            data = data.sum(axis=1)
+    return data.rename(name)
+
+
+def fetch_entsoe(start: datetime, end: datetime, country: str) -> pd.DataFrame:
+    _load_env_fallback()
     api_key = os.getenv("ENTSOE_API_KEY")
     if not api_key:
-        _load_env()
-        api_key = os.getenv("ENTSOE_API_KEY")
-    if not api_key:
-        raise RuntimeError("ENTSOE_API_KEY not set (load .env or export it).")
+        raise RuntimeError("ENTSOE_API_KEY is not set in the environment.")
 
-    session = _make_session()
-    urls = _build_urls(start, end, bidding_zone, process_year_ahead, api_key)
-    responses: Dict[str, str] = {}
-    for metric, url in urls.items():
-        try:
-            responses[metric] = _fetch(url, session=session, timeout=timeout)
-        except RuntimeError as exc:
-            LOGGER.warning("Skipping metric '%s' due to fetch error: %s", metric, exc)
-    merged = combine_metric_responses(responses)
-    # Trim to requested window (ENTSO-E may return extra boundary data)
-    try:
-        start_dt = pl.datetime(
-            int(start[0:4]), int(start[4:6]), int(start[6:8]), int(start[8:10]), int(start[10:12])
-        ).dt.replace_time_zone("UTC")
-        end_dt = pl.datetime(
-            int(end[0:4]), int(end[4:6]), int(end[6:8]), int(end[8:10]), int(end[10:12])
-        ).dt.replace_time_zone("UTC")
-        if "timestamp" in merged.columns:
-            merged = merged.filter(pl.col("timestamp").is_between(start_dt, end_dt))
-    except Exception:
-        # If parsing fails, leave data as-is.
-        pass
-    return merged
+    client = EntsoePandasClient(api_key=api_key)
+    start_ts = pd.Timestamp(start, tz="UTC")
+    end_ts = pd.Timestamp(end, tz="UTC")
+
+    load_actual = _safe_fetch(
+        "load_actual",
+        lambda: client.query_load(country, start=start_ts, end=end_ts),
+    )
+    load_actual = _to_series(load_actual, "load_actual")
+
+    load_forecast_da = _safe_fetch(
+        "load_forecast_da",
+        lambda: client.query_load_forecast(country, start=start_ts, end=end_ts, process_type="A01"),
+    )
+    load_forecast_da = _to_series(load_forecast_da, "load_forecast_da")
+
+    series = [s for s in [load_actual, load_forecast_da] if s is not None and len(s) > 0]
+    if not series:
+        raise RuntimeError("No ENTSO-E data fetched.")
+
+    df = pd.concat(series, axis=1).sort_index()
+    df = df.loc[(df.index >= start_ts) & (df.index < end_ts)]
+    df = df.reset_index().rename(columns={"index": "timestamp"})
+    return df
 
 
-def main():
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Fetch ENTSO-E data and merge into one table.")
-    parser.add_argument("--start", required=True, help="periodStart in UTC, e.g. 202201010000")
-    parser.add_argument("--end", required=True, help="periodEnd in UTC, e.g. 202202010000")
-    parser.add_argument("--bidding-zone", default="10Y1001A1001A82H", help="Bidding/Control area domain code (default DE-LU).")
-    parser.add_argument("--process-year-ahead", default="A33", help="Process type for installed capacity (default A33).")
-    parser.add_argument("--out", default="data/entsoe.parquet", help="Output parquet path.")
-    parser.add_argument("--timeout", type=int, default=60, help="HTTP read timeout per request (seconds).")
-    parser.add_argument("--chunk-days", type=int, default=90, help="Chunk size in days to avoid large-range timeouts (0 disables chunking).")
-    parser.add_argument("--chunk-sleep", type=float, default=1.0, help="Seconds to sleep between chunks to be gentle on the API.")
+    parser = argparse.ArgumentParser(description="Fetch ENTSO-E load data via entsoe-py.")
+    parser.add_argument("--start", default="2022-01-01", help="Start date (UTC, inclusive).")
+    parser.add_argument("--end", default="2025-12-31", help="End date (UTC, inclusive).")
+    parser.add_argument("--country", default=DEFAULT_COUNTRY, help="ENTSO-E country/bidding zone code (default DE_LU).")
+    parser.add_argument(
+        "--out",
+        default=str(Path(__file__).resolve().parents[2] / "data" / "entsoe.parquet"),
+        help="Output parquet path.",
+    )
     args = parser.parse_args()
 
-    _load_env()
-    if args.chunk_days and args.chunk_days > 0:
-        start_dt = datetime.strptime(args.start, "%Y%m%d%H%M")
-        end_dt = datetime.strptime(args.end, "%Y%m%d%H%M")
-        frames = []
-        cur = start_dt
-        while cur < end_dt:
-            window_end = min(cur + timedelta(days=args.chunk_days), end_dt)
-            s_str = cur.strftime("%Y%m%d%H%M")
-            e_str = window_end.strftime("%Y%m%d%H%M")
-            LOGGER.info("Fetching chunk %s -> %s", s_str, e_str)
-            try:
-                part = fetch_and_merge(s_str, e_str, args.bidding_zone, args.process_year_ahead, timeout=args.timeout)
-                if not part.is_empty():
-                    frames.append(part)
-            except Exception as exc:
-                LOGGER.warning("Chunk %s->%s failed: %s", s_str, e_str, exc)
-            cur = window_end
-            if args.chunk_sleep and args.chunk_sleep > 0:
-                time.sleep(args.chunk_sleep)
-        if not frames:
-            LOGGER.warning("No data parsed (all chunks failed).")
-            return
-        df = pl.concat(frames).unique(subset=["timestamp"], keep="last").sort("timestamp")
-    else:
-        df = fetch_and_merge(args.start, args.end, args.bidding_zone, args.process_year_ahead, timeout=args.timeout)
-        if df.is_empty():
-            LOGGER.warning("No data parsed.")
-            return
+    start_dt = datetime.fromisoformat(args.start)
+    end_dt = datetime.fromisoformat(args.end)
 
+    df = fetch_entsoe(start_dt, end_dt, args.country)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(out_path, compression="zstd")
+    df.to_parquet(out_path, index=False)
     LOGGER.info("Wrote %s rows to %s", len(df), out_path)
 
 
