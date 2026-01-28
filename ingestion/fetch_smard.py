@@ -11,17 +11,13 @@ Outputs:
 Columns (high level):
     - actuals: load, residual load, wind onshore/offshore, solar
     - forecasts: day-ahead wind/solar, intraday wind onshore
-    - prices: day-ahead (hourly)
+    - prices: price_da_eur (hourly), price_intraday_eur (hourly mean)
     - engineered: forecast errors, wind_forecast_de, total_wind_intraday_error, system_stress_signal
 """
 from __future__ import annotations
 
 import warnings
 import logging
-
-# Suppress urllib3's LibreSSL/OpenSSL compatibility warning on Apple system Python.
-warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL 1.1.1+.*")
-
 import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,14 +25,24 @@ from typing import Dict, Iterable, List, Tuple
 
 import polars as pl
 import requests
-from urllib3.exceptions import NotOpenSSLWarning
+
+# Suppress urllib3's LibreSSL/OpenSSL compatibility warning on Apple system Python.
+warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL 1.1.1+.*")
+
+LOGGER = logging.getLogger(__name__)
 
 # SMARD API configuration.
 BASE_URL = "https://www.smard.de/app/chart_data"
 DEFAULT_REGION = "DE-LU"
 DEFAULT_RESOLUTION = "hour"
+INTRADAY_REGION = "DE"
+INTRADAY_RESOLUTION = "quarterhour"
 
-# SMARD module IDs.
+# Price filter IDs
+DA_PRICE_FILTER_ID = 4169  # Day-ahead market price DE/LU
+INTRADAY_PRICE_FILTER_ID = 4996  # Intraday trading (quarter-hour)
+
+# SMARD module IDs for non-price series.
 DATA_MODULES: Dict[str, int] = {
     # Actuals
     "load_actual": 410,
@@ -48,12 +54,9 @@ DATA_MODULES: Dict[str, int] = {
     "wind_onshore_forecast": 123,
     "wind_offshore_forecast": 3791,
     "solar_forecast": 125,
-    # Market price
-    "da_price_eur": 4169,  # Day-ahead market price DE/LU
     # Intraday forecasts
     "wind_onshore_forecast_intraday": 715,
 }
-LOGGER = logging.getLogger(__name__)
 
 
 def _make_session(retries: int = 3, backoff: float = 0.3) -> requests.Session:
@@ -83,7 +86,13 @@ def _available_timestamps(filter_id: int, region: str, resolution: str, session:
     return sorted(payload.get("timestamps", []))
 
 
-def _fetch_chunk(filter_id: int, region: str, resolution: str, ts: int, session: requests.Session) -> List[Tuple[int, float]]:
+def _fetch_chunk(
+    filter_id: int,
+    region: str,
+    resolution: str,
+    ts: int,
+    session: requests.Session,
+) -> List[Tuple[int, float]]:
     filename = f"{filter_id}_{region}_{resolution}_{ts}.json"
     url = f"{BASE_URL}/{filter_id}/{region}/{filename}"
     resp = session.get(url, timeout=30)
@@ -93,16 +102,51 @@ def _fetch_chunk(filter_id: int, region: str, resolution: str, ts: int, session:
     return resp.json().get("series", [])
 
 
-def _series_to_frame(name: str, series_data: Iterable[Tuple[int, float]], start_ms: int, end_ms: int) -> pl.DataFrame:
+def _series_to_frame(
+    name: str,
+    series_data: Iterable[Tuple[int, float]],
+    start_ms: int,
+    end_ms: int,
+) -> pl.DataFrame:
     df = pl.DataFrame(series_data, schema=[("timestamp_ms", pl.Int64), (name, pl.Float64)], orient="row")
     df = (
         df.filter((pl.col("timestamp_ms") >= start_ms) & (pl.col("timestamp_ms") <= end_ms))
         .with_columns(pl.from_epoch("timestamp_ms", time_unit="ms").alias("timestamp"))
         .drop("timestamp_ms")
         .group_by("timestamp")
-        .agg(pl.col(name).last())  # keep the last value per timestamp if duplicates exist
+        .agg(pl.col(name).last())
     )
     return df
+
+
+def fetch_series(
+    session: requests.Session,
+    filter_id: int,
+    region: str,
+    resolution: str,
+    start_ms: int,
+    end_ms: int,
+    cutoff_ms: int,
+    col_name: str,
+) -> pl.DataFrame | None:
+    timestamps = _available_timestamps(filter_id, region, resolution, session)
+    relevant = [ts for ts in timestamps if ts >= cutoff_ms]
+    if not relevant:
+        LOGGER.warning("Skipping %s: no timestamps found.", col_name)
+        return None
+
+    records: List[Tuple[int, float]] = []
+    for ts in relevant:
+        try:
+            records.extend(_fetch_chunk(filter_id, region, resolution, ts, session))
+        except requests.HTTPError as exc:
+            LOGGER.warning("Failed chunk %s for %s: %s", ts, col_name, exc)
+
+    if not records:
+        LOGGER.warning("Skipping %s: no data records.", col_name)
+        return None
+
+    return _series_to_frame(col_name, records, start_ms, end_ms)
 
 
 def fetch_smard(
@@ -111,55 +155,61 @@ def fetch_smard(
     region: str = DEFAULT_REGION,
     resolution: str = DEFAULT_RESOLUTION,
 ) -> pl.DataFrame:
-    """Fetch all SMARD series and merge on timestamp."""
     session = _make_session()
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
-    # Pull a small buffer before start to catch boundary data.
     cutoff_ms = int((start - timedelta(days=62)).timestamp() * 1000)
 
     merged: pl.DataFrame | None = None
+
+    # Non-price series
     for col_name, filter_id in DATA_MODULES.items():
-        timestamps = _available_timestamps(filter_id, region, resolution, session)
-        relevant = [ts for ts in timestamps if ts >= cutoff_ms]
-        if not relevant:
-            LOGGER.warning("Skipping %s: no timestamps found.", col_name)
+        series_df = fetch_series(session, filter_id, region, resolution, start_ms, end_ms, cutoff_ms, col_name)
+        if series_df is None:
             continue
-
-        records: List[Tuple[int, float]] = []
-        for ts in relevant:
-            try:
-                chunk = _fetch_chunk(filter_id, region, resolution, ts, session)
-                records.extend(chunk)
-            except requests.HTTPError as exc:
-                LOGGER.warning("Failed chunk %s for %s: %s", ts, col_name, exc)
-        if not records:
-            LOGGER.warning("Skipping %s: no data records.", col_name)
-            continue
-
-        series_df = _series_to_frame(col_name, records, start_ms, end_ms)
-        if merged is None:
-            merged = series_df
-        else:
-            merged = merged.join(series_df, on="timestamp", how="full", suffix=f"_{col_name}")
-            # Older Polars versions may produce a duplicate key column named timestamp_right; drop it if present.
-            if "timestamp_right" in merged.columns:
-                merged = merged.drop("timestamp_right")
+        merged = series_df if merged is None else merged.join(series_df, on="timestamp", how="full")
+        if merged is not None and "timestamp_right" in merged.columns:
+            merged = merged.drop("timestamp_right")
         LOGGER.info("Fetched %s rows for %s.", len(series_df), col_name)
 
     if merged is None:
         raise RuntimeError("No SMARD data fetched.")
 
+    # Day-ahead prices (hourly)
+    da_df = fetch_series(session, DA_PRICE_FILTER_ID, region, resolution, start_ms, end_ms, cutoff_ms, "price_da_eur")
+    if da_df is not None:
+        merged = merged.join(da_df, on="timestamp", how="full", coalesce=True)
+        LOGGER.info("Fetched %s rows for price_da_eur.", len(da_df))
+
+    # Intraday prices (quarter-hour) -> hourly mean
+    intraday_qh = fetch_series(
+        session,
+        INTRADAY_PRICE_FILTER_ID,
+        INTRADAY_REGION,
+        INTRADAY_RESOLUTION,
+        start_ms,
+        end_ms,
+        cutoff_ms,
+        "price_intraday_qh",
+    )
+    if intraday_qh is not None:
+        intraday_hourly = (
+            intraday_qh.sort("timestamp")
+            .group_by_dynamic("timestamp", every="1h", closed="left", label="left")
+            .agg(pl.col("price_intraday_qh").mean().alias("price_intraday_eur"))
+            .sort("timestamp")
+        )
+        merged = merged.join(intraday_hourly, on="timestamp", how="full", coalesce=True)
+        LOGGER.info("Fetched %s rows for price_intraday_eur.", len(intraday_hourly))
+
     merged = merged.sort("timestamp")
-    # Drop duplicate timestamp_* columns created by joins
-    ts_cols = [c for c in merged.columns if c.startswith("timestamp_") and c != "timestamp"]
-    if ts_cols:
-        merged = merged.drop(ts_cols)
+
     # Derived aggregates
     if "wind_onshore_forecast" in merged.columns and "wind_offshore_forecast" in merged.columns:
         merged = merged.with_columns(
             (pl.col("wind_onshore_forecast") + pl.col("wind_offshore_forecast")).alias("wind_forecast_de")
         )
+
     # Forecast error features: Forecast - Actual
     if "wind_onshore_forecast" in merged.columns and "wind_onshore_actual" in merged.columns:
         merged = merged.with_columns(
@@ -170,9 +220,8 @@ def fetch_smard(
             (pl.col("wind_offshore_forecast") - pl.col("wind_offshore_actual")).alias("wind_offshore_error")
         )
     if "solar_forecast" in merged.columns and "solar_actual" in merged.columns:
-        merged = merged.with_columns(
-            (pl.col("solar_forecast") - pl.col("solar_actual")).alias("solar_error")
-        )
+        merged = merged.with_columns((pl.col("solar_forecast") - pl.col("solar_actual")).alias("solar_error"))
+
     # System stress signal: sum of absolute forecast errors
     if (
         "wind_onshore_error" in merged.columns
@@ -213,10 +262,16 @@ def fetch_smard(
             ).alias("total_wind_intraday_error")
         )
 
+    # Keep only one UTC and one CET timestamp
+    if "timestamp" in merged.columns:
+        merged = merged.with_columns(pl.col("timestamp").dt.replace_time_zone("UTC").alias("timestamp_utc"))
+        merged = merged.with_columns(pl.col("timestamp").dt.convert_time_zone("Europe/Berlin").alias("timestamp_cet"))
+        merged = merged.drop("timestamp")
+
     return merged
 
 
-def main():
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch SMARD data and store as parquet.")
     parser.add_argument("--start", default="2022-01-01", help="Start date (UTC, inclusive), e.g. 2022-01-01")
@@ -234,15 +289,12 @@ def main():
     end_dt = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
 
     df = fetch_smard(start_dt, end_dt, region=args.region, resolution=args.resolution)
-    # Keep only one UTC and one CET timestamp
-    if "timestamp" in df.columns:
-        df = df.with_columns(pl.col("timestamp").dt.replace_time_zone("UTC").alias("timestamp_utc"))
-        df = df.with_columns(pl.col("timestamp").dt.convert_time_zone("Europe/Berlin").alias("timestamp_cet"))
-        df = df.drop("timestamp")
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path, compression="zstd")
     LOGGER.info("Wrote %s rows to %s", df.height, out_path)
+    print(f"SMARD rows: {df.height}")
+    print(df.head(5))
 
 
 if __name__ == "__main__":
