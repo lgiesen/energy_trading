@@ -1,4 +1,4 @@
-"""Fetch ENTSO-E load data and generation outages via entsoe-py.
+"""Fetch ENTSO-E load data and generation outages via entsoe-py (hourly output).
 
 Usage:
     python -m ingestion.fetch_entsoe \
@@ -18,6 +18,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from entsoe import EntsoePandasClient
 
@@ -77,6 +78,54 @@ def _to_series(data: pd.Series | pd.DataFrame, name: str) -> pd.Series | None:
     return data.rename(name)
 
 
+def _outages_to_hourly(events: pd.DataFrame, idx: pd.DatetimeIndex) -> pd.DataFrame:
+    baseload = {"Nuclear", "Fossil Brown coal/Lignite"}
+    hard_coal = {"Fossil Hard coal"}
+    gas = {"Fossil Gas"}
+
+    ts = idx.values
+    base_vals = np.zeros(len(idx), dtype=float)
+    coal_vals = np.zeros(len(idx), dtype=float)
+    gas_vals = np.zeros(len(idx), dtype=float)
+
+    mapped_baseload = 0
+    mapped_hard_coal = 0
+    mapped_gas = 0
+
+    for _, row in events.iterrows():
+        evt_start = max(row["start"], idx[0])
+        evt_end = min(row["end"], idx[-1])
+        if evt_start >= evt_end:
+            continue
+        i_start = np.searchsorted(ts, evt_start.to_datetime64(), side="left")
+        i_end = np.searchsorted(ts, evt_end.to_datetime64(), side="left")
+        if i_start >= i_end:
+            continue
+        fuel = row["plant_type"]
+        if fuel in baseload:
+            base_vals[i_start:i_end] += row["missing_mw"]
+            mapped_baseload += 1
+        elif fuel in hard_coal:
+            coal_vals[i_start:i_end] += row["missing_mw"]
+            mapped_hard_coal += 1
+        elif fuel in gas:
+            gas_vals[i_start:i_end] += row["missing_mw"]
+            mapped_gas += 1
+
+    LOGGER.info("Mapped %s events to Baseload outages.", mapped_baseload)
+    LOGGER.info("Mapped %s events to Hard Coal outages.", mapped_hard_coal)
+    LOGGER.info("Mapped %s events to Gas outages.", mapped_gas)
+
+    return pd.DataFrame(
+        {
+            "outage_baseload_mw": base_vals,
+            "outage_hard_coal_mw": coal_vals,
+            "outage_gas_mw": gas_vals,
+        },
+        index=idx,
+    )
+
+
 def fetch_outages_as_timeseries(
     client: EntsoePandasClient,
     start: pd.Timestamp,
@@ -100,60 +149,24 @@ def fetch_outages_as_timeseries(
     end_col = cols.get("end")
     avail_col = cols.get("avail_qty")
     nominal_col = cols.get("nominal_power")
-    psr_col = cols.get("plant_type") or cols.get("production_resource_psr_name")
+    psr_col = cols.get("plant_type")
 
     if not (start_col and end_col and avail_col and nominal_col and psr_col):
         LOGGER.warning("Outage data missing expected columns; got: %s", list(df.columns))
         return pd.DataFrame()
 
     events = df[[start_col, end_col, avail_col, nominal_col, psr_col]].copy()
-    events[start_col] = pd.to_datetime(events[start_col], errors="coerce").dt.tz_convert("UTC")
-    events[end_col] = pd.to_datetime(events[end_col], errors="coerce").dt.tz_convert("UTC")
-    events[avail_col] = pd.to_numeric(events[avail_col], errors="coerce").astype(float)
-    events[nominal_col] = pd.to_numeric(events[nominal_col], errors="coerce").astype(float)
-    events = events.dropna(subset=[start_col, end_col, avail_col, nominal_col, psr_col])
+    events["start"] = pd.to_datetime(events[start_col], errors="coerce").dt.tz_convert("UTC")
+    events["end"] = pd.to_datetime(events[end_col], errors="coerce").dt.tz_convert("UTC")
+    events["avail_qty"] = pd.to_numeric(events[avail_col], errors="coerce").astype(float)
+    events["nominal_power"] = pd.to_numeric(events[nominal_col], errors="coerce").astype(float)
+    events["plant_type"] = events[psr_col]
+    events = events.dropna(subset=["start", "end", "avail_qty", "nominal_power", "plant_type"])
 
-    events["missing_mw"] = (events[nominal_col] - events[avail_col]).clip(lower=0.0)
-
-    baseload = {"Nuclear", "Fossil Brown coal/Lignite"}
-    hard_coal = {"Fossil Hard coal"}
-    gas = {"Fossil Gas"}
+    events["missing_mw"] = (events["nominal_power"] - events["avail_qty"]).clip(lower=0.0)
 
     idx = pd.date_range(start=start, end=end, freq="1h", tz="UTC", inclusive="left")
-    mapped_baseload = 0
-    mapped_hard_coal = 0
-    mapped_gas = 0
-    out = pd.DataFrame(
-        {
-            "outage_baseload_mw": 0.0,
-            "outage_hard_coal_mw": 0.0,
-            "outage_gas_mw": 0.0,
-        },
-        index=idx,
-    )
-
-    for _, row in events.iterrows():
-        evt_start = max(row[start_col], idx[0])
-        evt_end = min(row[end_col], idx[-1])
-        if evt_start >= evt_end:
-            continue
-        hours = pd.date_range(evt_start.floor("1h"), evt_end.floor("1h"), freq="1h", tz="UTC", inclusive="left")
-        fuel = str(row[psr_col])
-        if fuel in baseload:
-            out.loc[hours, "outage_baseload_mw"] += float(row["missing_mw"])
-            mapped_baseload += 1
-        elif fuel in hard_coal:
-            out.loc[hours, "outage_hard_coal_mw"] += float(row["missing_mw"])
-            mapped_hard_coal += 1
-        elif fuel in gas:
-            out.loc[hours, "outage_gas_mw"] += float(row["missing_mw"])
-            mapped_gas += 1
-
-    LOGGER.info("Mapped %s events to Baseload outages.", mapped_baseload)
-    LOGGER.info("Mapped %s events to Hard Coal outages.", mapped_hard_coal)
-    LOGGER.info("Mapped %s events to Gas outages.", mapped_gas)
-
-    return out
+    return _outages_to_hourly(events, idx)
 
 
 def fetch_entsoe(start: datetime, end: datetime, country: str) -> pd.DataFrame:
@@ -178,13 +191,20 @@ def fetch_entsoe(start: datetime, end: datetime, country: str) -> pd.DataFrame:
     )
     load_forecast_da = _to_series(load_forecast_da, "load_forecast_da")
 
-    outages = fetch_outages_as_timeseries(client, start_ts, end_ts, country)
-
     series = [s for s in [load_actual, load_forecast_da] if s is not None and len(s) > 0]
     if not series:
         raise RuntimeError("No ENTSO-E load data fetched.")
 
-    df = pd.concat(series, axis=1).sort_index()
+    df_load = pd.concat(series, axis=1).sort_index()
+    # Force hourly resolution
+    df_load = df_load.resample("1h").mean()
+    # Fix known 24h gap with linear interpolation
+    if "load_forecast_da" in df_load.columns:
+        df_load["load_forecast_da"] = df_load["load_forecast_da"].interpolate(method="linear", limit=24)
+
+    outages = fetch_outages_as_timeseries(client, start_ts, end_ts, country)
+
+    df = df_load.copy()
     if not outages.empty:
         df = df.join(outages, how="left")
         for col in ["outage_baseload_mw", "outage_hard_coal_mw", "outage_gas_mw"]:
@@ -198,7 +218,7 @@ def fetch_entsoe(start: datetime, end: datetime, country: str) -> pd.DataFrame:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Fetch ENTSO-E load data and outages via entsoe-py.")
+    parser = argparse.ArgumentParser(description="Fetch ENTSO-E load data and outages via entsoe-py (hourly).")
     parser.add_argument("--start", default="2022-01-01", help="Start date (UTC, inclusive).")
     parser.add_argument("--end", default="2025-12-31", help="End date (UTC, inclusive).")
     parser.add_argument("--country", default=DEFAULT_COUNTRY, help="ENTSO-E country/bidding zone code (default DE_LU).")
