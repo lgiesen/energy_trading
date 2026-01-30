@@ -1,7 +1,7 @@
 """Merge all parquet files in the data directory on timestamp_utc into one table.
 
 Usage:
-    python -m ingestion.merge_data \
+    python -m energy_trading.ingestion.merge_data \
         --data-dir data/raw \
         --out data/processed/all_data.parquet \
         --clip-start 2020-12-01T00:00:00 \
@@ -161,12 +161,12 @@ def main():
     parser = argparse.ArgumentParser(description="Merge all parquet files in the data directory on timestamp.")
     parser.add_argument(
         "--data-dir",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "raw"),
-        help="Directory containing parquet files to merge (default: energy_trading/data/raw).",
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw"),
+        help="Directory containing parquet files to merge (default: data/raw).",
     )
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "processed" / "all_data.parquet"),
+        default=str(Path(__file__).resolve().parents[3] / "data" / "processed" / "all_data.parquet"),
         help="Output parquet path.",
     )
     parser.add_argument(

@@ -1,7 +1,7 @@
 """Fetch Regelleistung aFRR CAPACITY/ENERGY results and store as parquet.
 
 Usage:
-    python -m ingestion.fetch_regelleistung \
+    python -m energy_trading.ingestion.fetch_regelleistung \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/regelleistung.parquet
 
@@ -464,12 +464,12 @@ def main() -> None:
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "raw" / "regelleistung.parquet"),
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "regelleistung.parquet"),
         help="Output parquet path",
     )
     parser.add_argument(
         "--mol-dir",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "raw"),
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw"),
         help="Directory containing RESULT_LIST_ANONYM_* files (zip/xlsx).",
     )
     args = parser.parse_args()

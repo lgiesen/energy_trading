@@ -1,7 +1,7 @@
 """Fetch SMARD load/generation/price series and store them in one parquet file.
 
 Usage:
-    python -m ingestion.fetch_smard \
+    python -m energy_trading.ingestion.fetch_smard \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/smard.parquet
 
@@ -59,12 +59,17 @@ DATA_MODULES: Dict[str, int] = {
     "wind_onshore_forecast_intraday": 715,
 }
 
-# Candidate IDs for realised fossil generation (Ist-Erzeugung).
+MARKET_CONFIG_URL = "https://www.smard.de/app/chart_configuration/market_data_configuration.json"
+
+# Candidate IDs for realised generation (Ist-Erzeugung).
 # We try these IDs in order and keep the first one that returns data.
-FOSSIL_GENERATION_CANDIDATES: Dict[str, List[int]] = {
+GENERATION_CANDIDATES: Dict[str, List[int]] = {
     "generation_fossil_brown_coal_mw": [1223],
     "generation_fossil_hard_coal_mw": [4069],
     "generation_fossil_gas_mw": [4071],
+    # Quarterhour IDs to avoid gaps.
+    "generation_nuclear_mw": [4067],
+    "generation_hydro_pumped_storage_mw": [4066],
 }
 
 
@@ -93,6 +98,45 @@ def _available_timestamps(filter_id: int, region: str, resolution: str, session:
     resp.raise_for_status()
     payload = resp.json()
     return sorted(payload.get("timestamps", []))
+
+
+def _lookup_data_id_by_name(
+    session: requests.Session,
+    name_contains: str,
+    resolution: str = "quarterhour",
+) -> List[int]:
+    """Lookup SMARD data_id by module name from market_data_configuration.json."""
+    try:
+        resp = session.get(MARKET_CONFIG_URL, timeout=30)
+        resp.raise_for_status()
+        cfg = resp.json()
+    except Exception:
+        return []
+
+    matches: List[int] = []
+
+    def walk(obj) -> None:
+        if isinstance(obj, dict):
+            if "data_id" in obj and "name" in obj:
+                name = str(obj.get("name", "")).lower()
+                if name_contains.lower() in name:
+                    if resolution is None or obj.get("source_resolution") == resolution:
+                        matches.append(int(obj["data_id"]))
+            for val in obj.values():
+                walk(val)
+        elif isinstance(obj, list):
+            for val in obj:
+                walk(val)
+
+    walk(cfg)
+    # Deduplicate while preserving order.
+    seen = set()
+    out = []
+    for mid in matches:
+        if mid not in seen:
+            seen.add(mid)
+            out.append(mid)
+    return out
 
 
 def _fetch_chunk(
@@ -284,26 +328,45 @@ def fetch_smard(
     if merged is None:
         raise RuntimeError("No SMARD data fetched.")
 
-    # Realised fossil generation (Ist-Erzeugung) with region + resolution fallback
+    # Realised generation (Ist-Erzeugung) with region + resolution fallback
     expected_hours = int((end_ms - start_ms) / 3600000) + 1
-    for col_name, candidates in FOSSIL_GENERATION_CANDIDATES.items():
+    for col_name, candidates in GENERATION_CANDIDATES.items():
         series_df = None
-        # Order: DE-LU @ hour -> DE-LU @ quarterhour -> DE @ hour -> DE @ quarterhour
-        for region_try in [DEFAULT_REGION, "DE"]:
-            series_df = fetch_series_with_resolution_fallback(
-                session,
-                candidates,
-                region_try,
-                start_ms,
-                end_ms,
-                cutoff_ms,
-                col_name,
-                expected_hours,
-            )
-            if series_df is not None and series_df.height > 0:
-                if region_try != DEFAULT_REGION:
-                    LOGGER.warning("%s fell back to region=%s", col_name, region_try)
-                break
+        # Nuclear + pumped storage: force quarterhour and resample to hourly mean.
+        if col_name in {"generation_nuclear_mw", "generation_hydro_pumped_storage_mw"}:
+            for region_try in [DEFAULT_REGION, "DE"]:
+                series_df = fetch_series_with_candidates(
+                    session,
+                    candidates,
+                    region_try,
+                    "quarterhour",
+                    start_ms,
+                    end_ms,
+                    cutoff_ms,
+                    col_name,
+                )
+                if series_df is not None and series_df.height > 0:
+                    series_df = _resample_qh_to_hour(series_df, col_name)
+                    if region_try != DEFAULT_REGION:
+                        LOGGER.warning("%s fell back to region=%s", col_name, region_try)
+                    break
+        else:
+            # Order: DE-LU @ hour -> DE-LU @ quarterhour -> DE @ hour -> DE @ quarterhour
+            for region_try in [DEFAULT_REGION, "DE"]:
+                series_df = fetch_series_with_resolution_fallback(
+                    session,
+                    candidates,
+                    region_try,
+                    start_ms,
+                    end_ms,
+                    cutoff_ms,
+                    col_name,
+                    expected_hours,
+                )
+                if series_df is not None and series_df.height > 0:
+                    if region_try != DEFAULT_REGION:
+                        LOGGER.warning("%s fell back to region=%s", col_name, region_try)
+                    break
         if series_df is None:
             continue
         merged = merged.join(series_df, on="timestamp", how="full", coalesce=True)
@@ -455,7 +518,7 @@ def main() -> None:
     parser.add_argument("--resolution", default=DEFAULT_RESOLUTION, help="Resolution string used by SMARD (default hour).")
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "raw" / "smard.parquet"),
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "smard.parquet"),
         help="Output parquet path.",
     )
     args = parser.parse_args()

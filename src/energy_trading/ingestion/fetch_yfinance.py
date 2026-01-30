@@ -2,7 +2,7 @@
 Fetch commodity prices (TTF gas, CO2, API2 coal) from Yahoo Finance and store as parquet.
 
 Usage:
-    python -m ingestion.fetch_yfinance \
+    python -m energy_trading.ingestion.fetch_yfinance \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/yfinance.parquet
 

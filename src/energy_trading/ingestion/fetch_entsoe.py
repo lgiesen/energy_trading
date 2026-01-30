@@ -1,7 +1,7 @@
 """Fetch ENTSO-E load data and generation outages via entsoe-py (hourly output).
 
 Usage:
-    python -m ingestion.fetch_entsoe \
+    python -m energy_trading.ingestion.fetch_entsoe \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/entsoe.parquet
 
@@ -31,8 +31,9 @@ def _load_env_fallback() -> None:
     if os.getenv("ENTSOE_API_KEY"):
         return
     candidates = [
-        Path(__file__).resolve().parents[1] / ".env",  # /energy_trading/.env
-        Path(__file__).resolve().parents[2] / ".env",  # repo root .env
+        Path(__file__).resolve().parents[3] / ".env",  # repo root .env
+        Path(__file__).resolve().parents[2] / ".env",  # src/.env (legacy)
+        Path(__file__).resolve().parents[1] / ".env",  # package/.env (legacy)
     ]
     for env_path in candidates:
         if not env_path.exists():
@@ -233,7 +234,7 @@ def main() -> None:
     parser.add_argument("--country", default=DEFAULT_COUNTRY, help="ENTSO-E country/bidding zone code (default DE_LU).")
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "raw" / "entsoe.parquet"),
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "entsoe.parquet"),
         help="Output parquet path.",
     )
     args = parser.parse_args()

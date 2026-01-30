@@ -46,7 +46,7 @@ def main():
 
     # ENTSO-E (requires ENTSOE_API_KEY env)
     run([
-        py, "-m", "ingestion.fetch_entsoe",
+        py, "-m", "energy_trading.ingestion.fetch_entsoe",
         "--start", args.start,
         "--end", args.end,
         "--timeout", str(args.entsoe_timeout),
@@ -57,7 +57,7 @@ def main():
 
     # Day-ahead prices
     run([
-        py, "-m", "ingestion.fetch_energy_charts_prices",
+        py, "-m", "energy_trading.ingestion.fetch_energy_charts_prices",
         "--start", args.start,
         "--end", args.end,
         "--out", str(out_dir / "energy_charts.parquet"),
@@ -65,7 +65,7 @@ def main():
 
     # Netztransparenz (assumes env creds configured)
     run([
-        py, "-m", "ingestion.fetch_netztransparenz",
+        py, "-m", "energy_trading.ingestion.fetch_netztransparenz",
         "--start", args.start,
         "--end", args.end,
         "--chunk-days", "60",
@@ -76,7 +76,7 @@ def main():
     # SMARD
     if not args.skip_smard:
         run([
-            py, "-m", "ingestion.fetch_smard",
+            py, "-m", "energy_trading.ingestion.fetch_smard",
             "--start", args.start,
             "--end", args.end,
             "--out", str(out_dir / "smard.parquet"),
@@ -85,7 +85,7 @@ def main():
     # yfinance commodities
     if not args.skip_commodities:
         run([
-            py, "-m", "ingestion.fetch_yfinance",
+            py, "-m", "energy_trading.ingestion.fetch_yfinance",
             "--start", args.start,
             "--end", args.end,
             "--out", str(out_dir / "commodities.parquet"),
@@ -93,7 +93,7 @@ def main():
 
     # Regelleistung aFRR (hourly, includes net import/export + MOL slope)
     run([
-        py, "-m", "ingestion.fetch_regelleistung",
+        py, "-m", "energy_trading.ingestion.fetch_regelleistung",
         "--start", args.start,
         "--end", args.end,
         "--out", str(out_dir / "regelleistung.parquet"),
@@ -101,7 +101,7 @@ def main():
 
     # Merge all parquets in out_dir
     run([
-        py, "-m", "ingestion.merge_data",
+        py, "-m", "energy_trading.ingestion.merge_data",
         "--data-dir", str(out_dir),
         "--out", str(Path(args.merged)),
     ])

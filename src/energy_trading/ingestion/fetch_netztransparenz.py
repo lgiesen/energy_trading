@@ -1,6 +1,6 @@
 """
 Usage:
-    python -m ingestion.fetch_netztransparenz \
+    python -m energy_trading.ingestion.fetch_netztransparenz \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/netztransparenz.parquet
 

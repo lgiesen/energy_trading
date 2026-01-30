@@ -1,7 +1,7 @@
 """Backward-compatible wrapper for Energy Charts day-ahead prices.
 
 Use:
-    python -m ingestion.fetch_energy_charts_prices ...
+    python -m energy_trading.ingestion.fetch_energy_charts_prices ...
 """
 from __future__ import annotations
 

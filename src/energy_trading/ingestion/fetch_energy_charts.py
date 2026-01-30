@@ -1,7 +1,7 @@
 """Fetch day-ahead power prices from the Energy Charts API for multiple bidding zones.
 
 Usage:
-    python -m ingestion.fetch_energy_charts \
+    python -m energy_trading.ingestion.fetch_energy_charts \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/energy_charts.parquet
 
