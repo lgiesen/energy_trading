@@ -2,7 +2,7 @@
 Usage:
     python -m ingestion.fetch_netztransparenz \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
-        --out data/netztransparenz.parquet
+        --out data/raw/netztransparenz.parquet
 
 Outputs:
     - netztransparenz.parquet with hourly data aligned on timestamp_utc.
@@ -441,7 +441,7 @@ def main():
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument("--token", help="Bearer token (defaults to NETZTRANSPARENZ_TOKEN env var).")
-    parser.add_argument("--out", default="data/netztransparenz.parquet", help="Output parquet path.")
+    parser.add_argument("--out", default="data/raw/netztransparenz.parquet", help="Output parquet path.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds per request.")
     parser.add_argument("--chunk-days", type=int, default=180, help="Chunk size in days to avoid server errors.")
     parser.add_argument("--chunk-sleep", type=float, default=0.5, help="Seconds to sleep between chunks.")

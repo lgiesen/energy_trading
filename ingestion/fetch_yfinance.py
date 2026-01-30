@@ -4,7 +4,7 @@ Fetch commodity prices (TTF gas, CO2, API2 coal) from Yahoo Finance and store as
 Usage:
     python -m ingestion.fetch_yfinance \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
-        --out energy_trading/data/yfinance.parquet
+        --out data/raw/yfinance.parquet
 
 Outputs:
     - yfinance.parquet with daily prices upsampled to hourly (ffill).
@@ -113,7 +113,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch TTF gas, EUA CO2, and API2 coal prices from Yahoo Finance.")
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
-    parser.add_argument("--out", default="data/yfinance.parquet", help="Output parquet path.")
+    parser.add_argument("--out", default="data/raw/yfinance.parquet", help="Output parquet path.")
     parser.add_argument("--interval", default="1d", help="Yahoo interval (default 1d).")
     args = parser.parse_args()
 

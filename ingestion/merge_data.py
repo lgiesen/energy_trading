@@ -2,8 +2,8 @@
 
 Usage:
     python -m ingestion.merge_data \
-        --data-dir data \
-        --out data/all_data.parquet \
+        --data-dir data/raw \
+        --out data/processed/all_data.parquet \
         --clip-start 2020-12-01T00:00:00 \
         --clip-end 2026-01-01T02:00:00
 
@@ -161,12 +161,12 @@ def main():
     parser = argparse.ArgumentParser(description="Merge all parquet files in the data directory on timestamp.")
     parser.add_argument(
         "--data-dir",
-        default=str(Path(__file__).resolve().parents[1] / "data"),
-        help="Directory containing parquet files to merge (default: energy_trading/data).",
+        default=str(Path(__file__).resolve().parents[1] / "data" / "raw"),
+        help="Directory containing parquet files to merge (default: energy_trading/data/raw).",
     )
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "all_merged.parquet"),
+        default=str(Path(__file__).resolve().parents[1] / "data" / "processed" / "all_data.parquet"),
         help="Output parquet path.",
     )
     parser.add_argument(

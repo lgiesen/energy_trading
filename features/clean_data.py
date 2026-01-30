@@ -1,6 +1,6 @@
 """
-Run the script with: python3 -m energy_trading.features.clean_data --data-dir data --out data/all_merged_clean.parquet
-Prerequisite: data/all_merged_clean.parquet has been generated with energy_trading.ingestion.merge_data.py
+Run the script with: python3 -m energy_trading.features.clean_data --data-dir data/processed --out data/cleaned/all_merged_clean.parquet
+Prerequisite: data/processed/all_data.parquet has been generated with energy_trading.ingestion.merge_data.py
 """
 
 """Merge and clean all parquet datasets.
@@ -128,9 +128,9 @@ def load_or_merge(data_dir: Path, merged_path: Path | None) -> pl.DataFrame:
 
 def main():
     parser = argparse.ArgumentParser(description="Merge and clean all parquet files on timestamp.")
-    parser.add_argument("--data-dir", default="data", help="Directory containing parquet files (default: data).")
+    parser.add_argument("--data-dir", default="data/processed", help="Directory containing parquet files (default: data/processed).")
     parser.add_argument("--merged", default=None, help="Optional existing merged parquet to clean instead of merging.")
-    parser.add_argument("--out", default="data/all_merged_clean.parquet", help="Output parquet path.")
+    parser.add_argument("--out", default="data/cleaned/all_merged_clean.parquet", help="Output parquet path.")
     parser.add_argument("--gap-threshold", type=float, default=0.01, help="Max null ratio to auto-fill numeric gaps (default 1%).")
     parser.add_argument("--no-clip", action="store_true", help="Disable outlier clipping.")
     args = parser.parse_args()

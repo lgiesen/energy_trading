@@ -3,7 +3,7 @@
 Usage:
     python -m ingestion.fetch_energy_charts \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
-        --out data/energy_charts.parquet
+        --out data/raw/energy_charts.parquet
 
 Outputs:
     - energy_charts.parquet with hourly UTC timestamps and one price column per zone.
@@ -91,7 +91,7 @@ def main():
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument("--zones", nargs="*", default=NEIGHBOR_BZN, help="Bidding zones to fetch (default: DE-LU + neighbors).")
-    parser.add_argument("--out", default="data/energy_charts.parquet", help="Output parquet path.")
+    parser.add_argument("--out", default="data/raw/energy_charts.parquet", help="Output parquet path.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds per request.")
     args = parser.parse_args()
 

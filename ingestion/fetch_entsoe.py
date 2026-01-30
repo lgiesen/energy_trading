@@ -3,7 +3,7 @@
 Usage:
     python -m ingestion.fetch_entsoe \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
-        --out data/entsoe.parquet
+        --out data/raw/entsoe.parquet
 
 Outputs:
     - entsoe.parquet with hourly UTC timestamps and columns:
@@ -233,7 +233,7 @@ def main() -> None:
     parser.add_argument("--country", default=DEFAULT_COUNTRY, help="ENTSO-E country/bidding zone code (default DE_LU).")
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "entsoe.parquet"),
+        default=str(Path(__file__).resolve().parents[1] / "data" / "raw" / "entsoe.parquet"),
         help="Output parquet path.",
     )
     args = parser.parse_args()

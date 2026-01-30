@@ -3,7 +3,7 @@
 Usage:
     python -m ingestion.fetch_smard \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
-        --out data/smard.parquet
+        --out data/raw/smard.parquet
 
 Outputs:
     - smard.parquet with hourly data aligned on timestamp.
@@ -455,7 +455,7 @@ def main() -> None:
     parser.add_argument("--resolution", default=DEFAULT_RESOLUTION, help="Resolution string used by SMARD (default hour).")
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "smard.parquet"),
+        default=str(Path(__file__).resolve().parents[1] / "data" / "raw" / "smard.parquet"),
         help="Output parquet path.",
     )
     args = parser.parse_args()
