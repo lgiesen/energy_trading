@@ -28,8 +28,8 @@ def run(cmd: list[str]):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch all datasets and merge in one go.")
-    parser.add_argument("--start", default="2022-01-01", help="Start date (YYYY-MM-DD).")
-    parser.add_argument("--end", default="2025-12-31", help="End date (YYYY-MM-DD).")
+    parser.add_argument("--start", default="2020-12-01T00:00:00Z", help="Start date (UTC ISO8601).")
+    parser.add_argument("--end", default="2026-01-01T02:00:00Z", help="End date (UTC ISO8601).")
     parser.add_argument("--out-dir", default="data", help="Output directory for individual parquets.")
     parser.add_argument("--merged", default="data/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
@@ -47,8 +47,8 @@ def main():
     # ENTSO-E (requires ENTSOE_API_KEY env)
     run([
         py, "-m", "ingestion.fetch_entsoe",
-        "--start", args.start.replace("-", "") + "0000",
-        "--end", args.end.replace("-", "") + "2300",
+        "--start", args.start,
+        "--end", args.end,
         "--timeout", str(args.entsoe_timeout),
         "--chunk-days", str(args.entsoe_chunk_days),
         "--chunk-sleep", str(args.entsoe_chunk_sleep),
@@ -94,8 +94,8 @@ def main():
     # Regelleistung aFRR (hourly, includes net import/export + MOL slope)
     run([
         py, "-m", "ingestion.fetch_regelleistung",
-        "--start-year", args.start[:4],
-        "--end-year", args.end[:4],
+        "--start", args.start,
+        "--end", args.end,
         "--out", str(out_dir / "regelleistung.parquet"),
     ])
 

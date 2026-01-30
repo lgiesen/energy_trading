@@ -2,8 +2,8 @@
 
 Usage:
     python -m ingestion.fetch_regelleistung \
-        --start-year 2022 --end-year 2025 \
-        --out energy_trading/data/regelleistung.parquet
+        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+        --out data/regelleistung.parquet
 
 Outputs:
     - regelleistung.parquet with hourly aFRR capacity/energy results.
@@ -16,11 +16,12 @@ Includes:
 from __future__ import annotations
 
 import argparse
-import io
 import calendar
-import zipfile
-import warnings
+import io
 import logging
+import warnings
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -174,12 +175,21 @@ def _expand_capacity_mol(df: pd.DataFrame) -> pd.DataFrame:
         return df
     start_hour = df["product"].str.extract(r"_(\\d{2})_").astype(float)
     df = df.assign(start_hour=start_hour).dropna(subset=["start_hour"])
-    df["timestamp"] = pd.to_datetime(df["date"]) + pd.to_timedelta(df["start_hour"].astype(int), unit="h")
+    start_local = pd.to_datetime(df["date"]).dt.tz_localize(
+        "Europe/Berlin", ambiguous="infer", nonexistent="shift_forward"
+    )
+    df["timestamp"] = start_local + pd.to_timedelta(df["start_hour"].astype(int), unit="h")
     df = df.dropna(subset=["timestamp"])
     rows = []
     for _, r in df.iterrows():
-        for i in range(4):
-            rows.append((r["timestamp"] + pd.Timedelta(hours=i), r["reserve_type"], r["mol_slope"]))
+        block = pd.date_range(
+            start=r["timestamp"],
+            periods=4,
+            freq="1h",
+            inclusive="left",
+        )
+        for ts in block:
+            rows.append((ts, r["reserve_type"], r["mol_slope"]))
     out = pd.DataFrame(rows, columns=["timestamp", "reserve_type", "mol_slope"])
     out = (
         out.groupby(["timestamp", "reserve_type"])["mol_slope"]
@@ -229,11 +239,11 @@ def process_mol_slope(data_dir: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = energy if capacity.empty else energy.merge(capacity, on="timestamp", how="outer")
-    out["timestamp"] = (
-        pd.to_datetime(out["timestamp"])
-        .dt.tz_localize("Europe/Berlin", ambiguous="NaT", nonexistent="NaT")
-        .dt.tz_convert("UTC")
-    )
+    ts = pd.to_datetime(out["timestamp"], errors="coerce")
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("Europe/Berlin", ambiguous="NaT", nonexistent="NaT")
+    ts = ts.dt.tz_convert("UTC")
+    out["timestamp"] = ts
     out = out.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
     return out
 
@@ -245,9 +255,22 @@ def _download_overview_file(url: str) -> pd.DataFrame:
     return _normalize_regelleistung_columns(df)
 
 
-def _fetch_monthly_overview(year: int, market_type: str) -> pd.DataFrame:
+def _fetch_monthly_overview(
+    year: int,
+    market_type: str,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for month in range(1, 13):
+        if start_dt or end_dt:
+            month_start = datetime(year, month, 1, tzinfo=timezone.utc)
+            last_day = calendar.monthrange(year, month)[1]
+            month_end = datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
+            if start_dt and month_end < start_dt:
+                continue
+            if end_dt and month_start > end_dt:
+                continue
         last_day = calendar.monthrange(year, month)[1]
         url = (
             "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files/"
@@ -266,7 +289,12 @@ def _fetch_monthly_overview(year: int, market_type: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
+def fetch_and_parse_regelleistung(
+    year: int,
+    market_type: str,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+) -> pd.DataFrame:
     """Download aFRR results and return a tidy DataFrame indexed by timestamp."""
     url = (
         "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files/"
@@ -279,14 +307,37 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
     except Exception:
         LOGGER.warning("Yearly %s %s overview file not found.", year, market_type)
 
+    # --- 1) Dynamic column detection ---
+    date_col = _find_col(df, ["DATE"]) or _find_col(df, ["DATUM"]) or (df.columns[0] if not df.empty else None)
+    prod_col = (
+        _find_col(df, ["PRODUC"])
+        or _find_col(df, ["PRODUKT"])
+        or _find_col(df, ["TIME"])
+        or (df.columns[1] if not df.empty and len(df.columns) > 1 else None)
+    )
+
+    # If this is the start year, accept partial yearly data if it covers the requested window.
+    allow_partial = False
+    if (
+        market_type == "ENERGY"
+        and start_dt is not None
+        and year == start_dt.year
+        and not df.empty
+        and date_col is not None
+    ):
+        max_date = _parse_date_series(df[date_col]).max()
+        if pd.notna(max_date) and max_date.date() >= start_dt.date():
+            allow_partial = True
+            LOGGER.info("Yearly ENERGY %s accepted as partial coverage (max date %s).", year, max_date.date())
+
     # If ENERGY is missing or sparse, try monthly fallbacks.
-    if market_type == "ENERGY" and (df.empty or len(df) < 8000):
+    if market_type == "ENERGY" and (df.empty or len(df) < 4000) and not allow_partial:
         LOGGER.warning(
             "Yearly ENERGY file for %s is missing or sparse (%s rows). Falling back to monthly files.",
             year,
             len(df),
         )
-        df = _fetch_monthly_overview(year, market_type)
+        df = _fetch_monthly_overview(year, market_type, start_dt=start_dt, end_dt=end_dt)
 
     if df.empty:
         LOGGER.warning("Skipping %s %s: no usable data.", year, market_type)
@@ -314,7 +365,12 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
             df_part["start_hour"] = pd.to_numeric(df_part["start_hour"], errors="coerce")
             df_part = df_part.dropna(subset=["start_hour"])
             df_part["start_hour"] = df_part["start_hour"].astype(int)
-            df_part["timestamp"] = start_of_day + pd.to_timedelta(df_part["start_hour"], unit="h")
+            df_part["timestamp_local"] = start_of_day + pd.to_timedelta(df_part["start_hour"], unit="h")
+            df_part = df_part.dropna(subset=["timestamp_local"])
+            df_part["timestamp"] = df_part["timestamp_local"].apply(
+                lambda ts: pd.date_range(start=ts, periods=4, freq="1h", inclusive="left")
+            )
+            df_part = df_part.explode("timestamp").drop(columns=["timestamp_local"])
             df_part["Richtung"] = part_prod.str.split("_").str[0]
         elif mode == "qh":
             df_part["quarter_hour_int"] = part_prod.str.extract(r"_(\d+)").astype(int)
@@ -382,10 +438,7 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
         if net_series is not None:
             df_pivot = df_pivot.join(net_series, how="left")
 
-        if market_type == "CAPACITY" or mode == "block":
-            df_pivot = df_pivot.resample("1h").ffill(limit=3)
-        else:
-            df_pivot = df_pivot.resample("1h").mean()
+        df_pivot = df_pivot.resample("1h").mean()
         return df_pivot
 
     parts = []
@@ -407,8 +460,8 @@ def fetch_and_parse_regelleistung(year: int, market_type: str) -> pd.DataFrame:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch aFRR results from Regelleistung.net")
-    parser.add_argument("--start-year", type=int, default=2022)
-    parser.add_argument("--end-year", type=int, default=2025)
+    parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
+    parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument(
         "--out",
         default=str(Path(__file__).resolve().parents[1] / "data" / "regelleistung.parquet"),
@@ -421,11 +474,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    years = list(range(args.start_year, args.end_year + 1))
+    start_dt = datetime.fromisoformat(args.start)
+    end_dt = datetime.fromisoformat(args.end)
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    else:
+        start_dt = start_dt.astimezone(timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    else:
+        end_dt = end_dt.astimezone(timezone.utc)
+
+    years = list(range(start_dt.year, end_dt.year + 1))
     all_years = []
     for y in years:
-        df_cap = fetch_and_parse_regelleistung(y, "CAPACITY")
-        df_ene = fetch_and_parse_regelleistung(y, "ENERGY")
+        df_cap = fetch_and_parse_regelleistung(y, "CAPACITY", start_dt=start_dt, end_dt=end_dt)
+        df_ene = fetch_and_parse_regelleistung(y, "ENERGY", start_dt=start_dt, end_dt=end_dt)
         if not df_cap.empty or not df_ene.empty:
             all_years.append(pd.concat([df_cap, df_ene], axis=1))
 
@@ -439,24 +503,35 @@ def main() -> None:
         df_master = df_master.join(mol_df, how="left")
     df_master = df_master[~df_master.index.duplicated(keep="first")]
 
+    # Output standardization: UTC hourly, clip window, timestamp_utc column.
+    df_master = df_master.resample("1h").mean()
+    df_master = df_master.loc[(df_master.index >= start_dt) & (df_master.index <= end_dt)]
+    df_master = df_master.sort_index()
+    df_master = df_master.reset_index().rename(columns={"index": "timestamp_utc"})
+    if "timestamp_utc" not in df_master.columns and "timestamp" in df_master.columns:
+        df_master = df_master.rename(columns={"timestamp": "timestamp_utc"})
+
     # Log missing months for activation market (do not impute).
     if "afrr_activation_avg_price_neg" in df_master.columns:
         missing = df_master[df_master["afrr_activation_avg_price_neg"].isna()]
         if not missing.empty:
-            months = (
-                missing.index.to_series()
-                .dt.tz_convert("UTC")
-                .dt.strftime("%Y-%m")
-                .value_counts()
-                .sort_index()
-            )
-            LOGGER.warning("Missing activation market months (afrr_activation_avg_price_neg):")
-            for ym, cnt in months.items():
-                LOGGER.warning("  %s: %s hours missing", ym, cnt)
+            ts_col = "timestamp_utc" if "timestamp_utc" in missing.columns else ("timestamp" if "timestamp" in missing.columns else None)
+            if ts_col is not None:
+                months = (
+                    pd.to_datetime(missing[ts_col], utc=True, errors="coerce")
+                    .dt.strftime("%Y-%m")
+                    .value_counts()
+                    .sort_index()
+                )
+                LOGGER.warning("Missing activation market months (afrr_activation_avg_price_neg):")
+                for ym, cnt in months.items():
+                    LOGGER.warning("  %s: %s hours missing", ym, cnt)
+            else:
+                LOGGER.warning("Missing activation market months: timestamp column not found.")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_master.to_parquet(out_path)
+    df_master.to_parquet(out_path, index=False)
     LOGGER.info("Wrote %s rows to %s", len(df_master), out_path)
 
 

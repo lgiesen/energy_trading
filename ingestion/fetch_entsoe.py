@@ -2,7 +2,7 @@
 
 Usage:
     python -m ingestion.fetch_entsoe \
-        --start 2022-01-01 --end 2025-12-31 \
+        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/entsoe.parquet
 
 Outputs:
@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -176,8 +176,16 @@ def fetch_entsoe(start: datetime, end: datetime, country: str) -> pd.DataFrame:
         raise RuntimeError("ENTSOE_API_KEY is not set in the environment.")
 
     client = EntsoePandasClient(api_key=api_key)
-    start_ts = pd.Timestamp(start, tz="UTC")
-    end_ts = pd.Timestamp(end, tz="UTC")
+    start_ts = pd.Timestamp(start)
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.tz_localize("UTC")
+    else:
+        start_ts = start_ts.tz_convert("UTC")
+    end_ts = pd.Timestamp(end)
+    if end_ts.tzinfo is None:
+        end_ts = end_ts.tz_localize("UTC")
+    else:
+        end_ts = end_ts.tz_convert("UTC")
 
     load_actual = _safe_fetch(
         "load_actual",
@@ -211,26 +219,35 @@ def fetch_entsoe(start: datetime, end: datetime, country: str) -> pd.DataFrame:
             if col in df.columns:
                 df[col] = df[col].fillna(0.0)
 
-    df = df.loc[(df.index >= start_ts) & (df.index < end_ts)]
-    df = df.reset_index().rename(columns={"index": "timestamp"})
+    df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+    df = df.resample("1h").mean()
+    df = df.reset_index().rename(columns={"index": "timestamp_utc"})
     return df
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch ENTSO-E load data and outages via entsoe-py (hourly).")
-    parser.add_argument("--start", default="2022-01-01", help="Start date (UTC, inclusive).")
-    parser.add_argument("--end", default="2025-12-31", help="End date (UTC, inclusive).")
+    parser.add_argument("--start", required=True, help="Start ISO8601 (UTC, inclusive).")
+    parser.add_argument("--end", required=True, help="End ISO8601 (UTC, inclusive).")
     parser.add_argument("--country", default=DEFAULT_COUNTRY, help="ENTSO-E country/bidding zone code (default DE_LU).")
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parents[2] / "data" / "entsoe.parquet"),
+        default=str(Path(__file__).resolve().parents[1] / "data" / "entsoe.parquet"),
         help="Output parquet path.",
     )
     args = parser.parse_args()
 
     start_dt = datetime.fromisoformat(args.start)
     end_dt = datetime.fromisoformat(args.end)
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    else:
+        start_dt = start_dt.astimezone(timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    else:
+        end_dt = end_dt.astimezone(timezone.utc)
 
     df = fetch_entsoe(start_dt, end_dt, args.country)
     out_path = Path(args.out)

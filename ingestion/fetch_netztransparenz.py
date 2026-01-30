@@ -1,7 +1,7 @@
 """
 Usage:
     python -m ingestion.fetch_netztransparenz \
-        --start 2022-01-01T00:00:00 --end 2025-12-31T23:45:00 \
+        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/netztransparenz.parquet
 
 Outputs:
@@ -20,15 +20,14 @@ import argparse
 import io
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import polars as pl
 import requests
 from dotenv import load_dotenv
 import logging
-
-TOTAL_AFRR_CAPACITY_MW = 2000  # rough national capacity used for activation rate
 LOGGER = logging.getLogger(__name__)
 
 def _load_env():
@@ -332,7 +331,7 @@ def fetch_and_merge(
     end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
 
     frames = []
-    for s_dt, e_dt in _chunk_range(start_dt, end_dt, chunk_days):
+    def _fetch_chunk_data(s_dt: datetime, e_dt: datetime) -> pl.DataFrame | None:
         s_str = s_dt.isoformat(timespec="minutes")
         e_str = e_dt.isoformat(timespec="minutes")
         urls = {
@@ -355,10 +354,24 @@ def fetch_and_merge(
                 .join(mfrr_df, on="timestamp_utc", how="full", coalesce=True)
                 .sort("timestamp_utc")
             )
-            frames.append(merged)
             LOGGER.info("Fetched chunk %s -> %s: %s rows", s_str, e_str, len(merged))
+            return merged
         except Exception as exc:
+            delta_days = (e_dt - s_dt).days
+            if delta_days > 30:
+                mid = s_dt + (e_dt - s_dt) / 2
+                left = _fetch_chunk_data(s_dt, mid)
+                right = _fetch_chunk_data(mid, e_dt)
+                parts = [p for p in [left, right] if p is not None and not p.is_empty()]
+                if parts:
+                    return pl.concat(parts)
             LOGGER.warning("Chunk %s -> %s failed: %s", s_str, e_str, exc)
+            return None
+
+    for s_dt, e_dt in _chunk_range(start_dt, end_dt, chunk_days):
+        merged = _fetch_chunk_data(s_dt, e_dt)
+        if merged is not None and not merged.is_empty():
+            frames.append(merged)
         if chunk_sleep and e_dt < end_dt:
             time.sleep(chunk_sleep)
 
@@ -425,8 +438,8 @@ def fetch_and_merge(
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch NRV-Saldo and reBAP from Netztransparenz and merge on timestamp.")
-    parser.add_argument("--start", required=True, help="Start ISO8601, e.g. 2022-01-01T00:00:00")
-    parser.add_argument("--end", required=True, help="End ISO8601, e.g. 2022-12-31T23:45:00")
+    parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
+    parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument("--token", help="Bearer token (defaults to NETZTRANSPARENZ_TOKEN env var).")
     parser.add_argument("--out", default="data/netztransparenz.parquet", help="Output parquet path.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds per request.")
@@ -444,10 +457,24 @@ def main():
             raise RuntimeError("No token provided. Set NETZTRANSPARENZ_TOKEN or NETZTRANSPARENZ_CLIENT_ID/NETZTRANSPARENZ_CLIENT_SECRET.")
         token = _fetch_token_from_client_credentials(client_id, client_secret)
 
+    start_utc = datetime.fromisoformat(args.start)
+    end_utc = datetime.fromisoformat(args.end)
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=timezone.utc)
+    else:
+        start_utc = start_utc.astimezone(timezone.utc)
+    if end_utc.tzinfo is None:
+        end_utc = end_utc.replace(tzinfo=timezone.utc)
+    else:
+        end_utc = end_utc.astimezone(timezone.utc)
+
+    start_local = start_utc.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%dT%H:%M:%S")
+    end_local = end_utc.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%dT%H:%M:%S")
+
     resample_every = None if str(args.resample).lower() == "none" else args.resample
     df = fetch_and_merge(
-        args.start,
-        args.end,
+        start_local,
+        end_local,
         token,
         timeout=args.timeout,
         chunk_days=args.chunk_days,
@@ -457,6 +484,13 @@ def main():
     if df.is_empty():
         LOGGER.warning("No data fetched.")
         return
+
+    # Sanitize output: UTC hourly and clip to requested window.
+    df = df.with_columns(pl.col("timestamp_utc").dt.truncate("1h").alias("timestamp_utc"))
+    df = df.filter(
+        (pl.col("timestamp_utc") >= pl.lit(start_utc).cast(pl.Datetime(time_unit="us", time_zone="UTC")))
+        & (pl.col("timestamp_utc") <= pl.lit(end_utc).cast(pl.Datetime(time_unit="us", time_zone="UTC")))
+    ).sort("timestamp_utc")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,7 @@ Fetch commodity prices (TTF gas, CO2, API2 coal) from Yahoo Finance and store as
 
 Usage:
     python -m ingestion.fetch_yfinance \
-        --start 2022-01-01 --end 2025-12-31 \
+        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out energy_trading/data/yfinance.parquet
 
 Outputs:
@@ -12,6 +12,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 from typing import Dict
 
@@ -20,6 +21,7 @@ import yfinance as yf
 
 # Monkey-patch Timestamp.utcnow to the recommended Timestamp.now('UTC') until yfinance/pandas switch.
 pd.Timestamp.utcnow = staticmethod(lambda: pd.Timestamp.now("UTC"))
+LOGGER = logging.getLogger(__name__)
 
 # Yahoo tickers (adjusted close):
 # - TTF gas: TTF=F
@@ -107,20 +109,27 @@ def upsample_daily_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch TTF gas, EUA CO2, and API2 coal prices from Yahoo Finance.")
-    parser.add_argument("--start", default="2022-01-01", help="Start date (YYYY-MM-DD).")
-    parser.add_argument("--end", default="2025-12-31", help="End date (YYYY-MM-DD).")
+    parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
+    parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument("--out", default="data/yfinance.parquet", help="Output parquet path.")
     parser.add_argument("--interval", default="1d", help="Yahoo interval (default 1d).")
     args = parser.parse_args()
 
-    df = fetch_prices(args.start, args.end, interval=args.interval)
+    start_dt = pd.to_datetime(args.start, utc=True)
+    end_dt = pd.to_datetime(args.end, utc=True)
+    # yfinance expects naive dates; use UTC dates without timezone.
+    df = fetch_prices(start_dt.tz_localize(None), end_dt.tz_localize(None), interval=args.interval)
     df = upsample_daily_to_hourly(df)
+    # Enforce UTC, hourly truncation, and clip
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.floor("1h")
+    df = df[(df["timestamp"] >= start_dt) & (df["timestamp"] <= end_dt)].sort_values("timestamp")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, compression="zstd", index=False)
-    print(f"Wrote {len(df)} rows to {out_path}")
+    LOGGER.info("Wrote %s rows to %s", len(df), out_path)
 
 
 if __name__ == "__main__":

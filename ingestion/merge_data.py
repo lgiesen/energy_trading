@@ -1,7 +1,11 @@
 """Merge all parquet files in the data directory on timestamp_utc into one table.
 
 Usage:
-    python -m ingestion.merge_data --data-dir data --out data/all_merged.parquet
+    python -m ingestion.merge_data \
+        --data-dir data \
+        --out data/all_data.parquet \
+        --clip-start 2020-12-01T00:00:00 \
+        --clip-end 2026-01-01T02:00:00
 
 Notes:
     - Prefers timestamp_utc if available.
@@ -10,10 +14,33 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 from typing import Iterable, List
 
 import polars as pl
+
+LOGGER = logging.getLogger(__name__)
+
+def _normalize_timestamp(df: pl.DataFrame, ts_col: str) -> pl.DataFrame:
+    """Normalize timestamp column to datetime[us, UTC] and truncate to hour."""
+    ts_dtype = df[ts_col].dtype
+    if ts_dtype == pl.Int64:
+        df = df.with_columns(pl.from_epoch(ts_col, time_unit="ms").alias(ts_col))
+    elif ts_dtype == pl.Utf8:
+        df = df.with_columns(pl.col(ts_col).str.strptime(pl.Datetime, strict=False).alias(ts_col))
+    elif isinstance(ts_dtype, pl.datatypes.Datetime):
+        df = df.with_columns(pl.col(ts_col).dt.cast_time_unit("us").alias(ts_col))
+
+    if df[ts_col].dtype == pl.Datetime:  # type: ignore[attr-defined]
+        tz = df[ts_col].dtype.time_zone  # type: ignore[attr-defined]
+        if tz is None:
+            df = df.with_columns(pl.col(ts_col).dt.replace_time_zone("UTC").alias(ts_col))
+        elif tz != "UTC":
+            df = df.with_columns(pl.col(ts_col).dt.convert_time_zone("UTC").alias(ts_col))
+    # Force strict hourly alignment to remove precision jitter.
+    df = df.with_columns(pl.col(ts_col).dt.truncate("1h").alias(ts_col))
+    return df
 
 
 def _load_and_normalize(path: Path, resample_freq: str | None) -> pl.DataFrame | None:
@@ -29,24 +56,12 @@ def _load_and_normalize(path: Path, resample_freq: str | None) -> pl.DataFrame |
         return None  # Skip files without a timestamp column.
 
     # Cast timestamp to datetime[us, UTC] to avoid join mismatches.
-    ts_dtype = df[ts_col].dtype
-    if ts_dtype == pl.Int64:
-        df = df.with_columns(pl.from_epoch(ts_col, time_unit="ms").alias(ts_col))
-    elif isinstance(ts_dtype, pl.datatypes.Datetime):
-        # Align units to microseconds for consistency.
-        df = df.with_columns(pl.col(ts_col).dt.cast_time_unit("us").alias(ts_col))
-    # Normalize timezone to UTC.
-    if df[ts_col].dtype == pl.Datetime:  # type: ignore[attr-defined]
-        tz = df[ts_col].dtype.time_zone  # type: ignore[attr-defined]
+    if ts_col == "timestamp_cet":
+        tz = df[ts_col].dtype.time_zone if isinstance(df[ts_col].dtype, pl.datatypes.Datetime) else None
         if tz is None:
-            # If timestamp_cet is naive, assume Europe/Berlin.
-            if ts_col == "timestamp_cet":
-                df = df.with_columns(pl.col(ts_col).dt.replace_time_zone("Europe/Berlin").alias(ts_col))
-                df = df.with_columns(pl.col(ts_col).dt.convert_time_zone("UTC").alias(ts_col))
-            else:
-                df = df.with_columns(pl.col(ts_col).dt.replace_time_zone("UTC").alias(ts_col))
-        elif tz != "UTC":
-            df = df.with_columns(pl.col(ts_col).dt.convert_time_zone("UTC").alias(ts_col))
+            df = df.with_columns(pl.col(ts_col).dt.replace_time_zone("Europe/Berlin").alias(ts_col))
+        df = df.with_columns(pl.col(ts_col).dt.convert_time_zone("UTC").alias(ts_col))
+    df = _normalize_timestamp(df, ts_col)
 
     # Rename to canonical and drop other timestamp columns.
     if ts_col != "timestamp":
@@ -78,18 +93,23 @@ def _resample_to_freq(df: pl.DataFrame, freq: str) -> pl.DataFrame:
     return df.group_by("timestamp").agg(aggs).sort("timestamp")
 
 
-def merge_all(parquet_paths: Iterable[Path], resample_freq: str | None) -> pl.DataFrame:
+def merge_all(
+    parquet_paths: Iterable[Path],
+    resample_freq: str | None,
+    clip_start: str | None,
+    clip_end: str | None,
+) -> pl.DataFrame:
     """Full-join all provided parquet files on timestamp."""
     merged: pl.DataFrame | None = None
     for path in parquet_paths:
         df = _load_and_normalize(path, resample_freq)
         if df is None:
-            print(f"Skipping {path.name}: no timestamp column.")
+            LOGGER.warning("Skipping %s: no timestamp column.", path.name)
             continue
 
         if merged is None:
             merged = df
-            print(f"Seeded merge with {path.name} ({len(df)} rows).")
+            LOGGER.info("Seeded merge with %s (%s rows).", path.name, len(df))
             continue
 
         # Avoid column name collisions (other than timestamp) by suffixing with file stem.
@@ -98,26 +118,64 @@ def merge_all(parquet_paths: Iterable[Path], resample_freq: str | None) -> pl.Da
             df = df.rename({col: f"{col}_{path.stem}" for col in overlap})
 
         merged = merged.join(df, on="timestamp", how="full", suffix=f"_{path.stem}")
-        # Older Polars may emit a timestamp_right column; drop it if present.
+        # Coalesce any timestamp_right into timestamp, then drop.
         if "timestamp_right" in merged.columns:
-            merged = merged.drop("timestamp_right")
-        print(f"Merged {path.name} -> {len(merged)} rows.")
+            merged = merged.with_columns(
+                pl.coalesce(["timestamp", "timestamp_right"]).alias("timestamp")
+            ).drop("timestamp_right")
+        LOGGER.info("Merged %s -> %s rows.", path.name, len(merged))
 
     if merged is None:
         raise RuntimeError("No parquet files with a timestamp column were merged.")
 
-    return merged.sort("timestamp")
+    merged = merged.sort("timestamp")
+    if clip_start:
+        start_dt = (
+            pl.Series([clip_start])
+            .str.to_datetime(time_zone="Europe/Berlin")
+            .dt.convert_time_zone("UTC")[0]
+        )
+        merged = merged.filter(pl.col("timestamp") >= pl.lit(start_dt))
+    if clip_end:
+        end_dt = (
+            pl.Series([clip_end])
+            .str.to_datetime(time_zone="Europe/Berlin")
+            .dt.convert_time_zone("UTC")[0]
+        )
+        merged = merged.filter(pl.col("timestamp") <= pl.lit(end_dt))
+    # Keep only canonical UTC and CET timestamps in final output.
+    merged = merged.with_columns(
+        pl.col("timestamp").alias("timestamp_utc"),
+        pl.col("timestamp").dt.convert_time_zone("Europe/Berlin").alias("timestamp_cet"),
+    )
+    # Drop all other timestamp-like columns and the raw join key.
+    drop_ts = [c for c in merged.columns if c.startswith("timestamp_") and c not in {"timestamp_utc", "timestamp_cet"}]
+    if drop_ts:
+        merged = merged.drop(drop_ts)
+    merged = merged.drop("timestamp")
+    return merged
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Merge all parquet files in the data directory on timestamp.")
-    parser.add_argument("--data-dir", default="data", help="Directory containing parquet files to merge (default: data).")
-    parser.add_argument("--out", default="data/all_merged.parquet", help="Output parquet path.")
+    parser.add_argument(
+        "--data-dir",
+        default=str(Path(__file__).resolve().parents[1] / "data"),
+        help="Directory containing parquet files to merge (default: energy_trading/data).",
+    )
+    parser.add_argument(
+        "--out",
+        default=str(Path(__file__).resolve().parents[1] / "data" / "all_merged.parquet"),
+        help="Output parquet path.",
+    )
     parser.add_argument(
         "--resample-freq",
         default="1h",
         help="Optional resample frequency before merge (default: 1h). Use '' to disable.",
     )
+    parser.add_argument("--clip-start", default="", help="Optional CET start timestamp (e.g. 2022-01-01T00:00:00).")
+    parser.add_argument("--clip-end", default="", help="Optional CET end timestamp (e.g. 2025-12-31T00:00:00).")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -132,11 +190,13 @@ def main():
         raise FileNotFoundError(f"No parquet files found in {data_dir}")
 
     resample_freq = args.resample_freq.strip() if args.resample_freq else ""
-    merged = merge_all(parquet_paths, resample_freq or None)
+    clip_start = args.clip_start.strip() or None
+    clip_end = args.clip_end.strip() or None
+    merged = merge_all(parquet_paths, resample_freq or None, clip_start, clip_end)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged.write_parquet(out_path, compression="zstd")
-    print(f"Wrote {len(merged)} rows to {out_path}")
+    LOGGER.info("Wrote %s rows to %s", len(merged), out_path)
 
 
 if __name__ == "__main__":
