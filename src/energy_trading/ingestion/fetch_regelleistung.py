@@ -435,6 +435,14 @@ def fetch_and_parse_regelleistung(
             new_cols.append(f"{val_cols[orig_metric]}_{direction}")
         df_pivot.columns = new_cols
 
+        # Drop marginal activation price columns if present.
+        drop_cols = [
+            c for c in df_pivot.columns
+            if c in {"afrr_activation_price_pos", "afrr_activation_price_neg"}
+        ]
+        if drop_cols:
+            df_pivot = df_pivot.drop(columns=drop_cols)
+
         if net_series is not None:
             df_pivot = df_pivot.join(net_series, how="left")
 

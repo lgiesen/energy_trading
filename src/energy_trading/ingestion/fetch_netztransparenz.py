@@ -11,7 +11,8 @@ Includes:
     - NRV-Saldo (NRV_balance)
     - reBAP (reBAP_shortage_surplus)
     - aFRR/mFRR activated volumes (afrr_activated_mw_*, mfrr_activated_mw_*)
-    - hourly energy totals (afrr_activated_mwh, mfrr_activated_mwh)
+    - hourly energy totals (afrr_activated_mwh_*, mfrr_activated_mwh_*)
+    - total activated volumes (activated_volume_*_mw/mwh)
     - RZ-Saldo (rz_saldo_mw + per-TSO columns)
 """
 from __future__ import annotations
@@ -29,6 +30,7 @@ import requests
 from dotenv import load_dotenv
 import logging
 LOGGER = logging.getLogger(__name__)
+
 
 def _load_env():
     """Load .env by walking up the tree (also checking an energy_trading/ folder)."""
@@ -102,6 +104,38 @@ def _normalize_cols(df: pl.DataFrame) -> pl.DataFrame:
     mapping_lower = {c: c.lower() for c in df.columns}
     df = df.rename(mapping_lower)
     return df
+
+
+def _find_region_col(df: pl.DataFrame) -> str | None:
+    candidates = [
+        "regelzone",
+        "netzregelverbund",
+        "gebiet",
+        "region",
+        "tso",
+        "uebertragungsnetzbetreiber",
+        "bilanz",
+    ]
+    for c in df.columns:
+        for needle in candidates:
+            if needle in c:
+                return c
+    return None
+
+
+def _select_germany_rows(df: pl.DataFrame, region_col: str) -> tuple[pl.DataFrame, str | None]:
+    # Prefer aggregated Germany row if present.
+    keywords = ["deutschland", "netzregelverbund", "igcc"]
+    pattern = "|".join(keywords)
+    try:
+        matches = df.filter(pl.col(region_col).cast(pl.Utf8).str.contains(pattern, case=False, literal=False))
+    except Exception:
+        return df, None
+    if matches.height == 0:
+        return df, None
+    label = matches.select(pl.col(region_col).cast(pl.Utf8)).unique().to_series().to_list()
+    selected = label[0] if label else None
+    return matches, selected
 
 
 def _tidy_nrv(df: pl.DataFrame) -> pl.DataFrame:
@@ -222,21 +256,25 @@ def _tidy_rz_saldo(df: pl.DataFrame) -> pl.DataFrame:
     return cleaned.select(["timestamp_utc"] + tso_cols).with_columns(total.alias("rz_saldo_mw"))
 
 
-def _tidy_afrr_activation(df: pl.DataFrame) -> pl.DataFrame:
-    """Parse Aktivierte SRL (aFRR) volumes."""
+def _tidy_activation(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
     df = _normalize_cols(df)
     date_col = "datum" if "datum" in df.columns else df.columns[0]
     time_col = "von" if "von" in df.columns else df.columns[1]
+    region_col = _find_region_col(df)
     ts = (
         pl.concat_str([pl.col(date_col), pl.lit(" "), pl.col(time_col)])
         .str.to_datetime("%d.%m.%Y %H:%M", strict=False)
         .dt.replace_time_zone("UTC")
         .alias("timestamp_utc")
     )
-    pos_col = next((c for c in df.columns if "positiv" in c.lower()), None)
-    neg_col = next((c for c in df.columns if "negativ" in c.lower()), None)
-    if not pos_col or not neg_col:
-        raise RuntimeError("Could not find positive/negative columns in Aktivierte SRL payload.")
+    meta_cols = {date_col, time_col, "zeitzone"}
+    if region_col:
+        meta_cols = meta_cols | {region_col}
+    pos_cols = [c for c in df.columns if "positiv" in c and c not in meta_cols]
+    neg_cols = [c for c in df.columns if "negativ" in c and c not in meta_cols]
+    if not pos_cols or not neg_cols:
+        raise RuntimeError(f"Could not find positive/negative columns in {prefix} payload.")
+
     def _clean_num(col: str) -> pl.Expr:
         return (
             pl.col(col)
@@ -245,53 +283,20 @@ def _tidy_afrr_activation(df: pl.DataFrame) -> pl.DataFrame:
             .str.replace(",", ".")
             .cast(pl.Float64, strict=False)
         )
-    clean = (
-        df.with_columns(
-            [
-                ts,
-                _clean_num(pos_col).alias("afrr_activated_mw_pos"),
-                _clean_num(neg_col).alias("afrr_activated_mw_neg"),
-            ]
-        )
-        .select(["timestamp_utc", "afrr_activated_mw_pos", "afrr_activated_mw_neg"])
-    )
-    return clean
 
+    clean = df.with_columns([ts] + [_clean_num(c).alias(c) for c in (pos_cols + neg_cols)])
+    selected_region = None
+    if region_col:
+        clean, selected_region = _select_germany_rows(clean, region_col)
+    if selected_region:
+        LOGGER.info("Selected region '%s' for %s aggregation.", selected_region, prefix)
 
-def _tidy_mfrr_activation(df: pl.DataFrame) -> pl.DataFrame:
-    """Parse Aktivierte MRL (mFRR) volumes."""
-    df = _normalize_cols(df)
-    date_col = "datum" if "datum" in df.columns else df.columns[0]
-    time_col = "von" if "von" in df.columns else df.columns[1]
-    ts = (
-        pl.concat_str([pl.col(date_col), pl.lit(" "), pl.col(time_col)])
-        .str.to_datetime("%d.%m.%Y %H:%M", strict=False)
-        .dt.replace_time_zone("UTC")
-        .alias("timestamp_utc")
-    )
-    pos_col = next((c for c in df.columns if "positiv" in c.lower()), None)
-    neg_col = next((c for c in df.columns if "negativ" in c.lower()), None)
-    if not pos_col or not neg_col:
-        raise RuntimeError("Could not find positive/negative columns in Aktivierte MRL payload.")
-    def _clean_num(col: str) -> pl.Expr:
-        return (
-            pl.col(col)
-            .cast(pl.Utf8)
-            .str.replace(".", "")
-            .str.replace(",", ".")
-            .cast(pl.Float64, strict=False)
-        )
-    clean = (
-        df.with_columns(
-            [
-                ts,
-                _clean_num(pos_col).alias("mfrr_activated_mw_pos"),
-                _clean_num(neg_col).alias("mfrr_activated_mw_neg"),
-            ]
-        )
-        .select(["timestamp_utc", "mfrr_activated_mw_pos", "mfrr_activated_mw_neg"])
-    )
-    return clean
+    clean = clean.with_columns(
+        pl.sum_horizontal([pl.col(c) for c in pos_cols]).alias(f"{prefix}_mw_pos"),
+        pl.sum_horizontal([pl.col(c) for c in neg_cols]).alias(f"{prefix}_mw_neg"),
+    ).select(["timestamp_utc", f"{prefix}_mw_pos", f"{prefix}_mw_neg"])
+    return clean.sort("timestamp_utc")
+
 
 def _chunk_range(start: datetime, end: datetime, days: int):
     cur = start
@@ -299,21 +304,6 @@ def _chunk_range(start: datetime, end: datetime, days: int):
         nxt = min(cur + timedelta(days=days), end)
         yield cur, nxt
         cur = nxt
-
-
-def _resample(df: pl.DataFrame, every: str = "1h") -> pl.DataFrame:
-    if df.is_empty() or "timestamp_utc" not in df.columns:
-        return df
-    numeric_cols = [c for c, t in zip(df.columns, df.dtypes) if t.is_numeric()]
-    if not numeric_cols:
-        return df
-    agg_exprs = [pl.col(c).mean().alias(c) for c in numeric_cols]
-    return (
-        df.sort("timestamp_utc")
-        .group_by_dynamic("timestamp_utc", every=every, closed="left", label="left")
-        .agg(agg_exprs)
-        .sort("timestamp_utc")
-    )
 
 
 def fetch_and_merge(
@@ -345,8 +335,8 @@ def fetch_and_merge(
             nrv_df = _tidy_nrv(_read_csv(_fetch_csv(urls["nrv"], session, timeout=timeout)))
             rebap_df = _tidy_rebap(_read_csv(_fetch_csv(urls["rebap"], session, timeout=timeout)))
             rz_df = _tidy_rz_saldo(_read_csv(_fetch_csv(urls["rz"], session, timeout=timeout)))
-            afrr_df = _tidy_afrr_activation(_read_csv(_fetch_csv(urls["afrr"], session, timeout=timeout)))
-            mfrr_df = _tidy_mfrr_activation(_read_csv(_fetch_csv(urls["mfrr"], session, timeout=timeout)))
+            afrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["afrr"], session, timeout=timeout)), "afrr_activated")
+            mfrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["mfrr"], session, timeout=timeout)), "mfrr_activated")
             merged = (
                 nrv_df.join(rebap_df, on="timestamp_utc", how="full", coalesce=True)
                 .join(rz_df, on="timestamp_utc", how="full", coalesce=True)
@@ -408,28 +398,58 @@ def fetch_and_merge(
 
     # Keep only one datetime column for merging; drop redundant date/time fields if present.
     merged = merged.drop([c for c in ("Datum", "Zeitzone", "time", "datum", "zeitzone") if c in merged.columns])
-    # Alias for imbalance
     if "nrv_imbalance" in merged.columns and "NRV_balance" in merged.columns:
-        # Drop legacy alias; NRV_balance is the canonical column.
         merged = merged.drop("nrv_imbalance")
-    # Backward-compatible aliases for aFRR activated volumes
-    if "afrr_activated_mw_pos" in merged.columns and "activated_volume_pos_mw" not in merged.columns:
-        merged = merged.with_columns(pl.col("afrr_activated_mw_pos").alias("activated_volume_pos_mw"))
-    if "afrr_activated_mw_neg" in merged.columns and "activated_volume_neg_mw" not in merged.columns:
-        merged = merged.with_columns(pl.col("afrr_activated_mw_neg").alias("activated_volume_neg_mw"))
 
     if resample_every:
-        merged = _resample(merged, every=resample_every)
-        # Convert mean MW over the hour into hourly MWh (numerically identical for 1h)
-        if "afrr_activated_mw_pos" in merged.columns or "afrr_activated_mw_neg" in merged.columns:
+        # 15-min MW -> hourly mean MW; MWh = MW * 0.25 summed per hour.
+        mw_cols = [
+            "afrr_activated_mw_pos",
+            "afrr_activated_mw_neg",
+            "mfrr_activated_mw_pos",
+            "mfrr_activated_mw_neg",
+        ]
+        for col in mw_cols:
+            if col in merged.columns:
+                merged = merged.with_columns((pl.col(col) * 0.25).alias(col.replace("_mw_", "_mwh_")))
+
+        mwh_cols = [c for c in merged.columns if c.endswith("_mwh_pos") or c.endswith("_mwh_neg")]
+        other_numeric = [c for c, t in zip(merged.columns, merged.dtypes) if t.is_numeric() and c not in mwh_cols]
+
+        agg_exprs = []
+        if other_numeric:
+            agg_exprs.append(pl.col(other_numeric).mean())
+        if mwh_cols:
+            agg_exprs.append(pl.col(mwh_cols).sum())
+        merged = (
+            merged.sort("timestamp_utc")
+            .group_by_dynamic("timestamp_utc", every=resample_every, closed="left", label="left")
+            .agg(agg_exprs)
+            .sort("timestamp_utc")
+        )
+
+        # Total activated volume (MW + MWh)
+        if "afrr_activated_mw_pos" in merged.columns:
             merged = merged.with_columns(
-                (pl.col("afrr_activated_mw_pos").fill_null(0) + pl.col("afrr_activated_mw_neg").fill_null(0))
-                .alias("afrr_activated_mwh")
+                (
+                    pl.col("afrr_activated_mw_pos").fill_null(0.0)
+                    + pl.col("mfrr_activated_mw_pos").fill_null(0.0)
+                ).alias("activated_volume_pos_mw"),
+                (
+                    pl.col("afrr_activated_mw_neg").fill_null(0.0)
+                    + pl.col("mfrr_activated_mw_neg").fill_null(0.0)
+                ).alias("activated_volume_neg_mw"),
             )
-        if "mfrr_activated_mw_pos" in merged.columns or "mfrr_activated_mw_neg" in merged.columns:
+        if "afrr_activated_mwh_pos" in merged.columns:
             merged = merged.with_columns(
-                (pl.col("mfrr_activated_mw_pos").fill_null(0) + pl.col("mfrr_activated_mw_neg").fill_null(0))
-                .alias("mfrr_activated_mwh")
+                (
+                    pl.col("afrr_activated_mwh_pos").fill_null(0.0)
+                    + pl.col("mfrr_activated_mwh_pos").fill_null(0.0)
+                ).alias("activated_volume_pos_mwh"),
+                (
+                    pl.col("afrr_activated_mwh_neg").fill_null(0.0)
+                    + pl.col("mfrr_activated_mwh_neg").fill_null(0.0)
+                ).alias("activated_volume_neg_mwh"),
             )
 
     return merged
@@ -491,6 +511,29 @@ def main():
         (pl.col("timestamp_utc") >= pl.lit(start_utc).cast(pl.Datetime(time_unit="us", time_zone="UTC")))
         & (pl.col("timestamp_utc") <= pl.lit(end_utc).cast(pl.Datetime(time_unit="us", time_zone="UTC")))
     ).sort("timestamp_utc")
+
+    # Data quality: null/zero counts (including nulls filled as 0.0 in activated_volume).
+    cols_to_audit = [
+        "afrr_activated_mw_pos",
+        "afrr_activated_mw_neg",
+        "mfrr_activated_mw_pos",
+        "mfrr_activated_mw_neg",
+        "activated_volume_pos_mw",
+        "activated_volume_neg_mw",
+    ]
+    for col in cols_to_audit:
+        if col in df.columns:
+            nulls = df.select(pl.col(col).is_null().sum()).item()
+            zeros = df.select((pl.col(col) == 0).sum()).item()
+            LOGGER.info("Data quality %s: nulls=%s zeros=%s", col, nulls, zeros)
+    if "mfrr_activated_mw_pos" in df.columns and "mfrr_activated_mw_neg" in df.columns:
+        mfrr_pos_nulls = df.select(pl.col("mfrr_activated_mw_pos").is_null().sum()).item()
+        mfrr_neg_nulls = df.select(pl.col("mfrr_activated_mw_neg").is_null().sum()).item()
+        LOGGER.info(
+            "Filled-as-zero in activated_volume from mFRR nulls: pos=%s neg=%s",
+            mfrr_pos_nulls,
+            mfrr_neg_nulls,
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

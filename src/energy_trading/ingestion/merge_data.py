@@ -4,7 +4,7 @@ Usage:
     python -m energy_trading.ingestion.merge_data \
         --data-dir data/raw \
         --out data/processed/all_data.parquet \
-        --clip-start 2020-12-01T00:00:00 \
+        --clip-start 2020-11-30T23:00:00 \
         --clip-end 2026-01-01T02:00:00
 
 Notes:
@@ -43,6 +43,20 @@ def _normalize_timestamp(df: pl.DataFrame, ts_col: str) -> pl.DataFrame:
     return df
 
 
+def _drop_nulls_and_dedup(df: pl.DataFrame, ts_col: str, label: str) -> pl.DataFrame:
+    """Drop null timestamps and de-duplicate by timestamp, logging any removals."""
+    null_count = df.filter(pl.col(ts_col).is_null()).height
+    if null_count:
+        LOGGER.warning("Dropping %s rows with null %s in %s.", null_count, ts_col, label)
+        df = df.filter(pl.col(ts_col).is_not_null())
+
+    dupes = df.select(pl.col(ts_col).is_duplicated().sum()).item()
+    if dupes:
+        LOGGER.warning("Dropping %s duplicate %s values in %s.", dupes, ts_col, label)
+        df = df.unique(subset=[ts_col], keep="last")
+    return df
+
+
 def _load_and_normalize(path: Path, resample_freq: str | None) -> pl.DataFrame | None:
     """Load a parquet and normalize its timestamp column name and type."""
     df = pl.read_parquet(path)
@@ -62,6 +76,7 @@ def _load_and_normalize(path: Path, resample_freq: str | None) -> pl.DataFrame |
             df = df.with_columns(pl.col(ts_col).dt.replace_time_zone("Europe/Berlin").alias(ts_col))
         df = df.with_columns(pl.col(ts_col).dt.convert_time_zone("UTC").alias(ts_col))
     df = _normalize_timestamp(df, ts_col)
+    df = _drop_nulls_and_dedup(df, ts_col, path.name)
 
     # Rename to canonical and drop other timestamp columns.
     if ts_col != "timestamp":
@@ -73,6 +88,7 @@ def _load_and_normalize(path: Path, resample_freq: str | None) -> pl.DataFrame |
         df = df.drop(drop_cols)
     if resample_freq:
         df = _resample_to_freq(df, resample_freq)
+        df = _drop_nulls_and_dedup(df, "timestamp", f"{path.name} (resampled)")
     return df
 
 
@@ -129,6 +145,7 @@ def merge_all(
         raise RuntimeError("No parquet files with a timestamp column were merged.")
 
     merged = merged.sort("timestamp")
+    merged = _drop_nulls_and_dedup(merged, "timestamp", "merged output")
     if clip_start:
         start_dt = (
             pl.Series([clip_start])

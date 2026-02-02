@@ -45,8 +45,7 @@ INTRADAY_PRICE_FILTER_ID = 4996  # Intraday trading (quarter-hour)
 
 # SMARD module IDs for non-price series.
 DATA_MODULES: Dict[str, int] = {
-    # Actuals
-    "load_actual": 410,
+    # Actuals (load_actual dropped; sourced from ENTSO-E)
     "residual_load_actual": 4359,
     "wind_onshore_actual": 4067,
     "wind_offshore_actual": 1225,

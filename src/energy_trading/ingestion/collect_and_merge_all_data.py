@@ -1,5 +1,8 @@
 """Collect all data sources and merge them into one parquet.
 
+Usage:
+    ./.venv/bin/python scripts/collect_and_merge_all_data.py --start 2020-11-30T23:00:00Z --end 2026-01-01T02:00:00Z
+
 Runs:
 - ENTSO-E
 - Day-ahead prices (Energy Charts)
@@ -11,11 +14,10 @@ Runs:
 from __future__ import annotations
 
 import argparse
+import logging
 import subprocess
 import sys
-import logging
 from pathlib import Path
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -28,15 +30,16 @@ def run(cmd: list[str]):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch all datasets and merge in one go.")
-    parser.add_argument("--start", default="2020-12-01T00:00:00Z", help="Start date (UTC ISO8601).")
+    parser.add_argument("--start", default="2020-11-30T23:00:00Z", help="Start date (UTC ISO8601).")
     parser.add_argument("--end", default="2026-01-01T02:00:00Z", help="End date (UTC ISO8601).")
     parser.add_argument("--out-dir", default="data/raw", help="Output directory for individual parquets.")
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
-    parser.add_argument("--entsoe-timeout", dest="entsoe_timeout", type=int, default=120, help="ENTSO-E HTTP timeout seconds (default 120).")
-    parser.add_argument("--entsoe-chunk-days", dest="entsoe_chunk_days", type=int, default=90, help="ENTSO-E chunk size in days to avoid timeouts (default 90).")
-    parser.add_argument("--entsoe-chunk-sleep", dest="entsoe_chunk_sleep", type=float, default=1.0, help="Sleep seconds between ENTSO-E chunks (default 1.0).")
+    # Kept for backward compatibility but ignored by fetch_entsoe (no chunk/timeout CLI).
+    parser.add_argument("--entsoe-timeout", dest="entsoe_timeout", type=int, default=120, help="(unused) ENTSO-E HTTP timeout seconds.")
+    parser.add_argument("--entsoe-chunk-days", dest="entsoe_chunk_days", type=int, default=90, help="(unused) ENTSO-E chunk size in days.")
+    parser.add_argument("--entsoe-chunk-sleep", dest="entsoe_chunk_sleep", type=float, default=1.0, help="(unused) Sleep seconds between ENTSO-E chunks.")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -49,15 +52,12 @@ def main():
         py, "-m", "energy_trading.ingestion.fetch_entsoe",
         "--start", args.start,
         "--end", args.end,
-        "--timeout", str(args.entsoe_timeout),
-        "--chunk-days", str(args.entsoe_chunk_days),
-        "--chunk-sleep", str(args.entsoe_chunk_sleep),
         "--out", str(out_dir / "entsoe.parquet"),
     ])
 
     # Day-ahead prices
     run([
-        py, "-m", "energy_trading.ingestion.fetch_energy_charts_prices",
+        py, "-m", "energy_trading.ingestion.fetch_energy_charts",
         "--start", args.start,
         "--end", args.end,
         "--out", str(out_dir / "energy_charts.parquet"),

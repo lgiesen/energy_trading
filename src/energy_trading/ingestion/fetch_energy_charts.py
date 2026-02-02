@@ -31,7 +31,7 @@ NEIGHBOR_BZN = [
     "DK2",
     "FR",
     "NL",
-    "NO2",
+    # Dropped: da_price_NO2 has ~11.85% nulls, unusable for this project.
     "PL",
     "SE4",
 ]
