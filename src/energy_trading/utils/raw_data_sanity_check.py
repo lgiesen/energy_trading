@@ -1,6 +1,9 @@
 """
 Sanity Check Script for Energy Trading Data.
 Validates 'data/processed/all_data.parquet' against physical and market reality.
+
+Usage: 
+    ./.venv/bin/python -m energy_trading.utils.raw_data_sanity_check
 """
 
 import logging
