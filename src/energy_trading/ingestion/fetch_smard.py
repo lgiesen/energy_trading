@@ -1,7 +1,7 @@
 """Fetch SMARD load/generation/price series and store them in one parquet file.
 
 Usage:
-    python -m energy_trading.ingestion.fetch_smard \
+    ./.venv/bin/python -m energy_trading.ingestion.fetch_smard \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/smard.parquet
 
@@ -403,12 +403,6 @@ def fetch_smard(
         )
         merged = merged.join(intraday_hourly, on="timestamp", how="full", coalesce=True)
         LOGGER.info("Fetched %s rows for price_intraday_eur.", len(intraday_hourly))
-    # Fill missing intraday prices with day-ahead prices to avoid backtest gaps.
-    if "price_intraday_eur" in merged.columns and "da_price_eur" in merged.columns:
-        merged = merged.with_columns(
-            pl.col("price_intraday_eur").fill_null(pl.col("da_price_eur")).alias("price_intraday_eur")
-        )
-
     merged = merged.sort("timestamp")
     # Enforce strict hourly alignment and clip to requested UTC window.
     merged = merged.with_columns(pl.col("timestamp").dt.truncate("1h").alias("timestamp"))
@@ -536,6 +530,9 @@ def main() -> None:
     df = fetch_smard(start_dt, end_dt, region=args.region, resolution=args.resolution)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Drop SMARD load duplicate if it exists (we use ENTSO-E load_actual).
+    if "load_actual_smard" in df.columns:
+        df = df.drop("load_actual_smard")
     df.write_parquet(out_path, compression="zstd")
 
 

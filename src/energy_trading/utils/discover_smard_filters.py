@@ -1,14 +1,14 @@
 """Discover SMARD filter IDs for a given region/resolution.
 
 Usage:
-    python -m energy_trading.utils.discover_smard_filters \
+    ./.venv/bin/python -m energy_trading.utils.discover_smard_filters \
         --region DE-LU --resolution quarterhour \
         --start-id 1 --end-id 20000
 
-    python -m energy_trading.utils.discover_smard_filters \
+    ./.venv/bin/python -m energy_trading.utils.discover_smard_filters \
         --search Steinkohle --resolution quarterhour
 
-    python -m energy_trading.utils.discover_smard_filters \
+    ./.venv/bin/python -m energy_trading.utils.discover_smard_filters \
         --region DE-LU --resolution quarterhour \
         --ids 4169,715,716,717
 

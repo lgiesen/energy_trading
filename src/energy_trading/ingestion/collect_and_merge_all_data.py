@@ -82,13 +82,13 @@ def main():
             "--out", str(out_dir / "smard.parquet"),
         ])
 
-    # yfinance commodities
+    # yfinance commodities (write to yfinance.parquet)
     if not args.skip_commodities:
         run([
             py, "-m", "energy_trading.ingestion.fetch_yfinance",
             "--start", args.start,
             "--end", args.end,
-            "--out", str(out_dir / "commodities.parquet"),
+            "--out", str(out_dir / "yfinance.parquet"),
         ])
 
     # Regelleistung aFRR (hourly, includes net import/export + MOL slope)

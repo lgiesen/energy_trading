@@ -1,7 +1,7 @@
 """Fetch ENTSO-E load and outage data for Germany (DE_LU) using entsoe-py.
 
 Usage:
-    python -m energy_trading.ingestion.fetch_entsoe \
+    ./.venv/bin/python -m energy_trading.ingestion.fetch_entsoe \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/entsoe.parquet
 

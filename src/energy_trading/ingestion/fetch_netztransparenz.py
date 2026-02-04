@@ -1,8 +1,10 @@
 """
 Usage:
-    python -m energy_trading.ingestion.fetch_netztransparenz \
+    ./.venv/bin/python -m energy_trading.ingestion.fetch_netztransparenz \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+        --chunk-days 30 --chunk-sleep 3 \
         --out data/raw/netztransparenz.parquet
+
 
 Outputs:
     - netztransparenz.parquet with hourly data aligned on timestamp_utc.
@@ -12,24 +14,31 @@ Includes:
     - reBAP (reBAP_shortage_surplus)
     - aFRR/mFRR activated volumes (afrr_activated_mw_*, mfrr_activated_mw_*)
     - hourly energy totals (afrr_activated_mwh_*, mfrr_activated_mwh_*)
-    - total activated volumes (activated_volume_*_mw/mwh)
     - RZ-Saldo (rz_saldo_mw + per-TSO columns)
 """
 from __future__ import annotations
 
 import argparse
 import io
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from pathlib import Path
+from typing import Iterable, List, Tuple
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import requests
 from dotenv import load_dotenv
-import logging
+
 LOGGER = logging.getLogger(__name__)
+
+# SMARD fallback for RZ saldo
+SMARD_BASE_URL = "https://www.smard.de/app/chart_data"
+SMARD_RZ_SALDO_ID = 37  # Regelzonensaldo (Netto)
+SMARD_REGIONS = ["DE", "DE-LU"]
+SMARD_RESOLUTION = "hour"
 
 
 def _load_env():
@@ -72,18 +81,35 @@ def _fetch_token_from_client_credentials(client_id: str, client_secret: str) -> 
 
 def _make_session(token: str) -> requests.Session:
     s = requests.Session()
-    s.headers.update({"Authorization": _ensure_bearer(token)})
+    s.headers.update({
+        "Authorization": _ensure_bearer(token),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/91.0.4472.124 Safari/537.36"
+        ),
+    })
     return s
 
 
-def _fetch_csv(url: str, session: requests.Session, timeout: int = 60) -> str:
-    resp = session.get(url, timeout=timeout)
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as exc:
-        detail = resp.text[:500] if resp.text else "no response body"
-        raise RuntimeError(f"Netztransparenz request failed ({resp.status_code}): {detail}") from exc
-    return resp.text
+def _fetch_csv(url: str, session: requests.Session, timeout: int = 60, retries: int = 3, retry_sleep: float = 10.0) -> str:
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = session.get(url, timeout=timeout)
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as exc:
+                detail = resp.text[:500] if resp.text else "no response body"
+                raise RuntimeError(f"Netztransparenz request failed ({resp.status_code}): {detail}") from exc
+            return resp.text
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(retry_sleep)
+            else:
+                raise
+    raise last_exc  # pragma: no cover
 
 
 def _read_csv(text: str) -> pl.DataFrame:
@@ -95,6 +121,71 @@ def _read_csv(text: str) -> pl.DataFrame:
         infer_schema_length=2000,
         quote_char=None,
     )
+
+
+def _smard_available_timestamps(filter_id: int, region: str, resolution: str, session: requests.Session) -> List[int]:
+    url = f"{SMARD_BASE_URL}/{filter_id}/{region}/index_{resolution}.json"
+    resp = session.get(url, timeout=30)
+    if resp.status_code == 404:
+        return []
+    resp.raise_for_status()
+    return sorted(resp.json().get("timestamps", []))
+
+
+def _smard_fetch_chunk(filter_id: int, region: str, resolution: str, ts: int, session: requests.Session) -> List[Tuple[int, float]]:
+    filename = f"{filter_id}_{region}_{resolution}_{ts}.json"
+    url = f"{SMARD_BASE_URL}/{filter_id}/{region}/{filename}"
+    resp = session.get(url, timeout=30)
+    if resp.status_code == 404:
+        return []
+    resp.raise_for_status()
+    payload = resp.json()
+    return [(int(k), float(v)) for k, v in payload.get("series", [])]
+
+
+def _smard_series_to_frame(
+    name: str,
+    series_data: Iterable[Tuple[int, float]],
+    start_ms: int,
+    end_ms: int,
+) -> pl.DataFrame:
+    df = pl.DataFrame(series_data, schema=[("timestamp_ms", pl.Int64), (name, pl.Float64)], orient="row")
+    df = (
+        df.filter((pl.col("timestamp_ms") >= start_ms) & (pl.col("timestamp_ms") <= end_ms))
+        .with_columns(pl.from_epoch("timestamp_ms", time_unit="ms").alias("timestamp_utc"))
+        .with_columns(pl.col("timestamp_utc").dt.replace_time_zone("UTC"))
+        .drop("timestamp_ms")
+        .with_columns(pl.col("timestamp_utc").dt.truncate("1h").alias("timestamp_utc"))
+        .group_by("timestamp_utc")
+        .agg(pl.col(name).mean())
+    )
+    return df
+
+
+def fetch_smard_saldo(start_utc: datetime, end_utc: datetime) -> pl.DataFrame:
+    """Fetch RZ saldo from SMARD and return timestamp_utc + rz_saldo_mw."""
+    session = requests.Session()
+    start_ms = int(start_utc.timestamp() * 1000)
+    end_ms = int(end_utc.timestamp() * 1000)
+    cutoff_ms = start_ms
+
+    records: List[Tuple[int, float]] = []
+    for region in SMARD_REGIONS:
+        timestamps = _smard_available_timestamps(SMARD_RZ_SALDO_ID, region, SMARD_RESOLUTION, session)
+        relevant = [ts for ts in timestamps if ts >= cutoff_ms]
+        if not relevant:
+            continue
+        for ts in relevant:
+            try:
+                records.extend(_smard_fetch_chunk(SMARD_RZ_SALDO_ID, region, SMARD_RESOLUTION, ts, session))
+            except requests.HTTPError as exc:
+                LOGGER.warning("SMARD RZ saldo chunk %s failed (%s).", ts, exc)
+        if records:
+            break
+
+    if not records:
+        return pl.DataFrame()
+    return _smard_series_to_frame("rz_saldo_mw", records, start_ms, end_ms)
 
 
 def _normalize_cols(df: pl.DataFrame) -> pl.DataFrame:
@@ -320,10 +411,14 @@ def fetch_and_merge(
     start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
     end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
 
+    def _fmt_dt(dt: datetime) -> str:
+        # Netztransparenz expects UTC timestamps like 2020-12-01T00:00Z
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+
     frames = []
-    def _fetch_chunk_data(s_dt: datetime, e_dt: datetime) -> pl.DataFrame | None:
-        s_str = s_dt.isoformat(timespec="minutes")
-        e_str = e_dt.isoformat(timespec="minutes")
+    def _fetch_chunk_data(s_dt: datetime, e_dt: datetime, retries: int = 2) -> pl.DataFrame | None:
+        s_str = _fmt_dt(s_dt)
+        e_str = _fmt_dt(e_dt)
         urls = {
             "nrv": f"{base_url}/NrvSaldo/NRVSaldo/Qualitaetsgesichert/{s_str}/{e_str}",
             "rebap": f"{base_url}/NrvSaldo/reBAP/Qualitaetsgesichert/{s_str}/{e_str}",
@@ -331,10 +426,31 @@ def fetch_and_merge(
             "afrr": f"{base_url}/NrvSaldo/AktivierteSRL/Qualitaetsgesichert/{s_str}/{e_str}",
             "mfrr": f"{base_url}/NrvSaldo/AktivierteMRL/Qualitaetsgesichert/{s_str}/{e_str}",
         }
+        urls_operational = {
+            "nrv": f"{base_url}/NrvSaldo/NRVSaldo/Betrieblich/{s_str}/{e_str}",
+            "rz": f"{base_url}/NrvSaldo/RZSaldo/Betrieblich/{s_str}/{e_str}",
+        }
         try:
             nrv_df = _tidy_nrv(_read_csv(_fetch_csv(urls["nrv"], session, timeout=timeout)))
             rebap_df = _tidy_rebap(_read_csv(_fetch_csv(urls["rebap"], session, timeout=timeout)))
             rz_df = _tidy_rz_saldo(_read_csv(_fetch_csv(urls["rz"], session, timeout=timeout)))
+            rz_nulls = rz_df.select(pl.col("rz_saldo_mw").null_count()).item()
+            nrv_nulls = nrv_df.select(pl.col("NRV_balance").null_count()).item()
+            if rz_nulls > 0 or nrv_nulls > 0:
+                LOGGER.warning(
+                    "RZ/NRV nulls for %s -> %s (rz=%s nrv=%s). Trying Betrieblich fallback.",
+                    s_str,
+                    e_str,
+                    rz_nulls,
+                    nrv_nulls,
+                )
+                try:
+                    rz_oper = _tidy_rz_saldo(_read_csv(_fetch_csv(urls_operational["rz"], session, timeout=timeout)))
+                    nrv_oper = _tidy_nrv(_read_csv(_fetch_csv(urls_operational["nrv"], session, timeout=timeout)))
+                    rz_df = rz_df.join(rz_oper, on="timestamp_utc", how="full", coalesce=True)
+                    nrv_df = nrv_df.join(nrv_oper, on="timestamp_utc", how="full", coalesce=True)
+                except Exception as exc:
+                    LOGGER.warning("Betrieblich fallback failed for %s -> %s: %s", s_str, e_str, exc)
             afrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["afrr"], session, timeout=timeout)), "afrr_activated")
             mfrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["mfrr"], session, timeout=timeout)), "mfrr_activated")
             merged = (
@@ -347,11 +463,19 @@ def fetch_and_merge(
             LOGGER.info("Fetched chunk %s -> %s: %s rows", s_str, e_str, len(merged))
             return merged
         except Exception as exc:
+            if retries > 0:
+                LOGGER.warning("Chunk %s -> %s failed (%s). Retrying with smaller window.", s_str, e_str, exc)
+                mid = s_dt + (e_dt - s_dt) / 2
+                left = _fetch_chunk_data(s_dt, mid, retries=retries - 1)
+                right = _fetch_chunk_data(mid, e_dt, retries=retries - 1)
+                parts = [p for p in [left, right] if p is not None and not p.is_empty()]
+                if parts:
+                    return pl.concat(parts)
             delta_days = (e_dt - s_dt).days
             if delta_days > 30:
                 mid = s_dt + (e_dt - s_dt) / 2
-                left = _fetch_chunk_data(s_dt, mid)
-                right = _fetch_chunk_data(mid, e_dt)
+                left = _fetch_chunk_data(s_dt, mid, retries=0)
+                right = _fetch_chunk_data(mid, e_dt, retries=0)
                 parts = [p for p in [left, right] if p is not None and not p.is_empty()]
                 if parts:
                     return pl.concat(parts)
@@ -374,6 +498,18 @@ def fetch_and_merge(
     drop_cols = [c for c in ("Datum_right", "Zeitzone_right", "von_right", "time_right", "datum_right", "zeitzone_right") if c in merged.columns]
     if drop_cols:
         merged = merged.drop(drop_cols)
+
+    # If Germany total is missing, sum TSO components where available.
+    tso_sum_cols = [c for c in ["50hertz", "amprion", "tennet tso", "transnetbw"] if c in merged.columns]
+    if tso_sum_cols and "rz_saldo_mw" in merged.columns:
+        tso_sum = pl.sum_horizontal([pl.col(c) for c in tso_sum_cols])
+        merged = merged.with_columns(
+            pl.coalesce([pl.col("rz_saldo_mw"), tso_sum]).alias("rz_saldo_mw")
+        )
+        if "NRV_balance" in merged.columns:
+            merged = merged.with_columns(
+                pl.coalesce([pl.col("NRV_balance"), tso_sum]).alias("NRV_balance")
+            )
 
     # Drop TSO-specific columns if present (not needed for ML) and reduce to a single datetime column.
     tso_cols = [
@@ -428,30 +564,6 @@ def fetch_and_merge(
             .sort("timestamp_utc")
         )
 
-        # Total activated volume (MW + MWh)
-        if "afrr_activated_mw_pos" in merged.columns:
-            merged = merged.with_columns(
-                (
-                    pl.col("afrr_activated_mw_pos").fill_null(0.0)
-                    + pl.col("mfrr_activated_mw_pos").fill_null(0.0)
-                ).alias("activated_volume_pos_mw"),
-                (
-                    pl.col("afrr_activated_mw_neg").fill_null(0.0)
-                    + pl.col("mfrr_activated_mw_neg").fill_null(0.0)
-                ).alias("activated_volume_neg_mw"),
-            )
-        if "afrr_activated_mwh_pos" in merged.columns:
-            merged = merged.with_columns(
-                (
-                    pl.col("afrr_activated_mwh_pos").fill_null(0.0)
-                    + pl.col("mfrr_activated_mwh_pos").fill_null(0.0)
-                ).alias("activated_volume_pos_mwh"),
-                (
-                    pl.col("afrr_activated_mwh_neg").fill_null(0.0)
-                    + pl.col("mfrr_activated_mwh_neg").fill_null(0.0)
-                ).alias("activated_volume_neg_mwh"),
-            )
-
     return merged
 
 
@@ -463,8 +575,8 @@ def main():
     parser.add_argument("--token", help="Bearer token (defaults to NETZTRANSPARENZ_TOKEN env var).")
     parser.add_argument("--out", default="data/raw/netztransparenz.parquet", help="Output parquet path.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds per request.")
-    parser.add_argument("--chunk-days", type=int, default=180, help="Chunk size in days to avoid server errors.")
-    parser.add_argument("--chunk-sleep", type=float, default=0.5, help="Seconds to sleep between chunks.")
+    parser.add_argument("--chunk-days", type=int, default=30, help="Chunk size in days to avoid server errors.")
+    parser.add_argument("--chunk-sleep", type=float, default=3.0, help="Seconds to sleep between chunks.")
     parser.add_argument("--resample", default="1h", help="Optional resample frequency (e.g. 1h). Use 'none' to disable.")
     args = parser.parse_args()
 
@@ -512,28 +624,23 @@ def main():
         & (pl.col("timestamp_utc") <= pl.lit(end_utc).cast(pl.Datetime(time_unit="us", time_zone="UTC")))
     ).sort("timestamp_utc")
 
-    # Data quality: null/zero counts (including nulls filled as 0.0 in activated_volume).
-    cols_to_audit = [
-        "afrr_activated_mw_pos",
-        "afrr_activated_mw_neg",
-        "mfrr_activated_mw_pos",
-        "mfrr_activated_mw_neg",
-        "activated_volume_pos_mw",
-        "activated_volume_neg_mw",
-    ]
-    for col in cols_to_audit:
-        if col in df.columns:
-            nulls = df.select(pl.col(col).is_null().sum()).item()
-            zeros = df.select((pl.col(col) == 0).sum()).item()
-            LOGGER.info("Data quality %s: nulls=%s zeros=%s", col, nulls, zeros)
-    if "mfrr_activated_mw_pos" in df.columns and "mfrr_activated_mw_neg" in df.columns:
-        mfrr_pos_nulls = df.select(pl.col("mfrr_activated_mw_pos").is_null().sum()).item()
-        mfrr_neg_nulls = df.select(pl.col("mfrr_activated_mw_neg").is_null().sum()).item()
-        LOGGER.info(
-            "Filled-as-zero in activated_volume from mFRR nulls: pos=%s neg=%s",
-            mfrr_pos_nulls,
-            mfrr_neg_nulls,
-        )
+    if "rz_saldo_mw" in df.columns and df.select(pl.col("rz_saldo_mw").null_count()).item() > 0:
+        smard_df = fetch_smard_saldo(start_utc, end_utc)
+        if smard_df.is_empty():
+            LOGGER.warning("SMARD fallback returned no RZ saldo data.")
+        else:
+            df = df.join(smard_df, on="timestamp_utc", how="left", suffix="_smard")
+            df = df.with_columns(
+                pl.coalesce([pl.col("rz_saldo_mw"), pl.col("rz_saldo_mw_smard")]).alias("rz_saldo_mw")
+            )
+            if "NRV_balance" in df.columns:
+                df = df.with_columns(
+                    pl.coalesce([pl.col("NRV_balance"), pl.col("rz_saldo_mw_smard")]).alias("NRV_balance")
+                )
+            df = df.drop("rz_saldo_mw_smard")
+            LOGGER.info("Filled RZ saldo nulls from SMARD fallback.")
+
+    # Data quality logs removed per request.
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

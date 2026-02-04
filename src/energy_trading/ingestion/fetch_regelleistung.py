@@ -1,7 +1,7 @@
 """Fetch Regelleistung aFRR CAPACITY/ENERGY results and store as parquet.
 
 Usage:
-    python -m energy_trading.ingestion.fetch_regelleistung \
+    ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/regelleistung.parquet
 
@@ -409,8 +409,11 @@ def fetch_and_parse_regelleistung(
             if off_col:
                 val_cols[off_col] = "afrr_capacity_offered_mw"
 
-        for col in val_cols.keys():
-            df_part[col] = pd.to_numeric(df_part[col], errors="coerce").fillna(0.0)
+        for col, out_name in val_cols.items():
+            series = pd.to_numeric(df_part[col], errors="coerce")
+            if "mw" in out_name:
+                series = series.fillna(0.0)
+            df_part[col] = series
 
         # --- 4) European netting (import/export) ---
         net_col = _find_col(df_part, ["GERMANY_IMPORT", "EXPORT"])
@@ -518,6 +521,19 @@ def main() -> None:
     df_master = df_master.reset_index().rename(columns={"index": "timestamp_utc"})
     if "timestamp_utc" not in df_master.columns and "timestamp" in df_master.columns:
         df_master = df_master.rename(columns={"timestamp": "timestamp_utc"})
+
+    # Drop redundant activated volume and MWh columns (keep MW components only).
+    drop_cols = [
+        "mfrr_activated_mwh_pos",
+        "mfrr_activated_mwh_neg",
+        "afrr_activated_mwh_pos",
+        "afrr_activated_mwh_neg",
+        "activated_volume_pos_mwh",
+        "activated_volume_neg_mwh",
+        "activated_volume_pos_mw",
+        "activated_volume_neg_mw",
+    ]
+    df_master = df_master.drop(columns=[c for c in drop_cols if c in df_master.columns])
 
     # Log missing months for activation market (do not impute).
     if "afrr_activation_avg_price_neg" in df_master.columns:

@@ -2,7 +2,7 @@
 Fetch commodity prices (TTF gas, CO2, API2 coal) from Yahoo Finance and store as parquet.
 
 Usage:
-    python -m energy_trading.ingestion.fetch_yfinance \
+    ./.venv/bin/python -m energy_trading.ingestion.fetch_yfinance \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/yfinance.parquet
 
@@ -23,72 +23,70 @@ import yfinance as yf
 pd.Timestamp.utcnow = staticmethod(lambda: pd.Timestamp.now("UTC"))
 LOGGER = logging.getLogger(__name__)
 
-# Yahoo tickers (adjusted close):
-# - TTF gas: TTF=F
-# - CO2: try fallbacks and pick the first that returns data (many symbols get delisted)
-# - API2 coal: MTF=F
-BASE_TICKERS: Dict[str, str] = {
-    "gas_price_ttf": "TTF=F",
-    "coal_price_api2": "MTF=F",
+# Yahoo tickers (adjusted close) with fallbacks to reduce missingness:
+# - TTF gas
+# - API2 coal
+# - CO2 EUA
+CANDIDATE_TICKERS: Dict[str, list[str]] = {
+    "gas_price_ttf": ["TTF=F", "TTF1!"],
+    "coal_price_api2": ["MTF=F", "MTF1!"],
+    "co2_price_eua": ["CO2.L", "CHEC.SW", "CBU2.DE", "EUA=F", "C02.F", "CO2.DE", "ECF2.EX"],
 }
-EUA_CANDIDATES = ["CO2.L", "CHEC.SW", "CBU2.DE", "EUA=F", "C02.F", "CO2.DE", "ECF2.EX"]
+
+
+def _download_adj_close(ticker: str, start: str, end: str, interval: str) -> pd.Series | None:
+    df = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        group_by="column",
+    )
+    if df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    if "Adj Close" not in df.columns:
+        return None
+    s = df["Adj Close"].copy()
+    s.index = pd.to_datetime(s.index, utc=True)
+    return s
 
 
 def fetch_prices(start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-    """Download adjusted close prices for all tickers."""
-    tickers = dict(BASE_TICKERS)  # local copy
-    frames = []
-    # Resolve EUA ticker by trying candidates in order.
-    eua_symbol = None
-    for cand in EUA_CANDIDATES:
-        test = yf.download(
-            cand,
-            start=start,
-            end=end,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            group_by="column",
-        )
-        if not test.empty and ("Adj Close" in test.columns or ("Adj Close" in test.columns.get_level_values(0) if isinstance(test.columns, pd.MultiIndex) else False)):
-            eua_symbol = cand
-            break
-    if eua_symbol:
-        tickers["co2_price_eua"] = eua_symbol
-    else:
-        print("Warning: no EUA ticker returned data; skipping CO2 series.")
+    """Download adjusted close prices using multiple tickers per series and coalesce."""
+    series_list = []
 
-    for col_name, ticker in tickers.items():
-        df = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            group_by="column",  # single-level columns
-        )
-        if df.empty:
-            print(f"Warning: no data for {ticker}")
+    for col_name, tickers in CANDIDATE_TICKERS.items():
+        candidates = []
+        for t in tickers:
+            s = _download_adj_close(t, start, end, interval)
+            if s is None or s.empty:
+                LOGGER.warning("No data for %s (%s)", col_name, t)
+                continue
+            candidates.append(s.rename(t))
+        if not candidates:
+            LOGGER.warning("No usable ticker for %s", col_name)
             continue
-        # Flatten possible multi-index columns
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        if "Adj Close" not in df.columns:
-            print(f"Warning: missing Adj Close for {ticker}; skipping.")
-            continue
-        df = df.reset_index().rename(columns={"Date": "timestamp", "Adj Close": col_name})
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        # Deduplicate per timestamp and set index to simplify concat.
-        df = df[["timestamp", col_name]].drop_duplicates(subset=["timestamp"]).set_index("timestamp")
-        frames.append(df)
+        df_cand = pd.concat(candidates, axis=1, sort=False).sort_index()
+        # Coalesce across candidate tickers (first non-null).
+        df_cand[col_name] = df_cand.bfill(axis=1).iloc[:, 0]
+        series_list.append(df_cand[[col_name]])
 
-    if not frames:
+    if not series_list:
         raise RuntimeError("No data downloaded for any ticker.")
 
-    merged = pd.concat(frames, axis=1, sort=False).sort_index()
+    merged = pd.concat(series_list, axis=1, sort=False).sort_index()
     merged = merged[~merged.index.duplicated(keep="last")]
-    return merged.reset_index()
+    merged = merged.reset_index()
+    if "timestamp" not in merged.columns:
+        if "index" in merged.columns:
+            merged = merged.rename(columns={"index": "timestamp"})
+        elif "Date" in merged.columns:
+            merged = merged.rename(columns={"Date": "timestamp"})
+    return merged
 
 
 def upsample_daily_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
@@ -98,13 +96,13 @@ def upsample_daily_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
     start = df["timestamp"].min().floor("D")
     end = df["timestamp"].max().ceil("D")
     hourly_index = pd.date_range(start, end, freq="1h", tz="UTC")
-    df = (
-        df.sort_values("timestamp")
-        .set_index("timestamp")
-        .reindex(hourly_index, method="ffill")
-        .reset_index()
-        .rename(columns={"index": "timestamp"})
-    )
+    df = df.sort_values("timestamp").set_index("timestamp")
+    # Fill daily gaps before hourly expansion.
+    daily_index = pd.date_range(start, end, freq="1D", tz="UTC")
+    df = df.reindex(daily_index, method="ffill")
+    # Backfill leading gaps if series starts after requested window.
+    df = df.bfill()
+    df = df.reindex(hourly_index, method="ffill").reset_index().rename(columns={"index": "timestamp"})
     return df
 
 

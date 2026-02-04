@@ -1,7 +1,7 @@
 """Audit netztransparenz.parquet for aggregation and physics consistency.
 
 Usage:
-    python -m energy_trading.ingestion.verify_netztransparenz \
+    ./.venv/bin/python -m energy_trading.ingestion.verify_netztransparenz \
         --path data/raw/netztransparenz.parquet
 """
 from __future__ import annotations

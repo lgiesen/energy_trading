@@ -1,7 +1,7 @@
 """Merge all parquet files in the data directory on timestamp_utc into one table.
 
 Usage:
-    python -m energy_trading.ingestion.merge_data \
+    ./.venv/bin/python -m energy_trading.ingestion.merge_data \
         --data-dir data/raw \
         --out data/processed/all_data.parquet \
         --clip-start 2020-11-30T23:00:00 \
