@@ -2,7 +2,7 @@
 
 # --- PHYSICAL BATTERY SPECS ---
 BATTERY_SPECS = {
-    "capacity_mwh": 2.0,       # Total energy capacity (E_max)
+    "capacity_mwh": 3.0,       # Total energy capacity (E_max)
     "power_mw": 1.0,           # Maximum power (P_max) -> 2-hour duration
     
     # Efficiency: 90% Round-trip AC-to-AC
@@ -18,6 +18,7 @@ BATTERY_SPECS = {
     
     # Costs
     "degradation_cost": 25.0,  # €/MWh throughput (slightly more conservative value)
+    "auxiliary_loss_hourly": 0.001, # 0.1% of capacity per hour lost to cooling/BMS
 }
 
 # --- ECONOMIC PARAMETERS ---
