@@ -47,15 +47,12 @@ INTRADAY_PRICE_FILTER_ID = 4996  # Intraday trading (quarter-hour)
 DATA_MODULES: Dict[str, int] = {
     # Actuals (load_actual dropped; sourced from ENTSO-E)
     "residual_load_actual": 4359,
-    "wind_onshore_actual": 4067,
     "wind_offshore_actual": 1225,
     "solar_actual": 4068,
     # Forecasts
     "wind_onshore_forecast": 123,
     "wind_offshore_forecast": 3791,
     "solar_forecast": 125,
-    # Intraday forecasts
-    "wind_onshore_forecast_intraday": 715,
 }
 
 MARKET_CONFIG_URL = "https://www.smard.de/app/chart_configuration/market_data_configuration.json"
@@ -67,7 +64,7 @@ GENERATION_CANDIDATES: Dict[str, List[int]] = {
     "generation_fossil_hard_coal_mw": [4069],
     "generation_fossil_gas_mw": [4071],
     # Quarterhour IDs to avoid gaps.
-    "generation_nuclear_mw": [4067],
+    "generation_nuclear_mw": [1224],
     "generation_hydro_pumped_storage_mw": [4066],
 }
 
@@ -326,6 +323,37 @@ def fetch_smard(
 
     if merged is None:
         raise RuntimeError("No SMARD data fetched.")
+
+    # Intraday forecast (quarter-hour) -> hourly mean (avoid 4x scaling)
+    intraday_qh_fc = fetch_series(
+        session,
+        715,
+        DEFAULT_REGION,
+        "quarterhour",
+        start_ms,
+        end_ms,
+        cutoff_ms,
+        "wind_onshore_forecast_intraday",
+    )
+    if intraday_qh_fc is not None:
+        intraday_hourly_fc = _resample_qh_to_hour(intraday_qh_fc, "wind_onshore_forecast_intraday")
+        merged = merged.join(intraday_hourly_fc, on="timestamp", how="full", coalesce=True)
+        LOGGER.info("Fetched %s rows for wind_onshore_forecast_intraday.", len(intraday_hourly_fc))
+
+    # Wind onshore actuals (region fallback: DE first, then DE-LU)
+    wind_onshore_actual = fetch_series_with_region_fallback(
+        session,
+        [4067],
+        regions=["DE", "DE-LU"],
+        resolution="hour",
+        start_ms=start_ms,
+        end_ms=end_ms,
+        cutoff_ms=cutoff_ms,
+        col_name="wind_onshore_actual",
+    )
+    if wind_onshore_actual is not None:
+        merged = merged.join(wind_onshore_actual, on="timestamp", how="full", coalesce=True)
+        LOGGER.info("Fetched %s rows for wind_onshore_actual.", len(wind_onshore_actual))
 
     # Realised generation (Ist-Erzeugung) with region + resolution fallback
     expected_hours = int((end_ms - start_ms) / 3600000) + 1
