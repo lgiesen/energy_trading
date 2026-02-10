@@ -2,8 +2,8 @@
 
 # --- PHYSICAL BATTERY SPECS ---
 BATTERY_SPECS = {
-    "capacity_mwh": 3.0,       # Total energy capacity (E_max)
-    "power_mw": 1.0,           # Maximum power (P_max) -> 2-hour duration
+    "capacity_mwh": 20.0,      # Total energy capacity (E_max)
+    "power_mw": 10.0,          # Maximum power (P_max) -> 2-hour duration
     
     # Efficiency: 90% Round-trip AC-to-AC
     # We use the square root for one-way efficiency (sqrt(0.9) ≈ 0.9487)
@@ -14,7 +14,7 @@ BATTERY_SPECS = {
     # Operation Limits
     "soc_min": 0.1,            # 10% min SOC to protect battery health
     "soc_max": 0.9,            # 90% max SOC
-    "initial_soc": 0.1,        # Start at soc_min (realistic empty state)
+    "initial_soc": 0.5,        # Start at 50% SOC
     
     # Costs
     "degradation_cost": 25.0,  # €/MWh throughput (slightly more conservative value)

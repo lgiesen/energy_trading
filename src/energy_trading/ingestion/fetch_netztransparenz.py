@@ -245,7 +245,7 @@ def _tidy_nrv(df: pl.DataFrame) -> pl.DataFrame:
         df.with_columns(
             [
                 ts,
-                pl.when(pl.col(value_col) == "N.A.")
+                pl.when(pl.col(value_col).cast(pl.Utf8) == "N.A.")
                 .then(None)
                 .otherwise(pl.col(value_col))
                 .cast(pl.Utf8)
@@ -282,14 +282,14 @@ def _tidy_rebap(df: pl.DataFrame) -> pl.DataFrame:
         df.with_columns(
             [
                 ts,
-                pl.when(pl.col(unter_col) == "N.A.")
+                pl.when(pl.col(unter_col).cast(pl.Utf8) == "N.A.")
                 .then(None)
                 .otherwise(pl.col(unter_col))
                 .cast(pl.Utf8)
                 .str.replace(",", ".")
                 .cast(pl.Float64, strict=False)
                 .alias("reBAP unterdeckt"),
-                pl.when(pl.col(ueber_col) == "N.A.")
+                pl.when(pl.col(ueber_col).cast(pl.Utf8) == "N.A.")
                 .then(None)
                 .otherwise(pl.col(ueber_col))
                 .cast(pl.Utf8)

@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""End-to-end pipeline wrapper: fetch -> merge -> clean -> transform -> features.
+
+Usage:
+    ./.venv/bin/python scripts/run_pipeline.py --start 2020-11-30T23:00:00Z --end 2026-01-01T02:00:00Z
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import subprocess
+import sys
+from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
+
+
+def run(cmd: list[str]) -> None:
+    LOGGER.info("-> %s", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    parser = argparse.ArgumentParser(description="Run full data pipeline (fetch -> features).")
+    parser.add_argument("--start", default="2020-11-30T23:00:00Z", help="Start date (UTC ISO8601).")
+    parser.add_argument("--end", default="2026-01-01T02:00:00Z", help="End date (UTC ISO8601).")
+    parser.add_argument("--out-dir", default="data/raw", help="Output directory for raw parquets.")
+    parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
+    parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
+    parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
+    parser.add_argument("--skip-features", action="store_true", help="Stop after transform step.")
+    parser.add_argument("--entsoe-chunk-months", type=int, default=3, help="ENTSO-E chunk size in months.")
+    parser.add_argument("--entsoe-workers", type=int, default=3, help="ENTSO-E parallel workers.")
+    args = parser.parse_args()
+
+    py = sys.executable
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Fetch + merge raw data
+    run([
+        py, "scripts/collect_and_merge_all_data.py",
+        "--start", args.start,
+        "--end", args.end,
+        "--out-dir", str(out_dir),
+        "--merged", args.merged,
+        *( ["--skip-commodities"] if args.skip_commodities else [] ),
+        *( ["--skip-smard"] if args.skip_smard else [] ),
+    ])
+
+    # 2) Handle missing values
+    clean_path = "data/processed/all_data_clean.parquet"
+    run([
+        py, "-m", "energy_trading.processing.handle_missing_values",
+        "--in", args.merged,
+        "--out", clean_path,
+    ])
+
+    # 3) Transform
+    transformed_path = "data/processed/all_data_transformed.parquet"
+    run([
+        py, "-m", "energy_trading.processing.transform_data",
+        "--in", clean_path,
+        "--out", transformed_path,
+    ])
+
+    if args.skip_features:
+        LOGGER.info("Skipping feature generation (--skip-features).")
+        return
+
+    # 4) Build features
+    run([
+        py, "-m", "energy_trading.features.build_features",
+        "--in", transformed_path,
+        "--out", "data/features/all_data_features.parquet",
+    ])
+
+    LOGGER.info("Pipeline completed.")
+
+
+if __name__ == "__main__":
+    main()

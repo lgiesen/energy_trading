@@ -10,9 +10,9 @@ Outputs:
 
 Columns (high level):
     - actuals: load, residual load, wind onshore/offshore, solar
-    - forecasts: day-ahead wind/solar, intraday wind onshore
+    - forecasts: day-ahead wind/solar
     - prices: da_price_eur (hourly), price_intraday_eur (hourly mean)
-    - engineered: forecast errors, wind_forecast_de, total_wind_intraday_error, system_stress_signal
+    - engineered: forecast errors, wind_forecast_de, system_stress_signal
 """
 from __future__ import annotations
 
@@ -324,22 +324,6 @@ def fetch_smard(
     if merged is None:
         raise RuntimeError("No SMARD data fetched.")
 
-    # Intraday forecast (quarter-hour) -> hourly mean (avoid 4x scaling)
-    intraday_qh_fc = fetch_series(
-        session,
-        715,
-        DEFAULT_REGION,
-        "quarterhour",
-        start_ms,
-        end_ms,
-        cutoff_ms,
-        "wind_onshore_forecast_intraday",
-    )
-    if intraday_qh_fc is not None:
-        intraday_hourly_fc = _resample_qh_to_hour(intraday_qh_fc, "wind_onshore_forecast_intraday")
-        merged = merged.join(intraday_hourly_fc, on="timestamp", how="full", coalesce=True)
-        LOGGER.info("Fetched %s rows for wind_onshore_forecast_intraday.", len(intraday_hourly_fc))
-
     # Wind onshore actuals (region fallback: DE first, then DE-LU)
     wind_onshore_actual = fetch_series_with_region_fallback(
         session,
@@ -471,32 +455,6 @@ def fetch_smard(
                 + pl.col("wind_offshore_error").abs()
                 + pl.col("solar_error").abs()
             ).alias("system_stress_signal")
-        )
-
-    # Intraday forecast errors (Forecast - Actual)
-    if "wind_onshore_forecast_intraday" in merged.columns and "wind_onshore_actual" in merged.columns:
-        merged = merged.with_columns(
-            (pl.col("wind_onshore_forecast_intraday") - pl.col("wind_onshore_actual")).alias(
-                "wind_onshore_intraday_error"
-            )
-        )
-    # Optional fallback: total wind intraday forecast uses offshore day-ahead
-    if (
-        "wind_onshore_forecast_intraday" in merged.columns
-        and "wind_offshore_forecast" in merged.columns
-        and "wind_onshore_actual" in merged.columns
-        and "wind_offshore_actual" in merged.columns
-    ):
-        merged = merged.with_columns(
-            (pl.col("wind_onshore_forecast_intraday") + pl.col("wind_offshore_forecast")).alias(
-                "total_wind_intraday_forecast"
-            )
-        )
-        merged = merged.with_columns(
-            (
-                pl.col("total_wind_intraday_forecast")
-                - (pl.col("wind_onshore_actual") + pl.col("wind_offshore_actual"))
-            ).alias("total_wind_intraday_error")
         )
 
     # Keep only one UTC and one CET timestamp

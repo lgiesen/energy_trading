@@ -1,4 +1,4 @@
-"""Fetch ENTSO-E load and outage data for Germany (DE_LU) using entsoe-py.
+"""Fetch ENTSO-E wind/solar actuals and forecasts for DE-LU using entsoe-py.
 
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_entsoe \
@@ -7,8 +7,10 @@ Usage:
 
 Outputs:
     - entsoe.parquet with hourly UTC timestamps and:
-        timestamp_utc, load_actual, load_forecast_da,
-        outage_baseload_mw, outage_hard_coal_mw, outage_gas_mw
+        timestamp_utc,
+        wind_onshore_actual_entsoe, wind_offshore_actual_entsoe, solar_actual_entsoe,
+        wind_onshore_forecast_da_entsoe, wind_offshore_forecast_da_entsoe, solar_forecast_da_entsoe,
+        wind_onshore_forecast_id_entsoe, wind_offshore_forecast_id_entsoe, solar_forecast_id_entsoe
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ from pathlib import Path
 import pandas as pd
 import polars as pl
 from entsoe import EntsoePandasClient
-from entsoe.parsers import PSRTYPE_MAPPINGS
+
 try:
     from dotenv import load_dotenv
 except Exception:  # pragma: no cover - optional dependency
@@ -30,14 +32,10 @@ except Exception:  # pragma: no cover - optional dependency
 
 LOGGER = logging.getLogger(__name__)
 
-COUNTRY_CODE = "DE_LU"
+# DE-LU bidding zone
+REGION_CODE = "10Y1001A1001A83F"
 
-PSR_MAP = {
-    "gas": "B04",
-    "hard_coal": "B02",
-    "lignite": "B11",
-    "nuclear": "B14",
-}
+WIND_SOLAR_COLS = ["Wind Onshore", "Wind Offshore", "Solar"]
 
 
 def _parse_utc(ts: str) -> pd.Timestamp:
@@ -59,6 +57,20 @@ def _month_ranges(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[pd.Times
     return ranges
 
 
+def _chunk_ranges(start: pd.Timestamp, end: pd.Timestamp, months: int) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    if months <= 1:
+        return _month_ranges(start, end)
+    ranges = []
+    cur = start
+    while cur < end:
+        nxt = (cur + pd.DateOffset(months=months)).normalize()
+        if nxt <= cur:
+            nxt = cur + pd.DateOffset(months=months)
+        ranges.append((cur, min(nxt, end)))
+        cur = nxt
+    return ranges
+
+
 def _retry(func, attempts: int = 3, sleep_s: float = 2.0):
     last_exc = None
     for attempt in range(1, attempts + 1):
@@ -72,103 +84,241 @@ def _retry(func, attempts: int = 3, sleep_s: float = 2.0):
     raise RuntimeError(f"Failed after {attempts} attempts") from last_exc
 
 
-def _ensure_utc_index(series: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
-    if series is None or len(series) == 0:
-        return series
-    if series.index.tz is None:
-        series.index = series.index.tz_localize("UTC")
+def _ensure_utc_index(df: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
     else:
-        series.index = series.index.tz_convert("UTC")
-    return series
+        df.index = df.index.tz_convert("UTC")
+    return df
 
 
-def _resample_hourly(obj: pd.Series | pd.DataFrame) -> pd.Series:
+def _resample_hourly(obj: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
     obj = _ensure_utc_index(obj)
-    if isinstance(obj, pd.DataFrame):
-        if obj.shape[1] == 1:
-            obj = obj.iloc[:, 0]
-        else:
-            obj = obj.sum(axis=1)
     return obj.resample("1h").mean()
 
 
-def _events_to_hourly(events: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
-    idx = pd.date_range(start=start, end=end, freq="1h", tz="UTC", inclusive="left")
-    out = pd.Series(0.0, index=idx)
-    if events is None or events.empty:
-        return out
+def _select_wind_solar(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    cols = [c for c in WIND_SOLAR_COLS if c in df.columns]
+    if not cols:
+        return df.iloc[0:0]
+    return df[cols]
 
-    # Expected columns from entsoe-py: start, end, avail_qty, nominal_power
-    for _, row in events.iterrows():
-        ev_start = pd.Timestamp(row["start"]).tz_convert("UTC")
-        ev_end = pd.Timestamp(row["end"]).tz_convert("UTC")
-        nominal = float(row.get("nominal_power", 0) or 0)
-        avail = float(row.get("avail_qty", 0) or 0)
-        missing = max(nominal - avail, 0.0)
-        if missing == 0.0:
+
+def _select_generation_actuals(df: pd.DataFrame) -> pd.DataFrame:
+    """Select wind/solar actuals from entsoe-py generation response."""
+    if df is None or df.empty:
+        return df
+
+    if isinstance(df.columns, pd.MultiIndex):
+        want = [("Wind Onshore", "Actual Aggregated"),
+                ("Wind Offshore", "Actual Aggregated"),
+                ("Solar", "Actual Aggregated")]
+        cols = [c for c in want if c in df.columns]
+        if not cols:
+            # Fallback if only consumption is available.
+            want = [("Wind Onshore", "Actual Consumption"),
+                    ("Wind Offshore", "Actual Consumption"),
+                    ("Solar", "Actual Consumption")]
+            cols = [c for c in want if c in df.columns]
+        return df[cols] if cols else df.iloc[0:0]
+
+    # Flattened parquet columns often stringify tuples like "('Wind Onshore', 'Actual Aggregated')".
+    def _pick(label: str, kind: str) -> str | None:
+        key = f"('{label}', '{kind}')"
+        return key if key in df.columns else None
+
+    cols = [
+        _pick("Wind Onshore", "Actual Aggregated"),
+        _pick("Wind Offshore", "Actual Aggregated"),
+        _pick("Solar", "Actual Aggregated"),
+    ]
+    cols = [c for c in cols if c is not None]
+    if not cols:
+        cols = [
+            _pick("Wind Onshore", "Actual Consumption"),
+            _pick("Wind Offshore", "Actual Consumption"),
+            _pick("Solar", "Actual Consumption"),
+        ]
+        cols = [c for c in cols if c is not None]
+    return df[cols] if cols else df.iloc[0:0]
+
+
+def _rename_actual_cols(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {
+        "Wind Offshore": "wind_offshore_actual_entsoe",
+        "Wind Onshore": "wind_onshore_actual_entsoe",
+        "Solar": "solar_actual_entsoe",
+    }
+    if isinstance(df.columns, pd.MultiIndex):
+        cols = {}
+        for (psr, kind) in df.columns:
+            if psr in mapping:
+                cols[(psr, kind)] = mapping[psr]
+        return df.rename(columns=cols)
+
+    # Stringified tuple columns.
+    str_map = {
+        "('Wind Offshore', 'Actual Aggregated')": "wind_offshore_actual_entsoe",
+        "('Wind Onshore', 'Actual Aggregated')": "wind_onshore_actual_entsoe",
+        "('Solar', 'Actual Aggregated')": "solar_actual_entsoe",
+        "('Wind Offshore', 'Actual Consumption')": "wind_offshore_actual_entsoe",
+        "('Wind Onshore', 'Actual Consumption')": "wind_onshore_actual_entsoe",
+        "('Solar', 'Actual Consumption')": "solar_actual_entsoe",
+    }
+    cols = {c: str_map[c] for c in df.columns if c in str_map}
+    if cols:
+        return df.rename(columns=cols)
+
+    # Fallback: match on string representation to catch variant column names.
+    fallback = {}
+    for c in df.columns:
+        s = str(c)
+        if "Actual" not in s:
             continue
+        if "Wind Onshore" in s:
+            fallback[c] = "wind_onshore_actual_entsoe"
+        elif "Wind Offshore" in s:
+            fallback[c] = "wind_offshore_actual_entsoe"
+        elif "Solar" in s:
+            fallback[c] = "solar_actual_entsoe"
+    if fallback:
+        return df.rename(columns=fallback)
 
-        # Align to hourly boundaries.
-        h_start = ev_start.floor("1h")
-        h_end = ev_end.ceil("1h")
-        if h_end <= start or h_start >= end:
-            continue
-        h_start = max(h_start, start)
-        h_end = min(h_end, end)
-        if h_start >= h_end:
-            continue
-        out.loc[h_start:h_end - pd.Timedelta(hours=1)] += missing
-
-    return out
+    cols = {c: mapping[c] for c in df.columns if c in mapping}
+    return df.rename(columns=cols)
 
 
-def _psr_name(psr_code: str) -> str:
-    return PSRTYPE_MAPPINGS.get(psr_code, psr_code)
+def _rename_forecast_cols(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
+    mapping = {
+        "Wind Offshore": f"wind_offshore_forecast_{suffix}_entsoe",
+        "Wind Onshore": f"wind_onshore_forecast_{suffix}_entsoe",
+        "Solar": f"solar_forecast_{suffix}_entsoe",
+    }
+    cols = {c: mapping[c] for c in df.columns if c in mapping}
+    return df.rename(columns=cols)
 
 
-def _filter_by_psr(events: pd.DataFrame, psr_code: str) -> pd.DataFrame:
-    if events is None or events.empty:
-        return events
-    name = _psr_name(psr_code)
-    for col in ("plant_type", "production_resource_psr_name"):
-        if col in events.columns:
-            return events[events[col] == name]
-    # If no known PSR column, return empty to avoid mixing types.
-    return events.iloc[0:0]
+def _fetch_actuals(
+    client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp
+) -> pd.DataFrame | None:
+    try:
+        actuals = _retry(lambda: client.query_generation(REGION_CODE, start=start, end=end))
+    except Exception as exc:  # pragma: no cover - network errors
+        LOGGER.warning("Actual generation failed: %s", exc)
+        return None
+
+    if actuals is None or len(actuals) == 0:
+        return None
+
+    actuals = _ensure_utc_index(actuals)
+    actuals = _select_generation_actuals(actuals)
+    actuals = _rename_actual_cols(actuals)
+    return _resample_hourly(actuals)
+
+
+def _fetch_forecast(
+    client: EntsoePandasClient,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    process_type: str,
+    suffix: str,
+) -> pd.DataFrame | None:
+    try:
+        forecast = _retry(
+            lambda: client.query_wind_and_solar_forecast(
+                REGION_CODE, start=start, end=end, process_type=process_type
+            )
+        )
+    except Exception as exc:  # pragma: no cover - network errors
+        LOGGER.warning("Wind/solar forecast %s failed: %s", process_type, exc)
+        return None
+
+    if forecast is None or len(forecast) == 0:
+        return None
+
+    forecast = _ensure_utc_index(forecast)
+    forecast = _select_wind_solar(forecast)
+    forecast = _rename_forecast_cols(forecast, suffix)
+    return _resample_hourly(forecast)
+
+
+def _fetch_capacity(
+    client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp
+) -> pd.DataFrame | None:
+    try:
+        capacity = _retry(lambda: client.query_installed_generation_capacity(
+            REGION_CODE, start=start, end=end
+        ))
+    except Exception as exc:  # pragma: no cover - network errors
+        LOGGER.warning("Installed capacity fetch failed: %s", exc)
+        return None
+
+    if capacity is None or len(capacity) == 0:
+        return None
+
+    capacity = _ensure_utc_index(capacity)
+    capacity = _select_wind_solar(capacity)
+    if capacity is None or capacity.empty:
+        return None
+
+    capacity = capacity.rename(
+        columns={
+            "Wind Onshore": "wind_onshore_capacity_entsoe",
+            "Wind Offshore": "wind_offshore_capacity_entsoe",
+            "Solar": "solar_capacity_entsoe",
+        }
+    )
+    capacity = capacity.resample("1h").ffill()
+    return capacity
 
 
 def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp) -> pl.DataFrame:
     LOGGER.info("Fetching %s to %s", start, end)
 
-    load_actual = _retry(lambda: client.query_load(COUNTRY_CODE, start=start, end=end))
-    load_forecast = _retry(lambda: client.query_load_forecast(COUNTRY_CODE, start=start, end=end))
+    actuals = _fetch_actuals(client, start, end)
 
-    load_actual = _resample_hourly(load_actual)
-    load_actual = load_actual.rename("load_actual")
-    load_forecast = _resample_hourly(load_forecast)
-    load_forecast = load_forecast.rename("load_forecast_da")
+    da = _fetch_forecast(client, start, end, process_type="A01", suffix="da")
 
-    # Outages by PSR type (filter locally; entsoe-py does not accept psr_type)
-    events_all = _retry(
-        lambda: client.query_unavailability_of_generation_units(
-            COUNTRY_CODE,
-            start=start,
-            end=end,
-        )
-    )
-    outages = {}
-    for key, psr in PSR_MAP.items():
-        events = _filter_by_psr(events_all, psr)
-        outages[key] = _events_to_hourly(events, start, end)
+    id_forecast = _fetch_forecast(client, start, end, process_type="A18", suffix="id")
+    if id_forecast is None:
+        LOGGER.warning("A18 returned empty; trying A40 for intraday/current forecasts.")
+        id_forecast = _fetch_forecast(client, start, end, process_type="A40", suffix="id")
 
-    outage_baseload = (outages["lignite"] + outages["nuclear"]).rename("outage_baseload_mw")
-    outage_hard_coal = outages["hard_coal"].rename("outage_hard_coal_mw")
-    outage_gas = outages["gas"].rename("outage_gas_mw")
+    capacity = _fetch_capacity(client, start, end)
 
-    df = pd.concat(
-        [load_actual, load_forecast, outage_baseload, outage_hard_coal, outage_gas],
-        axis=1,
-    )
+    frames = [df for df in (actuals, da, id_forecast, capacity) if df is not None and len(df) > 0]
+    if frames:
+        df = pd.concat(frames, axis=1, join="outer", sort=False)
+        # Final cleanup: enforce actual column names in case tuple-like names survived.
+        rename_map = {
+            "('Wind Onshore', 'Actual Aggregated')": "wind_onshore_actual_entsoe",
+            "('Wind Offshore', 'Actual Aggregated')": "wind_offshore_actual_entsoe",
+            "('Solar', 'Actual Aggregated')": "solar_actual_entsoe",
+            "('Wind Onshore', 'Actual Consumption')": "wind_onshore_actual_entsoe",
+            "('Wind Offshore', 'Actual Consumption')": "wind_offshore_actual_entsoe",
+            "('Solar', 'Actual Consumption')": "solar_actual_entsoe",
+        }
+        df = df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map})
+        # Handle tuple columns directly if present.
+        tuple_map = {}
+        for c in df.columns:
+            if isinstance(c, tuple) and len(c) >= 2 and "Actual" in c[1]:
+                if "Wind Onshore" in c[0]:
+                    tuple_map[c] = "wind_onshore_actual_entsoe"
+                elif "Wind Offshore" in c[0]:
+                    tuple_map[c] = "wind_offshore_actual_entsoe"
+                elif "Solar" in c[0]:
+                    tuple_map[c] = "solar_actual_entsoe"
+        if tuple_map:
+            df = df.rename(columns=tuple_map)
+    else:
+        idx = pd.date_range(start=start, end=end, freq="1h", tz="UTC", inclusive="left")
+        df = pd.DataFrame(index=idx)
+
     df.index = df.index.tz_convert("UTC")
     df = df.sort_index()
 
@@ -178,13 +328,14 @@ def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timesta
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Fetch ENTSO-E load + outage data (DE_LU).")
+    parser = argparse.ArgumentParser(description="Fetch ENTSO-E wind/solar actuals + forecasts (DE-LU).")
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument("--out", default="data/raw/entsoe.parquet", help="Output parquet path.")
+    parser.add_argument("--chunk-months", type=int, default=3, help="Chunk size in months (default: 3).")
+    parser.add_argument("--workers", type=int, default=3, help="Parallel workers (default: 3).")
     args = parser.parse_args()
 
-    # Load .env from repo root if available.
     if load_dotenv is not None:
         load_dotenv(dotenv_path=Path(".env"))
 
@@ -199,11 +350,24 @@ def main() -> None:
 
     client = EntsoePandasClient(api_key=api_key)
 
+    ranges = _chunk_ranges(start, end, args.chunk_months)
     frames = []
-    for s, e in _month_ranges(start, end):
-        frames.append(fetch_chunk(client, s, e))
+    if args.workers <= 1:
+        for s, e in ranges:
+            frames.append(fetch_chunk(client, s, e))
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    merged = pl.concat(frames).unique(subset=["timestamp_utc"], keep="last").sort("timestamp_utc")
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = {ex.submit(fetch_chunk, client, s, e): (s, e) for s, e in ranges}
+            for fut in as_completed(futures):
+                frames.append(fut.result())
+
+    merged = (
+        pl.concat(frames, how="diagonal")
+        .unique(subset=["timestamp_utc"], keep="last")
+        .sort("timestamp_utc")
+    )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
