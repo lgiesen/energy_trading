@@ -36,10 +36,12 @@ def main():
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
-    # Kept for backward compatibility but ignored by fetch_entsoe (no chunk/timeout CLI).
+    # Kept for backward compatibility (currently unused by fetch_entsoe).
     parser.add_argument("--entsoe-timeout", dest="entsoe_timeout", type=int, default=120, help="(unused) ENTSO-E HTTP timeout seconds.")
     parser.add_argument("--entsoe-chunk-days", dest="entsoe_chunk_days", type=int, default=90, help="(unused) ENTSO-E chunk size in days.")
     parser.add_argument("--entsoe-chunk-sleep", dest="entsoe_chunk_sleep", type=float, default=1.0, help="(unused) Sleep seconds between ENTSO-E chunks.")
+    parser.add_argument("--entsoe-chunk-months", type=int, default=3, help="ENTSO-E chunk size in months.")
+    parser.add_argument("--entsoe-workers", type=int, default=3, help="ENTSO-E parallel workers.")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -53,6 +55,8 @@ def main():
         "--start", args.start,
         "--end", args.end,
         "--out", str(out_dir / "entsoe.parquet"),
+        "--chunk-months", str(args.entsoe_chunk_months),
+        "--workers", str(args.entsoe_workers),
     ])
 
     # Day-ahead prices

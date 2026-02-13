@@ -32,8 +32,11 @@ except Exception:  # pragma: no cover - optional dependency
 
 LOGGER = logging.getLogger(__name__)
 
-# DE-LU bidding zone
-REGION_CODE = "10Y1001A1001A83F"
+# Domain codes (kept explicit to avoid mixing bidding-zone and physical/control areas):
+# - DE_LU_BIDDING_ZONE_CODE (10Y1001A1001A82H): use for price endpoints
+# - DE_PHYSICAL_CONTROL_CODE (10Y1001A1001A83F): use for generation/capacity/load
+DE_LU_BIDDING_ZONE_CODE = "10Y1001A1001A82H"
+DE_PHYSICAL_CONTROL_CODE = "10Y1001A1001A83F"
 
 WIND_SOLAR_COLS = ["Wind Onshore", "Wind Offshore", "Solar"]
 
@@ -106,6 +109,16 @@ def _select_wind_solar(df: pd.DataFrame) -> pd.DataFrame:
     if not cols:
         return df.iloc[0:0]
     return df[cols]
+
+
+def _select_wind_solar_any(df: pd.DataFrame) -> pd.DataFrame:
+    """Select wind/solar columns from flat or MultiIndex columns."""
+    if df is None or df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        keep = [c for c in df.columns if c[0] in WIND_SOLAR_COLS]
+        return df[keep] if keep else df.iloc[0:0]
+    return _select_wind_solar(df)
 
 
 def _select_generation_actuals(df: pd.DataFrame) -> pd.DataFrame:
@@ -206,7 +219,7 @@ def _fetch_actuals(
     client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp
 ) -> pd.DataFrame | None:
     try:
-        actuals = _retry(lambda: client.query_generation(REGION_CODE, start=start, end=end))
+        actuals = _retry(lambda: client.query_generation(DE_PHYSICAL_CONTROL_CODE, start=start, end=end))
     except Exception as exc:  # pragma: no cover - network errors
         LOGGER.warning("Actual generation failed: %s", exc)
         return None
@@ -230,7 +243,7 @@ def _fetch_forecast(
     try:
         forecast = _retry(
             lambda: client.query_wind_and_solar_forecast(
-                REGION_CODE, start=start, end=end, process_type=process_type
+                DE_PHYSICAL_CONTROL_CODE, start=start, end=end, process_type=process_type
             )
         )
     except Exception as exc:  # pragma: no cover - network errors
@@ -251,7 +264,7 @@ def _fetch_capacity(
 ) -> pd.DataFrame | None:
     try:
         capacity = _retry(lambda: client.query_installed_generation_capacity(
-            REGION_CODE, start=start, end=end
+            DE_PHYSICAL_CONTROL_CODE, start=start, end=end
         ))
     except Exception as exc:  # pragma: no cover - network errors
         LOGGER.warning("Installed capacity fetch failed: %s", exc)
@@ -261,18 +274,35 @@ def _fetch_capacity(
         return None
 
     capacity = _ensure_utc_index(capacity)
-    capacity = _select_wind_solar(capacity)
+    capacity = _select_wind_solar_any(capacity)
     if capacity is None or capacity.empty:
+        LOGGER.warning("Installed capacity response has no Wind/Solar columns.")
         return None
 
-    capacity = capacity.rename(
-        columns={
-            "Wind Onshore": "wind_onshore_capacity_entsoe",
-            "Wind Offshore": "wind_offshore_capacity_entsoe",
-            "Solar": "solar_capacity_entsoe",
-        }
-    )
-    capacity = capacity.resample("1h").ffill()
+    if isinstance(capacity.columns, pd.MultiIndex):
+        cap_map = {}
+        for c in capacity.columns:
+            if c[0] == "Wind Onshore":
+                cap_map[c] = "wind_onshore_capacity_entsoe"
+            elif c[0] == "Wind Offshore":
+                cap_map[c] = "wind_offshore_capacity_entsoe"
+            elif c[0] == "Solar":
+                cap_map[c] = "solar_capacity_entsoe"
+        capacity = capacity.rename(columns=cap_map)
+    else:
+        capacity = capacity.rename(
+            columns={
+                "Wind Onshore": "wind_onshore_capacity_entsoe",
+                "Wind Offshore": "wind_offshore_capacity_entsoe",
+                "Solar": "solar_capacity_entsoe",
+            }
+        )
+
+    # Capacity is sparse (often annual/monthly). Reindex to full hourly chunk and forward-fill.
+    hourly_idx = pd.date_range(start=start, end=end, freq="1h", tz="UTC", inclusive="left")
+    capacity = capacity.sort_index().reindex(hourly_idx).ffill()
+    # Backfill head if first observed capacity point is after chunk start.
+    capacity = capacity.bfill()
     return capacity
 
 

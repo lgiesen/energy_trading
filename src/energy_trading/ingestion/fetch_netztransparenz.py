@@ -397,6 +397,57 @@ def _chunk_range(start: datetime, end: datetime, days: int):
         cur = nxt
 
 
+def _combine_qs_and_operational(
+    qs_df: pl.DataFrame,
+    op_df: pl.DataFrame,
+    base_col: str,
+) -> pl.DataFrame:
+    """Keep QS/operational raw columns and create canonical + source columns."""
+    qs_col = f"{base_col}_qs"
+    op_col = f"{base_col}_op"
+    source_col = f"{base_col}_source"
+    fallback_col = f"{base_col}_source_is_fallback"
+    if base_col not in qs_df.columns:
+        return qs_df
+
+    left = qs_df.rename({base_col: qs_col})
+    right = op_df.rename({base_col: op_col}) if base_col in op_df.columns else pl.DataFrame()
+    if right.is_empty():
+        merged = left.with_columns(pl.lit(None).cast(pl.Float64).alias(op_col))
+    else:
+        merged = left.join(
+            right.select(["timestamp_utc", op_col]),
+            on="timestamp_utc",
+            how="full",
+            coalesce=True,
+        )
+
+    if "timestamp_utc_right" in merged.columns:
+        merged = (
+            merged.with_columns(
+                pl.coalesce([pl.col("timestamp_utc"), pl.col("timestamp_utc_right")]).alias("timestamp_utc")
+            )
+            .drop("timestamp_utc_right")
+        )
+
+    result = (
+        merged.with_columns(
+            [
+                pl.coalesce([pl.col(qs_col), pl.col(op_col)]).alias(base_col),
+                pl.when(pl.col(qs_col).is_not_null())
+                .then(pl.lit("qs"))
+                .when(pl.col(op_col).is_not_null())
+                .then(pl.lit("betrieblich"))
+                .otherwise(pl.lit("missing"))
+                .alias(source_col),
+            ]
+        )
+        .with_columns((pl.col(source_col) == pl.lit("betrieblich")).alias(fallback_col))
+        .sort("timestamp_utc")
+    )
+    return result
+
+
 def fetch_and_merge(
     start: str,
     end: str,
@@ -431,26 +482,32 @@ def fetch_and_merge(
             "rz": f"{base_url}/NrvSaldo/RZSaldo/Betrieblich/{s_str}/{e_str}",
         }
         try:
-            nrv_df = _tidy_nrv(_read_csv(_fetch_csv(urls["nrv"], session, timeout=timeout)))
+            nrv_qs_df = _tidy_nrv(_read_csv(_fetch_csv(urls["nrv"], session, timeout=timeout)))
             rebap_df = _tidy_rebap(_read_csv(_fetch_csv(urls["rebap"], session, timeout=timeout)))
-            rz_df = _tidy_rz_saldo(_read_csv(_fetch_csv(urls["rz"], session, timeout=timeout)))
+            rz_qs_df = _tidy_rz_saldo(_read_csv(_fetch_csv(urls["rz"], session, timeout=timeout)))
+            try:
+                rz_op_df = _tidy_rz_saldo(_read_csv(_fetch_csv(urls_operational["rz"], session, timeout=timeout)))
+                nrv_op_df = _tidy_nrv(_read_csv(_fetch_csv(urls_operational["nrv"], session, timeout=timeout)))
+            except Exception as exc:
+                LOGGER.warning("Operational fetch failed for %s -> %s: %s", s_str, e_str, exc)
+                rz_op_df = rz_qs_df.select(["timestamp_utc"]).with_columns(
+                    pl.lit(None).cast(pl.Float64).alias("rz_saldo_mw")
+                ).head(0)
+                nrv_op_df = nrv_qs_df.select(["timestamp_utc"]).with_columns(
+                    pl.lit(None).cast(pl.Float64).alias("NRV_balance")
+                ).head(0)
+
+            rz_df = _combine_qs_and_operational(rz_qs_df, rz_op_df, "rz_saldo_mw")
+            nrv_df = _combine_qs_and_operational(nrv_qs_df, nrv_op_df, "NRV_balance")
             rz_nulls = rz_df.select(pl.col("rz_saldo_mw").null_count()).item()
             nrv_nulls = nrv_df.select(pl.col("NRV_balance").null_count()).item()
-            if rz_nulls > 0 or nrv_nulls > 0:
-                LOGGER.warning(
-                    "RZ/NRV nulls for %s -> %s (rz=%s nrv=%s). Trying Betrieblich fallback.",
-                    s_str,
-                    e_str,
-                    rz_nulls,
-                    nrv_nulls,
-                )
-                try:
-                    rz_oper = _tidy_rz_saldo(_read_csv(_fetch_csv(urls_operational["rz"], session, timeout=timeout)))
-                    nrv_oper = _tidy_nrv(_read_csv(_fetch_csv(urls_operational["nrv"], session, timeout=timeout)))
-                    rz_df = rz_df.join(rz_oper, on="timestamp_utc", how="full", coalesce=True)
-                    nrv_df = nrv_df.join(nrv_oper, on="timestamp_utc", how="full", coalesce=True)
-                except Exception as exc:
-                    LOGGER.warning("Betrieblich fallback failed for %s -> %s: %s", s_str, e_str, exc)
+            LOGGER.debug(
+                "RZ/NRV merged %s -> %s (nulls rz=%s nrv=%s).",
+                s_str,
+                e_str,
+                rz_nulls,
+                nrv_nulls,
+            )
             afrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["afrr"], session, timeout=timeout)), "afrr_activated")
             mfrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["mfrr"], session, timeout=timeout)), "mfrr_activated")
             merged = (

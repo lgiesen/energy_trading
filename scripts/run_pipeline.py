@@ -45,6 +45,8 @@ def main() -> None:
         "--end", args.end,
         "--out-dir", str(out_dir),
         "--merged", args.merged,
+        "--entsoe-chunk-months", str(args.entsoe_chunk_months),
+        "--entsoe-workers", str(args.entsoe_workers),
         *( ["--skip-commodities"] if args.skip_commodities else [] ),
         *( ["--skip-smard"] if args.skip_smard else [] ),
     ])

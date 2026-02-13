@@ -4,6 +4,8 @@ Usage:
     ./.venv/bin/python -m energy_trading.processing.transform_data \
         --in data/processed/all_data_clean.parquet \
         --out data/processed/all_data_transformed.parquet
+
+TODO: Keep in mind: predict the downward and upward activation probabilities separately!
 """
 from __future__ import annotations
 

@@ -68,6 +68,58 @@ def _recalc_total_wind_error(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def _apply_capacity_fallback(df: pl.DataFrame) -> pl.DataFrame:
+    """Fill ENTSO-E capacity gaps from SMARD capacity columns when available."""
+    fallback_candidates = {
+        "wind_onshore": [
+            "wind_onshore_capacity_smard",
+            "wind_onshore_capacity",
+            "wind_onshore_installed_capacity_mw",
+        ],
+        "wind_offshore": [
+            "wind_offshore_capacity_smard",
+            "wind_offshore_capacity",
+            "wind_offshore_installed_capacity_mw",
+        ],
+        "solar": [
+            "solar_capacity_smard",
+            "solar_capacity",
+            "solar_installed_capacity_mw",
+        ],
+    }
+
+    for tech, candidates in fallback_candidates.items():
+        entsoe_col = f"{tech}_capacity_entsoe"
+        if entsoe_col not in df.columns:
+            continue
+
+        smard_cols = [c for c in candidates if c in df.columns]
+        orig_col = f"__{tech}_capacity_entsoe_orig"
+        df = df.with_columns(pl.col(entsoe_col).alias(orig_col))
+        if smard_cols:
+            df = df.with_columns(
+                pl.coalesce([pl.col(entsoe_col)] + [pl.col(c) for c in smard_cols]).alias(entsoe_col)
+            )
+            smard_any = pl.coalesce([pl.col(c) for c in smard_cols]).is_not_null()
+            df = df.with_columns(
+                pl.when(pl.col(orig_col).is_not_null())
+                .then(pl.lit("entsoe"))
+                .when(smard_any)
+                .then(pl.lit("smard_fallback"))
+                .otherwise(pl.lit("missing"))
+                .alias(f"{tech}_capacity_source")
+            )
+        else:
+            df = df.with_columns(
+                pl.when(pl.col(orig_col).is_null())
+                .then(pl.lit("missing"))
+                .otherwise(pl.lit("entsoe"))
+                .alias(f"{tech}_capacity_source")
+            )
+        df = df.drop(orig_col)
+    return df
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Handle missing values for modeling.")
@@ -129,6 +181,7 @@ def main() -> None:
 
     df = _recalc_onshore_error(df)
     df = _recalc_total_wind_error(df)
+    df = _apply_capacity_fallback(df)
 
     # 4) Intraday price: fill with day-ahead if missing
     if "price_intraday_eur" in df.columns and "da_price_d_eur_mwh" in df.columns:
