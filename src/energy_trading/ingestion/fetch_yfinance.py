@@ -3,10 +3,10 @@ Fetch commodity prices (TTF gas, CO2, API2 coal) from Yahoo Finance and store as
 
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_yfinance \
-        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+        --start 2020-11-30T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/yfinance.parquet
 
-Outputs:
+        Outputs:
     - yfinance.parquet with daily prices upsampled to hourly (ffill).
 """
 from __future__ import annotations
@@ -28,22 +28,32 @@ LOGGER = logging.getLogger(__name__)
 # - API2 coal
 # - CO2 EUA
 CANDIDATE_TICKERS: Dict[str, list[str]] = {
-    "gas_price_ttf": ["TTF=F", "TTF1!"],
-    "coal_price_api2": ["MTF=F", "MTF1!"],
-    "co2_price_eua": ["CO2.L", "CHEC.SW", "CBU2.DE", "EUA=F", "C02.F", "CO2.DE", "ECF2.EX"],
+    "gas_price_ttf": ["TTF=F"],
+    "coal_price_api2": ["MTF=F"],
+    "co2_price_eua": ["CO2.L", "CBU2.DE"],
 }
 
 
+def _configure_third_party_logging() -> None:
+    # Keep pipeline logs readable: yfinance emits error logs for stale/delisted symbols.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+
 def _download_adj_close(ticker: str, start: str, end: str, interval: str) -> pd.Series | None:
-    df = yf.download(
-        ticker,
-        start=start,
-        end=end,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        group_by="column",
-    )
+    try:
+        df = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            group_by="column",
+            threads=False,
+        )
+    except Exception as exc:
+        LOGGER.warning("Failed to download %s: %s", ticker, exc)
+        return None
     if df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -76,9 +86,17 @@ def fetch_prices(start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         series_list.append(df_cand[[col_name]])
 
     if not series_list:
-        raise RuntimeError("No data downloaded for any ticker.")
+        # Keep schema stable even when Yahoo has no usable symbols in this run.
+        idx = pd.date_range(start=pd.to_datetime(start, utc=True), end=pd.to_datetime(end, utc=True), freq="1D")
+        empty = pd.DataFrame({"timestamp": idx})
+        for col_name in CANDIDATE_TICKERS:
+            empty[col_name] = pd.NA
+        return empty
 
     merged = pd.concat(series_list, axis=1, sort=False).sort_index()
+    for col_name in CANDIDATE_TICKERS:
+        if col_name not in merged.columns:
+            merged[col_name] = pd.NA
     merged = merged[~merged.index.duplicated(keep="last")]
     merged = merged.reset_index()
     if "timestamp" not in merged.columns:
@@ -108,6 +126,7 @@ def upsample_daily_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    _configure_third_party_logging()
     parser = argparse.ArgumentParser(description="Fetch TTF gas, EUA CO2, and API2 coal prices from Yahoo Finance.")
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")

@@ -289,6 +289,25 @@ def _fetch_monthly_overview(
     return pd.concat(frames, ignore_index=True)
 
 
+def _close_isolated_hourly_gaps(df_hourly: pd.DataFrame) -> pd.DataFrame:
+    """Close isolated 1-hour holes (common around DST boundary conversions)."""
+    if df_hourly.empty:
+        return df_hourly
+    out = df_hourly.copy()
+    out = out.asfreq("1h")
+    for col in out.columns:
+        s = out[col]
+        if not pd.api.types.is_numeric_dtype(s):
+            continue
+        nulls = s.isna()
+        isolated = nulls & ~nulls.shift(1, fill_value=False) & ~nulls.shift(-1, fill_value=False)
+        if not isolated.any():
+            continue
+        interp = s.interpolate(limit=1, limit_direction="both")
+        out.loc[isolated, col] = interp.loc[isolated]
+    return out
+
+
 def fetch_and_parse_regelleistung(
     year: int,
     market_type: str,
@@ -319,7 +338,7 @@ def fetch_and_parse_regelleistung(
     # If this is the start year, accept partial yearly data if it covers the requested window.
     allow_partial = False
     if (
-        market_type == "ENERGY"
+        market_type in {"ENERGY", "CAPACITY"}
         and start_dt is not None
         and year == start_dt.year
         and not df.empty
@@ -328,12 +347,14 @@ def fetch_and_parse_regelleistung(
         max_date = _parse_date_series(df[date_col]).max()
         if pd.notna(max_date) and max_date.date() >= start_dt.date():
             allow_partial = True
-            LOGGER.info("Yearly ENERGY %s accepted as partial coverage (max date %s).", year, max_date.date())
+            LOGGER.info("Yearly %s %s accepted as partial coverage (max date %s).", market_type, year, max_date.date())
 
-    # If ENERGY is missing or sparse, try monthly fallbacks.
-    if market_type == "ENERGY" and (df.empty or len(df) < 4000) and not allow_partial:
+    # If yearly file is missing/sparse, try monthly fallbacks (ENERGY and CAPACITY).
+    min_rows = 4000 if market_type == "ENERGY" else 2000
+    if market_type in {"ENERGY", "CAPACITY"} and (df.empty or len(df) < min_rows) and not allow_partial:
         LOGGER.warning(
-            "Yearly ENERGY file for %s is missing or sparse (%s rows). Falling back to monthly files.",
+            "Yearly %s file for %s is missing or sparse (%s rows). Falling back to monthly files.",
+            market_type,
             year,
             len(df),
         )
@@ -396,7 +417,7 @@ def fetch_and_parse_regelleistung(
             avg_col = _find_col(df_part, ["AVERAGE", "ENERGY", "PRICE"])
             off_col = _find_col(df_part, ["OFFERED", "CAPACITY"])
             if marg_col:
-                val_cols[marg_col] = "afrr_activation_price"
+                val_cols[marg_col] = "afrr_activation_marginal_price"
             if avg_col:
                 val_cols[avg_col] = "afrr_activation_avg_price"
             if off_col:
@@ -438,14 +459,6 @@ def fetch_and_parse_regelleistung(
             new_cols.append(f"{val_cols[orig_metric]}_{direction}")
         df_pivot.columns = new_cols
 
-        # Drop marginal activation price columns if present.
-        drop_cols = [
-            c for c in df_pivot.columns
-            if c in {"afrr_activation_price_pos", "afrr_activation_price_neg"}
-        ]
-        if drop_cols:
-            df_pivot = df_pivot.drop(columns=drop_cols)
-
         if net_series is not None:
             df_pivot = df_pivot.join(net_series, how="left")
 
@@ -465,6 +478,7 @@ def fetch_and_parse_regelleistung(
         return pd.DataFrame()
     df_pivot = pd.concat(parts).sort_index()
     df_pivot = df_pivot[~df_pivot.index.duplicated(keep="first")]
+    df_pivot = _close_isolated_hourly_gaps(df_pivot)
     return df_pivot
 
 

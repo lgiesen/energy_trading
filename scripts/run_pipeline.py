@@ -29,6 +29,21 @@ def main() -> None:
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
+    parser.add_argument(
+        "--smard-download-market-data-csv",
+        action="store_true",
+        help="Deprecated: SMARD CSV download is default. Kept for compatibility.",
+    )
+    parser.add_argument(
+        "--smard-skip-market-data-csv",
+        action="store_true",
+        help="Skip SMARD market-data CSV download during SMARD fetch.",
+    )
+    parser.add_argument(
+        "--smard-market-data-out",
+        default=None,
+        help="Optional path for SMARD market-data CSV output.",
+    )
     parser.add_argument("--skip-features", action="store_true", help="Stop after transform step.")
     parser.add_argument("--entsoe-chunk-months", type=int, default=3, help="ENTSO-E chunk size in months.")
     parser.add_argument("--entsoe-workers", type=int, default=3, help="ENTSO-E parallel workers.")
@@ -49,6 +64,9 @@ def main() -> None:
         "--entsoe-workers", str(args.entsoe_workers),
         *( ["--skip-commodities"] if args.skip_commodities else [] ),
         *( ["--skip-smard"] if args.skip_smard else [] ),
+        *( ["--smard-download-market-data-csv"] if args.smard_download_market_data_csv else [] ),
+        *( ["--smard-skip-market-data-csv"] if args.smard_skip_market_data_csv else [] ),
+        *( ["--smard-market-data-out", args.smard_market_data_out] if args.smard_market_data_out else [] ),
     ])
 
     # 2) Handle missing values

@@ -4,12 +4,15 @@ Usage:
     ./.venv/bin/python -m energy_trading.ingestion.merge_data \
         --data-dir data/raw \
         --out data/processed/all_data.parquet \
-        --clip-start 2020-11-30T23:00:00 \
-        --clip-end 2026-01-01T02:00:00
+        --clip-start 2020-11-30T23:00:00Z \
+        --clip-end 2025-12-31T22:00:00Z
+
 
 Notes:
     - Prefers timestamp_utc if available.
     - Drops other timestamp columns to avoid duplicate/suffixed fields.
+    - `--clip-start/--clip-end` accept timezone-aware ISO values (recommended: UTC with `Z`).
+      If no timezone is provided, values are interpreted as Europe/Berlin local time.
 """
 from __future__ import annotations
 
@@ -191,8 +194,18 @@ def main():
         default="1h",
         help="Optional resample frequency before merge (default: 1h). Use '' to disable.",
     )
-    parser.add_argument("--clip-start", default="", help="Optional CET start timestamp (e.g. 2022-01-01T00:00:00).")
-    parser.add_argument("--clip-end", default="", help="Optional CET end timestamp (e.g. 2025-12-31T00:00:00).")
+    parser.add_argument(
+        "--clip-start",
+        default="",
+        help="Optional clip start (timezone-aware recommended, e.g. 2020-11-30T23:00:00Z). "
+             "Naive values are interpreted as Europe/Berlin.",
+    )
+    parser.add_argument(
+        "--clip-end",
+        default="",
+        help="Optional clip end (timezone-aware recommended, e.g. 2025-12-31T22:00:00Z). "
+             "Naive values are interpreted as Europe/Berlin.",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)

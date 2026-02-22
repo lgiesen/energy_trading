@@ -25,6 +25,21 @@ def main() -> None:
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument("--raw-out", default="data/processed/all_data.parquet", help="Output path for raw merged data.")
     parser.add_argument("--clean-out", default="data/processed/all_data_clean.parquet", help="Output path for cleaned data.")
+    parser.add_argument(
+        "--smard-download-market-data-csv",
+        action="store_true",
+        help="Deprecated: SMARD CSV download is default. Kept for compatibility.",
+    )
+    parser.add_argument(
+        "--smard-skip-market-data-csv",
+        action="store_true",
+        help="Skip SMARD market-data CSV download during fetch.",
+    )
+    parser.add_argument(
+        "--smard-market-data-out",
+        default=None,
+        help="Optional path for SMARD market-data CSV output.",
+    )
     args = parser.parse_args()
 
     python_bin = Path(".venv/bin/python")
@@ -36,6 +51,9 @@ def main() -> None:
         "scripts/collect_and_merge_all_data.py",
         "--start", args.start,
         "--end", args.end,
+        *( ["--smard-download-market-data-csv"] if args.smard_download_market_data_csv else [] ),
+        *( ["--smard-skip-market-data-csv"] if args.smard_skip_market_data_csv else [] ),
+        *( ["--smard-market-data-out", args.smard_market_data_out] if args.smard_market_data_out else [] ),
     ])
 
     _run([

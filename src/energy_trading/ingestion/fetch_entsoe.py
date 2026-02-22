@@ -257,55 +257,6 @@ def _fetch_forecast(
     forecast = _select_wind_solar(forecast)
     forecast = _rename_forecast_cols(forecast, suffix)
     return _resample_hourly(forecast)
-
-
-def _fetch_capacity(
-    client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp
-) -> pd.DataFrame | None:
-    try:
-        capacity = _retry(lambda: client.query_installed_generation_capacity(
-            DE_PHYSICAL_CONTROL_CODE, start=start, end=end
-        ))
-    except Exception as exc:  # pragma: no cover - network errors
-        LOGGER.warning("Installed capacity fetch failed: %s", exc)
-        return None
-
-    if capacity is None or len(capacity) == 0:
-        return None
-
-    capacity = _ensure_utc_index(capacity)
-    capacity = _select_wind_solar_any(capacity)
-    if capacity is None or capacity.empty:
-        LOGGER.warning("Installed capacity response has no Wind/Solar columns.")
-        return None
-
-    if isinstance(capacity.columns, pd.MultiIndex):
-        cap_map = {}
-        for c in capacity.columns:
-            if c[0] == "Wind Onshore":
-                cap_map[c] = "wind_onshore_capacity_entsoe"
-            elif c[0] == "Wind Offshore":
-                cap_map[c] = "wind_offshore_capacity_entsoe"
-            elif c[0] == "Solar":
-                cap_map[c] = "solar_capacity_entsoe"
-        capacity = capacity.rename(columns=cap_map)
-    else:
-        capacity = capacity.rename(
-            columns={
-                "Wind Onshore": "wind_onshore_capacity_entsoe",
-                "Wind Offshore": "wind_offshore_capacity_entsoe",
-                "Solar": "solar_capacity_entsoe",
-            }
-        )
-
-    # Capacity is sparse (often annual/monthly). Reindex to full hourly chunk and forward-fill.
-    hourly_idx = pd.date_range(start=start, end=end, freq="1h", tz="UTC", inclusive="left")
-    capacity = capacity.sort_index().reindex(hourly_idx).ffill()
-    # Backfill head if first observed capacity point is after chunk start.
-    capacity = capacity.bfill()
-    return capacity
-
-
 def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp) -> pl.DataFrame:
     LOGGER.info("Fetching %s to %s", start, end)
 
@@ -318,9 +269,7 @@ def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timesta
         LOGGER.warning("A18 returned empty; trying A40 for intraday/current forecasts.")
         id_forecast = _fetch_forecast(client, start, end, process_type="A40", suffix="id")
 
-    capacity = _fetch_capacity(client, start, end)
-
-    frames = [df for df in (actuals, da, id_forecast, capacity) if df is not None and len(df) > 0]
+    frames = [df for df in (actuals, da, id_forecast) if df is not None and len(df) > 0]
     if frames:
         df = pd.concat(frames, axis=1, join="outer", sort=False)
         # Final cleanup: enforce actual column names in case tuple-like names survived.

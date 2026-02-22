@@ -4,15 +4,31 @@ Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_smard \
         --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
         --out data/raw/smard.parquet
+        --market-data-out data/raw/installed_capacity.csv
+
+    Disable CSV download (timeseries-only):
+    ./.venv/bin/python -m energy_trading.ingestion.fetch_smard \
+        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+        --out data/raw/smard.parquet \
+        --skip-market-data-csv
 
 Outputs:
-    - smard.parquet with hourly data aligned on timestamp.
+    - data/raw/smard.parquet (hourly SMARD timeseries + joined installed capacity columns)
+    - data/raw/installed_capacity.csv (downloaded binary CSV from nip-download-manager API)
 
 Columns (high level):
-    - actuals: load, residual load, wind onshore/offshore, solar
+    - actuals: residual load, wind onshore/offshore, solar
     - forecasts: day-ahead wind/solar
+    - generation by fuel: lignite, hard coal, gas, nuclear, hydro pumped storage
     - prices: da_price_eur (hourly), price_intraday_eur (hourly mean)
     - engineered: forecast errors, wind_forecast_de, system_stress_signal
+
+API notes:
+    - chart_data API (GET): continuous timeseries used for smard.parquet
+      Endpoint pattern: https://www.smard.de/app/chart_data/{filter_id}/{region}/{file}.json
+    - nip-download-manager API (POST): bulk market-data export used for installed_capacity.csv
+      Endpoint: https://www.smard.de/nip-download-manager/nip/download/market-data
+    - Default behavior in this script: run both APIs in one command.
 """
 from __future__ import annotations
 
@@ -24,6 +40,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import pandas as pd
 import polars as pl
 import requests
 
@@ -68,6 +85,36 @@ GENERATION_CANDIDATES: Dict[str, List[int]] = {
     "generation_hydro_pumped_storage_mw": [4066],
 }
 
+MARKET_DATA_INIT_URL = "https://www.smard.de/en/downloadcenter/download-market-data/"
+MARKET_DATA_POST_URL = "https://www.smard.de/nip-download-manager/nip/download/market-data"
+MARKET_DATA_PAYLOAD = {
+    "request_form": [
+        {
+            "format": "CSV",
+            "moduleIds": [
+                3004073,
+                3004076,
+                3004072,
+                3004074,
+                3004075,
+                3000186,
+                3000188,
+                3000189,
+                3000194,
+                3000198,
+                3003792,
+                3000207,
+            ],
+            "region": "DE-LU",
+            "timestamp_from": 1609455600000,
+            "timestamp_to": 1769900400000,
+            "type": "discrete",
+            "language": "en",
+            "resolution": "hour",
+        }
+    ]
+}
+
 
 def _make_session(retries: int = 3, backoff: float = 0.3) -> requests.Session:
     """Create a requests session with simple retries."""
@@ -84,6 +131,150 @@ def _make_session(retries: int = 3, backoff: float = 0.3) -> requests.Session:
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+
+
+def download_market_data_csv(out_path: Path) -> None:
+    """Replicate SMARD market-data POST download and save CSV as binary stream."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.Session() as session:
+        user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/144.0.0.0 Safari/537.36"
+        )
+        # Initialize session/cookies.
+        session.get(MARKET_DATA_INIT_URL, headers={"User-Agent": user_agent}, timeout=60).raise_for_status()
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": user_agent,
+            "Referer": MARKET_DATA_INIT_URL,
+        }
+        resp = session.post(
+            MARKET_DATA_POST_URL,
+            headers=headers,
+            json=MARKET_DATA_PAYLOAD,
+            timeout=180,
+            stream=True,
+        )
+        status_code = resp.status_code
+        resp.raise_for_status()
+
+        with out_path.open("wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    print(f"Downloaded {out_path} (status={status_code}, bytes={out_path.stat().st_size})")
+
+
+def load_installed_capacity_csv(
+    csv_path: Path,
+    start: datetime,
+    end: datetime,
+) -> pl.DataFrame | None:
+    """Load SMARD market-data CSV and return selected capacity columns on timestamp_utc."""
+    if not csv_path.exists():
+        LOGGER.info("Installed capacity CSV not found at %s (skip join).", csv_path)
+        return None
+
+    # SMARD export may prepend metadata lines and place real header later.
+    raw_text = csv_path.read_text(encoding="utf-8-sig", errors="replace")
+    lines = raw_text.splitlines()
+    header_idx = None
+    delimiter = ";"
+    for i, line in enumerate(lines):
+        l = line.strip()
+        if not l:
+            continue
+        if l.startswith("Start date;") or l.startswith("Start date\t"):
+            header_idx = i
+            delimiter = "\t" if "\t" in l and ";" not in l else ";"
+            break
+    if header_idx is None:
+        LOGGER.warning("Installed capacity CSV header row not found in %s", csv_path)
+        return None
+
+    df = pd.read_csv(
+        csv_path,
+        sep=delimiter,
+        encoding="utf-8-sig",
+        skiprows=header_idx,
+        header=0,
+    )
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Start date" not in df.columns:
+        LOGGER.warning("Installed capacity CSV missing 'Start date' column after parsing: %s", csv_path)
+        return None
+
+    mapping_candidates = {
+        "wind_onshore_capacity": [
+            "Wind onshore [MW]",
+            "Wind onshore [MW] Calculated resolutions",
+        ],
+        "wind_offshore_capacity": [
+            "Wind offshore [MW]",
+            "Wind offshore [MW] Calculated resolutions",
+        ],
+        "solar_capacity": [
+            "Photovoltaics [MW]",
+            "Photovoltaics [MW] Calculated resolutions",
+        ],
+        "gas_capacity": [
+            "Fossil gas [MW]",
+            "Fossil gas [MW] Calculated resolutions",
+        ],
+        "hard_coal_capacity": [
+            "Hard coal [MW]",
+            "Hard coal [MW] Calculated resolutions",
+        ],
+        "lignite_capacity": [
+            "Lignite [MW]",
+            "Lignite [MW] Calculated resolutions",
+        ],
+        "pumped_storage_capacity": [
+            "Hydro pumped storage [MW]",
+            "Hydro pumped storage [MW] Calculated resolutions",
+        ],
+    }
+    available: Dict[str, str] = {}
+    for out_col, candidates in mapping_candidates.items():
+        src = next((c for c in candidates if c in df.columns), None)
+        if src:
+            available[src] = out_col
+    if not available:
+        LOGGER.warning("Installed capacity CSV has none of the expected capacity columns: %s", csv_path)
+        return None
+
+    keep_cols = ["Start date"] + list(available.keys())
+    df = df[keep_cols].rename(columns={"Start date": "timestamp_utc", **available})
+    df["timestamp_utc"] = pd.to_datetime(
+        df["timestamp_utc"],
+        format="%b %d, %Y %I:%M %p",
+        errors="coerce",
+    )
+    # CSV timestamps are in local German market time.
+    df["timestamp_utc"] = (
+        df["timestamp_utc"]
+        .dt.tz_localize("Europe/Berlin", ambiguous="infer", nonexistent="shift_forward")
+        .dt.tz_convert("UTC")
+    )
+
+    cap_cols = list(available.values())
+    for col in cap_cols:
+        s = df[col].astype(str).str.strip()
+        s = s.replace("-", pd.NA)
+        # Example values: "8,428.00" -> 8428.00
+        s = s.str.replace(",", "", regex=False)
+        df[col] = pd.to_numeric(s, errors="coerce")
+
+    # Keep only requested window and one value per hour.
+    df = df[(df["timestamp_utc"] >= start) & (df["timestamp_utc"] <= end)]
+    df["timestamp_utc"] = df["timestamp_utc"].dt.floor("h")
+    df = df.sort_values("timestamp_utc").drop_duplicates(subset=["timestamp_utc"], keep="last")
+    if df.empty:
+        return None
+
+    return pl.from_pandas(df)
 
 
 def _available_timestamps(filter_id: int, region: str, resolution: str, session: requests.Session) -> List[int]:
@@ -463,28 +654,6 @@ def fetch_smard(
         merged = merged.with_columns(pl.col("timestamp").dt.convert_time_zone("Europe/Berlin").alias("timestamp_cet"))
         merged = merged.drop("timestamp")
 
-    # Procured capacity proxy (offered capacity) from capacity overview.
-    try:
-        try:
-            from .fetch_afrr_procured_capacity import fetch_procured_capacity
-        except ImportError:
-            from energy_trading.ingestion.fetch_afrr_procured_capacity import fetch_procured_capacity
-        with requests.Session() as session:
-            proc = fetch_procured_capacity(start.isoformat(), end.isoformat(), session)
-        if not proc.empty:
-            proc_pl = pl.from_pandas(proc.reset_index())
-            if "timestamp_utc" not in proc_pl.columns and "timestamp" in proc_pl.columns:
-                proc_pl = proc_pl.rename({"timestamp": "timestamp_utc"})
-            proc_pl = proc_pl.with_columns(
-                pl.col("timestamp_utc")
-                .dt.truncate("1h")
-                .dt.cast_time_unit("ms")
-                .alias("timestamp_utc")
-            )
-            merged = merged.join(proc_pl, on="timestamp_utc", how="left")
-    except Exception as exc:
-        LOGGER.warning("Failed to fetch procured capacity proxy: %s", exc)
-
     return merged
 
 
@@ -500,6 +669,16 @@ def main() -> None:
         default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "smard.parquet"),
         help="Output parquet path.",
     )
+    parser.add_argument(
+        "--skip-market-data-csv",
+        action="store_true",
+        help="Skip market-data CSV download and only use chart_data API.",
+    )
+    parser.add_argument(
+        "--market-data-out",
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "installed_capacity.csv"),
+        help="Output path for SMARD market-data CSV download.",
+    )
     args = parser.parse_args()
 
     start_dt = datetime.fromisoformat(args.start)
@@ -513,14 +692,24 @@ def main() -> None:
     else:
         end_dt = end_dt.astimezone(timezone.utc)
 
+    if not args.skip_market_data_csv:
+        download_market_data_csv(Path(args.market_data_out))
+
     df = fetch_smard(start_dt, end_dt, region=args.region, resolution=args.resolution)
+    cap_df = load_installed_capacity_csv(Path(args.market_data_out), start_dt, end_dt)
+    if cap_df is not None and cap_df.height > 0:
+        # Align join-key dtype with SMARD frame (datetime[ms, UTC]).
+        cap_df = cap_df.with_columns(
+            pl.col("timestamp_utc").dt.cast_time_unit("ms").alias("timestamp_utc")
+        )
+        df = df.join(cap_df, on="timestamp_utc", how="left", coalesce=True)
+        LOGGER.info("Joined installed capacity CSV (%s rows) into smard parquet.", cap_df.height)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Drop SMARD load duplicate if it exists (we use ENTSO-E load_actual).
     if "load_actual_smard" in df.columns:
         df = df.drop("load_actual_smard")
     df.write_parquet(out_path, compression="zstd")
-
 
 if __name__ == "__main__":
     main()

@@ -1,10 +1,81 @@
-"""Feature engineering module for building features from transformed data."""
+"""Feature engineering for model-ready training/backtest data.
+
+Target design (aFRR PICASSO):
+- `y_true_*`: economically correct pay-as-cleared marginal price (for backtests/PnL).
+- `y_train_*`: clipped version of `y_true_*` (for stable ML regression training).
+
+Rationale:
+- Average activation prices are not valid settlement targets in pay-as-cleared setup.
+- Extreme sentinel values (about +/-99,999) are technical artifacts and are neutralized
+  only when activation is effectively zero.
+- Real scarcity spikes are preserved in `y_true_*` and clipped only in `y_train_*`.
+"""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
 import polars as pl
+
+
+def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
+    """Create pay-as-cleared targets for both economics and ML.
+
+    Inputs required:
+    - `afrr_activation_marginal_price_pos`, `afrr_activation_marginal_price_neg`
+    - `afrr_activated_mwh_pos`, `afrr_activated_mwh_neg`
+
+    Outputs created:
+    - `y_true_pos`, `y_true_neg`: cleaned, *unclipped* marginal price
+    - `y_train_pos`, `y_train_neg`: clipped targets in [-500, 500]
+    """
+    required = [
+        "afrr_activation_marginal_price_pos",
+        "afrr_activation_marginal_price_neg",
+        "afrr_activated_mwh_pos",
+        "afrr_activated_mwh_neg",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required target-engineering columns: {missing}")
+
+    # 1) Prevent leakage from economically incorrect target candidates.
+    #    Keep only marginal-price-based targets for a pay-as-cleared market.
+    drop_avg = [c for c in ("afrr_activation_avg_price_pos", "afrr_activation_avg_price_neg") if c in df.columns]
+    if drop_avg:
+        df = df.drop(drop_avg)
+
+    sentinel_abs = 90_000.0
+    clip_low = -500.0
+    clip_high = 500.0
+
+    # 2) y_true: economically valid backtest target (pay-as-cleared marginal price),
+    # with only technical sentinel values neutralized when activation is effectively zero.
+    df = df.with_columns([
+        pl.when(
+            (pl.col("afrr_activation_marginal_price_pos").cast(pl.Float64).abs() > sentinel_abs)
+            & (pl.col("afrr_activated_mwh_pos").cast(pl.Float64).fill_null(0.0).abs() == 0.0)
+        )
+        .then(0.0)
+        .otherwise(pl.col("afrr_activation_marginal_price_pos").cast(pl.Float64))
+        .alias("y_true_pos"),
+        pl.when(
+            (pl.col("afrr_activation_marginal_price_neg").cast(pl.Float64).abs() > sentinel_abs)
+            & (pl.col("afrr_activated_mwh_neg").cast(pl.Float64).fill_null(0.0).abs() == 0.0)
+        )
+        .then(0.0)
+        .otherwise(pl.col("afrr_activation_marginal_price_neg").cast(pl.Float64))
+        .alias("y_true_neg"),
+    ])
+
+    # 3) y_train: ML-stable target. Clip tails to protect MSE from rare scarcity spikes.
+    df = df.with_columns([
+        pl.col("y_true_pos").clip(clip_low, clip_high).alias("y_train_pos"),
+        pl.col("y_true_neg").clip(clip_low, clip_high).alias("y_train_neg"),
+    ])
+
+    # 4) Cleanup raw marginal columns to avoid accidental downstream use.
+    return df.drop(["afrr_activation_marginal_price_pos", "afrr_activation_marginal_price_neg"])
 
 
 def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -24,6 +95,16 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
     drop_smard = [c for c in drop_smard if c in df.columns]
     if drop_smard:
         df = df.drop(drop_smard)
+
+    # Keep pay-as-cleared marginal prices as market target inputs; drop average activation prices.
+    drop_avg_activation_prices = [
+        "afrr_activation_avg_price_pos",
+        "afrr_activation_avg_price_neg",
+        "GERMANY_AVERAGE_ENERGY_PRICE_[EUR/MWh]",
+    ]
+    drop_avg_activation_prices = [c for c in drop_avg_activation_prices if c in df.columns]
+    if drop_avg_activation_prices:
+        df = df.drop(drop_avg_activation_prices)
 
     price_col = None
     for candidate in ("da_price", "da_price_d_eur_mwh", "da_price_eur"):
@@ -133,6 +214,7 @@ def build_features(input_path: Path, output_path: Path) -> None:
     if "timestamp_utc" in df.columns:
         df = df.sort("timestamp_utc")
 
+    df = engineer_targets(df)
     df = add_confidence_features(df)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

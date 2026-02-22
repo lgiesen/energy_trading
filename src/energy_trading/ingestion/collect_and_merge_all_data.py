@@ -8,6 +8,7 @@ Runs:
 - Day-ahead prices (Energy Charts)
 - Netztransparenz
 - SMARD
+- Optional SMARD market-data CSV (installed_capacity.csv)
 - Commodities (Yahoo Finance)
 - Merge all parquets into one file
 """
@@ -36,12 +37,37 @@ def main():
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
+    parser.add_argument(
+        "--smard-download-market-data-csv",
+        action="store_true",
+        help="Deprecated: SMARD CSV download is now default. Kept for compatibility.",
+    )
+    parser.add_argument(
+        "--smard-skip-market-data-csv",
+        action="store_true",
+        help="Skip SMARD market-data CSV download (installed_capacity.csv).",
+    )
+    parser.add_argument(
+        "--smard-market-data-out",
+        default=None,
+        help="Optional path for SMARD market-data CSV output (default: <out-dir>/installed_capacity.csv).",
+    )
     # Kept for backward compatibility (currently unused by fetch_entsoe).
     parser.add_argument("--entsoe-timeout", dest="entsoe_timeout", type=int, default=120, help="(unused) ENTSO-E HTTP timeout seconds.")
     parser.add_argument("--entsoe-chunk-days", dest="entsoe_chunk_days", type=int, default=90, help="(unused) ENTSO-E chunk size in days.")
     parser.add_argument("--entsoe-chunk-sleep", dest="entsoe_chunk_sleep", type=float, default=1.0, help="(unused) Sleep seconds between ENTSO-E chunks.")
     parser.add_argument("--entsoe-chunk-months", type=int, default=3, help="ENTSO-E chunk size in months.")
     parser.add_argument("--entsoe-workers", type=int, default=3, help="ENTSO-E parallel workers.")
+    parser.add_argument(
+        "--clip-start",
+        default=None,
+        help="Clip start passed to merge_data (defaults to --start).",
+    )
+    parser.add_argument(
+        "--clip-end",
+        default=None,
+        help="Clip end passed to merge_data (defaults to --end).",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -79,12 +105,20 @@ def main():
 
     # SMARD
     if not args.skip_smard:
-        run([
+        smard_cmd = [
             py, "-m", "energy_trading.ingestion.fetch_smard",
             "--start", args.start,
             "--end", args.end,
             "--out", str(out_dir / "smard.parquet"),
-        ])
+        ]
+        if args.smard_download_market_data_csv:
+            pass
+        if args.smard_skip_market_data_csv:
+            smard_cmd.extend(["--skip-market-data-csv"])
+        if not args.smard_skip_market_data_csv:
+            market_data_out = args.smard_market_data_out or str(out_dir / "installed_capacity.csv")
+            smard_cmd.extend(["--market-data-out", market_data_out])
+        run(smard_cmd)
 
     # yfinance commodities (write to yfinance.parquet)
     if not args.skip_commodities:
@@ -104,10 +138,14 @@ def main():
     ])
 
     # Merge all parquets in out_dir
+    clip_start = args.clip_start or args.start
+    clip_end = args.clip_end or args.end
     run([
         py, "-m", "energy_trading.ingestion.merge_data",
         "--data-dir", str(out_dir),
         "--out", str(Path(args.merged)),
+        "--clip-start", clip_start,
+        "--clip-end", clip_end,
     ])
 
     LOGGER.info("All tasks completed.")
