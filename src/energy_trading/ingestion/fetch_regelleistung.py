@@ -31,6 +31,11 @@ import requests
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 LOGGER = logging.getLogger(__name__)
 
+# Accumulate all 15‑min energy/capacity time series across yearly/monthly files
+# so we can persist the full raw history once at the end (instead of
+# overwriting per iteration).
+ALL_15MIN_DATA: list[pd.DataFrame] = []
+
 
 def _find_col(df: pd.DataFrame, needles: list[str]) -> str | None:
     for c in df.columns:
@@ -125,17 +130,20 @@ def _mol_slope_from_bids(df_bids: pd.DataFrame, market: str) -> pd.DataFrame:
     group_cols = [date_col, prod_col] + ([res_col] if res_col else [])
     rows = []
     for keys, g in df_bids.groupby(group_cols):
-        g = g.sort_values(price_col)
+        # Reset index so idxmax() returns a positional row index for safe lookup.
+        g = g.sort_values(price_col).reset_index(drop=True)
         g["cum"] = g[cap_col].cumsum()
         total = g["cum"].iloc[-1]
         if total < 100:
             slope = float("nan")
         else:
-            p100 = float(pd.Series(g[price_col]).iloc[(g["cum"] >= 100).idxmax()]) if (g["cum"] >= 100).any() else float(g[price_col].max())
+            mask100 = g["cum"] >= 100
+            p100 = float(g.loc[mask100.idxmax(), price_col]) if mask100.any() else float(g[price_col].max())
             if total < 500:
                 p500 = float(g[price_col].max())
             else:
-                p500 = float(pd.Series(g[price_col]).iloc[(g["cum"] >= 500).idxmax()])
+                mask500 = g["cum"] >= 500
+                p500 = float(g.loc[mask500.idxmax(), price_col])
             slope = p500 - p100
         if res_col:
             d, prod, reserve = keys
@@ -374,6 +382,7 @@ def fetch_and_parse_regelleistung(
     mask_qh = prod_str.str.contains(r"_\d{3}") & ~mask_block
 
     def _process_part(df_part: pd.DataFrame, mode: str) -> pd.DataFrame:
+        global ALL_15MIN_DATA
         if df_part.empty:
             return pd.DataFrame()
 
@@ -462,6 +471,9 @@ def fetch_and_parse_regelleistung(
         if net_series is not None:
             df_pivot = df_pivot.join(net_series, how="left")
 
+        # Rohes 15-Minuten-/Block-Zeitgitter sammeln (wird am Ende einmalig geschrieben)
+        ALL_15MIN_DATA.append(df_pivot.copy())
+
         df_pivot = df_pivot.resample("1h").mean()
         return df_pivot
 
@@ -497,6 +509,11 @@ def main() -> None:
         default=str(Path(__file__).resolve().parents[3] / "data" / "raw"),
         help="Directory containing RESULT_LIST_ANONYM_* files (zip/xlsx).",
     )
+    parser.add_argument(
+        "--skip-hourly",
+        action="store_true",
+        help="Skip hourly resample; use processing.upsample_regelleistung instead.",
+    )
     args = parser.parse_args()
 
     start_dt = datetime.fromisoformat(args.start)
@@ -521,6 +538,40 @@ def main() -> None:
     if not all_years:
         LOGGER.warning("No regelleistung data fetched.")
         return
+
+    # Persist komplette 15-Minuten-Historie (Energie/Kapazität) bevor die stündliche
+    # Harmonisierung erfolgt.
+    if ALL_15MIN_DATA:
+        raw_15 = pd.concat(ALL_15MIN_DATA).sort_index()
+        # When capacity and activation sources share the same timestamp, keep
+        # the first non-null value per column instead of dropping one row.
+        # This avoids losing activation prices at :00 where capacity rows
+        # often coexist with activation rows.
+        raw_15 = raw_15.groupby(level=0, sort=True).first()
+        raw_15 = raw_15.loc[(raw_15.index >= start_dt) & (raw_15.index <= end_dt)]
+
+        # Align with other raw 15‑minute files (e.g., Netztransparenz volumes)
+        # by providing an explicit UTC column instead of an unnamed index so
+        # downstream merges on `timestamp_utc` succeed.
+        raw_15_out = raw_15.reset_index()
+        # Normalize index column name regardless of how pandas names it.
+        if "timestamp_utc" not in raw_15_out.columns:
+            if "index" in raw_15_out.columns:
+                raw_15_out = raw_15_out.rename(columns={"index": "timestamp_utc"})
+            elif "timestamp" in raw_15_out.columns:
+                raw_15_out = raw_15_out.rename(columns={"timestamp": "timestamp_utc"})
+            else:
+                raw_15_out.insert(0, "timestamp_utc", raw_15_out.index)
+        raw_15_out = raw_15_out.sort_values("timestamp_utc")
+
+        out_15_path = Path(args.out).resolve().parent / "prices_15min.parquet"
+        out_15_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_15_out.to_parquet(out_15_path, compression="zstd", index=False)
+        LOGGER.info("Wrote %s rows to %s", len(raw_15_out), out_15_path)
+
+        if args.skip_hourly:
+            LOGGER.info("Skip-hourly set; hourly aggregation will be handled downstream.")
+            return
 
     df_master = pd.concat(all_years).sort_index()
     mol_df = process_mol_slope(Path(args.mol_dir))

@@ -135,6 +135,17 @@ def main():
         "--start", args.start,
         "--end", args.end,
         "--out", str(out_dir / "regelleistung.parquet"),
+        "--skip-hourly",
+    ])
+
+    # Upsample 15-min Regelleistung prices to hourly parquet (replaces in-script resample).
+    run([
+        py, "-m", "energy_trading.processing.upsample_regelleistung",
+        "--prices-15-in", str(out_dir / "prices_15min.parquet"),
+        "--out", str(out_dir / "regelleistung.parquet"),
+        "--start", args.start,
+        "--end", args.end,
+        "--mol-dir", str(out_dir),
     ])
 
     # Merge all parquets in out_dir

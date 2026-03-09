@@ -595,6 +595,11 @@ def fetch_and_merge(
         merged = merged.drop("nrv_imbalance")
 
     if resample_every:
+        # 15-Minuten-Frame vor stündlicher Aggregation sichern
+        out_15_path = Path(__file__).resolve().parents[3] / "data" / "raw" / "volumes_15min.parquet"
+        out_15_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.write_parquet(out_15_path)
+
         # 15-min MW -> hourly mean MW; MWh = MW * 0.25 summed per hour.
         mw_cols = [
             "afrr_activated_mw_pos",
