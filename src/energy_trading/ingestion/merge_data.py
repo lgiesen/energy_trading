@@ -5,12 +5,14 @@ Usage:
         --data-dir data/raw \
         --out data/processed/all_data.parquet \
         --clip-start 2020-11-30T23:00:00Z \
-        --clip-end 2025-12-31T22:00:00Z
+        --clip-end 2026-03-01T00:00:00Z
 
 
 Notes:
     - Prefers timestamp_utc if available.
     - Drops other timestamp columns to avoid duplicate/suffixed fields.
+    - Merges all columns produced by fetchers (including anonymous-bid price columns
+      from regelleistung.parquet if present).
     - `--clip-start/--clip-end` accept timezone-aware ISO values (recommended: UTC with `Z`).
       If no timezone is provided, values are interpreted as Europe/Berlin local time.
 """

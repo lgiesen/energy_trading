@@ -1,13 +1,13 @@
 """
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_netztransparenz \
-        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+        --start 2020-12-01T00:00:00Z \
+        --end 2026-03-01T00:00:00Z \
         --chunk-days 30 --chunk-sleep 3 \
         --out data/raw/netztransparenz.parquet
 
-
 Outputs:
-    - netztransparenz.parquet with hourly data aligned on timestamp_utc.
+    - netztransparenz.parquet with hourly data aligned on timestamp_utc (UTC).
 
 Includes:
     - NRV-Saldo (NRV_balance)
@@ -15,6 +15,10 @@ Includes:
     - aFRR/mFRR activated volumes (afrr_activated_mw_*, mfrr_activated_mw_*)
     - hourly energy totals (afrr_activated_mwh_*, mfrr_activated_mwh_*)
     - RZ-Saldo (rz_saldo_mw + per-TSO columns)
+
+Auth:
+    - Reads credentials/token from .env (NETZTRANSPARENZ_* variables).
+    - Token can be direct bearer token or client-credentials based.
 """
 from __future__ import annotations
 
