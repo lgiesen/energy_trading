@@ -2,8 +2,8 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
-        --start 2020-12-01T00:00:00Z \
-        --end 2026-03-01T00:00:00Z \
+        --start 2020-11-30T23:00:00Z \
+        --end 2025-12-31T23:00:00Z \
         --out data/raw/regelleistung.parquet \
         --mol-dir data/raw \
         --bids-dir data/raw/bids
@@ -46,6 +46,23 @@ import requests
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 LOGGER = logging.getLogger(__name__)
 CPP_FILES_BASE_URL = "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files"
+
+
+def _log_dst_drop(label: str, ts_series: pd.Series, date_series: pd.Series) -> None:
+    """Log rows lost due to ambiguous/nonexistent local times during tz conversion."""
+    drop_mask = ts_series.isna()
+    dropped = int(drop_mask.sum())
+    if dropped == 0:
+        return
+    dates = pd.to_datetime(date_series[drop_mask], errors="coerce").dt.strftime("%Y-%m-%d")
+    top = dates.value_counts().head(5)
+    top_txt = ", ".join([f"{d}:{int(n)}" for d, n in top.items()]) if len(top) else "n/a"
+    LOGGER.warning(
+        "DST/timestamp conversion dropped %s rows in %s (top dates: %s).",
+        dropped,
+        label,
+        top_txt,
+    )
 
 
 def _find_col(df: pd.DataFrame, needles: list[str]) -> str | None:
@@ -336,9 +353,11 @@ def _bid_prices_from_bids(df_bids: pd.DataFrame) -> pd.DataFrame:
         base_local = pd.to_datetime(q[date_col]).dt.floor("D").dt.tz_localize(
             "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
         )
-        q["timestamp_utc"] = (
+        q_ts = (
             base_local + pd.to_timedelta((qh_q - 1) * 15, unit="m")
         ).dt.tz_convert("UTC")
+        _log_dst_drop("bid qh-format", q_ts, q[date_col])
+        q["timestamp_utc"] = q_ts
         parts.append(q)
 
     if mask_block.any():
@@ -353,9 +372,11 @@ def _bid_prices_from_bids(df_bids: pd.DataFrame) -> pd.DataFrame:
         base_local = pd.to_datetime(b[date_col]).dt.floor("D").dt.tz_localize(
             "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
         )
-        b["timestamp_utc"] = (
+        b_ts = (
             base_local + pd.to_timedelta(b["hour_offsets"].astype(int), unit="h")
         ).dt.tz_convert("UTC")
+        _log_dst_drop("bid block-format", b_ts, b[date_col])
+        b["timestamp_utc"] = b_ts
         b = b.drop(columns=["start_hour", "end_hour", "hour_offsets"])
         parts.append(b)
 
@@ -885,6 +906,11 @@ def main() -> None:
         default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "bids"),
         help="Directory to store/read anonymous bid files for marginal-price calculation.",
     )
+    parser.add_argument(
+        "--skip-bid-activation-prices",
+        action="store_true",
+        help="Skip anonymous-bid activation price reconstruction (afrr_bid_* columns).",
+    )
     args = parser.parse_args()
 
     start_dt = datetime.fromisoformat(args.start)
@@ -914,24 +940,27 @@ def main() -> None:
     mol_df = process_mol_slope(Path(args.mol_dir))
     if not mol_df.empty:
         df_master = df_master.join(mol_df, how="left")
-    bids_dir = Path(args.bids_dir)
-    download_bid_files_with_fallback(start_dt, end_dt, bids_dir)
-    bid_df = process_bid_prices(bids_dir)
-    if bid_df.empty and bids_dir != Path(args.mol_dir):
-        LOGGER.warning(
-            "No anonymous-bid prices found in %s. Falling back to %s.",
-            bids_dir,
-            args.mol_dir,
-        )
-        bid_df = process_bid_prices(Path(args.mol_dir))
-    if not bid_df.empty:
-        df_master = df_master.join(bid_df, how="left")
-        LOGGER.info(
-            "Merged anonymous-bid marginal/VWAP columns into regelleistung: rows=%s, range=%s -> %s",
-            len(bid_df),
-            bid_df.index.min(),
-            bid_df.index.max(),
-        )
+    if args.skip_bid_activation_prices:
+        LOGGER.info("Skipping anonymous-bid activation price reconstruction (--skip-bid-activation-prices).")
+    else:
+        bids_dir = Path(args.bids_dir)
+        download_bid_files_with_fallback(start_dt, end_dt, bids_dir)
+        bid_df = process_bid_prices(bids_dir)
+        if bid_df.empty and bids_dir != Path(args.mol_dir):
+            LOGGER.warning(
+                "No anonymous-bid prices found in %s. Falling back to %s.",
+                bids_dir,
+                args.mol_dir,
+            )
+            bid_df = process_bid_prices(Path(args.mol_dir))
+        if not bid_df.empty:
+            df_master = df_master.join(bid_df, how="left")
+            LOGGER.info(
+                "Merged anonymous-bid activation/VWAP columns into regelleistung: rows=%s, range=%s -> %s",
+                len(bid_df),
+                bid_df.index.min(),
+                bid_df.index.max(),
+            )
     df_master = df_master[~df_master.index.duplicated(keep="first")]
 
     # Output standardization: UTC hourly, clip window, timestamp_utc column.

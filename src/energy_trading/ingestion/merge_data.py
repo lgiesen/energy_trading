@@ -5,7 +5,7 @@ Usage:
         --data-dir data/raw \
         --out data/processed/all_data.parquet \
         --clip-start 2020-11-30T23:00:00Z \
-        --clip-end 2026-03-01T00:00:00Z
+        --clip-end 2025-12-31T23:00:00Z
 
 
 Notes:
@@ -13,6 +13,9 @@ Notes:
     - Drops other timestamp columns to avoid duplicate/suffixed fields.
     - Merges all columns produced by fetchers (including anonymous-bid price columns
       from regelleistung.parquet if present).
+    - The example above clips to CET boundaries:
+      2020-12-01 00:00:00 CET -> 2026-01-01 00:00:00 CET,
+      passed as UTC (`Z`) values.
     - `--clip-start/--clip-end` accept timezone-aware ISO values (recommended: UTC with `Z`).
       If no timezone is provided, values are interpreted as Europe/Berlin local time.
 """
@@ -20,12 +23,22 @@ from __future__ import annotations
 
 import argparse
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _parse_clip_to_utc(value: str):
+    """Parse clip boundary; keep explicit timezone, default naive to Europe/Berlin."""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("Europe/Berlin"))
+    return dt.astimezone(ZoneInfo("UTC"))
 
 def _normalize_timestamp(df: pl.DataFrame, ts_col: str) -> pl.DataFrame:
     """Normalize timestamp column to datetime[us, UTC] and truncate to hour."""
@@ -152,18 +165,10 @@ def merge_all(
     merged = merged.sort("timestamp")
     merged = _drop_nulls_and_dedup(merged, "timestamp", "merged output")
     if clip_start:
-        start_dt = (
-            pl.Series([clip_start])
-            .str.to_datetime(time_zone="Europe/Berlin")
-            .dt.convert_time_zone("UTC")[0]
-        )
+        start_dt = _parse_clip_to_utc(clip_start)
         merged = merged.filter(pl.col("timestamp") >= pl.lit(start_dt))
     if clip_end:
-        end_dt = (
-            pl.Series([clip_end])
-            .str.to_datetime(time_zone="Europe/Berlin")
-            .dt.convert_time_zone("UTC")[0]
-        )
+        end_dt = _parse_clip_to_utc(clip_end)
         merged = merged.filter(pl.col("timestamp") <= pl.lit(end_dt))
     # Keep only canonical UTC and CET timestamps in final output.
     merged = merged.with_columns(

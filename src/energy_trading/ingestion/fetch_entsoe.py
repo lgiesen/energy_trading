@@ -2,7 +2,7 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_entsoe \
-        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+        --start 2020-11-30T23:00:00Z --end 2025-12-31T23:00:00Z \
         --out data/raw/entsoe.parquet
 
 Outputs:

@@ -18,6 +18,7 @@ import argparse
 import logging
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +27,15 @@ LOGGER = logging.getLogger(__name__)
 def run(cmd: list[str]):
     LOGGER.info("-> %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
+
+
+def _to_utc_iso(dt_str: str) -> str:
+    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def main():
@@ -37,6 +47,11 @@ def main():
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
+    parser.add_argument(
+        "--skip-bid-activation-prices",
+        action="store_true",
+        help="Skip anonymous-bid activation price reconstruction in fetch_regelleistung.",
+    )
     parser.add_argument(
         "--smard-download-market-data-csv",
         action="store_true",
@@ -73,13 +88,23 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fetch with one-day lookback to reduce boundary losses; merge is clipped to exact requested window.
+    requested_start_utc = datetime.fromisoformat(args.start.replace("Z", "+00:00"))
+    if requested_start_utc.tzinfo is None:
+        requested_start_utc = requested_start_utc.replace(tzinfo=timezone.utc)
+    else:
+        requested_start_utc = requested_start_utc.astimezone(timezone.utc)
+    fetch_start_utc = requested_start_utc - timedelta(days=1)
+    fetch_start = fetch_start_utc.isoformat().replace("+00:00", "Z")
+    fetch_end = _to_utc_iso(args.end)
+
     py = sys.executable
 
     # ENTSO-E (requires ENTSOE_API_KEY env)
     run([
         py, "-m", "energy_trading.ingestion.fetch_entsoe",
-        "--start", args.start,
-        "--end", args.end,
+        "--start", fetch_start,
+        "--end", fetch_end,
         "--out", str(out_dir / "entsoe.parquet"),
         "--chunk-months", str(args.entsoe_chunk_months),
         "--workers", str(args.entsoe_workers),
@@ -88,16 +113,16 @@ def main():
     # Day-ahead prices
     run([
         py, "-m", "energy_trading.ingestion.fetch_energy_charts",
-        "--start", args.start,
-        "--end", args.end,
+        "--start", fetch_start,
+        "--end", fetch_end,
         "--out", str(out_dir / "energy_charts.parquet"),
     ])
 
     # Netztransparenz (assumes env creds configured)
     run([
         py, "-m", "energy_trading.ingestion.fetch_netztransparenz",
-        "--start", args.start,
-        "--end", args.end,
+        "--start", fetch_start,
+        "--end", fetch_end,
         "--chunk-days", "60",
         "--chunk-sleep", "1",
         "--out", str(out_dir / "netztransparenz.parquet"),
@@ -107,8 +132,8 @@ def main():
     if not args.skip_smard:
         smard_cmd = [
             py, "-m", "energy_trading.ingestion.fetch_smard",
-            "--start", args.start,
-            "--end", args.end,
+            "--start", fetch_start,
+            "--end", fetch_end,
             "--out", str(out_dir / "smard.parquet"),
         ]
         if args.smard_download_market_data_csv:
@@ -124,22 +149,25 @@ def main():
     if not args.skip_commodities:
         run([
             py, "-m", "energy_trading.ingestion.fetch_yfinance",
-            "--start", args.start,
-            "--end", args.end,
+            "--start", fetch_start,
+            "--end", fetch_end,
             "--out", str(out_dir / "yfinance.parquet"),
         ])
 
     # Regelleistung aFRR (hourly, includes net import/export + MOL slope)
-    run([
+    reg_cmd = [
         py, "-m", "energy_trading.ingestion.fetch_regelleistung",
-        "--start", args.start,
-        "--end", args.end,
+        "--start", fetch_start,
+        "--end", fetch_end,
         "--out", str(out_dir / "regelleistung.parquet"),
-    ])
+    ]
+    if args.skip_bid_activation_prices:
+        reg_cmd.append("--skip-bid-activation-prices")
+    run(reg_cmd)
 
     # Merge all parquets in out_dir
-    clip_start = args.clip_start or args.start
-    clip_end = args.clip_end or args.end
+    clip_start = _to_utc_iso(args.clip_start or args.start)
+    clip_end = _to_utc_iso(args.clip_end or args.end)
     run([
         py, "-m", "energy_trading.ingestion.merge_data",
         "--data-dir", str(out_dir),
