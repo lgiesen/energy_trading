@@ -2,16 +2,28 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
-        --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
-        --out data/raw/regelleistung.parquet
+        --start 2020-12-01T00:00:00Z \
+        --end 2026-03-01T00:00:00Z \
+        --out data/raw/regelleistung.parquet \
+        --mol-dir data/raw \
+        --bids-dir data/raw/bids
 
 Outputs:
-    - regelleistung.parquet with hourly aFRR capacity/energy results.
+    - regelleistung.parquet with hourly aFRR capacity/energy results (UTC, timestamp_utc).
 
 Includes:
     - capacity/energy prices and offered volumes (pos/neg)
     - net_import_export_mw (IGCC/PICASSO netting when present)
-    - mol_slope_100_500 (from anonymous bid list, expanded to hourly)
+    - MOL slope features (from anonymous bid lists, expanded to hourly)
+    - hourly anonymous-bid features:
+        - afrr_bid_avg_activation_price_{pos,neg}
+        - afrr_bid_vwap_activation_price_{pos,neg}
+        - bid_alloc_mw_{pos,neg}
+
+Bid file behavior:
+    - Tries yearly anonymous energy bid files first (one per year).
+    - Falls back to monthly files only if yearly files are not available.
+    - Downloads to --bids-dir and reuses existing files.
 """
 from __future__ import annotations
 
@@ -19,17 +31,21 @@ import argparse
 import calendar
 import io
 import logging
+import re
+import time
 import warnings
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
 # Suppress openpyxl style warnings.
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 LOGGER = logging.getLogger(__name__)
+CPP_FILES_BASE_URL = "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files"
 
 
 def _find_col(df: pd.DataFrame, needles: list[str]) -> str | None:
@@ -52,7 +68,15 @@ def _parse_product_start(product: str) -> int | None:
 
 
 def _parse_date_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, dayfirst=True, errors="coerce")
+    parsed = pd.to_datetime(series, dayfirst=True, errors="coerce")
+    serial = pd.to_numeric(series, errors="coerce")
+    # Some XLSX readers expose Excel serials (e.g. 45658) instead of datetimes.
+    use_serial = serial.notna() & (parsed.isna() | (parsed.dt.year < 1995))
+    if use_serial.any():
+        parsed.loc[use_serial] = pd.to_datetime(
+            serial.loc[use_serial], unit="D", origin="1899-12-30", errors="coerce"
+        )
+    return parsed
 
 
 def _normalize_col_name(name: str) -> str:
@@ -131,11 +155,16 @@ def _mol_slope_from_bids(df_bids: pd.DataFrame, market: str) -> pd.DataFrame:
         if total < 100:
             slope = float("nan")
         else:
-            p100 = float(pd.Series(g[price_col]).iloc[(g["cum"] >= 100).idxmax()]) if (g["cum"] >= 100).any() else float(g[price_col].max())
+            # idxmax returns the original index label, so we must use .loc (not .iloc).
+            p100 = (
+                float(g.loc[(g["cum"] >= 100).idxmax(), price_col])
+                if (g["cum"] >= 100).any()
+                else float(g[price_col].max())
+            )
             if total < 500:
                 p500 = float(g[price_col].max())
             else:
-                p500 = float(pd.Series(g[price_col]).iloc[(g["cum"] >= 500).idxmax()])
+                p500 = float(g.loc[(g["cum"] >= 500).idxmax(), price_col])
             slope = p500 - p100
         if res_col:
             d, prod, reserve = keys
@@ -246,6 +275,363 @@ def process_mol_slope(data_dir: Path) -> pd.DataFrame:
     out["timestamp"] = ts
     out = out.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
     return out
+
+
+def _bid_prices_from_bids(df_bids: pd.DataFrame) -> pd.DataFrame:
+    """Extract hourly bid-based price features from anonymous aFRR energy bids."""
+    if df_bids.empty:
+        return pd.DataFrame()
+    df = df_bids.copy()
+    df.columns = df.columns.str.strip()
+
+    date_col = _find_col(df, ["DELIVERY", "DATE"]) or _find_col(df, ["DATUM"]) or df.columns[0]
+    prod_col = _find_col(df, ["PRODUCT"]) or _find_col(df, ["PRODUKT"])
+    reserve_col = _find_col(df, ["RESERVE"]) or _find_col(df, ["RESERVETYPE"])
+    alloc_col = _find_col(df, ["ALLOCATED", "CAPACITY"]) or _find_col(df, ["CAPACITY", "MW"])
+    price_col = _find_col(df, ["ENERGY", "PRICE"]) or _find_col(df, ["PRICE"])
+    pay_col = _find_col(df, ["PAYMENT", "DIRECTION"])
+    country_col = _find_col(df, ["COUNTRY"])
+
+    if not prod_col or not alloc_col or not price_col:
+        return pd.DataFrame()
+
+    keep = [date_col, prod_col, alloc_col, price_col]
+    if reserve_col:
+        keep.append(reserve_col)
+    if pay_col:
+        keep.append(pay_col)
+    if country_col:
+        keep.append(country_col)
+    df = df[keep].copy()
+
+    df[date_col] = _parse_date_series(df[date_col])
+    df[alloc_col] = pd.to_numeric(df[alloc_col], errors="coerce")
+    df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
+    df = df.dropna(subset=[date_col, alloc_col, price_col])
+    df = df[df[alloc_col] > 0]
+
+    if reserve_col:
+        df = df[df[reserve_col].astype(str).str.upper().str.contains("AFRR", na=False)]
+    if country_col:
+        df = df[df[country_col].astype(str).str.upper().eq("DE")]
+
+    prod = df[prod_col].astype(str)
+    df["direction"] = prod.str.split("_").str[0].str.upper()
+    df = df[df["direction"].isin(["POS", "NEG"])]
+
+    # PRODUCT has two formats in source files:
+    #   1) NEG_001 .. NEG_096 (quarter-hour index)
+    #   2) NEG_04_08 (hour block, start-end)
+    qh = pd.to_numeric(prod.str.extract(r"_(\d{3})$")[0], errors="coerce")
+    start_hour = pd.to_numeric(prod.str.extract(r"_(\d{2})_(\d{2})$")[0], errors="coerce")
+    end_hour = pd.to_numeric(prod.str.extract(r"_(\d{2})_(\d{2})$")[1], errors="coerce")
+    mask_qh = qh.notna()
+    mask_block = start_hour.notna() & end_hour.notna()
+
+    parts: list[pd.DataFrame] = []
+
+    if mask_qh.any():
+        q = df.loc[mask_qh].copy()
+        qh_q = qh.loc[mask_qh].astype(int)
+        base_local = pd.to_datetime(q[date_col]).dt.floor("D").dt.tz_localize(
+            "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
+        )
+        q["timestamp_utc"] = (
+            base_local + pd.to_timedelta((qh_q - 1) * 15, unit="m")
+        ).dt.tz_convert("UTC")
+        parts.append(q)
+
+    if mask_block.any():
+        b = df.loc[mask_block].copy()
+        b["start_hour"] = start_hour.loc[mask_block].astype(int)
+        b["end_hour"] = end_hour.loc[mask_block].astype(int)
+        b["hour_offsets"] = [
+            list(range(sh, eh if eh > sh else eh + 24))
+            for sh, eh in zip(b["start_hour"], b["end_hour"])
+        ]
+        b = b.explode("hour_offsets")
+        base_local = pd.to_datetime(b[date_col]).dt.floor("D").dt.tz_localize(
+            "Europe/Berlin", ambiguous="NaT", nonexistent="shift_forward"
+        )
+        b["timestamp_utc"] = (
+            base_local + pd.to_timedelta(b["hour_offsets"].astype(int), unit="h")
+        ).dt.tz_convert("UTC")
+        b = b.drop(columns=["start_hour", "end_hour", "hour_offsets"])
+        parts.append(b)
+
+    if not parts:
+        return pd.DataFrame()
+
+    df = pd.concat(parts, ignore_index=True)
+    df = df.dropna(subset=["timestamp_utc"])
+
+    pay_sign = 1.0
+    if pay_col:
+        pay = df[pay_col].astype(str).str.upper()
+        pay_sign = np.where(pay.str.contains("PROVIDER_TO_GRID", na=False), -1.0, 1.0)
+    dir_sign = np.where(df["direction"].eq("NEG"), -1.0, 1.0)
+    df["price_signed"] = df[price_col] * pay_sign * dir_sign
+    df["pv"] = df["price_signed"] * df[alloc_col]
+    df["hour"] = df["timestamp_utc"].dt.floor("1h")
+
+    g = (
+        df.groupby(["hour", "direction"], as_index=False)
+        .agg(
+            bid_vwap_num=("pv", "sum"),
+            bid_alloc_mw=(alloc_col, "sum"),
+            bid_price_max=("price_signed", "max"),
+            bid_price_min=("price_signed", "min"),
+        )
+    )
+    g["afrr_bid_vwap_activation_price"] = np.where(
+        g["bid_alloc_mw"] != 0, g["bid_vwap_num"] / g["bid_alloc_mw"], np.nan
+    )
+    # Marginal proxy: POS -> max accepted signed price, NEG -> min accepted signed price.
+    g["afrr_bid_avg_activation_price"] = np.where(
+        g["direction"].eq("POS"), g["bid_price_max"], g["bid_price_min"]
+    )
+
+    out = g.pivot_table(
+        index="hour",
+        columns="direction",
+        values=["afrr_bid_vwap_activation_price", "afrr_bid_avg_activation_price", "bid_alloc_mw"],
+        aggfunc="mean",
+    )
+    out.columns = [f"{m}_{d.lower()}" for m, d in out.columns]
+    out = out.rename_axis("timestamp").sort_index()
+    return out
+
+
+def _bid_usecol(name: str) -> bool:
+    """Keep only columns needed for bid-based price reconstruction."""
+    n = _normalize_col_name(str(name))
+    keywords = (
+        "deliverydate",
+        "datum",
+        "product",
+        "produkt",
+        "typeofreserves",
+        "reservetype",
+        "country",
+        "allocatedcapacity",
+        "capacitymw",
+        "energyprice",
+        "price",
+        "paymentdirection",
+    )
+    return any(k in n for k in keywords)
+
+
+def _file_signature(path: Path) -> str:
+    st = path.stat()
+    return f"{path.name}|{st.st_size}|{int(st.st_mtime)}"
+
+
+def process_bid_prices(data_dir: Path) -> pd.DataFrame:
+    """Process anonymous energy bids into hourly price features."""
+    raw_files = sorted(
+        p
+        for p in data_dir.rglob("RESULT_LIST_ANONYM_ENERGY_MARKET_*.xlsx*")
+        if p.is_file() and not p.name.startswith("~$")
+    )
+    period_re = re.compile(
+        r"RESULT_LIST_ANONYM_ENERGY_MARKET_aFRR_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.xlsx(?:\.zip)?$",
+        flags=re.IGNORECASE,
+    )
+    selected: dict[str, Path] = {}
+    for p in raw_files:
+        m = period_re.search(p.name)
+        key = f"{m.group(1)}_{m.group(2)}" if m else p.stem.lower()
+        # Prefer zipped source when both .xlsx and .xlsx.zip exist.
+        if key not in selected or p.suffix.lower() == ".zip":
+            selected[key] = p
+    files = sorted(selected.values())
+    LOGGER.info(
+        "Anonymous bid files selected for marginal-price calculation: %s (from %s discovered)",
+        len(files),
+        len(raw_files),
+    )
+    if not files:
+        return pd.DataFrame()
+
+    cache_path = data_dir / "_afrr_bid_hourly_cache.parquet"
+    cached = pd.DataFrame()
+    if cache_path.exists():
+        try:
+            cached = pd.read_parquet(cache_path)
+            required = {
+                "source_file",
+                "file_sig",
+                "timestamp",
+                "afrr_bid_vwap_activation_price_pos",
+                "afrr_bid_vwap_activation_price_neg",
+                "afrr_bid_avg_activation_price_pos",
+                "afrr_bid_avg_activation_price_neg",
+                "bid_alloc_mw_pos",
+                "bid_alloc_mw_neg",
+            }
+            if not required.issubset(set(cached.columns)):
+                LOGGER.warning("Bid cache schema mismatch; ignoring %s", cache_path)
+                cached = pd.DataFrame()
+        except Exception as exc:
+            LOGGER.warning("Failed to read bid cache %s: %s", cache_path, exc)
+            cached = pd.DataFrame()
+
+    frames_with_meta: list[pd.DataFrame] = []
+    cached_hits = 0
+    parsed_files = 0
+    t0 = time.perf_counter()
+    for path in files:
+        sig = _file_signature(path)
+        if not cached.empty:
+            hit = cached[(cached["source_file"] == path.name) & (cached["file_sig"] == sig)]
+            if not hit.empty:
+                cached_hits += 1
+                frames_with_meta.append(hit.copy())
+                LOGGER.info("Using bid cache for %s: %s hourly rows", path.name, len(hit))
+                continue
+
+        try:
+            per_file_parts: list[pd.DataFrame] = []
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path, "r") as zf:
+                    for name in zf.namelist():
+                        if name.lower().endswith((".xlsx", ".xls")):
+                            with zf.open(name) as f:
+                                xls = pd.ExcelFile(f, engine="openpyxl")
+                                for sheet in xls.sheet_names:
+                                    df = xls.parse(sheet_name=sheet, usecols=_bid_usecol)
+                                    x = _bid_prices_from_bids(df)
+                                    if not x.empty:
+                                        per_file_parts.append(x)
+                                file_rows = sum(len(x) for x in per_file_parts)
+                                LOGGER.info(
+                                    "Parsed bid marginal prices from %s/%s (%s sheets): %s hourly rows",
+                                    path.name,
+                                    name,
+                                    len(xls.sheet_names),
+                                    file_rows,
+                                )
+            else:
+                xls = pd.ExcelFile(path, engine="openpyxl")
+                for sheet in xls.sheet_names:
+                    df = xls.parse(sheet_name=sheet, usecols=_bid_usecol)
+                    x = _bid_prices_from_bids(df)
+                    if not x.empty:
+                        per_file_parts.append(x)
+                file_rows = sum(len(x) for x in per_file_parts)
+                LOGGER.info(
+                    "Parsed bid marginal prices from %s (%s sheets): %s hourly rows",
+                    path.name,
+                    len(xls.sheet_names),
+                    file_rows,
+                )
+            if per_file_parts:
+                parsed_files += 1
+                per_file = pd.concat(per_file_parts).sort_index()
+                per_file = per_file.groupby(level=0).mean(numeric_only=True)
+                per_file = per_file.reset_index().rename(columns={"index": "timestamp"})
+                per_file["source_file"] = path.name
+                per_file["file_sig"] = sig
+                frames_with_meta.append(per_file)
+        except Exception as exc:  # pragma: no cover - defensive parsing
+            LOGGER.warning("Failed to parse bid file %s: %s", path, exc)
+
+    if not frames_with_meta:
+        LOGGER.warning("No usable anonymous bid data for marginal-price calculation.")
+        return pd.DataFrame()
+
+    combined = pd.concat(frames_with_meta, ignore_index=True)
+    combined["timestamp"] = pd.to_datetime(combined["timestamp"], utc=True, errors="coerce")
+    combined = combined.dropna(subset=["timestamp"])
+    try:
+        combined.to_parquet(cache_path, index=False)
+        LOGGER.info(
+            "Updated bid cache: %s rows (%s cache hits, %s parsed files) in %.1fs",
+            len(combined),
+            cached_hits,
+            parsed_files,
+            time.perf_counter() - t0,
+        )
+    except Exception as exc:
+        LOGGER.warning("Failed to write bid cache %s: %s", cache_path, exc)
+
+    out = combined.drop(columns=["source_file", "file_sig"], errors="ignore").set_index("timestamp").sort_index()
+    raw_rows = len(out)
+    out = out.groupby(level=0).mean(numeric_only=True)
+    out = out[~out.index.duplicated(keep="last")]
+    LOGGER.info(
+        "Computed anonymous-bid hourly prices: rows=%s (from %s pre-agg rows), range=%s -> %s",
+        len(out),
+        raw_rows,
+        out.index.min(),
+        out.index.max(),
+    )
+    for col in (
+        "afrr_bid_avg_activation_price_pos",
+        "afrr_bid_avg_activation_price_neg",
+        "afrr_bid_vwap_activation_price_pos",
+        "afrr_bid_vwap_activation_price_neg",
+    ):
+        if col in out.columns:
+            LOGGER.info("Non-null %s: %s", col, int(out[col].notna().sum()))
+    return out
+
+
+def _download_bid_result_file(period_start: str, period_end: str, out_dir: Path) -> Path | None:
+    """Try to download one anonymous bid result file for the given period."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = f"RESULT_LIST_ANONYM_ENERGY_MARKET_aFRR_{period_start}_{period_end}.xlsx"
+    candidates = [f"{base}.zip", base]
+    for name in candidates:
+        target = out_dir / name
+        if target.exists() and target.stat().st_size > 0:
+            LOGGER.info("Bid file already exists: %s", target.name)
+            return target
+        url = f"{CPP_FILES_BASE_URL}/{name}"
+        try:
+            resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            target.write_bytes(resp.content)
+            LOGGER.info("Downloaded bid file: %s", target.name)
+            return target
+        except Exception:
+            continue
+    return None
+
+
+def download_bid_files_with_fallback(start_dt: datetime, end_dt: datetime, bids_dir: Path) -> list[Path]:
+    """Download yearly anonymous bid files; if missing, fallback to monthly files."""
+    downloaded: list[Path] = []
+    for year in range(start_dt.year, end_dt.year + 1):
+        year_start = datetime(year, 1, 1, tzinfo=timezone.utc)
+        year_end = datetime(year, 12, 31, tzinfo=timezone.utc)
+        if year_end < start_dt or year_start > end_dt:
+            continue
+
+        yearly = _download_bid_result_file(f"{year}-01-01", f"{year}-12-31", bids_dir)
+        if yearly is not None:
+            downloaded.append(yearly)
+            continue
+
+        LOGGER.warning("Yearly anonymous bid file missing for %s. Falling back to monthly files.", year)
+        for month in range(1, 13):
+            month_start = datetime(year, month, 1, tzinfo=timezone.utc)
+            month_last = calendar.monthrange(year, month)[1]
+            month_end = datetime(year, month, month_last, tzinfo=timezone.utc)
+            if month_end < start_dt or month_start > end_dt:
+                continue
+            monthly = _download_bid_result_file(
+                f"{year}-{month:02d}-01",
+                f"{year}-{month:02d}-{month_last:02d}",
+                bids_dir,
+            )
+            if monthly is not None:
+                downloaded.append(monthly)
+            else:
+                LOGGER.warning("Missing monthly anonymous bid file for %s-%02d.", year, month)
+    LOGGER.info("Anonymous bid download complete. Files available/added: %s", len(downloaded))
+    return downloaded
 
 
 def _download_overview_file(url: str) -> pd.DataFrame:
@@ -413,13 +799,10 @@ def fetch_and_parse_regelleistung(
         # --- 3) Feature columns ---
         val_cols: dict[str, str] = {}
         if market_type == "ENERGY":
-            marg_col = _find_col(df_part, ["MARGINAL", "ENERGY", "PRICE"])
             avg_col = _find_col(df_part, ["AVERAGE", "ENERGY", "PRICE"])
             off_col = _find_col(df_part, ["OFFERED", "CAPACITY"])
-            if marg_col:
-                val_cols[marg_col] = "afrr_activation_marginal_price"
             if avg_col:
-                val_cols[avg_col] = "afrr_activation_avg_price"
+                val_cols[avg_col] = "afrr_avg_activation_price"
             if off_col:
                 val_cols[off_col] = "afrr_activation_offered_mw"
         else:
@@ -497,6 +880,11 @@ def main() -> None:
         default=str(Path(__file__).resolve().parents[3] / "data" / "raw"),
         help="Directory containing RESULT_LIST_ANONYM_* files (zip/xlsx).",
     )
+    parser.add_argument(
+        "--bids-dir",
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "bids"),
+        help="Directory to store/read anonymous bid files for marginal-price calculation.",
+    )
     args = parser.parse_args()
 
     start_dt = datetime.fromisoformat(args.start)
@@ -526,6 +914,24 @@ def main() -> None:
     mol_df = process_mol_slope(Path(args.mol_dir))
     if not mol_df.empty:
         df_master = df_master.join(mol_df, how="left")
+    bids_dir = Path(args.bids_dir)
+    download_bid_files_with_fallback(start_dt, end_dt, bids_dir)
+    bid_df = process_bid_prices(bids_dir)
+    if bid_df.empty and bids_dir != Path(args.mol_dir):
+        LOGGER.warning(
+            "No anonymous-bid prices found in %s. Falling back to %s.",
+            bids_dir,
+            args.mol_dir,
+        )
+        bid_df = process_bid_prices(Path(args.mol_dir))
+    if not bid_df.empty:
+        df_master = df_master.join(bid_df, how="left")
+        LOGGER.info(
+            "Merged anonymous-bid marginal/VWAP columns into regelleistung: rows=%s, range=%s -> %s",
+            len(bid_df),
+            bid_df.index.min(),
+            bid_df.index.max(),
+        )
     df_master = df_master[~df_master.index.duplicated(keep="first")]
 
     # Output standardization: UTC hourly, clip window, timestamp_utc column.
@@ -550,8 +956,8 @@ def main() -> None:
     df_master = df_master.drop(columns=[c for c in drop_cols if c in df_master.columns])
 
     # Log missing months for activation market (do not impute).
-    if "afrr_activation_avg_price_neg" in df_master.columns:
-        missing = df_master[df_master["afrr_activation_avg_price_neg"].isna()]
+    if "afrr_avg_activation_price_neg" in df_master.columns:
+        missing = df_master[df_master["afrr_avg_activation_price_neg"].isna()]
         if not missing.empty:
             ts_col = "timestamp_utc" if "timestamp_utc" in missing.columns else ("timestamp" if "timestamp" in missing.columns else None)
             if ts_col is not None:
@@ -561,7 +967,7 @@ def main() -> None:
                     .value_counts()
                     .sort_index()
                 )
-                LOGGER.warning("Missing activation market months (afrr_activation_avg_price_neg):")
+                LOGGER.warning("Missing activation market months (afrr_avg_activation_price_neg):")
                 for ym, cnt in months.items():
                     LOGGER.warning("  %s: %s hours missing", ym, cnt)
             else:
