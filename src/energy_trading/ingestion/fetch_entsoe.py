@@ -10,7 +10,8 @@ Outputs:
         timestamp_utc,
         wind_onshore_actual_entsoe, wind_offshore_actual_entsoe, solar_actual_entsoe,
         wind_onshore_forecast_da_entsoe, wind_offshore_forecast_da_entsoe, solar_forecast_da_entsoe,
-        wind_onshore_forecast_id_entsoe, wind_offshore_forecast_id_entsoe, solar_forecast_id_entsoe
+        wind_onshore_forecast_id_entsoe, wind_offshore_forecast_id_entsoe, solar_forecast_id_entsoe,
+        wind_onshore_capacity_entsoe, wind_offshore_capacity_entsoe
 """
 from __future__ import annotations
 
@@ -39,6 +40,8 @@ DE_LU_BIDDING_ZONE_CODE = "10Y1001A1001A82H"
 DE_PHYSICAL_CONTROL_CODE = "10Y1001A1001A83F"
 
 WIND_SOLAR_COLS = ["Wind Onshore", "Wind Offshore", "Solar"]
+PSR_WIND_ONSHORE = "B19"
+PSR_WIND_OFFSHORE = "B18"
 
 
 def _parse_utc(ts: str) -> pd.Timestamp:
@@ -257,6 +260,83 @@ def _fetch_forecast(
     forecast = _select_wind_solar(forecast)
     forecast = _rename_forecast_cols(forecast, suffix)
     return _resample_hourly(forecast)
+
+
+def _fetch_capacity_yearly(
+    client: EntsoePandasClient,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Fetch sparse installed capacities by year and return UTC-indexed time series.
+
+    ENTSO-E installed generation capacity is typically sparse (e.g., annual or monthly updates),
+    so we query per year and later forward-fill onto the hourly grid.
+    """
+
+    def _fetch_psr(
+        psr_type: str,
+        year_start: pd.Timestamp,
+        year_end: pd.Timestamp,
+        label: str,
+    ) -> pd.Series | None:
+        try:
+            out = _retry(
+                lambda: client.query_installed_generation_capacity(
+                    DE_PHYSICAL_CONTROL_CODE,
+                    start=year_start,
+                    end=year_end,
+                    psr_type=psr_type,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - network errors
+            LOGGER.warning("Installed capacity %s failed for %s: %s", label, year_start.year, exc)
+            return None
+        if out is None or len(out) == 0:
+            LOGGER.warning("Installed capacity %s empty for %s.", label, year_start.year)
+            return None
+        if isinstance(out, pd.DataFrame):
+            # Defensive fallback: reduce dataframe responses to one numeric series.
+            num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+            if not num_cols:
+                return None
+            series = out[num_cols[0]]
+        else:
+            series = out
+        series = pd.to_numeric(series, errors="coerce")
+        series = _ensure_utc_index(series)
+        return series
+
+    year_frames: list[pd.DataFrame] = []
+    for year in range(start.year, end.year + 1):
+        year_start = max(start, pd.Timestamp(year=year, month=1, day=1, tz="UTC"))
+        year_end = min(end, pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC"))
+        if year_end <= year_start:
+            continue
+
+        onshore = _fetch_psr(PSR_WIND_ONSHORE, year_start, year_end, "wind_onshore")
+        offshore = _fetch_psr(PSR_WIND_OFFSHORE, year_start, year_end, "wind_offshore")
+        if onshore is None and offshore is None:
+            continue
+
+        year_df = pd.DataFrame(index=pd.Index([], dtype="datetime64[ns, UTC]"))
+        if onshore is not None:
+            year_df = year_df.join(
+                onshore.rename("wind_onshore_capacity_entsoe"), how="outer"
+            )
+        if offshore is not None:
+            year_df = year_df.join(
+                offshore.rename("wind_offshore_capacity_entsoe"), how="outer"
+            )
+        year_frames.append(year_df)
+
+    if not year_frames:
+        return pd.DataFrame()
+
+    cap = pd.concat(year_frames, axis=0).sort_index()
+    cap = cap[~cap.index.duplicated(keep="last")]
+    return cap
+
+
 def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp) -> pl.DataFrame:
     LOGGER.info("Fetching %s to %s", start, end)
 
@@ -347,6 +427,19 @@ def main() -> None:
         .unique(subset=["timestamp_utc"], keep="last")
         .sort("timestamp_utc")
     )
+
+    # Installed capacities are sparse; fetch yearly and forward-fill to hourly grid.
+    cap_sparse = _fetch_capacity_yearly(client, start, end)
+    if cap_sparse.empty:
+        LOGGER.warning("Installed generation capacity endpoint returned no usable rows.")
+    else:
+        hourly = merged.to_pandas().set_index("timestamp_utc").sort_index()
+        hourly = hourly.join(cap_sparse, how="left")
+        for col in ("wind_onshore_capacity_entsoe", "wind_offshore_capacity_entsoe"):
+            if col in hourly.columns:
+                hourly[col] = hourly[col].ffill()
+                LOGGER.info("Non-null %s: %s", col, int(hourly[col].notna().sum()))
+        merged = pl.from_pandas(hourly.reset_index())
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -51,6 +51,14 @@ Important behavior:
 
 ## 3) Useful Variants
 
+Run only post-collection processing (if raw files are already collected):
+
+```bash
+./.venv/bin/python scripts/post_collection_pipeline.py \
+  --clip-start 2020-11-30T23:00:00Z \
+  --clip-end 2025-12-31T23:00:00Z
+```
+
 Skip anonymous-bid activation price reconstruction (faster):
 
 ```bash
