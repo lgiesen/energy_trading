@@ -31,6 +31,10 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 LOGGER = logging.getLogger(__name__)
+EXCLUDED_TIMESTAMPS_UTC = {
+    # Known DST transition artifact hour not relevant for this project window semantics.
+    datetime.fromisoformat("2021-10-31T22:00:00+00:00"),
+}
 
 
 def _parse_clip_to_utc(value: str):
@@ -164,6 +168,12 @@ def merge_all(
 
     merged = merged.sort("timestamp")
     merged = _drop_nulls_and_dedup(merged, "timestamp", "merged output")
+    if EXCLUDED_TIMESTAMPS_UTC:
+        before = merged.height
+        merged = merged.filter(~pl.col("timestamp").is_in(list(EXCLUDED_TIMESTAMPS_UTC)))
+        dropped = before - merged.height
+        if dropped:
+            LOGGER.info("Dropped %s known excluded timestamp rows.", dropped)
     if clip_start:
         start_dt = _parse_clip_to_utc(clip_start)
         merged = merged.filter(pl.col("timestamp") >= pl.lit(start_dt))

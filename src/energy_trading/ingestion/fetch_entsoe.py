@@ -406,10 +406,12 @@ def main() -> None:
     end = _parse_utc(args.end)
     if end <= start:
         raise ValueError("--end must be after --start")
+    # ENTSO-E API windows are end-exclusive; query one extra hour and clip back.
+    query_end = end + pd.Timedelta(hours=1)
 
     client = EntsoePandasClient(api_key=api_key)
 
-    ranges = _chunk_ranges(start, end, args.chunk_months)
+    ranges = _chunk_ranges(start, query_end, args.chunk_months)
     frames = []
     if args.workers <= 1:
         for s, e in ranges:
@@ -429,7 +431,7 @@ def main() -> None:
     )
 
     # Installed capacities are sparse; fetch yearly and forward-fill to hourly grid.
-    cap_sparse = _fetch_capacity_yearly(client, start, end)
+    cap_sparse = _fetch_capacity_yearly(client, start, query_end)
     if cap_sparse.empty:
         LOGGER.warning("Installed generation capacity endpoint returned no usable rows.")
     else:
@@ -440,6 +442,8 @@ def main() -> None:
                 hourly[col] = hourly[col].ffill()
                 LOGGER.info("Non-null %s: %s", col, int(hourly[col].notna().sum()))
         merged = pl.from_pandas(hourly.reset_index())
+
+    merged = merged.filter(pl.col("timestamp_utc") <= pl.lit(end))
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

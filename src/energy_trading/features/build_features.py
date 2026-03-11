@@ -29,13 +29,23 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     - `y_true_pos`, `y_true_neg`: cleaned, *unclipped* marginal price
     - `y_train_pos`, `y_train_neg`: clipped targets in [-500, 500]
     """
-    required = [
-        "afrr_activation_marginal_price_pos",
-        "afrr_activation_marginal_price_neg",
-        "afrr_activated_mwh_pos",
-        "afrr_activated_mwh_neg",
-    ]
-    missing = [c for c in required if c not in df.columns]
+    pos_price_col = None
+    neg_price_col = None
+    for cand in ("afrr_activation_marginal_price_pos", "afrr_avg_activation_price_pos", "afrr_activation_avg_price_pos"):
+        if cand in df.columns:
+            pos_price_col = cand
+            break
+    for cand in ("afrr_activation_marginal_price_neg", "afrr_avg_activation_price_neg", "afrr_activation_avg_price_neg"):
+        if cand in df.columns:
+            neg_price_col = cand
+            break
+
+    required = [c for c in (pos_price_col, neg_price_col, "afrr_activated_mwh_pos", "afrr_activated_mwh_neg") if c is not None]
+    missing = [c for c in ("afrr_activated_mwh_pos", "afrr_activated_mwh_neg") if c not in df.columns]
+    if pos_price_col is None:
+        missing.append("afrr activation price (pos)")
+    if neg_price_col is None:
+        missing.append("afrr activation price (neg)")
     if missing:
         raise KeyError(f"Missing required target-engineering columns: {missing}")
 
@@ -53,18 +63,18 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     # with only technical sentinel values neutralized when activation is effectively zero.
     df = df.with_columns([
         pl.when(
-            (pl.col("afrr_activation_marginal_price_pos").cast(pl.Float64).abs() > sentinel_abs)
+            (pl.col(pos_price_col).cast(pl.Float64).abs() > sentinel_abs)
             & (pl.col("afrr_activated_mwh_pos").cast(pl.Float64).fill_null(0.0).abs() == 0.0)
         )
         .then(0.0)
-        .otherwise(pl.col("afrr_activation_marginal_price_pos").cast(pl.Float64))
+        .otherwise(pl.col(pos_price_col).cast(pl.Float64))
         .alias("y_true_pos"),
         pl.when(
-            (pl.col("afrr_activation_marginal_price_neg").cast(pl.Float64).abs() > sentinel_abs)
+            (pl.col(neg_price_col).cast(pl.Float64).abs() > sentinel_abs)
             & (pl.col("afrr_activated_mwh_neg").cast(pl.Float64).fill_null(0.0).abs() == 0.0)
         )
         .then(0.0)
-        .otherwise(pl.col("afrr_activation_marginal_price_neg").cast(pl.Float64))
+        .otherwise(pl.col(neg_price_col).cast(pl.Float64))
         .alias("y_true_neg"),
     ])
 
@@ -75,7 +85,16 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     ])
 
     # 4) Cleanup raw marginal columns to avoid accidental downstream use.
-    return df.drop(["afrr_activation_marginal_price_pos", "afrr_activation_marginal_price_neg"])
+    drop_target_sources = [
+        "afrr_activation_marginal_price_pos",
+        "afrr_activation_marginal_price_neg",
+        "afrr_avg_activation_price_pos",
+        "afrr_avg_activation_price_neg",
+        "afrr_activation_avg_price_pos",
+        "afrr_activation_avg_price_neg",
+    ]
+    drop_target_sources = [c for c in drop_target_sources if c in df.columns]
+    return df.drop(drop_target_sources) if drop_target_sources else df
 
 
 def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
