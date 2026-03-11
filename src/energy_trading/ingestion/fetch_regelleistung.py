@@ -696,25 +696,6 @@ def _fetch_monthly_overview(
     return pd.concat(frames, ignore_index=True)
 
 
-def _close_isolated_hourly_gaps(df_hourly: pd.DataFrame) -> pd.DataFrame:
-    """Close isolated 1-hour holes (common around DST boundary conversions)."""
-    if df_hourly.empty:
-        return df_hourly
-    out = df_hourly.copy()
-    out = out.asfreq("1h")
-    for col in out.columns:
-        s = out[col]
-        if not pd.api.types.is_numeric_dtype(s):
-            continue
-        nulls = s.isna()
-        isolated = nulls & ~nulls.shift(1, fill_value=False) & ~nulls.shift(-1, fill_value=False)
-        if not isolated.any():
-            continue
-        interp = s.interpolate(limit=1, limit_direction="both")
-        out.loc[isolated, col] = interp.loc[isolated]
-    return out
-
-
 def fetch_and_parse_regelleistung(
     year: int,
     market_type: str,
@@ -836,8 +817,6 @@ def fetch_and_parse_regelleistung(
 
         for col, out_name in val_cols.items():
             series = pd.to_numeric(df_part[col], errors="coerce")
-            if "mw" in out_name:
-                series = series.fillna(0.0)
             df_part[col] = series
 
         # --- 4) European netting (import/export) ---
@@ -882,7 +861,6 @@ def fetch_and_parse_regelleistung(
         return pd.DataFrame()
     df_pivot = pd.concat(parts).sort_index()
     df_pivot = df_pivot[~df_pivot.index.duplicated(keep="first")]
-    df_pivot = _close_isolated_hourly_gaps(df_pivot)
     return df_pivot
 
 

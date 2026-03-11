@@ -176,7 +176,13 @@ def _build_treatment_map(df: pl.DataFrame) -> dict[str, str]:
     if "price_intraday_eur" in df.columns and "da_price_d_eur_mwh" in df.columns:
         treatment["price_intraday_eur"] = "coalesce(intraday, day_ahead)"
 
-    for prefix in ("afrr_activation_avg_price_", "afrr_activation_price_", "mfrr_activation_price_", "afrr_capacity_price_"):
+    for prefix in (
+        "afrr_avg_activation_price_",
+        "afrr_activation_avg_price_",
+        "afrr_activation_price_",
+        "mfrr_activation_price_",
+        "afrr_capacity_price_",
+    ):
         for direction in ("pos", "neg"):
             c = f"{prefix}{direction}"
             if c in df.columns:
@@ -195,6 +201,10 @@ def _build_treatment_map(df: pl.DataFrame) -> dict[str, str]:
     ):
         if c in df.columns:
             treatment[c] = "interpolate_small_gaps(max_gap_hours=8) + forward_fill"
+
+    for c in ("afrr_capacity_offered_mw_pos", "afrr_capacity_offered_mw_neg", "afrr_activation_offered_mw_pos", "afrr_activation_offered_mw_neg"):
+        if c in df.columns:
+            treatment[c] = "fill_null(0.0) + interpolate_small_gaps(max_gap_hours=8) + forward_fill"
 
     for c in ("afrr_activated_mwh_pos", "afrr_activated_mwh_neg", "mfrr_activated_mwh_pos", "mfrr_activated_mwh_neg"):
         if c in df.columns:
@@ -250,7 +260,7 @@ def _log_missing_report(before: dict[str, int], after: dict[str, int], treatment
         len("before"),
         len("after"),
         len("reduced"),
-        max(len(str(v)) for _, b, a, d, _ in ordered for v in (b, a, d)),
+        max(len(str(v)) for _, b, a, d, _, _ in ordered for v in (b, a, d)),
     )
 
     LOGGER.info("Missing-value report:")
@@ -568,8 +578,29 @@ def main() -> None:
             pl.coalesce([pl.col("price_intraday_eur"), pl.col("da_price_d_eur_mwh")]).alias("price_intraday_eur")
         )
 
-    # 5) Regelleistung prices: interpolate if volume != 0 and price is null
+    # 5) Regelleistung offered MW: missing means zero offer in published aggregates.
+    for col in ("afrr_capacity_offered_mw_pos", "afrr_capacity_offered_mw_neg", "afrr_activation_offered_mw_pos", "afrr_activation_offered_mw_neg"):
+        if col in df.columns:
+            df = df.with_columns(pl.col(col).fill_null(0.0).alias(col))
+
+    # 5b) Regelleistung prices: close isolated 1h holes (moved from fetch_regelleistung.py).
+    for col in (
+        "afrr_avg_activation_price_pos",
+        "afrr_avg_activation_price_neg",
+        "afrr_activation_avg_price_pos",
+        "afrr_activation_avg_price_neg",
+        "afrr_activation_price_pos",
+        "afrr_activation_price_neg",
+        "mfrr_activation_price_pos",
+        "mfrr_activation_price_neg",
+        "afrr_capacity_price_pos",
+        "afrr_capacity_price_neg",
+    ):
+        df = _interpolate_small_gaps(df, col, max_gap_hours=1)
+
+    # 5c) Regelleistung prices: interpolate if volume != 0 and price is null
     price_specs = [
+        ("afrr_avg_activation_price_", "afrr_activated_mw_"),
         ("afrr_activation_avg_price_", "afrr_activated_mw_"),
         ("afrr_activation_price_", "afrr_activated_mw_"),
         ("mfrr_activation_price_", "mfrr_activated_mw_"),
@@ -593,7 +624,7 @@ def main() -> None:
             # Interpolate remaining nulls (only small gaps)
             df = _interpolate_small_gaps(df, price_col, max_gap_hours=2)
 
-    # 5b) Regelleistung/activation volume-like signals: short forward-fill.
+    # 5d) Regelleistung/activation volume-like signals: short forward-fill.
     volume_ffill_cols = [
         "net_import_export_mw",
         "afrr_capacity_offered_mw_pos",
