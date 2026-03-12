@@ -3,7 +3,7 @@
 from .style import (
     GEO_DIVERGING,
     GEO_SEQUENTIAL_BLUE,
-    ROLE_COLORS,
+    THESIS_PALETTE,
     apply_geo_style,
     get_color,
 )
@@ -11,7 +11,7 @@ from .style import (
 __all__ = [
     "GEO_DIVERGING",
     "GEO_SEQUENTIAL_BLUE",
-    "ROLE_COLORS",
+    "THESIS_PALETTE",
     "apply_geo_style",
     "get_color",
 ]

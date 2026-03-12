@@ -1,16 +1,18 @@
-"""Central plotting style for thesis figures (GeoDataViz-based).
+"""Central plotting style for thesis figures (functional minimalist palette).
 
 Plotting best practices for thesis figures:
-- Use alpha=0.6 or 0.7 for "solar" and "wind" when using plt.fill_between()
-  to keep the background light.
-- Use linewidth=2.0 or 2.5 for "actual_profit" and "oracle_profit" to make
-  them stand out.
-- Use linestyle="--" for "oracle_profit" and linestyle=":" for
-  "benchmark_profit".
+- Use "primary" (#226E9C) for the main focus of the plot
+  (e.g., actual profit, proposed model).
+- Use "secondary" (#d9b98d) primarily for bar charts, areas, or thick lines
+  to show context/comparison.
+- Use "tertiary" (#7C1D6F) for a third distinct category or theoretical
+  maximums (Oracle).
+- Use "neutral_dark" (#333333) for naive benchmarks, borders, and thin
+  context lines.
 
 Reuse this module across Python scripts and notebooks:
 
-    from energy_trading.visualization.style import apply_geo_style, ROLE_COLORS
+    from energy_trading.visualization.style import apply_geo_style, THESIS_PALETTE
     apply_geo_style()
 """
 from __future__ import annotations
@@ -41,20 +43,18 @@ GEO_SEQUENTIAL_BLUE: Dict[str, str] = {
     "seq_7": "#0D4A70",
 }
 
-# Functional color identities for consistent semantics across plots.
-ROLE_COLORS: Dict[str, str] = {
-    "wind": "#089099",
-    "solar": "#FCDE9C",
-    "load": "#333333",
-    "actual_profit": "#045275",
-    "oracle_profit": "#7C1D6F",
-    "benchmark_profit": "#999999",
+# Functional thesis palette (minimalist, high-contrast roles).
+THESIS_PALETTE: Dict[str, str] = {
+    "primary": "#226E9C",
+    "secondary": "#d9b98d",
+    "tertiary": "#7C1D6F",
+    "neutral_dark": "#333333",
 }
 
 
-def get_color(role: str, default: str = "#999999") -> str:
+def get_color(role: str, default: str = "#333333") -> str:
     """Return a semantic color for the given role, fallback to default."""
-    return ROLE_COLORS.get(role, default)
+    return THESIS_PALETTE.get(role, default)
 
 
 def apply_geo_style() -> None:
@@ -67,6 +67,9 @@ def apply_geo_style() -> None:
             "axes.axisbelow": True,
             "grid.color": "#EEEEEE",
             "grid.linestyle": "--",
+            "patch.edgecolor": "#333333",
+            "patch.linewidth": 0.8,
+            "patch.force_edgecolor": True,
             "axes.spines.top": False,
             "axes.spines.right": False,
         }
