@@ -25,6 +25,21 @@ Main scripts:
 Raw outputs are written to `data/raw/*.parquet`.  
 Final merged table is written to `data/processed/all_data.parquet`.
 
+### Step-by-step I/O map
+
+| Step | Script | Main Input(s) | Main Output |
+|---|---|---|---|
+| 1 | `fetch_entsoe.py` | ENTSO-E API (`--start`, `--end`) | `data/raw/entsoe.parquet` |
+| 2 | `fetch_energy_charts.py` | Energy-Charts API | `data/raw/energy_charts.parquet` |
+| 3 | `fetch_netztransparenz.py` | Netztransparenz API | `data/raw/netztransparenz.parquet` |
+| 4 | `fetch_smard.py` | SMARD API (+ optional market-data CSV) | `data/raw/smard.parquet` (+ `data/raw/installed_capacity.csv`) |
+| 5 | `fetch_yfinance.py` | Yahoo Finance API | `data/raw/yfinance.parquet` |
+| 6 | `fetch_regelleistung.py` | Regelleistung API + bid files in `data/raw/bids/` | `data/raw/regelleistung.parquet` |
+| 7 | `merge_data.py` | All `data/raw/*.parquet` files | `data/processed/all_data.parquet` |
+| 8 | `handle_missing_values.py` | `data/processed/all_data.parquet` | `data/processed/all_data_clean.parquet` |
+| 9 | `transform_data.py` | `data/processed/all_data_clean.parquet` | `data/processed/all_data_transformed.parquet` |
+| 10 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
+
 ---
 
 ## 2) Canonical Command (Recommended)
