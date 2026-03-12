@@ -17,6 +17,29 @@ from pathlib import Path
 
 import polars as pl
 
+# Columns kept in cleaned datasets for audit/provenance but excluded from ML feature table.
+# The list is intentionally conservative and can be tuned per experiment.
+DROP_FOR_MODEL = [
+    # Alternate timezone representation; keep only timestamp_utc for modeling.
+    "timestamp_cet",
+    # Netztransparenz provenance streams (canonical columns are NRV_balance / rz_saldo_mw).
+    "NRV_balance_qs",
+    "NRV_balance_op",
+    "rz_saldo_mw_qs",
+    "rz_saldo_mw_op",
+    # Legacy SMARD aggregate error features (recomputed ENTSO-E based features are used instead).
+    "wind_onshore_error",
+    "wind_offshore_error",
+    "solar_error",
+    # Source-tag helper columns used for QA lineage only.
+    "solar_forecast_id_entsoe_source",
+    "wind_onshore_forecast_id_entsoe_source",
+    "wind_offshore_forecast_id_entsoe_source",
+    "wind_onshore_capacity_source",
+    "wind_offshore_capacity_source",
+    "solar_capacity_source",
+]
+
 
 def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     """Create pay-as-cleared targets for both economics and ML.
@@ -99,6 +122,72 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
 
 def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
     """Add forecast confidence and market stress indicators (no look-ahead bias)."""
+    # Renewable share features for balancing context.
+    # Use legacy renewable actual/forecast columns before they are dropped from model inputs.
+    actual_share_cols = {
+        "wind_onshore_actual",
+        "wind_offshore_actual",
+        "solar_actual",
+        "residual_load_actual",
+    }
+    if actual_share_cols.issubset(df.columns):
+        df = df.with_columns([
+            (pl.col("wind_onshore_actual").cast(pl.Float64).fill_null(0.0)).alias("__wind_onshore_actual_f"),
+            (pl.col("wind_offshore_actual").cast(pl.Float64).fill_null(0.0)).alias("__wind_offshore_actual_f"),
+            (pl.col("solar_actual").cast(pl.Float64).fill_null(0.0)).alias("__solar_actual_f"),
+            pl.col("residual_load_actual").cast(pl.Float64).fill_null(0.0).alias("__residual_load_actual_f"),
+        ])
+        df = df.with_columns([
+            (
+                pl.col("__wind_onshore_actual_f")
+                + pl.col("__wind_offshore_actual_f")
+                + pl.col("__solar_actual_f")
+            ).alias("total_renewables_actual"),
+        ])
+        df = df.with_columns([
+            (pl.col("__residual_load_actual_f") + pl.col("total_renewables_actual")).alias("total_load_actual"),
+        ])
+        df = df.with_columns([
+            pl.when(pl.col("total_load_actual") > 0)
+            .then(pl.col("total_renewables_actual") / pl.col("total_load_actual"))
+            .otherwise(None)
+            .alias("renewable_share_actual"),
+        ])
+
+    forecast_share_cols = {"wind_onshore_forecast", "wind_offshore_forecast", "solar_forecast"}
+    if forecast_share_cols.issubset(df.columns):
+        df = df.with_columns([
+            (pl.col("wind_onshore_forecast").cast(pl.Float64).fill_null(0.0)).alias("__wind_onshore_forecast_f"),
+            (pl.col("wind_offshore_forecast").cast(pl.Float64).fill_null(0.0)).alias("__wind_offshore_forecast_f"),
+            (pl.col("solar_forecast").cast(pl.Float64).fill_null(0.0)).alias("__solar_forecast_f"),
+        ])
+        df = df.with_columns([
+            (
+                pl.col("__wind_onshore_forecast_f")
+                + pl.col("__wind_offshore_forecast_f")
+                + pl.col("__solar_forecast_f")
+            ).alias("total_renewables_forecast"),
+        ])
+        # Use total_load_forecast when present, else proxy with total_load_actual.
+        denom = (
+            pl.coalesce([pl.col("total_load_forecast").cast(pl.Float64), pl.col("total_load_actual")])
+            if "total_load_forecast" in df.columns
+            else pl.col("total_load_actual")
+        )
+        df = df.with_columns([
+            pl.when(denom > 0)
+            .then(pl.col("total_renewables_forecast") / denom)
+            .otherwise(None)
+            .alias("renewable_share_forecast"),
+        ])
+        drop_tmp = [c for c in ("__wind_onshore_forecast_f", "__wind_offshore_forecast_f", "__solar_forecast_f") if c in df.columns]
+        if drop_tmp:
+            df = df.drop(drop_tmp)
+
+    drop_tmp = [c for c in ("__wind_onshore_actual_f", "__wind_offshore_actual_f", "__solar_actual_f", "__residual_load_actual_f") if c in df.columns]
+    if drop_tmp:
+        df = df.drop(drop_tmp)
+
     # Enforce ENTSO-E as the exclusive source for wind/solar.
     drop_smard = [
         "wind_onshore_actual",
@@ -235,6 +324,9 @@ def build_features(input_path: Path, output_path: Path) -> None:
 
     df = engineer_targets(df)
     df = add_confidence_features(df)
+    drop_cols = [c for c in DROP_FOR_MODEL if c in df.columns]
+    if drop_cols:
+        df = df.drop(drop_cols)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(output_path, compression="zstd")
