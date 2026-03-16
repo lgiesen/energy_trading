@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import polars as pl
 
 # Columns kept in cleaned datasets for audit/provenance but excluded from ML feature table.
@@ -46,7 +48,10 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
 
     Inputs required:
     - `afrr_activation_marginal_price_pos`, `afrr_activation_marginal_price_neg`
-    - `afrr_activated_mwh_pos`, `afrr_activated_mwh_neg`
+      (fallback to avg-activation columns if marginal columns are not present)
+    - activation magnitude columns:
+      - preferred: `afrr_activated_mwh_pos`, `afrr_activated_mwh_neg`
+      - fallback: `afrr_activated_mw_pos`, `afrr_activated_mw_neg`
 
     Outputs created:
     - `y_true_pos`, `y_true_neg`: cleaned, *unclipped* marginal price
@@ -63,12 +68,25 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
             neg_price_col = cand
             break
 
-    required = [c for c in (pos_price_col, neg_price_col, "afrr_activated_mwh_pos", "afrr_activated_mwh_neg") if c is not None]
-    missing = [c for c in ("afrr_activated_mwh_pos", "afrr_activated_mwh_neg") if c not in df.columns]
+    pos_act_col = (
+        "afrr_activated_mwh_pos"
+        if "afrr_activated_mwh_pos" in df.columns
+        else ("afrr_activated_mw_pos" if "afrr_activated_mw_pos" in df.columns else None)
+    )
+    neg_act_col = (
+        "afrr_activated_mwh_neg"
+        if "afrr_activated_mwh_neg" in df.columns
+        else ("afrr_activated_mw_neg" if "afrr_activated_mw_neg" in df.columns else None)
+    )
+    missing = []
     if pos_price_col is None:
         missing.append("afrr activation price (pos)")
     if neg_price_col is None:
         missing.append("afrr activation price (neg)")
+    if pos_act_col is None:
+        missing.append("afrr activation volume/power (pos)")
+    if neg_act_col is None:
+        missing.append("afrr activation volume/power (neg)")
     if missing:
         raise KeyError(f"Missing required target-engineering columns: {missing}")
 
@@ -87,14 +105,14 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns([
         pl.when(
             (pl.col(pos_price_col).cast(pl.Float64).abs() > sentinel_abs)
-            & (pl.col("afrr_activated_mwh_pos").cast(pl.Float64).fill_null(0.0).abs() == 0.0)
+            & (pl.col(pos_act_col).cast(pl.Float64).fill_null(0.0).abs() == 0.0)
         )
         .then(0.0)
         .otherwise(pl.col(pos_price_col).cast(pl.Float64))
         .alias("y_true_pos"),
         pl.when(
             (pl.col(neg_price_col).cast(pl.Float64).abs() > sentinel_abs)
-            & (pl.col("afrr_activated_mwh_neg").cast(pl.Float64).fill_null(0.0).abs() == 0.0)
+            & (pl.col(neg_act_col).cast(pl.Float64).fill_null(0.0).abs() == 0.0)
         )
         .then(0.0)
         .otherwise(pl.col(neg_price_col).cast(pl.Float64))
@@ -316,6 +334,87 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Add market-regime and grid-stress features without target leakage.
+
+    Features created:
+    - `mfrr_active_lag`: lagged mFRR activity flag (1 if activation > 0 else 0)
+    - `nrv_zscore_24h`: 24h z-score of NRV balance
+    - `picasso_flow_rate`: cross-border balancing flow proxy
+    - `grid_stress_index`: composite stress score in [0, 1]
+    - `market_regime_picasso`: 0 before 2022-06-22 UTC, 1 from 2022-06-22 UTC onward
+
+    Notes:
+    - Lag steps are derived from data frequency: 1 step for hourly, 4 for 15-min.
+    - Rolling windows use a 24h horizon in row-count space based on inferred frequency.
+    - Early-window NaNs are handled by safe defaults (mostly 0.0) for model robustness.
+    """
+    if "timestamp_utc" not in df.columns:
+        return df
+
+    pdf = df.to_pandas()
+    pdf["timestamp_utc"] = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
+    pdf = pdf.sort_values("timestamp_utc").reset_index(drop=True)
+
+    # Infer sampling frequency to set leakage-safe lag.
+    diffs = pdf["timestamp_utc"].dropna().diff().dropna()
+    if len(diffs) == 0:
+        step_seconds = 3600.0
+    else:
+        step_seconds = float(diffs.median().total_seconds())
+        if not np.isfinite(step_seconds) or step_seconds <= 0:
+            step_seconds = 3600.0
+    steps_per_hour = max(1, int(round(3600.0 / step_seconds)))
+    lag_steps = 4 if steps_per_hour >= 4 else 1
+    window_24h = max(1, 24 * steps_per_hour)
+
+    # 1) mFRR activity lag (prefer MWh, fallback to MW).
+    mfrr_pos = "mfrr_activated_mwh_pos" if "mfrr_activated_mwh_pos" in pdf.columns else "mfrr_activated_mw_pos"
+    mfrr_neg = "mfrr_activated_mwh_neg" if "mfrr_activated_mwh_neg" in pdf.columns else "mfrr_activated_mw_neg"
+    if mfrr_pos in pdf.columns and mfrr_neg in pdf.columns:
+        active = ((pdf[mfrr_pos].fillna(0.0) > 0.0) | (pdf[mfrr_neg].fillna(0.0) > 0.0)).astype(int)
+        pdf["mfrr_active_lag"] = active.shift(lag_steps).fillna(0).astype(int)
+    else:
+        pdf["mfrr_active_lag"] = 0
+
+    # 2) NRV z-score over last 24h.
+    nrv_col = "NRV_balance" if "NRV_balance" in pdf.columns else None
+    if nrv_col is not None:
+        nrv = pd.to_numeric(pdf[nrv_col], errors="coerce")
+        nrv_mean = nrv.rolling(window_24h, min_periods=2).mean()
+        nrv_std = nrv.rolling(window_24h, min_periods=2).std(ddof=0)
+        z = (nrv - nrv_mean) / nrv_std.replace(0.0, np.nan)
+        pdf["nrv_zscore_24h"] = z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        nrv_abs = nrv.abs().fillna(0.0)
+    else:
+        pdf["nrv_zscore_24h"] = 0.0
+        nrv_abs = pd.Series(0.0, index=pdf.index)
+
+    # 3) PICASSO flow proxy.
+    if "afrr_optimization_mwh" in pdf.columns:
+        picasso = pd.to_numeric(pdf["afrr_optimization_mwh"], errors="coerce").fillna(0.0)
+    elif "net_import_export_mw" in pdf.columns:
+        picasso = pd.to_numeric(pdf["net_import_export_mw"], errors="coerce").fillna(0.0)
+    else:
+        picasso = pd.Series(0.0, index=pdf.index)
+    pdf["picasso_flow_rate"] = picasso
+
+    # 4) Composite stress index in [0, 1].
+    nrv_norm_den = nrv_abs.rolling(window_24h, min_periods=2).max().replace(0.0, np.nan)
+    nrv_norm = (nrv_abs / nrv_norm_den).fillna(0.0).clip(0.0, 1.0)
+    pic_abs = picasso.abs()
+    pic_norm_den = pic_abs.rolling(window_24h, min_periods=2).max().replace(0.0, np.nan)
+    pic_norm = (pic_abs / pic_norm_den).fillna(0.0).clip(0.0, 1.0)
+    gsi = 0.4 * nrv_norm + 0.4 * pdf["mfrr_active_lag"].astype(float) + 0.2 * pic_norm
+    pdf["grid_stress_index"] = gsi.clip(0.0, 1.0)
+
+    # 5) Market regime flag (PICASSO structural break).
+    picasso_start = pd.Timestamp("2022-06-22 00:00:00+00:00")
+    pdf["market_regime_picasso"] = (pdf["timestamp_utc"] >= picasso_start).astype(int)
+
+    return pl.from_pandas(pdf)
+
+
 def build_features(input_path: Path, output_path: Path) -> None:
     """Build ML features from transformed parquet."""
     df = pl.read_parquet(input_path)
@@ -324,6 +423,7 @@ def build_features(input_path: Path, output_path: Path) -> None:
 
     df = engineer_targets(df)
     df = add_confidence_features(df)
+    df = add_market_regime_features(df)
     drop_cols = [c for c in DROP_FOR_MODEL if c in df.columns]
     if drop_cols:
         df = df.drop(drop_cols)
