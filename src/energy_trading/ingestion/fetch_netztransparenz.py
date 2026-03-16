@@ -13,7 +13,6 @@ Includes:
     - NRV-Saldo (NRV_balance)
     - reBAP (reBAP_shortage_surplus)
     - aFRR/mFRR activated volumes (afrr_activated_mw_*, mfrr_activated_mw_*)
-    - hourly energy totals (afrr_activated_mwh_*, mfrr_activated_mwh_*)
     - RZ-Saldo (rz_saldo_mw + per-TSO columns)
 
 Auth:
@@ -219,8 +218,10 @@ def _find_region_col(df: pl.DataFrame) -> str | None:
 
 
 def _select_germany_rows(df: pl.DataFrame, region_col: str) -> tuple[pl.DataFrame, str | None]:
-    # Prefer aggregated Germany row if present.
-    keywords = ["deutschland", "netzregelverbund", "igcc"]
+    # Prefer explicit Germany row only.
+    # Do not select generic netting/IGCC rows here, as those can understate
+    # activated aFRR/mFRR volumes compared with Germany totals.
+    keywords = ["deutschland", "germany"]
     pattern = "|".join(keywords)
     try:
         matches = df.filter(pl.col(region_col).cast(pl.Utf8).str.contains(pattern, case=False, literal=False))
@@ -253,7 +254,7 @@ def _tidy_nrv(df: pl.DataFrame) -> pl.DataFrame:
                 .then(None)
                 .otherwise(pl.col(value_col))
                 .cast(pl.Utf8)
-                .str.replace(",", ".")
+                .str.replace_all(",", ".", literal=True)
                 .cast(pl.Float64, strict=False)
                 .alias("NRV_balance"),
             ]
@@ -290,14 +291,14 @@ def _tidy_rebap(df: pl.DataFrame) -> pl.DataFrame:
                 .then(None)
                 .otherwise(pl.col(unter_col))
                 .cast(pl.Utf8)
-                .str.replace(",", ".")
+                .str.replace_all(",", ".", literal=True)
                 .cast(pl.Float64, strict=False)
                 .alias("reBAP unterdeckt"),
                 pl.when(pl.col(ueber_col).cast(pl.Utf8) == "N.A.")
                 .then(None)
                 .otherwise(pl.col(ueber_col))
                 .cast(pl.Utf8)
-                .str.replace(",", ".")
+                .str.replace_all(",", ".", literal=True)
                 .cast(pl.Float64, strict=False)
                 .alias("reBAP ueberdeckt"),
             ]
@@ -339,8 +340,8 @@ def _tidy_rz_saldo(df: pl.DataFrame) -> pl.DataFrame:
         return (
             pl.col(col)
             .cast(pl.Utf8)
-            .str.replace(".", "")
-            .str.replace(",", ".")
+            .str.replace_all(".", "", literal=True)
+            .str.replace_all(",", ".", literal=True)
             .cast(pl.Float64, strict=False)
         )
 
@@ -370,27 +371,59 @@ def _tidy_activation(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
     if not pos_cols or not neg_cols:
         raise RuntimeError(f"Could not find positive/negative columns in {prefix} payload.")
 
+    # Prefer Germany total columns when present to avoid summing duplicated
+    # regional views in mixed payload layouts.
+    pos_cols_de = [c for c in pos_cols if "deutschland" in c]
+    neg_cols_de = [c for c in neg_cols if "deutschland" in c]
+    use_de_cols = bool(pos_cols_de and neg_cols_de)
+    if use_de_cols:
+        pos_cols = pos_cols_de
+        neg_cols = neg_cols_de
+
     def _clean_num(col: str) -> pl.Expr:
         return (
             pl.col(col)
             .cast(pl.Utf8)
-            .str.replace(".", "")
-            .str.replace(",", ".")
+            .str.replace_all(".", "", literal=True)
+            .str.replace_all(",", ".", literal=True)
             .cast(pl.Float64, strict=False)
         )
 
     clean = df.with_columns([ts] + [_clean_num(c).alias(c) for c in (pos_cols + neg_cols)])
     selected_region = None
-    if region_col:
+    if region_col and not use_de_cols:
         clean, selected_region = _select_germany_rows(clean, region_col)
     if selected_region:
         LOGGER.info("Selected region '%s' for %s aggregation.", selected_region, prefix)
 
-    clean = clean.with_columns(
-        pl.sum_horizontal([pl.col(c) for c in pos_cols]).alias(f"{prefix}_mw_pos"),
-        pl.sum_horizontal([pl.col(c) for c in neg_cols]).alias(f"{prefix}_mw_neg"),
-    ).select(["timestamp_utc", f"{prefix}_mw_pos", f"{prefix}_mw_neg"])
-    return clean.sort("timestamp_utc")
+    base = clean.with_columns(
+        pl.sum_horizontal([pl.col(c) for c in pos_cols]).alias(f"{prefix}_mw_pos_row"),
+        pl.sum_horizontal([pl.col(c) for c in neg_cols]).alias(f"{prefix}_mw_neg_row"),
+    ).select(["timestamp_utc", f"{prefix}_mw_pos_row", f"{prefix}_mw_neg_row"])
+
+    # Ensure one row per timestamp before outer joins.
+    # - If Germany total columns are used, take max per timestamp
+    #   (defensive against repeated identical Germany rows).
+    # - Otherwise sum rows per timestamp (typical per-TSO layout).
+    if use_de_cols:
+        out = (
+            base.group_by("timestamp_utc")
+            .agg(
+                pl.col(f"{prefix}_mw_pos_row").max().alias(f"{prefix}_mw_pos"),
+                pl.col(f"{prefix}_mw_neg_row").max().alias(f"{prefix}_mw_neg"),
+            )
+            .sort("timestamp_utc")
+        )
+    else:
+        out = (
+            base.group_by("timestamp_utc")
+            .agg(
+                pl.col(f"{prefix}_mw_pos_row").sum().alias(f"{prefix}_mw_pos"),
+                pl.col(f"{prefix}_mw_neg_row").sum().alias(f"{prefix}_mw_neg"),
+            )
+            .sort("timestamp_utc")
+        )
+    return out
 
 
 def _chunk_range(start: datetime, end: datetime, days: int):
@@ -599,25 +632,11 @@ def fetch_and_merge(
         merged = merged.drop("nrv_imbalance")
 
     if resample_every:
-        # 15-min MW -> hourly mean MW; MWh = MW * 0.25 summed per hour.
-        mw_cols = [
-            "afrr_activated_mw_pos",
-            "afrr_activated_mw_neg",
-            "mfrr_activated_mw_pos",
-            "mfrr_activated_mw_neg",
-        ]
-        for col in mw_cols:
-            if col in merged.columns:
-                merged = merged.with_columns((pl.col(col) * 0.25).alias(col.replace("_mw_", "_mwh_")))
-
-        mwh_cols = [c for c in merged.columns if c.endswith("_mwh_pos") or c.endswith("_mwh_neg")]
-        other_numeric = [c for c, t in zip(merged.columns, merged.dtypes) if t.is_numeric() and c not in mwh_cols]
-
+        # Downsample numeric values to the target grid using mean aggregation.
+        numeric_cols = [c for c, t in zip(merged.columns, merged.dtypes) if t.is_numeric()]
         agg_exprs = []
-        if other_numeric:
-            agg_exprs.append(pl.col(other_numeric).mean())
-        if mwh_cols:
-            agg_exprs.append(pl.col(mwh_cols).sum())
+        if numeric_cols:
+            agg_exprs.append(pl.col(numeric_cols).mean())
         merged = (
             merged.sort("timestamp_utc")
             .group_by_dynamic("timestamp_utc", every=resample_every, closed="left", label="left")
