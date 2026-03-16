@@ -33,17 +33,17 @@ https://ds.netztransparenz.de/api/v1/data
 
 Quality-assured endpoints:
 ```text
-/NrvSaldo/NRVSaldo/Qualitaetsgesichert/{start_local}/{end_local}
-/NrvSaldo/reBAP/Qualitaetsgesichert/{start_local}/{end_local}
-/NrvSaldo/RZSaldo/Qualitaetsgesichert/{start_local}/{end_local}
-/NrvSaldo/AktivierteSRL/Qualitaetsgesichert/{start_local}/{end_local}
-/NrvSaldo/AktivierteMRL/Qualitaetsgesichert/{start_local}/{end_local}
+/NrvSaldo/NRVSaldo/Qualitaetsgesichert/{start_utc}/{end_utc}
+/NrvSaldo/reBAP/Qualitaetsgesichert/{start_utc}/{end_utc}
+/NrvSaldo/RZSaldo/Qualitaetsgesichert/{start_utc}/{end_utc}
+/NrvSaldo/AktivierteSRL/Qualitaetsgesichert/{start_utc}/{end_utc}
+/NrvSaldo/AktivierteMRL/Qualitaetsgesichert/{start_utc}/{end_utc}
 ```
 
 Operational fallback endpoints:
 ```text
-/NrvSaldo/NRVSaldo/Betrieblich/{start_local}/{end_local}
-/NrvSaldo/RZSaldo/Betrieblich/{start_local}/{end_local}
+/NrvSaldo/NRVSaldo/Betrieblich/{start_utc}/{end_utc}
+/NrvSaldo/RZSaldo/Betrieblich/{start_utc}/{end_utc}
 ```
 
 ### Chunking / Request Strategy
@@ -78,16 +78,13 @@ Current schema in `data/raw/netztransparenz.parquet`:
 | `afrr_activated_mw_neg` | float | MW | Activated aFRR power, negative direction. |
 | `mfrr_activated_mw_pos` | float | MW | Activated mFRR power, positive direction. |
 | `mfrr_activated_mw_neg` | float | MW | Activated mFRR power, negative direction. |
-| `afrr_activated_mwh_pos` | float | MWh | Hourly activated aFRR energy, positive direction. |
-| `afrr_activated_mwh_neg` | float | MWh | Hourly activated aFRR energy, negative direction. |
-| `mfrr_activated_mwh_pos` | float | MWh | Hourly activated mFRR energy, positive direction. |
-| `mfrr_activated_mwh_neg` | float | MWh | Hourly activated mFRR energy, negative direction. |
 
 ## 4. Data Preprocessing & Transformations (ETL)
 ### Parsing and Normalization
 - CSV responses are parsed with robust delimiter and encoding cleanup.
 - Date/time fields are converted to timezone-aware datetimes and normalized to UTC.
 - Numeric fields are sanitized from localized decimal/thousands formats.
+- For activation series, Germany aggregate columns (`Deutschland (Positiv/Negativ)`) are preferred when present.
 
 ### Canonical Column Construction
 - `NRV_balance` is built by coalescing quality-assured and operational sources.
@@ -97,7 +94,6 @@ Current schema in `data/raw/netztransparenz.parquet`:
 ### Resolution Harmonization
 - Source values are ingested at quarter-hour granularity where applicable.
 - Power (`MW`) series are resampled to hourly mean.
-- Energy (`MWh`) series are computed from quarter-hour MW (`MW * 0.25`) and then summed to hourly totals.
 
 ### Missing Data and Fallback Handling
 - Chunked fetching and retry logic reduce transport-level gaps.
