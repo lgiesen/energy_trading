@@ -13,22 +13,29 @@ Rationale:
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import polars as pl
 
+try:
+    import holidays
+except ModuleNotFoundError:  # pragma: no cover - runtime fallback for missing optional dep
+    holidays = None
+
 # Columns kept in cleaned datasets for audit/provenance but excluded from ML feature table.
 # The list is intentionally conservative and can be tuned per experiment.
 DROP_FOR_MODEL = [
     # Alternate timezone representation; keep only timestamp_utc for modeling.
     "timestamp_cet",
-    # Netztransparenz provenance streams (canonical columns are NRV_balance / rz_saldo_mw).
+    # Netztransparenz provenance streams kept for QA, not modeling.
     "NRV_balance_qs",
     "NRV_balance_op",
     "rz_saldo_mw_qs",
     "rz_saldo_mw_op",
+    "rz_saldo_mw",
     # Legacy SMARD aggregate error features (recomputed ENTSO-E based features are used instead).
     "wind_onshore_error",
     "wind_offshore_error",
@@ -415,6 +422,97 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     return pl.from_pandas(pdf)
 
 
+def add_german_holiday_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Add German holiday/regime features from local (Europe/Berlin) dates.
+
+    Features:
+    - holiday_severity: 1.0 national, 0.5 regional (BW/BY/NW), 0.0 otherwise
+    - is_bridge_day: 1 for Mon-before-national-Tue-holiday or Fri-after-national-Thu-holiday
+    - is_christmas_break: 1 for Dec 24-31 inclusive
+    """
+    if "timestamp_utc" not in df.columns:
+        return df
+
+    # Convert UTC timestamp to local German date for calendar matching.
+    df = df.with_columns(
+        pl.col("timestamp_utc")
+        .dt.convert_time_zone("Europe/Berlin")
+        .dt.date()
+        .alias("local_date")
+    )
+
+    if holidays is None:
+        # Degrade gracefully when optional dependency is unavailable.
+        return (
+            df.with_columns(
+                pl.lit(0.0).cast(pl.Float64).alias("holiday_severity"),
+                pl.lit(0).cast(pl.Int8).alias("is_bridge_day"),
+                pl.when((pl.col("local_date").dt.month() == 12) & (pl.col("local_date").dt.day().is_between(24, 31)))
+                .then(1)
+                .otherwise(0)
+                .cast(pl.Int8)
+                .alias("is_christmas_break"),
+            )
+            .drop("local_date")
+        )
+
+    date_bounds = df.select(
+        pl.col("local_date").min().alias("min_date"),
+        pl.col("local_date").max().alias("max_date"),
+    ).row(0)
+    min_date, max_date = date_bounds
+    if min_date is None or max_date is None:
+        return df.with_columns(
+            pl.lit(0.0).cast(pl.Float64).alias("holiday_severity"),
+            pl.lit(0).cast(pl.Int8).alias("is_bridge_day"),
+            pl.lit(0).cast(pl.Int8).alias("is_christmas_break"),
+        )
+
+    years = list(range(min_date.year, max_date.year + 1))
+    de_national = holidays.country_holidays("DE", years=years)
+    de_bw = holidays.country_holidays("DE", subdiv="BW", years=years)
+    de_by = holidays.country_holidays("DE", subdiv="BY", years=years)
+    de_nw = holidays.country_holidays("DE", subdiv="NW", years=years)
+
+    calendar_rows: list[dict[str, object]] = []
+    d = min_date
+    while d <= max_date:
+        is_national = d in de_national
+        is_regional = (d in de_bw) or (d in de_by) or (d in de_nw)
+        if is_national:
+            severity = 1.0
+        elif is_regional:
+            severity = 0.5
+        else:
+            severity = 0.0
+
+        is_bridge = int(
+            (d.weekday() == 0 and ((d + timedelta(days=1)) in de_national))
+            or (d.weekday() == 4 and ((d - timedelta(days=1)) in de_national))
+        )
+        is_xmas_break = int(d.month == 12 and 24 <= d.day <= 31)
+
+        calendar_rows.append(
+            {
+                "local_date": d,
+                "holiday_severity": severity,
+                "is_bridge_day": is_bridge,
+                "is_christmas_break": is_xmas_break,
+            }
+        )
+        d += timedelta(days=1)
+
+    df_calendar = pl.DataFrame(calendar_rows).with_columns(
+        pl.col("local_date").cast(pl.Date),
+        pl.col("holiday_severity").cast(pl.Float64),
+        pl.col("is_bridge_day").cast(pl.Int8),
+        pl.col("is_christmas_break").cast(pl.Int8),
+    )
+
+    df = df.join(df_calendar, on="local_date", how="left")
+    return df.drop("local_date")
+
+
 def build_features(input_path: Path, output_path: Path) -> None:
     """Build ML features from transformed parquet."""
     df = pl.read_parquet(input_path)
@@ -423,6 +521,7 @@ def build_features(input_path: Path, output_path: Path) -> None:
 
     df = engineer_targets(df)
     df = add_confidence_features(df)
+    df = add_german_holiday_features(df)
     df = add_market_regime_features(df)
     drop_cols = [c for c in DROP_FOR_MODEL if c in df.columns]
     if drop_cols:
