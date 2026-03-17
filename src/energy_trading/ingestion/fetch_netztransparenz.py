@@ -25,6 +25,7 @@ import argparse
 import io
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,6 +43,34 @@ SMARD_BASE_URL = "https://www.smard.de/app/chart_data"
 SMARD_RZ_SALDO_ID = 37  # Regelzonensaldo (Netto)
 SMARD_REGIONS = ["DE", "DE-LU"]
 SMARD_RESOLUTION = "hour"
+
+
+def _parse_mixed_numeric(value: object) -> float | None:
+    """Parse mixed German/English numeric formats robustly.
+
+    Handles values such as:
+    - 1.105,35  -> 1105.35
+    - -210,928  -> -210.928
+    - -210.928  -> -210.928  (dot kept as decimal if comma absent)
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "n.a.", "n/a"}:
+        return None
+
+    s = re.sub(r"[^0-9,.-]", "", s)
+    if not s:
+        return None
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    # dot-only values are interpreted as decimal notation
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 def _load_env():
@@ -236,8 +265,32 @@ def _select_germany_rows(df: pl.DataFrame, region_col: str) -> tuple[pl.DataFram
 
 def _tidy_nrv(df: pl.DataFrame) -> pl.DataFrame:
     df = _normalize_cols(df)
-    # Use the last column as value if no explicit match.
-    value_col = df.columns[-1]
+    meta_cols = {
+        "datum",
+        "von",
+        "time",
+        "zeitzone",
+        "bis",
+        "einheit",
+        "datenkategorie",
+        "datentyp",
+    }
+    candidates = [c for c in df.columns if c not in meta_cols]
+    # Exclude traffic-light/status style columns (e.g., "NRV-Saldo-Ampel").
+    candidates = [c for c in candidates if "ampel" not in c]
+    if not candidates:
+        candidates = [c for c in df.columns if c not in meta_cols] or [df.columns[-1]]
+
+    # Prefer explicit Germany value column for NRV saldo endpoints.
+    value_col = next((c for c in candidates if "deutsch" in c), None)
+    if value_col is None:
+        value_col = next((c for c in candidates if ("nrv" in c and "saldo" in c)), None)
+    if value_col is None:
+        value_col = next((c for c in candidates if "saldo" in c), None)
+    if value_col is None:
+        value_col = candidates[-1]
+    LOGGER.debug("NRV parser selected value column: %s", value_col)
+
     date_col = "datum" if "datum" in df.columns else df.columns[0]
     time_col = "von" if "von" in df.columns else df.columns[1]
     ts = (
@@ -254,8 +307,7 @@ def _tidy_nrv(df: pl.DataFrame) -> pl.DataFrame:
                 .then(None)
                 .otherwise(pl.col(value_col))
                 .cast(pl.Utf8)
-                .str.replace_all(",", ".", literal=True)
-                .cast(pl.Float64, strict=False)
+                .map_elements(_parse_mixed_numeric, return_dtype=pl.Float64)
                 .alias("NRV_balance"),
             ]
         )
