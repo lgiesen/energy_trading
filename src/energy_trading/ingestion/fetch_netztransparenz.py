@@ -13,6 +13,8 @@ Includes:
     - NRV-Saldo (NRV_balance)
     - reBAP (reBAP_shortage_surplus)
     - aFRR/mFRR activated volumes (afrr_activated_mw_*, mfrr_activated_mw_*)
+    - aFRR Optimierung (PICASSO) net flow (afrr_picasso_net_mw)
+    - mFRR Optimierung (MARI) net flow (mfrr_mari_net_mw)
     - RZ-Saldo (rz_saldo_mw + per-TSO columns)
 
 Auth:
@@ -43,6 +45,20 @@ SMARD_BASE_URL = "https://www.smard.de/app/chart_data"
 SMARD_RZ_SALDO_ID = 37  # Regelzonensaldo (Netto)
 SMARD_REGIONS = ["DE", "DE-LU"]
 SMARD_RESOLUTION = "hour"
+
+A_FRR_OPTIMIZATION_SERIES_CANDIDATES = [
+    "SRLOptimierung",
+    "aFRROptimierung",
+    "aFRR_Optimierung",
+    "aFRR-Optimierung",
+]
+
+M_FRR_OPTIMIZATION_SERIES_CANDIDATES = [
+    "mFRROptimierung",
+    "mFRR_Optimierung",
+    "mFRR-Optimierung",
+    "MRLOptimierung",
+]
 
 
 def _parse_mixed_numeric(value: object) -> float | None:
@@ -152,6 +168,69 @@ def _read_csv(text: str) -> pl.DataFrame:
         separator=";",
         infer_schema_length=2000,
         quote_char=None,
+    )
+
+
+def _fetch_first_available_csv(
+    *,
+    base_url: str,
+    session: requests.Session,
+    series_candidates: list[str],
+    quality: str,
+    s_str: str,
+    e_str: str,
+    timeout: int,
+) -> pl.DataFrame:
+    """Try multiple series names and return first successful CSV payload.
+
+    Netztransparenz naming can change across endpoints/releases. This helper
+    keeps the pipeline resilient by trying a small candidate list per dataset.
+    """
+    errors: list[str] = []
+    for series in series_candidates:
+        url = f"{base_url}/NrvSaldo/{series}/{quality}/{s_str}/{e_str}"
+        try:
+            # Candidate probing should fail fast: unknown DataType returns
+            # deterministic 4xx/5xx and should not trigger long retry sleeps.
+            df = _read_csv(
+                _fetch_csv(
+                    url,
+                    session,
+                    timeout=timeout,
+                    retries=1,
+                    retry_sleep=0.0,
+                )
+            )
+            LOGGER.debug("Fetched series %s for %s -> %s", series, s_str, e_str)
+            return df
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{series}: {exc}")
+    raise RuntimeError(
+        f"No series candidate worked for quality={quality}. Tried: {series_candidates}. "
+        f"Errors: {' | '.join(errors)}"
+    )
+
+
+def _is_pre_platform_not_available_error(exc: Exception) -> bool:
+    """Return True when platform optimization data is unavailable for early dates."""
+    msg = str(exc).lower()
+    return (
+        "404" in msg
+        or "es können keine daten vor dem" in msg
+        or "pre-picasso" in msg
+        or "pre-mari" in msg
+    )
+
+
+def _empty_optimization_df(prefix: str) -> pl.DataFrame:
+    """Empty fallback with stable schema for join compatibility."""
+    return pl.DataFrame(
+        schema={
+            "timestamp_utc": pl.Datetime(time_unit="us", time_zone="UTC"),
+            f"{prefix}_mw_pos": pl.Float64,
+            f"{prefix}_mw_neg": pl.Float64,
+            f"{prefix}_net_mw": pl.Float64,
+        }
     )
 
 
@@ -478,6 +557,72 @@ def _tidy_activation(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
     return out
 
 
+def _select_flow_columns(columns: list[str], positive: bool) -> list[str]:
+    """Select directional flow columns, preferring Germany totals when present."""
+    if positive:
+        direction_hits = [c for c in columns if ("positiv" in c or "import" in c)]
+    else:
+        direction_hits = [c for c in columns if ("negativ" in c or "export" in c)]
+    germany_hits = [c for c in direction_hits if "deutschland" in c]
+    return germany_hits if germany_hits else direction_hits
+
+
+def _tidy_optimization_flow(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
+    """Parse cross-border balancing-flow payload and compute net MW.
+
+    aFRR Optimierung (PICASSO) and IGCC Optimierung are balancing power flows.
+    Positive/import values increase local available balancing supply, negative/
+    export values decrease it. Net flow is modeled as:
+        net_mw = import_or_positive_mw - export_or_negative_mw
+    """
+    df = _normalize_cols(df)
+    date_col = "datum" if "datum" in df.columns else df.columns[0]
+    time_col = "von" if "von" in df.columns else df.columns[1]
+    ts = (
+        pl.concat_str([pl.col(date_col), pl.lit(" "), pl.col(time_col)])
+        .str.to_datetime("%d.%m.%Y %H:%M", strict=False)
+        .dt.replace_time_zone("UTC")
+        .alias("timestamp_utc")
+    )
+
+    meta_cols = {date_col, time_col, "zeitzone", "bis", "einheit", "datenkategorie", "datentyp"}
+    value_cols = [c for c in df.columns if c not in meta_cols]
+    pos_cols = _select_flow_columns(value_cols, positive=True)
+    neg_cols = _select_flow_columns(value_cols, positive=False)
+    if not pos_cols or not neg_cols:
+        raise RuntimeError(
+            f"Could not detect directional columns for {prefix}. "
+            f"Available: {value_cols}"
+        )
+
+    cleaned = df.with_columns(
+        [ts]
+        + [
+            pl.col(c).cast(pl.Utf8).map_elements(_parse_mixed_numeric, return_dtype=pl.Float64).alias(c)
+            for c in (pos_cols + neg_cols)
+        ]
+    )
+    return (
+        cleaned.with_columns(
+            [
+                pl.sum_horizontal([pl.col(c) for c in pos_cols]).alias(f"{prefix}_mw_pos"),
+                pl.sum_horizontal([pl.col(c) for c in neg_cols]).alias(f"{prefix}_mw_neg"),
+            ]
+        )
+        .with_columns(
+            (pl.col(f"{prefix}_mw_pos") - pl.col(f"{prefix}_mw_neg")).alias(f"{prefix}_net_mw")
+        )
+        .select(["timestamp_utc", f"{prefix}_mw_pos", f"{prefix}_mw_neg", f"{prefix}_net_mw"])
+        .group_by("timestamp_utc")
+        .agg(
+            pl.col(f"{prefix}_mw_pos").max().alias(f"{prefix}_mw_pos"),
+            pl.col(f"{prefix}_mw_neg").max().alias(f"{prefix}_mw_neg"),
+            pl.col(f"{prefix}_net_mw").max().alias(f"{prefix}_net_mw"),
+        )
+        .sort("timestamp_utc")
+    )
+
+
 def _chunk_range(start: datetime, end: datetime, days: int):
     cur = start
     while cur < end:
@@ -599,6 +744,56 @@ def fetch_and_merge(
             )
             afrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["afrr"], session, timeout=timeout)), "afrr_activated")
             mfrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["mfrr"], session, timeout=timeout)), "mfrr_activated")
+            afrr_opt_df: pl.DataFrame | None = None
+            mfrr_opt_df: pl.DataFrame | None = None
+            try:
+                afrr_opt_raw = _fetch_first_available_csv(
+                    base_url=base_url,
+                    session=session,
+                    series_candidates=A_FRR_OPTIMIZATION_SERIES_CANDIDATES,
+                    quality="Qualitaetsgesichert",
+                    s_str=s_str,
+                    e_str=e_str,
+                    timeout=timeout,
+                )
+                afrr_opt_df = _tidy_optimization_flow(afrr_opt_raw, "afrr_picasso")
+            except Exception as exc:  # noqa: BLE001
+                if _is_pre_platform_not_available_error(exc):
+                    LOGGER.info(
+                        "aFRR Optimierung not available for %s -> %s (pre-PICASSO).",
+                        s_str,
+                        e_str,
+                    )
+                    afrr_opt_df = _empty_optimization_df("afrr_picasso")
+                else:
+                    LOGGER.info("aFRR Optimierung unavailable for %s -> %s.", s_str, e_str)
+                    LOGGER.debug("aFRR Optimierung details: %s", exc)
+                    afrr_opt_df = _empty_optimization_df("afrr_picasso")
+
+            try:
+                mfrr_opt_raw = _fetch_first_available_csv(
+                    base_url=base_url,
+                    session=session,
+                    series_candidates=M_FRR_OPTIMIZATION_SERIES_CANDIDATES,
+                    quality="Qualitaetsgesichert",
+                    s_str=s_str,
+                    e_str=e_str,
+                    timeout=timeout,
+                )
+                mfrr_opt_df = _tidy_optimization_flow(mfrr_opt_raw, "mfrr_mari")
+            except Exception as exc:  # noqa: BLE001
+                if _is_pre_platform_not_available_error(exc):
+                    LOGGER.info(
+                        "mFRR Optimierung not available for %s -> %s (pre-MARI).",
+                        s_str,
+                        e_str,
+                    )
+                    mfrr_opt_df = _empty_optimization_df("mfrr_mari")
+                else:
+                    LOGGER.info("mFRR Optimierung unavailable for %s -> %s.", s_str, e_str)
+                    LOGGER.debug("mFRR Optimierung details: %s", exc)
+                    mfrr_opt_df = _empty_optimization_df("mfrr_mari")
+
             merged = (
                 nrv_df.join(rebap_df, on="timestamp_utc", how="full", coalesce=True)
                 .join(rz_df, on="timestamp_utc", how="full", coalesce=True)
@@ -606,6 +801,11 @@ def fetch_and_merge(
                 .join(mfrr_df, on="timestamp_utc", how="full", coalesce=True)
                 .sort("timestamp_utc")
             )
+            if afrr_opt_df is not None and not afrr_opt_df.is_empty() and "timestamp_utc" in afrr_opt_df.columns:
+                merged = merged.join(afrr_opt_df, on="timestamp_utc", how="full", coalesce=True)
+            if mfrr_opt_df is not None and not mfrr_opt_df.is_empty() and "timestamp_utc" in mfrr_opt_df.columns:
+                merged = merged.join(mfrr_opt_df, on="timestamp_utc", how="full", coalesce=True)
+            merged = merged.sort("timestamp_utc")
             LOGGER.info("Fetched chunk %s -> %s: %s rows", s_str, e_str, len(merged))
             return merged
         except Exception as exc:
@@ -616,7 +816,9 @@ def fetch_and_merge(
                 right = _fetch_chunk_data(mid, e_dt, retries=retries - 1)
                 parts = [p for p in [left, right] if p is not None and not p.is_empty()]
                 if parts:
-                    return pl.concat(parts)
+                    # Recursive splits may return chunks with slightly different
+                    # column sets (e.g. optional platform features unavailable).
+                    return pl.concat(parts, how="diagonal_relaxed")
             delta_days = (e_dt - s_dt).days
             if delta_days > 30:
                 mid = s_dt + (e_dt - s_dt) / 2
@@ -624,7 +826,7 @@ def fetch_and_merge(
                 right = _fetch_chunk_data(mid, e_dt, retries=0)
                 parts = [p for p in [left, right] if p is not None and not p.is_empty()]
                 if parts:
-                    return pl.concat(parts)
+                    return pl.concat(parts, how="diagonal_relaxed")
             LOGGER.warning("Chunk %s -> %s failed: %s", s_str, e_str, exc)
             return None
 
@@ -638,7 +840,11 @@ def fetch_and_merge(
     if not frames:
         return pl.DataFrame()
 
-    merged = pl.concat(frames).unique(subset=["timestamp_utc"], keep="last").sort("timestamp_utc")
+    merged = (
+        pl.concat(frames, how="diagonal_relaxed")
+        .unique(subset=["timestamp_utc"], keep="last")
+        .sort("timestamp_utc")
+    )
 
     # Drop duplicate metadata columns from the right-hand frame if they exist.
     drop_cols = [c for c in ("Datum_right", "Zeitzone_right", "von_right", "time_right", "datum_right", "zeitzone_right") if c in merged.columns]
@@ -685,6 +891,8 @@ def fetch_and_merge(
 
     if resample_every:
         # Downsample numeric values to the target grid using mean aggregation.
+        # This is required for MW-valued signals (power): hourly values must be
+        # the average power over the four 15-minute quarters, not a sum.
         numeric_cols = [c for c, t in zip(merged.columns, merged.dtypes) if t.is_numeric()]
         agg_exprs = []
         if numeric_cols:
@@ -695,6 +903,18 @@ def fetch_and_merge(
             .agg(agg_exprs)
             .sort("timestamp_utc")
         )
+
+    expected_cols = [
+        "afrr_picasso_mw_pos",
+        "afrr_picasso_mw_neg",
+        "afrr_picasso_net_mw",
+        "mfrr_mari_mw_pos",
+        "mfrr_mari_mw_neg",
+        "mfrr_mari_net_mw",
+    ]
+    for col in expected_cols:
+        if col not in merged.columns:
+            merged = merged.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
     return merged
 
