@@ -11,7 +11,8 @@ Outputs:
         wind_onshore_actual_entsoe, wind_offshore_actual_entsoe, solar_actual_entsoe,
         wind_onshore_forecast_da_entsoe, wind_offshore_forecast_da_entsoe, solar_forecast_da_entsoe,
         wind_onshore_forecast_id_entsoe, wind_offshore_forecast_id_entsoe, solar_forecast_id_entsoe,
-        wind_onshore_capacity_entsoe, wind_offshore_capacity_entsoe
+        wind_onshore_capacity_entsoe, wind_offshore_capacity_entsoe,
+        afrr_cbmp_pos_eur_mwh, afrr_cbmp_neg_eur_mwh
 """
 from __future__ import annotations
 
@@ -262,6 +263,118 @@ def _fetch_forecast(
     return _resample_hourly(forecast)
 
 
+def _find_directional_columns(df: pd.DataFrame) -> tuple[str | None, str | None]:
+    """Detect positive/upward and negative/downward price columns."""
+    if df is None or df.empty:
+        return None, None
+    lower_map = {c: str(c).lower() for c in df.columns}
+
+    def _pick(keywords: tuple[str, ...]) -> str | None:
+        for c, lc in lower_map.items():
+            if all(k in lc for k in keywords):
+                return c
+        for c, lc in lower_map.items():
+            if any(k in lc for k in keywords):
+                return c
+        return None
+
+    pos = _pick(("positive",)) or _pick(("upward",)) or _pick(("(+)",)) or _pick(("pos",))
+    neg = _pick(("negative",)) or _pick(("downward",)) or _pick(("(-)",)) or _pick(("neg",))
+    return pos, neg
+
+
+def _empty_afrr_cbmp() -> pd.DataFrame:
+    idx = pd.DatetimeIndex([], tz="UTC", name="timestamp_utc")
+    return pd.DataFrame(
+        {
+            "afrr_cbmp_pos_eur_mwh": pd.Series(dtype="float64"),
+            "afrr_cbmp_neg_eur_mwh": pd.Series(dtype="float64"),
+        },
+        index=idx,
+    )
+
+
+def fetch_afrr_cbmp(
+    client: EntsoePandasClient, start_dt: pd.Timestamp, end_dt: pd.Timestamp
+) -> pd.DataFrame:
+    """Fetch aFRR CBMP (cross-border marginal prices) for DE-LU control area.
+
+    Notes:
+    - ENTSO-E library versions differ: some provide `query_balancing_prices`,
+      others provide `query_activated_balancing_energy_prices`.
+    - Data may be unavailable for early periods. In that case return an empty
+      frame with stable schema so joins remain safe.
+    - Raw data may be 15-minute; we aggregate to hourly by mean because price
+      units are EUR/MWh.
+    """
+    raw: pd.DataFrame | pd.Series | None = None
+    errors: list[str] = []
+
+    # Preferred method if available in local entsoe-py.
+    if hasattr(client, "query_balancing_prices"):
+        try:
+            raw = _retry(
+                lambda: client.query_balancing_prices(
+                    country_code=DE_PHYSICAL_CONTROL_CODE,
+                    start=start_dt,
+                    end=end_dt,
+                    process_type="A16",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - network/API variation
+            errors.append(f"query_balancing_prices: {exc}")
+
+    # Fallback for currently installed entsoe-py versions.
+    if raw is None:
+        try:
+            raw = _retry(
+                lambda: client.query_activated_balancing_energy_prices(
+                    country_code=DE_PHYSICAL_CONTROL_CODE,
+                    start=start_dt,
+                    end=end_dt,
+                    process_type="A16",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - network/API variation
+            errors.append(f"query_activated_balancing_energy_prices: {exc}")
+
+    if raw is None or (hasattr(raw, "__len__") and len(raw) == 0):
+        if errors:
+            LOGGER.info("aFRR CBMP unavailable for %s -> %s (%s)", start_dt, end_dt, " | ".join(errors))
+        return _empty_afrr_cbmp()
+
+    if isinstance(raw, pd.Series):
+        frame = raw.to_frame(name="afrr_cbmp_pos_eur_mwh")
+        frame["afrr_cbmp_neg_eur_mwh"] = pd.NA
+    else:
+        frame = raw.copy()
+
+    frame = _ensure_utc_index(frame)
+    frame.index.name = "timestamp_utc"
+
+    pos_col, neg_col = _find_directional_columns(frame)
+    if pos_col is None and neg_col is None:
+        # If only one numeric series is returned, map to pos and keep neg null.
+        num_cols = [c for c in frame.columns if pd.api.types.is_numeric_dtype(frame[c])]
+        if len(num_cols) == 1:
+            frame = frame[[num_cols[0]]].rename(columns={num_cols[0]: "afrr_cbmp_pos_eur_mwh"})
+            frame["afrr_cbmp_neg_eur_mwh"] = pd.NA
+        else:
+            LOGGER.info("aFRR CBMP columns not recognized for %s -> %s; returning empty schema.", start_dt, end_dt)
+            return _empty_afrr_cbmp()
+    else:
+        out = pd.DataFrame(index=frame.index)
+        out["afrr_cbmp_pos_eur_mwh"] = frame[pos_col] if pos_col is not None else pd.NA
+        out["afrr_cbmp_neg_eur_mwh"] = frame[neg_col] if neg_col is not None else pd.NA
+        frame = out
+
+    frame = frame.apply(pd.to_numeric, errors="coerce")
+    frame = _resample_hourly(frame)  # Prices: hourly mean from 15-min EUR/MWh.
+    frame.index = frame.index.tz_convert("UTC")
+    frame.index.name = "timestamp_utc"
+    return frame
+
+
 def _fetch_capacity_yearly(
     client: EntsoePandasClient,
     start: pd.Timestamp,
@@ -348,8 +461,9 @@ def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timesta
     if id_forecast is None:
         LOGGER.warning("A18 returned empty; trying A40 for intraday/current forecasts.")
         id_forecast = _fetch_forecast(client, start, end, process_type="A40", suffix="id")
+    afrr_cbmp = fetch_afrr_cbmp(client, start, end)
 
-    frames = [df for df in (actuals, da, id_forecast) if df is not None and len(df) > 0]
+    frames = [df for df in (actuals, da, id_forecast, afrr_cbmp) if df is not None and len(df) > 0]
     if frames:
         df = pd.concat(frames, axis=1, join="outer", sort=False)
         # Final cleanup: enforce actual column names in case tuple-like names survived.
@@ -378,6 +492,10 @@ def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timesta
         idx = pd.date_range(start=start, end=end, freq="1h", tz="UTC", inclusive="left")
         df = pd.DataFrame(index=idx)
 
+    for col in ("afrr_cbmp_pos_eur_mwh", "afrr_cbmp_neg_eur_mwh"):
+        if col not in df.columns:
+            df[col] = pd.NA
+
     df.index = df.index.tz_convert("UTC")
     df = df.sort_index()
 
@@ -398,9 +516,9 @@ def main() -> None:
     if load_dotenv is not None:
         load_dotenv(dotenv_path=Path(".env"))
 
-    api_key = os.getenv("ENTSOE_API_KEY")
+    api_key = os.getenv("ENTSOE_API_TOKEN") or os.getenv("ENTSOE_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing ENTSOE_API_KEY environment variable")
+        raise RuntimeError("Missing ENTSOE_API_TOKEN (or ENTSOE_API_KEY) environment variable")
 
     start = _parse_utc(args.start)
     end = _parse_utc(args.end)
