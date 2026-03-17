@@ -22,7 +22,7 @@ Policy notes:
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import date, datetime, timezone
 import logging
 from pathlib import Path
 from typing import Iterable
@@ -30,6 +30,7 @@ from typing import Iterable
 import polars as pl
 
 LOGGER = logging.getLogger(__name__)
+PICASSO_START_UTC = datetime(2022, 6, 21, 22, 0, tzinfo=timezone.utc)
 
 
 def _interpolate_small_gaps(df: pl.DataFrame, col: str, max_gap_hours: int) -> pl.DataFrame:
@@ -190,6 +191,12 @@ def _build_treatment_map(df: pl.DataFrame) -> dict[str, str]:
 
     for c in (
         "net_import_export_mw",
+        "afrr_picasso_mw_pos",
+        "afrr_picasso_mw_neg",
+        "afrr_picasso_net_mw",
+        "igcc_import_mw",
+        "igcc_export_mw",
+        "igcc_net_mw",
         "afrr_capacity_offered_mw_pos",
         "afrr_capacity_offered_mw_neg",
         "afrr_activation_offered_mw_pos",
@@ -201,6 +208,13 @@ def _build_treatment_map(df: pl.DataFrame) -> dict[str, str]:
     ):
         if c in df.columns:
             treatment[c] = "interpolate_small_gaps(max_gap_hours=8) + forward_fill"
+
+    for c in ("afrr_picasso_mw_pos", "afrr_picasso_mw_neg", "afrr_picasso_net_mw"):
+        if c in df.columns:
+            treatment[c] = (
+                "pre-PICASSO (<2022-06-21T22:00Z): fill_null(0.0), "
+                "then interpolate_small_gaps(max_gap_hours=8) + forward_fill"
+            )
 
     for c in ("afrr_capacity_offered_mw_pos", "afrr_capacity_offered_mw_neg", "afrr_activation_offered_mw_pos", "afrr_activation_offered_mw_neg"):
         if c in df.columns:
@@ -423,6 +437,27 @@ def _fill_activation_energy_from_power(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def _fill_pre_picasso_afrr_optimization_zero(df: pl.DataFrame) -> pl.DataFrame:
+    """Fill structural pre-PICASSO nulls for aFRR optimization with 0 MW."""
+    if "timestamp_utc" not in df.columns:
+        return df
+
+    cols = [c for c in ("afrr_picasso_mw_pos", "afrr_picasso_mw_neg", "afrr_picasso_net_mw") if c in df.columns]
+    if not cols:
+        return df
+
+    cutoff = pl.lit(PICASSO_START_UTC).cast(pl.Datetime(time_unit="us", time_zone="UTC"))
+    return df.with_columns(
+        [
+            pl.when((pl.col("timestamp_utc") < cutoff) & pl.col(c).is_null())
+            .then(pl.lit(0.0))
+            .otherwise(pl.col(c))
+            .alias(c)
+            for c in cols
+        ]
+    )
+
+
 def _fix_smard_dst_gaps(df: pl.DataFrame) -> pl.DataFrame:
     """Fix known single-hour DST gaps in legacy SMARD forecasts."""
     for col in ("wind_onshore_forecast", "solar_forecast"):
@@ -625,8 +660,16 @@ def main() -> None:
             df = _interpolate_small_gaps(df, price_col, max_gap_hours=2)
 
     # 5d) Regelleistung/activation volume-like signals: short forward-fill.
+    df = _fill_pre_picasso_afrr_optimization_zero(df)
+
     volume_ffill_cols = [
         "net_import_export_mw",
+        "afrr_picasso_mw_pos",
+        "afrr_picasso_mw_neg",
+        "afrr_picasso_net_mw",
+        "igcc_import_mw",
+        "igcc_export_mw",
+        "igcc_net_mw",
         "afrr_capacity_offered_mw_pos",
         "afrr_capacity_offered_mw_neg",
         "afrr_activation_offered_mw_pos",
