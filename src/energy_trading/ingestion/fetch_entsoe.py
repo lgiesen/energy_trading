@@ -39,6 +39,8 @@ LOGGER = logging.getLogger(__name__)
 # - DE_PHYSICAL_CONTROL_CODE (10Y1001A1001A83F): use for generation/capacity/load
 DE_LU_BIDDING_ZONE_CODE = "10Y1001A1001A82H"
 DE_PHYSICAL_CONTROL_CODE = "10Y1001A1001A83F"
+# Legacy alias used by older notebooks.
+BIDDING_ZONE = DE_LU_BIDDING_ZONE_CODE
 
 WIND_SOLAR_COLS = ["Wind Onshore", "Wind Offshore", "Solar"]
 PSR_WIND_ONSHORE = "B19"
@@ -46,7 +48,11 @@ PSR_WIND_OFFSHORE = "B18"
 
 
 def _parse_utc(ts: str) -> pd.Timestamp:
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    # Accept ISO8601 and compact forms used in legacy notebooks (YYYYMMDDHHMM).
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        dt = pd.to_datetime(ts, utc=True, format="%Y%m%d%H%M", errors="raise").to_pydatetime()
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return pd.Timestamp(dt).tz_convert("UTC")
@@ -501,6 +507,89 @@ def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timesta
 
     pl_df = pl.from_pandas(df.reset_index()).rename({"index": "timestamp_utc"})
     return pl_df
+
+
+def fetch_and_merge(
+    start: str,
+    end: str,
+    bidding_zone_or_out: str | None = None,
+    process_year_ahead: str | None = None,
+    out: str | None = None,
+    chunk_months: int = 3,
+    workers: int = 3,
+    token: str | None = None,
+    timeout: int | None = None,
+    chunk_days: int | None = None,
+) -> pl.DataFrame:
+    """Backward-compatible notebook helper.
+
+    Notes:
+    - `timeout` and `chunk_days` are accepted for compatibility and ignored.
+    - `process_year_ahead` is accepted for compatibility and ignored.
+    - `start`/`end` accept ISO8601 and compact `YYYYMMDDHHMM`.
+    - Third positional argument can be either legacy bidding-zone code or output path.
+    """
+    _ = timeout
+    _ = chunk_days
+    _ = process_year_ahead
+
+    bidding_zone = DE_LU_BIDDING_ZONE_CODE
+    if bidding_zone_or_out:
+        if str(bidding_zone_or_out).startswith("10Y"):
+            bidding_zone = str(bidding_zone_or_out)
+        elif out is None:
+            out = str(bidding_zone_or_out)
+
+    if load_dotenv is not None:
+        load_dotenv(dotenv_path=Path(".env"))
+
+    api_key = token or os.getenv("ENTSOE_API_TOKEN") or os.getenv("ENTSOE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing ENTSOE_API_TOKEN (or ENTSOE_API_KEY) environment variable")
+
+    start_ts = _parse_utc(start)
+    end_ts = _parse_utc(end)
+    if end_ts <= start_ts:
+        raise ValueError("end must be after start")
+    query_end = end_ts + pd.Timedelta(hours=1)
+
+    _ = bidding_zone  # kept for interface compatibility; current implementation uses fixed DE-LU mappings.
+    client = EntsoePandasClient(api_key=api_key)
+    ranges = _chunk_ranges(start_ts, query_end, chunk_months)
+    frames: list[pl.DataFrame] = []
+
+    if workers <= 1:
+        for s, e in ranges:
+            frames.append(fetch_chunk(client, s, e))
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(fetch_chunk, client, s, e): (s, e) for s, e in ranges}
+            for fut in as_completed(futures):
+                frames.append(fut.result())
+
+    merged = (
+        pl.concat(frames, how="diagonal")
+        .unique(subset=["timestamp_utc"], keep="last")
+        .sort("timestamp_utc")
+    )
+
+    cap_sparse = _fetch_capacity_yearly(client, start_ts, query_end)
+    if not cap_sparse.empty:
+        hourly = merged.to_pandas().set_index("timestamp_utc").sort_index()
+        hourly = hourly.join(cap_sparse, how="left")
+        for col in ("wind_onshore_capacity_entsoe", "wind_offshore_capacity_entsoe"):
+            if col in hourly.columns:
+                hourly[col] = hourly[col].ffill()
+        merged = pl.from_pandas(hourly.reset_index())
+
+    merged = merged.filter(pl.col("timestamp_utc") <= pl.lit(end_ts))
+    if out:
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.write_parquet(out_path, compression="zstd")
+    return merged
 
 
 def main() -> None:
