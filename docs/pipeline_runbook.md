@@ -21,12 +21,13 @@ Main scripts:
   Regelleistung aFRR CAPACITY/ENERGY + optional anonymous-bid derived prices.
 - `src/energy_trading/ingestion/merge_data.py`  
   Full join of all raw parquet files on hourly UTC timestamps.
-- `src/energy_trading/processing/drop_redundant_features.py`  
-  Refines merged data, drops SMARD redundancies, calculates ENTSO-E based errors.
+- `src/energy_trading/processing/refine_market_data.py`  
+  Refines merged data, consolidates sources, and applies market logic.
 
 Raw outputs are written to `data/raw/*.parquet`.  
 Merged table is written to `data/processed/all_data.parquet`.  
-Refined table is written to `data/processed/all_data_refined.parquet`.
+Refined table is written to `data/processed/all_data_refined.parquet`.  
+Cleaned table is written to `data/processed/cleaned_data.parquet`.
 
 ### Step-by-step I/O map
 
@@ -39,12 +40,23 @@ Refined table is written to `data/processed/all_data_refined.parquet`.
 | 5 | `fetch_yfinance.py` | Yahoo Finance API | `data/raw/yfinance.parquet` |
 | 6 | `fetch_regelleistung.py` | Regelleistung API + bid files in `data/raw/bids/` | `data/raw/regelleistung.parquet` |
 | 7 | `merge_data.py` | All `data/raw/*.parquet` files | `data/processed/all_data.parquet` |
-| 8 | `drop_redundant_features.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
-| 9 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/all_data_clean.parquet` |
-| 10 | `transform_data.py` | `data/processed/all_data_clean.parquet` | `data/processed/all_data_transformed.parquet` |
+| 8 | `refine_market_data.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
+| 9 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/cleaned_data.parquet` |
+| 10 | `transform_data.py` | `data/processed/cleaned_data.parquet` | `data/processed/all_data_transformed.parquet` |
 | 11 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
 
 ---
+
+## Design Principles
+
+- Separation of concerns:
+  Fetchers mirror raw API data and avoid domain-specific transformations.
+- Market logic in processing:
+  Processing scripts implement source consolidation, structural-break logic,
+  and feature engineering in a traceable layer.
+- Reproducibility:
+  Intermediate artifacts (`all_data.parquet`, `all_data_refined.parquet`,
+  `cleaned_data.parquet`) make every transformation stage auditable.
 
 ## 2) Canonical Command (Recommended)
 
@@ -121,6 +133,10 @@ Run merge only:
 ---
 
 ## 5) Activation Price Columns (What They Mean)
+
+Activation prices (work prices) are sourced exclusively from
+`regelleistung.net` (directly and bid-derived VWAP variants). ENTSO-E CBMP is
+not part of the production pipeline.
 
 From Regelleistung TSO aggregation:
 
