@@ -49,6 +49,8 @@ import requests
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 LOGGER = logging.getLogger(__name__)
 CPP_FILES_BASE_URL = "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files"
+# Collect full 15-minute activation price streams while parsing yearly files.
+ALL_15MIN_PRICE_DATA: list[pd.DataFrame] = []
 
 
 def _log_dst_drop(label: str, ts_series: pd.Series, date_series: pd.Series) -> None:
@@ -804,8 +806,11 @@ def fetch_and_parse_regelleistung(
         # --- 3) Feature columns ---
         val_cols: dict[str, str] = {}
         if market_type == "ENERGY":
+            marg_col = _find_col(df_part, ["MARGINAL", "ENERGY", "PRICE"])
             avg_col = _find_col(df_part, ["AVERAGE", "ENERGY", "PRICE"])
             off_col = _find_col(df_part, ["OFFERED", "CAPACITY"])
+            if marg_col:
+                val_cols[marg_col] = "afrr_marginal_activation_price"
             if avg_col:
                 val_cols[avg_col] = "afrr_avg_activation_price"
             if off_col:
@@ -930,15 +935,114 @@ def _aggregate_hourly_with_vwap(df_15m: pd.DataFrame) -> pd.DataFrame:
         sum_weighted_pos = df_15m["weighted_cost_pos"].resample("1h").sum(min_count=1)
         sum_vol_pos = df_15m[vol_pos].resample("1h").sum(min_count=1)
         mean_price_pos = df_15m[price_pos].resample("1h").mean()
-        hourly["afrr_vwap_pos"] = np.where(sum_vol_pos != 0, sum_weighted_pos / sum_vol_pos, mean_price_pos)
+        vwap_pos = np.where(sum_vol_pos != 0, sum_weighted_pos / sum_vol_pos, mean_price_pos)
+        hourly["afrr_vwap_pos"] = vwap_pos
+        hourly["afrr_vwap_pos_eur_mwh"] = vwap_pos
 
     if {"weighted_cost_neg", vol_neg, price_neg}.issubset(df_15m.columns):
         sum_weighted_neg = df_15m["weighted_cost_neg"].resample("1h").sum(min_count=1)
         sum_vol_neg = df_15m[vol_neg].resample("1h").sum(min_count=1)
         mean_price_neg = df_15m[price_neg].resample("1h").mean()
-        hourly["afrr_vwap_neg"] = np.where(sum_vol_neg != 0, sum_weighted_neg / sum_vol_neg, mean_price_neg)
+        vwap_neg = np.where(sum_vol_neg != 0, sum_weighted_neg / sum_vol_neg, mean_price_neg)
+        hourly["afrr_vwap_neg"] = vwap_neg
+        hourly["afrr_vwap_neg_eur_mwh"] = vwap_neg
 
     return hourly.drop(columns=[c for c in ["weighted_cost_pos", "weighted_cost_neg"] if c in hourly.columns], errors="ignore")
+
+
+def _export_afrr_15min_price_volume(
+    price_15m: pd.DataFrame,
+    volume_15m: pd.DataFrame,
+    out_dir: Path,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> None:
+    """Persist raw 15-minute aFRR prices and volumes for VWAP validation."""
+    if price_15m.empty and volume_15m.empty:
+        LOGGER.warning("No 15-minute aFRR price/volume data to export.")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    if not price_15m.empty:
+        p = price_15m.copy()
+        p.index = pd.to_datetime(p.index, utc=True, errors="coerce")
+        p = p[~p.index.isna()]
+        p = p[(p.index >= start_dt) & (p.index <= end_dt)]
+        p.index = p.index.floor("15min")
+        p = p[~p.index.duplicated(keep="last")].sort_index()
+        frames.append(p)
+        p.reset_index(names="timestamp_utc").to_parquet(
+            out_dir / "afrr_prices_15min.parquet",
+            index=False,
+            compression="zstd",
+        )
+
+    if not volume_15m.empty:
+        v = volume_15m.copy()
+        v.index = pd.to_datetime(v.index, utc=True, errors="coerce")
+        v = v[~v.index.isna()]
+        v = v[(v.index >= start_dt) & (v.index <= end_dt)]
+        v.index = v.index.floor("15min")
+        v = v[~v.index.duplicated(keep="last")].sort_index()
+        frames.append(v)
+        v.reset_index(names="timestamp_utc").to_parquet(
+            out_dir / "afrr_volumes_15min.parquet",
+            index=False,
+            compression="zstd",
+        )
+
+    combined = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+    if not combined.empty:
+        combined = combined.loc[:, ~combined.columns.duplicated()]
+        # Provide stable aliases used in validation notebooks and legacy exports.
+        alias_candidates = [
+            ("abgerufene_arbeit_pos", ["afrr_activated_mw_pos", "activated_volume_pos_mw"]),
+            ("abgerufene_arbeit_neg", ["afrr_activated_mw_neg", "activated_volume_neg_mw"]),
+            (
+                "arbeitspreis_pos",
+                [
+                    "afrr_avg_activation_price_pos",
+                    "afrr_activation_avg_price_pos",
+                    "afrr_marginal_activation_price_pos",
+                    "afrr_activation_marginal_price_pos",
+                ],
+            ),
+            (
+                "arbeitspreis_neg",
+                [
+                    "afrr_avg_activation_price_neg",
+                    "afrr_activation_avg_price_neg",
+                    "afrr_marginal_activation_price_neg",
+                    "afrr_activation_marginal_price_neg",
+                ],
+            ),
+            (
+                "durchschnittlicher_arbeitspreis_pos",
+                ["afrr_avg_activation_price_pos", "afrr_activation_avg_price_pos"],
+            ),
+            (
+                "durchschnittlicher_arbeitspreis_neg",
+                ["afrr_avg_activation_price_neg", "afrr_activation_avg_price_neg"],
+            ),
+        ]
+        for alias, candidates in alias_candidates:
+            if alias in combined.columns:
+                continue
+            for src in candidates:
+                if src in combined.columns:
+                    combined[alias] = combined[src]
+                    break
+        combined.reset_index(names="timestamp_utc").to_parquet(
+            out_dir / "afrr_price_volume_15min.parquet",
+            index=False,
+            compression="zstd",
+        )
+        LOGGER.info(
+            "Wrote 15-minute aFRR files to %s (rows=%s).",
+            out_dir,
+            len(combined),
+        )
 
 
 def main() -> None:
@@ -971,6 +1075,11 @@ def main() -> None:
         default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "netztransparenz.parquet"),
         help="Path to netztransparenz parquet used for 15-minute activated MW in VWAP calculation.",
     )
+    parser.add_argument(
+        "--out-15min-dir",
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "regelleistung_15min"),
+        help="Directory for raw 15-minute aFRR price/volume parquet exports.",
+    )
     args = parser.parse_args()
 
     start_dt = datetime.fromisoformat(args.start)
@@ -989,8 +1098,25 @@ def main() -> None:
     for y in years:
         df_cap = fetch_and_parse_regelleistung(y, "CAPACITY", start_dt=start_dt, end_dt=end_dt)
         df_ene = fetch_and_parse_regelleistung(y, "ENERGY", start_dt=start_dt, end_dt=end_dt)
+        if not df_ene.empty:
+            cols_15m = [
+                c
+                for c in (
+                    "afrr_avg_activation_price_pos",
+                    "afrr_avg_activation_price_neg",
+                    "afrr_marginal_activation_price_pos",
+                    "afrr_marginal_activation_price_neg",
+                    "afrr_activation_marginal_price_pos",
+                    "afrr_activation_marginal_price_neg",
+                    "afrr_activation_avg_price_pos",
+                    "afrr_activation_avg_price_neg",
+                )
+                if c in df_ene.columns
+            ]
+            if cols_15m:
+                ALL_15MIN_PRICE_DATA.append(df_ene[cols_15m].copy())
         if not df_cap.empty or not df_ene.empty:
-            all_years.append(pd.concat([df_cap, df_ene], axis=1))
+            all_years.append(pd.concat([df_cap, df_ene], axis=1, sort=False))
 
     if not all_years:
         LOGGER.warning("No regelleistung data fetched.")
@@ -1038,6 +1164,20 @@ def main() -> None:
             "No 15-minute Netztransparenz activation volumes available at %s; VWAP columns may be NaN/fallback.",
             args.netztransparenz_path,
         )
+
+    # Persist 15-minute price and volume streams for transparent VWAP validation.
+    price_15m = (
+        pd.concat(ALL_15MIN_PRICE_DATA).sort_index().groupby(level=0).first()
+        if ALL_15MIN_PRICE_DATA
+        else pd.DataFrame()
+    )
+    _export_afrr_15min_price_volume(
+        price_15m=price_15m,
+        volume_15m=netz_df,
+        out_dir=Path(args.out_15min_dir),
+        start_dt=start_dt,
+        end_dt=end_dt,
+    )
 
     # Output standardization: hourly aggregation with explicit VWAP.
     df_master = _aggregate_hourly_with_vwap(df_master)
