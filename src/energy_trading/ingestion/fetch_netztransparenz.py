@@ -571,7 +571,8 @@ def _select_flow_columns(columns: list[str], positive: bool) -> list[str]:
 def _tidy_optimization_flow(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
     """Parse cross-border balancing-flow payload and compute net MW.
 
-    aFRR Optimierung (PICASSO) and IGCC Optimierung are balancing power flows.
+    aFRR Optimierung (PICASSO) and mFRR Optimierung (MARI) are balancing
+    power flows.
     Positive/import values increase local available balancing supply, negative/
     export values decrease it. Net flow is modeled as:
         net_mw = import_or_positive_mw - export_or_negative_mw
@@ -596,11 +597,12 @@ def _tidy_optimization_flow(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
             f"Available: {value_cols}"
         )
 
+    parse_cols = sorted(set(pos_cols + neg_cols))
     cleaned = df.with_columns(
         [ts]
         + [
             pl.col(c).cast(pl.Utf8).map_elements(_parse_mixed_numeric, return_dtype=pl.Float64).alias(c)
-            for c in (pos_cols + neg_cols)
+            for c in parse_cols
         ]
     )
     return (
