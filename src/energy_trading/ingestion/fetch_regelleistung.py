@@ -13,6 +13,9 @@ Outputs:
 
 Includes:
     - capacity/energy prices and offered volumes (pos/neg)
+    - hourly aFRR VWAP activation prices:
+        - afrr_vwap_pos
+        - afrr_vwap_neg
     - net_import_export_mw (IGCC/PICASSO netting when present)
     - MOL slope features (from anonymous bid lists, expanded to hourly)
     - hourly anonymous-bid features:
@@ -831,7 +834,7 @@ def fetch_and_parse_regelleistung(
                 .rename("net_import_export_mw")
             )
 
-        # --- 5) Pivot by direction and resample ---
+        # --- 5) Pivot by direction ---
         df_clean = df_part[["timestamp", "Richtung"] + list(val_cols.keys())]
         df_pivot = df_clean.pivot_table(index="timestamp", columns="Richtung", values=list(val_cols.keys()))
 
@@ -845,7 +848,6 @@ def fetch_and_parse_regelleistung(
         if net_series is not None:
             df_pivot = df_pivot.join(net_series, how="left")
 
-        df_pivot = df_pivot.resample("1h").mean()
         return df_pivot
 
     parts = []
@@ -862,6 +864,81 @@ def fetch_and_parse_regelleistung(
     df_pivot = pd.concat(parts).sort_index()
     df_pivot = df_pivot[~df_pivot.index.duplicated(keep="first")]
     return df_pivot
+
+
+def _load_netztransparenz_activation_15m(
+    netz_path: Path,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> pd.DataFrame:
+    """Load 15-minute aFRR activated volumes from Netztransparenz parquet."""
+    if not netz_path.exists():
+        LOGGER.warning("Netztransparenz parquet not found for VWAP join: %s", netz_path)
+        return pd.DataFrame()
+
+    df = pd.read_parquet(netz_path)
+    ts_col = "timestamp_utc" if "timestamp_utc" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
+    if ts_col is None:
+        LOGGER.warning("No timestamp column found in %s for VWAP join.", netz_path)
+        return pd.DataFrame()
+
+    required_cols = ["afrr_activated_mw_pos", "afrr_activated_mw_neg"]
+    found_cols = [c for c in required_cols if c in df.columns]
+    if not found_cols:
+        LOGGER.warning("No aFRR activated volume columns found in %s for VWAP join.", netz_path)
+        return pd.DataFrame()
+
+    df = df[[ts_col] + found_cols].copy()
+    df["timestamp_utc"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp_utc"]).drop(columns=[ts_col]).set_index("timestamp_utc").sort_index()
+    df = df.loc[(df.index >= start_dt) & (df.index <= end_dt)]
+
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df.index = df.index.floor("15min")
+    return df.groupby(df.index).mean(numeric_only=True)[required_cols]
+
+
+def _aggregate_hourly_with_vwap(df_15m: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate to hourly means and compute aFRR VWAP from 15-minute rows."""
+    if df_15m.empty:
+        return df_15m
+
+    df_15m = df_15m.copy()
+    if df_15m.index.tz is None:
+        df_15m.index = df_15m.index.tz_localize("UTC")
+    else:
+        df_15m.index = df_15m.index.tz_convert("UTC")
+    df_15m.index = df_15m.index.floor("15min")
+    df_15m = df_15m[~df_15m.index.duplicated(keep="last")].sort_index()
+
+    price_pos = "afrr_avg_activation_price_pos"
+    price_neg = "afrr_avg_activation_price_neg"
+    vol_pos = "afrr_activated_mw_pos"
+    vol_neg = "afrr_activated_mw_neg"
+
+    if {price_pos, vol_pos}.issubset(df_15m.columns):
+        df_15m["weighted_cost_pos"] = df_15m[price_pos] * df_15m[vol_pos]
+    if {price_neg, vol_neg}.issubset(df_15m.columns):
+        df_15m["weighted_cost_neg"] = df_15m[price_neg] * df_15m[vol_neg]
+
+    hourly = df_15m.resample("1h").mean(numeric_only=True)
+
+    if {"weighted_cost_pos", vol_pos, price_pos}.issubset(df_15m.columns):
+        sum_weighted_pos = df_15m["weighted_cost_pos"].resample("1h").sum(min_count=1)
+        sum_vol_pos = df_15m[vol_pos].resample("1h").sum(min_count=1)
+        mean_price_pos = df_15m[price_pos].resample("1h").mean()
+        hourly["afrr_vwap_pos"] = np.where(sum_vol_pos != 0, sum_weighted_pos / sum_vol_pos, mean_price_pos)
+
+    if {"weighted_cost_neg", vol_neg, price_neg}.issubset(df_15m.columns):
+        sum_weighted_neg = df_15m["weighted_cost_neg"].resample("1h").sum(min_count=1)
+        sum_vol_neg = df_15m[vol_neg].resample("1h").sum(min_count=1)
+        mean_price_neg = df_15m[price_neg].resample("1h").mean()
+        hourly["afrr_vwap_neg"] = np.where(sum_vol_neg != 0, sum_weighted_neg / sum_vol_neg, mean_price_neg)
+
+    return hourly.drop(columns=[c for c in ["weighted_cost_pos", "weighted_cost_neg"] if c in hourly.columns], errors="ignore")
 
 
 def main() -> None:
@@ -888,6 +965,11 @@ def main() -> None:
         "--skip-bid-activation-prices",
         action="store_true",
         help="Skip anonymous-bid activation price reconstruction (afrr_bid_* columns).",
+    )
+    parser.add_argument(
+        "--netztransparenz-path",
+        default=str(Path(__file__).resolve().parents[3] / "data" / "raw" / "netztransparenz.parquet"),
+        help="Path to netztransparenz parquet used for 15-minute activated MW in VWAP calculation.",
     )
     args = parser.parse_args()
 
@@ -941,8 +1023,24 @@ def main() -> None:
             )
     df_master = df_master[~df_master.index.duplicated(keep="first")]
 
-    # Output standardization: UTC hourly, clip window, timestamp_utc column.
-    df_master = df_master.resample("1h").mean()
+    # Join 15-minute activated volumes from Netztransparenz for VWAP weighting.
+    netz_df = _load_netztransparenz_activation_15m(Path(args.netztransparenz_path), start_dt, end_dt)
+    if not netz_df.empty:
+        df_master = df_master.join(netz_df, how="left")
+        LOGGER.info(
+            "Joined Netztransparenz 15-minute volumes for VWAP: rows=%s, range=%s -> %s",
+            len(netz_df),
+            netz_df.index.min(),
+            netz_df.index.max(),
+        )
+    else:
+        LOGGER.warning(
+            "No 15-minute Netztransparenz activation volumes available at %s; VWAP columns may be NaN/fallback.",
+            args.netztransparenz_path,
+        )
+
+    # Output standardization: hourly aggregation with explicit VWAP.
+    df_master = _aggregate_hourly_with_vwap(df_master)
     df_master = df_master.loc[(df_master.index >= start_dt) & (df_master.index <= end_dt)]
     df_master = df_master.sort_index()
     df_master = df_master.reset_index().rename(columns={"index": "timestamp_utc"})

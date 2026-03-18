@@ -125,6 +125,7 @@ def main():
         "--end", fetch_end,
         "--chunk-days", "60",
         "--chunk-sleep", "1",
+        "--resample", "none",
         "--out", str(out_dir / "netztransparenz.parquet"),
     ])
 
@@ -159,6 +160,7 @@ def main():
         py, "-m", "energy_trading.ingestion.fetch_regelleistung",
         "--start", fetch_start,
         "--end", fetch_end,
+        "--netztransparenz-path", str(out_dir / "netztransparenz.parquet"),
         "--out", str(out_dir / "regelleistung.parquet"),
     ]
     if args.skip_bid_activation_prices:

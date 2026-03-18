@@ -7,7 +7,8 @@ Usage:
         --out data/raw/netztransparenz.parquet
 
 Outputs:
-    - netztransparenz.parquet with hourly data aligned on timestamp_utc (UTC).
+    - netztransparenz.parquet with 15-minute data aligned on timestamp_utc (UTC)
+      by default; optional resampling is available via --resample.
 
 Includes:
     - NRV-Saldo (NRV_balance)
@@ -929,7 +930,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds per request.")
     parser.add_argument("--chunk-days", type=int, default=30, help="Chunk size in days to avoid server errors.")
     parser.add_argument("--chunk-sleep", type=float, default=3.0, help="Seconds to sleep between chunks.")
-    parser.add_argument("--resample", default="1h", help="Optional resample frequency (e.g. 1h). Use 'none' to disable.")
+    parser.add_argument("--resample", default="none", help="Optional resample frequency (e.g. 1h). Use 'none' to disable.")
     args = parser.parse_args()
 
     _load_env()
@@ -969,8 +970,7 @@ def main():
         LOGGER.warning("No data fetched.")
         return
 
-    # Sanitize output: UTC hourly and clip to requested window.
-    df = df.with_columns(pl.col("timestamp_utc").dt.truncate("1h").alias("timestamp_utc"))
+    # Sanitize output and clip to requested UTC window.
     df = df.filter(
         (pl.col("timestamp_utc") >= pl.lit(start_utc).cast(pl.Datetime(time_unit="us", time_zone="UTC")))
         & (pl.col("timestamp_utc") <= pl.lit(end_utc).cast(pl.Datetime(time_unit="us", time_zone="UTC")))
