@@ -61,6 +61,9 @@ M_FRR_OPTIMIZATION_SERIES_CANDIDATES = [
     "MRLOptimierung",
 ]
 
+PICASSO_GO_LIVE_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
+MARI_GO_LIVE_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
+
 
 def _parse_mixed_numeric(value: object) -> float | None:
     """Parse mixed German/English numeric formats robustly.
@@ -696,8 +699,11 @@ def fetch_and_merge(
 ) -> pl.DataFrame:
     base_url = "https://ds.netztransparenz.de/api/v1/data"
     session = _make_session(token)
-    start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-    end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    def _as_utc(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+    start_dt = _as_utc(datetime.fromisoformat(start.replace("Z", "+00:00")))
+    end_dt = _as_utc(datetime.fromisoformat(end.replace("Z", "+00:00")))
 
     def _fmt_dt(dt: datetime) -> str:
         # Netztransparenz expects UTC timestamps like 2020-12-01T00:00Z
@@ -705,6 +711,8 @@ def fetch_and_merge(
 
     frames = []
     def _fetch_chunk_data(s_dt: datetime, e_dt: datetime, retries: int = 2) -> pl.DataFrame | None:
+        s_dt = _as_utc(s_dt)
+        e_dt = _as_utc(e_dt)
         s_str = _fmt_dt(s_dt)
         e_str = _fmt_dt(e_dt)
         urls = {
@@ -747,55 +755,43 @@ def fetch_and_merge(
             )
             afrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["afrr"], session, timeout=timeout)), "afrr_activated")
             mfrr_df = _tidy_activation(_read_csv(_fetch_csv(urls["mfrr"], session, timeout=timeout)), "mfrr_activated")
-            afrr_opt_df: pl.DataFrame | None = None
-            mfrr_opt_df: pl.DataFrame | None = None
-            try:
-                afrr_opt_raw = _fetch_first_available_csv(
-                    base_url=base_url,
-                    session=session,
-                    series_candidates=A_FRR_OPTIMIZATION_SERIES_CANDIDATES,
-                    quality="Qualitaetsgesichert",
-                    s_str=s_str,
-                    e_str=e_str,
-                    timeout=timeout,
-                )
-                afrr_opt_df = _tidy_optimization_flow(afrr_opt_raw, "afrr_picasso")
-            except Exception as exc:  # noqa: BLE001
-                if _is_pre_platform_not_available_error(exc):
-                    LOGGER.info(
-                        "aFRR Optimierung not available for %s -> %s (pre-PICASSO).",
-                        s_str,
-                        e_str,
-                    )
-                    afrr_opt_df = _empty_optimization_df("afrr_picasso")
-                else:
-                    LOGGER.info("aFRR Optimierung unavailable for %s -> %s.", s_str, e_str)
-                    LOGGER.debug("aFRR Optimierung details: %s", exc)
-                    afrr_opt_df = _empty_optimization_df("afrr_picasso")
+            afrr_opt_df: pl.DataFrame | None = _empty_optimization_df("afrr_picasso")
+            mfrr_opt_df: pl.DataFrame | None = _empty_optimization_df("mfrr_mari")
 
-            try:
-                mfrr_opt_raw = _fetch_first_available_csv(
-                    base_url=base_url,
-                    session=session,
-                    series_candidates=M_FRR_OPTIMIZATION_SERIES_CANDIDATES,
-                    quality="Qualitaetsgesichert",
-                    s_str=s_str,
-                    e_str=e_str,
-                    timeout=timeout,
-                )
-                mfrr_opt_df = _tidy_optimization_flow(mfrr_opt_raw, "mfrr_mari")
-            except Exception as exc:  # noqa: BLE001
-                if _is_pre_platform_not_available_error(exc):
-                    LOGGER.info(
-                        "mFRR Optimierung not available for %s -> %s (pre-MARI).",
-                        s_str,
-                        e_str,
+            # Do not query optimization flows before platform go-live.
+            afrr_s_dt = max(s_dt, PICASSO_GO_LIVE_UTC)
+            if afrr_s_dt < e_dt:
+                try:
+                    afrr_opt_raw = _fetch_first_available_csv(
+                        base_url=base_url,
+                        session=session,
+                        series_candidates=A_FRR_OPTIMIZATION_SERIES_CANDIDATES,
+                        quality="Qualitaetsgesichert",
+                        s_str=_fmt_dt(afrr_s_dt),
+                        e_str=e_str,
+                        timeout=timeout,
                     )
-                    mfrr_opt_df = _empty_optimization_df("mfrr_mari")
-                else:
-                    LOGGER.info("mFRR Optimierung unavailable for %s -> %s.", s_str, e_str)
+                    afrr_opt_df = _tidy_optimization_flow(afrr_opt_raw, "afrr_picasso")
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.info("aFRR Optimierung unavailable for %s -> %s.", _fmt_dt(afrr_s_dt), e_str)
+                    LOGGER.debug("aFRR Optimierung details: %s", exc)
+
+            mari_s_dt = max(s_dt, MARI_GO_LIVE_UTC)
+            if mari_s_dt < e_dt:
+                try:
+                    mfrr_opt_raw = _fetch_first_available_csv(
+                        base_url=base_url,
+                        session=session,
+                        series_candidates=M_FRR_OPTIMIZATION_SERIES_CANDIDATES,
+                        quality="Qualitaetsgesichert",
+                        s_str=_fmt_dt(mari_s_dt),
+                        e_str=e_str,
+                        timeout=timeout,
+                    )
+                    mfrr_opt_df = _tidy_optimization_flow(mfrr_opt_raw, "mfrr_mari")
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.info("mFRR Optimierung unavailable for %s -> %s.", _fmt_dt(mari_s_dt), e_str)
                     LOGGER.debug("mFRR Optimierung details: %s", exc)
-                    mfrr_opt_df = _empty_optimization_df("mfrr_mari")
 
             merged = (
                 nrv_df.join(rebap_df, on="timestamp_utc", how="full", coalesce=True)
