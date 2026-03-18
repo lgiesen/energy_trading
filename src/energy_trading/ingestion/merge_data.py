@@ -45,7 +45,7 @@ def _parse_clip_to_utc(value: str):
     return dt.astimezone(ZoneInfo("UTC"))
 
 def _normalize_timestamp(df: pl.DataFrame, ts_col: str) -> pl.DataFrame:
-    """Normalize timestamp column to datetime[us, UTC] and truncate to hour."""
+    """Normalize timestamp column to datetime[us, UTC] without changing resolution."""
     ts_dtype = df[ts_col].dtype
     if ts_dtype == pl.Int64:
         df = df.with_columns(pl.from_epoch(ts_col, time_unit="ms").alias(ts_col))
@@ -60,8 +60,6 @@ def _normalize_timestamp(df: pl.DataFrame, ts_col: str) -> pl.DataFrame:
             df = df.with_columns(pl.col(ts_col).dt.replace_time_zone("UTC").alias(ts_col))
         elif tz != "UTC":
             df = df.with_columns(pl.col(ts_col).dt.convert_time_zone("UTC").alias(ts_col))
-    # Force strict hourly alignment to remove precision jitter.
-    df = df.with_columns(pl.col(ts_col).dt.truncate("1h").alias(ts_col))
     return df
 
 
