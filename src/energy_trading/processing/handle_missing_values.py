@@ -2,8 +2,8 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.processing.handle_missing_values \
-        --in data/processed/all_data.parquet \
-        --out data/processed/all_data_clean.parquet
+        --in data/processed/merged_data.parquet \
+        --out data/processed/cleaned_data.parquet
 
 Check results with:
     ./.venv/bin/python -m energy_trading.processing.compare_missingness \
@@ -30,7 +30,31 @@ from typing import Iterable
 import polars as pl
 
 LOGGER = logging.getLogger(__name__)
-PICASSO_START_UTC = datetime(2022, 6, 21, 22, 0, tzinfo=timezone.utc)
+PICASSO_START_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
+
+
+def _existing(df: pl.DataFrame, cols: Iterable[str]) -> list[str]:
+    return [c for c in cols if c in df.columns]
+
+
+def _find_price_cols(df: pl.DataFrame) -> list[str]:
+    exact = {"reBAP_shortage_surplus"}
+    tokens = ("lmp", "rebap", "da_price", "day_ahead")
+    cols: list[str] = []
+    for c in df.columns:
+        lc = c.lower()
+        if c in exact or any(tok in lc for tok in tokens):
+            cols.append(c)
+    return cols
+
+
+def _find_capacity_cols(df: pl.DataFrame) -> list[str]:
+    cols: list[str] = []
+    for c in df.columns:
+        lc = c.lower()
+        if "capacity" in lc and "price" not in lc:
+            cols.append(c)
+    return cols
 
 
 def _interpolate_small_gaps(df: pl.DataFrame, col: str, max_gap_hours: int) -> pl.DataFrame:
@@ -533,13 +557,13 @@ def main() -> None:
     parser.add_argument(
         "--in",
         dest="input_path",
-        default="data/processed/all_data.parquet",
-        help="Input parquet (defaults to all_data.parquet).",
+        default="data/processed/merged_data.parquet",
+        help="Input parquet (defaults to merged_data.parquet).",
     )
     parser.add_argument(
         "--out",
         dest="output_path",
-        default="data/processed/all_data_clean.parquet",
+        default="data/processed/cleaned_data.parquet",
         help="Output parquet path.",
     )
     args = parser.parse_args()
@@ -552,144 +576,80 @@ def main() -> None:
         else:
             raise FileNotFoundError(f"Missing input parquet: {args.input_path}")
 
-    df = pl.read_parquet(input_path).sort("timestamp_utc")
+    df = pl.read_parquet(input_path)
+    if "timestamp_utc" not in df.columns:
+        raise ValueError("Missing required column: timestamp_utc")
+    df = df.with_columns(
+        pl.col("timestamp_utc").cast(pl.Datetime(time_unit="us", time_zone="UTC"), strict=False).alias("timestamp_utc")
+    ).sort("timestamp_utc")
     LOGGER.info("Loaded %s rows from %s", df.height, input_path)
-    missing_before = _null_count_dict(df)
-    treatment_map = _build_treatment_map(df)
+    cutoff = pl.lit(PICASSO_START_UTC).cast(pl.Datetime(time_unit="us", time_zone="UTC"))
 
-    # 1) Commodity prices: weekend carry-forward (no interpolation to avoid leakage).
-    commodity_cols = ["co2_price_eua", "gas_price_ttf", "coal_price_api2", "coal_price_api"]
-    _log_null_counts(df, commodity_cols, "Before commodity ffill")
-    df = _ffill_cols(df, commodity_cols)
-    _log_null_counts(df, commodity_cols, "After commodity ffill")
-
-    # 1b) Installed generation capacities from SMARD CSV (safe anchor fill, no backward fill).
-    df = _clean_and_anchor_smard_capacity(df)
-
-    # 2) Physics/grid small gaps (<= 2 hours)
-    for col in ["load_forecast_da", "da_price_d_eur_mwh", "ex_rate_eur_usd"]:
-        df = _interpolate_small_gaps(df, col, max_gap_hours=2)
-
-    # 2b) Belgian day-ahead price: allow short linear interpolation (<24h).
-    df = _interpolate_small_gaps(df, "da_price_BE", max_gap_hours=24)
-
-    # 2c) Nuclear post phase-out: missing means no generation.
-    df = _fill_nuclear_after_phaseout(df)
-    # 2d) Legacy SMARD forecast single-hour DST gaps.
-    df = _fix_smard_dst_gaps(df)
-
-    # 3) Wind intraday proxy
-    if "wind_onshore_forecast_intraday" in df.columns and "wind_onshore_forecast" in df.columns:
+    # 1) Structural-break aware optimization flows (PICASSO/MARI).
+    structural_cols = _existing(
+        df,
+        [
+            "afrr_picasso_mw_pos",
+            "afrr_picasso_mw_neg",
+            "mfrr_mari_mw_pos",
+            "mfrr_mari_mw_neg",
+        ],
+    )
+    if structural_cols:
         df = df.with_columns(
-            pl.coalesce([pl.col("wind_onshore_forecast_intraday"), pl.col("wind_onshore_forecast")]).alias(
-                "wind_onshore_forecast_intraday"
-            )
-        )
-    if "total_wind_intraday_forecast" in df.columns:
-        if "wind_forecast_de" in df.columns:
-            df = df.with_columns(
-                pl.coalesce([pl.col("total_wind_intraday_forecast"), pl.col("wind_forecast_de")]).alias(
-                    "total_wind_intraday_forecast"
-                )
-            )
-        elif {"wind_onshore_forecast", "wind_offshore_forecast"}.issubset(df.columns):
-            df = df.with_columns(
-                pl.coalesce(
-                    [
-                        pl.col("total_wind_intraday_forecast"),
-                        (pl.col("wind_onshore_forecast") + pl.col("wind_offshore_forecast")),
-                    ]
-                ).alias("total_wind_intraday_forecast")
-            )
-
-    df = _recalc_onshore_error(df)
-    df = _recalc_total_wind_error(df)
-    df = _apply_capacity_fallback(df)
-    df = _apply_entsoe_intraday_fallback(df)
-
-    # 4) Intraday price: fill with day-ahead if missing
-    if "price_intraday_eur" in df.columns and "da_price_d_eur_mwh" in df.columns:
-        df = df.with_columns(
-            pl.coalesce([pl.col("price_intraday_eur"), pl.col("da_price_d_eur_mwh")]).alias("price_intraday_eur")
+            [
+                pl.when(pl.col("timestamp_utc") < cutoff)
+                .then(pl.lit(0.0))
+                .otherwise(pl.col(c).fill_null(0.0))
+                .cast(pl.Float64, strict=False)
+                .alias(c)
+                for c in structural_cols
+            ]
         )
 
-    # 5) Regelleistung offered MW: missing means zero offer in published aggregates.
-    for col in ("afrr_capacity_offered_mw_pos", "afrr_capacity_offered_mw_neg", "afrr_activation_offered_mw_pos", "afrr_activation_offered_mw_neg"):
-        if col in df.columns:
-            df = df.with_columns(pl.col(col).fill_null(0.0).alias(col))
+    # 2) Saldos: missing means neutral imbalance.
+    saldo_cols = _existing(
+        df,
+        ["NRV_balance", "NRV_balance_qs", "NRV_balance_op", "rz_saldo_mw", "rz_saldo_mw_qs", "rz_saldo_mw_op"],
+    )
+    if saldo_cols:
+        df = df.with_columns([pl.col(c).fill_null(0.0).cast(pl.Float64, strict=False).alias(c) for c in saldo_cols])
 
-    # 5b) Regelleistung prices: close isolated 1h holes (moved from fetch_regelleistung.py).
-    for col in (
-        "afrr_avg_activation_price_pos",
-        "afrr_avg_activation_price_neg",
-        "afrr_activation_avg_price_pos",
-        "afrr_activation_avg_price_neg",
-        "afrr_activation_price_pos",
-        "afrr_activation_price_neg",
-        "mfrr_activation_price_pos",
-        "mfrr_activation_price_neg",
-        "afrr_capacity_price_pos",
-        "afrr_capacity_price_neg",
-    ):
-        df = _interpolate_small_gaps(df, col, max_gap_hours=1)
+    # 3) Prices: sticky process -> ffill then bfill.
+    price_cols = _find_price_cols(df)
+    if price_cols:
+        df = df.with_columns(
+            [
+                pl.col(c)
+                .fill_null(strategy="forward")
+                .fill_null(strategy="backward")
+                .cast(pl.Float64, strict=False)
+                .alias(c)
+                for c in price_cols
+            ]
+        )
 
-    # 5c) Regelleistung prices: interpolate if volume != 0 and price is null
-    price_specs = [
-        ("afrr_avg_activation_price_", "afrr_activated_mw_"),
-        ("afrr_activation_avg_price_", "afrr_activated_mw_"),
-        ("afrr_activation_price_", "afrr_activated_mw_"),
-        ("mfrr_activation_price_", "mfrr_activated_mw_"),
-        ("afrr_capacity_price_", "afrr_capacity_offered_mw_"),
-    ]
-    for prefix, vol_prefix in price_specs:
-        for direction in ("pos", "neg"):
-            price_col = f"{prefix}{direction}"
-            vol_col = f"{vol_prefix}{direction}"
-            if price_col not in df.columns or vol_col not in df.columns:
-                continue
+    # 4) Capacity-like columns: carry forward within delivery blocks.
+    capacity_cols = _find_capacity_cols(df)
+    if capacity_cols:
+        df = df.with_columns(
+            [
+                pl.col(c)
+                .fill_null(strategy="forward")
+                .cast(pl.Float64, strict=False)
+                .alias(c)
+                for c in capacity_cols
+            ]
+        )
 
-            # If volume is zero and price is null, mark as 0 (irrelevant)
-            df = df.with_columns(
-                pl.when(pl.col(vol_col) == 0)
-                .then(pl.coalesce([pl.col(price_col), pl.lit(0.0)]))
-                .otherwise(pl.col(price_col))
-                .alias(price_col)
-            )
-
-            # Interpolate remaining nulls (only small gaps)
-            df = _interpolate_small_gaps(df, price_col, max_gap_hours=2)
-
-    # 5d) Regelleistung/activation volume-like signals: short forward-fill.
-    df = _fill_pre_picasso_afrr_optimization_zero(df)
-
-    volume_ffill_cols = [
-        "net_import_export_mw",
-        "afrr_picasso_mw_pos",
-        "afrr_picasso_mw_neg",
-        "afrr_picasso_net_mw",
-        "igcc_import_mw",
-        "igcc_export_mw",
-        "igcc_net_mw",
-        "afrr_capacity_offered_mw_pos",
-        "afrr_capacity_offered_mw_neg",
-        "afrr_activation_offered_mw_pos",
-        "afrr_activation_offered_mw_neg",
-        "afrr_activated_mw_pos",
-        "afrr_activated_mw_neg",
-        "mfrr_activated_mw_pos",
-        "mfrr_activated_mw_neg",
-    ]
-    for col in volume_ffill_cols:
-        if col in df.columns:
-            df = _interpolate_small_gaps(df, col, max_gap_hours=8)
-            df = df.with_columns(pl.col(col).fill_null(strategy="forward").alias(col))
-
-    df = _fill_activation_energy_from_power(df)
-
-    # 6) Recalculate derived error/signal columns after filling base signals.
-    df = _recalculate_error_columns(df)
-    missing_after = _null_count_dict(df)
-    _log_missing_report(missing_before, missing_after, treatment_map)
+    # 5) Regime indicator for post-PICASSO/MARI period.
+    df = df.with_columns(
+        pl.when(pl.col("timestamp_utc") >= cutoff)
+        .then(pl.lit(1))
+        .otherwise(pl.lit(0))
+        .cast(pl.Int8)
+        .alias("market_regime_picasso")
+    )
 
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
