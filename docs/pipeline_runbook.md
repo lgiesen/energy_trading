@@ -35,10 +35,10 @@ Cleaned table is written to `data/processed/cleaned_data.parquet`.
 |---|---|---|---|
 | 1 | `fetch_entsoe.py` | ENTSO-E API (`--start`, `--end`) | `data/raw/entsoe.parquet` |
 | 2 | `fetch_energy_charts.py` | Energy-Charts API | `data/raw/energy_charts.parquet` |
-| 3 | `fetch_netztransparenz.py` | Netztransparenz API | `data/raw/netztransparenz.parquet` |
+| 3 | `fetch_netztransparenz.py` | Netztransparenz API | `data/raw/netztransparenz.parquet` (15-min activation volumes) |
 | 4 | `fetch_smard.py` | SMARD API (+ optional market-data CSV) | `data/raw/smard.parquet` (+ `data/raw/installed_capacity.csv`) |
 | 5 | `fetch_yfinance.py` | Yahoo Finance API | `data/raw/yfinance.parquet` |
-| 6 | `fetch_regelleistung.py` | Regelleistung API + bid files in `data/raw/bids/` | `data/raw/regelleistung.parquet` |
+| 6 | `fetch_regelleistung.py` | Regelleistung API + bid files in `data/raw/bids/` | `data/raw/regelleistung.parquet` (hourly) + `data/raw/regelleistung_15min/afrr_prices_15min.parquet` + `data/raw/regelleistung_15min/afrr_volumes_15min.parquet` + `data/raw/regelleistung_15min/afrr_price_volume_15min.parquet` |
 | 7 | `merge_data.py` | All `data/raw/*.parquet` files | `data/processed/all_data.parquet` |
 | 8 | `refine_market_data.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
 | 9 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/cleaned_data.parquet` |
@@ -142,6 +142,8 @@ From Regelleistung TSO aggregation:
 
 - `afrr_avg_activation_price_pos`
 - `afrr_avg_activation_price_neg`
+- `afrr_vwap_pos_eur_mwh`
+- `afrr_vwap_neg_eur_mwh`
 
 From anonymous bids (derived in `fetch_regelleistung.py`):
 
@@ -157,6 +159,12 @@ Implementation note:
 - `afrr_bid_vwap_activation_price_*` is volume-weighted from accepted anonymous bids.
 - `afrr_bid_avg_activation_price_*` is currently derived as an extremum proxy on signed bid prices
   (`POS -> max`, `NEG -> min`) after payment-direction sign handling.
+- Primary model work-price VWAP is computed from 15-minute Regelleistung price/volume
+  exports:
+  `data/raw/regelleistung_15min/afrr_price_volume_15min.parquet`.
+- VWAP is calculated in two stages:
+  1. `fetch_regelleistung.py` (hourly export convenience),
+  2. `refine_market_data.py` (processing-stage recomputation/join for canonical use).
 
 ---
 
