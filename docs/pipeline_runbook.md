@@ -21,9 +21,12 @@ Main scripts:
   Regelleistung aFRR CAPACITY/ENERGY + optional anonymous-bid derived prices.
 - `src/energy_trading/ingestion/merge_data.py`  
   Full join of all raw parquet files on hourly UTC timestamps.
+- `src/energy_trading/processing/drop_redundant_features.py`  
+  Refines merged data, drops SMARD redundancies, calculates ENTSO-E based errors.
 
 Raw outputs are written to `data/raw/*.parquet`.  
-Final merged table is written to `data/processed/all_data.parquet`.
+Merged table is written to `data/processed/all_data.parquet`.  
+Refined table is written to `data/processed/all_data_refined.parquet`.
 
 ### Step-by-step I/O map
 
@@ -36,9 +39,10 @@ Final merged table is written to `data/processed/all_data.parquet`.
 | 5 | `fetch_yfinance.py` | Yahoo Finance API | `data/raw/yfinance.parquet` |
 | 6 | `fetch_regelleistung.py` | Regelleistung API + bid files in `data/raw/bids/` | `data/raw/regelleistung.parquet` |
 | 7 | `merge_data.py` | All `data/raw/*.parquet` files | `data/processed/all_data.parquet` |
-| 8 | `handle_missing_values.py` | `data/processed/all_data.parquet` | `data/processed/all_data_clean.parquet` |
-| 9 | `transform_data.py` | `data/processed/all_data_clean.parquet` | `data/processed/all_data_transformed.parquet` |
-| 10 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
+| 8 | `drop_redundant_features.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
+| 9 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/all_data_clean.parquet` |
+| 10 | `transform_data.py` | `data/processed/all_data_clean.parquet` | `data/processed/all_data_transformed.parquet` |
+| 11 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
 
 ---
 
