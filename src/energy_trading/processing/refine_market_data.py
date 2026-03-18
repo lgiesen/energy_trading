@@ -45,7 +45,15 @@ def _first_existing(columns: list[str], candidates: list[str]) -> str | None:
 
 
 def compute_afrr_vwap_from_15min(path: Path) -> pl.DataFrame:
-    """Compute hourly aFRR VWAP from 15-minute Regelleistung price+volume data."""
+    """Compute hourly aFRR VWAP from 15-minute Regelleistung price+volume data.
+
+    Method:
+    - Use activated work/volume as weight.
+    - Pre-PICASSO (< 2022-06-22 22:00 UTC): forward-fill hourly posted prices
+      inside each hour so :15/:30/:45 can be weighted correctly.
+    - Aggregate with group_by_dynamic(every="1h", closed="left").
+    - If hourly volume sum is 0 or null, return NaN VWAP.
+    """
     if not path.exists():
         LOGGER.info("No 15-minute Regelleistung file found for VWAP: %s", path)
         return pl.DataFrame()
@@ -58,31 +66,37 @@ def compute_afrr_vwap_from_15min(path: Path) -> pl.DataFrame:
     price_pos_col = _first_existing(
         df.columns,
         [
+            "afrr_activation_price_pos_ffill",
             "afrr_avg_activation_price_pos",
             "afrr_activation_avg_price_pos",
             "afrr_marginal_activation_price_pos",
             "afrr_activation_marginal_price_pos",
+            "arbeitspreis_pos",  # legacy alias in older exports
         ],
     )
     price_neg_col = _first_existing(
         df.columns,
         [
+            "afrr_activation_price_neg_ffill",
             "afrr_avg_activation_price_neg",
             "afrr_activation_avg_price_neg",
             "afrr_marginal_activation_price_neg",
             "afrr_activation_marginal_price_neg",
+            "arbeitspreis_neg",  # legacy alias in older exports
         ],
     )
     vol_pos_col = _first_existing(
         df.columns,
-        ["afrr_activated_mw_pos", "activated_volume_pos_mw"],
+        ["afrr_activated_mw_pos", "activated_volume_pos_mw", "abgerufene_arbeit_pos"],
     )
     vol_neg_col = _first_existing(
         df.columns,
-        ["afrr_activated_mw_neg", "activated_volume_neg_mw"],
+        ["afrr_activated_mw_neg", "activated_volume_neg_mw", "abgerufene_arbeit_neg"],
     )
 
-    if not ({price_pos_col, vol_pos_col} - {None}) and not ({price_neg_col, vol_neg_col} - {None}):
+    has_pos = price_pos_col is not None and vol_pos_col is not None
+    has_neg = price_neg_col is not None and vol_neg_col is not None
+    if not has_pos and not has_neg:
         LOGGER.warning("Skip VWAP build: no usable 15-minute aFRR price/volume columns in %s", path)
         return pl.DataFrame()
 
@@ -92,58 +106,84 @@ def compute_afrr_vwap_from_15min(path: Path) -> pl.DataFrame:
     for c in (price_pos_col, price_neg_col, vol_pos_col, vol_neg_col):
         if c is not None:
             cast_exprs.append(pl.col(c).cast(pl.Float64, strict=False))
-    df = df.with_columns(cast_exprs).drop_nulls(subset=["timestamp_utc"])
+    df = (
+        df.with_columns(cast_exprs)
+        .drop_nulls(subset=["timestamp_utc"])
+        .sort("timestamp_utc")
+    )
 
-    extra_exprs: list[pl.Expr] = []
+    cutoff = pl.lit(PICASSO_START_UTC).cast(pl.Datetime(time_unit="us", time_zone="UTC"))
+    ff_exprs: list[pl.Expr] = []
+    if has_pos:
+        if price_pos_col == "afrr_activation_price_pos_ffill":
+            ff_exprs.append(pl.col(price_pos_col).alias("__price_pos_ff"))
+        else:
+            ff_exprs.append(
+                pl.when(pl.col("timestamp_utc") < cutoff)
+                .then(pl.col(price_pos_col).forward_fill().over(pl.col("timestamp_utc").dt.truncate("1h")))
+                .otherwise(pl.col(price_pos_col))
+                .alias("__price_pos_ff")
+            )
+    if has_neg:
+        if price_neg_col == "afrr_activation_price_neg_ffill":
+            ff_exprs.append(pl.col(price_neg_col).alias("__price_neg_ff"))
+        else:
+            ff_exprs.append(
+                pl.when(pl.col("timestamp_utc") < cutoff)
+                .then(pl.col(price_neg_col).forward_fill().over(pl.col("timestamp_utc").dt.truncate("1h")))
+                .otherwise(pl.col(price_neg_col))
+                .alias("__price_neg_ff")
+            )
+    df = df.with_columns(ff_exprs)
+
+    calc_exprs: list[pl.Expr] = []
     agg_exprs: list[pl.Expr] = []
-    out_cols: list[str] = []
-
-    if price_pos_col is not None and vol_pos_col is not None:
-        extra_exprs.append((pl.col(price_pos_col) * pl.col(vol_pos_col)).alias("__weighted_cost_pos"))
+    if has_pos:
+        calc_exprs.append((pl.col("__price_pos_ff") * pl.col(vol_pos_col).abs()).alias("__weighted_cost_pos"))
         agg_exprs.extend(
             [
-                pl.sum("__weighted_cost_pos").alias("__sum_weighted_pos"),
-                pl.sum(vol_pos_col).alias("__sum_vol_pos"),
-                pl.mean(price_pos_col).alias("__mean_price_pos"),
+                pl.col("__weighted_cost_pos").sum().alias("__sum_weighted_pos"),
+                pl.col(vol_pos_col).abs().sum().alias("__sum_vol_pos"),
             ]
         )
-        out_cols.append("afrr_vwap_pos_eur_mwh")
-
-    if price_neg_col is not None and vol_neg_col is not None:
-        extra_exprs.append((pl.col(price_neg_col) * pl.col(vol_neg_col)).alias("__weighted_cost_neg"))
+    if has_neg:
+        calc_exprs.append((pl.col("__price_neg_ff") * pl.col(vol_neg_col).abs()).alias("__weighted_cost_neg"))
         agg_exprs.extend(
             [
-                pl.sum("__weighted_cost_neg").alias("__sum_weighted_neg"),
-                pl.sum(vol_neg_col).alias("__sum_vol_neg"),
-                pl.mean(price_neg_col).alias("__mean_price_neg"),
+                pl.col("__weighted_cost_neg").sum().alias("__sum_weighted_neg"),
+                pl.col(vol_neg_col).abs().sum().alias("__sum_vol_neg"),
             ]
         )
-        out_cols.append("afrr_vwap_neg_eur_mwh")
-
-    if not agg_exprs:
-        return pl.DataFrame()
 
     hourly = (
-        df.with_columns(extra_exprs)
-        .with_columns(pl.col("timestamp_utc").dt.truncate("1h").alias("timestamp_utc"))
-        .group_by("timestamp_utc")
+        df.with_columns(calc_exprs)
+        .group_by_dynamic(
+            index_column="timestamp_utc",
+            every="1h",
+            period="1h",
+            closed="left",
+            label="left",
+        )
         .agg(agg_exprs)
         .sort("timestamp_utc")
     )
 
     vwap_exprs: list[pl.Expr] = []
-    if "afrr_vwap_pos_eur_mwh" in out_cols:
+    out_cols: list[str] = []
+    if has_pos:
+        out_cols.append("afrr_vwap_pos_eur_mwh")
         vwap_exprs.append(
-            pl.when(pl.col("__sum_vol_pos") != 0.0)
-            .then(pl.col("__sum_weighted_pos") / pl.col("__sum_vol_pos"))
-            .otherwise(pl.col("__mean_price_pos"))
+            pl.when(pl.col("__sum_vol_pos").is_null() | (pl.col("__sum_vol_pos") == 0.0))
+            .then(pl.lit(float("nan")))
+            .otherwise(pl.col("__sum_weighted_pos") / pl.col("__sum_vol_pos"))
             .alias("afrr_vwap_pos_eur_mwh")
         )
-    if "afrr_vwap_neg_eur_mwh" in out_cols:
+    if has_neg:
+        out_cols.append("afrr_vwap_neg_eur_mwh")
         vwap_exprs.append(
-            pl.when(pl.col("__sum_vol_neg") != 0.0)
-            .then(pl.col("__sum_weighted_neg") / pl.col("__sum_vol_neg"))
-            .otherwise(pl.col("__mean_price_neg"))
+            pl.when(pl.col("__sum_vol_neg").is_null() | (pl.col("__sum_vol_neg") == 0.0))
+            .then(pl.lit(float("nan")))
+            .otherwise(pl.col("__sum_weighted_neg") / pl.col("__sum_vol_neg"))
             .alias("afrr_vwap_neg_eur_mwh")
         )
 
@@ -233,24 +273,29 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("wind_onshore_forecast_id_entsoe") - pl.col("wind_onshore_forecast_da_entsoe"),
         cols,
     )
-    _add_if_possible(
-        exprs,
-        created,
-        [
-            "load_actual_entsoe",
-            "wind_onshore_actual_entsoe",
-            "wind_offshore_actual_entsoe",
-            "solar_actual_entsoe",
-        ],
-        "residual_load_calc",
-        (
-            pl.col("load_actual_entsoe")
-            - pl.col("wind_onshore_actual_entsoe")
-            - pl.col("wind_offshore_actual_entsoe")
-            - pl.col("solar_actual_entsoe")
-        ),
-        cols,
-    )
+    # Prefer ENTSO-E load, fallback to generic load_actual when present.
+    load_col = "load_actual_entsoe" if "load_actual_entsoe" in cols else ("load_actual" if "load_actual" in cols else None)
+    if load_col is not None:
+        _add_if_possible(
+            exprs,
+            created,
+            [
+                load_col,
+                "wind_onshore_actual_entsoe",
+                "wind_offshore_actual_entsoe",
+                "solar_actual_entsoe",
+            ],
+            "residual_load_calc",
+            (
+                pl.col(load_col)
+                - pl.col("wind_onshore_actual_entsoe")
+                - pl.col("wind_offshore_actual_entsoe")
+                - pl.col("solar_actual_entsoe")
+            ),
+            cols,
+        )
+    else:
+        LOGGER.warning("Skip residual_load_calc, missing inputs: ['load_actual_entsoe' or 'load_actual']")
     _add_if_possible(
         exprs,
         created,
