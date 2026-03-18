@@ -16,6 +16,13 @@ import polars as pl
 
 LOGGER = logging.getLogger(__name__)
 PICASSO_START_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
+DEFAULT_REGELLEISTUNG_15M_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "data"
+    / "raw"
+    / "regelleistung_15min"
+    / "afrr_price_volume_15min.parquet"
+)
 
 SMARD_REDUNDANT_COLS = [
     "wind_onshore_actual",
@@ -28,6 +35,119 @@ SMARD_REDUNDANT_COLS = [
     "wind_offshore_error",
     "solar_error",
 ]
+
+
+def _first_existing(columns: list[str], candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in columns:
+            return c
+    return None
+
+
+def compute_afrr_vwap_from_15min(path: Path) -> pl.DataFrame:
+    """Compute hourly aFRR VWAP from 15-minute Regelleistung price+volume data."""
+    if not path.exists():
+        LOGGER.info("No 15-minute Regelleistung file found for VWAP: %s", path)
+        return pl.DataFrame()
+
+    df = pl.read_parquet(path)
+    if "timestamp_utc" not in df.columns:
+        LOGGER.warning("Skip VWAP build: missing timestamp_utc in %s", path)
+        return pl.DataFrame()
+
+    price_pos_col = _first_existing(
+        df.columns,
+        [
+            "afrr_avg_activation_price_pos",
+            "afrr_activation_avg_price_pos",
+            "afrr_marginal_activation_price_pos",
+            "afrr_activation_marginal_price_pos",
+        ],
+    )
+    price_neg_col = _first_existing(
+        df.columns,
+        [
+            "afrr_avg_activation_price_neg",
+            "afrr_activation_avg_price_neg",
+            "afrr_marginal_activation_price_neg",
+            "afrr_activation_marginal_price_neg",
+        ],
+    )
+    vol_pos_col = _first_existing(
+        df.columns,
+        ["afrr_activated_mw_pos", "activated_volume_pos_mw"],
+    )
+    vol_neg_col = _first_existing(
+        df.columns,
+        ["afrr_activated_mw_neg", "activated_volume_neg_mw"],
+    )
+
+    if not ({price_pos_col, vol_pos_col} - {None}) and not ({price_neg_col, vol_neg_col} - {None}):
+        LOGGER.warning("Skip VWAP build: no usable 15-minute aFRR price/volume columns in %s", path)
+        return pl.DataFrame()
+
+    cast_exprs = [
+        pl.col("timestamp_utc").cast(pl.Datetime(time_unit="us", time_zone="UTC"), strict=False),
+    ]
+    for c in (price_pos_col, price_neg_col, vol_pos_col, vol_neg_col):
+        if c is not None:
+            cast_exprs.append(pl.col(c).cast(pl.Float64, strict=False))
+    df = df.with_columns(cast_exprs).drop_nulls(subset=["timestamp_utc"])
+
+    extra_exprs: list[pl.Expr] = []
+    agg_exprs: list[pl.Expr] = []
+    out_cols: list[str] = []
+
+    if price_pos_col is not None and vol_pos_col is not None:
+        extra_exprs.append((pl.col(price_pos_col) * pl.col(vol_pos_col)).alias("__weighted_cost_pos"))
+        agg_exprs.extend(
+            [
+                pl.sum("__weighted_cost_pos").alias("__sum_weighted_pos"),
+                pl.sum(vol_pos_col).alias("__sum_vol_pos"),
+                pl.mean(price_pos_col).alias("__mean_price_pos"),
+            ]
+        )
+        out_cols.append("afrr_vwap_pos_eur_mwh")
+
+    if price_neg_col is not None and vol_neg_col is not None:
+        extra_exprs.append((pl.col(price_neg_col) * pl.col(vol_neg_col)).alias("__weighted_cost_neg"))
+        agg_exprs.extend(
+            [
+                pl.sum("__weighted_cost_neg").alias("__sum_weighted_neg"),
+                pl.sum(vol_neg_col).alias("__sum_vol_neg"),
+                pl.mean(price_neg_col).alias("__mean_price_neg"),
+            ]
+        )
+        out_cols.append("afrr_vwap_neg_eur_mwh")
+
+    if not agg_exprs:
+        return pl.DataFrame()
+
+    hourly = (
+        df.with_columns(extra_exprs)
+        .with_columns(pl.col("timestamp_utc").dt.truncate("1h").alias("timestamp_utc"))
+        .group_by("timestamp_utc")
+        .agg(agg_exprs)
+        .sort("timestamp_utc")
+    )
+
+    vwap_exprs: list[pl.Expr] = []
+    if "afrr_vwap_pos_eur_mwh" in out_cols:
+        vwap_exprs.append(
+            pl.when(pl.col("__sum_vol_pos") != 0.0)
+            .then(pl.col("__sum_weighted_pos") / pl.col("__sum_vol_pos"))
+            .otherwise(pl.col("__mean_price_pos"))
+            .alias("afrr_vwap_pos_eur_mwh")
+        )
+    if "afrr_vwap_neg_eur_mwh" in out_cols:
+        vwap_exprs.append(
+            pl.when(pl.col("__sum_vol_neg") != 0.0)
+            .then(pl.col("__sum_weighted_neg") / pl.col("__sum_vol_neg"))
+            .otherwise(pl.col("__mean_price_neg"))
+            .alias("afrr_vwap_neg_eur_mwh")
+        )
+
+    return hourly.with_columns(vwap_exprs).select(["timestamp_utc"] + out_cols)
 
 
 def _add_if_possible(
@@ -49,6 +169,26 @@ def _add_if_possible(
 def refine(df: pl.DataFrame) -> pl.DataFrame:
     if "timestamp_utc" not in df.columns:
         raise ValueError("Missing required column: timestamp_utc")
+
+    # Build and join hourly VWAP from raw 15-minute Regelleistung exports.
+    vwap_hourly = compute_afrr_vwap_from_15min(DEFAULT_REGELLEISTUNG_15M_PATH)
+    if not vwap_hourly.is_empty():
+        df = df.join(vwap_hourly, on="timestamp_utc", how="left", suffix="_from15m")
+        for col in ("afrr_vwap_pos_eur_mwh", "afrr_vwap_neg_eur_mwh"):
+            from15 = f"{col}_from15m"
+            if from15 in df.columns and col in df.columns:
+                df = df.with_columns(pl.coalesce([pl.col(from15), pl.col(col)]).alias(col)).drop(from15)
+            elif from15 in df.columns:
+                df = df.rename({from15: col})
+        LOGGER.info("Joined hourly aFRR VWAP from 15-minute source: %s rows", vwap_hourly.height)
+    else:
+        LOGGER.info("No 15-minute VWAP source joined; continuing with existing hourly columns.")
+
+    # Keep backwards-compatible aliases if legacy names exist.
+    if "afrr_vwap_pos_eur_mwh" not in df.columns and "afrr_vwap_pos" in df.columns:
+        df = df.with_columns(pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False).alias("afrr_vwap_pos_eur_mwh"))
+    if "afrr_vwap_neg_eur_mwh" not in df.columns and "afrr_vwap_neg" in df.columns:
+        df = df.with_columns(pl.col("afrr_vwap_neg").cast(pl.Float64, strict=False).alias("afrr_vwap_neg_eur_mwh"))
 
     drop_cols = [c for c in SMARD_REDUNDANT_COLS if c in df.columns]
     if drop_cols:
