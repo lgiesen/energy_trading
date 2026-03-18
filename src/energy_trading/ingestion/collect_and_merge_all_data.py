@@ -45,6 +45,11 @@ def main():
     parser.add_argument("--end", default="2026-01-01T02:00:00Z", help="End date (UTC ISO8601).")
     parser.add_argument("--out-dir", default="data/raw", help="Output directory for individual parquets.")
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
+    parser.add_argument(
+        "--refined",
+        default="data/processed/all_data_refined.parquet",
+        help="Refined merged parquet output (after dropping redundant SMARD features).",
+    )
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
     parser.add_argument("--skip-smard", action="store_true", help="Skip SMARD fetch.")
     parser.add_argument(
@@ -176,6 +181,13 @@ def main():
         "--out", str(Path(args.merged)),
         "--clip-start", clip_start,
         "--clip-end", clip_end,
+    ])
+
+    # Refine merged data: drop redundant SMARD features, add ENTSO-E errors.
+    run([
+        py, "-m", "energy_trading.processing.drop_redundant_features",
+        "--in", str(Path(args.merged)),
+        "--out", str(Path(args.refined)),
     ])
 
     LOGGER.info("All tasks completed.")

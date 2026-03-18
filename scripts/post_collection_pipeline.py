@@ -39,6 +39,11 @@ def main() -> None:
         help="Cleaned parquet output.",
     )
     parser.add_argument(
+        "--refined-out",
+        default="data/processed/all_data_refined.parquet",
+        help="Refined parquet output (after dropping redundant features).",
+    )
+    parser.add_argument(
         "--transformed-out",
         default="data/processed/all_data_transformed.parquet",
         help="Transformed parquet output.",
@@ -77,6 +82,7 @@ def main() -> None:
 
     py = sys.executable
     Path(args.merged).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.refined_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.clean_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.transformed_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.features_out).parent.mkdir(parents=True, exist_ok=True)
@@ -99,14 +105,27 @@ def main() -> None:
         merge_cmd.extend(["--resample-freq", args.resample_freq])
     _run(merge_cmd)
 
-    # 2) Handle missing values.
+    # 2) Refine merged data (drop redundant SMARD columns and add ENTSO-E errors).
+    _run(
+        [
+            py,
+            "-m",
+            "energy_trading.processing.drop_redundant_features",
+            "--in",
+            args.merged,
+            "--out",
+            args.refined_out,
+        ]
+    )
+
+    # 3) Handle missing values.
     _run(
         [
             py,
             "-m",
             "energy_trading.processing.handle_missing_values",
             "--in",
-            args.merged,
+            args.refined_out,
             "--out",
             args.clean_out,
         ]
@@ -116,7 +135,7 @@ def main() -> None:
         LOGGER.info("Stopping after cleaning (--skip-transform).")
         return
 
-    # 3) Transform.
+    # 4) Transform.
     _run(
         [
             py,
@@ -133,7 +152,7 @@ def main() -> None:
         LOGGER.info("Stopping after transform (--skip-features).")
         return
 
-    # 4) Build features.
+    # 5) Build features.
     _run(
         [
             py,
