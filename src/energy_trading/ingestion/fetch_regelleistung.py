@@ -8,6 +8,14 @@ Usage:
         --mol-dir data/raw \
         --bids-dir data/raw/bids
 
+    # Skip bid-based activation reconstruction (faster, no bid files needed)
+    ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
+        --start 2020-11-30T23:00:00Z \
+        --end 2025-12-31T23:00:00Z \
+        --out data/raw/regelleistung.parquet \
+        --mol-dir data/raw \
+        --skip-bid-activation-prices
+
 Outputs:
     - regelleistung.parquet with hourly aFRR capacity/energy results (UTC, timestamp_utc).
 
@@ -51,6 +59,7 @@ LOGGER = logging.getLogger(__name__)
 CPP_FILES_BASE_URL = "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files"
 # Collect full 15-minute activation price streams while parsing yearly files.
 ALL_15MIN_PRICE_DATA: list[pd.DataFrame] = []
+PICASSO_START_UTC = pd.Timestamp("2022-06-22 22:00:00+00:00")
 
 
 def _log_dst_drop(label: str, ts_series: pd.Series, date_series: pd.Series) -> None:
@@ -895,7 +904,13 @@ def _load_netztransparenz_activation_15m(
 
     df = df[[ts_col] + found_cols].copy()
     df["timestamp_utc"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp_utc"]).drop(columns=[ts_col]).set_index("timestamp_utc").sort_index()
+    drop_cols = [ts_col] if ts_col != "timestamp_utc" else []
+    df = (
+        df.dropna(subset=["timestamp_utc"])
+        .drop(columns=drop_cols)
+        .set_index("timestamp_utc")
+        .sort_index()
+    )
     df = df.loc[(df.index >= start_dt) & (df.index <= end_dt)]
 
     for col in required_cols:
@@ -924,16 +939,35 @@ def _aggregate_hourly_with_vwap(df_15m: pd.DataFrame) -> pd.DataFrame:
     vol_pos = "afrr_activated_mw_pos"
     vol_neg = "afrr_activated_mw_neg"
 
+    # Pre-PICASSO prices are often posted only at :00. Fill :15/:30/:45 inside
+    # each hour before weighting, but never propagate across hour boundaries.
+    pre_picasso_mask = df_15m.index < PICASSO_START_UTC
+    if pre_picasso_mask.any():
+        if price_pos in df_15m.columns:
+            pre_idx = df_15m.index[pre_picasso_mask]
+            df_15m.loc[pre_picasso_mask, price_pos] = (
+                df_15m.loc[pre_picasso_mask, price_pos]
+                .groupby(pre_idx.floor("1h"))
+                .ffill()
+            )
+        if price_neg in df_15m.columns:
+            pre_idx = df_15m.index[pre_picasso_mask]
+            df_15m.loc[pre_picasso_mask, price_neg] = (
+                df_15m.loc[pre_picasso_mask, price_neg]
+                .groupby(pre_idx.floor("1h"))
+                .ffill()
+            )
+
     if {price_pos, vol_pos}.issubset(df_15m.columns):
-        df_15m["weighted_cost_pos"] = df_15m[price_pos] * df_15m[vol_pos]
+        df_15m["weighted_cost_pos"] = df_15m[price_pos] * df_15m[vol_pos].abs()
     if {price_neg, vol_neg}.issubset(df_15m.columns):
-        df_15m["weighted_cost_neg"] = df_15m[price_neg] * df_15m[vol_neg]
+        df_15m["weighted_cost_neg"] = df_15m[price_neg] * df_15m[vol_neg].abs()
 
     hourly = df_15m.resample("1h").mean(numeric_only=True)
 
     if {"weighted_cost_pos", vol_pos, price_pos}.issubset(df_15m.columns):
         sum_weighted_pos = df_15m["weighted_cost_pos"].resample("1h").sum(min_count=1)
-        sum_vol_pos = df_15m[vol_pos].resample("1h").sum(min_count=1)
+        sum_vol_pos = df_15m[vol_pos].abs().resample("1h").sum(min_count=1)
         mean_price_pos = df_15m[price_pos].resample("1h").mean()
         vwap_pos = np.where(sum_vol_pos != 0, sum_weighted_pos / sum_vol_pos, mean_price_pos)
         hourly["afrr_vwap_pos"] = vwap_pos
@@ -941,7 +975,7 @@ def _aggregate_hourly_with_vwap(df_15m: pd.DataFrame) -> pd.DataFrame:
 
     if {"weighted_cost_neg", vol_neg, price_neg}.issubset(df_15m.columns):
         sum_weighted_neg = df_15m["weighted_cost_neg"].resample("1h").sum(min_count=1)
-        sum_vol_neg = df_15m[vol_neg].resample("1h").sum(min_count=1)
+        sum_vol_neg = df_15m[vol_neg].abs().resample("1h").sum(min_count=1)
         mean_price_neg = df_15m[price_neg].resample("1h").mean()
         vwap_neg = np.where(sum_vol_neg != 0, sum_weighted_neg / sum_vol_neg, mean_price_neg)
         hourly["afrr_vwap_neg"] = vwap_neg
@@ -992,47 +1026,32 @@ def _export_afrr_15min_price_volume(
             compression="zstd",
         )
 
-    combined = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+    combined = pd.concat(frames, axis=1, sort=False).sort_index() if frames else pd.DataFrame()
     if not combined.empty:
         combined = combined.loc[:, ~combined.columns.duplicated()]
-        # Provide stable aliases used in validation notebooks and legacy exports.
-        alias_candidates = [
-            ("abgerufene_arbeit_pos", ["afrr_activated_mw_pos", "activated_volume_pos_mw"]),
-            ("abgerufene_arbeit_neg", ["afrr_activated_mw_neg", "activated_volume_neg_mw"]),
-            (
-                "arbeitspreis_pos",
-                [
-                    "afrr_avg_activation_price_pos",
-                    "afrr_activation_avg_price_pos",
-                    "afrr_marginal_activation_price_pos",
-                    "afrr_activation_marginal_price_pos",
-                ],
-            ),
-            (
-                "arbeitspreis_neg",
-                [
-                    "afrr_avg_activation_price_neg",
-                    "afrr_activation_avg_price_neg",
-                    "afrr_marginal_activation_price_neg",
-                    "afrr_activation_marginal_price_neg",
-                ],
-            ),
-            (
-                "durchschnittlicher_arbeitspreis_pos",
-                ["afrr_avg_activation_price_pos", "afrr_activation_avg_price_pos"],
-            ),
-            (
-                "durchschnittlicher_arbeitspreis_neg",
-                ["afrr_avg_activation_price_neg", "afrr_activation_avg_price_neg"],
-            ),
+        # Keep raw source prices untouched and add explicit pre-PICASSO
+        # quarter-hour filled prices (within-hour only) for transparent VWAP use.
+        cutoff = pd.Timestamp("2022-06-22 22:00:00+00:00")
+        fill_pairs = [
+            ("afrr_avg_activation_price_pos", "afrr_activation_price_pos_ffill"),
+            ("afrr_avg_activation_price_neg", "afrr_activation_price_neg_ffill"),
         ]
-        for alias, candidates in alias_candidates:
-            if alias in combined.columns:
-                continue
-            for src in candidates:
-                if src in combined.columns:
-                    combined[alias] = combined[src]
-                    break
+        pre_mask = combined.index < cutoff
+        if pre_mask.any():
+            for src_col, out_col in fill_pairs:
+                if src_col not in combined.columns:
+                    continue
+                combined[out_col] = combined[src_col]
+                pre_idx = combined.index[pre_mask]
+                combined.loc[pre_mask, out_col] = (
+                    combined.loc[pre_mask, src_col]
+                    .groupby(pre_idx.floor("1h"))
+                    .ffill()
+                )
+        else:
+            for src_col, out_col in fill_pairs:
+                if src_col in combined.columns:
+                    combined[out_col] = combined[src_col]
         combined.reset_index(names="timestamp_utc").to_parquet(
             out_dir / "afrr_price_volume_15min.parquet",
             index=False,
@@ -1047,7 +1066,17 @@ def _export_afrr_15min_price_volume(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Fetch aFRR results from Regelleistung.net")
+    parser = argparse.ArgumentParser(
+        description="Fetch aFRR results from Regelleistung.net",
+        epilog=(
+            "Example (skip bid-based activation reconstruction):\n"
+            "  ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung "
+            "--start 2020-11-30T23:00:00Z --end 2025-12-31T23:00:00Z "
+            "--out data/raw/regelleistung.parquet --mol-dir data/raw "
+            "--skip-bid-activation-prices"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument(
