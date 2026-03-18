@@ -8,6 +8,7 @@ Usage:
 Outputs:
     - entsoe.parquet with hourly UTC timestamps and:
         timestamp_utc,
+        load_actual_entsoe, load_forecast_da_entsoe,
         wind_onshore_actual_entsoe, wind_offshore_actual_entsoe, solar_actual_entsoe,
         wind_onshore_forecast_da_entsoe, wind_offshore_forecast_da_entsoe, solar_forecast_da_entsoe,
         wind_onshore_forecast_id_entsoe, wind_offshore_forecast_id_entsoe, solar_forecast_id_entsoe,
@@ -268,6 +269,86 @@ def _fetch_forecast(
     return _resample_hourly(forecast)
 
 
+def _fetch_load_actual(
+    client: EntsoePandasClient,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame | None:
+    """Fetch ENTSO-E total actual load."""
+    area_candidates = [DE_LU_BIDDING_ZONE_CODE, DE_PHYSICAL_CONTROL_CODE]
+    for area in area_candidates:
+        try:
+            load = _retry(lambda: client.query_load(area, start=start, end=end))
+        except Exception as exc:  # pragma: no cover - network/API variation
+            LOGGER.warning("Load actual failed for area %s: %s", area, exc)
+            continue
+        if load is None or len(load) == 0:
+            continue
+        if isinstance(load, pd.DataFrame):
+            num_cols = [c for c in load.columns if pd.api.types.is_numeric_dtype(load[c])]
+            if not num_cols:
+                continue
+            load = load[num_cols[0]]
+        load = pd.to_numeric(load, errors="coerce")
+        load = _resample_hourly(load)
+        return load.to_frame(name="load_actual_entsoe")
+    return None
+
+
+def _fetch_load_forecast_da(
+    client: EntsoePandasClient,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame | None:
+    """Fetch ENTSO-E day-ahead load forecast."""
+    area_candidates = [DE_LU_BIDDING_ZONE_CODE, DE_PHYSICAL_CONTROL_CODE]
+    # A01 = day-ahead, A31 = common fallback in ENTSO-E payloads.
+    process_candidates = ["A01", "A31"]
+    for area in area_candidates:
+        for process_type in process_candidates:
+            try:
+                forecast = _retry(
+                    lambda: client.query_load_forecast(
+                        area,
+                        start=start,
+                        end=end,
+                        process_type=process_type,
+                    )
+                )
+            except TypeError:
+                # Some entsoe-py versions do not accept process_type.
+                try:
+                    forecast = _retry(lambda: client.query_load_forecast(area, start=start, end=end))
+                except Exception as exc:  # pragma: no cover - network/API variation
+                    LOGGER.warning(
+                        "Load forecast failed for area %s (process %s): %s",
+                        area,
+                        process_type,
+                        exc,
+                    )
+                    continue
+            except Exception as exc:  # pragma: no cover - network/API variation
+                LOGGER.warning(
+                    "Load forecast failed for area %s (process %s): %s",
+                    area,
+                    process_type,
+                    exc,
+                )
+                continue
+
+            if forecast is None or len(forecast) == 0:
+                continue
+            if isinstance(forecast, pd.DataFrame):
+                num_cols = [c for c in forecast.columns if pd.api.types.is_numeric_dtype(forecast[c])]
+                if not num_cols:
+                    continue
+                forecast = forecast[num_cols[0]]
+            forecast = pd.to_numeric(forecast, errors="coerce")
+            forecast = _resample_hourly(forecast)
+            return forecast.to_frame(name="load_forecast_da_entsoe")
+    return None
+
+
 def _fetch_capacity_yearly(
     client: EntsoePandasClient,
     start: pd.Timestamp,
@@ -346,6 +427,8 @@ def _fetch_capacity_yearly(
 def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp) -> pl.DataFrame:
     LOGGER.info("Fetching %s to %s", start, end)
 
+    load_actual = _fetch_load_actual(client, start, end)
+    load_forecast_da = _fetch_load_forecast_da(client, start, end)
     actuals = _fetch_actuals(client, start, end)
 
     da = _fetch_forecast(client, start, end, process_type="A01", suffix="da")
@@ -355,7 +438,7 @@ def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timesta
         LOGGER.warning("A18 returned empty; trying A40 for intraday/current forecasts.")
         id_forecast = _fetch_forecast(client, start, end, process_type="A40", suffix="id")
 
-    frames = [df for df in (actuals, da, id_forecast) if df is not None and len(df) > 0]
+    frames = [df for df in (load_actual, load_forecast_da, actuals, da, id_forecast) if df is not None and len(df) > 0]
     if frames:
         df = pd.concat(frames, axis=1, join="outer", sort=False)
         # Final cleanup: enforce actual column names in case tuple-like names survived.
