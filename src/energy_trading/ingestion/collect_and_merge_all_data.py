@@ -183,9 +183,9 @@ def main():
         "--clip-end", clip_end,
     ])
 
-    # Refine merged data: drop redundant SMARD features, add ENTSO-E errors.
+    # Refine merged data: source consolidation + market-specific feature logic.
     run([
-        py, "-m", "energy_trading.processing.drop_redundant_features",
+        py, "-m", "energy_trading.processing.refine_market_data",
         "--in", str(Path(args.merged)),
         "--out", str(Path(args.refined)),
     ])

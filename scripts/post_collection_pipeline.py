@@ -35,7 +35,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--clean-out",
-        default="data/processed/all_data_clean.parquet",
+        default="data/processed/cleaned_data.parquet",
         help="Cleaned parquet output.",
     )
     parser.add_argument(
@@ -105,12 +105,12 @@ def main() -> None:
         merge_cmd.extend(["--resample-freq", args.resample_freq])
     _run(merge_cmd)
 
-    # 2) Refine merged data (drop redundant SMARD columns and add ENTSO-E errors).
+    # 2) Refine merged data (source consolidation + market-specific features).
     _run(
         [
             py,
             "-m",
-            "energy_trading.processing.drop_redundant_features",
+            "energy_trading.processing.refine_market_data",
             "--in",
             args.merged,
             "--out",
