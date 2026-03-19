@@ -1058,6 +1058,72 @@ def _add_if_possible(
         LOGGER.warning("Skip %s, missing inputs: %s", out_col, missing)
 
 
+def add_specialized_activation_rates(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Add deterministic physical/ML activation-rate columns on hourly data.
+
+    Definitions (hourly):
+    - activation_rate_phys_* = activated_mw / capacity_awarded_mw
+      signed and uncapped to preserve physical stress/scarcity behavior.
+    - activation_rate_ml_* = min(|activated_mw| / capacity_awarded_mw, 1.0)
+      absolute and capped for stable ML targets.
+
+    Division-by-zero policy:
+    - if awarded capacity <= 0, set rate to 0.0.
+
+    ACHTUNG: Kein Faktor 4 nötig, da Daten stündlich aggregiert sind
+    (1 MW * 1h = 1 MWh).
+    """
+    schema_cols = set(lf.collect_schema().names())
+    required = {
+        "afrr_activated_mw_pos",
+        "afrr_activated_mw_neg",
+        "afrr_capacity_awarded_mw_pos",
+        "afrr_capacity_awarded_mw_neg",
+    }
+    missing = sorted(required - schema_cols)
+    if missing:
+        LOGGER.warning("Skip specialized activation rates, missing inputs: %s", missing)
+        return lf
+
+    num_pos = pl.col("afrr_activated_mw_pos").cast(pl.Float64, strict=False)
+    num_neg = pl.col("afrr_activated_mw_neg").cast(pl.Float64, strict=False)
+    den_pos = pl.col("afrr_capacity_awarded_mw_pos").cast(pl.Float64, strict=False)
+    den_neg = pl.col("afrr_capacity_awarded_mw_neg").cast(pl.Float64, strict=False)
+
+    phys_pos_expr = (
+        pl.when(den_pos > 0.0)
+        .then((num_pos / den_pos).cast(pl.Float64))
+        .otherwise(pl.lit(0.0, dtype=pl.Float64))
+    )
+    phys_neg_expr = (
+        pl.when(den_neg > 0.0)
+        .then((num_neg / den_neg).cast(pl.Float64))
+        .otherwise(pl.lit(0.0, dtype=pl.Float64))
+    )
+    ml_pos_expr = (
+        pl.when(den_pos > 0.0)
+        .then((num_pos.abs() / den_pos).clip(upper_bound=1.0).cast(pl.Float64))
+        .otherwise(pl.lit(0.0, dtype=pl.Float64))
+    )
+    ml_neg_expr = (
+        pl.when(den_neg > 0.0)
+        .then((num_neg.abs() / den_neg).clip(upper_bound=1.0).cast(pl.Float64))
+        .otherwise(pl.lit(0.0, dtype=pl.Float64))
+    )
+
+    return lf.with_columns(
+        [
+            phys_pos_expr.alias("activation_rate_phys_pos"),
+            phys_neg_expr.alias("activation_rate_phys_neg"),
+            ml_pos_expr.alias("activation_rate_ml_pos"),
+            ml_neg_expr.alias("activation_rate_ml_neg"),
+            # Backward-compatible aliases for existing downstream usage.
+            phys_pos_expr.alias("afrr_activation_rate_pos"),
+            phys_neg_expr.alias("afrr_activation_rate_neg"),
+        ]
+    )
+
+
 def refine(df: pl.DataFrame) -> pl.DataFrame:
     if "timestamp_utc" not in df.columns:
         raise ValueError("Missing required column: timestamp_utc")
@@ -1274,99 +1340,6 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
         cols,
     )
 
-    # aFRR activation rate: activated / awarded.
-    # Unit check: if scale against rz_saldo_mw is closer after *4, apply factor.
-    rz_med = _median_abs(df, "rz_saldo_mw")
-
-    def _pick_activation_power_expr(service: str, direction: str) -> pl.Expr | None:
-        mw_col = f"{service}_activated_mw_{direction}"
-        mwh_col = f"{service}_activated_mwh_{direction}"
-        candidates: list[tuple[str, pl.Expr, float | None]] = []
-        if mw_col in df.columns:
-            mw_med = _median_abs(df, mw_col)
-            candidates.append(
-                (
-                    f"{mw_col} (as-is MW)",
-                    pl.col(mw_col).cast(pl.Float64, strict=False),
-                    mw_med,
-                )
-            )
-            candidates.append(
-                (
-                    f"{mw_col} (*4 unit correction)",
-                    pl.col(mw_col).cast(pl.Float64, strict=False) * 4.0,
-                    None if mw_med is None else mw_med * 4.0,
-                )
-            )
-        if mwh_col in df.columns:
-            mwh_med = _median_abs(df, mwh_col)
-            candidates.append(
-                (
-                    f"{mwh_col} (*4 MWh->MW)",
-                    pl.col(mwh_col).cast(pl.Float64, strict=False) * 4.0,
-                    None if mwh_med is None else mwh_med * 4.0,
-                )
-            )
-        if not candidates:
-            return None
-
-        if rz_med is None or rz_med <= 0:
-            label, expr, _ = candidates[0]
-            LOGGER.info("Using %s as activation-power numerator (rz_saldo_mw scale unavailable).", label)
-            return expr
-
-        scored = []
-        for label, expr, med in candidates:
-            if med is None:
-                continue
-            scored.append((abs(med - rz_med), label, expr, med))
-        if not scored:
-            label, expr, _ = candidates[0]
-            LOGGER.info("Using %s as activation-power numerator (median scale unavailable).", label)
-            return expr
-        scored.sort(key=lambda x: x[0])
-        _, label, expr, med = scored[0]
-        LOGGER.info(
-            "Using %s as activation-power numerator (median_abs=%s, rz_saldo_median_abs=%s).",
-            label,
-            round(med, 6) if med is not None else None,
-            round(rz_med, 6),
-        )
-        return expr
-
-    num_pos_expr = _pick_activation_power_expr("afrr", "pos")
-    num_neg_expr = _pick_activation_power_expr("afrr", "neg")
-    cap_pos_col = "afrr_capacity_awarded_mw_pos" if "afrr_capacity_awarded_mw_pos" in df.columns else "awarded_capacity_mw_pos"
-    cap_neg_col = "afrr_capacity_awarded_mw_neg" if "afrr_capacity_awarded_mw_neg" in df.columns else "awarded_capacity_mw_neg"
-
-    if num_pos_expr is not None and cap_pos_col in df.columns:
-        exprs.append(
-            pl.when(pl.col(cap_pos_col).cast(pl.Float64, strict=False).abs() == 0.0)
-            .then(pl.lit(float("nan")))
-            .otherwise(num_pos_expr / pl.col(cap_pos_col).cast(pl.Float64, strict=False))
-            .alias("afrr_activation_rate_pos")
-        )
-        created.append("afrr_activation_rate_pos")
-    else:
-        LOGGER.warning(
-            "Skip afrr_activation_rate_pos, missing inputs: %s",
-            ["afrr_activated_mw_pos or afrr_activated_mwh_pos", cap_pos_col],
-        )
-
-    if num_neg_expr is not None and cap_neg_col in df.columns:
-        exprs.append(
-            pl.when(pl.col(cap_neg_col).cast(pl.Float64, strict=False).abs() == 0.0)
-            .then(pl.lit(float("nan")))
-            .otherwise(num_neg_expr / pl.col(cap_neg_col).cast(pl.Float64, strict=False))
-            .alias("afrr_activation_rate_neg")
-        )
-        created.append("afrr_activation_rate_neg")
-    else:
-        LOGGER.warning(
-            "Skip afrr_activation_rate_neg, missing inputs: %s",
-            ["afrr_activated_mw_neg or afrr_activated_mwh_neg", cap_neg_col],
-        )
-
     # Draft profitability feature:
     # Profit = (Allocated_Capacity * Capacity_Price) + (Activated_MWh * Signed_VWAP)
     # with signed VWAP already reflecting payment direction.
@@ -1414,6 +1387,38 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
 
     if exprs:
         df = df.with_columns(exprs)
+
+    # Specialized deterministic activation rates (hourly; no factor-4 scaling).
+    prev_cols = set(df.columns)
+    df = add_specialized_activation_rates(df.lazy()).collect()
+    new_rate_cols = [
+        c
+        for c in (
+            "activation_rate_phys_pos",
+            "activation_rate_phys_neg",
+            "activation_rate_ml_pos",
+            "activation_rate_ml_neg",
+            "afrr_activation_rate_pos",
+            "afrr_activation_rate_neg",
+        )
+        if c in df.columns and (c not in prev_cols or c.startswith("afrr_activation_rate_"))
+    ]
+    if new_rate_cols:
+        created.extend(new_rate_cols)
+
+    # Optional sanity check: ML rates must remain in [0, 1].
+    if "activation_rate_ml_pos" in df.columns and "activation_rate_ml_neg" in df.columns:
+        ml_violations = df.filter(
+            (pl.col("activation_rate_ml_pos") < 0.0)
+            | (pl.col("activation_rate_ml_pos") > 1.0)
+            | (pl.col("activation_rate_ml_neg") < 0.0)
+            | (pl.col("activation_rate_ml_neg") > 1.0)
+        ).height
+        if ml_violations > 0:
+            LOGGER.warning("ML activation-rate range check failed: %s rows outside [0,1]", ml_violations)
+        else:
+            LOGGER.info("ML activation-rate range check passed: all rows in [0,1].")
+
     LOGGER.info("Created/updated %s columns: %s", len(created), created)
 
     # Structural break for platform flows in refined layer.
