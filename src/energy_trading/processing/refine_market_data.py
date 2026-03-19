@@ -652,23 +652,31 @@ def _reconstruct_marginal_for_direction(
         ["timestamp_utc", "__cum_offered_mw"]
     )
 
-    matched = a_pos.join_asof(
-        curve,
-        left_on="activation_mw",
-        right_on="__cum_offered_mw",
-        by="timestamp_utc",
-        strategy="forward",
-    )
     last_price = (
         curve.group_by("timestamp_utc")
         .agg(pl.col("signed_energy_price_eur_mwh").last().alias("__last_price"))
     )
+
+    # Merit-order match without grouped join_asof warning:
+    # for each timestamp, pick the first bid where cum_offered >= activation.
+    hit = (
+        a_pos.join(curve, on="timestamp_utc", how="left")
+        .filter(pl.col("__cum_offered_mw") >= pl.col("activation_mw"))
+        .group_by(["timestamp_utc", "activation_mw"])
+        .agg(
+            pl.col("signed_energy_price_eur_mwh")
+            .sort_by("__cum_offered_mw")
+            .first()
+            .alias("__hit_price")
+        )
+    )
     matched = (
-        matched.join(last_price, on="timestamp_utc", how="left")
+        a_pos.join(hit, on=["timestamp_utc", "activation_mw"], how="left")
+        .join(last_price, on="timestamp_utc", how="left")
         .with_columns(
             pl.coalesce(
                 [
-                    pl.col("signed_energy_price_eur_mwh").cast(pl.Float64, strict=False),
+                    pl.col("__hit_price").cast(pl.Float64, strict=False),
                     pl.col("__last_price").cast(pl.Float64, strict=False),
                 ]
             ).alias(out_col)
@@ -730,6 +738,28 @@ def compute_afrr_reconstructed_marginal_from_bids(
     if cache_path.exists():
         try:
             merit = pd.read_parquet(cache_path)
+            # Backward compatibility: older cache versions may miss newly
+            # required fields. Reconstruct them so we can reuse cache and avoid
+            # expensive workbook parsing.
+            if "energy_price_eur_mwh" not in merit.columns and "signed_energy_price_eur_mwh" in merit.columns:
+                merit["energy_price_eur_mwh"] = pd.to_numeric(
+                    merit["signed_energy_price_eur_mwh"], errors="coerce"
+                ).abs()
+            if "payment_direction" not in merit.columns:
+                if {"signed_energy_price_eur_mwh", "direction", "energy_price_eur_mwh"}.issubset(set(merit.columns)):
+                    signed = pd.to_numeric(merit["signed_energy_price_eur_mwh"], errors="coerce")
+                    raw = pd.to_numeric(merit["energy_price_eur_mwh"], errors="coerce")
+                    dir_sign = np.where(merit["direction"].astype(str).str.upper().eq("NEG"), -1.0, 1.0)
+                    # signed = raw * pay_sign * dir_sign  -> pay_sign = signed/(raw*dir_sign)
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        pay_sign = signed / (raw * dir_sign)
+                    merit["payment_direction"] = np.where(
+                        pay_sign < 0,
+                        "PROVIDER_TO_GRID",
+                        "GRID_TO_PROVIDER",
+                    )
+                else:
+                    merit["payment_direction"] = "GRID_TO_PROVIDER"
             merit["timestamp_utc"] = pd.to_datetime(merit["timestamp_utc"], utc=True, errors="coerce")
             merit = merit.dropna(
                 subset=[
@@ -741,6 +771,11 @@ def compute_afrr_reconstructed_marginal_from_bids(
                 ]
             )
             merit = merit[merit["timestamp_utc"] >= pd.Timestamp(PICASSO_START_UTC)]
+            # Persist migrated cache schema so future runs stay fast and quiet.
+            try:
+                merit.to_parquet(cache_path, index=False)
+            except Exception:
+                pass
             LOGGER.info("Loaded bid merit cache: %s rows", len(merit))
         except Exception as exc:
             LOGGER.warning("Failed reading bid merit cache %s: %s", cache_path, exc)
@@ -988,20 +1023,20 @@ def compute_afrr_vwap_from_15min(path: Path) -> pl.DataFrame:
     vwap_exprs: list[pl.Expr] = []
     out_cols: list[str] = []
     if has_pos:
-        out_cols.append("afrr_vwap_pos_eur_mwh")
+        out_cols.append("afrr_vwap_pos")
         vwap_exprs.append(
             pl.when(pl.col("__sum_vol_pos").is_null() | (pl.col("__sum_vol_pos") == 0.0))
             .then(pl.lit(float("nan")))
             .otherwise(pl.col("__sum_weighted_pos") / pl.col("__sum_vol_pos"))
-            .alias("afrr_vwap_pos_eur_mwh")
+            .alias("afrr_vwap_pos")
         )
     if has_neg:
-        out_cols.append("afrr_vwap_neg_eur_mwh")
+        out_cols.append("afrr_vwap_neg")
         vwap_exprs.append(
             pl.when(pl.col("__sum_vol_neg").is_null() | (pl.col("__sum_vol_neg") == 0.0))
             .then(pl.lit(float("nan")))
             .otherwise(pl.col("__sum_weighted_neg") / pl.col("__sum_vol_neg"))
-            .alias("afrr_vwap_neg_eur_mwh")
+            .alias("afrr_vwap_neg")
         )
 
     return hourly.with_columns(vwap_exprs).select(["timestamp_utc"] + out_cols)
@@ -1031,7 +1066,7 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
     vwap_hourly = compute_afrr_vwap_from_15min(DEFAULT_REGELLEISTUNG_15M_PATH)
     if not vwap_hourly.is_empty():
         df = df.join(vwap_hourly, on="timestamp_utc", how="left", suffix="_from15m")
-        for col in ("afrr_vwap_pos_eur_mwh", "afrr_vwap_neg_eur_mwh"):
+        for col in ("afrr_vwap_pos", "afrr_vwap_neg"):
             from15 = f"{col}_from15m"
             if from15 in df.columns and col in df.columns:
                 df = df.with_columns(pl.coalesce([pl.col(from15), pl.col(col)]).alias(col)).drop(from15)
@@ -1125,33 +1160,28 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
 
     # Signed bid-VWAP override (economic sign from ENERGY_PRICE_PAYMENT_DIRECTION).
     if "bid_signed_vwap_eur_mwh_pos" in df.columns:
-        if "afrr_vwap_pos_eur_mwh" in df.columns:
+        if "afrr_vwap_pos" in df.columns:
             df = df.with_columns(
-                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_pos"), pl.col("afrr_vwap_pos_eur_mwh")]).alias(
-                    "afrr_vwap_pos_eur_mwh"
+                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_pos"), pl.col("afrr_vwap_pos")]).alias(
+                    "afrr_vwap_pos"
                 )
             )
         else:
-            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_pos").alias("afrr_vwap_pos_eur_mwh"))
+            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_pos").alias("afrr_vwap_pos"))
     if "bid_signed_vwap_eur_mwh_neg" in df.columns:
-        if "afrr_vwap_neg_eur_mwh" in df.columns:
+        if "afrr_vwap_neg" in df.columns:
             df = df.with_columns(
-                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_neg"), pl.col("afrr_vwap_neg_eur_mwh")]).alias(
-                    "afrr_vwap_neg_eur_mwh"
+                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_neg"), pl.col("afrr_vwap_neg")]).alias(
+                    "afrr_vwap_neg"
                 )
             )
         else:
-            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_neg").alias("afrr_vwap_neg_eur_mwh"))
+            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_neg").alias("afrr_vwap_neg"))
 
-    # Keep backwards-compatible aliases if legacy names exist.
-    if "afrr_vwap_pos_eur_mwh" not in df.columns and "afrr_vwap_pos" in df.columns:
-        df = df.with_columns(pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False).alias("afrr_vwap_pos_eur_mwh"))
-    if "afrr_vwap_neg_eur_mwh" not in df.columns and "afrr_vwap_neg" in df.columns:
-        df = df.with_columns(pl.col("afrr_vwap_neg").cast(pl.Float64, strict=False).alias("afrr_vwap_neg_eur_mwh"))
-    if "afrr_vwap_pos_eur_mwh" in df.columns and "afrr_vwap_pos" not in df.columns:
-        df = df.with_columns(pl.col("afrr_vwap_pos_eur_mwh").alias("afrr_vwap_pos"))
-    if "afrr_vwap_neg_eur_mwh" in df.columns and "afrr_vwap_neg" not in df.columns:
-        df = df.with_columns(pl.col("afrr_vwap_neg_eur_mwh").alias("afrr_vwap_neg"))
+    # Normalize VWAP dtype.
+    for c in ("afrr_vwap_pos", "afrr_vwap_neg"):
+        if c in df.columns:
+            df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False).alias(c))
 
     drop_cols = [c for c in SMARD_REDUNDANT_COLS if c in df.columns]
     if drop_cols:
@@ -1363,8 +1393,8 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
         and "afrr_capacity_awarded_mw_neg" in df.columns
         and "afrr_capacity_price_pos" in df.columns
         and "afrr_capacity_price_neg" in df.columns
-        and "afrr_vwap_pos_eur_mwh" in df.columns
-        and "afrr_vwap_neg_eur_mwh" in df.columns
+        and "afrr_vwap_pos" in df.columns
+        and "afrr_vwap_neg" in df.columns
         and act_mwh_pos is not None
         and act_mwh_neg is not None
     ):
@@ -1372,10 +1402,10 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
             (
                 pl.col("afrr_capacity_awarded_mw_pos").cast(pl.Float64, strict=False)
                 * pl.col("afrr_capacity_price_pos").cast(pl.Float64, strict=False)
-                + act_mwh_pos * pl.col("afrr_vwap_pos_eur_mwh").cast(pl.Float64, strict=False)
+                + act_mwh_pos * pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False)
                 + pl.col("afrr_capacity_awarded_mw_neg").cast(pl.Float64, strict=False)
                 * pl.col("afrr_capacity_price_neg").cast(pl.Float64, strict=False)
-                + act_mwh_neg * pl.col("afrr_vwap_neg_eur_mwh").cast(pl.Float64, strict=False)
+                + act_mwh_neg * pl.col("afrr_vwap_neg").cast(pl.Float64, strict=False)
             ).alias("simulated_afrr_profit_eur")
         )
         created.append("simulated_afrr_profit_eur")
