@@ -27,6 +27,34 @@ DROP_COLS = [
     "solar_error",
 ]
 
+# Keep only canonical activation-price signal columns.
+# All other historical/alternative activation-price variants are removed.
+ACTIVATION_PRICE_DROP_COLS = [
+    "afrr_marginal_activation_price_pos",
+    "afrr_marginal_activation_price_neg",
+    "afrr_activation_marginal_price_pos",
+    "afrr_activation_marginal_price_neg",
+    "afrr_avg_activation_price_pos",
+    "afrr_avg_activation_price_neg",
+    "afrr_activation_avg_price_pos",
+    "afrr_activation_avg_price_neg",
+    "afrr_bid_avg_activation_price_pos",
+    "afrr_bid_avg_activation_price_neg",
+    "afrr_bid_vwap_activation_price_pos",
+    "afrr_bid_vwap_activation_price_neg",
+    "afrr_reconstructed_marginal_price_pos",
+    "afrr_reconstructed_marginal_price_neg",
+    "afrr_vwap_pos_eur_mwh",
+    "afrr_vwap_neg_eur_mwh",
+]
+
+# For ML training datasets: drop physical activation-rate columns.
+# They can be re-joined later for optimizer-specific runs.
+ACTIVATION_RATE_DROP_COLS = [
+    "activation_rate_phys_pos",
+    "activation_rate_phys_neg",
+]
+
 ERROR_FEATURE_SPECS: dict[str, tuple[str, str]] = {
     "wind_onshore_error_da": ("wind_onshore_forecast_da_entsoe", "wind_onshore_actual_entsoe"),
     "wind_offshore_error_da": ("wind_offshore_forecast_da_entsoe", "wind_offshore_actual_entsoe"),
@@ -69,11 +97,41 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
     if "timestamp_utc" not in df.columns:
         raise ValueError("Missing required column: timestamp_utc")
 
-    drop_existing = [c for c in DROP_COLS if c in df.columns]
-    df_out = df.drop(drop_existing) if drop_existing else df
+    df_out = df
+
+    # Canonicalize VWAP naming if old _eur_mwh columns still exist.
+    if "afrr_vwap_pos" not in df_out.columns and "afrr_vwap_pos_eur_mwh" in df_out.columns:
+        df_out = df_out.with_columns(pl.col("afrr_vwap_pos_eur_mwh").alias("afrr_vwap_pos"))
+        LOGGER.info("Canonicalized afrr_vwap_pos from afrr_vwap_pos_eur_mwh")
+    if "afrr_vwap_neg" not in df_out.columns and "afrr_vwap_neg_eur_mwh" in df_out.columns:
+        df_out = df_out.with_columns(pl.col("afrr_vwap_neg_eur_mwh").alias("afrr_vwap_neg"))
+        LOGGER.info("Canonicalized afrr_vwap_neg from afrr_vwap_neg_eur_mwh")
+
+    drop_existing = [c for c in DROP_COLS if c in df_out.columns]
+    df_out = df_out.drop(drop_existing) if drop_existing else df_out
     LOGGER.info("Dropped %s redundant SMARD columns.", len(drop_existing))
     if drop_existing:
         LOGGER.info("Dropped columns: %s", drop_existing)
+
+    activation_drop_existing = [c for c in ACTIVATION_PRICE_DROP_COLS if c in df_out.columns]
+    if activation_drop_existing:
+        df_out = df_out.drop(activation_drop_existing)
+    LOGGER.info(
+        "Dropped %s non-canonical activation-price columns (kept afrr_vwap_pos/neg).",
+        len(activation_drop_existing),
+    )
+    if activation_drop_existing:
+        LOGGER.info("Dropped activation-price columns: %s", activation_drop_existing)
+
+    rate_drop_existing = [c for c in ACTIVATION_RATE_DROP_COLS if c in df_out.columns]
+    if rate_drop_existing:
+        df_out = df_out.drop(rate_drop_existing)
+    LOGGER.info(
+        "Dropped %s activation-rate columns for ML dataset.",
+        len(rate_drop_existing),
+    )
+    if rate_drop_existing:
+        LOGGER.info("Dropped activation-rate columns: %s", rate_drop_existing)
 
     exprs, added, _ = _build_feature_exprs(df_out)
     if exprs:
