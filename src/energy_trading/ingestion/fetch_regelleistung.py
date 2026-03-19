@@ -971,7 +971,6 @@ def _aggregate_hourly_with_vwap(df_15m: pd.DataFrame) -> pd.DataFrame:
         mean_price_pos = df_15m[price_pos].resample("1h").mean()
         vwap_pos = np.where(sum_vol_pos != 0, sum_weighted_pos / sum_vol_pos, mean_price_pos)
         hourly["afrr_vwap_pos"] = vwap_pos
-        hourly["afrr_vwap_pos_eur_mwh"] = vwap_pos
 
     if {"weighted_cost_neg", vol_neg, price_neg}.issubset(df_15m.columns):
         sum_weighted_neg = df_15m["weighted_cost_neg"].resample("1h").sum(min_count=1)
@@ -979,7 +978,6 @@ def _aggregate_hourly_with_vwap(df_15m: pd.DataFrame) -> pd.DataFrame:
         mean_price_neg = df_15m[price_neg].resample("1h").mean()
         vwap_neg = np.where(sum_vol_neg != 0, sum_weighted_neg / sum_vol_neg, mean_price_neg)
         hourly["afrr_vwap_neg"] = vwap_neg
-        hourly["afrr_vwap_neg_eur_mwh"] = vwap_neg
 
     return hourly.drop(columns=[c for c in ["weighted_cost_pos", "weighted_cost_neg"] if c in hourly.columns], errors="ignore")
 

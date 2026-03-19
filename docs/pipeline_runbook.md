@@ -142,8 +142,8 @@ From Regelleistung TSO aggregation:
 
 - `afrr_avg_activation_price_pos`
 - `afrr_avg_activation_price_neg`
-- `afrr_vwap_pos_eur_mwh`
-- `afrr_vwap_neg_eur_mwh`
+- `afrr_vwap_pos`
+- `afrr_vwap_neg`
 
 From anonymous bids (derived in `fetch_regelleistung.py`):
 

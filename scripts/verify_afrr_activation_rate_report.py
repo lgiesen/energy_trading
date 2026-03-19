@@ -172,10 +172,10 @@ def main() -> None:
         work_15m = work_15m.with_columns(pl.lit(None).cast(pl.Float64).alias("official_avg_price_15m"))
 
     top3 = (
-        df.select(["timestamp_utc", "afrr_vwap_pos_eur_mwh"])
+        df.select(["timestamp_utc", "afrr_vwap_pos"])
         .drop_nulls()
-        .filter(pl.col("afrr_vwap_pos_eur_mwh").is_finite())
-        .sort("afrr_vwap_pos_eur_mwh", descending=True)
+        .filter(pl.col("afrr_vwap_pos").is_finite())
+        .sort("afrr_vwap_pos", descending=True)
         .head(3)
     )
 
@@ -214,7 +214,7 @@ def main() -> None:
             {
                 "timestamp_utc": h,
                 "manual_vwap_from_15m": manual_vwap,
-                "pipeline_hourly_vwap": row["afrr_vwap_pos_eur_mwh"],
+                "pipeline_hourly_vwap": row["afrr_vwap_pos"],
                 "simple_mean_15m_price": vals["simple_mean_15m"],
                 "official_avg_price_hour": vals["official_avg_hour"],
             }
@@ -237,7 +237,7 @@ def main() -> None:
             [
                 "timestamp_utc",
                 pl.col("afrr_activation_rate_pos").cast(pl.Float64, strict=False).alias("rate"),
-                pl.col("afrr_vwap_pos_eur_mwh").cast(pl.Float64, strict=False).alias("vwap"),
+                pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False).alias("vwap"),
             ]
         )
         .drop_nulls()
@@ -289,11 +289,11 @@ def main() -> None:
                 pl.col("afrr_activated_mw_pos").cast(pl.Float64, strict=False),
                 pl.col(cap_col).cast(pl.Float64, strict=False).alias("afrr_capacity_awarded_mw_pos"),
                 pl.col("afrr_activation_rate_pos").cast(pl.Float64, strict=False),
-                pl.col("afrr_vwap_pos_eur_mwh").cast(pl.Float64, strict=False),
+                pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False),
             ]
         )
-        .drop_nulls(["afrr_vwap_pos_eur_mwh"])
-        .sort("afrr_vwap_pos_eur_mwh", descending=True)
+        .drop_nulls(["afrr_vwap_pos"])
+        .sort("afrr_vwap_pos", descending=True)
         .head(10)
     )
     sanity_path = out_dir / "afrr_sanity_top10_expensive_hours.csv"
@@ -309,17 +309,17 @@ def main() -> None:
                 [
                     "timestamp_utc",
                     pl.col(provider_col).cast(pl.Float64, strict=False).alias("provider_to_grid_share_pos"),
-                    pl.col("afrr_vwap_pos_eur_mwh").cast(pl.Float64, strict=False).alias("afrr_vwap_pos_eur_mwh"),
+                    pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False).alias("afrr_vwap_pos"),
                     pl.col("afrr_activation_rate_pos").cast(pl.Float64, strict=False).alias("afrr_activation_rate_pos"),
                 ]
             )
-            .drop_nulls(["provider_to_grid_share_pos", "afrr_vwap_pos_eur_mwh"])
+            .drop_nulls(["provider_to_grid_share_pos", "afrr_vwap_pos"])
             .filter(pl.col("provider_to_grid_share_pos") > 0.0)
             .sort("provider_to_grid_share_pos", descending=True)
             .head(5)
         )
         p2g.write_csv(provider_top5_path)
-        provider_warning_rows = p2g.filter(pl.col("afrr_vwap_pos_eur_mwh") > 0.0).height
+        provider_warning_rows = p2g.filter(pl.col("afrr_vwap_pos") > 0.0).height
     else:
         pl.DataFrame(
             {
@@ -357,7 +357,7 @@ def main() -> None:
         df.select(
             [
                 pl.col("afrr_activation_rate_pos").cast(pl.Float64, strict=False).alias("rate"),
-                pl.col("afrr_vwap_pos_eur_mwh").cast(pl.Float64, strict=False).alias("vwap"),
+                pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False).alias("vwap"),
             ]
         )
         .drop_nulls()
@@ -374,7 +374,7 @@ def main() -> None:
     fig = plt.figure(figsize=(8, 5))
     plt.scatter(plot_df["rate"], plot_df["vwap"], s=6, alpha=0.25)
     plt.xlabel("afrr_activation_rate_pos")
-    plt.ylabel("afrr_vwap_pos_eur_mwh")
+    plt.ylabel("afrr_vwap_pos")
     plt.title("aFRR Activation Rate vs VWAP (POS)")
     plt.grid(alpha=0.25)
     fig.tight_layout()
