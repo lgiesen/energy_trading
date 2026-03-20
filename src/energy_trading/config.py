@@ -25,7 +25,7 @@ BATTERY_SPECS = {
 
     # Costs
     "degradation_cost": 25.0,  # EUR/MWh internal throughput
-    "aux_power_mw": 0.02,  # AC-side house load (cooling/BMS/etc.)
+    "aux_power_mw": 0.2,  # AC-side house load (cooling/BMS/etc.)
 }
 BATTERY_SPECS["efficiency_rt"] = BATTERY_SPECS["efficiency_in"] * BATTERY_SPECS["efficiency_out"]
 
