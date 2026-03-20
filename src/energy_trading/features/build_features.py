@@ -49,6 +49,116 @@ DROP_FOR_MODEL = [
     "solar_capacity_source",
 ]
 
+DATA_IS_LAGGED = True
+
+
+def _lag_hours_for_column(col: str) -> int:
+    """Return lag (hours) for PiT alignment based on column semantics."""
+    if (
+        "_actual_entsoe" in col
+        or "generation_fossil_" in col
+        or col == "generation_nuclear_mw"
+        or "generation_hydro_" in col
+        or col == "residual_load_actual"
+        or col == "NRV_balance"
+        or col == "residual_load_calc"
+        or col == "wind_total_error_da"
+    ):
+        return 2
+    if (
+        "afrr_activated_mw" in col
+        or "afrr_activated_mwh" in col
+        or "mfrr_activated_mw" in col
+        or "mfrr_activated_mwh" in col
+        or "afrr_marginal_activation_price" in col
+        or "afrr_activation_marginal_price" in col
+        or "afrr_vwap" in col
+        or "reBAP_shortage_surplus" in col
+        or "afrr_picasso_mw" in col
+        or "price_intraday_eur" in col
+        or "afrr_picasso_net_mw" in col
+        or "mfrr_mari_net_mw" in col
+    ):
+        return 1
+    return 0
+
+
+def apply_point_in_time_lag_layer(df: pl.DataFrame) -> pl.DataFrame:
+    """Apply strict PiT publication lags to observation features.
+
+    Ground-truth target columns are protected and never lagged.
+    """
+    protected = {"timestamp_utc", "y_true_pos", "y_true_neg", "y_train_pos", "y_train_neg"}
+    exprs: list[pl.Expr] = []
+    lagged_cols = 0
+    for col in df.columns:
+        if col in protected:
+            continue
+        lag_h = _lag_hours_for_column(col)
+        if lag_h > 0:
+            exprs.append(pl.col(col).shift(lag_h).alias(col))
+            lagged_cols += 1
+    if exprs:
+        df = df.with_columns(exprs)
+    return df.with_columns([
+        pl.lit(DATA_IS_LAGGED).cast(pl.Boolean).alias("data_is_lagged"),
+        pl.lit(lagged_cols).cast(pl.Int32).alias("pit_lagged_column_count"),
+    ])
+
+
+def apply_day_ahead_forecast_availability(df: pl.DataFrame) -> pl.DataFrame:
+    """Apply conservative DA publication availability handling (13:00 Europe/Berlin).
+
+    For day-ahead forecast columns used in 72h sequence settings, enforce a
+    conservative availability rule:
+    - If the full horizon cannot be covered by currently available DA publications,
+      replace with persistence fallback (same hour previous day, `shift(24)`).
+
+    Note:
+    - Day-ahead market prices (e.g., `da_price_eur`, `da_price_*`) are intentionally
+      excluded and treated as strict T-0 features for the delivery day.
+    """
+    if "timestamp_utc" not in df.columns:
+        return df
+    forecast_cols = [c for c in df.columns if "forecast_da" in c]
+    if not forecast_cols:
+        return df
+
+    # Compute horizon visibility wrt next DA publication in local time (13:00 CET/CEST).
+    out = df.with_columns(
+        pl.col("timestamp_utc").dt.convert_time_zone("Europe/Berlin").dt.hour().alias("__local_hour")
+    ).with_columns(
+        pl.when(pl.col("__local_hour") < 13)
+        .then(13 - pl.col("__local_hour"))
+        .otherwise(37 - pl.col("__local_hour"))
+        .cast(pl.Int32)
+        .alias("__hours_to_next_da_pub")
+    ).with_columns(
+        (pl.col("__hours_to_next_da_pub") + 24).alias("__known_horizon_hours")
+    )
+    exprs: list[pl.Expr] = []
+    for c in forecast_cols:
+        # Persistence fallback for same hour previous day (hourly data).
+        exprs.append(
+            pl.when(pl.col("__known_horizon_hours") < 72)
+            .then(pl.col(c).shift(24))
+            .otherwise(pl.col(c))
+            .forward_fill()
+            .alias(c)
+        )
+    return out.with_columns(exprs).drop("__local_hour", "__hours_to_next_da_pub", "__known_horizon_hours")
+
+
+def add_multi_output_targets(df: pl.DataFrame, horizon_hours: int = 72) -> pl.DataFrame:
+    """Create direct multi-output target columns for +1h..+72h."""
+    if "y_true_pos" not in df.columns or "y_true_neg" not in df.columns:
+        return df
+    exprs: list[pl.Expr] = []
+    for h in range(1, horizon_hours + 1):
+        exprs.append(pl.col("y_true_pos").shift(-h).alias(f"target_pos_h{h}"))
+        exprs.append(pl.col("y_true_neg").shift(-h).alias(f"target_neg_h{h}"))
+    return df.with_columns(exprs)
+
 
 def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     """Create pay-as-cleared targets for both economics and ML.
@@ -334,9 +444,25 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
         "wind_ramp",
         "residual_load_forecast",
     ]
+    # Additional rolling windows requested for key series.
+    extra_rolling_specs = [
+        ("load_actual_entsoe", "load_actual_entsoe"),
+        ("da_price_eur", "da_price_eur"),
+        ("wind_onshore_actual_entsoe", "wind_onshore_actual_entsoe"),
+    ]
+    for col_name, prefix in extra_rolling_specs:
+        if col_name in df.columns:
+            df = df.with_columns([
+                pl.col(col_name).cast(pl.Float64).rolling_mean(window_size=24, min_samples=1).alias(f"{prefix}_mean_24h"),
+                pl.col(col_name).cast(pl.Float64).rolling_std(window_size=24, min_samples=2).alias(f"{prefix}_std_24h"),
+                pl.col(col_name).cast(pl.Float64).rolling_mean(window_size=168, min_samples=1).alias(f"{prefix}_mean_168h"),
+                pl.col(col_name).cast(pl.Float64).rolling_std(window_size=168, min_samples=2).alias(f"{prefix}_std_168h"),
+            ])
+
     fill_cols = [c for c in fill_cols if c in df.columns]
     if fill_cols:
-        df = df.with_columns([pl.col(c).fill_null(strategy="backward").alias(c) for c in fill_cols])
+        # Never backfill from the future in a PiT feature set.
+        df = df.with_columns([pl.col(c).fill_null(strategy="forward").alias(c) for c in fill_cols])
 
     return df
 
@@ -374,7 +500,6 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
             "afrr_vwap_pos",
             "afrr_avg_activation_price_pos",
             "afrr_bid_vwap_activation_price_pos",
-            "y_true_pos",
         )
     )
     intraday_col = _first_existing(
@@ -525,7 +650,7 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     - `market_regime_picasso`: 0 before 2022-06-22 UTC, 1 from 2022-06-22 UTC onward
 
     Notes:
-    - Lag steps are derived from data frequency: 1 step for hourly, 4 for 15-min.
+    - Inputs may already be globally lagged by the PiT layer.
     - Rolling windows use a 24h horizon in row-count space based on inferred frequency.
     - Early-window NaNs are handled by safe defaults (mostly 0.0) for model robustness.
     """
@@ -536,7 +661,7 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     pdf["timestamp_utc"] = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
     pdf = pdf.sort_values("timestamp_utc").reset_index(drop=True)
 
-    # Infer sampling frequency to set leakage-safe lag.
+    # Infer sampling frequency for rolling-window sizing.
     diffs = pdf["timestamp_utc"].dropna().diff().dropna()
     if len(diffs) == 0:
         step_seconds = 3600.0
@@ -545,15 +670,15 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
         if not np.isfinite(step_seconds) or step_seconds <= 0:
             step_seconds = 3600.0
     steps_per_hour = max(1, int(round(3600.0 / step_seconds)))
-    lag_steps = 4 if steps_per_hour >= 4 else 1
     window_24h = max(1, 24 * steps_per_hour)
 
-    # 1) mFRR activity lag (prefer MWh, fallback to MW).
+    # 1) mFRR activity feature. Do not apply an additional lag here:
+    # base activation columns are already shifted by PiT layer where configured.
     mfrr_pos = "mfrr_activated_mwh_pos" if "mfrr_activated_mwh_pos" in pdf.columns else "mfrr_activated_mw_pos"
     mfrr_neg = "mfrr_activated_mwh_neg" if "mfrr_activated_mwh_neg" in pdf.columns else "mfrr_activated_mw_neg"
     if mfrr_pos in pdf.columns and mfrr_neg in pdf.columns:
         active = ((pdf[mfrr_pos].fillna(0.0) > 0.0) | (pdf[mfrr_neg].fillna(0.0) > 0.0)).astype(int)
-        pdf["mfrr_active_lag"] = active.shift(lag_steps).fillna(0).astype(int)
+        pdf["mfrr_active_lag"] = active.fillna(0).astype(int)
     else:
         pdf["mfrr_active_lag"] = 0
 
@@ -752,11 +877,15 @@ def build_features(input_path: Path, output_path: Path) -> None:
         df = df.sort("timestamp_utc")
 
     df = engineer_targets(df)
+    # Lag-first architecture for all observation-side features.
+    df = apply_point_in_time_lag_layer(df)
+    df = apply_day_ahead_forecast_availability(df)
     df = add_confidence_features(df)
     df = add_german_holiday_features(df)
     df = add_market_regime_features(df)
     df = add_price_offering_features(df)
     df = add_aggregated_and_cluster_features(df)
+    df = add_multi_output_targets(df, horizon_hours=72)
 
     # Optional: generic time features for user-centric datasets.
     # For this thesis pipeline, many datasets are system-level and may not include user_id.
@@ -776,8 +905,8 @@ def main() -> None:
     parser.add_argument(
         "--in",
         dest="input_path",
-        default="data/processed/all_data_transformed.parquet",
-        help="Input parquet (default: data/processed/all_data_transformed.parquet).",
+        default="data/processed/all_data_refined.parquet",
+        help="Input parquet (default: data/processed/all_data_refined.parquet).",
     )
     parser.add_argument(
         "--out",
