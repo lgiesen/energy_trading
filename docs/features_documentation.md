@@ -26,13 +26,14 @@ considered available for a prediction made at decision time `T`.
 |---|---|---|
 | ENTSO-E actuals and derived actual-based signals (`residual_load_calc`, `wind_total_error_da`) | finalized at `T-2h` | Values from `(T-2h, T]` are not visible to the model at `T`. |
 | Balancing/settlement streams (aFRR/mFRR activation and settlement-price proxies) | finalized at `T-1h` | The most recent hour is withheld to reflect settlement/operational delay. |
-| Day-ahead forecasts (`*_forecast_da*`) for sequence settings | publication-constrained by 13:00 Europe/Berlin and forecast horizon | If required horizon exceeds known publication coverage, a persistence fallback (`shift(24)`) is used. |
+| Day-ahead forecasts (`*_forecast_da*`) for sequence settings | publication-constrained by 13:00 Europe/Berlin and forecast horizon | Base/current-hour DA forecast columns are strict T-0. Publication gating with persistence fallback (`shift(24)`) is applied only to explicit future-horizon forecast columns (for example `*_forecast_da_*_h48`). |
 | Day-ahead market prices (`da_price_eur`, `da_price_*`) | finalized at `T` for delivery-day usage | Treated as strict T-0 in the feature layer (no publication gating). |
 | Calendar/metadata/capacity | finalized at `T` | No publication lag applied in the feature layer. |
 
 Additional availability handling:
-- Day-ahead forecast columns are aligned with a conservative 13:00 Europe/Berlin publication cutoff.
-- For 72h sequence contexts (D+3), DA forecasts that are not yet publishable at decision time use persistence fallback (same hour previous day).
+- Day-ahead forecast publication gates are evaluated at 13:00 Europe/Berlin on D-1 of the target delivery day (DST-aware via timezone conversion).
+- Base/current-hour DA forecast columns remain strict T-0 and are not publication-gated.
+- For 72h sequence contexts (D+3), only explicit future-horizon DA forecast columns are gated; unavailable horizons use persistence fallback (same hour previous day).
 - Day-ahead price columns are not gated and remain strict T-0 for delivery-day feature usage.
 - Missing values from lagging and long windows are never backfilled from future rows.
 - Ground truth (`y_true_pos`, `y_true_neg`) is not lagged. Multi-output targets are created by future shifting (`target_pos_h1..h72`, `target_neg_h1..h72`).
@@ -111,9 +112,12 @@ Tolerance:
 - Boundary NaNs are ignored through overlap-only comparisons.
 
 Special D+3 forecast availability audit:
-- Forecast columns are checked against a publication-aware expected series
-  (13:00 Europe/Berlin DA publication gate with persistence fallback `shift(24)`).
-- Additional anti-look-ahead check ensures gated rows do not collapse to raw future-truth values when informative differences exist.
+- Base DA forecast columns are asserted as strict T-0 overlap.
+- Explicit future-horizon DA forecast columns (if present) are checked against a
+  publication-aware expected series (13:00 Europe/Berlin D-1 gate with
+  persistence fallback `shift(24)`).
+- Additional anti-look-ahead checks verify gated rows do not collapse to raw
+  future-truth values when informative differences exist.
 
 Latest audited outcome (executed on March 20, 2026):
 - `da_price_eur` strict T-0 check: **PASS** (`max_abs_error = 0.0`)
