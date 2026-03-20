@@ -54,6 +54,27 @@ def main() -> None:
         help="Features parquet output.",
     )
     parser.add_argument(
+        "--outages-hourly-out",
+        default="data/processed/outages_hourly.parquet",
+        help="Hourly outages parquet output (sidecar feature table).",
+    )
+    parser.add_argument(
+        "--planned-outages-in",
+        default="data/raw/entsoe_outages/planned_generation_outages.parquet",
+        help="Planned outages parquet input.",
+    )
+    parser.add_argument(
+        "--unplanned-outages-in",
+        default="data/raw/entsoe_outages/unplanned_generation_outages.parquet",
+        help="Unplanned outages parquet input.",
+    )
+    parser.add_argument(
+        "--outages-days-ahead",
+        type=int,
+        default=7,
+        help="Forecast horizon for outages hourly transform (default: 7 days).",
+    )
+    parser.add_argument(
         "--clip-start",
         default="2020-11-30T23:00:00Z",
         help="Clip start (timezone-aware recommended, UTC Z).",
@@ -78,6 +99,11 @@ def main() -> None:
         action="store_true",
         help="Stop after transform step.",
     )
+    parser.add_argument(
+        "--skip-outages-hourly",
+        action="store_true",
+        help="Skip sidecar transform of ENTSO-E outages to hourly table.",
+    )
     args = parser.parse_args()
 
     py = sys.executable
@@ -86,6 +112,7 @@ def main() -> None:
     Path(args.clean_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.transformed_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.features_out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.outages_hourly_out).parent.mkdir(parents=True, exist_ok=True)
 
     # 1) Merge collected raw files.
     merge_cmd = [
@@ -164,6 +191,33 @@ def main() -> None:
             args.features_out,
         ]
     )
+
+    # 6) Build sidecar hourly outage features (if raw outage files are available).
+    if not args.skip_outages_hourly:
+        planned_path = Path(args.planned_outages_in)
+        unplanned_path = Path(args.unplanned_outages_in)
+        if planned_path.exists() and unplanned_path.exists():
+            outage_transform = Path(__file__).with_name("transform_entsoe_outages_hourly.py")
+            _run(
+                [
+                    py,
+                    str(outage_transform),
+                    "--planned",
+                    str(planned_path),
+                    "--unplanned",
+                    str(unplanned_path),
+                    "--out",
+                    args.outages_hourly_out,
+                    "--days-ahead",
+                    str(args.outages_days_ahead),
+                ]
+            )
+        else:
+            LOGGER.warning(
+                "Skipping outages-hourly transform: missing input files (%s, %s).",
+                planned_path,
+                unplanned_path,
+            )
 
     LOGGER.info("Post-collection pipeline completed.")
 
