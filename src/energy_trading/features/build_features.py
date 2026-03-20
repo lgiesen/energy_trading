@@ -64,6 +64,8 @@ def _lag_hours_for_column(col: str) -> int:
         or col == "NRV_balance"
         or col == "residual_load_calc"
         or col == "wind_total_error_da"
+        or col == "planned_outages_mw"
+        or col == "unplanned_outages_mw"
     ):
         return 2
     if (
@@ -1062,12 +1064,51 @@ def run_feature_sanity_checks(df_features: pd.DataFrame | pl.DataFrame) -> None:
     assert err_e <= 1e-12, f"Test E failed: max_abs_error={err_e}"
 
 
+def merge_outages_sidecar(
+    df: pl.DataFrame,
+    outages_path: Path | None = None,
+) -> pl.DataFrame:
+    """Left-join outage sidecar onto main table in a causally safe way."""
+    if outages_path is None:
+        outages_path = Path("data/processed/outages_hourly.parquet")
+    if "timestamp_utc" not in df.columns:
+        return df
+    if not outages_path.exists():
+        return df.with_columns([
+            pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
+            pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
+        ])
+
+    outages = pl.read_parquet(outages_path)
+    if "timestamp_utc" not in outages.columns and "timestamp" in outages.columns:
+        outages = outages.rename({"timestamp": "timestamp_utc"})
+    if "timestamp_utc" not in outages.columns:
+        return df.with_columns([
+            pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
+            pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
+        ])
+
+    keep_cols = ["timestamp_utc", "planned_outages_mw", "unplanned_outages_mw"]
+    keep_cols = [c for c in keep_cols if c in outages.columns]
+    outages = outages.select(keep_cols)
+
+    merged = df.join(outages, on="timestamp_utc", how="left")
+    for c in ("planned_outages_mw", "unplanned_outages_mw"):
+        if c in merged.columns:
+            merged = merged.with_columns(pl.col(c).cast(pl.Float64).fill_null(0.0).alias(c))
+        else:
+            merged = merged.with_columns(pl.lit(0.0).cast(pl.Float64).alias(c))
+    return merged
+
+
 def build_features(input_path: Path, output_path: Path) -> None:
     """Build ML features from transformed parquet."""
     # --- STEP 1: Load Data ---
     df = pl.read_parquet(input_path)
     if "timestamp_utc" in df.columns:
         df = df.sort("timestamp_utc")
+    # Merge outage sidecar before causal lag layer; missing means no outage.
+    df = merge_outages_sidecar(df, outages_path=Path("data/processed/outages_hourly.parquet"))
 
     # Ground-truth target engineering is intentionally performed on raw market
     # observations. `y_true_*` must remain unlagged economic truth.
