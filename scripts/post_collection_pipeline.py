@@ -179,20 +179,8 @@ def main() -> None:
         LOGGER.info("Stopping after transform (--skip-features).")
         return
 
-    # 5) Build features.
-    _run(
-        [
-            py,
-            "-m",
-            "energy_trading.features.build_features",
-            "--in",
-            args.transformed_out,
-            "--out",
-            args.features_out,
-        ]
-    )
-
-    # 6) Build sidecar hourly outage features (if raw outage files are available).
+    # 5) Build sidecar hourly outage features (if raw outage files are available).
+    # This must happen before feature construction so outages can be merged safely.
     if not args.skip_outages_hourly:
         planned_path = Path(args.planned_outages_in)
         unplanned_path = Path(args.unplanned_outages_in)
@@ -218,6 +206,19 @@ def main() -> None:
                 planned_path,
                 unplanned_path,
             )
+
+    # 6) Build features.
+    _run(
+        [
+            py,
+            "-m",
+            "energy_trading.features.build_features",
+            "--in",
+            args.transformed_out,
+            "--out",
+            args.features_out,
+        ]
+    )
 
     LOGGER.info("Post-collection pipeline completed.")
 
