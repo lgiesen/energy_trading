@@ -10,6 +10,7 @@ Outputs:
         timestamp_utc,
         load_actual_entsoe, load_forecast_da_entsoe,
         wind_onshore_actual_entsoe, wind_offshore_actual_entsoe, solar_actual_entsoe,
+        biomass_actual_entsoe, hydro_ror_actual_entsoe, hydro_reservoir_actual_entsoe, hydro_pumped_actual_entsoe,
         wind_onshore_forecast_da_entsoe, wind_offshore_forecast_da_entsoe, solar_forecast_da_entsoe,
         wind_onshore_forecast_id_entsoe, wind_offshore_forecast_id_entsoe, solar_forecast_id_entsoe,
         wind_onshore_capacity_entsoe, wind_offshore_capacity_entsoe
@@ -45,6 +46,10 @@ BIDDING_ZONE = DE_LU_BIDDING_ZONE_CODE
 WIND_SOLAR_COLS = ["Wind Onshore", "Wind Offshore", "Solar"]
 PSR_WIND_ONSHORE = "B19"
 PSR_WIND_OFFSHORE = "B18"
+PSR_BIOMASS = "B01"
+PSR_HYDRO_PUMPED = "B10"
+PSR_HYDRO_ROR = "B11"
+PSR_HYDRO_RESERVOIR = "B12"
 
 
 def _parse_utc(ts: str) -> pd.Timestamp:
@@ -137,15 +142,35 @@ def _select_generation_actuals(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     if isinstance(df.columns, pd.MultiIndex):
-        want = [("Wind Onshore", "Actual Aggregated"),
-                ("Wind Offshore", "Actual Aggregated"),
-                ("Solar", "Actual Aggregated")]
+        hydro_ror_labels = [
+            "Hydro Run-of-River and poundage",
+            "Hydro Run-of-river and poundage",
+            "Hydro Run-of-River and pondage",
+            "Hydro Run-of-river and pondage",
+        ]
+        want = [
+            ("Wind Onshore", "Actual Aggregated"),
+            ("Wind Offshore", "Actual Aggregated"),
+            ("Solar", "Actual Aggregated"),
+            ("Biomass", "Actual Aggregated"),
+            ("Hydro Water Reservoir", "Actual Aggregated"),
+            ("Hydro Pumped Storage", "Actual Aggregated"),
+            ("Other storage", "Actual Aggregated"),
+        ]
+        want += [(lbl, "Actual Aggregated") for lbl in hydro_ror_labels]
         cols = [c for c in want if c in df.columns]
         if not cols:
             # Fallback if only consumption is available.
-            want = [("Wind Onshore", "Actual Consumption"),
-                    ("Wind Offshore", "Actual Consumption"),
-                    ("Solar", "Actual Consumption")]
+            want = [
+                ("Wind Onshore", "Actual Consumption"),
+                ("Wind Offshore", "Actual Consumption"),
+                ("Solar", "Actual Consumption"),
+                ("Biomass", "Actual Consumption"),
+                ("Hydro Water Reservoir", "Actual Consumption"),
+                ("Hydro Pumped Storage", "Actual Consumption"),
+                ("Other storage", "Actual Consumption"),
+            ]
+            want += [(lbl, "Actual Consumption") for lbl in hydro_ror_labels]
             cols = [c for c in want if c in df.columns]
         return df[cols] if cols else df.iloc[0:0]
 
@@ -158,6 +183,11 @@ def _select_generation_actuals(df: pd.DataFrame) -> pd.DataFrame:
         _pick("Wind Onshore", "Actual Aggregated"),
         _pick("Wind Offshore", "Actual Aggregated"),
         _pick("Solar", "Actual Aggregated"),
+        _pick("Biomass", "Actual Aggregated"),
+        _pick("Hydro Run-of-River and poundage", "Actual Aggregated"),
+        _pick("Hydro Water Reservoir", "Actual Aggregated"),
+        _pick("Hydro Pumped Storage", "Actual Aggregated"),
+        _pick("Other storage", "Actual Aggregated"),
     ]
     cols = [c for c in cols if c is not None]
     if not cols:
@@ -165,6 +195,11 @@ def _select_generation_actuals(df: pd.DataFrame) -> pd.DataFrame:
             _pick("Wind Onshore", "Actual Consumption"),
             _pick("Wind Offshore", "Actual Consumption"),
             _pick("Solar", "Actual Consumption"),
+            _pick("Biomass", "Actual Consumption"),
+            _pick("Hydro Run-of-River and poundage", "Actual Consumption"),
+            _pick("Hydro Water Reservoir", "Actual Consumption"),
+            _pick("Hydro Pumped Storage", "Actual Consumption"),
+            _pick("Other storage", "Actual Consumption"),
         ]
         cols = [c for c in cols if c is not None]
     return df[cols] if cols else df.iloc[0:0]
@@ -175,13 +210,28 @@ def _rename_actual_cols(df: pd.DataFrame) -> pd.DataFrame:
         "Wind Offshore": "wind_offshore_actual_entsoe",
         "Wind Onshore": "wind_onshore_actual_entsoe",
         "Solar": "solar_actual_entsoe",
+        "Biomass": "biomass_actual_entsoe",
+        "Hydro Run-of-River and poundage": "hydro_ror_actual_entsoe",
+        "Hydro Water Reservoir": "hydro_reservoir_actual_entsoe",
+        "Hydro Pumped Storage": "hydro_pumped_actual_entsoe",
+        "Other storage": "hydro_pumped_actual_entsoe",
     }
     if isinstance(df.columns, pd.MultiIndex):
-        cols = {}
-        for (psr, kind) in df.columns:
-            if psr in mapping:
-                cols[(psr, kind)] = mapping[psr]
-        return df.rename(columns=cols)
+        # Pandas MultiIndex rename with tuple-keys can be unreliable across versions.
+        # Build a flat single-level column index explicitly.
+        new_cols = []
+        for (psr, _kind) in df.columns:
+            psr_str = str(psr)
+            psr_low = psr_str.lower()
+            if psr_str in mapping:
+                new_cols.append(mapping[psr_str])
+            elif "run-of-river" in psr_low and ("poundage" in psr_low or "pondage" in psr_low):
+                new_cols.append("hydro_ror_actual_entsoe")
+            else:
+                new_cols.append(psr_str)
+        out = df.copy()
+        out.columns = new_cols
+        return out
 
     # Stringified tuple columns.
     str_map = {
@@ -191,6 +241,16 @@ def _rename_actual_cols(df: pd.DataFrame) -> pd.DataFrame:
         "('Wind Offshore', 'Actual Consumption')": "wind_offshore_actual_entsoe",
         "('Wind Onshore', 'Actual Consumption')": "wind_onshore_actual_entsoe",
         "('Solar', 'Actual Consumption')": "solar_actual_entsoe",
+        "('Biomass', 'Actual Aggregated')": "biomass_actual_entsoe",
+        "('Biomass', 'Actual Consumption')": "biomass_actual_entsoe",
+        "('Hydro Run-of-River and poundage', 'Actual Aggregated')": "hydro_ror_actual_entsoe",
+        "('Hydro Run-of-River and poundage', 'Actual Consumption')": "hydro_ror_actual_entsoe",
+        "('Hydro Water Reservoir', 'Actual Aggregated')": "hydro_reservoir_actual_entsoe",
+        "('Hydro Water Reservoir', 'Actual Consumption')": "hydro_reservoir_actual_entsoe",
+        "('Hydro Pumped Storage', 'Actual Aggregated')": "hydro_pumped_actual_entsoe",
+        "('Hydro Pumped Storage', 'Actual Consumption')": "hydro_pumped_actual_entsoe",
+        "('Other storage', 'Actual Aggregated')": "hydro_pumped_actual_entsoe",
+        "('Other storage', 'Actual Consumption')": "hydro_pumped_actual_entsoe",
     }
     cols = {c: str_map[c] for c in df.columns if c in str_map}
     if cols:
@@ -202,12 +262,21 @@ def _rename_actual_cols(df: pd.DataFrame) -> pd.DataFrame:
         s = str(c)
         if "Actual" not in s:
             continue
+        s_low = s.lower()
         if "Wind Onshore" in s:
             fallback[c] = "wind_onshore_actual_entsoe"
         elif "Wind Offshore" in s:
             fallback[c] = "wind_offshore_actual_entsoe"
         elif "Solar" in s:
             fallback[c] = "solar_actual_entsoe"
+        elif "Biomass" in s:
+            fallback[c] = "biomass_actual_entsoe"
+        elif "run-of-river" in s_low and ("poundage" in s_low or "pondage" in s_low):
+            fallback[c] = "hydro_ror_actual_entsoe"
+        elif "Hydro Water Reservoir" in s:
+            fallback[c] = "hydro_reservoir_actual_entsoe"
+        elif "Hydro Pumped Storage" in s or "Other storage" in s:
+            fallback[c] = "hydro_pumped_actual_entsoe"
     if fallback:
         return df.rename(columns=fallback)
 
@@ -228,19 +297,52 @@ def _rename_forecast_cols(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
 def _fetch_actuals(
     client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timestamp
 ) -> pd.DataFrame | None:
-    try:
-        actuals = _retry(lambda: client.query_generation(DE_PHYSICAL_CONTROL_CODE, start=start, end=end))
-    except Exception as exc:  # pragma: no cover - network errors
-        LOGGER.warning("Actual generation failed: %s", exc)
-        return None
+    target_cols = [
+        "wind_onshore_actual_entsoe",
+        "wind_offshore_actual_entsoe",
+        "solar_actual_entsoe",
+        "biomass_actual_entsoe",
+        "hydro_ror_actual_entsoe",
+        "hydro_reservoir_actual_entsoe",
+        "hydro_pumped_actual_entsoe",
+    ]
+    area_candidates = [DE_LU_BIDDING_ZONE_CODE, DE_PHYSICAL_CONTROL_CODE]
+    combined: pd.DataFrame | None = None
+    for area in area_candidates:
+        try:
+            actuals = _retry(lambda: client.query_generation(area, start=start, end=end))
+        except Exception as exc:  # pragma: no cover - network errors
+            LOGGER.warning("Actual generation failed for area %s: %s", area, exc)
+            continue
 
-    if actuals is None or len(actuals) == 0:
-        return None
+        if actuals is None or len(actuals) == 0:
+            continue
 
-    actuals = _ensure_utc_index(actuals)
-    actuals = _select_generation_actuals(actuals)
-    actuals = _rename_actual_cols(actuals)
-    return _resample_hourly(actuals)
+        actuals = _ensure_utc_index(actuals)
+        actuals = _select_generation_actuals(actuals)
+        actuals = _rename_actual_cols(actuals)
+        if actuals is None or len(actuals) == 0:
+            continue
+        actuals = _resample_hourly(actuals)
+
+        if combined is None:
+            combined = actuals
+        else:
+            combined = combined.combine_first(actuals)
+
+        missing = [
+            c
+            for c in target_cols
+            if c not in combined.columns or combined[c].notna().sum() == 0
+        ]
+        if not missing:
+            break
+        LOGGER.info(
+            "Actual generation area %s merged; still missing columns: %s",
+            area,
+            missing,
+        )
+    return combined
 
 
 def _fetch_forecast(
@@ -250,23 +352,33 @@ def _fetch_forecast(
     process_type: str,
     suffix: str,
 ) -> pd.DataFrame | None:
-    try:
-        forecast = _retry(
-            lambda: client.query_wind_and_solar_forecast(
-                DE_PHYSICAL_CONTROL_CODE, start=start, end=end, process_type=process_type
+    area_candidates = [DE_LU_BIDDING_ZONE_CODE, DE_PHYSICAL_CONTROL_CODE]
+    for area in area_candidates:
+        try:
+            forecast = _retry(
+                lambda: client.query_wind_and_solar_forecast(
+                    area, start=start, end=end, process_type=process_type
+                )
             )
-        )
-    except Exception as exc:  # pragma: no cover - network errors
-        LOGGER.warning("Wind/solar forecast %s failed: %s", process_type, exc)
-        return None
+        except Exception as exc:  # pragma: no cover - network errors
+            LOGGER.warning(
+                "Wind/solar forecast %s failed for area %s: %s",
+                process_type,
+                area,
+                exc,
+            )
+            continue
 
-    if forecast is None or len(forecast) == 0:
-        return None
+        if forecast is None or len(forecast) == 0:
+            continue
 
-    forecast = _ensure_utc_index(forecast)
-    forecast = _select_wind_solar(forecast)
-    forecast = _rename_forecast_cols(forecast, suffix)
-    return _resample_hourly(forecast)
+        forecast = _ensure_utc_index(forecast)
+        forecast = _select_wind_solar(forecast)
+        if forecast is None or len(forecast) == 0:
+            continue
+        forecast = _rename_forecast_cols(forecast, suffix)
+        return _resample_hourly(forecast)
+    return None
 
 
 def _fetch_load_actual(
@@ -449,18 +561,38 @@ def fetch_chunk(client: EntsoePandasClient, start: pd.Timestamp, end: pd.Timesta
             "('Wind Onshore', 'Actual Consumption')": "wind_onshore_actual_entsoe",
             "('Wind Offshore', 'Actual Consumption')": "wind_offshore_actual_entsoe",
             "('Solar', 'Actual Consumption')": "solar_actual_entsoe",
+            "('Biomass', 'Actual Aggregated')": "biomass_actual_entsoe",
+            "('Biomass', 'Actual Consumption')": "biomass_actual_entsoe",
+            "('Hydro Run-of-River and poundage', 'Actual Aggregated')": "hydro_ror_actual_entsoe",
+            "('Hydro Run-of-River and poundage', 'Actual Consumption')": "hydro_ror_actual_entsoe",
+            "('Hydro Water Reservoir', 'Actual Aggregated')": "hydro_reservoir_actual_entsoe",
+            "('Hydro Water Reservoir', 'Actual Consumption')": "hydro_reservoir_actual_entsoe",
+            "('Hydro Pumped Storage', 'Actual Aggregated')": "hydro_pumped_actual_entsoe",
+            "('Hydro Pumped Storage', 'Actual Consumption')": "hydro_pumped_actual_entsoe",
+            "('Other storage', 'Actual Aggregated')": "hydro_pumped_actual_entsoe",
+            "('Other storage', 'Actual Consumption')": "hydro_pumped_actual_entsoe",
         }
         df = df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map})
         # Handle tuple columns directly if present.
         tuple_map = {}
         for c in df.columns:
             if isinstance(c, tuple) and len(c) >= 2 and "Actual" in c[1]:
+                psr = str(c[0])
+                psr_low = psr.lower()
                 if "Wind Onshore" in c[0]:
                     tuple_map[c] = "wind_onshore_actual_entsoe"
                 elif "Wind Offshore" in c[0]:
                     tuple_map[c] = "wind_offshore_actual_entsoe"
                 elif "Solar" in c[0]:
                     tuple_map[c] = "solar_actual_entsoe"
+                elif "Biomass" in c[0]:
+                    tuple_map[c] = "biomass_actual_entsoe"
+                elif "run-of-river" in psr_low and ("poundage" in psr_low or "pondage" in psr_low):
+                    tuple_map[c] = "hydro_ror_actual_entsoe"
+                elif "Hydro Water Reservoir" in c[0]:
+                    tuple_map[c] = "hydro_reservoir_actual_entsoe"
+                elif "Hydro Pumped Storage" in c[0] or "Other storage" in c[0]:
+                    tuple_map[c] = "hydro_pumped_actual_entsoe"
         if tuple_map:
             df = df.rename(columns=tuple_map)
     else:
