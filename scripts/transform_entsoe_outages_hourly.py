@@ -56,6 +56,20 @@ def _load_outages(path: Path) -> pd.DataFrame:
     return df
 
 
+def _apply_unplanned_persistence_window(events: pd.DataFrame, hours: int = 24) -> pd.DataFrame:
+    """Replace ex-post unplanned `end` with causal persistence window.
+
+    For unplanned outages, the historical `end` is often revised retroactively.
+    Using it directly leaks future repair information. We therefore define:
+      synthetic_end = start + hours
+    """
+    if events.empty:
+        return events
+    out = events.copy()
+    out["end"] = out["start"] + pd.Timedelta(hours=hours)
+    return out
+
+
 def _build_hourly_outage_series(
     events: pd.DataFrame,
     range_start: pd.Timestamp,
@@ -114,7 +128,9 @@ def transform_outages_hourly(
     hourly_index = pd.date_range(range_start, range_end, freq="1h", inclusive="left", tz="UTC")
 
     planned = _load_outages(planned_path)
-    unplanned = _load_outages(unplanned_path)
+    unplanned_raw = _load_outages(unplanned_path)
+    # Causal safety: ignore retroactively known repair time for unplanned outages.
+    unplanned = _apply_unplanned_persistence_window(unplanned_raw, hours=24)
 
     planned_series = _build_hourly_outage_series(planned, range_start, range_end, hourly_index)
     unplanned_series = _build_hourly_outage_series(unplanned, range_start, range_end, hourly_index)
