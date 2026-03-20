@@ -341,6 +341,179 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Add price/opportunity features for activation-price and capacity-price modeling.
+
+    Features:
+    - afrr_id_price_spread = afrr_activation_price - intraday_price_da
+    - relative_price_competitiveness = afrr_activation_price / rolling_mean_24h(shifted)
+    - price_volatility_short_term = rolling_std_4h(shifted afrr_activation_price)
+    - scarcity_price_premium = afrr_activation_price * grid_stress_index
+
+    Notes:
+    - Uses time-based rolling windows (`24h`, `4h`) in pandas.
+    - Leakage-safe rolling stats via `shift(1)` before rolling.
+    - NaNs are forward-filled then zero-filled for robustness.
+    """
+    if "timestamp_utc" not in df.columns:
+        return df
+
+    pdf = df.to_pandas()
+    pdf["timestamp_utc"] = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
+    pdf = pdf.sort_values("timestamp_utc").reset_index(drop=True)
+
+    def _first_existing(candidates: tuple[str, ...]) -> str | None:
+        for c in candidates:
+            if c in pdf.columns:
+                return c
+        return None
+
+    afrr_price_col = _first_existing(
+        (
+            "afrr_activation_price",
+            "afrr_vwap_pos",
+            "afrr_avg_activation_price_pos",
+            "afrr_bid_vwap_activation_price_pos",
+            "y_true_pos",
+        )
+    )
+    intraday_col = _first_existing(
+        (
+            "intraday_price_da",
+            "price_intraday_eur",
+            "da_price_eur",
+        )
+    )
+
+    if afrr_price_col is None:
+        return df
+
+    p = pd.to_numeric(pdf[afrr_price_col], errors="coerce")
+    # Use DatetimeIndex for offset-based rolling windows.
+    p_indexed = p.copy()
+    p_indexed.index = pdf["timestamp_utc"]
+
+    # 1) Cross-market spread.
+    if intraday_col is not None:
+        p_id = pd.to_numeric(pdf[intraday_col], errors="coerce")
+        pdf["afrr_id_price_spread"] = p - p_id
+    else:
+        pdf["afrr_id_price_spread"] = np.nan
+
+    # 2) Relative price competitiveness with leakage-safe rolling mean.
+    roll_mean_24h = p_indexed.shift(1).rolling("24h", min_periods=1).mean()
+    denom = roll_mean_24h.reindex(pdf["timestamp_utc"]).to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = p.to_numpy() / denom
+    pdf["relative_price_competitiveness"] = rel
+
+    # 3) Short-term price volatility (4h), leakage-safe.
+    roll_std_4h = p_indexed.shift(1).rolling("4h", min_periods=2).std(ddof=0)
+    pdf["price_volatility_short_term"] = roll_std_4h.reindex(pdf["timestamp_utc"]).to_numpy()
+
+    # 4) Scarcity interaction premium.
+    if "grid_stress_index" in pdf.columns:
+        gsi = pd.to_numeric(pdf["grid_stress_index"], errors="coerce")
+        pdf["scarcity_price_premium"] = p * gsi
+    else:
+        pdf["scarcity_price_premium"] = np.nan
+
+    # Robust missing handling.
+    for c in (
+        "afrr_id_price_spread",
+        "relative_price_competitiveness",
+        "price_volatility_short_term",
+        "scarcity_price_premium",
+    ):
+        pdf[c] = pd.to_numeric(pdf[c], errors="coerce").ffill().fillna(0.0)
+
+    return pl.from_pandas(pdf)
+
+
+def add_aggregated_and_cluster_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Add aggregated target-encoding and market-state clustering features.
+
+    Created features:
+    - TE_hour_regime_activation
+    - market_state_cluster
+    - nrv_quantile_5
+
+    Leakage control:
+    - Target encoding uses `shift(1)` + `expanding().mean()` inside each
+      (`market_regime_picasso`, `hour`) group.
+    - Clustering input uses rolling-normalized signals built from past values
+      only (`shift(1)` prior to rolling stats).
+    """
+    if "timestamp_utc" not in df.columns:
+        return df
+
+    pdf = df.to_pandas()
+    pdf["timestamp_utc"] = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
+    pdf = pdf.sort_values("timestamp_utc").reset_index(drop=True)
+
+    # Ensure required grouping columns exist.
+    if "hour" not in pdf.columns:
+        pdf["hour"] = pdf["timestamp_utc"].dt.hour.astype(np.int8)
+    if "market_regime_picasso" not in pdf.columns:
+        picasso_start = pd.Timestamp("2022-06-22 00:00:00+00:00")
+        pdf["market_regime_picasso"] = (pdf["timestamp_utc"] >= picasso_start).astype(np.int8)
+
+    # Ensure binary target is available.
+    if "is_activated" not in pdf.columns:
+        if {"afrr_activated_mw_pos", "afrr_activated_mw_neg"}.issubset(pdf.columns):
+            ap = pd.to_numeric(pdf["afrr_activated_mw_pos"], errors="coerce").fillna(0.0)
+            an = pd.to_numeric(pdf["afrr_activated_mw_neg"], errors="coerce").fillna(0.0)
+            pdf["is_activated"] = ((ap.abs() > 0.0) | (an.abs() > 0.0)).astype(np.int8)
+        else:
+            # Conservative fallback if no activation columns are available.
+            pdf["is_activated"] = 0
+
+    # 1) Leakage-safe target encoding by regime/hour.
+    global_mean = float(pd.to_numeric(pdf["is_activated"], errors="coerce").fillna(0.0).mean())
+    te = (
+        pdf.groupby(["market_regime_picasso", "hour"])["is_activated"]
+        .transform(lambda x: x.shift(1).expanding().mean())
+    )
+    pdf["TE_hour_regime_activation"] = pd.to_numeric(te, errors="coerce").fillna(global_mean).astype(np.float64)
+
+    # 2) Market-state clustering on rolling-normalized inputs.
+    need_cols = ["nrv_zscore_24h", "grid_stress_index", "picasso_flow_rate"]
+    for c in need_cols:
+        if c not in pdf.columns:
+            pdf[c] = 0.0
+        pdf[c] = pd.to_numeric(pdf[c], errors="coerce")
+
+    ts_index = pdf["timestamp_utc"]
+    norm_feats: list[np.ndarray] = []
+    for c in need_cols:
+        s = pdf[c].copy()
+        s.index = ts_index
+        mu = s.shift(1).rolling("24h", min_periods=2).mean()
+        sd = s.shift(1).rolling("24h", min_periods=2).std(ddof=0).replace(0.0, np.nan)
+        z = ((s - mu) / sd).reindex(ts_index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        norm_feats.append(z.to_numpy(dtype=float))
+
+    X = np.column_stack(norm_feats)
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "scikit-learn is required for market_state_cluster. Install `scikit-learn`."
+        ) from exc
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    km = KMeans(n_clusters=4, random_state=42, n_init=10)
+    pdf["market_state_cluster"] = km.fit_predict(X_scaled).astype(np.int8)
+
+    # 3) NRV quantile buckets.
+    q = pd.qcut(pd.to_numeric(pdf["nrv_zscore_24h"], errors="coerce"), 5, labels=False, duplicates="drop")
+    pdf["nrv_quantile_5"] = pd.to_numeric(q, errors="coerce").fillna(0).astype(np.int8)
+
+    return pl.from_pandas(pdf)
+
+
 def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     """Add market-regime and grid-stress features without target leakage.
 
@@ -420,6 +593,65 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     pdf["market_regime_picasso"] = (pdf["timestamp_utc"] >= picasso_start).astype(int)
 
     return pl.from_pandas(pdf)
+
+
+def add_time_features(
+    df: pd.DataFrame,
+    datetime_col: str = "timestamp_utc",
+    user_col: str = "user_id",
+) -> pd.DataFrame:
+    """Add vectorized calendar/cyclical/user-recency time features.
+
+    Notes:
+    - Uses only pandas/numpy vectorized operations (no row-wise apply).
+    - `days_since_last_activation` is grouped by `user_col` and filled with -1
+      for each user's first event.
+    """
+    if datetime_col not in df.columns:
+        raise KeyError(f"Missing datetime column: {datetime_col}")
+    if user_col not in df.columns:
+        raise KeyError(f"Missing user column: {user_col}")
+
+    out = df.copy()
+    out[datetime_col] = pd.to_datetime(out[datetime_col], utc=True, errors="coerce")
+    if out[datetime_col].isna().any():
+        raise ValueError(f"Column '{datetime_col}' contains invalid datetimes.")
+
+    out = out.sort_values([user_col, datetime_col], kind="mergesort")
+
+    dt = out[datetime_col].dt
+    hour = dt.hour.to_numpy()
+    weekday = dt.weekday.to_numpy()  # 0..6
+    month = dt.month.to_numpy()  # 1..12
+    day = dt.day.to_numpy()
+
+    # 1) Cyclical features.
+    out["hour_sin"] = np.sin(2.0 * np.pi * hour / 24.0)
+    out["hour_cos"] = np.cos(2.0 * np.pi * hour / 24.0)
+    out["weekday_sin"] = np.sin(2.0 * np.pi * weekday / 7.0)
+    out["weekday_cos"] = np.cos(2.0 * np.pi * weekday / 7.0)
+    out["month_sin"] = np.sin(2.0 * np.pi * month / 12.0)
+    out["month_cos"] = np.cos(2.0 * np.pi * month / 12.0)
+
+    # 2) Calendar/economic indicators.
+    out["is_weekend"] = (weekday >= 5).astype(np.int8)
+    out["is_payday_period"] = ((day >= 27) | (day <= 3)).astype(np.int8)
+
+    # 3) Daypart one-hot features.
+    out["is_morning"] = ((hour >= 6) & (hour <= 11)).astype(np.int8)
+    out["is_afternoon"] = ((hour >= 12) & (hour <= 16)).astype(np.int8)
+    out["is_evening"] = ((hour >= 17) & (hour <= 22)).astype(np.int8)
+    out["is_night"] = ((hour >= 23) | (hour <= 5)).astype(np.int8)
+
+    # 4) User-level recency delta (days).
+    delta_days = (
+        out.groupby(user_col, sort=False)[datetime_col]
+        .diff()
+        .dt.total_seconds()
+        .div(86400.0)
+    )
+    out["days_since_last_activation"] = delta_days.fillna(-1.0).astype(np.float64)
+    return out
 
 
 def add_german_holiday_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -523,6 +755,14 @@ def build_features(input_path: Path, output_path: Path) -> None:
     df = add_confidence_features(df)
     df = add_german_holiday_features(df)
     df = add_market_regime_features(df)
+    df = add_price_offering_features(df)
+    df = add_aggregated_and_cluster_features(df)
+
+    # Optional: generic time features for user-centric datasets.
+    # For this thesis pipeline, many datasets are system-level and may not include user_id.
+    if "timestamp_utc" in df.columns and "user_id" in df.columns:
+        df = pl.from_pandas(add_time_features(df.to_pandas(), datetime_col="timestamp_utc", user_col="user_id"))
+
     drop_cols = [c for c in DROP_FOR_MODEL if c in df.columns]
     if drop_cols:
         df = df.drop(drop_cols)
