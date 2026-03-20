@@ -13,6 +13,7 @@ Rationale:
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -107,46 +108,70 @@ def apply_point_in_time_lag_layer(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def apply_day_ahead_forecast_availability(df: pl.DataFrame) -> pl.DataFrame:
-    """Apply conservative DA publication availability handling (13:00 Europe/Berlin).
+    """Apply DA publication gates only for explicit future-horizon forecast columns.
 
-    For day-ahead forecast columns used in 72h sequence settings, enforce a
-    conservative availability rule:
-    - If the full horizon cannot be covered by currently available DA publications,
-      replace with persistence fallback (same hour previous day, `shift(24)`).
-
-    Note:
-    - Day-ahead market prices (e.g., `da_price_eur`, `da_price_*`) are intentionally
-      excluded and treated as strict T-0 features for the delivery day.
+    Design:
+    - DA prices remain strict T-0 and are never gated here.
+    - Current-hour DA forecasts (base columns without horizon suffix) remain strict T-0.
+    - Future DA forecast columns (e.g. `*_forecast_da_*_h48`) are gated by publication
+      time: D-1 13:00 Europe/Berlin of the target delivery day.
+    - If unavailable at decision time, fallback is persistence (`shift(24)`).
     """
     if "timestamp_utc" not in df.columns:
         return df
-    forecast_cols = [c for c in df.columns if "forecast_da" in c]
-    if not forecast_cols:
+
+    base_forecast_cols = {
+        "load_forecast_da_entsoe",
+        "load_forecast_da",
+        "wind_onshore_forecast_da_entsoe",
+        "wind_offshore_forecast_da_entsoe",
+        "solar_forecast_da_entsoe",
+    }
+    # Match future-horizon forecast columns like:
+    # - load_forecast_da_entsoe_h48
+    # - wind_onshore_forecast_da_entsoe_tplus24
+    horizon_re = re.compile(
+        r"^(?P<base>.+forecast_da(?:_entsoe)?)(?:_(?:h|tplus)(?P<h>\d+))$",
+        flags=re.IGNORECASE,
+    )
+
+    decision_ts = pd.to_datetime(df["timestamp_utc"].to_pandas(), utc=True, errors="coerce")
+    if decision_ts.isna().any():
         return df
 
-    # Compute horizon visibility wrt next DA publication in local time (13:00 CET/CEST).
-    out = df.with_columns(
-        pl.col("timestamp_utc").dt.convert_time_zone("Europe/Berlin").dt.hour().alias("__local_hour")
-    ).with_columns(
-        pl.when(pl.col("__local_hour") < 13)
-        .then(13 - pl.col("__local_hour"))
-        .otherwise(37 - pl.col("__local_hour"))
-        .cast(pl.Int32)
-        .alias("__hours_to_next_da_pub")
-    ).with_columns(
-        (pl.col("__hours_to_next_da_pub") + 24).alias("__known_horizon_hours")
-    )
-    exprs: list[pl.Expr] = []
-    for c in forecast_cols:
-        # Persistence fallback for same hour previous day (hourly data).
-        exprs.append(
-            pl.when(pl.col("__known_horizon_hours") < 72)
-            .then(pl.col(c).shift(24))
-            .otherwise(pl.col(c))
-            .forward_fill()
-            .alias(c)
-        )
-    return out.with_columns(exprs).drop("__local_hour", "__hours_to_next_da_pub", "__known_horizon_hours")
+    pdf = df.to_pandas()
+    changed = False
+    for col in list(pdf.columns):
+        if col not in base_forecast_cols:
+            m = horizon_re.match(col)
+            if not m:
+                continue
+            base = m.group("base")
+            if base not in base_forecast_cols:
+                continue
+            horizon_h = int(m.group("h"))
+        else:
+            # Strict T-0 overlap for current delivery-hour DA forecasts.
+            horizon_h = 0
+
+        if horizon_h <= 0:
+            continue
+
+        target_ts = decision_ts + pd.to_timedelta(horizon_h, unit="h")
+        target_local = target_ts.dt.tz_convert("Europe/Berlin")
+        pub_local = (target_local.dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=13)
+        pub_utc = pub_local.dt.tz_convert("UTC")
+        available = decision_ts >= pub_utc
+
+        s = pd.to_numeric(pdf[col], errors="coerce")
+        fallback = s.shift(24)
+        gated = s.where(available, fallback).ffill()
+        pdf[col] = gated
+        changed = True
+
+    if not changed:
+        return df
+    return pl.from_pandas(pdf)
 
 
 def add_multi_output_targets(df: pl.DataFrame, horizon_hours: int = 72) -> pl.DataFrame:
@@ -870,23 +895,209 @@ def add_german_holiday_features(df: pl.DataFrame) -> pl.DataFrame:
     return df.drop("local_date")
 
 
+def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add advanced ML features on already PiT-lagged/gated inputs.
+
+    This function is intentionally pandas-based and vectorized for fast feature
+    generation across tree-based, neural, and linear model families.
+    """
+    out = df.copy()
+
+    if "timestamp_utc" in out.columns:
+        out["timestamp_utc"] = pd.to_datetime(out["timestamp_utc"], utc=True, errors="coerce")
+        out = out.sort_values("timestamp_utc").reset_index(drop=True)
+
+    # 1) Point-in-time slices (explicit lags for tree models).
+    lag_targets = ["load_actual_entsoe", "da_price_eur", "wind_onshore_actual_entsoe"]
+    for col in lag_targets:
+        if col not in out.columns:
+            continue
+        s = pd.to_numeric(out[col], errors="coerce")
+        out[f"{col}_lag24"] = s.shift(24)
+        out[f"{col}_lag48"] = s.shift(48)
+        out[f"{col}_lag168"] = s.shift(168)
+
+    # 2) Momentum/trend features (differences for linear models).
+    momentum_targets = ["load_actual_entsoe", "da_price_eur"]
+    for col in momentum_targets:
+        if col not in out.columns:
+            continue
+        s = pd.to_numeric(out[col], errors="coerce")
+        out[f"{col}_diff1"] = s.diff(1)
+        out[f"{col}_diff24"] = s.diff(24)
+
+    # 3) EWMA features (recently weighted context for sequence models).
+    ewma_targets = ["da_price_eur", "load_actual_entsoe"]
+    for col in ewma_targets:
+        if col not in out.columns:
+            continue
+        s = pd.to_numeric(out[col], errors="coerce")
+        out[f"{col}_ewma24"] = s.ewm(span=24, adjust=False, min_periods=1, ignore_na=False).mean()
+
+    # 4) Cyclical time features.
+    if "timestamp_utc" in out.columns:
+        dt = pd.to_datetime(out["timestamp_utc"], utc=True, errors="coerce")
+        if "hour" not in out.columns:
+            out["hour"] = dt.dt.hour.astype("float64")
+        if "dayofweek" not in out.columns:
+            out["dayofweek"] = dt.dt.dayofweek.astype("float64")
+        if "month" not in out.columns:
+            out["month"] = dt.dt.month.astype("float64")
+
+    cyclical_specs = [("hour", 24.0), ("dayofweek", 7.0), ("month", 12.0)]
+    for col, max_val in cyclical_specs:
+        if col not in out.columns:
+            continue
+        vals = pd.to_numeric(out[col], errors="coerce")
+        out[f"{col}_sin"] = np.sin(2.0 * np.pi * vals / max_val)
+        out[f"{col}_cos"] = np.cos(2.0 * np.pi * vals / max_val)
+
+    # 5) Cross-features / ratios.
+    if {"wind_onshore_actual_entsoe", "load_actual_entsoe"}.issubset(out.columns):
+        wind = pd.to_numeric(out["wind_onshore_actual_entsoe"], errors="coerce")
+        load = pd.to_numeric(out["load_actual_entsoe"], errors="coerce")
+        out["renewable_penetration_ratio"] = wind / (load + 1.0)
+
+    return out
+
+
+def run_feature_sanity_checks(df_features: pd.DataFrame | pl.DataFrame) -> None:
+    """Run strict mathematical sanity checks on final feature outputs.
+
+    Prints `[PASS/FAIL]` per test and raises `AssertionError` on failure.
+    """
+    if isinstance(df_features, pl.DataFrame):
+        pdf = df_features.to_pandas()
+    else:
+        pdf = df_features.copy()
+
+    if "timestamp_utc" in pdf.columns:
+        pdf["timestamp_utc"] = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
+        pdf = pdf.sort_values("timestamp_utc").reset_index(drop=True)
+
+    def _max_abs_err(a: pd.Series, b: pd.Series) -> float:
+        aa, bb = a.align(b, join="inner")
+        valid = aa.notna() & bb.notna()
+        if valid.sum() == 0:
+            return 0.0
+        return float((pd.to_numeric(aa[valid], errors="coerce") - pd.to_numeric(bb[valid], errors="coerce")).abs().max())
+
+    # Test A: explicit slices.
+    assert {"da_price_eur", "da_price_eur_lag24"}.issubset(pdf.columns), (
+        "Missing columns for Test A: da_price_eur / da_price_eur_lag24"
+    )
+    err_a = _max_abs_err(pdf["da_price_eur_lag24"], pd.to_numeric(pdf["da_price_eur"], errors="coerce").shift(24))
+    if err_a == 0.0:
+        print("[PASS] Test A (Explicit Slices): da_price_eur_lag24 == da_price_eur.shift(24)")
+    else:
+        print(f"[FAIL] Test A (Explicit Slices): max_abs_error={err_a:.12g}")
+    assert err_a == 0.0, f"Test A failed: max_abs_error={err_a}"
+
+    # Test B: momentum/diff.
+    assert {"da_price_eur", "da_price_eur_diff1"}.issubset(pdf.columns), (
+        "Missing columns for Test B: da_price_eur / da_price_eur_diff1"
+    )
+    expected_b = pd.to_numeric(pdf["da_price_eur"], errors="coerce") - pd.to_numeric(pdf["da_price_eur"], errors="coerce").shift(1)
+    err_b = _max_abs_err(pdf["da_price_eur_diff1"], expected_b)
+    if err_b == 0.0:
+        print("[PASS] Test B (Momentum): da_price_eur_diff1 == da_price_eur - shift(1)")
+    else:
+        print(f"[FAIL] Test B (Momentum): max_abs_error={err_b:.12g}")
+    assert err_b == 0.0, f"Test B failed: max_abs_error={err_b}"
+
+    # Test C: cyclic bounds and hour periodicity.
+    assert {"hour", "hour_sin", "hour_cos"}.issubset(pdf.columns), (
+        "Missing columns for Test C: hour / hour_sin / hour_cos"
+    )
+    sin_s = pd.to_numeric(pdf["hour_sin"], errors="coerce")
+    cos_s = pd.to_numeric(pdf["hour_cos"], errors="coerce")
+    min_sin, max_sin = float(sin_s.min(skipna=True)), float(sin_s.max(skipna=True))
+    min_cos, max_cos = float(cos_s.min(skipna=True)), float(cos_s.max(skipna=True))
+    bounds_ok = (min_sin >= -1.0 - 1e-12) and (max_sin <= 1.0 + 1e-12) and (min_cos >= -1.0 - 1e-12) and (max_cos <= 1.0 + 1e-12)
+
+    hour_vals = pd.to_numeric(pdf["hour"], errors="coerce")
+    expected_hour_sin = np.sin(2.0 * np.pi * hour_vals / 24.0)
+    expected_hour_cos = np.cos(2.0 * np.pi * hour_vals / 24.0)
+    err_c1 = _max_abs_err(sin_s, expected_hour_sin)
+    err_c2 = _max_abs_err(cos_s, expected_hour_cos)
+    periodic_ok = bool(np.isclose(np.sin(2.0 * np.pi * 24.0 / 24.0), np.sin(0.0), atol=1e-15)) and bool(
+        np.isclose(np.cos(2.0 * np.pi * 24.0 / 24.0), np.cos(0.0), atol=1e-15)
+    )
+    if bounds_ok and err_c1 == 0.0 and err_c2 == 0.0 and periodic_ok:
+        print("[PASS] Test C (Cyclic Bounds): hour_sin/hour_cos in [-1,1] and periodicity holds (0 == 24)")
+    else:
+        print(
+            "[FAIL] Test C (Cyclic Bounds): "
+            f"bounds_ok={bounds_ok}, err_sin={err_c1:.12g}, err_cos={err_c2:.12g}, periodic_ok={periodic_ok}"
+        )
+    assert bounds_ok and err_c1 == 0.0 and err_c2 == 0.0 and periodic_ok, (
+        "Test C failed: cyclic bounds/periodicity mismatch."
+    )
+
+    # Test D: ratio math.
+    assert {"renewable_penetration_ratio", "wind_onshore_actual_entsoe", "load_actual_entsoe"}.issubset(pdf.columns), (
+        "Missing columns for Test D: renewable_penetration_ratio / wind_onshore_actual_entsoe / load_actual_entsoe"
+    )
+    expected_d = pd.to_numeric(pdf["wind_onshore_actual_entsoe"], errors="coerce") / (
+        pd.to_numeric(pdf["load_actual_entsoe"], errors="coerce") + 1.0
+    )
+    err_d = _max_abs_err(pd.to_numeric(pdf["renewable_penetration_ratio"], errors="coerce"), expected_d)
+    if err_d <= 1e-12:
+        print("[PASS] Test D (Ratio): renewable_penetration_ratio math is correct")
+    else:
+        print(f"[FAIL] Test D (Ratio): max_abs_error={err_d:.12g}")
+    assert err_d <= 1e-12, f"Test D failed: max_abs_error={err_d}"
+
+    # Test E: EWMA causality and formula check.
+    assert {"da_price_eur", "da_price_eur_ewma24"}.issubset(pdf.columns), (
+        "Missing columns for Test E: da_price_eur / da_price_eur_ewma24"
+    )
+    base = pd.to_numeric(pdf["da_price_eur"], errors="coerce")
+    expected_e = base.ewm(span=24, adjust=False, min_periods=1, ignore_na=False).mean()
+    err_e = _max_abs_err(pd.to_numeric(pdf["da_price_eur_ewma24"], errors="coerce"), expected_e)
+    if err_e <= 1e-12:
+        print("[PASS] Test E (EWMA): da_price_eur_ewma24 matches causal ewm(span=24, adjust=False, ignore_na=False)")
+    else:
+        print(f"[FAIL] Test E (EWMA): max_abs_error={err_e:.12g}")
+    assert err_e <= 1e-12, f"Test E failed: max_abs_error={err_e}"
+
+
 def build_features(input_path: Path, output_path: Path) -> None:
     """Build ML features from transformed parquet."""
+    # --- STEP 1: Load Data ---
     df = pl.read_parquet(input_path)
     if "timestamp_utc" in df.columns:
         df = df.sort("timestamp_utc")
 
+    # Ground-truth target engineering is intentionally performed on raw market
+    # observations. `y_true_*` must remain unlagged economic truth.
     df = engineer_targets(df)
-    # Lag-first architecture for all observation-side features.
+
+    # --- STEP 2: CAUSAL FIREWALL (GLOBAL PiT LAG LAYER) ---
     df = apply_point_in_time_lag_layer(df)
+
+    if "data_is_lagged" not in df.columns:
+        raise RuntimeError("Causal firewall failed: missing `data_is_lagged` marker after PiT lag layer.")
+    if not bool(df.select(pl.col("data_is_lagged").all()).item()):
+        raise RuntimeError("Causal firewall failed: `data_is_lagged` is not true for all rows.")
+
+    # --- STEP 3: HORIZON GATING (PUBLICATION AVAILABILITY) ---
     df = apply_day_ahead_forecast_availability(df)
+
+    # --- STEP 4: DERIVED & HYBRID FEATURES (ON LAGGED/GATED BASE) ---
     df = add_confidence_features(df)
     df = add_german_holiday_features(df)
     df = add_market_regime_features(df)
     df = add_price_offering_features(df)
     df = add_aggregated_and_cluster_features(df)
+    # Advanced ML block (seasonal slices, momentum, EWMA, cyclical terms, ratios).
+    # Must run after PiT lagging/gating and before target matrix.
+    df = pl.from_pandas(add_advanced_ml_features(df.to_pandas()))
+
+    # --- STEP 5: TARGET MATRIX (h+1 ... h+72) ---
     df = add_multi_output_targets(df, horizon_hours=72)
 
+    # --- STEP 6: CLEANUP & DROP ---
     # Optional: generic time features for user-centric datasets.
     # For this thesis pipeline, many datasets are system-level and may not include user_id.
     if "timestamp_utc" in df.columns and "user_id" in df.columns:
