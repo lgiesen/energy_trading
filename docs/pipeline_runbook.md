@@ -19,6 +19,10 @@ Main scripts:
   Orchestrator (runs all fetchers + merge).
 - `src/energy_trading/ingestion/fetch_regelleistung.py`  
   Regelleistung aFRR CAPACITY/ENERGY + optional anonymous-bid derived prices.
+- `scripts/fetch_entsoe_outages.py`  
+  ENTSO-E planned/unplanned generation outage events (DE-LU).
+- `scripts/transform_entsoe_outages_hourly.py`  
+  Converts outage events to hourly sidecar features for short-term forecasting.
 - `src/energy_trading/ingestion/merge_data.py`  
   Full join of all raw parquet files on hourly UTC timestamps.
 - `src/energy_trading/processing/refine_market_data.py`  
@@ -39,11 +43,13 @@ Cleaned table is written to `data/processed/cleaned_data.parquet`.
 | 4 | `fetch_smard.py` | SMARD API (+ optional market-data CSV) | `data/raw/smard.parquet` (+ `data/raw/installed_capacity.csv`) |
 | 5 | `fetch_yfinance.py` | Yahoo Finance API | `data/raw/yfinance.parquet` |
 | 6 | `fetch_regelleistung.py` | Regelleistung API + bid files in `data/raw/bids/` | `data/raw/regelleistung.parquet` (hourly) + `data/raw/regelleistung_15min/afrr_prices_15min.parquet` + `data/raw/regelleistung_15min/afrr_volumes_15min.parquet` + `data/raw/regelleistung_15min/afrr_price_volume_15min.parquet` |
-| 7 | `merge_data.py` | All `data/raw/*.parquet` files | `data/processed/all_data.parquet` |
-| 8 | `refine_market_data.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
-| 9 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/cleaned_data.parquet` |
-| 10 | `transform_data.py` | `data/processed/cleaned_data.parquet` | `data/processed/all_data_transformed.parquet` |
-| 11 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
+| 7 | `fetch_entsoe_outages.py` | ENTSO-E API (`A80` + `A53/A54`) | `data/raw/entsoe_outages/planned_generation_outages.parquet` + `data/raw/entsoe_outages/unplanned_generation_outages.parquet` |
+| 8 | `merge_data.py` | All `data/raw/*.parquet` files | `data/processed/all_data.parquet` |
+| 9 | `refine_market_data.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
+| 10 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/cleaned_data.parquet` |
+| 11 | `transform_data.py` | `data/processed/cleaned_data.parquet` | `data/processed/all_data_transformed.parquet` |
+| 12 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
+| 13 | `transform_entsoe_outages_hourly.py` | `data/raw/entsoe_outages/planned_generation_outages.parquet` + `data/raw/entsoe_outages/unplanned_generation_outages.parquet` | `data/processed/outages_hourly.parquet` |
 
 ---
 
@@ -68,6 +74,13 @@ Run everything end-to-end:
   --end 2025-12-31T23:00:00Z
 ```
 
+Then fetch outage events and build hourly outage sidecar features:
+
+```bash
+./.venv/bin/python scripts/fetch_entsoe_outages.py --days-ahead 7
+./.venv/bin/python scripts/transform_entsoe_outages_hourly.py --days-ahead 7
+```
+
 This corresponds to:
 
 - Start: `2020-12-01 00:00:00 CET`
@@ -88,6 +101,24 @@ Run only post-collection processing (if raw files are already collected):
 ./.venv/bin/python scripts/post_collection_pipeline.py \
   --clip-start 2020-11-30T23:00:00Z \
   --clip-end 2025-12-31T23:00:00Z
+```
+
+`post_collection_pipeline.py` now also runs outage-event transformation to:
+
+- `data/processed/outages_hourly.parquet`
+
+if both outage inputs exist:
+
+- `data/raw/entsoe_outages/planned_generation_outages.parquet`
+- `data/raw/entsoe_outages/unplanned_generation_outages.parquet`
+
+To disable this sidecar step:
+
+```bash
+./.venv/bin/python scripts/post_collection_pipeline.py \
+  --clip-start 2020-11-30T23:00:00Z \
+  --clip-end 2025-12-31T23:00:00Z \
+  --skip-outages-hourly
 ```
 
 Skip anonymous-bid activation price reconstruction (faster):
