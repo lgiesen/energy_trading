@@ -95,7 +95,7 @@ The notebook
 `notebooks/09_lag_information_set_validation.ipynb`
 contains a cell-by-cell mathematical audit between:
 - Ground Truth (GT): `data/processed/all_data_refined.parquet`
-- Feature Set (FE): `data/processed/all_data_features.parquet`
+- Feature Set (FE): `data/features/all_data_features.parquet`
 
 Audit constraints:
 - 2H group: `FE[C]_t = GT[C]_{t-2}`
@@ -124,3 +124,58 @@ Latest audited outcome (executed on March 20, 2026):
 - Lag-policy failures (`2H`, `1H`, `0H`, `D+3_GATE`): **0** (PASS)
 - Informational groups (`TARGET`, `DERIVED`, `UNMAPPED`) are reported
   separately and do not drive the hard policy gate.
+
+### Missing Value Handling Policy
+
+The missing-value policy is implemented in
+`src/energy_trading/processing/handle_missing_values.py` and applied
+before downstream transformation/feature steps.
+
+Price transform note (`transform_data.py`)
+- Price-derived transformed columns use signed log:
+  `slog1p(x) = sign(x) * log1p(abs(x))`.
+- Column naming uses suffix `*_slog1p` (replacing `*_log1p`) to remain
+  mathematically valid for negative prices (including `x <= -1` EUR/MWh).
+- This prevents transformation-domain NaNs that occurred with plain `log1p`.
+
+Category A: Physical actuals (load, wind, solar, generation)
+- Short gaps (`<= 3h`): linear interpolation.
+- Long gaps (`> 3h`): seasonal persistence fill using `T-24h` with fallback
+  `T-168h`.
+- Rationale: physical quantities evolve continuously and daily/weekly
+  structure is informative during longer telemetry gaps.
+
+Category B: Market prices and continuous indicators
+- Primary fill: `ffill(limit=4)` (up to 4 hours).
+- No interpolation is applied for this category.
+- Rationale: prices remain valid until the next publication tick, and this
+  preserves trader-observable state without smoothing with future data.
+
+Category C: Forecasts (DA and related forecast features)
+- Fill strategy: forward fill only.
+- Interpolation is intentionally avoided for forecasts.
+- Rationale: once published, a forecast remains the trader information set
+  until replaced by a new publication.
+
+Category D: Rare-event and binary indicators (outages, holidays, flags)
+- Fill strategy: constant `0`.
+- Rationale: missing event marker is interpreted as “no event reported”.
+
+Category E: Targets (`y_train*`, `y_true*`, `target_*`)
+- Targets are never imputed.
+- Rows with missing targets are dropped in the cleaning stage used for model
+  training dataset generation.
+- For evaluation-only slices, rows can be retained and marked as
+  non-evaluable depending on metric design.
+
+Warmup handling
+- Leading rows with lag/rolling-induced NaNs are stripped rather than
+  imputed.
+- This avoids injecting synthetic values into initialization windows and
+  keeps causal consistency.
+
+Operational guarantees
+- Per-column imputation counts are logged to console for auditability.
+- The procedure is deterministic/idempotent: re-running on an already cleaned
+  dataset does not change values except for additional row drops if new
+  missing targets are introduced upstream.
