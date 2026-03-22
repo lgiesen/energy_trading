@@ -13,6 +13,7 @@ Rationale:
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 from datetime import timedelta
 from pathlib import Path
@@ -48,15 +49,124 @@ DROP_FOR_MODEL = [
     "wind_onshore_capacity_source",
     "wind_offshore_capacity_source",
     "solar_capacity_source",
+    # Streamline residual load representation: keep calculated variant only.
+    "residual_load_actual",
+    # Removed due to >98% missing values identified in the feature audit.
+    "bid_provider_to_grid_share_neg",
+    "bid_provider_to_grid_share_pos",
+    "afrr_reconstructed_marginal_price_pos",
+    "afrr_reconstructed_marginal_price_neg",
+]
+
+# Removed due to >98% missing values identified in the feature audit.
+DROP_HIGH_MISSING_BEFORE_FEATURES = [
+    "bid_provider_to_grid_share_neg",
+    "bid_provider_to_grid_share_pos",
+    "afrr_reconstructed_marginal_price_pos",
+    "afrr_reconstructed_marginal_price_neg",
 ]
 
 DATA_IS_LAGGED = True
+LOGGER = logging.getLogger(__name__)
+
+
+def apply_final_feature_aggregations(df: pl.DataFrame) -> pl.DataFrame:
+    """Apply final feature aggregation/reduction blocks with economic semantics.
+
+    Blocks:
+    1) Foreign DA prices -> `neighbor_price_avg`, `neighbor_spread_avg`
+    2) Balance redundancy cleanup -> drop QS/OP components + source/fallback metadata
+    3) Fossil generation aggregation -> `generation_fossil_total_mw`
+    """
+    before_cols = len(df.columns)
+
+    # --- Block 1: Foreign Price Spread aggregation ---
+    if "da_price_eur" not in df.columns:
+        LOGGER.info("Skip final aggregation block 1 (missing da_price_eur).")
+    else:
+        foreign_da_cols = [
+            c
+            for c in (
+                "da_price_AT",
+                "da_price_BE",
+                "da_price_CH",
+                "da_price_CZ",
+                "da_price_DK1",
+                "da_price_DK2",
+                "da_price_FR",
+                "da_price_NL",
+                "da_price_PL",
+                "da_price_SE4",
+            )
+            if c in df.columns
+        ]
+        if foreign_da_cols:
+            df = df.with_columns(
+                (
+                    pl.sum_horizontal([pl.col(c).cast(pl.Float64, strict=False) for c in foreign_da_cols])
+                    / float(len(foreign_da_cols))
+                ).alias("neighbor_price_avg")
+            )
+            df = df.with_columns(
+                (
+                    pl.col("neighbor_price_avg").cast(pl.Float64, strict=False)
+                    - pl.col("da_price_eur").cast(pl.Float64, strict=False)
+                ).alias("neighbor_spread_avg")
+            )
+            df = df.drop(foreign_da_cols)
+
+    # --- Block 2: Balance redundancy cleanup ---
+    balance_drop = [
+        c
+        for c in (
+            "NRV_balance_qs",
+            "NRV_balance_op",
+            "rz_saldo_mw_qs",
+            "rz_saldo_mw_op",
+            "NRV_balance_source",
+            "NRV_balance_source_is_fallback",
+            "rz_saldo_mw_source",
+            "rz_saldo_mw_source_is_fallback",
+        )
+        if c in df.columns
+    ]
+    if balance_drop:
+        df = df.drop(balance_drop)
+
+    # --- Block 3: Fossil generation aggregation ---
+    fossil_cols = [
+        c
+        for c in (
+            "generation_fossil_brown_coal_mw",
+            "generation_fossil_hard_coal_mw",
+            "generation_fossil_gas_mw",
+        )
+        if c in df.columns
+    ]
+    if fossil_cols:
+        df = df.with_columns(
+            (
+                pl.sum_horizontal([pl.col(c).cast(pl.Float64, strict=False) for c in fossil_cols])
+            ).alias("generation_fossil_total_mw")
+        )
+        df = df.drop(fossil_cols)
+
+    after_cols = len(df.columns)
+    LOGGER.info(
+        "Applied final feature aggregations: columns %s -> %s (delta=%s)",
+        before_cols,
+        after_cols,
+        after_cols - before_cols,
+    )
+    return df
 
 
 def _lag_hours_for_column(col: str) -> int:
     """Return lag (hours) for PiT alignment based on column semantics."""
     if (
         "_actual_entsoe" in col
+        # Legacy/raw actuals from non-ENTSO-E paths must also be delayed.
+        or col in {"wind_onshore_actual", "wind_offshore_actual", "solar_actual", "load_actual"}
         or "generation_fossil_" in col
         or col == "generation_nuclear_mw"
         or "generation_hydro_" in col
@@ -64,7 +174,6 @@ def _lag_hours_for_column(col: str) -> int:
         or col == "NRV_balance"
         or col == "residual_load_calc"
         or col == "wind_total_error_da"
-        or col == "planned_outages_mw"
         or col == "unplanned_outages_mw"
     ):
         return 2
@@ -290,14 +399,16 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
         "wind_onshore_actual",
         "wind_offshore_actual",
         "solar_actual",
-        "residual_load_actual",
     }
-    if actual_share_cols.issubset(df.columns):
+    residual_actual_col = "residual_load_calc" if "residual_load_calc" in df.columns else (
+        "residual_load_actual" if "residual_load_actual" in df.columns else None
+    )
+    if actual_share_cols.issubset(df.columns) and residual_actual_col is not None:
         df = df.with_columns([
             (pl.col("wind_onshore_actual").cast(pl.Float64).fill_null(0.0)).alias("__wind_onshore_actual_f"),
             (pl.col("wind_offshore_actual").cast(pl.Float64).fill_null(0.0)).alias("__wind_offshore_actual_f"),
             (pl.col("solar_actual").cast(pl.Float64).fill_null(0.0)).alias("__solar_actual_f"),
-            pl.col("residual_load_actual").cast(pl.Float64).fill_null(0.0).alias("__residual_load_actual_f"),
+            pl.col(residual_actual_col).cast(pl.Float64).fill_null(0.0).alias("__residual_load_actual_f"),
         ])
         df = df.with_columns([
             (
@@ -391,11 +502,13 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
         .alias("da_price_volatility_30d")
     )
 
+    load_fc_col = "load_forecast_da_entsoe" if "load_forecast_da_entsoe" in df.columns else "load_forecast_da"
+    load_act_col = "load_actual_entsoe" if "load_actual_entsoe" in df.columns else "load_actual"
     pairs = {
         "solar": ("solar_forecast_da_entsoe", "solar_actual_entsoe"),
         "wind_onshore": ("wind_onshore_forecast_da_entsoe", "wind_onshore_actual_entsoe"),
         "wind_offshore": ("wind_offshore_forecast_da_entsoe", "wind_offshore_actual_entsoe"),
-        "load": ("load_forecast_da", "load_actual"),
+        "load": (load_fc_col, load_act_col),
     }
     for name, (fc, act) in pairs.items():
         if fc in df.columns and act in df.columns:
@@ -421,14 +534,61 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
             .abs()
             .alias("wind_ramp")
         )
-    if {"load_forecast_da", "wind_onshore_forecast_da_entsoe", "solar_forecast_da_entsoe"}.issubset(df.columns):
+    # Primary T-0 renewable signal should come from intraday forecasts (ID).
+    # Capture the forecast "news" between DA and ID as a direct imbalance driver.
+    if {
+        "wind_onshore_forecast_id_entsoe",
+        "wind_offshore_forecast_id_entsoe",
+        "wind_onshore_forecast_da_entsoe",
+        "wind_offshore_forecast_da_entsoe",
+    }.issubset(df.columns):
         df = df.with_columns(
             (
-                pl.col("load_forecast_da")
+                pl.col("wind_onshore_forecast_id_entsoe")
+                + pl.col("wind_offshore_forecast_id_entsoe")
                 - pl.col("wind_onshore_forecast_da_entsoe")
+                - pl.col("wind_offshore_forecast_da_entsoe")
+            ).alias("wind_total_forecast_update")
+        )
+    if {"solar_forecast_id_entsoe", "solar_forecast_da_entsoe"}.issubset(df.columns):
+        df = df.with_columns(
+            (
+                pl.col("solar_forecast_id_entsoe")
+                - pl.col("solar_forecast_da_entsoe")
+            ).alias("solar_forecast_update")
+        )
+
+    if {
+        load_fc_col,
+        "wind_onshore_forecast_da_entsoe",
+        "wind_offshore_forecast_da_entsoe",
+        "solar_forecast_da_entsoe",
+    }.issubset(df.columns):
+        df = df.with_columns(
+            (
+                pl.col(load_fc_col)
+                - pl.col("wind_onshore_forecast_da_entsoe")
+                - pl.col("wind_offshore_forecast_da_entsoe")
                 - pl.col("solar_forecast_da_entsoe")
             )
-            .alias("residual_load_forecast")
+            .alias("residual_load_forecast_da")
+        )
+    # ENTSO-E based total system demand proxy including pumping load.
+    if {"load_actual_entsoe", "hydro_pumped_actual_entsoe"}.issubset(df.columns):
+        df = df.with_columns(
+            (
+                pl.col("load_actual_entsoe").cast(pl.Float64)
+                + pl.col("hydro_pumped_actual_entsoe").cast(pl.Float64)
+            ).alias("load_total_incl_pumping")
+        )
+
+    # Forecast-vs-realized residual imbalance proxy for aFRR stress conditions.
+    if {"residual_load_forecast_da", "residual_load_calc"}.issubset(df.columns):
+        df = df.with_columns(
+            (
+                pl.col("residual_load_forecast_da").cast(pl.Float64)
+                - pl.col("residual_load_calc").cast(pl.Float64)
+            ).alias("residual_forecast_error")
         )
 
     techs = ["wind_onshore", "wind_offshore", "solar"]
@@ -469,7 +629,11 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
         "load_mae_rolling_72h",
         "solar_ramp",
         "wind_ramp",
-        "residual_load_forecast",
+        "residual_load_forecast_da",
+        "load_total_incl_pumping",
+        "residual_forecast_error",
+        "wind_total_forecast_update",
+        "solar_forecast_update",
     ]
     # Additional rolling windows requested for key series.
     extra_rolling_specs = [
@@ -910,7 +1074,15 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         out = out.sort_values("timestamp_utc").reset_index(drop=True)
 
     # 1) Point-in-time slices (explicit lags for tree models).
-    lag_targets = ["load_actual_entsoe", "da_price_eur", "wind_onshore_actual_entsoe"]
+    # Keep the primary T+0 columns unchanged and add lag snapshots for seasonality/memory.
+    lag_targets = [
+        "load_actual_entsoe",
+        "da_price_eur",
+        "wind_onshore_actual_entsoe",
+        "load_total_incl_pumping",
+        "residual_load_forecast_da",
+        "residual_forecast_error",
+    ]
     for col in lag_targets:
         if col not in out.columns:
             continue
@@ -943,14 +1115,21 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
             out["hour"] = dt.dt.hour.astype("float64")
         if "dayofweek" not in out.columns:
             out["dayofweek"] = dt.dt.dayofweek.astype("float64")
+        if "day_of_week" not in out.columns:
+            out["day_of_week"] = out["dayofweek"].astype("float64")
         if "month" not in out.columns:
             out["month"] = dt.dt.month.astype("float64")
 
+    # Cyclical encoding prevents the "midnight gap": 23:00 and 00:00 are
+    # adjacent on a circle but appear far apart in raw integer space.
     cyclical_specs = [("hour", 24.0), ("dayofweek", 7.0), ("month", 12.0)]
     for col, max_val in cyclical_specs:
         if col not in out.columns:
             continue
         vals = pd.to_numeric(out[col], errors="coerce")
+        if col == "month":
+            # Map month 1..12 to 0..11 for a clean cyclical phase.
+            vals = vals - 1.0
         out[f"{col}_sin"] = np.sin(2.0 * np.pi * vals / max_val)
         out[f"{col}_cos"] = np.cos(2.0 * np.pi * vals / max_val)
 
@@ -960,6 +1139,102 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         load = pd.to_numeric(out["load_actual_entsoe"], errors="coerce")
         out["renewable_penetration_ratio"] = wind / (load + 1.0)
 
+    return out
+
+
+def _null_gap_length_expr(value_col: str, out_col: str) -> pl.Expr:
+    """Per-row length of the current null run (0 for non-null rows)."""
+    is_null = pl.col(value_col).is_null()
+    run_id = is_null.ne(is_null.shift(1).fill_null(False)).cum_sum()
+    return (
+        pl.when(is_null)
+        .then(pl.len().over(run_id))
+        .otherwise(pl.lit(0))
+        .cast(pl.Int32)
+        .alias(out_col)
+    )
+
+
+def apply_multi_strategy_imputation(df: pl.DataFrame) -> pl.DataFrame:
+    """Apply feature-specific imputation strategies for market data gaps."""
+    if "timestamp_utc" not in df.columns or df.height == 0:
+        return df
+
+    out = df.with_columns(
+        pl.col("timestamp_utc").cast(pl.Datetime(time_zone="UTC"), strict=False)
+    ).sort("timestamp_utc")
+
+    filled_coal = 0
+    filled_fc_delta = 0
+    filled_balancing = 0
+
+    # Coal: weekend ffill, weekday short-gap interpolation, weekday long-gap ffill.
+    coal_col = "coal_price_api2"
+    if coal_col in out.columns:
+        before = int(out.select(pl.col(coal_col).null_count()).item())
+        gap_col = "__gap_len_coal"
+        out = (
+            out.with_columns(
+                _null_gap_length_expr(coal_col, gap_col),
+                (pl.col("timestamp_utc").dt.weekday() >= 5).alias("__is_weekend"),
+            )
+            .with_columns(
+                pl.when(pl.col(coal_col).is_not_null())
+                .then(pl.col(coal_col))
+                .when(pl.col("__is_weekend"))
+                .then(pl.col(coal_col).fill_null(strategy="forward"))
+                .when(pl.col(gap_col) <= 3)
+                .then(pl.col(coal_col).interpolate())
+                .otherwise(pl.col(coal_col).fill_null(strategy="forward"))
+                .alias(coal_col)
+            )
+            .drop(gap_col, "__is_weekend")
+        )
+        after = int(out.select(pl.col(coal_col).null_count()).item())
+        filled_coal += max(0, before - after)
+
+    # Forecasts + deltas: linear interpolation.
+    forecast_cols: list[str] = []
+    if "load_forecast_da_entsoe" in out.columns:
+        forecast_cols.append("load_forecast_da_entsoe")
+    forecast_cols.extend([c for c in out.columns if c.endswith("_forecast_delta")])
+    # deduplicate while preserving order
+    seen_fc: set[str] = set()
+    forecast_cols = [c for c in forecast_cols if not (c in seen_fc or seen_fc.add(c))]
+
+    for col in forecast_cols:
+        before = int(out.select(pl.col(col).null_count()).item())
+        out = out.with_columns(pl.col(col).interpolate().alias(col))
+        after = int(out.select(pl.col(col).null_count()).item())
+        filled_fc_delta += max(0, before - after)
+
+    # Balancing offered MW: interpolate only for short gaps up to 6h.
+    for col in ("afrr_activation_offered_mw_pos", "afrr_activation_offered_mw_neg"):
+        if col not in out.columns:
+            continue
+        before = int(out.select(pl.col(col).null_count()).item())
+        gap_col = f"__gap_len_{col}"
+        out = (
+            out.with_columns(_null_gap_length_expr(col, gap_col))
+            .with_columns(
+                pl.when(pl.col(col).is_not_null())
+                .then(pl.col(col))
+                .when(pl.col(gap_col) <= 6)
+                .then(pl.col(col).interpolate())
+                .otherwise(pl.col(col))
+                .alias(col)
+            )
+            .drop(gap_col)
+        )
+        after = int(out.select(pl.col(col).null_count()).item())
+        filled_balancing += max(0, before - after)
+
+    print(
+        "[imputation] Validation Summary: "
+        f"coal_price_api2_filled={filled_coal}, "
+        f"forecast_delta_filled={filled_fc_delta}, "
+        f"balancing_offered_filled={filled_balancing}"
+    )
     return out
 
 
@@ -1101,6 +1376,70 @@ def merge_outages_sidecar(
     return merged
 
 
+def truncate_to_complete_information_core(df: pl.DataFrame) -> pl.DataFrame:
+    """Trim leading/trailing NaN zones to keep the complete information core.
+
+    - head gap: warmup NaNs from lags/rolling windows
+    - tail gap: horizon NaNs from forward-shifted targets
+    """
+    if df.height == 0:
+        return df
+
+    pdf = df.to_pandas()
+    n_rows = len(pdf)
+    na_mask = pdf.isna()
+
+    # Exclude fully-null columns from boundary detection.
+    # Those columns are data-quality issues and would otherwise collapse the table.
+    valid_cols = [c for c in pdf.columns if not bool(na_mask[c].all())]
+    if not valid_cols:
+        print("[truncate] No valid columns for boundary detection; returning input unchanged.")
+        return df
+
+    def _leading_nan_run(mask_col: pd.Series) -> int:
+        arr = mask_col.to_numpy(dtype=bool)
+        if arr.size == 0:
+            return 0
+        if arr.all():
+            return n_rows
+        return int(np.argmax(~arr))
+
+    def _trailing_nan_run(mask_col: pd.Series) -> int:
+        arr = mask_col.to_numpy(dtype=bool)
+        if arr.size == 0:
+            return 0
+        if arr.all():
+            return n_rows
+        return int(np.argmax(~arr[::-1]))
+
+    max_head_gap = max(_leading_nan_run(na_mask[c]) for c in valid_cols)
+    max_tail_gap = max(_trailing_nan_run(na_mask[c]) for c in valid_cols)
+
+    start_idx = max_head_gap
+    end_exclusive = n_rows - max_tail_gap
+    if start_idx >= end_exclusive:
+        raise ValueError(
+            "Truncation produced empty frame: "
+            f"rows={n_rows}, max_head_gap={max_head_gap}, max_tail_gap={max_tail_gap}"
+        )
+
+    out = df.slice(start_idx, end_exclusive - start_idx)
+    removed_head = start_idx
+    removed_tail = n_rows - end_exclusive
+    print(
+        "[truncate] "
+        f"max_head_gap={max_head_gap}, max_tail_gap={max_tail_gap}, "
+        f"removed_head={removed_head}, removed_tail={removed_tail}, "
+        f"rows_before={n_rows}, rows_after={out.height}"
+    )
+    if "timestamp_utc" in out.columns:
+        ts_min = out.select(pl.col("timestamp_utc").min()).item()
+        ts_max = out.select(pl.col("timestamp_utc").max()).item()
+        print(f"[truncate] new_start={ts_min}, new_end={ts_max}")
+
+    return out
+
+
 def build_features(input_path: Path, output_path: Path) -> None:
     """Build ML features from transformed parquet."""
     # --- STEP 1: Load Data ---
@@ -1109,6 +1448,10 @@ def build_features(input_path: Path, output_path: Path) -> None:
         df = df.sort("timestamp_utc")
     # Merge outage sidecar before causal lag layer; missing means no outage.
     df = merge_outages_sidecar(df, outages_path=Path("data/processed/outages_hourly.parquet"))
+    # Removed due to >98% missing values identified in the feature audit.
+    high_missing_drop = [c for c in DROP_HIGH_MISSING_BEFORE_FEATURES if c in df.columns]
+    if high_missing_drop:
+        df = df.drop(high_missing_drop)
 
     # Ground-truth target engineering is intentionally performed on raw market
     # observations. `y_true_*` must remain unlagged economic truth.
@@ -1127,6 +1470,8 @@ def build_features(input_path: Path, output_path: Path) -> None:
 
     # --- STEP 4: DERIVED & HYBRID FEATURES (ON LAGGED/GATED BASE) ---
     df = add_confidence_features(df)
+    # Final dimensionality reduction blocks: foreign spreads, balance cleanup, fossil total.
+    df = apply_final_feature_aggregations(df)
     df = add_german_holiday_features(df)
     df = add_market_regime_features(df)
     df = add_price_offering_features(df)
@@ -1134,6 +1479,8 @@ def build_features(input_path: Path, output_path: Path) -> None:
     # Advanced ML block (seasonal slices, momentum, EWMA, cyclical terms, ratios).
     # Must run after PiT lagging/gating and before target matrix.
     df = pl.from_pandas(add_advanced_ml_features(df.to_pandas()))
+    # Multi-strategy market-aware imputation for internal feature gaps.
+    df = apply_multi_strategy_imputation(df)
 
     # --- STEP 5: TARGET MATRIX (h+1 ... h+72) ---
     df = add_multi_output_targets(df, horizon_hours=72)
@@ -1147,6 +1494,9 @@ def build_features(input_path: Path, output_path: Path) -> None:
     drop_cols = [c for c in DROP_FOR_MODEL if c in df.columns]
     if drop_cols:
         df = df.drop(drop_cols)
+
+    # Trim dynamic warmup/horizon NaN zones before final export.
+    df = truncate_to_complete_information_core(df)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(output_path, compression="zstd")
