@@ -3,7 +3,7 @@
 
 Loads:
 - RAW sidecar: data/processed/outages_hourly.parquet
-- FEATURES:    data/features/all_data_features.parquet (fallback: data/processed)
+- FEATURES:    data/features/all_data_features.parquet
 
 Tests:
 - A: unplanned_outages_mw == RAW.shift(2)
@@ -21,10 +21,7 @@ import pandas as pd
 
 def _resolve_paths() -> tuple[Path, Path]:
     raw = Path("data/processed/outages_hourly.parquet")
-    features_candidates = [
-        Path("data/features/all_data_features.parquet"),
-        Path("data/processed/all_data_features.parquet"),
-    ]
+    features_candidates = [Path("data/features/all_data_features.parquet")]
     feat = next((p for p in features_candidates if p.exists()), None)
     if not raw.exists():
         raise FileNotFoundError(f"Missing RAW outages sidecar: {raw}")
@@ -33,7 +30,6 @@ def _resolve_paths() -> tuple[Path, Path]:
             "Missing FEATURES parquet. Checked: "
             + ", ".join(str(p) for p in features_candidates)
         )
-    # Prefer the first candidate that already contains outage columns.
     needed = {"planned_outages_mw", "unplanned_outages_mw"}
     for cand in features_candidates:
         if not cand.exists():

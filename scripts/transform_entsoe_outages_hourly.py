@@ -38,12 +38,12 @@ def _ensure_utc(ts: pd.Series) -> pd.Series:
     return out
 
 
-def _load_outages(path: Path) -> pd.DataFrame:
+def _load_outages(path: Path, *, require_end: bool = True) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing outage file: {path}")
 
     df = pd.read_parquet(path)
-    required = {"unavailable_power", "start", "end"}
+    required = {"unavailable_power", "start"} | ({"end"} if require_end else set())
     missing = required - set(df.columns)
     if missing:
         raise KeyError(f"{path} missing required columns: {sorted(missing)}")
@@ -51,8 +51,10 @@ def _load_outages(path: Path) -> pd.DataFrame:
     df = df.copy()
     df["unavailable_power"] = pd.to_numeric(df["unavailable_power"], errors="coerce")
     df["start"] = _ensure_utc(df["start"])
-    df["end"] = _ensure_utc(df["end"])
-    df = df.dropna(subset=["unavailable_power", "start", "end"])
+    if "end" in df.columns:
+        df["end"] = _ensure_utc(df["end"])
+    drop_subset = ["unavailable_power", "start"] + (["end"] if require_end else [])
+    df = df.dropna(subset=drop_subset)
     return df
 
 
@@ -127,8 +129,8 @@ def transform_outages_hourly(
     range_end = range_start + pd.Timedelta(days=days_ahead)
     hourly_index = pd.date_range(range_start, range_end, freq="1h", inclusive="left", tz="UTC")
 
-    planned = _load_outages(planned_path)
-    unplanned_raw = _load_outages(unplanned_path)
+    planned = _load_outages(planned_path, require_end=True)
+    unplanned_raw = _load_outages(unplanned_path, require_end=False)
     # Causal safety: ignore retroactively known repair time for unplanned outages.
     unplanned = _apply_unplanned_persistence_window(unplanned_raw, hours=24)
 
