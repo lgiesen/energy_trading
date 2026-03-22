@@ -51,6 +51,9 @@ Cleaned table is written to `data/processed/cleaned_data.parquet`.
 | 12 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
 | 13 | `transform_entsoe_outages_hourly.py` | `data/raw/entsoe_outages/planned_generation_outages.parquet` + `data/raw/entsoe_outages/unplanned_generation_outages.parquet` | `data/processed/outages_hourly.parquet` |
 
+Note: The canonical features output path is `data/features/all_data_features.parquet`.
+Do not maintain a duplicate `data/processed/all_data_features.parquet`.
+
 ---
 
 ## Design Principles
