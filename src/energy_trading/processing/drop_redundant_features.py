@@ -26,8 +26,8 @@ DROP_COLS = [
     "wind_onshore_error",
     "wind_offshore_error",
     "solar_error",
-    # Streamlined in final feature set: keep internally calculated residual-load variant.
-    "residual_load_actual",
+    # Use UTC only in model-ready datasets.
+    "timestamp_cet",
 ]
 
 # User-requested drops from latest feature-audit cycle.
@@ -79,6 +79,64 @@ KEEP_FOR_STRUCTURAL_ANALYSIS = [
     "NRV_balance_op",
     "rz_saldo_mw_qs",
     "rz_saldo_mw_op",
+]
+
+FOREIGN_DA_PRICE_COLS = [
+    "da_price_AT",
+    "da_price_BE",
+    "da_price_CH",
+    "da_price_CZ",
+    "da_price_DK1",
+    "da_price_DK2",
+    "da_price_FR",
+    "da_price_NL",
+    "da_price_PL",
+    "da_price_SE4",
+]
+
+BALANCE_COMPONENT_DROPS = [
+    "NRV_balance_qs",
+    "NRV_balance_op",
+    "rz_saldo_mw_qs",
+    "rz_saldo_mw_op",
+]
+
+FOSSIL_COMPONENT_DROPS = [
+    "generation_fossil_brown_coal_mw",
+    "generation_fossil_hard_coal_mw",
+    "generation_fossil_gas_mw",
+]
+
+RENEWABLE_DA_FORECAST_DROPS = [
+    "wind_onshore_forecast_da_entsoe",
+    "wind_offshore_forecast_da_entsoe",
+    "solar_forecast_da_entsoe",
+]
+
+# Keep only afrr_vwap_pos/neg as canonical activation price pair.
+ACTIVATION_PRICE_REDUNDANCY_PATTERNS = [
+    "avg_activation_price",
+    "marginal_activation_price",
+    "bid_avg_activation_price",
+]
+
+BALANCE_SIGNAL_DROPS = [
+    "rz_saldo_mw",
+    "reBAP_shortage_surplus",
+]
+
+SPREAD_FOCUS_DROPS = [
+    "neighbor_price_avg",
+]
+
+HYDRO_COMPONENT_COLS = [
+    "hydro_reservoir_actual_entsoe",
+    "hydro_pumped_actual_entsoe",
+    "hydro_ror_actual_entsoe",
+]
+
+AUDIT_REQUESTED_DROPS = [
+    "wind_forecast_de",
 ]
 
 
@@ -168,39 +226,134 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
         df_out = df_out.with_columns(pl.col("afrr_vwap_neg_eur_mwh").alias("afrr_vwap_neg"))
         LOGGER.info("Canonicalized afrr_vwap_neg from afrr_vwap_neg_eur_mwh")
 
-    removed_total: set[str] = set()
+    # ---------------------------------------------------------------------
+    # Transformation-first refinement:
+    # 1) Create compact aggregate signals
+    # 2) Drop redundant/raw helper families in one final exclude pass
+    # ---------------------------------------------------------------------
+    before_cols = len(df_out.columns)
 
-    df_out, drop_existing = _exclude_columns(df_out, DROP_COLS)
-    removed_total.update(drop_existing)
-    LOGGER.info("Dropped %s redundant SMARD columns.", len(drop_existing))
-    if drop_existing:
-        LOGGER.info("Dropped columns: %s", drop_existing)
+    # Residual load signals (forecast and actual) for DA/aFRR modeling.
+    residual_forecast_inputs = [
+        "load_forecast_da_entsoe",
+        "solar_forecast_id_entsoe",
+        "wind_onshore_forecast_id_entsoe",
+        "wind_offshore_forecast_id_entsoe",
+    ]
+    if all(c in df_out.columns for c in residual_forecast_inputs):
+        df_out = df_out.with_columns(
+            (
+                pl.col("load_forecast_da_entsoe").cast(pl.Float64, strict=False)
+                - pl.col("solar_forecast_id_entsoe").cast(pl.Float64, strict=False)
+                - pl.col("wind_onshore_forecast_id_entsoe").cast(pl.Float64, strict=False)
+                - pl.col("wind_offshore_forecast_id_entsoe").cast(pl.Float64, strict=False)
+            ).alias("residual_load_forecast")
+        )
 
-    df_out, user_drop_existing = _exclude_columns(df_out, USER_REQUESTED_DROPS)
-    removed_total.update(user_drop_existing)
-    LOGGER.info("Dropped %s user-requested redundancy/optimizer columns.", len(user_drop_existing))
-    if user_drop_existing:
-        LOGGER.info("Dropped user-requested columns: %s", user_drop_existing)
+        # Forecasted renewable share (wind+solar) / load forecast.
+        ren_num = (
+            pl.col("solar_forecast_id_entsoe").cast(pl.Float64, strict=False)
+            + pl.col("wind_onshore_forecast_id_entsoe").cast(pl.Float64, strict=False)
+            + pl.col("wind_offshore_forecast_id_entsoe").cast(pl.Float64, strict=False)
+        )
+        ren_den = pl.col("load_forecast_da_entsoe").cast(pl.Float64, strict=False)
+        df_out = df_out.with_columns(
+            pl.when(ren_den.is_null() | (ren_den == 0.0))
+            .then(None)
+            .otherwise(ren_num / ren_den)
+            .alias("renewable_share_forecast")
+        )
 
-    df_out, exact_dup_existing = _exclude_columns(df_out, EXACT_DUPLICATES_AUDIT)
-    removed_total.update(exact_dup_existing)
-    LOGGER.info("Dropped %s exact-duplicate audit columns.", len(exact_dup_existing))
-    if exact_dup_existing:
-        LOGGER.info("Dropped exact-duplicate columns: %s", exact_dup_existing)
+    residual_actual_inputs = [
+        "load_actual_entsoe",
+        "solar_actual_entsoe",
+        "wind_onshore_actual_entsoe",
+        "wind_offshore_actual_entsoe",
+    ]
+    if all(c in df_out.columns for c in residual_actual_inputs):
+        df_out = df_out.with_columns(
+            (
+                pl.col("load_actual_entsoe").cast(pl.Float64, strict=False)
+                - pl.col("solar_actual_entsoe").cast(pl.Float64, strict=False)
+                - pl.col("wind_onshore_actual_entsoe").cast(pl.Float64, strict=False)
+                - pl.col("wind_offshore_actual_entsoe").cast(pl.Float64, strict=False)
+            ).alias("residual_load_actual")
+        )
 
-    dynamic_stat_drops = _derive_statistical_overload_drops(df_out.columns)
-    stat_overload_candidates = sorted(set(STATISTICAL_OVERLOAD_DROPS).union(dynamic_stat_drops))
-    df_out, stat_overload_existing = _exclude_columns(df_out, stat_overload_candidates)
-    removed_total.update(stat_overload_existing)
-    LOGGER.info("Dropped %s statistical-overload columns.", len(stat_overload_existing))
-    if stat_overload_existing:
-        LOGGER.info("Dropped statistical-overload columns: %s", stat_overload_existing)
+    # Neighbor price spread: cross-border pressure vs Germany.
+    foreign_existing = [c for c in FOREIGN_DA_PRICE_COLS if c in df_out.columns]
+    if "da_price_eur" in df_out.columns and foreign_existing:
+        df_out = df_out.with_columns(
+            (
+                pl.sum_horizontal([pl.col(c).cast(pl.Float64, strict=False) for c in foreign_existing])
+                / float(len(foreign_existing))
+            ).alias("neighbor_price_avg")
+        ).with_columns(
+            (
+                pl.col("neighbor_price_avg").cast(pl.Float64, strict=False)
+                - pl.col("da_price_eur").cast(pl.Float64, strict=False)
+            ).alias("neighbor_spread_avg")
+        )
 
-    df_out, additional_drop_existing = _exclude_columns(df_out, ADDITIONAL_AUDIT_DROPS)
-    removed_total.update(additional_drop_existing)
-    LOGGER.info("Dropped %s additional audit columns.", len(additional_drop_existing))
-    if additional_drop_existing:
-        LOGGER.info("Dropped additional-audit columns: %s", additional_drop_existing)
+    # Fossil total: compact conventional generation signal.
+    fossil_existing = [c for c in FOSSIL_COMPONENT_DROPS if c in df_out.columns]
+    if fossil_existing:
+        df_out = df_out.with_columns(
+            pl.sum_horizontal([pl.col(c).cast(pl.Float64, strict=False) for c in fossil_existing]).alias(
+                "generation_fossil_total_mw"
+            )
+        )
+
+    # Baseload consolidation: drop nuclear if mostly zero after 04/2023,
+    # otherwise combine biomass + nuclear into one baseload channel.
+    nuclear_drop_cols: list[str] = []
+    if "generation_nuclear_mw" in df_out.columns:
+        nuclear_drop = False
+        if "timestamp_utc" in df_out.columns:
+            ts = pl.col("timestamp_utc").cast(pl.Datetime(time_zone="UTC"), strict=False)
+            post_cut = df_out.filter(ts >= pl.datetime(2023, 5, 1, 0, 0, 0, time_zone="UTC"))
+        else:
+            post_cut = df_out
+
+        if post_cut.height > 0:
+            stats = post_cut.select(
+                [
+                    pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False).is_not_null().sum().alias("n_non_null"),
+                    (
+                        (pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False) == 0.0)
+                        & pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False).is_not_null()
+                    ).sum().alias("n_zero_like"),
+                ]
+            ).to_dicts()[0]
+            n_non_null = int(stats["n_non_null"])
+            n_zero_like = int(stats["n_zero_like"])
+            zero_share = (n_zero_like / n_non_null) if n_non_null > 0 else 1.0
+            nuclear_drop = zero_share >= 0.95
+            LOGGER.info(
+                "Nuclear post-2023-04 zero-share=%0.3f (n=%s), drop=%s",
+                zero_share,
+                n_non_null,
+                nuclear_drop,
+            )
+
+        if nuclear_drop:
+            nuclear_drop_cols.append("generation_nuclear_mw")
+        elif "biomass_actual_entsoe" in df_out.columns:
+            df_out = df_out.with_columns(
+                (
+                    pl.col("biomass_actual_entsoe").cast(pl.Float64, strict=False)
+                    + pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False)
+                ).alias("generation_baseload_total")
+            )
+
+    # Hydro total: aggregate hydro actual components into one robust signal.
+    hydro_existing = [c for c in HYDRO_COMPONENT_COLS if c in df_out.columns]
+    if hydro_existing:
+        df_out = df_out.with_columns(
+            pl.sum_horizontal([pl.col(c).cast(pl.Float64, strict=False) for c in hydro_existing]).alias(
+                "generation_hydro_actual_total"
+            )
+        )
 
     exprs, added, _ = _build_feature_exprs(df_out)
     if exprs:
@@ -209,12 +362,53 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
     if added:
         LOGGER.info("Added columns: %s", added)
 
-    preserved = [c for c in KEEP_FOR_STRUCTURAL_ANALYSIS if c in df_out.columns]
-    LOGGER.info("Preserved structural-analysis columns: %s", preserved)
+    # Dynamically drop metadata lineage helpers.
+    metadata_drops = [c for c in df_out.columns if c.endswith("_source") or c.endswith("_is_fallback")]
+    activation_price_pattern_drops = [
+        c
+        for c in df_out.columns
+        if any(pat in c.lower() for pat in ACTIVATION_PRICE_REDUNDANCY_PATTERNS)
+    ]
 
-    metadata_cols = [c for c in df_out.columns if c.endswith("source") or c.endswith("is_fallback")]
-    LOGGER.info("Preserved metadata columns: %s", metadata_cols)
-    LOGGER.info("Total columns dropped during refinement: %s", len(removed_total))
+    # Compose one final drop set and apply with exclude for safety.
+    dynamic_stat_drops = _derive_statistical_overload_drops(df_out.columns)
+    all_to_drop = sorted(
+        set(DROP_COLS)
+        .union(nuclear_drop_cols)
+        .union(USER_REQUESTED_DROPS)
+        .union(EXACT_DUPLICATES_AUDIT)
+        .union(STATISTICAL_OVERLOAD_DROPS)
+        .union(dynamic_stat_drops)
+        .union(ADDITIONAL_AUDIT_DROPS)
+        .union(FOREIGN_DA_PRICE_COLS)
+        .union(BALANCE_COMPONENT_DROPS)
+        .union(BALANCE_SIGNAL_DROPS)
+        .union(FOSSIL_COMPONENT_DROPS)
+        .union(HYDRO_COMPONENT_COLS)
+        .union(RENEWABLE_DA_FORECAST_DROPS)
+        .union(SPREAD_FOCUS_DROPS)
+        .union(AUDIT_REQUESTED_DROPS)
+        .union(activation_price_pattern_drops)
+        .union(metadata_drops)
+    )
+    removed_existing = [c for c in all_to_drop if c in df_out.columns]
+    if removed_existing:
+        df_out = df_out.select(pl.all().exclude(removed_existing))
+
+    LOGGER.info("Total columns dropped during refinement: %s", len(removed_existing))
+    LOGGER.info("Columns before refinement=%s, after refinement=%s", before_cols, len(df_out.columns))
+    if removed_existing:
+        LOGGER.info("Dropped columns: %s", removed_existing)
+    created_now = [
+        c
+        for c in (
+            "neighbor_spread_avg",
+            "generation_fossil_total_mw",
+            "generation_hydro_actual_total",
+        )
+        if c in df_out.columns
+    ]
+    LOGGER.info("Created aggregate columns: %s", created_now)
 
     return df_out
 
