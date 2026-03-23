@@ -113,7 +113,9 @@ def apply_final_feature_aggregations(df: pl.DataFrame) -> pl.DataFrame:
                     - pl.col("da_price_eur").cast(pl.Float64, strict=False)
                 ).alias("neighbor_spread_avg")
             )
-            df = df.drop(foreign_da_cols)
+            # Keep only DE anchor and spread signal; drop foreign raw prices and
+            # intermediate neighbor average to reduce collinearity.
+            df = df.drop(foreign_da_cols + ["neighbor_price_avg"])
 
     # --- Block 2: Balance redundancy cleanup ---
     balance_drop = [
