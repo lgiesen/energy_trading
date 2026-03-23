@@ -87,6 +87,24 @@ def _find_col(df: pd.DataFrame, needles: list[str]) -> str | None:
     return None
 
 
+def _find_capacity_price_germany_col(df: pd.DataFrame) -> str | None:
+    """Prefer DE marginal capacity price and avoid TOTAL aggregate variants."""
+    exact = "GERMANY_MARGINAL_CAPACITY_PRICE_[(EUR/MW)/H]"
+    for c in df.columns:
+        if str(c).strip().upper() == exact:
+            return c
+    for c in df.columns:
+        c_up = str(c).upper()
+        if (
+            "GERMANY" in c_up
+            and "MARGINAL" in c_up
+            and "CAPACITY" in c_up
+            and "PRICE" in c_up
+        ):
+            return c
+    return _find_col(df, ["GRENZWERT"])
+
+
 def _parse_product_start(product: str) -> int | None:
     """Parse aFRR product like NEG_00_04 into start hour."""
     try:
@@ -779,27 +797,42 @@ def fetch_and_parse_regelleistung(
         if df_part.empty:
             return pd.DataFrame()
 
+        df_part = df_part.copy()
         part_prod = df_part[prod_col].astype(str)
-        start_of_day = pd.to_datetime(df_part[date_col]).dt.tz_localize(
+        start_of_day = _parse_date_series(df_part[date_col]).dt.tz_localize(
             "Europe/Berlin", ambiguous="infer", nonexistent="shift_forward"
         )
         if mode == "block":
-            df_part["start_hour"] = part_prod.str.extract(r"_(\d{2})_")
-            df_part["start_hour"] = pd.to_numeric(df_part["start_hour"], errors="coerce")
-            df_part = df_part.dropna(subset=["start_hour"])
+            parsed = part_prod.str.extract(r"^(?P<direction>[A-Za-z]+)_(?P<start>\d{2})_(?P<end>\d{2})$")
+            df_part["direction"] = parsed["direction"].str.upper()
+            df_part["start_hour"] = pd.to_numeric(parsed["start"], errors="coerce")
+            df_part["end_hour"] = pd.to_numeric(parsed["end"], errors="coerce")
+            df_part = df_part.dropna(subset=["direction", "start_hour", "end_hour"])
+            df_part = df_part[df_part["direction"].isin(["POS", "NEG"])]
+            if df_part.empty:
+                return pd.DataFrame()
+
             df_part["start_hour"] = df_part["start_hour"].astype(int)
-            df_part["timestamp_local"] = start_of_day + pd.to_timedelta(df_part["start_hour"], unit="h")
-            df_part = df_part.dropna(subset=["timestamp_local"])
-            df_part["timestamp"] = df_part["timestamp_local"].apply(
-                lambda ts: pd.date_range(start=ts, periods=4, freq="1h", inclusive="left")
-            )
-            df_part = df_part.explode("timestamp").drop(columns=["timestamp_local"])
-            df_part["Richtung"] = part_prod.str.split("_").str[0]
+            df_part["end_hour"] = df_part["end_hour"].astype(int)
+            df_part["hour_offsets"] = [
+                list(range(sh, eh if eh > sh else eh + 24))
+                for sh, eh in zip(df_part["start_hour"], df_part["end_hour"])
+            ]
+            df_part = df_part.explode("hour_offsets")
+            df_part["hour_offsets"] = pd.to_numeric(df_part["hour_offsets"], errors="coerce")
+            df_part = df_part.dropna(subset=["hour_offsets"])
+            df_part["timestamp"] = start_of_day + pd.to_timedelta(df_part["hour_offsets"].astype(int), unit="h")
         elif mode == "qh":
-            df_part["quarter_hour_int"] = part_prod.str.extract(r"_(\d+)").astype(int)
+            parsed = part_prod.str.extract(r"^(?P<direction>[A-Za-z]+)_(?P<qh>\d+)$")
+            df_part["direction"] = parsed["direction"].str.upper()
+            df_part["quarter_hour_int"] = pd.to_numeric(parsed["qh"], errors="coerce")
+            df_part = df_part.dropna(subset=["direction", "quarter_hour_int"])
+            df_part = df_part[df_part["direction"].isin(["POS", "NEG"])]
+            if df_part.empty:
+                return pd.DataFrame()
+            df_part["quarter_hour_int"] = df_part["quarter_hour_int"].astype(int)
             df_part["time_offset"] = pd.to_timedelta((df_part["quarter_hour_int"] - 1) * 15, unit="m")
             df_part["timestamp"] = start_of_day + df_part["time_offset"]
-            df_part["Richtung"] = part_prod.str.split("_").str[0]
         else:
             df_part["start_time"] = df_part[prod_col].astype(str).str.split(" - ").str[0]
             naive = pd.to_datetime(df_part[date_col].astype(str) + " " + df_part["start_time"])
@@ -807,13 +840,16 @@ def fetch_and_parse_regelleistung(
                 "Europe/Berlin", ambiguous="infer", nonexistent="shift_forward"
             )
             dir_col = _find_col(df_part, ["DIRECTION"]) or _find_col(df_part, ["RICHTUNG"]) or df_part.columns[2]
-            df_part["Richtung"] = df_part[dir_col]
+            dir_norm = df_part[dir_col].astype(str).str.upper()
+            dir_norm = dir_norm.replace({"POSITIVE": "POS", "NEGATIVE": "NEG"})
+            df_part["direction"] = dir_norm
 
         df_part["timestamp"] = df_part["timestamp"].dt.tz_convert("UTC")
-        df_part = df_part.dropna(subset=["timestamp"])
+        df_part = df_part.dropna(subset=["timestamp", "direction"])
 
         # --- 3) Feature columns ---
         val_cols: dict[str, str] = {}
+        net_col = _find_col(df_part, ["GERMANY_IMPORT", "EXPORT"])
         if market_type == "ENERGY":
             marg_col = _find_col(df_part, ["MARGINAL", "ENERGY", "PRICE"])
             avg_col = _find_col(df_part, ["AVERAGE", "ENERGY", "PRICE"])
@@ -825,32 +861,41 @@ def fetch_and_parse_regelleistung(
             if off_col:
                 val_cols[off_col] = "afrr_activation_offered_mw"
         else:
-            marg_col = _find_col(df_part, ["MARGINAL", "CAPACITY", "PRICE"]) or _find_col(df_part, ["GRENZWERT"])
+            marg_col = _find_capacity_price_germany_col(df_part)
             off_col = _find_col(df_part, ["OFFERED", "CAPACITY"])
             if marg_col:
                 val_cols[marg_col] = "afrr_capacity_price"
             if off_col:
                 val_cols[off_col] = "afrr_capacity_offered_mw"
+            if net_col:
+                # Keep direction split for capacity import/export signal.
+                val_cols[net_col] = "capacity_import_export_mw"
 
-        for col, out_name in val_cols.items():
+        for col in val_cols:
             series = pd.to_numeric(df_part[col], errors="coerce")
             df_part[col] = series
 
         # --- 4) European netting (import/export) ---
-        net_col = _find_col(df_part, ["GERMANY_IMPORT", "EXPORT"])
+        # For ENERGY keep legacy single-column net flow for downstream compatibility.
         net_series = None
-        if net_col:
+        if net_col and market_type == "ENERGY":
             net_series = (
                 df_part[["timestamp", net_col]]
                 .assign(**{net_col: pd.to_numeric(df_part[net_col], errors="coerce")})
+                .sort_values("timestamp")
                 .groupby("timestamp")[net_col]
-                .mean()
+                .first()
                 .rename("net_import_export_mw")
             )
 
         # --- 5) Pivot by direction ---
-        df_clean = df_part[["timestamp", "Richtung"] + list(val_cols.keys())]
-        df_pivot = df_clean.pivot_table(index="timestamp", columns="Richtung", values=list(val_cols.keys()))
+        df_clean = df_part[["timestamp", "direction"] + list(val_cols.keys())]
+        df_pivot = df_clean.pivot_table(
+            index="timestamp",
+            columns="direction",
+            values=list(val_cols.keys()),
+            aggfunc="first",
+        )
 
         new_cols = []
         for col in df_pivot.columns:
@@ -858,6 +903,18 @@ def fetch_and_parse_regelleistung(
             direction = str(col[1]).replace("ATIVE", "").lower()
             new_cols.append(f"{val_cols[orig_metric]}_{direction}")
         df_pivot.columns = new_cols
+        df_pivot = df_pivot.sort_index().groupby(level=0).first()
+
+        if "capacity_import_export_mw_pos" in df_pivot.columns or "capacity_import_export_mw_neg" in df_pivot.columns:
+            # Backward-compatible single net flow channel (prefer POS if present).
+            pos = df_pivot["capacity_import_export_mw_pos"] if "capacity_import_export_mw_pos" in df_pivot.columns else None
+            neg = df_pivot["capacity_import_export_mw_neg"] if "capacity_import_export_mw_neg" in df_pivot.columns else None
+            if pos is not None and neg is not None:
+                df_pivot["net_import_export_mw"] = pos.combine_first(neg)
+            elif pos is not None:
+                df_pivot["net_import_export_mw"] = pos
+            elif neg is not None:
+                df_pivot["net_import_export_mw"] = neg
 
         if net_series is not None:
             df_pivot = df_pivot.join(net_series, how="left")
