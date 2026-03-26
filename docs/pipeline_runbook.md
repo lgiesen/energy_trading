@@ -11,6 +11,68 @@ It is the operational reference for the ingestion + processing pipeline.
 
 ---
 
+## End-to-End Reproducible Workflow (Thesis)
+
+### Phase 1: Data Engineering Pipeline
+
+Purpose:
+- fetch and merge source data,
+- run refinement/pruning/transformation/feature engineering,
+- produce the canonical artifact `data/features/all_data_features.parquet`.
+
+Recommended terminal run:
+
+```bash
+./.venv/bin/python scripts/collect_and_merge_all_data.py \
+  --start 2020-11-30T23:00:00Z \
+  --end 2025-12-31T23:00:00Z && \
+./.venv/bin/python scripts/post_collection_pipeline.py \
+  --input data/processed/all_data.parquet \
+  --clip-start 2020-11-30T23:00:00Z \
+  --clip-end 2025-12-31T23:00:00Z
+```
+
+Phase-1 output:
+- `data/features/all_data_features.parquet`
+
+### Phase 2: Machine Learning Preparation (`data_prep.py`)
+
+Purpose:
+- construct leakage-safe `X`/`y`,
+- apply strict chronological train/test split,
+- switch preprocessing by model family (scaled vs unscaled).
+
+Notebook usage example:
+
+```python
+import pandas as pd
+from energy_trading.models.data_prep import prepare_model_data
+
+df = pd.read_parquet("data/features/all_data_features.parquet")
+
+# Tree-based models (no scaling)
+X_train, X_test, y_train, y_test = prepare_model_data(
+    df,
+    target_col="afrr_vwap_pos",
+    model_type="xgboost",
+    test_size=0.2,
+)
+
+# Linear / neural models (StandardScaler fit on train only)
+X_train_lin, X_test_lin, y_train_lin, y_test_lin = prepare_model_data(
+    df,
+    target_col="afrr_vwap_pos",
+    model_type="linear",
+    test_size=0.2,
+)
+```
+
+Leakage guarantee in Phase 2:
+- unlagged target columns are removed from `X` before model fitting,
+- split is chronological (no shuffle), preventing look-ahead bias.
+
+---
+
 ## 1) Pipeline Structure
 
 Main scripts:

@@ -178,7 +178,6 @@ Important implementation detail:
 
 ### Energy Prices and Exogenous Commodities
 - `da_price_eur` [EUR/MWh]
-- `price_intraday_eur` [EUR/MWh]
 - `gas_price_ttf` [market quote]
 - `coal_price_api2` [market quote]
 - `co2_price_eua` [market quote]
