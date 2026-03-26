@@ -48,6 +48,14 @@ USER_REQUESTED_DROPS = [
     "capacity_import_export_mw_neg",
     "load_actual_entsoe",
     "load_forecast_da_entsoe",
+    # Keep in data lake as DA proxy for later profit analysis, but never in ML table.
+    "price_intraday_eur",
+    # Raw calendar integers are redundant once cyclical encodings exist.
+    "hour",
+    "dayofweek",
+    "day_of_week",
+    "month",
+    "dayofyear",
     # Remove raw real-time PICASSO base channels (leakage risk as direct inputs).
     "afrr_picasso_mw_pos",
     "afrr_picasso_mw_neg",
@@ -393,7 +401,11 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
     removed_existing = [
         c
         for c in all_to_exclude
-        if c in df_out.columns and ("lag" not in c.lower()) and (c not in PROTECTED_KEEP)
+        if c in df_out.columns
+        and ("lag" not in c.lower())
+        and ("_sin" not in c.lower())
+        and ("_cos" not in c.lower())
+        and (c not in PROTECTED_KEEP)
     ]
     if removed_existing:
         df_out = df_out.select(pl.all().exclude(removed_existing))

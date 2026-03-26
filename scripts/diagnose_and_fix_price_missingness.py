@@ -28,7 +28,7 @@ import polars as pl
 DEFAULT_INPUT_CANDIDATES = [
     Path("data/features/all_data_features.parquet"),
 ]
-TARGET_COLS = ["da_price_eur_log1p", "price_intraday_eur_log1p"]
+TARGET_COLS = ["da_price_eur_slog1p"]
 
 
 @dataclass
