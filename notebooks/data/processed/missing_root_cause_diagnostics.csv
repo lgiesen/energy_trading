@@ -1,3 +1,1 @@
 column,missing_count,missing_pct,leading_nan_run_h,trailing_nan_run_h,internal_nan_count,max_internal_gap_h,first_missing_ts,last_missing_ts,refined_missing_count,inherited_vs_introduced,likely_cause
-da_price_eur_log1p,7,0.7963594994311717,0,0,7,5,2024-01-03 00:00:00+00:00,2024-01-24 03:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
-price_intraday_eur_log1p,7,0.7963594994311717,0,0,7,5,2024-01-03 01:00:00+00:00,2024-01-24 04:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
