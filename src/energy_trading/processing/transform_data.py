@@ -2,7 +2,7 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.processing.transform_data \
-        --in data/processed/all_data_clean.parquet \
+        --in data/processed/all_data_pruned.parquet \
         --out data/processed/all_data_transformed.parquet
 
 """
@@ -42,8 +42,8 @@ def main() -> None:
     parser.add_argument(
         "--in",
         dest="input_path",
-        default="data/processed/all_data_clean.parquet",
-        help="Input parquet (default: data/processed/all_data_clean.parquet).",
+        default="data/processed/all_data_pruned.parquet",
+        help="Input parquet (default: data/processed/all_data_pruned.parquet).",
     )
     parser.add_argument(
         "--out",
