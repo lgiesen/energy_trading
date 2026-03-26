@@ -24,7 +24,6 @@ Includes:
     - hourly aFRR VWAP activation prices:
         - afrr_vwap_pos
         - afrr_vwap_neg
-    - net_import_export_mw (IGCC/PICASSO netting when present)
     - MOL slope features (from anonymous bid lists, expanded to hourly)
     - hourly anonymous-bid features:
         - afrr_bid_avg_activation_price_{pos,neg}
@@ -875,20 +874,7 @@ def fetch_and_parse_regelleistung(
             series = pd.to_numeric(df_part[col], errors="coerce")
             df_part[col] = series
 
-        # --- 4) European netting (import/export) ---
-        # For ENERGY keep legacy single-column net flow for downstream compatibility.
-        net_series = None
-        if net_col and market_type == "ENERGY":
-            net_series = (
-                df_part[["timestamp", net_col]]
-                .assign(**{net_col: pd.to_numeric(df_part[net_col], errors="coerce")})
-                .sort_values("timestamp")
-                .groupby("timestamp")[net_col]
-                .first()
-                .rename("net_import_export_mw")
-            )
-
-        # --- 5) Pivot by direction ---
+        # --- 4) Pivot by direction ---
         df_clean = df_part[["timestamp", "direction"] + list(val_cols.keys())]
         df_pivot = df_clean.pivot_table(
             index="timestamp",
@@ -904,20 +890,6 @@ def fetch_and_parse_regelleistung(
             new_cols.append(f"{val_cols[orig_metric]}_{direction}")
         df_pivot.columns = new_cols
         df_pivot = df_pivot.sort_index().groupby(level=0).first()
-
-        if "capacity_import_export_mw_pos" in df_pivot.columns or "capacity_import_export_mw_neg" in df_pivot.columns:
-            # Backward-compatible single net flow channel (prefer POS if present).
-            pos = df_pivot["capacity_import_export_mw_pos"] if "capacity_import_export_mw_pos" in df_pivot.columns else None
-            neg = df_pivot["capacity_import_export_mw_neg"] if "capacity_import_export_mw_neg" in df_pivot.columns else None
-            if pos is not None and neg is not None:
-                df_pivot["net_import_export_mw"] = pos.combine_first(neg)
-            elif pos is not None:
-                df_pivot["net_import_export_mw"] = pos
-            elif neg is not None:
-                df_pivot["net_import_export_mw"] = neg
-
-        if net_series is not None:
-            df_pivot = df_pivot.join(net_series, how="left")
 
         return df_pivot
 
@@ -1273,6 +1245,10 @@ def main() -> None:
 
     # Drop redundant activated volume and MWh columns (keep MW components only).
     drop_cols = [
+        # Keep canonical activation MW from Netztransparenz pipeline, not from
+        # regelleistung export (prevents duplicate *_regelleistung columns later).
+        "afrr_activated_mw_pos",
+        "afrr_activated_mw_neg",
         "mfrr_activated_mwh_pos",
         "mfrr_activated_mwh_neg",
         "afrr_activated_mwh_pos",
