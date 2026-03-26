@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Post-collection pipeline wrapper: merge -> clean -> transform -> features.
+"""Post-collection pipeline wrapper: refine -> prune -> transform -> features.
 
 Usage:
     ./.venv/bin/python scripts/post_collection_pipeline.py \
-        --clip-start 2020-11-30T23:00:00Z \
-        --clip-end 2025-12-31T23:00:00Z
+        --input data/processed/all_data.parquet
 """
 from __future__ import annotations
 
@@ -25,23 +24,22 @@ def _run(cmd: list[str]) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(
-        description="Run post-collection processing (merge -> clean -> transform -> features)."
+        description="Run post-collection processing (refine -> prune -> transform -> features)."
     )
-    parser.add_argument("--data-dir", default="data/raw", help="Directory containing raw parquet files.")
     parser.add_argument(
-        "--merged",
+        "--input",
         default="data/processed/all_data.parquet",
-        help="Merged parquet output.",
-    )
-    parser.add_argument(
-        "--clean-out",
-        default="data/processed/cleaned_data.parquet",
-        help="Cleaned parquet output.",
+        help="Input merged parquet path (default: data/processed/all_data.parquet).",
     )
     parser.add_argument(
         "--refined-out",
         default="data/processed/all_data_refined.parquet",
-        help="Refined parquet output (after dropping redundant features).",
+        help="Refined parquet output.",
+    )
+    parser.add_argument(
+        "--pruned-out",
+        default="data/processed/all_data_pruned.parquet",
+        help="Pruned parquet output (post redundancy drop).",
     )
     parser.add_argument(
         "--transformed-out",
@@ -54,122 +52,70 @@ def main() -> None:
         help="Features parquet output.",
     )
     parser.add_argument(
-        "--outages-hourly-out",
-        default="data/processed/outages_hourly.parquet",
-        help="Hourly outages parquet output (sidecar feature table).",
-    )
-    parser.add_argument(
-        "--planned-outages-in",
-        default="data/raw/entsoe_outages/planned_generation_outages.parquet",
-        help="Planned outages parquet input.",
-    )
-    parser.add_argument(
-        "--unplanned-outages-in",
-        default="data/raw/entsoe_outages/unplanned_generation_outages.parquet",
-        help="Unplanned outages parquet input.",
-    )
-    parser.add_argument(
-        "--outages-days-ahead",
-        type=int,
-        default=7,
-        help="Forecast horizon for outages hourly transform (default: 7 days).",
-    )
-    parser.add_argument(
-        "--clip-start",
-        default="2020-11-30T23:00:00Z",
-        help="Clip start (timezone-aware recommended, UTC Z).",
-    )
-    parser.add_argument(
-        "--clip-end",
-        default="2025-12-31T23:00:00Z",
-        help="Clip end (timezone-aware recommended, UTC Z).",
-    )
-    parser.add_argument(
-        "--resample-freq",
-        default="1h",
-        help="Resample frequency passed to merge_data (default: 1h).",
+        "--skip-prune",
+        action="store_true",
+        help="Stop after refine step.",
     )
     parser.add_argument(
         "--skip-transform",
         action="store_true",
-        help="Stop after cleaning step.",
+        help="Stop after prune step.",
     )
     parser.add_argument(
         "--skip-features",
         action="store_true",
         help="Stop after transform step.",
     )
-    parser.add_argument(
-        "--skip-outages-hourly",
-        action="store_true",
-        help="Skip sidecar transform of ENTSO-E outages to hourly table.",
-    )
     args = parser.parse_args()
 
     py = sys.executable
-    Path(args.merged).parent.mkdir(parents=True, exist_ok=True)
     Path(args.refined_out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.clean_out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.pruned_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.transformed_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.features_out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.outages_hourly_out).parent.mkdir(parents=True, exist_ok=True)
 
-    # 1) Merge collected raw files.
-    merge_cmd = [
-        py,
-        "-m",
-        "energy_trading.ingestion.merge_data",
-        "--data-dir",
-        args.data_dir,
-        "--out",
-        args.merged,
-        "--clip-start",
-        args.clip_start,
-        "--clip-end",
-        args.clip_end,
-    ]
-    if args.resample_freq is not None:
-        merge_cmd.extend(["--resample-freq", args.resample_freq])
-    _run(merge_cmd)
-
-    # 2) Refine merged data (source consolidation + market-specific features).
+    # 1) Refine merged data (source consolidation + market-specific features).
     _run(
         [
             py,
             "-m",
             "energy_trading.processing.refine_market_data",
             "--in",
-            args.merged,
+            args.input,
             "--out",
             args.refined_out,
         ]
     )
 
-    # 3) Handle missing values.
+    if args.skip_prune:
+        LOGGER.info("Stopping after refine (--skip-prune).")
+        return
+
+    # 2) Drop/prune redundant columns (strictly reads refined output).
     _run(
         [
             py,
             "-m",
-            "energy_trading.processing.handle_missing_values",
+            "energy_trading.processing.drop_redundant_features",
             "--in",
             args.refined_out,
             "--out",
-            args.clean_out,
+            args.pruned_out,
         ]
     )
 
     if args.skip_transform:
-        LOGGER.info("Stopping after cleaning (--skip-transform).")
+        LOGGER.info("Stopping after prune (--skip-transform).")
         return
 
-    # 4) Transform.
+    # 3) Transform.
     _run(
         [
             py,
             "-m",
             "energy_trading.processing.transform_data",
             "--in",
-            args.clean_out,
+            args.pruned_out,
             "--out",
             args.transformed_out,
         ]
@@ -179,35 +125,7 @@ def main() -> None:
         LOGGER.info("Stopping after transform (--skip-features).")
         return
 
-    # 5) Build sidecar hourly outage features (if raw outage files are available).
-    # This must happen before feature construction so outages can be merged safely.
-    if not args.skip_outages_hourly:
-        planned_path = Path(args.planned_outages_in)
-        unplanned_path = Path(args.unplanned_outages_in)
-        if planned_path.exists() and unplanned_path.exists():
-            outage_transform = Path(__file__).with_name("transform_entsoe_outages_hourly.py")
-            _run(
-                [
-                    py,
-                    str(outage_transform),
-                    "--planned",
-                    str(planned_path),
-                    "--unplanned",
-                    str(unplanned_path),
-                    "--out",
-                    args.outages_hourly_out,
-                    "--days-ahead",
-                    str(args.outages_days_ahead),
-                ]
-            )
-        else:
-            LOGGER.warning(
-                "Skipping outages-hourly transform: missing input files (%s, %s).",
-                planned_path,
-                unplanned_path,
-            )
-
-    # 6) Build features.
+    # 4) Build features.
     _run(
         [
             py,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end pipeline wrapper: fetch -> merge -> clean -> transform -> features.
+"""End-to-end pipeline wrapper: fetch -> merge -> refine -> prune -> transform -> features.
 
 Usage:
     ./.venv/bin/python scripts/run_pipeline.py --start 2020-11-30T23:00:00Z --end 2026-01-01T02:00:00Z
@@ -69,19 +69,20 @@ def main() -> None:
         *( ["--smard-market-data-out", args.smard_market_data_out] if args.smard_market_data_out else [] ),
     ])
 
-    # 2) Handle missing values
-    clean_path = "data/processed/all_data_clean.parquet"
+    # 2) Prune redundant columns on refined output.
+    refined_path = "data/processed/all_data_refined.parquet"
+    pruned_path = "data/processed/all_data_pruned.parquet"
     run([
-        py, "-m", "energy_trading.processing.handle_missing_values",
-        "--in", args.merged,
-        "--out", clean_path,
+        py, "-m", "energy_trading.processing.drop_redundant_features",
+        "--in", refined_path,
+        "--out", pruned_path,
     ])
 
     # 3) Transform
     transformed_path = "data/processed/all_data_transformed.parquet"
     run([
         py, "-m", "energy_trading.processing.transform_data",
-        "--in", clean_path,
+        "--in", pruned_path,
         "--out", transformed_path,
     ])
 
