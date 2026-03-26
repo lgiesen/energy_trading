@@ -20,7 +20,7 @@ Columns (high level):
     - actuals: residual load, wind onshore/offshore, solar
     - forecasts: day-ahead wind/solar
     - generation by fuel: lignite, hard coal, gas, nuclear, hydro pumped storage
-    - prices: da_price_eur (hourly), price_intraday_eur (hourly mean)
+    - prices: da_price_eur (hourly)
     - engineered: forecast errors, wind_forecast_de, system_stress_signal
 
 API notes:
@@ -53,12 +53,8 @@ LOGGER = logging.getLogger(__name__)
 BASE_URL = "https://www.smard.de/app/chart_data"
 DEFAULT_REGION = "DE-LU"
 DEFAULT_RESOLUTION = "hour"
-INTRADAY_REGION = "DE"
-INTRADAY_RESOLUTION = "quarterhour"
-
 # Price filter IDs
 DA_PRICE_FILTER_ID = 4169  # Day-ahead market price DE/LU
-INTRADAY_PRICE_FILTER_ID = 4996  # Intraday trading (quarter-hour)
 
 # SMARD module IDs for non-price series.
 DATA_MODULES: Dict[str, int] = {
@@ -82,7 +78,8 @@ GENERATION_CANDIDATES: Dict[str, List[int]] = {
     "generation_fossil_gas_mw": [4071],
     # Quarterhour IDs to avoid gaps.
     "generation_nuclear_mw": [1224],
-    "generation_hydro_pumped_storage_mw": [4066],
+    # 4070 = Stromerzeugung: Pumpspeicher (4066 is Biomasse)
+    "generation_hydro_pumped_storage_mw": [4070],
 }
 
 MARKET_DATA_INIT_URL = "https://www.smard.de/en/downloadcenter/download-market-data/"
@@ -591,32 +588,11 @@ def fetch_smard(
         merged = merged.join(da_df, on="timestamp", how="full", coalesce=True)
         LOGGER.info("Fetched %s rows for da_price_eur.", len(da_df))
 
-    # Intraday prices (quarter-hour) -> hourly mean
-    #
-    # price_intraday_eur documentation (for thesis):
-    # Source: SMARD "Großhandelspreise / Intraday-Handel" (Filter-ID 4996).
-    # Methodology: hourly mean of 15-minute volume-weighted average prices (VWAP).
-    # Limitation: not an ID1 or ID3 index (closing prices).
-    # Assumption: proxy for rebalancing costs in an hourly simulation under liquid markets.
-    intraday_qh = fetch_series(
-        session,
-        INTRADAY_PRICE_FILTER_ID,
-        INTRADAY_REGION,
-        INTRADAY_RESOLUTION,
-        start_ms,
-        end_ms,
-        cutoff_ms,
-        "price_intraday_qh",
-    )
-    if intraday_qh is not None:
-        intraday_hourly = (
-            intraday_qh.sort("timestamp")
-            .group_by_dynamic("timestamp", every="1h", closed="left", label="left")
-            .agg(pl.col("price_intraday_qh").mean().alias("price_intraday_eur"))
-            .sort("timestamp")
-        )
-        merged = merged.join(intraday_hourly, on="timestamp", how="full", coalesce=True)
-        LOGGER.info("Fetched %s rows for price_intraday_eur.", len(intraday_hourly))
+    # TODO: Placeholder for profit analysis. Currently a copy of DA price.
+    # Replace with actual EPEX ID1 data later.
+    if "da_price_eur" in merged.columns:
+        merged = merged.with_columns(pl.col("da_price_eur").alias("price_intraday_eur"))
+
     merged = merged.sort("timestamp")
     # Enforce strict hourly alignment and clip to requested UTC window.
     merged = merged.with_columns(pl.col("timestamp").dt.truncate("1h").alias("timestamp"))
