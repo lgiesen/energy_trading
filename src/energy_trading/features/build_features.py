@@ -56,6 +56,12 @@ DROP_FOR_MODEL = [
     "bid_provider_to_grid_share_pos",
     "afrr_reconstructed_marginal_price_pos",
     "afrr_reconstructed_marginal_price_neg",
+    # Raw calendar integers are dropped in favor of cyclical sin/cos encodings.
+    "hour",
+    "dayofweek",
+    "day_of_week",
+    "month",
+    "dayofyear",
     # Keep only lagged PICASSO flow features in final ML table.
     "picasso_flow_rate",
 ]
@@ -191,7 +197,6 @@ def _lag_hours_for_column(col: str) -> int:
         or "afrr_vwap" in col
         or "reBAP_shortage_surplus" in col
         or "afrr_picasso_mw" in col
-        or "price_intraday_eur" in col
         or "afrr_picasso_net_mw" in col
         or "mfrr_mari_net_mw" in col
     ):
@@ -676,7 +681,7 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
     """Add price/opportunity features for activation-price and capacity-price modeling.
 
     Features:
-    - afrr_id_price_spread = afrr_activation_price - intraday_price_da
+    - afrr_da_price_spread = afrr_activation_price - da_price_eur
     - relative_price_competitiveness = afrr_activation_price / rolling_mean_24h(shifted)
     - price_volatility_short_term = rolling_std_4h(shifted afrr_activation_price)
     - scarcity_price_premium = afrr_activation_price * grid_stress_index
@@ -707,13 +712,6 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
             "afrr_bid_vwap_activation_price_pos",
         )
     )
-    intraday_col = _first_existing(
-        (
-            "intraday_price_da",
-            "price_intraday_eur",
-            "da_price_eur",
-        )
-    )
 
     if afrr_price_col is None:
         return df
@@ -723,12 +721,12 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
     p_indexed = p.copy()
     p_indexed.index = pdf["timestamp_utc"]
 
-    # 1) Cross-market spread.
-    if intraday_col is not None:
-        p_id = pd.to_numeric(pdf[intraday_col], errors="coerce")
-        pdf["afrr_id_price_spread"] = p - p_id
+    # 1) Cross-market spread: strictly against Day-Ahead price.
+    if "da_price_eur" in pdf.columns:
+        p_da = pd.to_numeric(pdf["da_price_eur"], errors="coerce")
+        pdf["afrr_da_price_spread"] = p - p_da
     else:
-        pdf["afrr_id_price_spread"] = np.nan
+        pdf["afrr_da_price_spread"] = np.nan
 
     # 2) Relative price competitiveness with leakage-safe rolling mean.
     roll_mean_24h = p_indexed.shift(1).rolling("24h", min_periods=1).mean()
@@ -750,7 +748,7 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
 
     # Robust missing handling.
     for c in (
-        "afrr_id_price_spread",
+        "afrr_da_price_spread",
         "relative_price_competitiveness",
         "price_volatility_short_term",
         "scarcity_price_premium",
@@ -1100,6 +1098,28 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{col}_lag24"] = s.shift(24)
         out[f"{col}_lag48"] = s.shift(48)
         out[f"{col}_lag168"] = s.shift(168)
+
+    # Historical target lags as valid autoregressive features (no leakage):
+    # only past values (t-1h, t-24h) are exposed to the model.
+    target_history_cols = [
+        "afrr_vwap_pos",
+        "afrr_vwap_neg",
+        "afrr_activated_mw_pos",
+        "afrr_activated_mw_neg",
+        "afrr_activated_mwh_pos",
+        "afrr_activated_mwh_neg",
+        "afrr_da_price_spread",
+        "afrr_neg_da_price_spread",
+    ]
+    for col in target_history_cols:
+        if col not in out.columns:
+            continue
+        s = pd.to_numeric(out[col], errors="coerce")
+        out[f"{col}_lag1"] = s.shift(1)
+        out[f"{col}_lag24"] = s.shift(24)
+        # Explicit hour-suffixed aliases for audit clarity.
+        out[f"{col}_lag_1h"] = out[f"{col}_lag1"]
+        out[f"{col}_lag_24h"] = out[f"{col}_lag24"]
 
     # 2) Momentum/trend features (differences for linear models).
     momentum_targets = ["load_actual_entsoe", "da_price_eur"]
