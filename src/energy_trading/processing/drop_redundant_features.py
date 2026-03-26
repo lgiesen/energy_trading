@@ -2,8 +2,8 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.processing.drop_redundant_features \
-        --in data/processed/all_data.parquet \
-        --out data/processed/all_data_refined.parquet
+        --in data/processed/all_data_refined.parquet \
+        --out data/processed/all_data_pruned.parquet
 """
 from __future__ import annotations
 
@@ -43,6 +43,14 @@ USER_REQUESTED_DROPS = [
     "activation_rate_phys_neg",
     "activation_rate_ml_pos",
     "activation_rate_ml_neg",
+    # Final-prune request for compact ML table.
+    "capacity_import_export_mw_pos",
+    "capacity_import_export_mw_neg",
+    "load_actual_entsoe",
+    "load_forecast_da_entsoe",
+    # Remove raw real-time PICASSO base channels (leakage risk as direct inputs).
+    "afrr_picasso_mw_pos",
+    "afrr_picasso_mw_neg",
 ]
 
 # Exact duplicates identified in audit (Pearson r=1.000 against canonical columns).
@@ -55,11 +63,21 @@ EXACT_DUPLICATES_AUDIT = [
     "awarded_capacity_mw_neg",
     "bid_alloc_mw_pos",
     "bid_alloc_mw_neg",
+    # Remove linear combinations of POS/NEG channels to reduce perfect collinearity.
+    "afrr_picasso_net_mw",
+    "afrr_picasso_churn_mw",
     "picasso_flow_rate",
 ]
 
 # Extend this list as audit iterations discover additional non-ML/redundant fields.
 ADDITIONAL_AUDIT_DROPS: list[str] = []
+
+# Protection clause: keep causal lag features and regime flags even if a future
+# wildcard/regex drop rule becomes too broad.
+PROTECTED_KEEP = {
+    "market_regime_picasso",
+    "is_picasso_regime",
+}
 
 # Statistical overload pruning (rolling-window redundancy).
 # This list can host explicit manual additions; dynamic pattern-based drops are
@@ -137,6 +155,11 @@ HYDRO_COMPONENT_COLS = [
 
 AUDIT_REQUESTED_DROPS = [
     "wind_forecast_de",
+]
+
+BASELOAD_COMPONENT_DROPS = [
+    "biomass_actual_entsoe",
+    "generation_nuclear_mw",
 ]
 
 
@@ -304,47 +327,20 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
             )
         )
 
-    # Baseload consolidation: drop nuclear if mostly zero after 04/2023,
-    # otherwise combine biomass + nuclear into one baseload channel.
-    nuclear_drop_cols: list[str] = []
-    if "generation_nuclear_mw" in df_out.columns:
-        nuclear_drop = False
-        if "timestamp_utc" in df_out.columns:
-            ts = pl.col("timestamp_utc").cast(pl.Datetime(time_zone="UTC"), strict=False)
-            post_cut = df_out.filter(ts >= pl.datetime(2023, 5, 1, 0, 0, 0, time_zone="UTC"))
-        else:
-            post_cut = df_out
-
-        if post_cut.height > 0:
-            stats = post_cut.select(
-                [
-                    pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False).is_not_null().sum().alias("n_non_null"),
-                    (
-                        (pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False) == 0.0)
-                        & pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False).is_not_null()
-                    ).sum().alias("n_zero_like"),
-                ]
-            ).to_dicts()[0]
-            n_non_null = int(stats["n_non_null"])
-            n_zero_like = int(stats["n_zero_like"])
-            zero_share = (n_zero_like / n_non_null) if n_non_null > 0 else 1.0
-            nuclear_drop = zero_share >= 0.95
-            LOGGER.info(
-                "Nuclear post-2023-04 zero-share=%0.3f (n=%s), drop=%s",
-                zero_share,
-                n_non_null,
-                nuclear_drop,
-            )
-
-        if nuclear_drop:
-            nuclear_drop_cols.append("generation_nuclear_mw")
-        elif "biomass_actual_entsoe" in df_out.columns:
-            df_out = df_out.with_columns(
-                (
-                    pl.col("biomass_actual_entsoe").cast(pl.Float64, strict=False)
-                    + pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False)
-                ).alias("generation_baseload_total")
-            )
+    # Stable Baseload consolidation for thesis consistency:
+    # Always aggregate biomass + nuclear; if nuclear is zero this remains biomass.
+    if all(c in df_out.columns for c in BASELOAD_COMPONENT_DROPS):
+        df_out = df_out.with_columns(
+            (
+                pl.col("biomass_actual_entsoe").cast(pl.Float64, strict=False)
+                + pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False)
+            ).alias("generation_baseload_total")
+        )
+    else:
+        LOGGER.warning(
+            "Skipping generation_baseload_total: missing inputs %s",
+            [c for c in BASELOAD_COMPONENT_DROPS if c not in df_out.columns],
+        )
 
     # Hydro total: aggregate hydro actual components into one robust signal.
     hydro_existing = [c for c in HYDRO_COMPONENT_COLS if c in df_out.columns]
@@ -370,11 +366,12 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
         if any(pat in c.lower() for pat in ACTIVATION_PRICE_REDUNDANCY_PATTERNS)
     ]
 
-    # Compose one final drop set and apply with exclude for safety.
+    # Compose one final drop set and apply via exclude.
+    # Using `exclude` keeps this step idempotent: rerunning on already-pruned
+    # datasets won't fail if some columns are already absent.
     dynamic_stat_drops = _derive_statistical_overload_drops(df_out.columns)
-    all_to_drop = sorted(
+    all_to_exclude = sorted(
         set(DROP_COLS)
-        .union(nuclear_drop_cols)
         .union(USER_REQUESTED_DROPS)
         .union(EXACT_DUPLICATES_AUDIT)
         .union(STATISTICAL_OVERLOAD_DROPS)
@@ -385,13 +382,19 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
         .union(BALANCE_SIGNAL_DROPS)
         .union(FOSSIL_COMPONENT_DROPS)
         .union(HYDRO_COMPONENT_COLS)
+        .union(BASELOAD_COMPONENT_DROPS)
         .union(RENEWABLE_DA_FORECAST_DROPS)
         .union(SPREAD_FOCUS_DROPS)
         .union(AUDIT_REQUESTED_DROPS)
         .union(activation_price_pattern_drops)
         .union(metadata_drops)
     )
-    removed_existing = [c for c in all_to_drop if c in df_out.columns]
+    # Never drop lag features or protected regime indicators.
+    removed_existing = [
+        c
+        for c in all_to_exclude
+        if c in df_out.columns and ("lag" not in c.lower()) and (c not in PROTECTED_KEEP)
+    ]
     if removed_existing:
         df_out = df_out.select(pl.all().exclude(removed_existing))
 
@@ -421,14 +424,14 @@ def main() -> None:
     parser.add_argument(
         "--in",
         dest="input_path",
-        default="data/processed/all_data.parquet",
-        help="Input merged parquet path.",
+        default="data/processed/all_data_refined.parquet",
+        help="Input refined parquet path.",
     )
     parser.add_argument(
         "--out",
         dest="output_path",
-        default="data/processed/all_data_refined.parquet",
-        help="Output refined parquet path.",
+        default="data/processed/all_data_pruned.parquet",
+        help="Output pruned parquet path.",
     )
     args = parser.parse_args()
 
