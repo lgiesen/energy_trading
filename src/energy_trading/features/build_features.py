@@ -56,6 +56,8 @@ DROP_FOR_MODEL = [
     "bid_provider_to_grid_share_pos",
     "afrr_reconstructed_marginal_price_pos",
     "afrr_reconstructed_marginal_price_neg",
+    # Keep only lagged PICASSO flow features in final ML table.
+    "picasso_flow_rate",
 ]
 
 # Removed due to >98% missing values identified in the feature audit.
@@ -302,8 +304,8 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     """Create pay-as-cleared targets for both economics and ML.
 
     Inputs required:
-    - `afrr_activation_marginal_price_pos`, `afrr_activation_marginal_price_neg`
-      (fallback to avg-activation columns if marginal columns are not present)
+    - primary: `afrr_vwap_pos`, `afrr_vwap_neg`
+    - fallback: marginal/average activation-price columns when VWAP is unavailable
     - activation magnitude columns:
       - preferred: `afrr_activated_mwh_pos`, `afrr_activated_mwh_neg`
       - fallback: `afrr_activated_mw_pos`, `afrr_activated_mw_neg`
@@ -314,11 +316,21 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     """
     pos_price_col = None
     neg_price_col = None
-    for cand in ("afrr_activation_marginal_price_pos", "afrr_avg_activation_price_pos", "afrr_activation_avg_price_pos"):
+    for cand in (
+        "afrr_vwap_pos",
+        "afrr_activation_marginal_price_pos",
+        "afrr_avg_activation_price_pos",
+        "afrr_activation_avg_price_pos",
+    ):
         if cand in df.columns:
             pos_price_col = cand
             break
-    for cand in ("afrr_activation_marginal_price_neg", "afrr_avg_activation_price_neg", "afrr_activation_avg_price_neg"):
+    for cand in (
+        "afrr_vwap_neg",
+        "afrr_activation_marginal_price_neg",
+        "afrr_avg_activation_price_neg",
+        "afrr_activation_avg_price_neg",
+    ):
         if cand in df.columns:
             neg_price_col = cand
             break
@@ -839,6 +851,9 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     - `mfrr_active_lag`: lagged mFRR activity flag (1 if activation > 0 else 0)
     - `nrv_zscore_24h`: 24h z-score of NRV balance
     - `picasso_flow_rate`: cross-border balancing flow proxy
+    - `picasso_flow_rate_lag_1h`: 1-hour lag of PICASSO flow
+    - `picasso_flow_rate_lag_24h`: 24-hour lag of PICASSO flow
+    - `is_picasso_regime`: 1 from 2024-06-01 UTC onward, else 0
     - `grid_stress_index`: composite stress score in [0, 1]
     - `market_regime_picasso`: 0 before 2022-06-22 UTC, 1 from 2022-06-22 UTC onward
 
@@ -889,13 +904,19 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
         nrv_abs = pd.Series(0.0, index=pdf.index)
 
     # 3) PICASSO flow proxy.
-    if "afrr_optimization_mwh" in pdf.columns:
+    # Do not fallback to capacity-market import/export channels:
+    # capacity snapshots are not a valid substitute for real-time PICASSO energy flow.
+    if "picasso_flow_rate" in pdf.columns:
+        picasso = pd.to_numeric(pdf["picasso_flow_rate"], errors="coerce").fillna(0.0)
+    elif "afrr_optimization_mwh" in pdf.columns:
         picasso = pd.to_numeric(pdf["afrr_optimization_mwh"], errors="coerce").fillna(0.0)
-    elif "net_import_export_mw" in pdf.columns:
-        picasso = pd.to_numeric(pdf["net_import_export_mw"], errors="coerce").fillna(0.0)
     else:
         picasso = pd.Series(0.0, index=pdf.index)
     pdf["picasso_flow_rate"] = picasso
+    pdf["picasso_flow_rate_lag_1h"] = picasso.shift(steps_per_hour).fillna(0.0)
+    pdf["picasso_flow_rate_lag_24h"] = picasso.shift(24 * steps_per_hour).fillna(0.0)
+    picasso_regime_start = pd.Timestamp("2024-06-01 00:00:00+00:00")
+    pdf["is_picasso_regime"] = (pdf["timestamp_utc"] >= picasso_regime_start).astype(np.int8)
 
     # 4) Composite stress index in [0, 1].
     nrv_norm_den = nrv_abs.rolling(window_24h, min_periods=2).max().replace(0.0, np.nan)
@@ -913,62 +934,49 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     return pl.from_pandas(pdf)
 
 
-def add_time_features(
-    df: pd.DataFrame,
-    datetime_col: str = "timestamp_utc",
-    user_col: str = "user_id",
-) -> pd.DataFrame:
-    """Add vectorized calendar/cyclical/user-recency time features.
+def add_time_features(df: pl.DataFrame, datetime_col: str = "timestamp_utc") -> pl.DataFrame:
+    """Add vectorized market time features for hourly power-market series.
 
-    Notes:
-    - Uses only pandas/numpy vectorized operations (no row-wise apply).
-    - `days_since_last_activation` is grouped by `user_col` and filled with -1
-      for each user's first event.
+    Scope:
+    - cyclical encodings (hour/weekday/month)
+    - calendar/daypart flags
+    - stable sorting by timestamp
     """
     if datetime_col not in df.columns:
         raise KeyError(f"Missing datetime column: {datetime_col}")
-    if user_col not in df.columns:
-        raise KeyError(f"Missing user column: {user_col}")
 
-    out = df.copy()
-    out[datetime_col] = pd.to_datetime(out[datetime_col], utc=True, errors="coerce")
-    if out[datetime_col].isna().any():
-        raise ValueError(f"Column '{datetime_col}' contains invalid datetimes.")
+    out = df.sort(datetime_col)
 
-    out = out.sort_values([user_col, datetime_col], kind="mergesort")
+    hour_expr = pl.col(datetime_col).dt.hour().cast(pl.Float64)
+    weekday_expr = pl.col(datetime_col).dt.weekday().cast(pl.Float64)  # 0..6
+    month_expr = pl.col(datetime_col).dt.month().cast(pl.Float64)  # 1..12
+    day_expr = pl.col(datetime_col).dt.day()
 
-    dt = out[datetime_col].dt
-    hour = dt.hour.to_numpy()
-    weekday = dt.weekday.to_numpy()  # 0..6
-    month = dt.month.to_numpy()  # 1..12
-    day = dt.day.to_numpy()
-
-    # 1) Cyclical features.
-    out["hour_sin"] = np.sin(2.0 * np.pi * hour / 24.0)
-    out["hour_cos"] = np.cos(2.0 * np.pi * hour / 24.0)
-    out["weekday_sin"] = np.sin(2.0 * np.pi * weekday / 7.0)
-    out["weekday_cos"] = np.cos(2.0 * np.pi * weekday / 7.0)
-    out["month_sin"] = np.sin(2.0 * np.pi * month / 12.0)
-    out["month_cos"] = np.cos(2.0 * np.pi * month / 12.0)
-
-    # 2) Calendar/economic indicators.
-    out["is_weekend"] = (weekday >= 5).astype(np.int8)
-    out["is_payday_period"] = ((day >= 27) | (day <= 3)).astype(np.int8)
-
-    # 3) Daypart one-hot features.
-    out["is_morning"] = ((hour >= 6) & (hour <= 11)).astype(np.int8)
-    out["is_afternoon"] = ((hour >= 12) & (hour <= 16)).astype(np.int8)
-    out["is_evening"] = ((hour >= 17) & (hour <= 22)).astype(np.int8)
-    out["is_night"] = ((hour >= 23) | (hour <= 5)).astype(np.int8)
-
-    # 4) User-level recency delta (days).
-    delta_days = (
-        out.groupby(user_col, sort=False)[datetime_col]
-        .diff()
-        .dt.total_seconds()
-        .div(86400.0)
+    # Cyclical encodings prevent artificial discontinuities (e.g. 23:00 vs 00:00).
+    out = out.with_columns(
+        [
+            (2.0 * np.pi * hour_expr / 24.0).sin().alias("hour_sin"),
+            (2.0 * np.pi * hour_expr / 24.0).cos().alias("hour_cos"),
+            (2.0 * np.pi * weekday_expr / 7.0).sin().alias("weekday_sin"),
+            (2.0 * np.pi * weekday_expr / 7.0).cos().alias("weekday_cos"),
+            (2.0 * np.pi * month_expr / 12.0).sin().alias("month_sin"),
+            (2.0 * np.pi * month_expr / 12.0).cos().alias("month_cos"),
+            (pl.col(datetime_col).dt.weekday() >= 5).cast(pl.Int8).alias("is_weekend"),
+            ((day_expr >= 27) | (day_expr <= 3)).cast(pl.Int8).alias("is_payday_period"),
+            ((pl.col(datetime_col).dt.hour() >= 6) & (pl.col(datetime_col).dt.hour() <= 11)).cast(pl.Int8).alias(
+                "is_morning"
+            ),
+            ((pl.col(datetime_col).dt.hour() >= 12) & (pl.col(datetime_col).dt.hour() <= 16))
+            .cast(pl.Int8)
+            .alias("is_afternoon"),
+            ((pl.col(datetime_col).dt.hour() >= 17) & (pl.col(datetime_col).dt.hour() <= 22)).cast(pl.Int8).alias(
+                "is_evening"
+            ),
+            ((pl.col(datetime_col).dt.hour() >= 23) | (pl.col(datetime_col).dt.hour() <= 5)).cast(pl.Int8).alias(
+                "is_night"
+            ),
+        ]
     )
-    out["days_since_last_activation"] = delta_days.fillna(-1.0).astype(np.float64)
     return out
 
 
@@ -1341,43 +1349,6 @@ def run_feature_sanity_checks(df_features: pd.DataFrame | pl.DataFrame) -> None:
     assert err_e <= 1e-12, f"Test E failed: max_abs_error={err_e}"
 
 
-def merge_outages_sidecar(
-    df: pl.DataFrame,
-    outages_path: Path | None = None,
-) -> pl.DataFrame:
-    """Left-join outage sidecar onto main table in a causally safe way."""
-    if outages_path is None:
-        outages_path = Path("data/processed/outages_hourly.parquet")
-    if "timestamp_utc" not in df.columns:
-        return df
-    if not outages_path.exists():
-        return df.with_columns([
-            pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
-            pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
-        ])
-
-    outages = pl.read_parquet(outages_path)
-    if "timestamp_utc" not in outages.columns and "timestamp" in outages.columns:
-        outages = outages.rename({"timestamp": "timestamp_utc"})
-    if "timestamp_utc" not in outages.columns:
-        return df.with_columns([
-            pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
-            pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
-        ])
-
-    keep_cols = ["timestamp_utc", "planned_outages_mw", "unplanned_outages_mw"]
-    keep_cols = [c for c in keep_cols if c in outages.columns]
-    outages = outages.select(keep_cols)
-
-    merged = df.join(outages, on="timestamp_utc", how="left")
-    for c in ("planned_outages_mw", "unplanned_outages_mw"):
-        if c in merged.columns:
-            merged = merged.with_columns(pl.col(c).cast(pl.Float64).fill_null(0.0).alias(c))
-        else:
-            merged = merged.with_columns(pl.lit(0.0).cast(pl.Float64).alias(c))
-    return merged
-
-
 def truncate_to_complete_information_core(df: pl.DataFrame) -> pl.DataFrame:
     """Trim leading/trailing NaN zones to keep the complete information core.
 
@@ -1448,8 +1419,6 @@ def build_features(input_path: Path, output_path: Path) -> None:
     df = pl.read_parquet(input_path)
     if "timestamp_utc" in df.columns:
         df = df.sort("timestamp_utc")
-    # Merge outage sidecar before causal lag layer; missing means no outage.
-    df = merge_outages_sidecar(df, outages_path=Path("data/processed/outages_hourly.parquet"))
     # Removed due to >98% missing values identified in the feature audit.
     high_missing_drop = [c for c in DROP_HIGH_MISSING_BEFORE_FEATURES if c in df.columns]
     if high_missing_drop:
@@ -1488,10 +1457,9 @@ def build_features(input_path: Path, output_path: Path) -> None:
     df = add_multi_output_targets(df, horizon_hours=72)
 
     # --- STEP 6: CLEANUP & DROP ---
-    # Optional: generic time features for user-centric datasets.
-    # For this thesis pipeline, many datasets are system-level and may not include user_id.
-    if "timestamp_utc" in df.columns and "user_id" in df.columns:
-        df = pl.from_pandas(add_time_features(df.to_pandas(), datetime_col="timestamp_utc", user_col="user_id"))
+    # Market-time features are always added when timestamp is available.
+    if "timestamp_utc" in df.columns:
+        df = add_time_features(df, datetime_col="timestamp_utc")
 
     drop_cols = [c for c in DROP_FOR_MODEL if c in df.columns]
     if drop_cols:
@@ -1509,8 +1477,8 @@ def main() -> None:
     parser.add_argument(
         "--in",
         dest="input_path",
-        default="data/processed/all_data_refined.parquet",
-        help="Input parquet (default: data/processed/all_data_refined.parquet).",
+        default="data/processed/all_data_transformed.parquet",
+        help="Input parquet (default: data/processed/all_data_transformed.parquet).",
     )
     parser.add_argument(
         "--out",
