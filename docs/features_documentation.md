@@ -1,239 +1,306 @@
-# Feature Documentation (Current Pipeline State)
+# Feature Documentation (Auto-Synced)
 
-This document is synchronized with the current refinement logic in
-`src/energy_trading/processing/drop_redundant_features.py` and the resulting
-refined dataset (`data/processed/all_data_refined.parquet`, 57 columns).
+This file is synchronized to the current final feature artifact:
 
-## Scope
+- `data/features/all_data_features.parquet`
+- Snapshot timestamp (UTC): 2026-03-26 18:12:50
+- Total columns: **279**
 
-- Purpose: document the model-ready *refined* feature table before downstream
-  training/feature expansion.
-- Time standard: UTC only (`timestamp_utc`).
-- Design objective: reduce redundancy, prevent multicollinearity, and keep
-  economically interpretable features for DA/aFRR forecasting.
+## 1) Scope and Governance
 
-## 1) Drop Logic Synchronization
+- This document reflects the final model table that is consumed by notebooks/training scripts.
+- Any pipeline refactor that changes column names/counts should regenerate this file.
+- Ground-truth target columns remain in the dataset by design and are dropped from `X` only right before model fitting in `data_prep.py`.
 
-### A. Redundant Sources (SMARD vs ENTSO-E)
+## 2) Column Group Summary
 
-SMARD duplicates were removed where ENTSO-E-based signals are preferred for
-consistency in the thesis pipeline.
+- Horizon targets (`target_pos_h*`, `target_neg_h*`): **144**
+- Base targets (`y_true_*`, `y_train_*`): **4**
+- Lag features (`*_lag*`): **31**
+- Statistical transforms (`mean/std/ewma/diff/zscore/volatility/quantile`): **15**
+- Cyclical and calendar features (`*_sin`, `*_cos`, calendar flags): **17**
+- Other core features (market/fundamental/regime/exogenous): **68**
 
-Removed examples:
-- `wind_onshore_actual`, `wind_offshore_actual`, `solar_actual`
-- `wind_onshore_forecast`, `wind_offshore_forecast`, `solar_forecast`
-- legacy error columns (`wind_onshore_error`, `wind_offshore_error`,
-  `solar_error`)
+## 3) Full Column Inventory (Exact, Ordered)
 
-Reason:
-- avoid parallel source definitions of the same physical quantity,
-- keep one canonical lineage for auditability.
-
-### B. Multicollinearity Reduction (VIF-focused)
-
-Kept as canonical price/saldo signals:
-- `afrr_vwap_pos`, `afrr_vwap_neg`
-- `NRV_balance`
-
-Removed as redundant/competing definitions:
-- activation price variants containing:
-  - `avg_activation_price`
-  - `marginal_activation_price`
-  - `bid_avg_activation_price`
-- balance alternatives: `rz_saldo_mw`, `reBAP_shortage_surplus`
-
-Reason:
-- multiple price and saldo variants were strongly collinear and caused
-  instability for linear/regularized models.
-
-### C. Logical Aggregations
-
-Implemented aggregations:
-- `neighbor_spread_avg`
-- `generation_fossil_total_mw`
-- `generation_baseload_total`
-- `generation_hydro_actual_total`
-
-and dropped component columns after aggregation.
-
-Reason:
-- reduce dimensionality while preserving economic signal.
-
-### D. Technical Cleanup
-
-Removed:
-- `timestamp_cet`
-
-Kept:
-- `timestamp_utc`
-
-Reason:
-- avoid duplicate time axes and enforce one timezone standard across training,
-  validation, and backtests.
-
-## 2) Engineered Features (Definitions & Formulas)
-
-### Residual Load Features
-
-- `residual_load_forecast` [MW]
-  - Formula:
-    `load_forecast_da_entsoe - solar_forecast_id_entsoe - wind_onshore_forecast_id_entsoe - wind_offshore_forecast_id_entsoe`
-  - Meaning: expected non-renewable net demand.
-
-- `residual_load_actual` [MW]
-  - Formula:
-    `load_actual_entsoe - solar_actual_entsoe - wind_onshore_actual_entsoe - wind_offshore_actual_entsoe`
-  - Meaning: realized non-renewable net demand.
-
-### Renewable Share Feature
-
-- `renewable_share_forecast` [ratio, 0..1+ depending on forecast/load relation]
-  - Formula:
-    `(solar_forecast_id_entsoe + wind_onshore_forecast_id_entsoe + wind_offshore_forecast_id_entsoe) / load_forecast_da_entsoe`
-  - Meaning: expected renewable penetration in load.
-
-### Cross-Border Price Pressure
-
-- `neighbor_spread_avg` [EUR/MWh]
-  - Formula:
-    `mean(da_price_AT, BE, CH, CZ, DK1, DK2, FR, NL, PL, SE4) - da_price_eur`
-  - Meaning: regional price pressure relative to Germany.
-
-### Forecast Update Features
-
-- `wind_onshore_forecast_update` [MW]
-  - Formula:
-    `wind_onshore_forecast_id_entsoe - wind_onshore_forecast_da_entsoe`
-- `solar_forecast_update` [MW]
-  - Formula:
-    `solar_forecast_id_entsoe - solar_forecast_da_entsoe`
-
-Interpretation:
-- captures new information arriving between DA and intraday forecast stages.
-
-### Capacity Import/Export Directional Logic
-
-From `fetch_regelleistung.py`, capacity products are parsed from block products
-(e.g. `POS_00_04`, `NEG_12_16`), expanded to hourly rows, and direction-split.
-
-Produced columns:
-- `capacity_import_export_mw_pos` [MW]
-- `capacity_import_export_mw_neg` [MW]
-
-Important implementation detail:
-- 4h block values are replicated to each hourly row (not divided by 4),
-  consistent with `[MW]` and `[(EUR/MW)/h]` semantics.
-
-## 3) Final Refined Column Set (57)
-
-### Time
-- `timestamp_utc`
-
-### Load / Residual / Forecast Core
-- `load_actual_entsoe` [MW]
-- `load_forecast_da_entsoe` [MW]
-- `residual_load_actual` [MW]
-- `residual_load_forecast` [MW]
-- `renewable_share_forecast` [ratio]
-
-### Renewable Actuals and Forecast Inputs
-- `wind_onshore_actual_entsoe` [MW]
-- `wind_offshore_actual_entsoe` [MW]
-- `solar_actual_entsoe` [MW]
-- `wind_onshore_forecast_id_entsoe` [MW]
-- `wind_offshore_forecast_id_entsoe` [MW]
-- `solar_forecast_id_entsoe` [MW]
-- `wind_onshore_error_da` [MW]
-- `wind_offshore_error_da` [MW]
-- `solar_error_da` [MW]
-- `wind_onshore_forecast_update` [MW]
-- `solar_forecast_update` [MW]
-
-### Balancing Activation / Flows
-- `NRV_balance` [MW]
-- `afrr_activated_mw_pos` [MW]
-- `afrr_activated_mw_neg` [MW]
-- `mfrr_activated_mw_pos` [MW]
-- `mfrr_activated_mw_neg` [MW]
-- `afrr_picasso_mw_pos` [MW]
-- `afrr_picasso_mw_neg` [MW]
-- `afrr_picasso_net_mw` [MW]
-- `mfrr_mari_mw_pos` [MW]
-- `mfrr_mari_mw_neg` [MW]
-- `mfrr_mari_net_mw` [MW]
-- `capacity_import_export_mw_pos` [MW]
-- `capacity_import_export_mw_neg` [MW]
-- `net_import_export_mw` [MW]
-- `system_stress_signal` [composite index/MW-equivalent]
-
-### aFRR Prices and Offered Capacities
-- `afrr_vwap_pos` [EUR/MWh]
-- `afrr_vwap_neg` [EUR/MWh]
-- `afrr_capacity_price_pos` [EUR/MW/h]
-- `afrr_capacity_price_neg` [EUR/MW/h]
-- `afrr_capacity_offered_mw_pos` [MW]
-- `afrr_capacity_offered_mw_neg` [MW]
-- `afrr_activation_offered_mw_pos` [MW]
-- `afrr_activation_offered_mw_neg` [MW]
-
-### Energy Prices and Exogenous Commodities
-- `da_price_eur` [EUR/MWh]
-- `gas_price_ttf` [market quote]
-- `coal_price_api2` [market quote]
-- `co2_price_eua` [market quote]
-
-### Generation and Capacity Structure
-- `generation_hydro_pumped_storage_mw` [MW]
-- `generation_fossil_total_mw` [MW]
-- `generation_baseload_total` [MW]
-- `generation_hydro_actual_total` [MW]
-- `wind_onshore_capacity` [MW]
-- `wind_offshore_capacity` [MW]
-- `solar_capacity` [MW]
-- `gas_capacity` [MW]
-- `hard_coal_capacity` [MW]
-- `lignite_capacity` [MW]
-- `pumped_storage_capacity` [MW]
-
-### Cross-Border Price Aggregate
-- `neighbor_spread_avg` [EUR/MWh]
-
-## 4) Veraltete Dokumentation entfernt / korrigiert
-
-The following are no longer active in the refined 57-column set and must not be
-interpreted as current model inputs in this stage:
-- foreign raw DA prices (`da_price_AT`, ..., `da_price_SE4`)
-- `neighbor_price_avg`
-- `rz_saldo_mw`, `reBAP_shortage_surplus`
-- activation price families based on `avg_activation_price`,
-  `marginal_activation_price`, `bid_avg_activation_price`
-- `timestamp_cet`
-- `biomass_actual_entsoe`, `generation_nuclear_mw` (replaced by
-  `generation_baseload_total`)
-
-## 5) Unit Check (Current)
-
-- Power/flow/capacity channels: MW
-- Activation energy price and DA/ID prices: EUR/MWh
-- Capacity prices: EUR/MW/h
-- Ratio features: dimensionless (`renewable_share_forecast`)
-- Composite signals (`system_stress_signal`): documented as composite index
-  or MW-equivalent proxy depending on upstream definition.
-
-## To-Do: Missing Info
-
-1. `system_stress_signal`
-- Confirm exact upstream formula and normalization bounds in final pipeline
-  run used for thesis tables.
-
-2. `net_import_export_mw` vs directional pair
-- Confirm sign convention and intended canonical usage when both
-  `capacity_import_export_mw_pos/neg` and `net_import_export_mw` exist.
-
-3. Commodity units metadata
-- Add canonical unit metadata for `gas_price_ttf`, `coal_price_api2`,
-  `co2_price_eua` (provider-specific quotation conventions).
-
-4. Capacity-source lineage table
-- Add explicit per-column lineage for capacities (ENTSO-E vs fallback source)
-  for audit appendix completeness.
+| # | Column Name |
+|---:|---|
+| 1 | `wind_onshore_actual_entsoe` |
+| 2 | `wind_offshore_actual_entsoe` |
+| 3 | `solar_actual_entsoe` |
+| 4 | `wind_onshore_forecast_id_entsoe` |
+| 5 | `wind_offshore_forecast_id_entsoe` |
+| 6 | `solar_forecast_id_entsoe` |
+| 7 | `NRV_balance` |
+| 8 | `afrr_activated_mw_pos` |
+| 9 | `afrr_activated_mw_neg` |
+| 10 | `mfrr_activated_mw_pos` |
+| 11 | `mfrr_activated_mw_neg` |
+| 12 | `mfrr_mari_net_mw` |
+| 13 | `afrr_capacity_price_neg` |
+| 14 | `afrr_capacity_price_pos` |
+| 15 | `afrr_capacity_offered_mw_neg` |
+| 16 | `afrr_capacity_offered_mw_pos` |
+| 17 | `afrr_activation_offered_mw_neg` |
+| 18 | `afrr_activation_offered_mw_pos` |
+| 19 | `afrr_vwap_pos` |
+| 20 | `afrr_vwap_neg` |
+| 21 | `generation_hydro_pumped_storage_mw` |
+| 22 | `da_price_eur` |
+| 23 | `system_stress_signal` |
+| 24 | `wind_onshore_capacity` |
+| 25 | `wind_offshore_capacity` |
+| 26 | `solar_capacity` |
+| 27 | `gas_capacity` |
+| 28 | `hard_coal_capacity` |
+| 29 | `lignite_capacity` |
+| 30 | `pumped_storage_capacity` |
+| 31 | `gas_price_ttf` |
+| 32 | `coal_price_api2` |
+| 33 | `co2_price_eua` |
+| 34 | `planned_outages_mw` |
+| 35 | `unplanned_outages_mw` |
+| 36 | `timestamp_utc` |
+| 37 | `is_local_reconstruction_only` |
+| 38 | `afrr_capacity_awarded_mw_pos` |
+| 39 | `afrr_capacity_awarded_mw_neg` |
+| 40 | `wind_total_error_da` |
+| 41 | `solar_error_da` |
+| 42 | `wind_forecast_update` |
+| 43 | `residual_load_calc` |
+| 44 | `simulated_afrr_profit_eur` |
+| 45 | `residual_load_forecast` |
+| 46 | `renewable_share_forecast` |
+| 47 | `neighbor_spread_avg` |
+| 48 | `generation_fossil_total_mw` |
+| 49 | `generation_baseload_total` |
+| 50 | `generation_hydro_actual_total` |
+| 51 | `wind_onshore_error_da` |
+| 52 | `wind_offshore_error_da` |
+| 53 | `wind_onshore_forecast_update` |
+| 54 | `solar_forecast_update` |
+| 55 | `da_price_eur_slog1p` |
+| 56 | `y_true_pos` |
+| 57 | `y_true_neg` |
+| 58 | `y_train_pos` |
+| 59 | `y_train_neg` |
+| 60 | `data_is_lagged` |
+| 61 | `pit_lagged_column_count` |
+| 62 | `da_price_volatility_30d` |
+| 63 | `wind_onshore_error_id` |
+| 64 | `wind_offshore_error_id` |
+| 65 | `solar_error_id` |
+| 66 | `total_wind_solar_id_error` |
+| 67 | `da_price_eur_mean_24h` |
+| 68 | `da_price_eur_std_24h` |
+| 69 | `da_price_eur_mean_168h` |
+| 70 | `da_price_eur_std_168h` |
+| 71 | `wind_onshore_actual_entsoe_mean_24h` |
+| 72 | `wind_onshore_actual_entsoe_std_24h` |
+| 73 | `wind_onshore_actual_entsoe_mean_168h` |
+| 74 | `wind_onshore_actual_entsoe_std_168h` |
+| 75 | `holiday_severity` |
+| 76 | `is_bridge_day` |
+| 77 | `is_christmas_break` |
+| 78 | `mfrr_active_lag` |
+| 79 | `nrv_zscore_24h` |
+| 80 | `picasso_flow_rate_lag_1h` |
+| 81 | `picasso_flow_rate_lag_24h` |
+| 82 | `is_picasso_regime` |
+| 83 | `grid_stress_index` |
+| 84 | `market_regime_picasso` |
+| 85 | `afrr_da_price_spread` |
+| 86 | `relative_price_competitiveness` |
+| 87 | `price_volatility_short_term` |
+| 88 | `scarcity_price_premium` |
+| 89 | `is_activated` |
+| 90 | `TE_hour_regime_activation` |
+| 91 | `market_state_cluster` |
+| 92 | `nrv_quantile_5` |
+| 93 | `da_price_eur_lag24` |
+| 94 | `da_price_eur_lag48` |
+| 95 | `da_price_eur_lag168` |
+| 96 | `wind_onshore_actual_entsoe_lag24` |
+| 97 | `wind_onshore_actual_entsoe_lag48` |
+| 98 | `wind_onshore_actual_entsoe_lag168` |
+| 99 | `afrr_vwap_pos_lag1` |
+| 100 | `afrr_vwap_pos_lag24` |
+| 101 | `afrr_vwap_pos_lag_1h` |
+| 102 | `afrr_vwap_pos_lag_24h` |
+| 103 | `afrr_vwap_neg_lag1` |
+| 104 | `afrr_vwap_neg_lag24` |
+| 105 | `afrr_vwap_neg_lag_1h` |
+| 106 | `afrr_vwap_neg_lag_24h` |
+| 107 | `afrr_activated_mw_pos_lag1` |
+| 108 | `afrr_activated_mw_pos_lag24` |
+| 109 | `afrr_activated_mw_pos_lag_1h` |
+| 110 | `afrr_activated_mw_pos_lag_24h` |
+| 111 | `afrr_activated_mw_neg_lag1` |
+| 112 | `afrr_activated_mw_neg_lag24` |
+| 113 | `afrr_activated_mw_neg_lag_1h` |
+| 114 | `afrr_activated_mw_neg_lag_24h` |
+| 115 | `afrr_da_price_spread_lag1` |
+| 116 | `afrr_da_price_spread_lag24` |
+| 117 | `afrr_da_price_spread_lag_1h` |
+| 118 | `afrr_da_price_spread_lag_24h` |
+| 119 | `da_price_eur_diff1` |
+| 120 | `da_price_eur_diff24` |
+| 121 | `da_price_eur_ewma24` |
+| 122 | `hour_sin` |
+| 123 | `hour_cos` |
+| 124 | `dayofweek_sin` |
+| 125 | `dayofweek_cos` |
+| 126 | `month_sin` |
+| 127 | `month_cos` |
+| 128 | `target_pos_h1` |
+| 129 | `target_neg_h1` |
+| 130 | `target_pos_h2` |
+| 131 | `target_neg_h2` |
+| 132 | `target_pos_h3` |
+| 133 | `target_neg_h3` |
+| 134 | `target_pos_h4` |
+| 135 | `target_neg_h4` |
+| 136 | `target_pos_h5` |
+| 137 | `target_neg_h5` |
+| 138 | `target_pos_h6` |
+| 139 | `target_neg_h6` |
+| 140 | `target_pos_h7` |
+| 141 | `target_neg_h7` |
+| 142 | `target_pos_h8` |
+| 143 | `target_neg_h8` |
+| 144 | `target_pos_h9` |
+| 145 | `target_neg_h9` |
+| 146 | `target_pos_h10` |
+| 147 | `target_neg_h10` |
+| 148 | `target_pos_h11` |
+| 149 | `target_neg_h11` |
+| 150 | `target_pos_h12` |
+| 151 | `target_neg_h12` |
+| 152 | `target_pos_h13` |
+| 153 | `target_neg_h13` |
+| 154 | `target_pos_h14` |
+| 155 | `target_neg_h14` |
+| 156 | `target_pos_h15` |
+| 157 | `target_neg_h15` |
+| 158 | `target_pos_h16` |
+| 159 | `target_neg_h16` |
+| 160 | `target_pos_h17` |
+| 161 | `target_neg_h17` |
+| 162 | `target_pos_h18` |
+| 163 | `target_neg_h18` |
+| 164 | `target_pos_h19` |
+| 165 | `target_neg_h19` |
+| 166 | `target_pos_h20` |
+| 167 | `target_neg_h20` |
+| 168 | `target_pos_h21` |
+| 169 | `target_neg_h21` |
+| 170 | `target_pos_h22` |
+| 171 | `target_neg_h22` |
+| 172 | `target_pos_h23` |
+| 173 | `target_neg_h23` |
+| 174 | `target_pos_h24` |
+| 175 | `target_neg_h24` |
+| 176 | `target_pos_h25` |
+| 177 | `target_neg_h25` |
+| 178 | `target_pos_h26` |
+| 179 | `target_neg_h26` |
+| 180 | `target_pos_h27` |
+| 181 | `target_neg_h27` |
+| 182 | `target_pos_h28` |
+| 183 | `target_neg_h28` |
+| 184 | `target_pos_h29` |
+| 185 | `target_neg_h29` |
+| 186 | `target_pos_h30` |
+| 187 | `target_neg_h30` |
+| 188 | `target_pos_h31` |
+| 189 | `target_neg_h31` |
+| 190 | `target_pos_h32` |
+| 191 | `target_neg_h32` |
+| 192 | `target_pos_h33` |
+| 193 | `target_neg_h33` |
+| 194 | `target_pos_h34` |
+| 195 | `target_neg_h34` |
+| 196 | `target_pos_h35` |
+| 197 | `target_neg_h35` |
+| 198 | `target_pos_h36` |
+| 199 | `target_neg_h36` |
+| 200 | `target_pos_h37` |
+| 201 | `target_neg_h37` |
+| 202 | `target_pos_h38` |
+| 203 | `target_neg_h38` |
+| 204 | `target_pos_h39` |
+| 205 | `target_neg_h39` |
+| 206 | `target_pos_h40` |
+| 207 | `target_neg_h40` |
+| 208 | `target_pos_h41` |
+| 209 | `target_neg_h41` |
+| 210 | `target_pos_h42` |
+| 211 | `target_neg_h42` |
+| 212 | `target_pos_h43` |
+| 213 | `target_neg_h43` |
+| 214 | `target_pos_h44` |
+| 215 | `target_neg_h44` |
+| 216 | `target_pos_h45` |
+| 217 | `target_neg_h45` |
+| 218 | `target_pos_h46` |
+| 219 | `target_neg_h46` |
+| 220 | `target_pos_h47` |
+| 221 | `target_neg_h47` |
+| 222 | `target_pos_h48` |
+| 223 | `target_neg_h48` |
+| 224 | `target_pos_h49` |
+| 225 | `target_neg_h49` |
+| 226 | `target_pos_h50` |
+| 227 | `target_neg_h50` |
+| 228 | `target_pos_h51` |
+| 229 | `target_neg_h51` |
+| 230 | `target_pos_h52` |
+| 231 | `target_neg_h52` |
+| 232 | `target_pos_h53` |
+| 233 | `target_neg_h53` |
+| 234 | `target_pos_h54` |
+| 235 | `target_neg_h54` |
+| 236 | `target_pos_h55` |
+| 237 | `target_neg_h55` |
+| 238 | `target_pos_h56` |
+| 239 | `target_neg_h56` |
+| 240 | `target_pos_h57` |
+| 241 | `target_neg_h57` |
+| 242 | `target_pos_h58` |
+| 243 | `target_neg_h58` |
+| 244 | `target_pos_h59` |
+| 245 | `target_neg_h59` |
+| 246 | `target_pos_h60` |
+| 247 | `target_neg_h60` |
+| 248 | `target_pos_h61` |
+| 249 | `target_neg_h61` |
+| 250 | `target_pos_h62` |
+| 251 | `target_neg_h62` |
+| 252 | `target_pos_h63` |
+| 253 | `target_neg_h63` |
+| 254 | `target_pos_h64` |
+| 255 | `target_neg_h64` |
+| 256 | `target_pos_h65` |
+| 257 | `target_neg_h65` |
+| 258 | `target_pos_h66` |
+| 259 | `target_neg_h66` |
+| 260 | `target_pos_h67` |
+| 261 | `target_neg_h67` |
+| 262 | `target_pos_h68` |
+| 263 | `target_neg_h68` |
+| 264 | `target_pos_h69` |
+| 265 | `target_neg_h69` |
+| 266 | `target_pos_h70` |
+| 267 | `target_neg_h70` |
+| 268 | `target_pos_h71` |
+| 269 | `target_neg_h71` |
+| 270 | `target_pos_h72` |
+| 271 | `target_neg_h72` |
+| 272 | `weekday_sin` |
+| 273 | `weekday_cos` |
+| 274 | `is_weekend` |
+| 275 | `is_payday_period` |
+| 276 | `is_morning` |
+| 277 | `is_afternoon` |
+| 278 | `is_evening` |
+| 279 | `is_night` |
