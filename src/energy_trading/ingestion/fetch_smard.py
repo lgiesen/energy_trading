@@ -441,11 +441,20 @@ def fetch_series_with_region_fallback(
     return merged
 
 
-def _resample_qh_to_hour(df: pl.DataFrame, col_name: str) -> pl.DataFrame:
+def _resample_qh_to_hour(df: pl.DataFrame, col_name: str, agg: str = "sum") -> pl.DataFrame:
+    """Resample quarter-hour series to hourly.
+
+    Aggregation policy:
+    - energy/volume series in [MWh]: use `sum`
+    - price/index series: use `mean`
+    """
+    if agg not in {"sum", "mean"}:
+        raise ValueError(f"Unsupported qh->hour aggregation: {agg}")
+    agg_expr = pl.col(col_name).sum() if agg == "sum" else pl.col(col_name).mean()
     return (
         df.sort("timestamp")
         .group_by_dynamic("timestamp", every="1h", closed="left", label="left")
-        .agg(pl.col(col_name).mean().alias(col_name))
+        .agg(agg_expr.alias(col_name))
         .sort("timestamp")
     )
 
@@ -459,6 +468,7 @@ def fetch_series_with_resolution_fallback(
     cutoff_ms: int,
     col_name: str,
     expected_hours: int,
+    qh_to_hour_agg: str = "sum",
 ) -> pl.DataFrame | None:
     """Try hour first; if missing/sparse, fallback to quarterhour and resample."""
     hourly = None
@@ -483,7 +493,7 @@ def fetch_series_with_resolution_fallback(
             break
     if qh is None:
         return hourly
-    return _resample_qh_to_hour(qh, col_name)
+    return _resample_qh_to_hour(qh, col_name, agg=qh_to_hour_agg)
 
 
 def fetch_smard(
@@ -534,7 +544,7 @@ def fetch_smard(
     expected_hours = int((end_ms - start_ms) / 3600000) + 1
     for col_name, candidates in GENERATION_CANDIDATES.items():
         series_df = None
-        # Nuclear + pumped storage: force quarterhour and resample to hourly mean.
+        # Nuclear + pumped storage are delivered as energy series; aggregate qh->hour by sum.
         if col_name in {"generation_nuclear_mw", "generation_hydro_pumped_storage_mw"}:
             for region_try in [DEFAULT_REGION, "DE"]:
                 series_df = fetch_series_with_candidates(
@@ -548,7 +558,7 @@ def fetch_smard(
                     col_name,
                 )
                 if series_df is not None and series_df.height > 0:
-                    series_df = _resample_qh_to_hour(series_df, col_name)
+                    series_df = _resample_qh_to_hour(series_df, col_name, agg="sum")
                     if region_try != DEFAULT_REGION:
                         LOGGER.warning("%s fell back to region=%s", col_name, region_try)
                     break
@@ -564,6 +574,7 @@ def fetch_smard(
                     cutoff_ms,
                     col_name,
                     expected_hours,
+                    qh_to_hour_agg="sum",
                 )
                 if series_df is not None and series_df.height > 0:
                     if region_try != DEFAULT_REGION:
