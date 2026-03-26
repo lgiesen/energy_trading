@@ -1,181 +1,240 @@
-# Feature Documentation for aFRR Battery Simulation
+# Feature Documentation (Current Pipeline State)
 
-This document describes engineered features used in
-`src/energy_trading/features/build_features.py`.
+This document is synchronized with the current refinement logic in
+`src/energy_trading/processing/drop_redundant_features.py` and the resulting
+refined dataset (`data/processed/all_data_refined.parquet`, 57 columns).
 
-## Data Latency & Information Set
+## Scope
 
-To prevent Look-Ahead Bias, the feature pipeline applies strict Point-in-Time (PiT)
-alignment before downstream feature engineering. Physical actuals are lagged by 2h
-and balancing/settlement-style observations are lagged by 1h. This ensures that each
-row only contains information that was physically available at prediction time.
+- Purpose: document the model-ready *refined* feature table before downstream
+  training/feature expansion.
+- Time standard: UTC only (`timestamp_utc`).
+- Design objective: reduce redundancy, prevent multicollinearity, and keep
+  economically interpretable features for DA/aFRR forecasting.
 
-| Feature Group | Applied Lag | Notes |
-|---|---|---|
-| ENTSO-E actuals (`*_actual_entsoe`, `generation_fossil_*`, `generation_nuclear_mw`, `generation_hydro_*`, `residual_load_actual`, `NRV_balance`) | 2 hours | Physical observations with publication delay |
-| Balancing/settlement-like streams (`afrr_activated_mw*`, `mfrr_activated_mw*`, `afrr_marginal_activation_price*`, `afrr_vwap*`, `reBAP_shortage_surplus*`, `afrr_picasso_mw*`, `afrr_picasso_net_mw`, `mfrr_mari_net_mw`, `price_intraday_eur`) | 1 hour | Finalized only after interval close / settlement publication |
-| Day-ahead market prices (`da_price_eur`, `da_price_*`) | 0 hours | Known for delivery day since D-1 13:00 CET/CEST; strict T-0 overlap in feature layer |
-| Capacity/calendar/fuel metadata | 0 hours | Available ex-ante |
+## 1) Drop Logic Synchronization
 
-### Information Gate (Feature Finalization Time)
+### A. Redundant Sources (SMARD vs ENTSO-E)
 
-The information gate defines the latest timestamp at which each feature class is
-considered available for a prediction made at decision time `T`.
+SMARD duplicates were removed where ENTSO-E-based signals are preferred for
+consistency in the thesis pipeline.
 
-| Feature Class | Gate Definition | Interpretation |
-|---|---|---|
-| ENTSO-E actuals and derived actual-based signals (`residual_load_calc`, `wind_total_error_da`) | finalized at `T-2h` | Values from `(T-2h, T]` are not visible to the model at `T`. |
-| Balancing/settlement streams (aFRR/mFRR activation and settlement-price proxies) | finalized at `T-1h` | The most recent hour is withheld to reflect settlement/operational delay. |
-| Day-ahead forecasts (`*_forecast_da*`) for sequence settings | publication-constrained by 13:00 Europe/Berlin and forecast horizon | Base/current-hour DA forecast columns are strict T-0. Publication gating with persistence fallback (`shift(24)`) is applied only to explicit future-horizon forecast columns (for example `*_forecast_da_*_h48`). |
-| Day-ahead market prices (`da_price_eur`, `da_price_*`) | finalized at `T` for delivery-day usage | Treated as strict T-0 in the feature layer (no publication gating). |
-| Calendar/metadata/capacity | finalized at `T` | No publication lag applied in the feature layer. |
+Removed examples:
+- `wind_onshore_actual`, `wind_offshore_actual`, `solar_actual`
+- `wind_onshore_forecast`, `wind_offshore_forecast`, `solar_forecast`
+- legacy error columns (`wind_onshore_error`, `wind_offshore_error`,
+  `solar_error`)
 
-Additional availability handling:
-- Day-ahead forecast publication gates are evaluated at 13:00 Europe/Berlin on D-1 of the target delivery day (DST-aware via timezone conversion).
-- Base/current-hour DA forecast columns remain strict T-0 and are not publication-gated.
-- For 72h sequence contexts (D+3), only explicit future-horizon DA forecast columns are gated; unavailable horizons use persistence fallback (same hour previous day).
-- Day-ahead price columns are not gated and remain strict T-0 for delivery-day feature usage.
-- Missing values from lagging and long windows are never backfilled from future rows.
-- Ground truth (`y_true_pos`, `y_true_neg`) is not lagged. Multi-output targets are created by future shifting (`target_pos_h1..h72`, `target_neg_h1..h72`).
+Reason:
+- avoid parallel source definitions of the same physical quantity,
+- keep one canonical lineage for auditability.
 
-## Newly Added Features
+### B. Multicollinearity Reduction (VIF-focused)
 
-| Feature Name | Definition | Calculation Logic | Unit | Justification |
-|---|---|---|---|---|
-| `mfrr_active_lag` | mFRR activity indicator built from PiT-aligned activation columns | Let `active_t = 1` if `mfrr_activated_mwh_pos > 0` OR `mfrr_activated_mwh_neg > 0` (fallback: corresponding MW columns), else `0`. `mfrr_active_lag_t = active_t` on already PiT-lagged base inputs (no extra internal shift). | binary (0/1) | Avoids double lagging while preserving a causally valid scarcity indicator. |
-| `nrv_zscore_24h` | Standardized NRV anomaly score over a 24h context window | `z_t = (NRV_balance_t - mean_24h(NRV_balance)) / std_24h(NRV_balance)` with frequency-adjusted rolling window size. Undefined values (early window, zero std) are set to `0.0`. | z-score | Highlights abnormal physical imbalance regimes relative to the recent system state. Useful for detecting stress phases linked to price spikes. |
-| `picasso_flow_rate` | PICASSO/cross-border flow proxy | Uses `afrr_optimization_mwh` if available. If unavailable, uses `net_import_export_mw` as proxy. | MWh or MW (source-dependent) | Represents European balancing coupling effects and potential cross-border congestion that can decouple local bids from settlement outcomes. |
-| `grid_stress_index` | Composite stress indicator in `[0, 1]` | `grid_stress_index = 0.4 * normalized_abs_nrv + 0.4 * mfrr_active_lag + 0.2 * normalized_abs_picasso_flow`. Normalization is rolling 24h max-based (`x / rolling_max_24h(|x|)`), clipped to `[0,1]`. | index [0,1] | Aggregates physical imbalance, reserve scarcity, and cross-border flow pressure into one robust stress signal for high-volatility balancing periods. |
-| `system_stress_signal` | Aggregate weather/forecast stress proxy | Horizontal sum of per-technology errors; prefers ID-based errors when available, otherwise DA-based errors. | MW-equivalent composite | Captures coincident stress from wind/solar forecast misses in one compact feature. |
-| `market_regime_picasso` | Structural market-regime flag | `0` for timestamps `< 2022-06-22 00:00:00 UTC`, `1` for timestamps `>= 2022-06-22 00:00:00 UTC`. | binary (0/1) | Encodes the structural break from pre-PICASSO behavior to PICASSO-coupled pricing (pay-as-bid era vs. marginal/coupled regime effects). |
-| `afrr_id_price_spread` | Cross-market price spread between balancing activation and intraday/day-ahead reference | `afrr_id_price_spread_t = afrr_activation_price_t - intraday_price_da_t` (column fallback to available intraday/DA proxy). | EUR/MWh | Captures opportunity-cost differentials between balancing and energy markets; relevant for bid/dispatch attractiveness. |
-| `relative_price_competitiveness` | Relative current activation price level vs recent local market regime | `relative_price_competitiveness_t = afrr_activation_price_t / mean_{(t-24h, t)}(afrr_activation_price)` with leakage-safe rolling mean based on `shift(1)` and time offset `24h`. | ratio (dimensionless) | Indicates whether current activation price is expensive/cheap relative to recent conditions; supports adaptive bidding and regime-aware forecasting. |
-| `price_volatility_short_term` | Short-horizon activation price uncertainty proxy | `price_volatility_short_term_t = std_{(t-4h, t)}(afrr_activation_price)` with leakage-safe window via `shift(1)` and time offset `4h`. | EUR/MWh | Short-term volatility often co-moves with reserve scarcity and uncertainty; useful explanatory signal for both activation-rate and capacity-price models. |
-| `scarcity_price_premium` | Stress-weighted price interaction | `scarcity_price_premium_t = afrr_activation_price_t * grid_stress_index_t`. | composite (EUR/MWh-scaled) | Emphasizes prices observed under physical stress, improving signal quality during scarcity-driven balancing phases. |
-| `TE_hour_regime_activation` | Leakage-safe target encoding of activation likelihood by hour and market regime | Group by `market_regime_picasso` and `hour`, then compute `shift(1).expanding().mean()` of `is_activated`; fill early NaNs with global mean activation rate. | probability-like ratio [0,1] | Encodes historically observed activation propensity for the same intraday/regime context while preventing look-ahead leakage. |
-| `market_state_cluster` | Latent market-state label from stress/flow regime vectors | Build rolling-normalized (24h, past-only) versions of `nrv_zscore_24h`, `grid_stress_index`, `picasso_flow_rate`; apply `StandardScaler` then `KMeans(n_clusters=4, random_state=42)`. | categorical cluster id (0-3) | Captures non-linear market-state regimes (e.g., scarcity/export vs stable/import) that are hard to represent with single linear features. |
-| `nrv_quantile_5` | Discrete NRV stress bucket | `pd.qcut(nrv_zscore_24h, q=5, labels=False, duplicates='drop')` with robust fallback for missing bins. | ordinal bucket (0-4, data-dependent if duplicates dropped) | Adds rank-based stress representation robust to scale/outlier effects and useful for tree/sequence models. |
-| `load_actual_entsoe_mean_24h`, `load_actual_entsoe_std_24h`, `load_actual_entsoe_mean_168h`, `load_actual_entsoe_std_168h` | Rolling load moments | Rolling mean/std over 24h and 168h windows on PiT-lagged `load_actual_entsoe`. | MW | Captures short and weekly load-state context. |
-| `da_price_eur_mean_24h`, `da_price_eur_std_24h`, `da_price_eur_mean_168h`, `da_price_eur_std_168h` | Rolling day-ahead price moments | Rolling mean/std over 24h and 168h windows on `da_price_eur`. | EUR/MWh | Adds multi-scale price regime context. |
-| `wind_onshore_actual_entsoe_mean_24h`, `wind_onshore_actual_entsoe_std_24h`, `wind_onshore_actual_entsoe_mean_168h`, `wind_onshore_actual_entsoe_std_168h` | Rolling wind onshore moments | Rolling mean/std over 24h and 168h windows on PiT-lagged `wind_onshore_actual_entsoe`. | MW | Captures renewable supply level and variability. |
-| `target_pos_h1..target_pos_h72`, `target_neg_h1..target_neg_h72` | 72-step direct multi-output targets | `target_pos_hk = y_true_pos.shift(-k)`, `target_neg_hk = y_true_neg.shift(-k)` for `k=1..72`. | EUR/MWh | Enables direct horizon-wise training for 72h sequence forecasting. |
+Kept as canonical price/saldo signals:
+- `afrr_vwap_pos`, `afrr_vwap_neg`
+- `NRV_balance`
 
-### Time-Based Features
+Removed as redundant/competing definitions:
+- activation price variants containing:
+  - `avg_activation_price`
+  - `marginal_activation_price`
+  - `bid_avg_activation_price`
+- balance alternatives: `rz_saldo_mw`, `reBAP_shortage_surplus`
 
-| Feature Name | Definition | Calculation Logic | Unit | Justification |
-|---|---|---|---|---|
-| `hour_sin`, `hour_cos` | Cyclical hour-of-day representation | With `h_t ∈ {0,...,23}` from timestamp column: `hour_sin_t = sin(2π h_t / 24)`, `hour_cos_t = cos(2π h_t / 24)`. | continuous [-1,1] | Preserves circular continuity of intraday time (e.g., 23:00 adjacent to 00:00). |
-| `weekday_sin`, `weekday_cos` | Cyclical weekday representation | With `w_t ∈ {0,...,6}`: `weekday_sin_t = sin(2π w_t / 7)`, `weekday_cos_t = cos(2π w_t / 7)`. | continuous [-1,1] | Captures repeating weekly demand and balancing behavior without artificial ordinal jumps. |
-| `month_sin`, `month_cos` | Cyclical month-of-year representation | With `m_t ∈ {1,...,12}`: `month_sin_t = sin(2π m_t / 12)`, `month_cos_t = cos(2π m_t / 12)`. | continuous [-1,1] | Models annual seasonality (weather/load) while preserving month-cycle continuity. |
-| `is_weekend` | Weekend indicator | `is_weekend_t = 1` if weekday is Saturday or Sunday, else `0`. | binary (0/1) | Weekend operations often show different load patterns, liquidity, and balancing activation behavior. |
-| `is_payday_period` | Payday-window indicator | `is_payday_period_t = 1` if day-of-month `>= 27` OR `<= 3`, else `0`. | binary (0/1) | Approximates monthly liquidity and behavior shifts that can propagate into consumption and balancing patterns. |
-| `is_morning` | Morning segment flag | `1` if hour in `[06,11]`, else `0`. | binary (0/1) | Captures morning ramp effects and typical market-state transitions. |
-| `is_afternoon` | Afternoon segment flag | `1` if hour in `[12,16]`, else `0`. | binary (0/1) | Captures midday balancing dynamics and load/RES transitions. |
-| `is_evening` | Evening segment flag | `1` if hour in `[17,22]`, else `0`. | binary (0/1) | Captures evening peak-related stress and price-relevant balancing conditions. |
-| `is_night` | Night segment flag | `1` if hour in `[23,05]`, else `0`. | binary (0/1) | Captures low-load base regime and nocturnal balancing behavior. |
-| `days_since_last_activation` | User-level recency feature | For each user (grouped by user ID), compute chronological delta in days to previous event: `Δdays_t = (ts_t - ts_{t-1})/86400`. First event per user is set to `-1`. | days | Encodes user/event rhythm and recency effects; useful for activation propensity timing. |
-| `holiday_severity` *(existing)* | Holiday intensity score | Already precomputed in upstream pipeline (national/regional severity encoding). | score | Public holiday intensity strongly affects demand profile and balancing dynamics. |
-| `is_bridge_day` *(existing)* | Bridge-day indicator | Already precomputed in upstream pipeline. | binary (0/1) | Bridge days can induce non-standard industrial/commercial load patterns. |
-| `is_christmas_break` *(existing)* | Christmas-break indicator | Already precomputed in upstream pipeline. | binary (0/1) | End-of-year operations materially shift demand and reserve activation behavior. |
+Reason:
+- multiple price and saldo variants were strongly collinear and caused
+  instability for linear/regularized models.
 
-## Notes on Leakage and Robustness
+### C. Logical Aggregations
 
-- `mfrr_active_lag` is computed from already PiT-lagged activation columns and therefore does not apply an additional internal lag.
-- Rolling features use frequency-aware window sizes (24h in row space).
-- Early-window NaNs and divide-by-zero cases are handled with safe defaults.
-- The PICASSO regime switch is inclusive from **2022-06-22** onward.
-- `days_since_last_activation` uses a deterministic fallback (`-1`) for each user’s first event, ensuring robust model input without row drops.
-- Cyclical time features (`*_sin`, `*_cos`) are leakage-safe because they are derived only from the current timestamp, not from future observations.
-- `TE_hour_regime_activation` is leakage-protected by construction: `shift(1)` excludes the current target and `expanding().mean()` uses only historical observations.
-- `market_state_cluster` is computed from rollingly normalized stress inputs using past-only windows, reducing regime drift sensitivity and preventing future-information bleed.
+Implemented aggregations:
+- `neighbor_spread_avg`
+- `generation_fossil_total_mw`
+- `generation_baseload_total`
+- `generation_hydro_actual_total`
 
-## Automated Audit Protocol
+and dropped component columns after aggregation.
 
-The notebook
-`notebooks/09_lag_information_set_validation.ipynb`
-contains a cell-by-cell mathematical audit between:
-- Ground Truth (GT): `data/processed/all_data_refined.parquet`
-- Feature Set (FE): `data/features/all_data_features.parquet`
+Reason:
+- reduce dimensionality while preserving economic signal.
 
-Audit constraints:
-- 2H group: `FE[C]_t = GT[C]_{t-2}`
-- 1H group: `FE[C]_t = GT[C]_{t-1}`
-- 0H group: `FE[C]_t = GT[C]_t`
-- Targets: `FE[target_*_h]_t = REF[y_true_*]_{t+h}` for `h in [1,72]`,
-  where `REF` is `FE` when `y_true_*` is generated in feature engineering
-  (fallback to `GT` when present).
+### D. Technical Cleanup
 
-Tolerance:
-- `max_abs_error <= 1e-9` for lag-policy groups (`2H`, `1H`, `0H`, `D+3_GATE`)
-- Derived-feature verification uses a separate floating-point tolerance (`1e-7`)
-  for numerical stability in rolling-standard-deviation recomputation checks.
-- Boundary NaNs are ignored through overlap-only comparisons.
+Removed:
+- `timestamp_cet`
 
-Special D+3 forecast availability audit:
-- Base DA forecast columns are asserted as strict T-0 overlap.
-- Explicit future-horizon DA forecast columns (if present) are checked against a
-  publication-aware expected series (13:00 Europe/Berlin D-1 gate with
-  persistence fallback `shift(24)`).
-- Additional anti-look-ahead checks verify gated rows do not collapse to raw
-  future-truth values when informative differences exist.
+Kept:
+- `timestamp_utc`
 
-Latest audited outcome (executed on March 20, 2026):
-- `da_price_eur` strict T-0 check: **PASS** (`max_abs_error = 0.0`)
-- Lag-policy failures (`2H`, `1H`, `0H`, `D+3_GATE`): **0** (PASS)
-- Informational groups (`TARGET`, `DERIVED`, `UNMAPPED`) are reported
-  separately and do not drive the hard policy gate.
+Reason:
+- avoid duplicate time axes and enforce one timezone standard across training,
+  validation, and backtests.
 
-### Missing Value Handling Policy
+## 2) Engineered Features (Definitions & Formulas)
 
-The missing-value policy is implemented in
-`src/energy_trading/processing/handle_missing_values.py` and applied
-before downstream transformation/feature steps.
+### Residual Load Features
 
-Price transform note (`transform_data.py`)
-- Price-derived transformed columns use signed log:
-  `slog1p(x) = sign(x) * log1p(abs(x))`.
-- Column naming uses suffix `*_slog1p` (replacing `*_log1p`) to remain
-  mathematically valid for negative prices (including `x <= -1` EUR/MWh).
-- This prevents transformation-domain NaNs that occurred with plain `log1p`.
+- `residual_load_forecast` [MW]
+  - Formula:
+    `load_forecast_da_entsoe - solar_forecast_id_entsoe - wind_onshore_forecast_id_entsoe - wind_offshore_forecast_id_entsoe`
+  - Meaning: expected non-renewable net demand.
 
-Category A: Physical actuals (load, wind, solar, generation)
-- Short gaps (`<= 3h`): linear interpolation.
-- Long gaps (`> 3h`): seasonal persistence fill using `T-24h` with fallback
-  `T-168h`.
-- Rationale: physical quantities evolve continuously and daily/weekly
-  structure is informative during longer telemetry gaps.
+- `residual_load_actual` [MW]
+  - Formula:
+    `load_actual_entsoe - solar_actual_entsoe - wind_onshore_actual_entsoe - wind_offshore_actual_entsoe`
+  - Meaning: realized non-renewable net demand.
 
-Category B: Market prices and continuous indicators
-- Primary fill: `ffill(limit=4)` (up to 4 hours).
-- No interpolation is applied for this category.
-- Rationale: prices remain valid until the next publication tick, and this
-  preserves trader-observable state without smoothing with future data.
+### Renewable Share Feature
 
-Category C: Forecasts (DA and related forecast features)
-- Fill strategy: forward fill only.
-- Interpolation is intentionally avoided for forecasts.
-- Rationale: once published, a forecast remains the trader information set
-  until replaced by a new publication.
+- `renewable_share_forecast` [ratio, 0..1+ depending on forecast/load relation]
+  - Formula:
+    `(solar_forecast_id_entsoe + wind_onshore_forecast_id_entsoe + wind_offshore_forecast_id_entsoe) / load_forecast_da_entsoe`
+  - Meaning: expected renewable penetration in load.
 
-Category D: Rare-event and binary indicators (outages, holidays, flags)
-- Fill strategy: constant `0`.
-- Rationale: missing event marker is interpreted as “no event reported”.
+### Cross-Border Price Pressure
 
-Category E: Targets (`y_train*`, `y_true*`, `target_*`)
-- Targets are never imputed.
-- Rows with missing targets are dropped in the cleaning stage used for model
-  training dataset generation.
-- For evaluation-only slices, rows can be retained and marked as
-  non-evaluable depending on metric design.
+- `neighbor_spread_avg` [EUR/MWh]
+  - Formula:
+    `mean(da_price_AT, BE, CH, CZ, DK1, DK2, FR, NL, PL, SE4) - da_price_eur`
+  - Meaning: regional price pressure relative to Germany.
 
-Warmup handling
-- Leading rows with lag/rolling-induced NaNs are stripped rather than
-  imputed.
-- This avoids injecting synthetic values into initialization windows and
-  keeps causal consistency.
+### Forecast Update Features
 
-Operational guarantees
-- Per-column imputation counts are logged to console for auditability.
-- The procedure is deterministic/idempotent: re-running on an already cleaned
-  dataset does not change values except for additional row drops if new
-  missing targets are introduced upstream.
+- `wind_onshore_forecast_update` [MW]
+  - Formula:
+    `wind_onshore_forecast_id_entsoe - wind_onshore_forecast_da_entsoe`
+- `solar_forecast_update` [MW]
+  - Formula:
+    `solar_forecast_id_entsoe - solar_forecast_da_entsoe`
+
+Interpretation:
+- captures new information arriving between DA and intraday forecast stages.
+
+### Capacity Import/Export Directional Logic
+
+From `fetch_regelleistung.py`, capacity products are parsed from block products
+(e.g. `POS_00_04`, `NEG_12_16`), expanded to hourly rows, and direction-split.
+
+Produced columns:
+- `capacity_import_export_mw_pos` [MW]
+- `capacity_import_export_mw_neg` [MW]
+
+Important implementation detail:
+- 4h block values are replicated to each hourly row (not divided by 4),
+  consistent with `[MW]` and `[(EUR/MW)/h]` semantics.
+
+## 3) Final Refined Column Set (57)
+
+### Time
+- `timestamp_utc`
+
+### Load / Residual / Forecast Core
+- `load_actual_entsoe` [MW]
+- `load_forecast_da_entsoe` [MW]
+- `residual_load_actual` [MW]
+- `residual_load_forecast` [MW]
+- `renewable_share_forecast` [ratio]
+
+### Renewable Actuals and Forecast Inputs
+- `wind_onshore_actual_entsoe` [MW]
+- `wind_offshore_actual_entsoe` [MW]
+- `solar_actual_entsoe` [MW]
+- `wind_onshore_forecast_id_entsoe` [MW]
+- `wind_offshore_forecast_id_entsoe` [MW]
+- `solar_forecast_id_entsoe` [MW]
+- `wind_onshore_error_da` [MW]
+- `wind_offshore_error_da` [MW]
+- `solar_error_da` [MW]
+- `wind_onshore_forecast_update` [MW]
+- `solar_forecast_update` [MW]
+
+### Balancing Activation / Flows
+- `NRV_balance` [MW]
+- `afrr_activated_mw_pos` [MW]
+- `afrr_activated_mw_neg` [MW]
+- `mfrr_activated_mw_pos` [MW]
+- `mfrr_activated_mw_neg` [MW]
+- `afrr_picasso_mw_pos` [MW]
+- `afrr_picasso_mw_neg` [MW]
+- `afrr_picasso_net_mw` [MW]
+- `mfrr_mari_mw_pos` [MW]
+- `mfrr_mari_mw_neg` [MW]
+- `mfrr_mari_net_mw` [MW]
+- `capacity_import_export_mw_pos` [MW]
+- `capacity_import_export_mw_neg` [MW]
+- `net_import_export_mw` [MW]
+- `system_stress_signal` [composite index/MW-equivalent]
+
+### aFRR Prices and Offered Capacities
+- `afrr_vwap_pos` [EUR/MWh]
+- `afrr_vwap_neg` [EUR/MWh]
+- `afrr_capacity_price_pos` [EUR/MW/h]
+- `afrr_capacity_price_neg` [EUR/MW/h]
+- `afrr_capacity_offered_mw_pos` [MW]
+- `afrr_capacity_offered_mw_neg` [MW]
+- `afrr_activation_offered_mw_pos` [MW]
+- `afrr_activation_offered_mw_neg` [MW]
+
+### Energy Prices and Exogenous Commodities
+- `da_price_eur` [EUR/MWh]
+- `price_intraday_eur` [EUR/MWh]
+- `gas_price_ttf` [market quote]
+- `coal_price_api2` [market quote]
+- `co2_price_eua` [market quote]
+
+### Generation and Capacity Structure
+- `generation_hydro_pumped_storage_mw` [MW]
+- `generation_fossil_total_mw` [MW]
+- `generation_baseload_total` [MW]
+- `generation_hydro_actual_total` [MW]
+- `wind_onshore_capacity` [MW]
+- `wind_offshore_capacity` [MW]
+- `solar_capacity` [MW]
+- `gas_capacity` [MW]
+- `hard_coal_capacity` [MW]
+- `lignite_capacity` [MW]
+- `pumped_storage_capacity` [MW]
+
+### Cross-Border Price Aggregate
+- `neighbor_spread_avg` [EUR/MWh]
+
+## 4) Veraltete Dokumentation entfernt / korrigiert
+
+The following are no longer active in the refined 57-column set and must not be
+interpreted as current model inputs in this stage:
+- foreign raw DA prices (`da_price_AT`, ..., `da_price_SE4`)
+- `neighbor_price_avg`
+- `rz_saldo_mw`, `reBAP_shortage_surplus`
+- activation price families based on `avg_activation_price`,
+  `marginal_activation_price`, `bid_avg_activation_price`
+- `timestamp_cet`
+- `biomass_actual_entsoe`, `generation_nuclear_mw` (replaced by
+  `generation_baseload_total`)
+
+## 5) Unit Check (Current)
+
+- Power/flow/capacity channels: MW
+- Activation energy price and DA/ID prices: EUR/MWh
+- Capacity prices: EUR/MW/h
+- Ratio features: dimensionless (`renewable_share_forecast`)
+- Composite signals (`system_stress_signal`): documented as composite index
+  or MW-equivalent proxy depending on upstream definition.
+
+## To-Do: Missing Info
+
+1. `system_stress_signal`
+- Confirm exact upstream formula and normalization bounds in final pipeline
+  run used for thesis tables.
+
+2. `net_import_export_mw` vs directional pair
+- Confirm sign convention and intended canonical usage when both
+  `capacity_import_export_mw_pos/neg` and `net_import_export_mw` exist.
+
+3. Commodity units metadata
+- Add canonical unit metadata for `gas_price_ttf`, `coal_price_api2`,
+  `co2_price_eua` (provider-specific quotation conventions).
+
+4. Capacity-source lineage table
+- Add explicit per-column lineage for capacities (ENTSO-E vs fallback source)
+  for audit appendix completeness.
