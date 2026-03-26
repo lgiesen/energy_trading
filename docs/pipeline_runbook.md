@@ -7,7 +7,7 @@ This document explains:
 3. which files/columns are produced,
 4. how to validate that the run is correct.
 
-It is the operational reference for the ingestion + merge pipeline.
+It is the operational reference for the ingestion + processing pipeline.
 
 ---
 
@@ -22,16 +22,18 @@ Main scripts:
 - `scripts/fetch_entsoe_outages.py`  
   ENTSO-E planned/unplanned generation outage events (DE-LU).
 - `scripts/transform_entsoe_outages_hourly.py`  
-  Converts outage events to hourly sidecar features for short-term forecasting.
+  Converts outage events to hourly outage features.
 - `src/energy_trading/ingestion/merge_data.py`  
-  Full join of all raw parquet files on hourly UTC timestamps.
+  Full join of all raw parquet files on hourly UTC timestamps + outage merge.
 - `src/energy_trading/processing/refine_market_data.py`  
   Refines merged data, consolidates sources, and applies market logic.
 
 Raw outputs are written to `data/raw/*.parquet`.  
 Merged table is written to `data/processed/all_data.parquet`.  
 Refined table is written to `data/processed/all_data_refined.parquet`.  
-Cleaned table is written to `data/processed/cleaned_data.parquet`.
+Pruned table is written to `data/processed/all_data_pruned.parquet`.  
+Transformed table is written to `data/processed/all_data_transformed.parquet`.  
+Final features are written to `data/features/all_data_features.parquet`.
 
 ### Step-by-step I/O map
 
@@ -44,12 +46,12 @@ Cleaned table is written to `data/processed/cleaned_data.parquet`.
 | 5 | `fetch_yfinance.py` | Yahoo Finance API | `data/raw/yfinance.parquet` |
 | 6 | `fetch_regelleistung.py` | Regelleistung API + bid files in `data/raw/bids/` | `data/raw/regelleistung.parquet` (hourly) + `data/raw/regelleistung_15min/afrr_prices_15min.parquet` + `data/raw/regelleistung_15min/afrr_volumes_15min.parquet` + `data/raw/regelleistung_15min/afrr_price_volume_15min.parquet` |
 | 7 | `fetch_entsoe_outages.py` | ENTSO-E API (`A80` + `A53/A54`) | `data/raw/entsoe_outages/planned_generation_outages.parquet` + `data/raw/entsoe_outages/unplanned_generation_outages.parquet` |
-| 8 | `merge_data.py` | All `data/raw/*.parquet` files | `data/processed/all_data.parquet` |
-| 9 | `refine_market_data.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
-| 10 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/cleaned_data.parquet` |
-| 11 | `transform_data.py` | `data/processed/cleaned_data.parquet` | `data/processed/all_data_transformed.parquet` |
-| 12 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
-| 13 | `transform_entsoe_outages_hourly.py` | `data/raw/entsoe_outages/planned_generation_outages.parquet` + `data/raw/entsoe_outages/unplanned_generation_outages.parquet` | `data/processed/outages_hourly.parquet` |
+| 8 | `transform_entsoe_outages_hourly.py` | `data/raw/entsoe_outages/planned_generation_outages.parquet` + `data/raw/entsoe_outages/unplanned_generation_outages.parquet` | `data/processed/outages_hourly.parquet` |
+| 9 | `merge_data.py` | All `data/raw/*.parquet` files + `data/processed/outages_hourly.parquet` | `data/processed/all_data.parquet` |
+| 10 | `refine_market_data.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
+| 11 | `drop_redundant_features.py` | `data/processed/all_data_refined.parquet` | `data/processed/all_data_pruned.parquet` |
+| 12 | `transform_data.py` | `data/processed/all_data_pruned.parquet` | `data/processed/all_data_transformed.parquet` |
+| 13 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
 
 Note: The canonical features output path is `data/features/all_data_features.parquet`.
 Do not maintain a duplicate `data/processed/all_data_features.parquet`.
@@ -65,7 +67,8 @@ Do not maintain a duplicate `data/processed/all_data_features.parquet`.
   and feature engineering in a traceable layer.
 - Reproducibility:
   Intermediate artifacts (`all_data.parquet`, `all_data_refined.parquet`,
-  `cleaned_data.parquet`) make every transformation stage auditable.
+  `all_data_pruned.parquet`, `all_data_transformed.parquet`) make every
+  transformation stage auditable.
 
 ## 2) Canonical Command (Recommended)
 
@@ -77,11 +80,17 @@ Run everything end-to-end:
   --end 2025-12-31T23:00:00Z
 ```
 
-Then fetch outage events and build hourly outage sidecar features:
+Then fetch outage events, build hourly outages, and re-run merge so outages are
+embedded in `all_data.parquet`:
 
 ```bash
 ./.venv/bin/python scripts/fetch_entsoe_outages.py --days-ahead 7
 ./.venv/bin/python scripts/transform_entsoe_outages_hourly.py --days-ahead 7
+./.venv/bin/python -m energy_trading.ingestion.merge_data \
+  --data-dir data/raw \
+  --out data/processed/all_data.parquet \
+  --clip-start 2020-11-30T23:00:00Z \
+  --clip-end 2025-12-31T23:00:00Z
 ```
 
 This corresponds to:
@@ -98,30 +107,11 @@ Important behavior:
 
 ## 3) Useful Variants
 
-Run only post-collection processing (if raw files are already collected):
+Run only post-collection processing (if `all_data.parquet` already exists):
 
 ```bash
 ./.venv/bin/python scripts/post_collection_pipeline.py \
-  --clip-start 2020-11-30T23:00:00Z \
-  --clip-end 2025-12-31T23:00:00Z
-```
-
-`post_collection_pipeline.py` now also runs outage-event transformation to:
-
-- `data/processed/outages_hourly.parquet`
-
-if both outage inputs exist:
-
-- `data/raw/entsoe_outages/planned_generation_outages.parquet`
-- `data/raw/entsoe_outages/unplanned_generation_outages.parquet`
-
-To disable this sidecar step:
-
-```bash
-./.venv/bin/python scripts/post_collection_pipeline.py \
-  --clip-start 2020-11-30T23:00:00Z \
-  --clip-end 2025-12-31T23:00:00Z \
-  --skip-outages-hourly
+  --input data/processed/all_data.parquet
 ```
 
 Skip anonymous-bid activation price reconstruction (faster):
@@ -151,6 +141,26 @@ Run merge only:
   --out data/processed/all_data.parquet \
   --clip-start 2020-11-30T23:00:00Z \
   --clip-end 2025-12-31T23:00:00Z
+```
+
+Run strict linear processing chain manually:
+
+```bash
+./.venv/bin/python -m energy_trading.processing.refine_market_data \
+  --in data/processed/all_data.parquet \
+  --out data/processed/all_data_refined.parquet
+
+./.venv/bin/python -m energy_trading.processing.drop_redundant_features \
+  --in data/processed/all_data_refined.parquet \
+  --out data/processed/all_data_pruned.parquet
+
+./.venv/bin/python -m energy_trading.processing.transform_data \
+  --in data/processed/all_data_pruned.parquet \
+  --out data/processed/all_data_transformed.parquet
+
+./.venv/bin/python -m energy_trading.features.build_features \
+  --in data/processed/all_data_transformed.parquet \
+  --out data/features/all_data_features.parquet
 ```
 
 ---
