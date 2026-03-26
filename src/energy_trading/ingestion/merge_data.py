@@ -13,6 +13,8 @@ Notes:
     - Drops other timestamp columns to avoid duplicate/suffixed fields.
     - Merges all columns produced by fetchers (including anonymous-bid price columns
       from regelleistung.parquet if present).
+    - Also left-joins hourly outages sidecar (`data/processed/outages_hourly.parquet`)
+      on UTC timestamp when available.
     - The example above clips to CET boundaries:
       2020-12-01 00:00:00 CET -> 2026-01-01 00:00:00 CET,
       passed as UTC (`Z`) values.
@@ -129,6 +131,53 @@ def _resample_to_freq(df: pl.DataFrame, freq: str) -> pl.DataFrame:
     return df.group_by("timestamp").agg(aggs).sort("timestamp")
 
 
+def _merge_outages_sidecar(merged: pl.DataFrame, outages_path: Path) -> pl.DataFrame:
+    """Left-join hourly outage sidecar on canonical timestamp key.
+
+    Missing sidecar or missing rows are interpreted as no outage and filled with 0.0.
+    """
+    if "timestamp" not in merged.columns:
+        return merged
+
+    if not outages_path.exists():
+        LOGGER.warning("Outage sidecar not found (%s). Filling outages with 0.0.", outages_path)
+        return merged.with_columns([
+            pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
+            pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
+        ])
+
+    outages = pl.read_parquet(outages_path)
+
+    if "timestamp_utc" in outages.columns:
+        ts_col = "timestamp_utc"
+    elif "timestamp" in outages.columns:
+        ts_col = "timestamp"
+    elif "__index_level_0__" in outages.columns:
+        ts_col = "__index_level_0__"
+    else:
+        LOGGER.warning("Outage sidecar has no timestamp column. Filling outages with 0.0.")
+        return merged.with_columns([
+            pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
+            pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
+        ])
+
+    outages = _normalize_timestamp(outages, ts_col)
+    if ts_col != "timestamp":
+        outages = outages.rename({ts_col: "timestamp"})
+
+    keep = [c for c in ("timestamp", "planned_outages_mw", "unplanned_outages_mw") if c in outages.columns]
+    outages = outages.select(keep)
+    outages = _drop_nulls_and_dedup(outages, "timestamp", "outages sidecar")
+
+    joined = merged.join(outages, on="timestamp", how="left")
+    for c in ("planned_outages_mw", "unplanned_outages_mw"):
+        if c in joined.columns:
+            joined = joined.with_columns(pl.col(c).cast(pl.Float64).fill_null(0.0).alias(c))
+        else:
+            joined = joined.with_columns(pl.lit(0.0).cast(pl.Float64).alias(c))
+    return joined
+
+
 def merge_all(
     parquet_paths: Iterable[Path],
     resample_freq: str | None,
@@ -178,6 +227,12 @@ def merge_all(
     if clip_end:
         end_dt = _parse_clip_to_utc(clip_end)
         merged = merged.filter(pl.col("timestamp") <= pl.lit(end_dt))
+
+    # Merge outages before final timestamp projection, so outages participate in
+    # all downstream processing/audits from all_data.parquet onward.
+    outages_path = Path(__file__).resolve().parents[3] / "data" / "processed" / "outages_hourly.parquet"
+    merged = _merge_outages_sidecar(merged, outages_path)
+
     # Keep only canonical UTC and CET timestamps in final output.
     merged = merged.with_columns(
         pl.col("timestamp").alias("timestamp_utc"),
