@@ -19,9 +19,9 @@ From a methodological perspective, these variables are treated as **exogenous ex
 ### Extraction Logic
 The script downloads adjusted close series with ticker fallback logic:
 
-- `gas_price_ttf`: `TTF=F`
-- `coal_price_api2`: `MTF=F`
-- `co2_price_eua`: `CO2.L`, fallback `CBU2.DE`
+- `gas_price`: `TTF=F`
+- `coal_price`: `MTF=F`
+- `co2_price`: `CO2.L`, fallback `CBU2.DE`
 
 Core call pattern:
 ```python
@@ -57,9 +57,9 @@ Current output schema in `data/raw/yfinance.parquet`:
 | Column Name | Data Type | Unit | Technical Description |
 |---|---:|---|---|
 | `timestamp` | datetime (UTC) | - | Canonical hourly UTC timestamp after upsampling. |
-| `gas_price_ttf` | float | (market quote units) | TTF gas adjusted close series from Yahoo ticker mapping. |
-| `coal_price_api2` | float | (market quote units) | API2 coal adjusted close series from Yahoo ticker mapping. |
-| `co2_price_eua` | float | (market quote units) | EUA CO2 adjusted close series from Yahoo ticker mapping/fallback. |
+| `gas_price` | float | (market quote units) | TTF gas adjusted close series from Yahoo ticker mapping. |
+| `coal_price` | float | (market quote units) | API2 coal adjusted close series from Yahoo ticker mapping. |
+| `co2_price` | float | (market quote units) | EUA CO2 adjusted close series from Yahoo ticker mapping/fallback. |
 
 > Note: The script stores **adjusted close values as provided by Yahoo Finance**. Unit conventions depend on ticker metadata and should be documented in thesis tables as source-reported market quote units.
 

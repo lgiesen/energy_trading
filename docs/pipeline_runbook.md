@@ -53,7 +53,7 @@ df = pd.read_parquet("data/features/all_data_features.parquet")
 # Tree-based models (no scaling)
 X_train, X_test, y_train, y_test = prepare_model_data(
     df,
-    target_col="afrr_vwap_pos",
+    target_col="target_afrr_activation_price_vwap_pos_h1",
     model_type="xgboost",
     test_size=0.2,
 )
@@ -61,7 +61,7 @@ X_train, X_test, y_train, y_test = prepare_model_data(
 # Linear / neural models (StandardScaler fit on train only)
 X_train_lin, X_test_lin, y_train_lin, y_test_lin = prepare_model_data(
     df,
-    target_col="afrr_vwap_pos",
+    target_col="target_afrr_activation_price_vwap_pos_h1",
     model_type="linear",
     test_size=0.2,
 )
@@ -248,8 +248,8 @@ From Regelleistung TSO aggregation:
 
 - `afrr_avg_activation_price_pos`
 - `afrr_avg_activation_price_neg`
-- `afrr_vwap_pos`
-- `afrr_vwap_neg`
+- `afrr_activation_price_vwap_pos`
+- `afrr_activation_price_vwap_neg`
 
 From anonymous bids (derived in `fetch_regelleistung.py`):
 

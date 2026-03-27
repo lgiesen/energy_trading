@@ -1,306 +1,190 @@
-# Feature Documentation (Auto-Synced)
+# Feature Documentation & Data Dictionary (ML-Training X)
 
-This file is synchronized to the current final feature artifact:
+## Einleitung
+Diese Dokumentation enthält **nur Spalten, die tatsächlich als ML-Input (`X`)** in `prepare_model_data(...)` verbleiben.
+- Basisartefakt: `data/features/all_data_features.parquet` (**172** Spalten)
+- Dokumentierte ML-Features (`X`): **166**
+- Automatisch aus `X` ausgeschlossene Spalten (fachlich relevant): **6**
 
-- `data/features/all_data_features.parquet`
-- Snapshot timestamp (UTC): 2026-03-26 18:12:50
-- Total columns: **279**
+## Momentum-Lags (Final)
+| Gruppe | Spaltenfamilien | Zusätzliche Lags |
+|---|---|---|
+| Momentum | aFRR-Preise (`afrr_activation_price_vwap_*`), `afrr_da_price_spread`, `system_stress_signal`, `nrv_zscore_24h` | `[1, 2, 3]` |
+| Trend-Historie (Schlüsselvariablen) | `afrr_da_price_spread`, `afrr_activation_price_vwap_pos/neg`, `da_price_pit`, `system_stress_signal` | `[1, 2, 3, 6, 12, 24, 48, 168]` |
+| Saison | `da_price_pit`, Wetter-/Forecast-Familie (`*_forecast_id_entsoe`, `renewable_share_forecast`), Last/Residuallast | `[24, 48, 168]` |
 
-## 1) Scope and Governance
+Hinweis zur Benennung: Lags sind als **absolute Latenz** codiert. Beispiel: `*_lag_1h` + zusätzlicher Shift `2h` ergibt `*_lag_3h`.
+Die breite Lag-Tiefe bis 168h erlaubt dem Modell, sowohl kurzfristige Markttrends (Momentum) als auch Wochenmuster robust zu erfassen.
 
-- This document reflects the final model table that is consumed by notebooks/training scripts.
-- Any pipeline refactor that changes column names/counts should regenerate this file.
-- Ground-truth target columns remain in the dataset by design and are dropped from `X` only right before model fitting in `data_prep.py`.
+## Publication Latency Rules (PiT)
+| Datengruppe | Regel |
+|---|---|
+| ENTSO-E/Actuals (Erzeugung/Last/Outages/NRV) | mindestens `lag_2h` |
+| aFRR/mFRR Aktivierung & Aktivierungspreise | mindestens `lag_1h` |
+| Day-Ahead Preis | `da_price_pit` mit D-1 13:00 UTC Gate; vor Freigabe Fallback `shift(24)` |
+| Forecast-basierte Größen | publication-gated je Horizont, kein Future-Backfill |
 
-## 2) Column Group Summary
+### Aus `X` entfernte Spalten (nicht als Trainingsfeature)
+- `afrr_activated_mw_pos`
+- `afrr_activated_mw_neg`
+- `afrr_activation_price_vwap_pos`
+- `afrr_activation_price_vwap_neg`
+- `afrr_da_price_spread`
+- `target_afrr_activation_price_vwap_pos_h1`
+- `target_da_price_h1`
+- `target_afrr_rate_h1`
 
-- Horizon targets (`target_pos_h*`, `target_neg_h*`): **144**
-- Base targets (`y_true_*`, `y_train_*`): **4**
-- Lag features (`*_lag*`): **31**
-- Statistical transforms (`mean/std/ewma/diff/zscore/volatility/quantile`): **15**
-- Cyclical and calendar features (`*_sin`, `*_cos`, calendar flags): **17**
-- Other core features (market/fundamental/regime/exogenous): **68**
+## Autoregressive Lags (X)
+| Feature Name | Einheit | Beschreibung & Rationale | Transformation |
+|---|---|---|---|
+| `mfrr_active_lag` | Numerisch | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Rohwert |
+| `picasso_flow_rate_lag_1h` | Anteil (0–1) | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `picasso_flow_rate_lag_24h` | Anteil (0–1) | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `da_price_eur_lag24` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `da_price_eur_lag48` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `da_price_eur_lag168` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `da_price_eur_lag_24h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `da_price_eur_lag_48h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `da_price_eur_lag_168h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `wind_onshore_actual_entsoe_lag24` | Numerisch | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `wind_onshore_actual_entsoe_lag48` | Numerisch | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `wind_onshore_actual_entsoe_lag168` | Numerisch | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `wind_onshore_actual_entsoe_lag_24h` | Numerisch | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `wind_onshore_actual_entsoe_lag_48h` | Numerisch | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `wind_onshore_actual_entsoe_lag_168h` | Numerisch | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_pos_lag1` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_pos_lag24` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_pos_lag_1h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_pos_lag_24h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_neg_lag1` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_neg_lag24` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_neg_lag_1h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_price_vwap_neg_lag_24h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_rate_lag1` | Anteil (0–1) | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_rate_lag24` | Anteil (0–1) | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_rate_lag_1h` | Anteil (0–1) | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activation_rate_lag_24h` | Anteil (0–1) | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_pos_lag1` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_pos_lag24` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_pos_lag_1h` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_pos_lag_24h` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_neg_lag1` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_neg_lag24` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_neg_lag_1h` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_activated_mw_neg_lag_24h` | MW | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_da_price_spread_lag1` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_da_price_spread_lag24` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_da_price_spread_lag_1h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
+| `afrr_da_price_spread_lag_24h` | EUR/MWh | Historischer Wert derselben Größe; autoregressives Input-Feature (X). | Lag-Feature (historisch, X) |
 
-## 3) Full Column Inventory (Exact, Ordered)
+## Marktpreise, Spreads & Kosten (X)
+| Feature Name | Einheit | Beschreibung & Rationale | Transformation |
+|---|---|---|---|
+| `afrr_capacity_price_neg` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
+| `afrr_capacity_price_pos` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
+| `da_price_eur` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
+| `gas_price` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
+| `coal_price` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
+| `co2_price` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
+| `neighbor_spread_avg` | EUR/MWh | Preisabstand als Knappheits-/Wettbewerbssignal zwischen Marktsegmenten. | Abgeleiteter Rohwert |
+| `da_price_eur_slog1p` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Signed-log Transform |
+| `relative_price_competitiveness` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
+| `scarcity_price_premium` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Rohwert |
 
-| # | Column Name |
-|---:|---|
-| 1 | `wind_onshore_actual_entsoe` |
-| 2 | `wind_offshore_actual_entsoe` |
-| 3 | `solar_actual_entsoe` |
-| 4 | `wind_onshore_forecast_id_entsoe` |
-| 5 | `wind_offshore_forecast_id_entsoe` |
-| 6 | `solar_forecast_id_entsoe` |
-| 7 | `NRV_balance` |
-| 8 | `afrr_activated_mw_pos` |
-| 9 | `afrr_activated_mw_neg` |
-| 10 | `mfrr_activated_mw_pos` |
-| 11 | `mfrr_activated_mw_neg` |
-| 12 | `mfrr_mari_net_mw` |
-| 13 | `afrr_capacity_price_neg` |
-| 14 | `afrr_capacity_price_pos` |
-| 15 | `afrr_capacity_offered_mw_neg` |
-| 16 | `afrr_capacity_offered_mw_pos` |
-| 17 | `afrr_activation_offered_mw_neg` |
-| 18 | `afrr_activation_offered_mw_pos` |
-| 19 | `afrr_vwap_pos` |
-| 20 | `afrr_vwap_neg` |
-| 21 | `generation_hydro_pumped_storage_mw` |
-| 22 | `da_price_eur` |
-| 23 | `system_stress_signal` |
-| 24 | `wind_onshore_capacity` |
-| 25 | `wind_offshore_capacity` |
-| 26 | `solar_capacity` |
-| 27 | `gas_capacity` |
-| 28 | `hard_coal_capacity` |
-| 29 | `lignite_capacity` |
-| 30 | `pumped_storage_capacity` |
-| 31 | `gas_price_ttf` |
-| 32 | `coal_price_api2` |
-| 33 | `co2_price_eua` |
-| 34 | `planned_outages_mw` |
-| 35 | `unplanned_outages_mw` |
-| 36 | `timestamp_utc` |
-| 37 | `is_local_reconstruction_only` |
-| 38 | `afrr_capacity_awarded_mw_pos` |
-| 39 | `afrr_capacity_awarded_mw_neg` |
-| 40 | `wind_total_error_da` |
-| 41 | `solar_error_da` |
-| 42 | `wind_forecast_update` |
-| 43 | `residual_load_calc` |
-| 44 | `simulated_afrr_profit_eur` |
-| 45 | `residual_load_forecast` |
-| 46 | `renewable_share_forecast` |
-| 47 | `neighbor_spread_avg` |
-| 48 | `generation_fossil_total_mw` |
-| 49 | `generation_baseload_total` |
-| 50 | `generation_hydro_actual_total` |
-| 51 | `wind_onshore_error_da` |
-| 52 | `wind_offshore_error_da` |
-| 53 | `wind_onshore_forecast_update` |
-| 54 | `solar_forecast_update` |
-| 55 | `da_price_eur_slog1p` |
-| 56 | `y_true_pos` |
-| 57 | `y_true_neg` |
-| 58 | `y_train_pos` |
-| 59 | `y_train_neg` |
-| 60 | `data_is_lagged` |
-| 61 | `pit_lagged_column_count` |
-| 62 | `da_price_volatility_30d` |
-| 63 | `wind_onshore_error_id` |
-| 64 | `wind_offshore_error_id` |
-| 65 | `solar_error_id` |
-| 66 | `total_wind_solar_id_error` |
-| 67 | `da_price_eur_mean_24h` |
-| 68 | `da_price_eur_std_24h` |
-| 69 | `da_price_eur_mean_168h` |
-| 70 | `da_price_eur_std_168h` |
-| 71 | `wind_onshore_actual_entsoe_mean_24h` |
-| 72 | `wind_onshore_actual_entsoe_std_24h` |
-| 73 | `wind_onshore_actual_entsoe_mean_168h` |
-| 74 | `wind_onshore_actual_entsoe_std_168h` |
-| 75 | `holiday_severity` |
-| 76 | `is_bridge_day` |
-| 77 | `is_christmas_break` |
-| 78 | `mfrr_active_lag` |
-| 79 | `nrv_zscore_24h` |
-| 80 | `picasso_flow_rate_lag_1h` |
-| 81 | `picasso_flow_rate_lag_24h` |
-| 82 | `is_picasso_regime` |
-| 83 | `grid_stress_index` |
-| 84 | `market_regime_picasso` |
-| 85 | `afrr_da_price_spread` |
-| 86 | `relative_price_competitiveness` |
-| 87 | `price_volatility_short_term` |
-| 88 | `scarcity_price_premium` |
-| 89 | `is_activated` |
-| 90 | `TE_hour_regime_activation` |
-| 91 | `market_state_cluster` |
-| 92 | `nrv_quantile_5` |
-| 93 | `da_price_eur_lag24` |
-| 94 | `da_price_eur_lag48` |
-| 95 | `da_price_eur_lag168` |
-| 96 | `wind_onshore_actual_entsoe_lag24` |
-| 97 | `wind_onshore_actual_entsoe_lag48` |
-| 98 | `wind_onshore_actual_entsoe_lag168` |
-| 99 | `afrr_vwap_pos_lag1` |
-| 100 | `afrr_vwap_pos_lag24` |
-| 101 | `afrr_vwap_pos_lag_1h` |
-| 102 | `afrr_vwap_pos_lag_24h` |
-| 103 | `afrr_vwap_neg_lag1` |
-| 104 | `afrr_vwap_neg_lag24` |
-| 105 | `afrr_vwap_neg_lag_1h` |
-| 106 | `afrr_vwap_neg_lag_24h` |
-| 107 | `afrr_activated_mw_pos_lag1` |
-| 108 | `afrr_activated_mw_pos_lag24` |
-| 109 | `afrr_activated_mw_pos_lag_1h` |
-| 110 | `afrr_activated_mw_pos_lag_24h` |
-| 111 | `afrr_activated_mw_neg_lag1` |
-| 112 | `afrr_activated_mw_neg_lag24` |
-| 113 | `afrr_activated_mw_neg_lag_1h` |
-| 114 | `afrr_activated_mw_neg_lag_24h` |
-| 115 | `afrr_da_price_spread_lag1` |
-| 116 | `afrr_da_price_spread_lag24` |
-| 117 | `afrr_da_price_spread_lag_1h` |
-| 118 | `afrr_da_price_spread_lag_24h` |
-| 119 | `da_price_eur_diff1` |
-| 120 | `da_price_eur_diff24` |
-| 121 | `da_price_eur_ewma24` |
-| 122 | `hour_sin` |
-| 123 | `hour_cos` |
-| 124 | `dayofweek_sin` |
-| 125 | `dayofweek_cos` |
-| 126 | `month_sin` |
-| 127 | `month_cos` |
-| 128 | `target_pos_h1` |
-| 129 | `target_neg_h1` |
-| 130 | `target_pos_h2` |
-| 131 | `target_neg_h2` |
-| 132 | `target_pos_h3` |
-| 133 | `target_neg_h3` |
-| 134 | `target_pos_h4` |
-| 135 | `target_neg_h4` |
-| 136 | `target_pos_h5` |
-| 137 | `target_neg_h5` |
-| 138 | `target_pos_h6` |
-| 139 | `target_neg_h6` |
-| 140 | `target_pos_h7` |
-| 141 | `target_neg_h7` |
-| 142 | `target_pos_h8` |
-| 143 | `target_neg_h8` |
-| 144 | `target_pos_h9` |
-| 145 | `target_neg_h9` |
-| 146 | `target_pos_h10` |
-| 147 | `target_neg_h10` |
-| 148 | `target_pos_h11` |
-| 149 | `target_neg_h11` |
-| 150 | `target_pos_h12` |
-| 151 | `target_neg_h12` |
-| 152 | `target_pos_h13` |
-| 153 | `target_neg_h13` |
-| 154 | `target_pos_h14` |
-| 155 | `target_neg_h14` |
-| 156 | `target_pos_h15` |
-| 157 | `target_neg_h15` |
-| 158 | `target_pos_h16` |
-| 159 | `target_neg_h16` |
-| 160 | `target_pos_h17` |
-| 161 | `target_neg_h17` |
-| 162 | `target_pos_h18` |
-| 163 | `target_neg_h18` |
-| 164 | `target_pos_h19` |
-| 165 | `target_neg_h19` |
-| 166 | `target_pos_h20` |
-| 167 | `target_neg_h20` |
-| 168 | `target_pos_h21` |
-| 169 | `target_neg_h21` |
-| 170 | `target_pos_h22` |
-| 171 | `target_neg_h22` |
-| 172 | `target_pos_h23` |
-| 173 | `target_neg_h23` |
-| 174 | `target_pos_h24` |
-| 175 | `target_neg_h24` |
-| 176 | `target_pos_h25` |
-| 177 | `target_neg_h25` |
-| 178 | `target_pos_h26` |
-| 179 | `target_neg_h26` |
-| 180 | `target_pos_h27` |
-| 181 | `target_neg_h27` |
-| 182 | `target_pos_h28` |
-| 183 | `target_neg_h28` |
-| 184 | `target_pos_h29` |
-| 185 | `target_neg_h29` |
-| 186 | `target_pos_h30` |
-| 187 | `target_neg_h30` |
-| 188 | `target_pos_h31` |
-| 189 | `target_neg_h31` |
-| 190 | `target_pos_h32` |
-| 191 | `target_neg_h32` |
-| 192 | `target_pos_h33` |
-| 193 | `target_neg_h33` |
-| 194 | `target_pos_h34` |
-| 195 | `target_neg_h34` |
-| 196 | `target_pos_h35` |
-| 197 | `target_neg_h35` |
-| 198 | `target_pos_h36` |
-| 199 | `target_neg_h36` |
-| 200 | `target_pos_h37` |
-| 201 | `target_neg_h37` |
-| 202 | `target_pos_h38` |
-| 203 | `target_neg_h38` |
-| 204 | `target_pos_h39` |
-| 205 | `target_neg_h39` |
-| 206 | `target_pos_h40` |
-| 207 | `target_neg_h40` |
-| 208 | `target_pos_h41` |
-| 209 | `target_neg_h41` |
-| 210 | `target_pos_h42` |
-| 211 | `target_neg_h42` |
-| 212 | `target_pos_h43` |
-| 213 | `target_neg_h43` |
-| 214 | `target_pos_h44` |
-| 215 | `target_neg_h44` |
-| 216 | `target_pos_h45` |
-| 217 | `target_neg_h45` |
-| 218 | `target_pos_h46` |
-| 219 | `target_neg_h46` |
-| 220 | `target_pos_h47` |
-| 221 | `target_neg_h47` |
-| 222 | `target_pos_h48` |
-| 223 | `target_neg_h48` |
-| 224 | `target_pos_h49` |
-| 225 | `target_neg_h49` |
-| 226 | `target_pos_h50` |
-| 227 | `target_neg_h50` |
-| 228 | `target_pos_h51` |
-| 229 | `target_neg_h51` |
-| 230 | `target_pos_h52` |
-| 231 | `target_neg_h52` |
-| 232 | `target_pos_h53` |
-| 233 | `target_neg_h53` |
-| 234 | `target_pos_h54` |
-| 235 | `target_neg_h54` |
-| 236 | `target_pos_h55` |
-| 237 | `target_neg_h55` |
-| 238 | `target_pos_h56` |
-| 239 | `target_neg_h56` |
-| 240 | `target_pos_h57` |
-| 241 | `target_neg_h57` |
-| 242 | `target_pos_h58` |
-| 243 | `target_neg_h58` |
-| 244 | `target_pos_h59` |
-| 245 | `target_neg_h59` |
-| 246 | `target_pos_h60` |
-| 247 | `target_neg_h60` |
-| 248 | `target_pos_h61` |
-| 249 | `target_neg_h61` |
-| 250 | `target_pos_h62` |
-| 251 | `target_neg_h62` |
-| 252 | `target_pos_h63` |
-| 253 | `target_neg_h63` |
-| 254 | `target_pos_h64` |
-| 255 | `target_neg_h64` |
-| 256 | `target_pos_h65` |
-| 257 | `target_neg_h65` |
-| 258 | `target_pos_h66` |
-| 259 | `target_neg_h66` |
-| 260 | `target_pos_h67` |
-| 261 | `target_neg_h67` |
-| 262 | `target_pos_h68` |
-| 263 | `target_neg_h68` |
-| 264 | `target_pos_h69` |
-| 265 | `target_neg_h69` |
-| 266 | `target_pos_h70` |
-| 267 | `target_neg_h70` |
-| 268 | `target_pos_h71` |
-| 269 | `target_neg_h71` |
-| 270 | `target_pos_h72` |
-| 271 | `target_neg_h72` |
-| 272 | `weekday_sin` |
-| 273 | `weekday_cos` |
-| 274 | `is_weekend` |
-| 275 | `is_payday_period` |
-| 276 | `is_morning` |
-| 277 | `is_afternoon` |
-| 278 | `is_evening` |
-| 279 | `is_night` |
+## Systemzustand, Volumen & Kapazitäten (X)
+| Feature Name | Einheit | Beschreibung & Rationale | Transformation |
+|---|---|---|---|
+| `mfrr_activated_mw_pos` | MW | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Rohwert |
+| `mfrr_activated_mw_neg` | MW | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Rohwert |
+| `mfrr_mari_net_mw` | MW | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Rohwert |
+| `afrr_capacity_offered_mw_neg` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `afrr_capacity_offered_mw_pos` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `afrr_activation_offered_mw_neg` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `afrr_activation_offered_mw_pos` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `wind_onshore_capacity` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `wind_offshore_capacity` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `solar_capacity` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `gas_capacity` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `hard_coal_capacity` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `lignite_capacity` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `pumped_storage_capacity` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `planned_outages_mw` | MW | Verfügbarkeitsstörung (geplant/ungeplant) als Treiber von Knappheit und Preisstress. | Rohwert |
+| `unplanned_outages_mw` | MW | Verfügbarkeitsstörung (geplant/ungeplant) als Treiber von Knappheit und Preisstress. | Rohwert |
+| `afrr_capacity_awarded_mw_pos` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+| `afrr_capacity_awarded_mw_neg` | MW | Volumen-/Kapazitätsinformation zur Angebots- und Systemverfügbarkeitslage. | Rohwert |
+
+## Fundamentaldaten & abgeleitete Signale (X)
+| Feature Name | Einheit | Beschreibung & Rationale | Transformation |
+|---|---|---|---|
+| `wind_onshore_actual_entsoe` | Numerisch | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Rohwert |
+| `wind_offshore_actual_entsoe` | Numerisch | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Rohwert |
+| `solar_actual_entsoe` | Numerisch | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Rohwert |
+| `wind_onshore_forecast_id_entsoe` | Numerisch | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `wind_offshore_forecast_id_entsoe` | Numerisch | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `solar_forecast_id_entsoe` | Numerisch | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `NRV_balance` | Numerisch | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Rohwert |
+| `generation_hydro_pumped_storage_mw` | MW | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Rohwert |
+| `system_stress_signal` | Index | Modellrelevantes numerisches Signal der finalen Feature-Matrix. | Abgeleiteter Rohwert |
+| `wind_total_error_da` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `solar_error_da` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `wind_forecast_update` | Numerisch | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `residual_load_calc` | Numerisch | Residuallastsignal als zentrale Knappheitsgröße im Stromsystem. | Abgeleiteter Rohwert |
+| `residual_load_forecast` | Numerisch | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `renewable_share_forecast` | Anteil (0–1) | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `generation_fossil_total_mw` | MW | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Rohwert |
+| `generation_baseload_total` | Anteil (0–1) | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Rohwert |
+| `generation_hydro_actual_total` | Anteil (0–1) | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Rohwert |
+| `wind_onshore_error_da` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `wind_offshore_error_da` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `wind_onshore_forecast_update` | Numerisch | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `solar_forecast_update` | Numerisch | Prognose- oder Prognoseupdate-Signal für ex-ante Erwartungsbildung. | Abgeleiteter Rohwert |
+| `afrr_activation_rate` | Anteil (0–1) | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Rohwert |
+| `wind_onshore_error_id` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `wind_offshore_error_id` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `solar_error_id` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `total_wind_solar_id_error` | Numerisch | Prognosefehler als Unsicherheits- und Stressindikator. | Abgeleiteter Rohwert |
+| `grid_stress_index` | Index | Modellrelevantes numerisches Signal der finalen Feature-Matrix. | Abgeleiteter Rohwert |
+| `market_regime_picasso` | Index | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Abgeleiteter Rohwert |
+| `TE_hour_regime_activation` | Index | Modellrelevantes numerisches Signal der finalen Feature-Matrix. | Abgeleiteter Rohwert |
+
+## Statistik- & Regimefeatures (X)
+| Feature Name | Einheit | Beschreibung & Rationale | Transformation |
+|---|---|---|---|
+| `da_price_volatility_30d` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `da_price_eur_mean_24h` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `da_price_eur_std_24h` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `da_price_eur_mean_168h` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `da_price_eur_std_168h` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `wind_onshore_actual_entsoe_mean_24h` | Numerisch | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Statistisch transformiert |
+| `wind_onshore_actual_entsoe_std_24h` | Numerisch | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Statistisch transformiert |
+| `wind_onshore_actual_entsoe_mean_168h` | Numerisch | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Statistisch transformiert |
+| `wind_onshore_actual_entsoe_std_168h` | Numerisch | Fundamentalgröße der Erzeugungsseite mit Einfluss auf Regelenergiebedarf. | Statistisch transformiert |
+| `nrv_zscore_24h` | Numerisch | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Statistisch transformiert |
+| `price_volatility_short_term` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `nrv_quantile_5` | Numerisch | Balancing-/Regelenergiesignal zur Abbildung von Systemungleichgewichten. | Statistisch transformiert |
+| `da_price_eur_diff1` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `da_price_eur_diff24` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+| `da_price_eur_ewma24` | EUR/MWh | Preisbezogene Marktinformation mit direkter Relevanz für Merit-Order und Knappheitssignale. | Statistisch transformiert |
+
+## Zeitliche & Kategorische Features (X)
+| Feature Name | Einheit | Beschreibung & Rationale | Transformation |
+|---|---|---|---|
+| `holiday_severity` | Index | Modellrelevantes numerisches Signal der finalen Feature-Matrix. | Rohwert |
+| `is_bridge_day` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `is_christmas_break` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `is_picasso_regime` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Abgeleiteter Rohwert |
+| `is_activated` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `hour_sin` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `hour_cos` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `dayofweek_sin` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `dayofweek_cos` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `month_sin` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `month_cos` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `weekday_sin` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `weekday_cos` | Index [-1,1] | Zyklische Kodierung zeitlicher Muster zur Vermeidung künstlicher Sprünge. | Rohwert |
+| `is_weekend` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `is_payday_period` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `is_morning` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `is_afternoon` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `is_evening` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
+| `is_night` | Flag (0/1) | Binärer Regime-/Kalenderindikator für nichtlineare Effekte. | Rohwert |
