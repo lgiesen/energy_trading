@@ -7,6 +7,7 @@ from .style import (
     apply_geo_style,
     get_color,
 )
+from .metrics import BatteryParams, calculate_pnl
 
 __all__ = [
     "GEO_DIVERGING",
@@ -14,4 +15,6 @@ __all__ = [
     "THESIS_PALETTE",
     "apply_geo_style",
     "get_color",
+    "BatteryParams",
+    "calculate_pnl",
 ]
