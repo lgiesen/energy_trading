@@ -139,7 +139,7 @@ RENEWABLE_DA_FORECAST_DROPS = [
     "solar_forecast_da_entsoe",
 ]
 
-# Keep only afrr_vwap_pos/neg as canonical activation price pair.
+# Keep only afrr_activation_price_vwap_pos/neg as canonical activation price pair.
 ACTIVATION_PRICE_REDUNDANCY_PATTERNS = [
     "avg_activation_price",
     "marginal_activation_price",
@@ -249,13 +249,13 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
 
     df_out = df
 
-    # Canonicalize VWAP naming if old _eur_mwh columns still exist.
-    if "afrr_vwap_pos" not in df_out.columns and "afrr_vwap_pos_eur_mwh" in df_out.columns:
-        df_out = df_out.with_columns(pl.col("afrr_vwap_pos_eur_mwh").alias("afrr_vwap_pos"))
-        LOGGER.info("Canonicalized afrr_vwap_pos from afrr_vwap_pos_eur_mwh")
-    if "afrr_vwap_neg" not in df_out.columns and "afrr_vwap_neg_eur_mwh" in df_out.columns:
-        df_out = df_out.with_columns(pl.col("afrr_vwap_neg_eur_mwh").alias("afrr_vwap_neg"))
-        LOGGER.info("Canonicalized afrr_vwap_neg from afrr_vwap_neg_eur_mwh")
+    # Canonicalize VWAP naming if legacy _eur_mwh columns still exist.
+    if "afrr_activation_price_vwap_pos" not in df_out.columns and "afrr_vwap_pos_eur_mwh" in df_out.columns:
+        df_out = df_out.with_columns(pl.col("afrr_vwap_pos_eur_mwh").alias("afrr_activation_price_vwap_pos"))
+        LOGGER.info("Canonicalized afrr_activation_price_vwap_pos from afrr_vwap_pos_eur_mwh")
+    if "afrr_activation_price_vwap_neg" not in df_out.columns and "afrr_vwap_neg_eur_mwh" in df_out.columns:
+        df_out = df_out.with_columns(pl.col("afrr_vwap_neg_eur_mwh").alias("afrr_activation_price_vwap_neg"))
+        LOGGER.info("Canonicalized afrr_activation_price_vwap_neg from afrr_vwap_neg_eur_mwh")
 
     # ---------------------------------------------------------------------
     # Transformation-first refinement:

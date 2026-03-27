@@ -1023,20 +1023,20 @@ def compute_afrr_vwap_from_15min(path: Path) -> pl.DataFrame:
     vwap_exprs: list[pl.Expr] = []
     out_cols: list[str] = []
     if has_pos:
-        out_cols.append("afrr_vwap_pos")
+        out_cols.append("afrr_activation_price_vwap_pos")
         vwap_exprs.append(
             pl.when(pl.col("__sum_vol_pos").is_null() | (pl.col("__sum_vol_pos") == 0.0))
             .then(pl.lit(float("nan")))
             .otherwise(pl.col("__sum_weighted_pos") / pl.col("__sum_vol_pos"))
-            .alias("afrr_vwap_pos")
+            .alias("afrr_activation_price_vwap_pos")
         )
     if has_neg:
-        out_cols.append("afrr_vwap_neg")
+        out_cols.append("afrr_activation_price_vwap_neg")
         vwap_exprs.append(
             pl.when(pl.col("__sum_vol_neg").is_null() | (pl.col("__sum_vol_neg") == 0.0))
             .then(pl.lit(float("nan")))
             .otherwise(pl.col("__sum_weighted_neg") / pl.col("__sum_vol_neg"))
-            .alias("afrr_vwap_neg")
+            .alias("afrr_activation_price_vwap_neg")
         )
 
     return hourly.with_columns(vwap_exprs).select(["timestamp_utc"] + out_cols)
@@ -1132,7 +1132,7 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
     vwap_hourly = compute_afrr_vwap_from_15min(DEFAULT_REGELLEISTUNG_15M_PATH)
     if not vwap_hourly.is_empty():
         df = df.join(vwap_hourly, on="timestamp_utc", how="left", suffix="_from15m")
-        for col in ("afrr_vwap_pos", "afrr_vwap_neg"):
+        for col in ("afrr_activation_price_vwap_pos", "afrr_activation_price_vwap_neg"):
             from15 = f"{col}_from15m"
             if from15 in df.columns and col in df.columns:
                 df = df.with_columns(pl.coalesce([pl.col(from15), pl.col(col)]).alias(col)).drop(from15)
@@ -1226,26 +1226,26 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
 
     # Signed bid-VWAP override (economic sign from ENERGY_PRICE_PAYMENT_DIRECTION).
     if "bid_signed_vwap_eur_mwh_pos" in df.columns:
-        if "afrr_vwap_pos" in df.columns:
+        if "afrr_activation_price_vwap_pos" in df.columns:
             df = df.with_columns(
-                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_pos"), pl.col("afrr_vwap_pos")]).alias(
-                    "afrr_vwap_pos"
+                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_pos"), pl.col("afrr_activation_price_vwap_pos")]).alias(
+                    "afrr_activation_price_vwap_pos"
                 )
             )
         else:
-            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_pos").alias("afrr_vwap_pos"))
+            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_pos").alias("afrr_activation_price_vwap_pos"))
     if "bid_signed_vwap_eur_mwh_neg" in df.columns:
-        if "afrr_vwap_neg" in df.columns:
+        if "afrr_activation_price_vwap_neg" in df.columns:
             df = df.with_columns(
-                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_neg"), pl.col("afrr_vwap_neg")]).alias(
-                    "afrr_vwap_neg"
+                pl.coalesce([pl.col("bid_signed_vwap_eur_mwh_neg"), pl.col("afrr_activation_price_vwap_neg")]).alias(
+                    "afrr_activation_price_vwap_neg"
                 )
             )
         else:
-            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_neg").alias("afrr_vwap_neg"))
+            df = df.with_columns(pl.col("bid_signed_vwap_eur_mwh_neg").alias("afrr_activation_price_vwap_neg"))
 
     # Normalize VWAP dtype.
-    for c in ("afrr_vwap_pos", "afrr_vwap_neg"):
+    for c in ("afrr_activation_price_vwap_pos", "afrr_activation_price_vwap_neg"):
         if c in df.columns:
             df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False).alias(c))
 
@@ -1343,48 +1343,6 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
     # Draft profitability feature:
     # Profit = (Allocated_Capacity * Capacity_Price) + (Activated_MWh * Signed_VWAP)
     # with signed VWAP already reflecting payment direction.
-    act_mwh_pos = (
-        pl.col("afrr_activated_mwh_pos").cast(pl.Float64, strict=False)
-        if "afrr_activated_mwh_pos" in df.columns
-        else (
-            pl.col("afrr_activated_mw_pos").cast(pl.Float64, strict=False) * 0.25
-            if "afrr_activated_mw_pos" in df.columns
-            else None
-        )
-    )
-    act_mwh_neg = (
-        pl.col("afrr_activated_mwh_neg").cast(pl.Float64, strict=False)
-        if "afrr_activated_mwh_neg" in df.columns
-        else (
-            pl.col("afrr_activated_mw_neg").cast(pl.Float64, strict=False) * 0.25
-            if "afrr_activated_mw_neg" in df.columns
-            else None
-        )
-    )
-    if (
-        "afrr_capacity_awarded_mw_pos" in df.columns
-        and "afrr_capacity_awarded_mw_neg" in df.columns
-        and "afrr_capacity_price_pos" in df.columns
-        and "afrr_capacity_price_neg" in df.columns
-        and "afrr_vwap_pos" in df.columns
-        and "afrr_vwap_neg" in df.columns
-        and act_mwh_pos is not None
-        and act_mwh_neg is not None
-    ):
-        exprs.append(
-            (
-                pl.col("afrr_capacity_awarded_mw_pos").cast(pl.Float64, strict=False)
-                * pl.col("afrr_capacity_price_pos").cast(pl.Float64, strict=False)
-                + act_mwh_pos * pl.col("afrr_vwap_pos").cast(pl.Float64, strict=False)
-                + pl.col("afrr_capacity_awarded_mw_neg").cast(pl.Float64, strict=False)
-                * pl.col("afrr_capacity_price_neg").cast(pl.Float64, strict=False)
-                + act_mwh_neg * pl.col("afrr_vwap_neg").cast(pl.Float64, strict=False)
-            ).alias("simulated_afrr_profit_eur")
-        )
-        created.append("simulated_afrr_profit_eur")
-    else:
-        LOGGER.warning("Skip simulated_afrr_profit_eur, missing required inputs.")
-
     if exprs:
         df = df.with_columns(exprs)
 
