@@ -20,7 +20,7 @@ def transform_data(input_path: Path, output_path: Path) -> None:
 
     # Signed log transform keeps negative price information and avoids NaNs for x <= -1:
     # slog1p(x) = sign(x) * log1p(abs(x))
-    price_cols = [c for c in ["da_price_d_eur_mwh", "da_price_eur"] if c in df.columns]
+    price_cols = [c for c in ["da_price_d_eur_mwh", "da_price"] if c in df.columns]
     if price_cols:
         df = df.with_columns(
             [

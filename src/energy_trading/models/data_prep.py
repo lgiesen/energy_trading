@@ -10,7 +10,9 @@ from sklearn.preprocessing import StandardScaler
 
 
 LEAKAGE_TARGET_COLS = [
-    "da_price_eur",
+    "da_price",
+    "afrr_capacity_price_pos",
+    "afrr_capacity_price_neg",
     "afrr_activation_price_vwap_pos",
     "afrr_activation_price_vwap_neg",
     "afrr_activated_mw_pos",

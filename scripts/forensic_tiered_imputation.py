@@ -27,7 +27,7 @@ import polars as pl
 DEFAULT_INPUT_CANDIDATES = [
     Path("data/features/all_data_features.parquet"),
 ]
-TARGET_PRICE_COLS = ["da_price_eur_slog1p", "da_price_BE"]
+TARGET_PRICE_COLS = ["da_price_slog1p", "da_price_BE"]
 ERROR_COLS = ["wind_onshore_error_id", "load_abs_error"]
 
 

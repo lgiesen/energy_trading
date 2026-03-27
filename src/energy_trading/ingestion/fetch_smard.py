@@ -20,7 +20,7 @@ Columns (high level):
     - actuals: residual load, wind onshore/offshore, solar
     - forecasts: day-ahead wind/solar
     - generation by fuel: lignite, hard coal, gas, nuclear, hydro pumped storage
-    - prices: da_price_eur (hourly)
+    - prices: da_price (hourly)
     - engineered: forecast errors, wind_forecast_de, system_stress_signal
 
 API notes:
@@ -583,15 +583,15 @@ def fetch_smard(
         LOGGER.info("Fetched %s rows for %s.", len(series_df), col_name)
 
     # Day-ahead prices (hourly)
-    da_df = fetch_series(session, DA_PRICE_FILTER_ID, region, resolution, start_ms, end_ms, cutoff_ms, "da_price_eur")
+    da_df = fetch_series(session, DA_PRICE_FILTER_ID, region, resolution, start_ms, end_ms, cutoff_ms, "da_price")
     if da_df is not None:
         merged = merged.join(da_df, on="timestamp", how="full", coalesce=True)
-        LOGGER.info("Fetched %s rows for da_price_eur.", len(da_df))
+        LOGGER.info("Fetched %s rows for da_price.", len(da_df))
 
     # TODO: Placeholder for profit analysis. Currently a copy of DA price.
     # Replace with actual EPEX ID1 data later.
-    if "da_price_eur" in merged.columns:
-        merged = merged.with_columns(pl.col("da_price_eur").alias("price_intraday_eur"))
+    if "da_price" in merged.columns:
+        merged = merged.with_columns(pl.col("da_price").alias("price_intraday_eur"))
 
     merged = merged.sort("timestamp")
     # Enforce strict hourly alignment and clip to requested UTC window.

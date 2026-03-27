@@ -67,7 +67,7 @@ DROP_FOR_MODEL = [
     # Keep only lagged PICASSO flow features in final ML table.
     "picasso_flow_rate",
     # Use publication-gated DA view in X.
-    "da_price_eur",
+    "da_price",
 ]
 
 # Removed due to >98% missing values identified in the feature audit.
@@ -104,8 +104,8 @@ def apply_final_feature_aggregations(df: pl.DataFrame) -> pl.DataFrame:
     before_cols = len(df.columns)
 
     # --- Block 1: Foreign Price Spread aggregation ---
-    if "da_price_eur" not in df.columns:
-        LOGGER.info("Skip final aggregation block 1 (missing da_price_eur).")
+    if "da_price" not in df.columns:
+        LOGGER.info("Skip final aggregation block 1 (missing da_price).")
     else:
         foreign_da_cols = [
             c
@@ -133,7 +133,7 @@ def apply_final_feature_aggregations(df: pl.DataFrame) -> pl.DataFrame:
             df = df.with_columns(
                 (
                     pl.col("neighbor_price_avg").cast(pl.Float64, strict=False)
-                    - pl.col("da_price_eur").cast(pl.Float64, strict=False)
+                    - pl.col("da_price").cast(pl.Float64, strict=False)
                 ).alias("neighbor_spread_avg")
             )
             # Keep only DE anchor and spread signal; drop foreign raw prices and
@@ -229,7 +229,7 @@ def apply_point_in_time_lag_layer(df: pl.DataFrame) -> pl.DataFrame:
     protected = {
         "timestamp_utc",
         "__target_source_afrr_activation_price_vwap_pos",
-        "__target_source_da_price_eur",
+        "__target_source_da_price",
         "__target_source_afrr_rate",
         "target_afrr_activation_price_vwap_pos_h1",
         "target_da_price_h1",
@@ -266,12 +266,12 @@ def add_day_ahead_publication_feature(df: pl.DataFrame) -> pl.DataFrame:
     - Before publication, use a causal fallback (`shift(24)`), i.e. prior-day
       same-hour DA price.
     """
-    if "timestamp_utc" not in df.columns or "da_price_eur" not in df.columns:
+    if "timestamp_utc" not in df.columns or "da_price" not in df.columns:
         return df
 
     pdf = df.to_pandas()
     ts = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
-    da = pd.to_numeric(pdf["da_price_eur"], errors="coerce")
+    da = pd.to_numeric(pdf["da_price"], errors="coerce")
 
     delivery_day_utc = ts.dt.floor("D")
     publication_ts = delivery_day_utc - pd.Timedelta(days=1) + pd.Timedelta(hours=13)
@@ -352,7 +352,7 @@ def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
     """Create explicit h+1 targets and drop temporary unlagged target sources."""
     required = {
         "__target_source_afrr_activation_price_vwap_pos",
-        "__target_source_da_price_eur",
+        "__target_source_da_price",
         "__target_source_afrr_rate",
     }
     if not required.issubset(set(df.columns)):
@@ -361,7 +361,7 @@ def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
 
     out = df.with_columns([
         pl.col("__target_source_afrr_activation_price_vwap_pos").shift(-1).alias("target_afrr_activation_price_vwap_pos_h1"),
-        pl.col("__target_source_da_price_eur").shift(-1).alias("target_da_price_h1"),
+        pl.col("__target_source_da_price").shift(-1).alias("target_da_price_h1"),
         pl.col("__target_source_afrr_rate").shift(-1).alias("target_afrr_rate_h1"),
     ])
     return out.drop([c for c in required if c in out.columns])
@@ -379,14 +379,13 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
 
     Outputs created:
     - `__target_source_afrr_activation_price_vwap_pos`
-    - `__target_source_da_price_eur`
+    - `__target_source_da_price`
     - `__target_source_afrr_rate`
     """
     pos_price_col = None
     neg_price_col = None
     for cand in (
         "afrr_activation_price_vwap_pos",
-        "afrr_vwap_pos",
         "afrr_activation_marginal_price_pos",
         "afrr_avg_activation_price_pos",
         "afrr_activation_avg_price_pos",
@@ -396,7 +395,6 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
             break
     for cand in (
         "afrr_activation_price_vwap_neg",
-        "afrr_vwap_neg",
         "afrr_activation_marginal_price_neg",
         "afrr_avg_activation_price_neg",
         "afrr_activation_avg_price_neg",
@@ -444,10 +442,10 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     ])
 
     # 3) Unlagged DA target source.
-    if "da_price_eur" not in df.columns:
-        raise KeyError("Missing required target source column: da_price_eur")
+    if "da_price" not in df.columns:
+        raise KeyError("Missing required target source column: da_price")
     df = df.with_columns([
-        pl.col("da_price_eur").cast(pl.Float64).alias("__target_source_da_price_eur"),
+        pl.col("da_price").cast(pl.Float64).alias("__target_source_da_price"),
     ])
 
     # 4) Unlagged activation-rate target source.
@@ -594,12 +592,12 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
         df = df.drop(drop_avg_activation_prices)
 
     price_col = None
-    for candidate in ("da_price", "da_price_d_eur_mwh", "da_price_eur"):
+    for candidate in ("da_price", "da_price_d_eur_mwh", "da_price"):
         if candidate in df.columns:
             price_col = candidate
             break
     if price_col is None:
-        raise KeyError("Missing required column: da_price (or da_price_d_eur_mwh/da_price_eur)")
+        raise KeyError("Missing required column: da_price (or da_price_d_eur_mwh/da_price)")
 
     df = df.with_columns(
         pl.col(price_col)
@@ -744,7 +742,7 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
     # Additional rolling windows requested for key series.
     extra_rolling_specs = [
         ("load_actual_entsoe", "load_actual_entsoe"),
-        ("da_price_eur", "da_price_eur"),
+        ("da_price", "da_price"),
         ("wind_onshore_actual_entsoe", "wind_onshore_actual_entsoe"),
     ]
     for col_name, prefix in extra_rolling_specs:
@@ -768,7 +766,7 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
     """Add price/opportunity features for activation-price and capacity-price modeling.
 
     Features:
-    - afrr_da_price_spread = afrr_activation_price - da_price_eur
+    - afrr_da_price_spread = afrr_activation_price - da_price
     - relative_price_competitiveness = afrr_activation_price / rolling_mean_24h(shifted)
     - price_volatility_short_term = rolling_std_4h(shifted afrr_activation_price)
     - scarcity_price_premium = afrr_activation_price * grid_stress_index
@@ -802,8 +800,8 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
     p_indexed.index = pdf["timestamp_utc"]
 
     # 1) Cross-market spread: strictly against Day-Ahead price.
-    if "da_price_eur" in pdf.columns:
-        p_da = pd.to_numeric(pdf["da_price_eur"], errors="coerce")
+    if "da_price" in pdf.columns:
+        p_da = pd.to_numeric(pdf["da_price"], errors="coerce")
         pdf["afrr_da_price_spread"] = p - p_da
     else:
         pdf["afrr_da_price_spread"] = np.nan
@@ -1131,7 +1129,7 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     # Keep the primary T+0 columns unchanged and add lag snapshots for seasonality/memory.
     lag_targets = [
         "load_actual_entsoe",
-        "da_price_eur",
+        "da_price",
         "wind_onshore_actual_entsoe",
         "load_total_incl_pumping",
         "residual_load_forecast_da",
@@ -1165,7 +1163,7 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{col}_lag_24h"] = s.shift(24)
 
     # 2) Momentum/trend features (differences for linear models).
-    momentum_targets = ["load_actual_entsoe", "da_price_eur"]
+    momentum_targets = ["load_actual_entsoe", "da_price"]
     for col in momentum_targets:
         if col not in out.columns:
             continue
@@ -1174,7 +1172,7 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{col}_diff24"] = s.diff(24)
 
     # 3) EWMA features (recently weighted context for sequence models).
-    ewma_targets = ["da_price_eur", "load_actual_entsoe"]
+    ewma_targets = ["da_price", "load_actual_entsoe"]
     for col in ewma_targets:
         if col not in out.columns:
             continue
@@ -1282,22 +1280,34 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
       output is `x_lag_3h` (absolute effective latency).
     """
     lag_plan = {
-        "momentum": {
+        "momentum_pit1h": {
             "lags": [1, 2, 3],
             "anchors": [
                 "afrr_activation_price_vwap_pos_lag_1h",
                 "afrr_activation_price_vwap_neg_lag_1h",
                 "afrr_da_price_spread_lag_1h",
-                "system_stress_signal_lag_2h",
-                "nrv_zscore_24h_lag_2h",
             ],
             "fallback_roots": [
                 "afrr_activation_price_vwap_pos",
                 "afrr_activation_price_vwap_neg",
                 "afrr_da_price_spread",
-                "system_stress_signal",
-                "nrv_zscore_24h",
             ],
+        },
+        "momentum_pit2h_nrv": {
+            "lags": [2, 3, 4],
+            "anchors": [
+                "nrv_zscore_24h_lag_2h",
+                "nrv_quantile_5_lag_2h",
+            ],
+            "fallback_roots": [],
+        },
+        "momentum_pit2h_stress": {
+            "lags": [2, 3, 6, 12, 24],
+            "anchors": [
+                "system_stress_signal_lag_2h",
+                "grid_stress_index_lag_2h",
+            ],
+            "fallback_roots": [],
         },
         "momentum_trend_memory": {
             "lags": [1, 2, 3, 6, 12, 24, 48, 168],
@@ -1305,14 +1315,12 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
                 "afrr_da_price_spread_lag_1h",
                 "afrr_activation_price_vwap_pos_lag_1h",
                 "afrr_activation_price_vwap_neg_lag_1h",
-                "system_stress_signal_lag_2h",
                 "da_price_pit",
             ],
             "fallback_roots": [
                 "afrr_da_price_spread",
                 "afrr_activation_price_vwap_pos",
                 "afrr_activation_price_vwap_neg",
-                "system_stress_signal",
                 "da_price_pit",
             ],
         },
@@ -1489,24 +1497,24 @@ def run_feature_sanity_checks(df_features: pd.DataFrame | pl.DataFrame) -> None:
         return float((pd.to_numeric(aa[valid], errors="coerce") - pd.to_numeric(bb[valid], errors="coerce")).abs().max())
 
     # Test A: explicit slices.
-    assert {"da_price_eur", "da_price_eur_lag_24h"}.issubset(pdf.columns), (
-        "Missing columns for Test A: da_price_eur / da_price_eur_lag_24h"
+    assert {"da_price", "da_price_lag_24h"}.issubset(pdf.columns), (
+        "Missing columns for Test A: da_price / da_price_lag_24h"
     )
-    err_a = _max_abs_err(pdf["da_price_eur_lag_24h"], pd.to_numeric(pdf["da_price_eur"], errors="coerce").shift(24))
+    err_a = _max_abs_err(pdf["da_price_lag_24h"], pd.to_numeric(pdf["da_price"], errors="coerce").shift(24))
     if err_a == 0.0:
-        print("[PASS] Test A (Explicit Slices): da_price_eur_lag_24h == da_price_eur.shift(24)")
+        print("[PASS] Test A (Explicit Slices): da_price_lag_24h == da_price.shift(24)")
     else:
         print(f"[FAIL] Test A (Explicit Slices): max_abs_error={err_a:.12g}")
     assert err_a == 0.0, f"Test A failed: max_abs_error={err_a}"
 
     # Test B: momentum/diff.
-    assert {"da_price_eur", "da_price_eur_diff1"}.issubset(pdf.columns), (
-        "Missing columns for Test B: da_price_eur / da_price_eur_diff1"
+    assert {"da_price", "da_price_diff1"}.issubset(pdf.columns), (
+        "Missing columns for Test B: da_price / da_price_diff1"
     )
-    expected_b = pd.to_numeric(pdf["da_price_eur"], errors="coerce") - pd.to_numeric(pdf["da_price_eur"], errors="coerce").shift(1)
-    err_b = _max_abs_err(pdf["da_price_eur_diff1"], expected_b)
+    expected_b = pd.to_numeric(pdf["da_price"], errors="coerce") - pd.to_numeric(pdf["da_price"], errors="coerce").shift(1)
+    err_b = _max_abs_err(pdf["da_price_diff1"], expected_b)
     if err_b == 0.0:
-        print("[PASS] Test B (Momentum): da_price_eur_diff1 == da_price_eur - shift(1)")
+        print("[PASS] Test B (Momentum): da_price_diff1 == da_price - shift(1)")
     else:
         print(f"[FAIL] Test B (Momentum): max_abs_error={err_b:.12g}")
     assert err_b == 0.0, f"Test B failed: max_abs_error={err_b}"
@@ -1555,14 +1563,14 @@ def run_feature_sanity_checks(df_features: pd.DataFrame | pl.DataFrame) -> None:
     assert err_d <= 1e-12, f"Test D failed: max_abs_error={err_d}"
 
     # Test E: EWMA causality and formula check.
-    assert {"da_price_eur", "da_price_eur_ewma24"}.issubset(pdf.columns), (
-        "Missing columns for Test E: da_price_eur / da_price_eur_ewma24"
+    assert {"da_price", "da_price_ewma24"}.issubset(pdf.columns), (
+        "Missing columns for Test E: da_price / da_price_ewma24"
     )
-    base = pd.to_numeric(pdf["da_price_eur"], errors="coerce")
+    base = pd.to_numeric(pdf["da_price"], errors="coerce")
     expected_e = base.ewm(span=24, adjust=False, min_periods=1, ignore_na=False).mean()
-    err_e = _max_abs_err(pd.to_numeric(pdf["da_price_eur_ewma24"], errors="coerce"), expected_e)
+    err_e = _max_abs_err(pd.to_numeric(pdf["da_price_ewma24"], errors="coerce"), expected_e)
     if err_e <= 1e-12:
-        print("[PASS] Test E (EWMA): da_price_eur_ewma24 matches causal ewm(span=24, adjust=False, ignore_na=False)")
+        print("[PASS] Test E (EWMA): da_price_ewma24 matches causal ewm(span=24, adjust=False, ignore_na=False)")
     else:
         print(f"[FAIL] Test E (EWMA): max_abs_error={err_e:.12g}")
     assert err_e <= 1e-12, f"Test E failed: max_abs_error={err_e}"
@@ -1670,8 +1678,10 @@ def build_features(input_path: Path, output_path: Path) -> None:
     # Advanced ML block (seasonal slices, momentum, EWMA, cyclical terms, ratios).
     # Must run after PiT lagging/gating and before target matrix.
     df = pl.from_pandas(add_advanced_ml_features(df.to_pandas()))
-    df = add_strategic_momentum_lags(df)
+    # Enforce explicit PiT anchors first (especially 2h for NRV/stress family),
+    # then expand strategic lag plans from those absolute anchors.
     df = apply_pit_audit_corrections(df)
+    df = add_strategic_momentum_lags(df)
     # Multi-strategy market-aware imputation for internal feature gaps.
     df = apply_multi_strategy_imputation(df)
 
@@ -1699,6 +1709,9 @@ def build_features(input_path: Path, output_path: Path) -> None:
         "system_stress_signal",
         "nrv_zscore_24h",
         "grid_stress_index",
+        # Legacy alias cleanup: keep only canonical afrr_activation_price_vwap_*.
+        "afrr_activation_price_vwap_pos",
+        "afrr_activation_price_vwap_neg",
     ]
     critical_raw_drop = [c for c in critical_raw_drop if c in df.columns]
     if critical_raw_drop:

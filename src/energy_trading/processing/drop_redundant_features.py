@@ -250,12 +250,12 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
     df_out = df
 
     # Canonicalize VWAP naming if legacy _eur_mwh columns still exist.
-    if "afrr_activation_price_vwap_pos" not in df_out.columns and "afrr_vwap_pos_eur_mwh" in df_out.columns:
-        df_out = df_out.with_columns(pl.col("afrr_vwap_pos_eur_mwh").alias("afrr_activation_price_vwap_pos"))
-        LOGGER.info("Canonicalized afrr_activation_price_vwap_pos from afrr_vwap_pos_eur_mwh")
-    if "afrr_activation_price_vwap_neg" not in df_out.columns and "afrr_vwap_neg_eur_mwh" in df_out.columns:
-        df_out = df_out.with_columns(pl.col("afrr_vwap_neg_eur_mwh").alias("afrr_activation_price_vwap_neg"))
-        LOGGER.info("Canonicalized afrr_activation_price_vwap_neg from afrr_vwap_neg_eur_mwh")
+    if "afrr_activation_price_vwap_pos" not in df_out.columns and "afrr_activation_price_vwap_pos_eur_mwh" in df_out.columns:
+        df_out = df_out.with_columns(pl.col("afrr_activation_price_vwap_pos_eur_mwh").alias("afrr_activation_price_vwap_pos"))
+        LOGGER.info("Canonicalized afrr_activation_price_vwap_pos from afrr_activation_price_vwap_pos_eur_mwh")
+    if "afrr_activation_price_vwap_neg" not in df_out.columns and "afrr_activation_price_vwap_neg_eur_mwh" in df_out.columns:
+        df_out = df_out.with_columns(pl.col("afrr_activation_price_vwap_neg_eur_mwh").alias("afrr_activation_price_vwap_neg"))
+        LOGGER.info("Canonicalized afrr_activation_price_vwap_neg from afrr_activation_price_vwap_neg_eur_mwh")
 
     # ---------------------------------------------------------------------
     # Transformation-first refinement:
@@ -313,7 +313,7 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
 
     # Neighbor price spread: cross-border pressure vs Germany.
     foreign_existing = [c for c in FOREIGN_DA_PRICE_COLS if c in df_out.columns]
-    if "da_price_eur" in df_out.columns and foreign_existing:
+    if "da_price" in df_out.columns and foreign_existing:
         df_out = df_out.with_columns(
             (
                 pl.sum_horizontal([pl.col(c).cast(pl.Float64, strict=False) for c in foreign_existing])
@@ -322,7 +322,7 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
         ).with_columns(
             (
                 pl.col("neighbor_price_avg").cast(pl.Float64, strict=False)
-                - pl.col("da_price_eur").cast(pl.Float64, strict=False)
+                - pl.col("da_price").cast(pl.Float64, strict=False)
             ).alias("neighbor_spread_avg")
         )
 

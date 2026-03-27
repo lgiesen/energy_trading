@@ -32,7 +32,7 @@ def _build_dummy_df(n_rows: int = 200) -> pl.DataFrame:
             "timestamp_utc": ts,
             "load_actual_entsoe": vals,  # 2h lag group
             "afrr_activated_mw_pos": vals,  # 1h lag group
-            "da_price_eur": vals,  # 0h lag group
+            "da_price": vals,  # 0h lag group
             "y_true_pos": vals,  # target
             "y_true_neg": vals,  # required by add_multi_output_targets in pipeline
         }
@@ -43,7 +43,7 @@ def test_strict_lag_first_integrity() -> None:
     df_raw = _build_dummy_df(200)
     raw_load = df_raw["load_actual_entsoe"].to_numpy()
     raw_afrr = df_raw["afrr_activated_mw_pos"].to_numpy()
-    raw_da = df_raw["da_price_eur"].to_numpy()
+    raw_da = df_raw["da_price"].to_numpy()
     raw_y = df_raw["y_true_pos"].to_numpy()
 
     # Run the lag layer exactly as in build_features.
@@ -56,11 +56,11 @@ def test_strict_lag_first_integrity() -> None:
     i = 180
     got_load = float(df_out.row(i, named=True)["load_actual_entsoe"])
     got_afrr = float(df_out.row(i, named=True)["afrr_activated_mw_pos"])
-    got_da = float(df_out.row(i, named=True)["da_price_eur"])
+    got_da = float(df_out.row(i, named=True)["da_price"])
 
     assert got_load == raw_load[i - 2], "2-hour lag mismatch for load_actual_entsoe"
     assert got_afrr == raw_afrr[i - 1], "1-hour lag mismatch for afrr_activated_mw_pos"
-    assert got_da == raw_da[i], "0-hour lag mismatch for da_price_eur"
+    assert got_da == raw_da[i], "0-hour lag mismatch for da_price"
     print("PASSED: Lag mapping (2h / 1h / 0h) is correct.")
 
     # Rolling integrity: 24h rolling mean on lagged load must not use raw i or i-1.

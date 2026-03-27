@@ -91,7 +91,7 @@ Current output schema in `data/raw/smard.parquet`:
 | `generation_fossil_gas_mw` | float | MW | Realized fossil-gas generation. |
 | `generation_nuclear_mw` | float | MW | Realized nuclear generation. |
 | `generation_hydro_pumped_storage_mw` | float | MW | Realized hydro pumped-storage generation. |
-| `da_price_eur` | float | EUR/MWh | Day-ahead price (DE-LU). |
+| `da_price` | float | EUR/MWh | Day-ahead price (DE-LU). |
 | `wind_forecast_de` | float | MW | Engineered combined wind forecast signal. |
 | `wind_onshore_error` | float | MW | Engineered wind onshore forecast error. |
 | `wind_offshore_error` | float | MW | Engineered wind offshore forecast error. |
