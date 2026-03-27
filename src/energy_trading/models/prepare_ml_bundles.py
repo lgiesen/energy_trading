@@ -23,6 +23,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 BundleName = Literal["da", "afrr"]
+PICASSO_START_UTC = "2022-06-22 22:00:00+00:00"
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,7 @@ class MLDataFactory:
     - scaler pipeline is fit on train split only.
     """
 
-    DA_TARGET_CANDIDATES = ["target_da_price_h1", "da_price"]
+    DA_TARGET_CANDIDATES = ["da_price", "target_da_price_h1"]
 
     AFRR_TARGET_SPECS = {
         "afrr_capacity_price_pos": ["afrr_capacity_price_pos"],
@@ -71,6 +72,8 @@ class MLDataFactory:
         self.doc_path = Path(doc_path)
         self.scaler_path = Path(scaler_path)
         self.config_path = self.output_dir / "feature_config.json"
+        # Law #1: strict causality purge gap between adjacent splits for 1h rows.
+        self.gap_rows = 72
 
     @staticmethod
     def _default_bounds() -> SplitBounds:
@@ -122,6 +125,18 @@ class MLDataFactory:
         df = df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc").reset_index(drop=True)
         return df
 
+    @staticmethod
+    def _apply_post_picasso_filter(df: pd.DataFrame) -> pd.DataFrame:
+        """Apply in-memory regime filter while keeping raw artifact unchanged."""
+        cut = pd.Timestamp(PICASSO_START_UTC, tz="UTC")
+        out = df.loc[df["timestamp_utc"] >= cut].copy()
+        out = out.sort_values("timestamp_utc").reset_index(drop=True)
+        print(
+            "Regime filter applied: Training on Post-PICASSO data only "
+            f"(Starting {PICASSO_START_UTC}). Rows available: {len(out)}"
+        )
+        return out
+
     def _resolve_da_targets(self, df: pd.DataFrame) -> list[str]:
         targets = [c for c in self.DA_TARGET_CANDIDATES if c in df.columns]
         if not targets:
@@ -136,7 +151,27 @@ class MLDataFactory:
                 resolved.append(chosen)
         if not resolved:
             raise KeyError("No aFRR targets found in artifact for configured target set")
-        return sorted(set(resolved))
+        # Primary aFRR target must be activation VWAP POS if available.
+        primary_candidates = self.AFRR_TARGET_SPECS["afrr_activation_price_vwap_pos"]
+        primary = next((c for c in primary_candidates if c in resolved), None)
+        uniq = []
+        seen = set()
+        for c in resolved:
+            if c not in seen:
+                uniq.append(c)
+                seen.add(c)
+        if primary is None:
+            return uniq
+        ordered = [primary] + [c for c in uniq if c != primary]
+        return ordered
+
+    @staticmethod
+    def _canonical_primary_target(bundle: BundleName) -> str:
+        if bundle == "da":
+            return "da_price"
+        if bundle == "afrr":
+            return "afrr_activation_price_vwap_pos"
+        raise ValueError(f"Unsupported bundle: {bundle}")
 
     def _bundle_targets(self, df: pd.DataFrame, bundle: BundleName) -> list[str]:
         if bundle == "da":
@@ -152,13 +187,27 @@ class MLDataFactory:
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
         return numeric_cols
 
-    @staticmethod
-    def _split_masks(df: pd.DataFrame, bounds: SplitBounds) -> dict[str, pd.Series]:
+    def _split_masks(self, df: pd.DataFrame, bounds: SplitBounds) -> dict[str, pd.Series]:
+        """Create chronological split masks with strict 72-row purge gaps.
+
+        Purge logic:
+        - Between train and val, drop first `gap_rows` rows of validation period.
+        - Between val and test, drop first `gap_rows` rows of test period.
+        """
         ts = df["timestamp_utc"]
+        idx = pd.RangeIndex(len(df))
+
+        train_idx = idx[ts < bounds.train_end_exclusive]
+        val_idx_raw = idx[(ts >= bounds.train_end_exclusive) & (ts < bounds.val_end_exclusive)]
+        test_idx_raw = idx[(ts >= bounds.val_end_exclusive) & (ts <= bounds.test_end_inclusive)]
+
+        val_idx = val_idx_raw[self.gap_rows :] if len(val_idx_raw) > self.gap_rows else val_idx_raw[:0]
+        test_idx = test_idx_raw[self.gap_rows :] if len(test_idx_raw) > self.gap_rows else test_idx_raw[:0]
+
         return {
-            "train": ts < bounds.train_end_exclusive,
-            "val": (ts >= bounds.train_end_exclusive) & (ts < bounds.val_end_exclusive),
-            "test": (ts >= bounds.val_end_exclusive) & (ts <= bounds.test_end_inclusive),
+            "train": idx.isin(train_idx),
+            "val": idx.isin(val_idx),
+            "test": idx.isin(test_idx),
         }
 
     def _fit_scaler_pipeline(self, X_train: pd.DataFrame) -> Pipeline:
@@ -168,6 +217,9 @@ class MLDataFactory:
 
     def build(self) -> dict:
         df = self._load_df()
+        # Lawful regime selection for training bundles (in-memory only).
+        # We do not modify the source artifact on disk.
+        df = self._apply_post_picasso_filter(df)
         bounds = self._default_bounds()
         masks = self._split_masks(df, bounds)
 
@@ -181,6 +233,7 @@ class MLDataFactory:
                 "train_end_exclusive": bounds.train_end_exclusive.isoformat(),
                 "val_end_exclusive": bounds.val_end_exclusive.isoformat(),
                 "test_end_inclusive": bounds.test_end_inclusive.isoformat(),
+                "purge_gap_rows": self.gap_rows,
             },
             "bundles": {},
         }
@@ -189,6 +242,8 @@ class MLDataFactory:
 
         for bundle in ("da", "afrr"):
             targets = self._bundle_targets(df, bundle=bundle)
+            primary_canonical = self._canonical_primary_target(bundle)
+            primary_source = targets[0]
             features = self._feature_columns(df, targets=targets)
 
             bundle_dir = self.output_dir / bundle
@@ -196,16 +251,22 @@ class MLDataFactory:
 
             for split_name, mask in masks.items():
                 part = df.loc[mask, ["timestamp_utc", *features, *targets]].copy()
+                if primary_source != primary_canonical:
+                    part = part.rename(columns={primary_source: primary_canonical})
                 part.to_parquet(bundle_dir / f"{split_name}.parquet", index=False)
+
+            targets_out = [primary_canonical] + [t for t in targets[1:] if t != primary_canonical]
 
             train_df = df.loc[masks["train"], features]
             scaler_store[bundle] = self._fit_scaler_pipeline(train_df)
 
             config["bundles"][bundle] = {
+                "primary_target": primary_canonical,
+                "target_source_columns": targets,
                 "features": features,
-                "targets": targets,
+                "targets": targets_out,
                 "n_features": len(features),
-                "n_targets": len(targets),
+                "n_targets": len(targets_out),
                 "files": {
                     "train": str(bundle_dir / "train.parquet"),
                     "val": str(bundle_dir / "val.parquet"),
