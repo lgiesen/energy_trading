@@ -16,7 +16,7 @@ Notes:
     - Also left-joins hourly outages sidecar (`data/processed/outages_hourly.parquet`)
       on UTC timestamp when available.
     - The example above clips to CET boundaries:
-      2020-12-01 00:00:00 CET -> 2026-01-01 00:00:00 CET,
+      2020-12-01 00:00:00 CET -> 2026-03-01 03:00:00 CET,
       passed as UTC (`Z`) values.
     - `--clip-start/--clip-end` accept timezone-aware ISO values (recommended: UTC with `Z`).
       If no timezone is provided, values are interpreted as Europe/Berlin local time.

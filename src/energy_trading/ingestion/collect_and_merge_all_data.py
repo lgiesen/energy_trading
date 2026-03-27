@@ -1,7 +1,7 @@
 """Collect all data sources and merge them into one parquet.
 
 Usage:
-    ./.venv/bin/python scripts/collect_and_merge_all_data.py --start 2020-11-30T23:00:00Z --end 2026-01-01T02:00:00Z
+    ./.venv/bin/python scripts/collect_and_merge_all_data.py --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z
 
 Runs:
 - ENTSO-E
@@ -42,7 +42,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch all datasets and merge in one go.")
     parser.add_argument("--start", default="2020-11-30T23:00:00Z", help="Start date (UTC ISO8601).")
-    parser.add_argument("--end", default="2026-01-01T02:00:00Z", help="End date (UTC ISO8601).")
+    parser.add_argument("--end", default="2026-03-01T02:00:00Z", help="End date (UTC ISO8601).")
     parser.add_argument("--out-dir", default="data/raw", help="Output directory for individual parquets.")
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument(

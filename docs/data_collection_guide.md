@@ -44,7 +44,7 @@ RESULT_OVERVIEW_{MARKET_TYPE}_MARKET_aFRR_{YEAR}-{MM}-01_{YEAR}-{MM}-{DD}.xlsx
 #### Query/Time Parameters
 ```bash
 ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
-  --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+  --start 2020-12-01T00:00:00Z --end 2026-03-01T02:00:00Z \
   --out data/raw/regelleistung.parquet
 ```
 - Internal filtering uses `start`/`end` bounds after timestamp normalization.
@@ -129,7 +129,7 @@ url = f"{base_url}&bzn={zone}"
 Run standalone:
 ```bash
 ./.venv/bin/python -m energy_trading.ingestion.fetch_energy_charts \
-  --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+  --start 2020-12-01T00:00:00Z --end 2026-03-01T02:00:00Z \
   --out data/raw/energy_charts.parquet
 ```
 

@@ -2,7 +2,7 @@
 
 Usage:
     ./.venv/bin/python scripts/collect_and_clean.py \
-        --start 2020-11-30T23:00:00Z --end 2026-01-01T02:00:00Z \
+        --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z \
         --raw-out data/processed/all_data.parquet \
         --clean-out data/processed/all_data_clean.parquet
 """

@@ -155,7 +155,7 @@ embedded in `all_data.parquet`:
 This corresponds to:
 
 - Start: `2020-12-01 00:00:00 CET`
-- End: `2026-01-01 00:00:00 CET`
+- End: `2026-03-01 03:00:00 CET`
 
 Important behavior:
 

@@ -42,7 +42,7 @@ process_type="A40"
 Example run:
 ```bash
 ./.venv/bin/python -m energy_trading.ingestion.fetch_entsoe \
-  --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+  --start 2020-12-01T00:00:00Z --end 2026-03-01T02:00:00Z \
   --out data/raw/entsoe.parquet
 ```
 

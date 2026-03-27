@@ -50,7 +50,7 @@ Operational fallback endpoints:
 To improve reliability and avoid server-side failures, extraction is chunked by date window:
 ```bash
 ./.venv/bin/python -m energy_trading.ingestion.fetch_netztransparenz \
-  --start 2020-12-01T00:00:00Z --end 2026-01-01T02:00:00Z \
+  --start 2020-12-01T00:00:00Z --end 2026-03-01T02:00:00Z \
   --chunk-days 30 --chunk-sleep 3 --resample 1h \
   --out data/raw/netztransparenz.parquet
 ```

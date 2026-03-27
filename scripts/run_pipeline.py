@@ -2,7 +2,7 @@
 """End-to-end pipeline wrapper: fetch -> merge -> refine -> prune -> transform -> features.
 
 Usage:
-    ./.venv/bin/python scripts/run_pipeline.py --start 2020-11-30T23:00:00Z --end 2026-01-01T02:00:00Z
+    ./.venv/bin/python scripts/run_pipeline.py --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Run full data pipeline (fetch -> features).")
     parser.add_argument("--start", default="2020-11-30T23:00:00Z", help="Start date (UTC ISO8601).")
-    parser.add_argument("--end", default="2026-01-01T02:00:00Z", help="End date (UTC ISO8601).")
+    parser.add_argument("--end", default="2026-03-01T02:00:00Z", help="End date (UTC ISO8601).")
     parser.add_argument("--out-dir", default="data/raw", help="Output directory for raw parquets.")
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument("--skip-commodities", action="store_true", help="Skip commodities fetch.")
