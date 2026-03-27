@@ -23,13 +23,10 @@ Purpose:
 Recommended terminal run:
 
 ```bash
-./.venv/bin/python scripts/collect_and_merge_all_data.py \
+./.venv/bin/python scripts/run_full_pipeline.py \
   --start 2020-11-30T23:00:00Z \
-  --end 2025-12-31T23:00:00Z && \
-./.venv/bin/python scripts/post_collection_pipeline.py \
-  --input data/processed/all_data.parquet \
-  --clip-start 2020-11-30T23:00:00Z \
-  --clip-end 2025-12-31T23:00:00Z
+  --end 2025-12-31T23:00:00Z \
+  --verify-lags
 ```
 
 Phase-1 output:
