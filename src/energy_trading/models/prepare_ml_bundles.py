@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,19 +27,33 @@ from typing import Literal
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from energy_trading.constants import PICASSO_RELEASE_UTC
+
 
 BundleName = Literal["da", "afrr"]
-PICASSO_START_UTC = "2022-06-22 22:00:00+00:00"
-
+LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SplitBounds:
     train_end_exclusive: pd.Timestamp
     val_end_exclusive: pd.Timestamp
     test_end_inclusive: pd.Timestamp
+
+
+@dataclass
+class ForecastFamilyPCA:
+    family: str
+    columns: list[str]
+    scaler: StandardScaler
+    pca: PCA
+    pc_names: list[str]
+    explained_variance_ratio: list[float]
+    max_abs_corr: float
+    max_vif: float
 
 
 class MLDataFactory:
@@ -49,23 +65,32 @@ class MLDataFactory:
     - scaler pipeline is fit on train split only.
     """
 
-    DA_TARGET_CANDIDATES = ["da_price", "target_da_price_h1"]
+    # Strict forecast labels for training (h+1 only).
+    DA_TRAIN_TARGET = "target_da_price_h1"
+    AFRR_PRIMARY_TRAIN_TARGET = "target_afrr_activation_price_vwap_pos_h1"
+    AFRR_OPTIONAL_TRAIN_TARGETS = [
+        "target_afrr_activation_price_vwap_neg_h1",
+        "target_afrr_rate_h1",
+    ]
 
-    AFRR_TARGET_SPECS = {
-        "afrr_capacity_price_pos": ["afrr_capacity_price_pos"],
-        "afrr_capacity_price_neg": ["afrr_capacity_price_neg"],
-        "afrr_activation_price_vwap_pos": [
-            "afrr_activation_price_vwap_pos",
-            "target_afrr_activation_price_vwap_pos_h1",
-        ],
-        "afrr_activation_price_vwap_neg": [
-            "afrr_activation_price_vwap_neg",
-            "target_afrr_activation_price_vwap_neg_h1",
-        ],
-        "afrr_activation_rate": ["afrr_activation_rate", "target_afrr_rate_h1"],
-    }
+    # Optional unshifted audit labels (y_true), never used as training targets.
+    DA_AUDIT_CANDIDATES = ["da_price"]
+    AFRR_AUDIT_CANDIDATES = [
+        "afrr_activation_price_vwap_pos",
+        "afrr_activation_price_vwap_neg",
+        "afrr_activation_rate",
+        "afrr_capacity_price_pos",
+        "afrr_capacity_price_neg",
+    ]
 
     HARD_META_EXCLUDE = {"timestamp_utc"}
+    FORECAST_FAMILY_PATTERNS: dict[str, str] = {
+        "load_forecast": r"^load_forecast",
+        "residual_load_forecast": r"^residual_load_forecast",
+        "wind_onshore_forecast": r"^wind_onshore_forecast",
+        "wind_offshore_forecast": r"^wind_offshore_forecast",
+        "solar_forecast": r"^solar_forecast",
+    }
 
     def __init__(
         self,
@@ -74,6 +99,11 @@ class MLDataFactory:
         doc_path: str | Path = "docs/features_documentation.md",
         scaler_path: str | Path = "models/preprocessing/scaler.joblib",
         null_report_path: str | Path = "data/reports/null_report_features.csv",
+        use_forecast_pca: bool = False,
+        forecast_pca_var_threshold: float = 0.95,
+        forecast_corr_threshold: float = 0.9,
+        forecast_vif_threshold: float = 10.0,
+        forecast_pca_drop_raw: bool = False,
     ) -> None:
         self.input_path = Path(input_path)
         self.output_dir = Path(output_dir)
@@ -85,6 +115,12 @@ class MLDataFactory:
         self.gap_rows = 72
         # Small-gap repair for sparse API holes on X only.
         self.feature_ffill_limit = 12
+        self.nan_warn_threshold_pct = 20.0
+        self.use_forecast_pca = bool(use_forecast_pca)
+        self.forecast_pca_var_threshold = float(forecast_pca_var_threshold)
+        self.forecast_corr_threshold = float(forecast_corr_threshold)
+        self.forecast_vif_threshold = float(forecast_vif_threshold)
+        self.forecast_pca_drop_raw = bool(forecast_pca_drop_raw)
 
     @staticmethod
     def _default_bounds() -> SplitBounds:
@@ -139,7 +175,7 @@ class MLDataFactory:
     @staticmethod
     def _apply_post_picasso_filter(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         """Apply in-memory regime filter while keeping raw artifact unchanged."""
-        cut = pd.Timestamp(PICASSO_START_UTC, tz="UTC")
+        cut = pd.Timestamp(PICASSO_RELEASE_UTC, tz="UTC")
         rows_before = len(df)
         # Remove pre-PICASSO rows due to structural market changes
         # (e.g., pay-as-bid vs pay-as-cleared activation-price dynamics).
@@ -148,43 +184,37 @@ class MLDataFactory:
         dropped = rows_before - len(out)
         return out, dropped
 
-    def _resolve_da_targets(self, df: pd.DataFrame) -> list[str]:
-        targets = [c for c in self.DA_TARGET_CANDIDATES if c in df.columns]
-        if not targets:
-            raise KeyError(f"No DA target found. Tried: {self.DA_TARGET_CANDIDATES}")
-        return [targets[0]]
+    def _resolve_da_targets(self, df: pd.DataFrame) -> tuple[list[str], list[str]]:
+        """Return (train_targets, audit_targets) for DA bundle."""
+        if self.DA_TRAIN_TARGET not in df.columns:
+            raise KeyError(
+                "Strict target validation failed for DA bundle: "
+                f"required `{self.DA_TRAIN_TARGET}` is missing."
+            )
+        audit = [c for c in self.DA_AUDIT_CANDIDATES if c in df.columns]
+        return [self.DA_TRAIN_TARGET], audit
 
-    def _resolve_afrr_targets(self, df: pd.DataFrame) -> list[str]:
-        resolved: list[str] = []
-        for _semantic_name, candidates in self.AFRR_TARGET_SPECS.items():
-            chosen = next((c for c in candidates if c in df.columns), None)
-            if chosen is not None:
-                resolved.append(chosen)
-        if not resolved:
-            raise KeyError("No aFRR targets found in artifact for configured target set")
-        # Primary aFRR target must be activation VWAP POS if available.
-        primary_candidates = self.AFRR_TARGET_SPECS["afrr_activation_price_vwap_pos"]
-        primary = next((c for c in primary_candidates if c in resolved), None)
-        uniq = []
-        seen = set()
-        for c in resolved:
-            if c not in seen:
-                uniq.append(c)
-                seen.add(c)
-        if primary is None:
-            return uniq
-        ordered = [primary] + [c for c in uniq if c != primary]
-        return ordered
+    def _resolve_afrr_targets(self, df: pd.DataFrame) -> tuple[list[str], list[str]]:
+        """Return (train_targets, audit_targets) for aFRR bundle."""
+        if self.AFRR_PRIMARY_TRAIN_TARGET not in df.columns:
+            raise KeyError(
+                "Strict target validation failed for aFRR bundle: "
+                f"required `{self.AFRR_PRIMARY_TRAIN_TARGET}` is missing."
+            )
+        train_targets = [self.AFRR_PRIMARY_TRAIN_TARGET]
+        train_targets.extend([c for c in self.AFRR_OPTIONAL_TRAIN_TARGETS if c in df.columns])
+        audit = [c for c in self.AFRR_AUDIT_CANDIDATES if c in df.columns]
+        return train_targets, audit
 
     @staticmethod
     def _canonical_primary_target(bundle: BundleName) -> str:
         if bundle == "da":
-            return "da_price"
+            return "target_da_price_h1"
         if bundle == "afrr":
-            return "afrr_activation_price_vwap_pos"
+            return "target_afrr_activation_price_vwap_pos_h1"
         raise ValueError(f"Unsupported bundle: {bundle}")
 
-    def _bundle_targets(self, df: pd.DataFrame, bundle: BundleName) -> list[str]:
+    def _bundle_targets(self, df: pd.DataFrame, bundle: BundleName) -> tuple[list[str], list[str]]:
         if bundle == "da":
             return self._resolve_da_targets(df)
         if bundle == "afrr":
@@ -206,14 +236,220 @@ class MLDataFactory:
             return part
         return part.dropna(subset=existing).copy()
 
-    def _impute_sparse_feature_gaps(self, part: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-        """Apply conservative ffill on X only (no backward fill, no target fill)."""
+    def _feature_quality_from_train(
+        self,
+        train_part: pd.DataFrame,
+        feature_cols: list[str],
+    ) -> tuple[list[str], pd.DataFrame]:
+        """Build feature-quality report on train split and decide keep/drop actions."""
+        existing = [c for c in feature_cols if c in train_part.columns]
+        if not existing:
+            return [], pd.DataFrame(columns=["feature", "train_nan_pct", "action"])
+
+        nan_pct = train_part[existing].isna().mean().mul(100.0)
+        rows: list[dict[str, object]] = []
+        kept: list[str] = []
+        for c in existing:
+            pct = float(nan_pct[c])
+            if pct >= 100.0:
+                action = "drop_all_nan_train"
+            elif pct > self.nan_warn_threshold_pct:
+                action = "warn_keep_high_nan"
+                kept.append(c)
+            else:
+                action = "keep"
+                kept.append(c)
+            rows.append({"feature": c, "train_nan_pct": round(pct, 6), "action": action})
+        report = (
+            pd.DataFrame(rows)
+            .sort_values(["train_nan_pct", "feature"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+        return kept, report
+
+    @staticmethod
+    def _print_feature_quality_report(bundle: BundleName, report: pd.DataFrame) -> None:
+        """Print compact feature quality report."""
+        if report.empty:
+            print(f"[quality][{bundle}] No features available for quality report.")
+            return
+        print(f"\n[quality][{bundle}] feature | train_nan_pct | action")
+        print("| feature | train_nan_pct | action |")
+        print("|---|---:|---|")
+        for _, row in report.iterrows():
+            print(f"| {row['feature']} | {row['train_nan_pct']:.4f} | {row['action']} |")
+
+    def _impute_features_with_train_fit(
+        self,
+        part: pd.DataFrame,
+        feature_cols: list[str],
+        train_medians: pd.Series,
+        *,
+        bundle: BundleName,
+        split_name: str,
+    ) -> pd.DataFrame:
+        """Impute X using split-local ffill + train-fitted median fallback."""
         existing = [c for c in feature_cols if c in part.columns]
         if not existing:
             return part
         part = part.sort_values("timestamp_utc").copy()
+
+        before = part[existing].isna().sum()
         part.loc[:, existing] = part.loc[:, existing].ffill(limit=self.feature_ffill_limit)
+        after_ffill = part[existing].isna().sum()
+
+        median_cols = [c for c in existing if c in train_medians.index and pd.notna(train_medians[c])]
+        if median_cols:
+            part.loc[:, median_cols] = part.loc[:, median_cols].fillna(train_medians[median_cols])
+        after_final = part[existing].isna().sum()
+
+        for c in existing:
+            ffilled = int(before[c] - after_ffill[c])
+            medianed = int(after_ffill[c] - after_final[c])
+            remaining = int(after_final[c])
+            if ffilled > 0 or medianed > 0:
+                LOGGER.info(
+                    "[impute][%s][%s] %s: ffill=%s median=%s remaining=%s",
+                    bundle,
+                    split_name,
+                    c,
+                    ffilled,
+                    medianed,
+                    remaining,
+                )
         return part
+
+    @staticmethod
+    def _max_abs_corr(x: pd.DataFrame) -> float:
+        if x.shape[1] < 2:
+            return 0.0
+        corr = x.corr().abs()
+        np.fill_diagonal(corr.values, np.nan)
+        v = np.nanmax(corr.values)
+        return float(v) if np.isfinite(v) else 0.0
+
+    @staticmethod
+    def _compute_vif_max(x: pd.DataFrame) -> float:
+        """Compute maximum VIF in a block using least squares (no statsmodels)."""
+        if x.shape[1] < 2:
+            return 1.0
+        arr = np.asarray(x, dtype=float)
+        max_vif = 1.0
+        for i in range(arr.shape[1]):
+            y = arr[:, i]
+            others = np.delete(arr, i, axis=1)
+            if others.shape[1] == 0:
+                continue
+            # Add intercept.
+            X = np.column_stack([np.ones(len(y)), others])
+            try:
+                coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+                y_hat = X @ coef
+                ss_res = float(np.sum((y - y_hat) ** 2))
+                ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                if ss_tot <= 0:
+                    continue
+                r2 = 1.0 - (ss_res / ss_tot)
+                r2 = min(max(r2, 0.0), 0.999999)
+                vif = 1.0 / (1.0 - r2)
+                if np.isfinite(vif):
+                    max_vif = max(max_vif, float(vif))
+            except Exception:
+                continue
+        return float(max_vif)
+
+    def _forecast_family_columns(self, feature_cols: list[str]) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for fam, pattern in self.FORECAST_FAMILY_PATTERNS.items():
+            rx = re.compile(pattern)
+            cols = [c for c in feature_cols if rx.match(c)]
+            # Restrict to family signals and their lagged variants.
+            cols = [c for c in cols if "_lag_" in c or "forecast" in c]
+            if cols:
+                out[fam] = cols
+        return out
+
+    def _fit_forecast_family_pca(
+        self,
+        train_df: pd.DataFrame,
+        feature_cols: list[str],
+    ) -> list[ForecastFamilyPCA]:
+        """Fit PCA modules on forecast families using train data only."""
+        families = self._forecast_family_columns(feature_cols)
+        models: list[ForecastFamilyPCA] = []
+        for fam, cols in families.items():
+            if len(cols) < 2:
+                continue
+            block = train_df[cols].copy()
+            # Train-fitted fallback for PCA fit robustness.
+            med = block.median(numeric_only=True)
+            block = block.fillna(med).fillna(0.0)
+
+            max_corr = self._max_abs_corr(block)
+            max_vif = self._compute_vif_max(block)
+            if max_corr < self.forecast_corr_threshold and max_vif < self.forecast_vif_threshold:
+                LOGGER.info(
+                    "[forecast-pca][skip] %s: low redundancy (max_corr=%.3f, max_vif=%.3f)",
+                    fam,
+                    max_corr,
+                    max_vif,
+                )
+                continue
+
+            scaler = StandardScaler()
+            scaled = scaler.fit_transform(block)
+            pca_full = PCA().fit(scaled)
+            cum = np.cumsum(pca_full.explained_variance_ratio_)
+            n_comp = int(np.searchsorted(cum, self.forecast_pca_var_threshold) + 1)
+            n_comp = max(1, min(n_comp, len(cols)))
+            pca = PCA(n_components=n_comp).fit(scaled)
+            pc_names = [f"{fam}_pc{i+1}" for i in range(n_comp)]
+
+            models.append(
+                ForecastFamilyPCA(
+                    family=fam,
+                    columns=cols,
+                    scaler=scaler,
+                    pca=pca,
+                    pc_names=pc_names,
+                    explained_variance_ratio=[float(v) for v in pca.explained_variance_ratio_],
+                    max_abs_corr=float(max_corr),
+                    max_vif=float(max_vif),
+                )
+            )
+            LOGGER.info(
+                "[forecast-pca][fit] %s: cols=%s n_comp=%s explained=%.4f max_corr=%.3f max_vif=%.3f",
+                fam,
+                len(cols),
+                n_comp,
+                float(np.sum(pca.explained_variance_ratio_)),
+                max_corr,
+                max_vif,
+            )
+        return models
+
+    def _apply_forecast_family_pca(
+        self,
+        part: pd.DataFrame,
+        models: list[ForecastFamilyPCA],
+    ) -> pd.DataFrame:
+        if not models:
+            return part
+        out = part.copy()
+        for m in models:
+            cols = [c for c in m.columns if c in out.columns]
+            if not cols:
+                continue
+            block = out[cols].copy()
+            med = block.median(numeric_only=True)
+            block = block.fillna(med).fillna(0.0)
+            scaled = m.scaler.transform(block)
+            pcs = m.pca.transform(scaled)
+            for i, name in enumerate(m.pc_names):
+                out[name] = pcs[:, i]
+            if self.forecast_pca_drop_raw:
+                out = out.drop(columns=cols, errors="ignore")
+        return out
 
     @staticmethod
     def _reason_category(col: str) -> str:
@@ -291,9 +527,14 @@ class MLDataFactory:
         df, dropped_picasso = self._apply_post_picasso_filter(df)
         print(
             "Regime filter applied: Training on Post-PICASSO data only "
-            f"(Starting {PICASSO_START_UTC}). Rows available: {len(df)}"
+            f"(Starting {PICASSO_RELEASE_UTC}). Rows available: {len(df)}"
         )
         print(f"Rows dropped due to Picasso-Cut: {dropped_picasso}")
+        if self.use_forecast_pca and self.forecast_pca_drop_raw:
+            LOGGER.warning(
+                "forecast_pca_drop_raw=True enabled. Use this only after CV MAE/PnL "
+                "A/B validation confirms no degradation."
+            )
         bounds = self._default_bounds()
         masks = self._split_masks(df, bounds)
 
@@ -303,6 +544,13 @@ class MLDataFactory:
         config: dict = {
             "artifact_path": str(self.input_path),
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "options": {
+                "use_forecast_pca": self.use_forecast_pca,
+                "forecast_pca_var_threshold": self.forecast_pca_var_threshold,
+                "forecast_corr_threshold": self.forecast_corr_threshold,
+                "forecast_vif_threshold": self.forecast_vif_threshold,
+                "forecast_pca_drop_raw": self.forecast_pca_drop_raw,
+            },
             "splits": {
                 "train_end_exclusive": bounds.train_end_exclusive.isoformat(),
                 "val_end_exclusive": bounds.val_end_exclusive.isoformat(),
@@ -314,30 +562,64 @@ class MLDataFactory:
 
         scaler_store: dict[str, Pipeline] = {}
         remaining_nans_x_total = 0
+        quality_reports: list[pd.DataFrame] = []
 
         for bundle in ("da", "afrr"):
-            targets = self._bundle_targets(df, bundle=bundle)
+            targets, audit_targets = self._bundle_targets(df, bundle=bundle)
             primary_canonical = self._canonical_primary_target(bundle)
             primary_source = targets[0]
-            features = self._feature_columns(df, targets=targets)
+            base_features = self._feature_columns(df, targets=targets)
+
+            # Train slice for quality diagnostics + train-fitted imputation stats.
+            train_cols = ["timestamp_utc", *base_features, *targets]
+            train_cols = list(dict.fromkeys([c for c in train_cols if c in df.columns]))
+            train_part = df.loc[masks["train"], train_cols].copy()
+            train_part = self._drop_target_nans(train_part, targets)
+            features, quality_report = self._feature_quality_from_train(train_part, base_features)
+            self._print_feature_quality_report(bundle, quality_report)
+            quality_report = quality_report.copy()
+            quality_report.insert(0, "bundle", bundle)
+            quality_reports.append(quality_report)
+            train_medians = train_part[features].median(numeric_only=True) if features else pd.Series(dtype=float)
 
             bundle_dir = self.output_dir / bundle
             bundle_dir.mkdir(parents=True, exist_ok=True)
+            forecast_pca_models = (
+                self._fit_forecast_family_pca(train_part, features)
+                if self.use_forecast_pca
+                else []
+            )
 
             for split_name, mask in masks.items():
-                part = df.loc[mask, ["timestamp_utc", *features, *targets]].copy()
+                cols = ["timestamp_utc", *features, *targets, *audit_targets]
+                cols = list(dict.fromkeys([c for c in cols if c in df.columns]))
+                part = df.loc[mask, cols].copy()
                 # Mandatory target cleaning: drop boundary rows with missing y.
                 part = self._drop_target_nans(part, targets)
-                # Sparse-gap repair on X only; keep remaining NaNs (model can handle).
-                part = self._impute_sparse_feature_gaps(part, features)
-                remaining_nans_x_total += int(part[features].isna().sum().sum())
+                # Split-local ffill + train-fitted median fallback.
+                part = self._impute_features_with_train_fit(
+                    part,
+                    features,
+                    train_medians,
+                    bundle=bundle,
+                    split_name=split_name,
+                )
+                part = self._apply_forecast_family_pca(part, forecast_pca_models)
+                active_features = [c for c in features if c in part.columns]
+                remaining_nans_x_total += int(part[active_features].isna().sum().sum())
                 if primary_source != primary_canonical:
                     part = part.rename(columns={primary_source: primary_canonical})
                 part.to_parquet(bundle_dir / f"{split_name}.parquet", index=False)
 
             targets_out = [primary_canonical] + [t for t in targets[1:] if t != primary_canonical]
+            pca_feature_names = [pc for m in forecast_pca_models for pc in m.pc_names]
+            if self.forecast_pca_drop_raw:
+                dropped_cols = {c for m in forecast_pca_models for c in m.columns}
+                features = [c for c in features if c not in dropped_cols]
+            features = list(dict.fromkeys(features + pca_feature_names))
 
-            train_df = df.loc[masks["train"], features]
+            train_for_scaler = self._apply_forecast_family_pca(train_part, forecast_pca_models)
+            train_df = train_for_scaler[features].copy()
             scaler_store[bundle] = self._fit_scaler_pipeline(train_df)
 
             config["bundles"][bundle] = {
@@ -345,6 +627,20 @@ class MLDataFactory:
                 "target_source_columns": targets,
                 "features": features,
                 "targets": targets_out,
+                "audit_targets": audit_targets,
+                "feature_quality_report": str(bundle_dir / "feature_quality_report.csv"),
+                "forecast_pca": [
+                    {
+                        "family": m.family,
+                        "columns": m.columns,
+                        "pc_names": m.pc_names,
+                        "explained_variance_ratio": m.explained_variance_ratio,
+                        "explained_variance_sum": float(sum(m.explained_variance_ratio)),
+                        "max_abs_corr": m.max_abs_corr,
+                        "max_vif": m.max_vif,
+                    }
+                    for m in forecast_pca_models
+                ],
                 "n_features": len(features),
                 "n_targets": len(targets_out),
                 "files": {
@@ -353,6 +649,10 @@ class MLDataFactory:
                     "test": str(bundle_dir / "test.parquet"),
                 },
             }
+            quality_report[["feature", "train_nan_pct", "action"]].to_csv(
+                bundle_dir / "feature_quality_report.csv",
+                index=False,
+            )
 
         with self.config_path.open("w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
@@ -367,6 +667,9 @@ class MLDataFactory:
         if report_frames:
             report_df = pd.concat(report_frames, ignore_index=True, sort=False)
             self._write_null_report(report_df, self.null_report_path)
+        if quality_reports:
+            quality_all = pd.concat(quality_reports, ignore_index=True, sort=False)
+            quality_all.to_csv(self.output_dir / "feature_quality_report_all.csv", index=False)
         print(f"Remaining NaNs in X : {remaining_nans_x_total}")
         return config
 
@@ -404,10 +707,39 @@ def _build_cli() -> argparse.ArgumentParser:
         default="data/reports/null_report_features.csv",
         help="Output CSV for post-cleaning null report.",
     )
+    p.add_argument(
+        "--use-forecast-pca",
+        action="store_true",
+        help="Enable train-fit PCA modules for forecast feature families.",
+    )
+    p.add_argument(
+        "--forecast-pca-var-threshold",
+        type=float,
+        default=0.95,
+        help="Minimum cumulative explained variance per forecast family PCA.",
+    )
+    p.add_argument(
+        "--forecast-corr-threshold",
+        type=float,
+        default=0.9,
+        help="Minimum max absolute correlation to trigger PCA for a family.",
+    )
+    p.add_argument(
+        "--forecast-vif-threshold",
+        type=float,
+        default=10.0,
+        help="Minimum max VIF to trigger PCA for a family.",
+    )
+    p.add_argument(
+        "--forecast-pca-drop-raw",
+        action="store_true",
+        help="Drop raw family forecast columns after PCA (recommended only after A/B validation).",
+    )
     return p
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = _build_cli().parse_args()
     factory = MLDataFactory(
         input_path=args.input,
@@ -415,6 +747,11 @@ def main() -> None:
         doc_path=args.doc_path,
         scaler_path=args.scaler_out,
         null_report_path=args.null_report_out,
+        use_forecast_pca=args.use_forecast_pca,
+        forecast_pca_var_threshold=args.forecast_pca_var_threshold,
+        forecast_corr_threshold=args.forecast_corr_threshold,
+        forecast_vif_threshold=args.forecast_vif_threshold,
+        forecast_pca_drop_raw=args.forecast_pca_drop_raw,
     )
     cfg = factory.build()
     print("[OK] ML bundles erstellt.")
