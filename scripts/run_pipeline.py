@@ -45,8 +45,8 @@ def main() -> None:
         help="Optional path for SMARD market-data CSV output.",
     )
     parser.add_argument("--skip-features", action="store_true", help="Stop after transform step.")
-    parser.add_argument("--entsoe-chunk-months", type=int, default=3, help="ENTSO-E chunk size in months.")
-    parser.add_argument("--entsoe-workers", type=int, default=3, help="ENTSO-E parallel workers.")
+    parser.add_argument("--entsoe-chunk-months", type=int, default=1, help="ENTSO-E chunk size in months.")
+    parser.add_argument("--entsoe-workers", type=int, default=1, help="ENTSO-E parallel workers.")
     args = parser.parse_args()
 
     py = sys.executable

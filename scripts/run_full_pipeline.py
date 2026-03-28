@@ -2,9 +2,12 @@
 """Single-command end-to-end pipeline runner (fetch -> final features).
 
 Usage:
-    ./.venv/bin/python scripts/run_full_pipeline.py \
-        --start 2020-11-30T23:00:00Z \
-        --end 2026-03-01T02:00:00Z
+    ./.venv/Bin/Python Scripts/run_full_pipeline.py \
+        --Start 2020-11-30T23:00:00Z \
+        --End 2026-03-01T02:00:00Z \
+        --Entsoe-Workers 1 \
+        --Entsoe-Chunk-Months 1
+
 """
 from __future__ import annotations
 
@@ -69,8 +72,8 @@ def main() -> None:
         default=None,
         help="Optional path for SMARD market-data CSV output.",
     )
-    parser.add_argument("--entsoe-chunk-months", type=int, default=3, help="ENTSO-E chunk size in months.")
-    parser.add_argument("--entsoe-workers", type=int, default=3, help="ENTSO-E parallel workers.")
+    parser.add_argument("--entsoe-chunk-months", type=int, default=1, help="ENTSO-E chunk size in months.")
+    parser.add_argument("--entsoe-workers", type=int, default=1, help="ENTSO-E parallel workers.")
     parser.add_argument(
         "--clip-start",
         default=None,

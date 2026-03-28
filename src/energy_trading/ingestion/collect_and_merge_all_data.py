@@ -76,8 +76,8 @@ def main():
     parser.add_argument("--entsoe-timeout", dest="entsoe_timeout", type=int, default=120, help="(unused) ENTSO-E HTTP timeout seconds.")
     parser.add_argument("--entsoe-chunk-days", dest="entsoe_chunk_days", type=int, default=90, help="(unused) ENTSO-E chunk size in days.")
     parser.add_argument("--entsoe-chunk-sleep", dest="entsoe_chunk_sleep", type=float, default=1.0, help="(unused) Sleep seconds between ENTSO-E chunks.")
-    parser.add_argument("--entsoe-chunk-months", type=int, default=3, help="ENTSO-E chunk size in months.")
-    parser.add_argument("--entsoe-workers", type=int, default=3, help="ENTSO-E parallel workers.")
+    parser.add_argument("--entsoe-chunk-months", type=int, default=1, help="ENTSO-E chunk size in months.")
+    parser.add_argument("--entsoe-workers", type=int, default=1, help="ENTSO-E parallel workers.")
     parser.add_argument(
         "--clip-start",
         default=None,

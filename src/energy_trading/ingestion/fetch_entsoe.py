@@ -102,7 +102,11 @@ def _chunk_ranges(start: pd.Timestamp, end: pd.Timestamp, months: int) -> list[t
     return ranges
 
 
-def _retry(func, attempts: int = 3, sleep_s: float = 2.0):
+DEFAULT_RETRY_ATTEMPTS = 4
+DEFAULT_RETRY_SLEEP_S = 2.0
+
+
+def _retry(func, attempts: int = DEFAULT_RETRY_ATTEMPTS, sleep_s: float = DEFAULT_RETRY_SLEEP_S):
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
@@ -659,8 +663,8 @@ def fetch_and_merge(
     bidding_zone_or_out: str | None = None,
     process_year_ahead: str | None = None,
     out: str | None = None,
-    chunk_months: int = 3,
-    workers: int = 3,
+    chunk_months: int = 1,
+    workers: int = 1,
     token: str | None = None,
     timeout: int | None = None,
     chunk_days: int | None = None,
@@ -737,8 +741,8 @@ def main() -> None:
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
     parser.add_argument("--out", default="data/raw/entsoe.parquet", help="Output parquet path.")
-    parser.add_argument("--chunk-months", type=int, default=3, help="Chunk size in months (default: 3).")
-    parser.add_argument("--workers", type=int, default=3, help="Parallel workers (default: 3).")
+    parser.add_argument("--chunk-months", type=int, default=1, help="Chunk size in months (default: 1).")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel workers (default: 1).")
     args = parser.parse_args()
 
     if load_dotenv is not None:
