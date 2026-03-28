@@ -155,7 +155,11 @@ def main() -> None:
     parser.add_argument("--corr-threshold", type=float, default=0.85, help="Absolute Pearson threshold.")
     parser.add_argument("--vif-threshold", type=float, default=10.0, help="VIF threshold.")
     parser.add_argument("--top-n", type=int, default=20, help="Number of features for heatmap.")
-    parser.add_argument("--out-dir", default="data/processed", help="Output directory for reports.")
+    parser.add_argument(
+        "--out-dir",
+        default="data/reports/processed_audits",
+        help="Output directory for reports.",
+    )
     args = parser.parse_args()
 
     in_path = Path(args.input)

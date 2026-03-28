@@ -256,7 +256,7 @@ def run_audit() -> None:
         print(f"- Missing required columns for residual test: {sorted(required - set(fe.columns))}")
 
     # Optional export for thesis appendix.
-    out_path = Path("data/processed/load_feature_completeness_audit.csv")
+    out_path = Path("data/reports/processed_audits/load_feature_completeness_audit.csv")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     report.to_csv(out_path, index=False)
     print(f"\nSaved report: {out_path}")

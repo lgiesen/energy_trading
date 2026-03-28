@@ -33,7 +33,12 @@ def _resolve_input(path: str | None) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot PurgedTimeSeriesSplit folds.")
     parser.add_argument("--in", dest="input_path", default=None, help="Input parquet path.")
-    parser.add_argument("--out", dest="output_path", default="data/processed/cv_folds.png", help="Output figure path.")
+    parser.add_argument(
+        "--out",
+        dest="output_path",
+        default="data/reports/processed_audits/cv_folds.png",
+        help="Output figure path.",
+    )
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--min-train-days", type=int, default=120)
     parser.add_argument("--test-days", type=int, default=14)
