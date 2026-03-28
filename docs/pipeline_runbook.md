@@ -68,6 +68,21 @@ Leakage guarantee in Phase 2:
 - unlagged target columns are removed from `X` before model fitting,
 - split is chronological (no shuffle), preventing look-ahead bias.
 
+### Phase 2b: Create DA/aFRR ML Bundles
+
+Purpose:
+- generate reusable `train/val/test` parquet bundles for DA and aFRR tracks,
+- export `feature_config.json` with exact `X`/`y` column mapping,
+- fit and store preprocessing scaler on train split only.
+
+```bash
+./.venv/bin/python -m src.energy_trading.models.prepare_ml_bundles \
+  --input data/features/all_data_features.parquet \
+  --output-dir data/model_input \
+  --doc-path docs/features_documentation.md \
+  --scaler-out models/preprocessing/scaler.joblib
+```
+
 ---
 
 ## 1) Pipeline Structure

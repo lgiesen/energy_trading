@@ -6,7 +6,7 @@ Dieses Dokument beschreibt den finalen, kausal abgesicherten Merkmalsraum für d
 
 - Finale Artefaktdatei: `data/features/all_data_features.parquet`
 - Aktueller Stand nach PiT-Latenzkorrektur: **173 Spalten**
-- Trainingsmerkmale `X` nach `prepare_model_data(...)` (numerisch): **164**
+- Trainingsmerkmale `X` nach `prepare_model_data(...)` (numerisch): **165**
 - `timestamp_utc` ist ein **Metadatum/Zeitindex** und wird nicht als Trainingsmerkmal gezählt.
 
 ## Regeln zur Publikationslatenz (PiT)
@@ -19,6 +19,17 @@ Dieses Dokument beschreibt den finalen, kausal abgesicherten Merkmalsraum für d
 | Day-Ahead-Preis                                                       | `da_price_pit` mit D-1 13:00-UTC-Freigabelogik                  |
 | Forecast-Signale                                                      | ex ante nutzbar, keine Zukunftsauffüllung                       |
 
+## Daten-Imputation (methodische Begründung)
+
+- Zur Vermeidung künstlicher Datenknappheit werden installierte Kapazitäten
+  (`*_capacity`) im Feature-Bau rückwärts aufgefüllt (`backfill`).
+- Der erste verfügbare Meldewert (typisch ab Ende 2023) wird rückwirkend für
+  frühere Zeitstempel bis mindestens zum PICASSO-Start
+  (`2022-06-22 22:00:00+00:00`) als konstante Strukturgröße verwendet.
+- Diese Imputation ist wissenschaftlich vertretbar, da installierte Kapazitäten
+  sich nur langsam ändern und die stündliche Marktdynamik über Ist- und
+  Aktivierungsdaten modelliert wird.
+
 ## Metadaten und ausgeschlossene Spalten
 
 | Typ                                                    | Spalten                                                                                                                                       |
@@ -26,6 +37,7 @@ Dieses Dokument beschreibt den finalen, kausal abgesicherten Merkmalsraum für d
 | Metadatum/Index                                        | `timestamp_utc`                                                                                                                               |
 | Technische Metadaten (aus `X` ausgeschlossen)          | `data_is_lagged`, `is_local_reconstruction_only`, `pit_lagged_column_count`, `market_state_cluster`                                           |
 | Zielvariablen/Outcome-Spalten (aus `X` ausgeschlossen) | `target_afrr_activation_price_vwap_pos_h1`, `target_da_price_h1`, `target_afrr_rate_h1`, `afrr_capacity_price_pos`, `afrr_capacity_price_neg` |
+| Hart entfernt (>90% Missing, nicht modellrelevant)     | `bid_provider_to_grid_share_pos`, `bid_provider_to_grid_share_neg`, `afrr_reconstructed_marginal_price_pos`, `afrr_reconstructed_marginal_price_neg` |
 
 Hinweis: Legacy-Aliase `afrr_activation_price_vwap_pos`/`afrr_activation_price_vwap_neg` wurden auf die kanonischen Namen
 `afrr_activation_price_vwap_pos`/`afrr_activation_price_vwap_neg` vereinheitlicht.
