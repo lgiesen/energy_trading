@@ -5,6 +5,13 @@ Design goals:
 - explicit leakage prevention via target/metadata exclusion from X,
 - reusable feature/target config for future model scripts,
 - train-only scaler fitting for causal preprocessing.
+
+Usage:
+    ./.venv/bin/python -m src.energy_trading.models.prepare_ml_bundles \
+        --input data/features/all_data_features.parquet \
+        --output-dir data/model_input \
+        --doc-path docs/features_documentation.md \
+        --scaler-out models/preprocessing/scaler.joblib
 """
 from __future__ import annotations
 
@@ -63,17 +70,21 @@ class MLDataFactory:
     def __init__(
         self,
         input_path: str | Path = "data/features/all_data_features.parquet",
-        output_dir: str | Path = "data/processed_ml",
+        output_dir: str | Path = "data/model_input",
         doc_path: str | Path = "docs/features_documentation.md",
         scaler_path: str | Path = "models/preprocessing/scaler.joblib",
+        null_report_path: str | Path = "data/reports/null_report_features.csv",
     ) -> None:
         self.input_path = Path(input_path)
         self.output_dir = Path(output_dir)
         self.doc_path = Path(doc_path)
         self.scaler_path = Path(scaler_path)
+        self.null_report_path = Path(null_report_path)
         self.config_path = self.output_dir / "feature_config.json"
         # Law #1: strict causality purge gap between adjacent splits for 1h rows.
         self.gap_rows = 72
+        # Small-gap repair for sparse API holes on X only.
+        self.feature_ffill_limit = 12
 
     @staticmethod
     def _default_bounds() -> SplitBounds:
@@ -126,16 +137,16 @@ class MLDataFactory:
         return df
 
     @staticmethod
-    def _apply_post_picasso_filter(df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_post_picasso_filter(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         """Apply in-memory regime filter while keeping raw artifact unchanged."""
         cut = pd.Timestamp(PICASSO_START_UTC, tz="UTC")
+        rows_before = len(df)
+        # Remove pre-PICASSO rows due to structural market changes
+        # (e.g., pay-as-bid vs pay-as-cleared activation-price dynamics).
         out = df.loc[df["timestamp_utc"] >= cut].copy()
         out = out.sort_values("timestamp_utc").reset_index(drop=True)
-        print(
-            "Regime filter applied: Training on Post-PICASSO data only "
-            f"(Starting {PICASSO_START_UTC}). Rows available: {len(out)}"
-        )
-        return out
+        dropped = rows_before - len(out)
+        return out, dropped
 
     def _resolve_da_targets(self, df: pd.DataFrame) -> list[str]:
         targets = [c for c in self.DA_TARGET_CANDIDATES if c in df.columns]
@@ -187,6 +198,64 @@ class MLDataFactory:
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
         return numeric_cols
 
+    @staticmethod
+    def _drop_target_nans(part: pd.DataFrame, target_cols: list[str]) -> pd.DataFrame:
+        """Remove rows where any target value is missing."""
+        existing = [c for c in target_cols if c in part.columns]
+        if not existing:
+            return part
+        return part.dropna(subset=existing).copy()
+
+    def _impute_sparse_feature_gaps(self, part: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+        """Apply conservative ffill on X only (no backward fill, no target fill)."""
+        existing = [c for c in feature_cols if c in part.columns]
+        if not existing:
+            return part
+        part = part.sort_values("timestamp_utc").copy()
+        part.loc[:, existing] = part.loc[:, existing].ffill(limit=self.feature_ffill_limit)
+        return part
+
+    @staticmethod
+    def _reason_category(col: str) -> str:
+        c = col.lower()
+        if c.startswith("target_"):
+            return "target_shift_boundary"
+        if "co2_price" in c:
+            return "source_history_gap"
+        if "_lag_" in c:
+            return "lag_warmup_or_sparse_source"
+        if "forecast" in c:
+            return "forecast_source_gap"
+        return "other_or_unknown"
+
+    def _write_null_report(self, df: pd.DataFrame, out_path: Path) -> None:
+        if "timestamp_utc" in df.columns:
+            ts = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+        else:
+            ts = pd.Series(pd.NaT, index=df.index)
+
+        rows: list[dict] = []
+        for col in df.columns:
+            mask = df[col].isna()
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            idx = mask[mask].index
+            rows.append(
+                {
+                    "col": col,
+                    "null_count": n,
+                    "first_null_ts": ts.loc[idx[0]] if len(idx) else pd.NaT,
+                    "last_null_ts": ts.loc[idx[-1]] if len(idx) else pd.NaT,
+                    "reason_category": self._reason_category(col),
+                }
+            )
+        rep = pd.DataFrame(rows).sort_values(["null_count", "col"], ascending=[False, True]) if rows else pd.DataFrame(
+            columns=["col", "null_count", "first_null_ts", "last_null_ts", "reason_category"]
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        rep.to_csv(out_path, index=False)
+
     def _split_masks(self, df: pd.DataFrame, bounds: SplitBounds) -> dict[str, pd.Series]:
         """Create chronological split masks with strict 72-row purge gaps.
 
@@ -219,7 +288,12 @@ class MLDataFactory:
         df = self._load_df()
         # Lawful regime selection for training bundles (in-memory only).
         # We do not modify the source artifact on disk.
-        df = self._apply_post_picasso_filter(df)
+        df, dropped_picasso = self._apply_post_picasso_filter(df)
+        print(
+            "Regime filter applied: Training on Post-PICASSO data only "
+            f"(Starting {PICASSO_START_UTC}). Rows available: {len(df)}"
+        )
+        print(f"Rows dropped due to Picasso-Cut: {dropped_picasso}")
         bounds = self._default_bounds()
         masks = self._split_masks(df, bounds)
 
@@ -239,6 +313,7 @@ class MLDataFactory:
         }
 
         scaler_store: dict[str, Pipeline] = {}
+        remaining_nans_x_total = 0
 
         for bundle in ("da", "afrr"):
             targets = self._bundle_targets(df, bundle=bundle)
@@ -251,6 +326,11 @@ class MLDataFactory:
 
             for split_name, mask in masks.items():
                 part = df.loc[mask, ["timestamp_utc", *features, *targets]].copy()
+                # Mandatory target cleaning: drop boundary rows with missing y.
+                part = self._drop_target_nans(part, targets)
+                # Sparse-gap repair on X only; keep remaining NaNs (model can handle).
+                part = self._impute_sparse_feature_gaps(part, features)
+                remaining_nans_x_total += int(part[features].isna().sum().sum())
                 if primary_source != primary_canonical:
                     part = part.rename(columns={primary_source: primary_canonical})
                 part.to_parquet(bundle_dir / f"{split_name}.parquet", index=False)
@@ -278,13 +358,23 @@ class MLDataFactory:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
         joblib.dump(scaler_store, self.scaler_path)
+        # Thesis transparency report after post-PICASSO filtering and target cleaning.
+        report_frames: list[pd.DataFrame] = []
+        for split in ("train", "val", "test"):
+            p = self.output_dir / "afrr" / f"{split}.parquet"
+            if p.exists():
+                report_frames.append(pd.read_parquet(p))
+        if report_frames:
+            report_df = pd.concat(report_frames, ignore_index=True, sort=False)
+            self._write_null_report(report_df, self.null_report_path)
+        print(f"Remaining NaNs in X : {remaining_nans_x_total}")
         return config
 
 
 def load_processed_data(
     bundle: BundleName,
     split: Literal["train", "val", "test"] = "train",
-    base_dir: str | Path = "data/processed_ml",
+    base_dir: str | Path = "data/model_input",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load prepared X/y matrices for a given bundle and split."""
     base = Path(base_dir)
@@ -302,12 +392,17 @@ def load_processed_data(
 def _build_cli() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Build DA/aFRR ML bundles from final feature artifact.")
     p.add_argument("--input", default="data/features/all_data_features.parquet", help="Input feature artifact path.")
-    p.add_argument("--output-dir", default="data/processed_ml", help="Output directory for split bundles.")
+    p.add_argument("--output-dir", default="data/model_input", help="Output directory for split bundles.")
     p.add_argument("--doc-path", default="docs/features_documentation.md", help="Path to features documentation.")
     p.add_argument(
         "--scaler-out",
         default="models/preprocessing/scaler.joblib",
         help="Output path for train-fitted scaler pipeline(s).",
+    )
+    p.add_argument(
+        "--null-report-out",
+        default="data/reports/null_report_features.csv",
+        help="Output CSV for post-cleaning null report.",
     )
     return p
 
@@ -319,6 +414,7 @@ def main() -> None:
         output_dir=args.output_dir,
         doc_path=args.doc_path,
         scaler_path=args.scaler_out,
+        null_report_path=args.null_report_out,
     )
     cfg = factory.build()
     print("[OK] ML bundles erstellt.")
