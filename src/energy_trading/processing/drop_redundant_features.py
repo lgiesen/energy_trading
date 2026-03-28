@@ -341,7 +341,7 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
         df_out = df_out.with_columns(
             (
                 pl.col("biomass_actual_entsoe").cast(pl.Float64, strict=False)
-                + pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False)
+                + pl.col("generation_nuclear_mw").cast(pl.Float64, strict=False).fill_null(0.0)
             ).alias("generation_baseload_total")
         )
     else:

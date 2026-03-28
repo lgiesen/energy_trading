@@ -78,6 +78,12 @@ DROP_HIGH_MISSING_BEFORE_FEATURES = [
     "afrr_reconstructed_marginal_price_neg",
 ]
 
+TRUNCATION_CORE_COLUMNS = [
+    "da_price_pit",
+    "load_actual_entsoe_lag_2h",
+    "afrr_activation_price_vwap_pos_lag_1h",
+]
+
 DATA_IS_LAGGED = True
 LOGGER = logging.getLogger(__name__)
 
@@ -1587,13 +1593,20 @@ def truncate_to_complete_information_core(df: pl.DataFrame) -> pl.DataFrame:
 
     pdf = df.to_pandas()
     n_rows = len(pdf)
-    na_mask = pdf.isna()
+    available_core = [c for c in TRUNCATION_CORE_COLUMNS if c in pdf.columns]
+    if not available_core:
+        print(
+            "[truncate] Core columns missing; returning input unchanged. "
+            f"Expected one of {TRUNCATION_CORE_COLUMNS}."
+        )
+        return df
 
-    # Exclude fully-null columns from boundary detection.
-    # Those columns are data-quality issues and would otherwise collapse the table.
-    valid_cols = [c for c in pdf.columns if not bool(na_mask[c].all())]
+    na_mask = pdf[available_core].isna()
+
+    # Exclude fully-null core columns from boundary detection.
+    valid_cols = [c for c in available_core if not bool(na_mask[c].all())]
     if not valid_cols:
-        print("[truncate] No valid columns for boundary detection; returning input unchanged.")
+        print("[truncate] No valid core columns for boundary detection; returning input unchanged.")
         return df
 
     def _leading_nan_run(mask_col: pd.Series) -> int:
@@ -1628,6 +1641,7 @@ def truncate_to_complete_information_core(df: pl.DataFrame) -> pl.DataFrame:
     removed_tail = n_rows - end_exclusive
     print(
         "[truncate] "
+        f"core_cols={valid_cols}, "
         f"max_head_gap={max_head_gap}, max_tail_gap={max_tail_gap}, "
         f"removed_head={removed_head}, removed_tail={removed_tail}, "
         f"rows_before={n_rows}, rows_after={out.height}"
@@ -1728,6 +1742,19 @@ def build_features(input_path: Path, output_path: Path) -> None:
             shifted_base_cols.append(c)
     if shifted_base_cols:
         df = df.drop(shifted_base_cols)
+
+    # Installed capacities are slow-moving structural fundamentals (not hourly
+    # market outcomes). Backfilling is methodically acceptable to avoid
+    # artificial data scarcity from late publication starts; intraday dynamics
+    # are captured by actual generation/activation features.
+    capacity_cols = [c for c in df.columns if "capacity" in c.lower()]
+    if capacity_cols:
+        cap_exprs = []
+        for c in capacity_cols:
+            cap_exprs.append(
+                pl.col(c).cast(pl.Float64, strict=False).backward_fill().alias(c)
+            )
+        df = df.with_columns(cap_exprs)
 
     # Trim dynamic warmup/horizon NaN zones before final export.
     df = truncate_to_complete_information_core(df)
