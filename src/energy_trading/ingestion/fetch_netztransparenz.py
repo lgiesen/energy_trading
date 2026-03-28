@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 import requests
 from dotenv import load_dotenv
+from energy_trading.constants import PICASSO_RELEASE_UTC
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,8 +62,8 @@ M_FRR_OPTIMIZATION_SERIES_CANDIDATES = [
     "MRLOptimierung",
 ]
 
-PICASSO_GO_LIVE_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
-MARI_GO_LIVE_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
+PICASSO_GO_LIVE_UTC = datetime.fromisoformat(PICASSO_RELEASE_UTC)
+MARI_GO_LIVE_UTC = datetime.fromisoformat(PICASSO_RELEASE_UTC)
 
 
 def _parse_mixed_numeric(value: object) -> float | None:

@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import polars as pl
 
+from energy_trading.constants import PICASSO_RELEASE_UTC
+
 LOGGER = logging.getLogger(__name__)
-PICASSO_START_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
 
 
 def _existing(df: pl.DataFrame, cols: list[str]) -> list[str]:
@@ -187,7 +187,7 @@ def clean(df: pl.DataFrame) -> pl.DataFrame:
     if "timestamp_utc" not in df.columns:
         raise ValueError("Missing required column: timestamp_utc")
 
-    cutoff = pl.lit(PICASSO_START_UTC).cast(pl.Datetime(time_unit="us", time_zone="UTC"))
+    cutoff = pl.lit(PICASSO_RELEASE_UTC).str.to_datetime(time_zone="UTC", strict=False)
 
     # Structural-break columns: set to zero before platform launch.
     platform_cols = _existing(

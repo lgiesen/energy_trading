@@ -51,6 +51,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
+from energy_trading.constants import PICASSO_RELEASE_UTC
 
 # Suppress openpyxl style warnings.
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -58,7 +59,7 @@ LOGGER = logging.getLogger(__name__)
 CPP_FILES_BASE_URL = "https://www.regelleistung.net/apps/cpp-publisher/api/v2/tenders/files"
 # Collect full 15-minute activation price streams while parsing yearly files.
 ALL_15MIN_PRICE_DATA: list[pd.DataFrame] = []
-PICASSO_START_UTC = pd.Timestamp("2022-06-22 22:00:00+00:00")
+PICASSO_START_UTC = pd.Timestamp(PICASSO_RELEASE_UTC)
 
 
 def _log_dst_drop(label: str, ts_series: pd.Series, date_series: pd.Series) -> None:
@@ -1058,7 +1059,7 @@ def _export_afrr_15min_price_volume(
         combined = combined.loc[:, ~combined.columns.duplicated()]
         # Keep raw source prices untouched and add explicit pre-PICASSO
         # quarter-hour filled prices (within-hour only) for transparent VWAP use.
-        cutoff = pd.Timestamp("2022-06-22 22:00:00+00:00")
+        cutoff = PICASSO_START_UTC
         fill_pairs = [
             ("afrr_avg_activation_price_pos", "afrr_activation_price_pos_ffill"),
             ("afrr_avg_activation_price_neg", "afrr_activation_price_neg_ffill"),

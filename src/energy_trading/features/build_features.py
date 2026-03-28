@@ -24,6 +24,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from energy_trading.constants import DA_GATE_HOUR_UTC, PICASSO_RELEASE_UTC
+
 try:
     import holidays
 except ModuleNotFoundError:  # pragma: no cover - runtime fallback for missing optional dep
@@ -268,7 +270,7 @@ def add_day_ahead_publication_feature(df: pl.DataFrame) -> pl.DataFrame:
 
     Rule:
     - For a delivery hour T, day-ahead price is considered available from
-      D-1 13:00 UTC (where D is the calendar day of T in UTC).
+      D-1 `DA_GATE_HOUR_UTC` in UTC.
     - Before publication, use a causal fallback (`shift(24)`), i.e. prior-day
       same-hour DA price.
     """
@@ -280,7 +282,7 @@ def add_day_ahead_publication_feature(df: pl.DataFrame) -> pl.DataFrame:
     da = pd.to_numeric(pdf["da_price"], errors="coerce")
 
     delivery_day_utc = ts.dt.floor("D")
-    publication_ts = delivery_day_utc - pd.Timedelta(days=1) + pd.Timedelta(hours=13)
+    publication_ts = delivery_day_utc - pd.Timedelta(days=1) + pd.Timedelta(hours=DA_GATE_HOUR_UTC)
     is_available = ts >= publication_ts
 
     pdf["da_price_pit"] = da.where(is_available, da.shift(24))
@@ -294,7 +296,7 @@ def apply_day_ahead_forecast_availability(df: pl.DataFrame) -> pl.DataFrame:
     - DA prices remain strict T-0 and are never gated here.
     - Current-hour DA forecasts (base columns without horizon suffix) remain strict T-0.
     - Future DA forecast columns (e.g. `*_forecast_da_*_h48`) are gated by publication
-      time: D-1 13:00 Europe/Berlin of the target delivery day.
+      time: D-1 `DA_GATE_HOUR_UTC` in UTC of the target delivery day.
     - If unavailable at decision time, fallback is persistence (`shift(24)`).
     """
     if "timestamp_utc" not in df.columns:
@@ -338,9 +340,8 @@ def apply_day_ahead_forecast_availability(df: pl.DataFrame) -> pl.DataFrame:
             continue
 
         target_ts = decision_ts + pd.to_timedelta(horizon_h, unit="h")
-        target_local = target_ts.dt.tz_convert("Europe/Berlin")
-        pub_local = (target_local.dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=13)
-        pub_utc = pub_local.dt.tz_convert("UTC")
+        target_day_utc = target_ts.dt.floor("D")
+        pub_utc = target_day_utc - pd.Timedelta(days=1) + pd.Timedelta(hours=DA_GATE_HOUR_UTC)
         available = decision_ts >= pub_utc
 
         s = pd.to_numeric(pdf[col], errors="coerce")
@@ -864,7 +865,7 @@ def add_aggregated_features(df: pl.DataFrame) -> pl.DataFrame:
     if "hour" not in pdf.columns:
         pdf["hour"] = pdf["timestamp_utc"].dt.hour.astype(np.int8)
     if "market_regime_picasso" not in pdf.columns:
-        picasso_start = pd.Timestamp("2022-06-22 00:00:00+00:00")
+        picasso_start = pd.Timestamp(PICASSO_RELEASE_UTC, tz="UTC")
         pdf["market_regime_picasso"] = (pdf["timestamp_utc"] >= picasso_start).astype(np.int8)
 
     # Ensure binary target is available.
@@ -903,7 +904,7 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     - `picasso_flow_rate_lag_24h`: 24-hour lag of PICASSO flow
     - `is_picasso_regime`: 1 from 2024-06-01 UTC onward, else 0
     - `grid_stress_index`: composite stress score in [0, 1]
-    - `market_regime_picasso`: 0 before 2022-06-22 UTC, 1 from 2022-06-22 UTC onward
+    - `market_regime_picasso`: 0 before PICASSO release, 1 from release onward
 
     Notes:
     - Inputs may already be globally lagged by the PiT layer.
@@ -976,7 +977,7 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     pdf["grid_stress_index"] = gsi.clip(0.0, 1.0)
 
     # 5) Market regime flag (PICASSO structural break).
-    picasso_start = pd.Timestamp("2022-06-22 00:00:00+00:00")
+    picasso_start = pd.Timestamp(PICASSO_RELEASE_UTC, tz="UTC")
     pdf["market_regime_picasso"] = (pdf["timestamp_utc"] >= picasso_start).astype(int)
 
     return pl.from_pandas(pdf)

@@ -9,16 +9,16 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 import zipfile
 
 import numpy as np
 import pandas as pd
 import polars as pl
+from energy_trading.constants import PICASSO_RELEASE_UTC
 
 LOGGER = logging.getLogger(__name__)
-PICASSO_START_UTC = datetime(2022, 6, 22, 22, 0, tzinfo=timezone.utc)
+PICASSO_START_UTC = pd.Timestamp(PICASSO_RELEASE_UTC)
 DEFAULT_REGELLEISTUNG_15M_PATH = (
     Path(__file__).resolve().parents[3]
     / "data"
