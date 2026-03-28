@@ -105,6 +105,7 @@ Main scripts:
 Raw outputs are written to `data/raw/*.parquet`.  
 Merged table is written to `data/processed/all_data.parquet`.  
 Refined table is written to `data/processed/all_data_refined.parquet`.  
+Cleaned table is written to `data/processed/all_data_cleaned.parquet`.  
 Pruned table is written to `data/processed/all_data_pruned.parquet`.  
 Transformed table is written to `data/processed/all_data_transformed.parquet`.  
 Final features are written to `data/features/all_data_features.parquet`.
@@ -123,9 +124,10 @@ Final features are written to `data/features/all_data_features.parquet`.
 | 8 | `transform_entsoe_outages_hourly.py` | `data/raw/entsoe_outages/planned_generation_outages.parquet` + `data/raw/entsoe_outages/unplanned_generation_outages.parquet` | `data/processed/outages_hourly.parquet` |
 | 9 | `merge_data.py` | All `data/raw/*.parquet` files + `data/processed/outages_hourly.parquet` | `data/processed/all_data.parquet` |
 | 10 | `refine_market_data.py` | `data/processed/all_data.parquet` | `data/processed/all_data_refined.parquet` |
-| 11 | `drop_redundant_features.py` | `data/processed/all_data_refined.parquet` | `data/processed/all_data_pruned.parquet` |
-| 12 | `transform_data.py` | `data/processed/all_data_pruned.parquet` | `data/processed/all_data_transformed.parquet` |
-| 13 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
+| 11 | `handle_missing_values.py` | `data/processed/all_data_refined.parquet` | `data/processed/all_data_cleaned.parquet` |
+| 12 | `drop_redundant_features.py` | `data/processed/all_data_cleaned.parquet` | `data/processed/all_data_pruned.parquet` |
+| 13 | `transform_data.py` | `data/processed/all_data_pruned.parquet` | `data/processed/all_data_transformed.parquet` |
+| 14 | `build_features.py` | `data/processed/all_data_transformed.parquet` | `data/features/all_data_features.parquet` |
 
 Note: The canonical features output path is `data/features/all_data_features.parquet`.
 Do not maintain a duplicate `data/processed/all_data_features.parquet`.
@@ -141,6 +143,7 @@ Do not maintain a duplicate `data/processed/all_data_features.parquet`.
   and feature engineering in a traceable layer.
 - Reproducibility:
   Intermediate artifacts (`all_data.parquet`, `all_data_refined.parquet`,
+  `all_data_cleaned.parquet`,
   `all_data_pruned.parquet`, `all_data_transformed.parquet`) make every
   transformation stage auditable.
 
@@ -224,8 +227,12 @@ Run strict linear processing chain manually:
   --in data/processed/all_data.parquet \
   --out data/processed/all_data_refined.parquet
 
-./.venv/bin/python -m energy_trading.processing.drop_redundant_features \
+./.venv/bin/python -m energy_trading.processing.handle_missing_values \
   --in data/processed/all_data_refined.parquet \
+  --out data/processed/all_data_cleaned.parquet
+
+./.venv/bin/python -m energy_trading.processing.drop_redundant_features \
+  --in data/processed/all_data_cleaned.parquet \
   --out data/processed/all_data_pruned.parquet
 
 ./.venv/bin/python -m energy_trading.processing.transform_data \
