@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end pipeline wrapper: fetch -> merge -> refine -> prune -> transform -> features.
+"""End-to-end pipeline wrapper: fetch -> merge -> refine -> clean -> prune -> transform -> features.
 
 Usage:
     ./.venv/bin/python scripts/run_pipeline.py --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z
@@ -22,7 +22,7 @@ def run(cmd: list[str]) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Run full data pipeline (fetch -> features).")
+    parser = argparse.ArgumentParser(description="Run full data pipeline (fetch -> clean -> features).")
     parser.add_argument("--start", default="2020-11-30T23:00:00Z", help="Start date (UTC ISO8601).")
     parser.add_argument("--end", default="2026-03-01T02:00:00Z", help="End date (UTC ISO8601).")
     parser.add_argument("--out-dir", default="data/raw", help="Output directory for raw parquets.")
@@ -69,16 +69,24 @@ def main() -> None:
         *( ["--smard-market-data-out", args.smard_market_data_out] if args.smard_market_data_out else [] ),
     ])
 
-    # 2) Prune redundant columns on refined output.
+    # 2) Missing-value handling on refined output.
     refined_path = "data/processed/all_data_refined.parquet"
+    cleaned_path = "data/processed/all_data_cleaned.parquet"
+    run([
+        py, "-m", "energy_trading.processing.handle_missing_values",
+        "--in", refined_path,
+        "--out", cleaned_path,
+    ])
+
+    # 3) Prune redundant columns on cleaned output.
     pruned_path = "data/processed/all_data_pruned.parquet"
     run([
         py, "-m", "energy_trading.processing.drop_redundant_features",
-        "--in", refined_path,
+        "--in", cleaned_path,
         "--out", pruned_path,
     ])
 
-    # 3) Transform
+    # 4) Transform
     transformed_path = "data/processed/all_data_transformed.parquet"
     run([
         py, "-m", "energy_trading.processing.transform_data",
@@ -90,7 +98,7 @@ def main() -> None:
         LOGGER.info("Skipping feature generation (--skip-features).")
         return
 
-    # 4) Build features
+    # 5) Build features
     run([
         py, "-m", "energy_trading.features.build_features",
         "--in", transformed_path,

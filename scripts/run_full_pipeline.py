@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-command end-to-end pipeline runner (fetch -> final features).
+"""Single-command end-to-end pipeline runner (fetch -> clean -> final features).
 
 Usage:
     ./.venv/Bin/Python Scripts/run_full_pipeline.py \
@@ -28,7 +28,7 @@ def _run(cmd: list[str]) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(
-        description="Run full pipeline in one command (fetch/merge/refine/prune/transform/features)."
+        description="Run full pipeline in one command (fetch/merge/refine/clean/prune/transform/features)."
     )
     parser.add_argument("--start", default="2020-11-30T23:00:00Z", help="Start date (UTC ISO8601).")
     parser.add_argument("--end", default="2026-03-01T02:00:00Z", help="End date (UTC ISO8601).")
@@ -36,6 +36,11 @@ def main() -> None:
     parser.add_argument("--merged", default="data/processed/all_data.parquet", help="Merged parquet output.")
     parser.add_argument(
         "--refined", default="data/processed/all_data_refined.parquet", help="Refined parquet output."
+    )
+    parser.add_argument(
+        "--cleaned",
+        default="data/processed/all_data_cleaned.parquet",
+        help="Cleaned parquet output (after missing-value handling).",
     )
     parser.add_argument(
         "--pruned", default="data/processed/all_data_pruned.parquet", help="Pruned parquet output."
@@ -92,6 +97,7 @@ def main() -> None:
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     Path(args.merged).parent.mkdir(parents=True, exist_ok=True)
     Path(args.refined).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.cleaned).parent.mkdir(parents=True, exist_ok=True)
     Path(args.pruned).parent.mkdir(parents=True, exist_ok=True)
     Path(args.transformed).parent.mkdir(parents=True, exist_ok=True)
     Path(args.features).parent.mkdir(parents=True, exist_ok=True)
@@ -133,20 +139,33 @@ def main() -> None:
         collect_cmd.extend(["--clip-end", args.clip_end])
     _run(collect_cmd)
 
-    # 2) Drop/prune redundant columns.
+    # 2) Missing-value handling.
+    _run(
+        [
+            py,
+            "-m",
+            "energy_trading.processing.handle_missing_values",
+            "--in",
+            args.refined,
+            "--out",
+            args.cleaned,
+        ]
+    )
+
+    # 3) Drop/prune redundant columns.
     _run(
         [
             py,
             "-m",
             "energy_trading.processing.drop_redundant_features",
             "--in",
-            args.refined,
+            args.cleaned,
             "--out",
             args.pruned,
         ]
     )
 
-    # 3) Transform.
+    # 4) Transform.
     _run(
         [
             py,
@@ -163,7 +182,7 @@ def main() -> None:
         LOGGER.info("Stopping after transform (--skip-features).")
         return
 
-    # 4) Build final features.
+    # 5) Build final features.
     _run(
         [
             py,
@@ -176,7 +195,7 @@ def main() -> None:
         ]
     )
 
-    # 5) Optional lag verification.
+    # 6) Optional lag verification.
     if args.verify_lags:
         _run([py, "scripts/verify_lags.py", "--path", args.features])
 

@@ -3,7 +3,7 @@
 Usage:
     ./.venv/bin/python scripts/collect_and_clean.py \
         --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z \
-        --raw-out data/processed/all_data.parquet \
+        --refined-out data/processed/all_data_refined.parquet \
         --clean-out data/processed/all_data_clean.parquet
 """
 from __future__ import annotations
@@ -23,7 +23,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Collect raw data and then clean missing values.")
     parser.add_argument("--start", required=True, help="Start ISO8601 (UTC).")
     parser.add_argument("--end", required=True, help="End ISO8601 (UTC).")
-    parser.add_argument("--raw-out", default="data/processed/all_data.parquet", help="Output path for raw merged data.")
+    parser.add_argument(
+        "--refined-out",
+        default="data/processed/all_data_refined.parquet",
+        help="Output path for refined data from collect_and_merge_all_data.",
+    )
     parser.add_argument("--clean-out", default="data/processed/all_data_clean.parquet", help="Output path for cleaned data.")
     parser.add_argument(
         "--smard-download-market-data-csv",
@@ -51,6 +55,7 @@ def main() -> None:
         "scripts/collect_and_merge_all_data.py",
         "--start", args.start,
         "--end", args.end,
+        "--refined", args.refined_out,
         *( ["--smard-download-market-data-csv"] if args.smard_download_market_data_csv else [] ),
         *( ["--smard-skip-market-data-csv"] if args.smard_skip_market_data_csv else [] ),
         *( ["--smard-market-data-out", args.smard_market_data_out] if args.smard_market_data_out else [] ),
@@ -59,7 +64,7 @@ def main() -> None:
     _run([
         str(python_bin),
         "-m", "energy_trading.processing.handle_missing_values",
-        "--in", args.raw_out,
+        "--in", args.refined_out,
         "--out", args.clean_out,
     ])
 
