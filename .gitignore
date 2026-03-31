@@ -9,8 +9,27 @@ __pycache__/
 # DS_Store
 *.DS_Store
 
-# Data
-data/*
+# Data and generated artifacts
+# Keep folder skeletons via .gitkeep, ignore heavy/generated contents.
+data/**
+!data/model_input/
+!data/reports/
+!data/**/.gitkeep
+!data/model_input/.gitkeep
+!data/reports/.gitkeep
+
+artifacts/**
+!artifacts/model_runs/
+!artifacts/simulation_runs/
+!artifacts/**/.gitkeep
+!artifacts/model_runs/.gitkeep
+!artifacts/simulation_runs/.gitkeep
+
+models/checkpoints/**
+!models/checkpoints/.gitkeep
+
+models/preprocessing/**
+!models/preprocessing/.gitkeep
 
 # Distribution / packaging
 .Python
