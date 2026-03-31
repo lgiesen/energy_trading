@@ -1,0 +1,5 @@
+family,n_cols,max_abs_corr_train,max_vif_train,n_comp_95pct,explained_var_95pct,recommendation
+residual_load_forecast,4,0.648314588997259,2.382817073022308,4,0.9999999999999999,keep raw
+solar_forecast,5,0.9513044520484166,16.090249657234455,2,0.9573992689046924,replace by PCs
+wind_offshore_forecast,4,0.4079091826013526,1.3679288337379922,4,0.9999999999999999,keep raw
+wind_onshore_forecast,5,0.5903721671115149,2.0162780584236373,5,1.0,keep raw
