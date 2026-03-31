@@ -299,35 +299,16 @@ def main() -> None:
     sanity_path = out_dir / "afrr_sanity_top10_expensive_hours.csv"
     sanity.write_csv(sanity_path)
 
-    # -------- 4b) Provider-to-grid hours check --------
-    provider_col = _first_existing(df.columns, ["bid_provider_to_grid_share_pos"])
+    # -------- 4b) Legacy provider-to-grid check removed --------
     provider_top5_path = out_dir / "afrr_provider_to_grid_top5.csv"
     provider_warning_rows = 0
-    if provider_col is not None:
-        p2g = (
-            df.select(
-                [
-                    "timestamp_utc",
-                    pl.col(provider_col).cast(pl.Float64, strict=False).alias("provider_to_grid_share_pos"),
-                    pl.col("afrr_activation_price_vwap_pos").cast(pl.Float64, strict=False).alias("afrr_activation_price_vwap_pos"),
-                    pl.col("afrr_activation_rate_pos").cast(pl.Float64, strict=False).alias("afrr_activation_rate_pos"),
-                ]
-            )
-            .drop_nulls(["provider_to_grid_share_pos", "afrr_activation_price_vwap_pos"])
-            .filter(pl.col("provider_to_grid_share_pos") > 0.0)
-            .sort("provider_to_grid_share_pos", descending=True)
-            .head(5)
-        )
-        p2g.write_csv(provider_top5_path)
-        provider_warning_rows = p2g.filter(pl.col("afrr_activation_price_vwap_pos") > 0.0).height
-    else:
-        pl.DataFrame(
-            {
-                "info": [
-                    "No bid_provider_to_grid_share_pos column found; cannot run provider_to_grid top-5 check."
-                ]
-            }
-        ).write_csv(provider_top5_path)
+    pl.DataFrame(
+        {
+            "info": [
+                "Provider-to-grid share features were removed from the production pipeline."
+            ]
+        }
+    ).write_csv(provider_top5_path)
 
     # -------- Physical impossibility flags --------
     impossible = (

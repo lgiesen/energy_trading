@@ -46,8 +46,6 @@ USER_REQUESTED_DROPS = [
     # Final-prune request for compact ML table.
     "capacity_import_export_mw_pos",
     "capacity_import_export_mw_neg",
-    "load_actual_entsoe",
-    "load_forecast_da_entsoe",
     # Keep in data lake as DA proxy for later profit analysis, but never in ML table.
     "price_intraday_eur",
     # Raw calendar integers are redundant once cyclical encodings exist.
@@ -85,6 +83,19 @@ ADDITIONAL_AUDIT_DROPS: list[str] = []
 PROTECTED_KEEP = {
     "market_regime_picasso",
     "is_picasso_regime",
+    # Needed for downstream alpha feature construction in build_features.py.
+    "load_actual_entsoe",
+    "load_forecast_da_entsoe",
+    "da_price_AT",
+    "da_price_BE",
+    "da_price_CH",
+    "da_price_CZ",
+    "da_price_DK1",
+    "da_price_DK2",
+    "da_price_FR",
+    "da_price_NL",
+    "da_price_PL",
+    "da_price_SE4",
 }
 
 # Statistical overload pruning (rolling-window redundancy).
@@ -385,7 +396,8 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
         .union(STATISTICAL_OVERLOAD_DROPS)
         .union(dynamic_stat_drops)
         .union(ADDITIONAL_AUDIT_DROPS)
-        .union(FOREIGN_DA_PRICE_COLS)
+        # Keep foreign DA prices for downstream PiT cross-border spread features.
+        # They are dropped later in feature engineering after spread construction.
         .union(BALANCE_COMPONENT_DROPS)
         .union(BALANCE_SIGNAL_DROPS)
         .union(FOSSIL_COMPONENT_DROPS)

@@ -40,6 +40,15 @@ SMARD_REDUNDANT_COLS = [
     "solar_error",
 ]
 
+# Permanently removed from modeling pipeline due to persistent missingness and
+# lack of stable contribution to downstream features.
+REMOVED_LEGACY_COLS = [
+    "bid_provider_to_grid_share_pos",
+    "bid_provider_to_grid_share_neg",
+    "afrr_reconstructed_marginal_price_pos",
+    "afrr_reconstructed_marginal_price_neg",
+]
+
 
 def _first_existing(columns: list[str], candidates: list[str]) -> str | None:
     for c in candidates:
@@ -262,7 +271,6 @@ def _parse_bid_features_15m(df_raw: pd.DataFrame) -> pd.DataFrame:
         .agg(
             total_awarded_capacity_mw=(alloc_col, "sum"),
             sum_price_weighted=("price_weighted", "sum"),
-            provider_to_grid_share=("is_provider_to_grid", "mean"),
         )
     )
     agg["bid_signed_vwap_eur_mwh"] = np.where(
@@ -289,24 +297,13 @@ def _parse_bid_features_15m(df_raw: pd.DataFrame) -> pd.DataFrame:
     vwap_piv.columns = [f"bid_signed_vwap_eur_mwh_{str(c).lower()}" for c in vwap_piv.columns]
     vwap_piv = vwap_piv.reset_index()
 
-    p2g_piv = agg.pivot_table(
-        index="timestamp_utc",
-        columns="direction",
-        values="provider_to_grid_share",
-        aggfunc="mean",
-    )
-    p2g_piv.columns = [f"bid_provider_to_grid_share_{str(c).lower()}" for c in p2g_piv.columns]
-    p2g_piv = p2g_piv.reset_index()
-
-    piv = cap_piv.merge(vwap_piv, on="timestamp_utc", how="outer").merge(p2g_piv, on="timestamp_utc", how="outer")
+    piv = cap_piv.merge(vwap_piv, on="timestamp_utc", how="outer")
     for c in ("awarded_capacity_mw_pos", "awarded_capacity_mw_neg"):
         if c not in piv.columns:
             piv[c] = np.nan
     for c in (
         "bid_signed_vwap_eur_mwh_pos",
         "bid_signed_vwap_eur_mwh_neg",
-        "bid_provider_to_grid_share_pos",
-        "bid_provider_to_grid_share_neg",
     ):
         if c not in piv.columns:
             piv[c] = np.nan
@@ -317,8 +314,6 @@ def _parse_bid_features_15m(df_raw: pd.DataFrame) -> pd.DataFrame:
             "awarded_capacity_mw_neg",
             "bid_signed_vwap_eur_mwh_pos",
             "bid_signed_vwap_eur_mwh_neg",
-            "bid_provider_to_grid_share_pos",
-            "bid_provider_to_grid_share_neg",
         ]
     ]
 
@@ -345,8 +340,6 @@ def load_bid_hourly_features_from_bids(bids_dir: Path) -> pl.DataFrame:
                     )
                 else:
                     cached["bid_signed_vwap_eur_mwh_neg"] = np.nan
-                cached["bid_provider_to_grid_share_pos"] = np.nan
-                cached["bid_provider_to_grid_share_neg"] = np.nan
                 cached = cached.dropna(subset=["timestamp_utc"])
                 cached = (
                     cached.groupby("timestamp_utc", as_index=False)[
@@ -355,8 +348,6 @@ def load_bid_hourly_features_from_bids(bids_dir: Path) -> pl.DataFrame:
                             "awarded_capacity_mw_neg",
                             "bid_signed_vwap_eur_mwh_pos",
                             "bid_signed_vwap_eur_mwh_neg",
-                            "bid_provider_to_grid_share_pos",
-                            "bid_provider_to_grid_share_neg",
                         ]
                     ]
                     .mean()
@@ -401,8 +392,6 @@ def load_bid_hourly_features_from_bids(bids_dir: Path) -> pl.DataFrame:
             awarded_capacity_mw_neg=("awarded_capacity_mw_neg", "sum"),
             bid_signed_vwap_eur_mwh_pos=("bid_signed_vwap_eur_mwh_pos", "mean"),
             bid_signed_vwap_eur_mwh_neg=("bid_signed_vwap_eur_mwh_neg", "mean"),
-            bid_provider_to_grid_share_pos=("bid_provider_to_grid_share_pos", "mean"),
-            bid_provider_to_grid_share_neg=("bid_provider_to_grid_share_neg", "mean"),
         )
         .sort_values("timestamp_utc")
     )
@@ -1142,47 +1131,9 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
     else:
         LOGGER.info("No 15-minute VWAP source joined; continuing with existing hourly columns.")
 
-    # Reconstruct 15-minute local marginal activation price from anonymous bids
-    # and align to hourly dataset via hourly mean of quarter-hour marginals.
-    marginal_15m = compute_afrr_reconstructed_marginal_from_bids(
-        DEFAULT_BIDS_DIR, DEFAULT_REGELLEISTUNG_15M_PATH
-    )
-    if not marginal_15m.is_empty():
-        marginal_hourly = (
-            marginal_15m
-            .group_by_dynamic(
-                index_column="timestamp_utc",
-                every="1h",
-                period="1h",
-                closed="left",
-                label="left",
-            )
-            .agg(
-                [
-                    pl.col("afrr_reconstructed_marginal_price_pos").mean(),
-                    pl.col("afrr_reconstructed_marginal_price_neg").mean(),
-                    pl.col("is_local_reconstruction_only").max().alias("is_local_reconstruction_only"),
-                ]
-            )
-            .sort("timestamp_utc")
-        )
-        df = df.join(marginal_hourly, on="timestamp_utc", how="left", suffix="_from15m")
-        for col in (
-            "afrr_reconstructed_marginal_price_pos",
-            "afrr_reconstructed_marginal_price_neg",
-            "is_local_reconstruction_only",
-        ):
-            from15 = f"{col}_from15m"
-            if from15 in df.columns and col in df.columns:
-                df = df.with_columns(pl.coalesce([pl.col(from15), pl.col(col)]).alias(col)).drop(from15)
-            elif from15 in df.columns:
-                df = df.rename({from15: col})
-        LOGGER.info(
-            "Joined hourly simulated marginal prices from 15-minute merit-order reconstruction: %s rows",
-            marginal_hourly.height,
-        )
-    else:
-        LOGGER.info("No simulated marginal source joined from bids.")
+    # Reconstruction-based marginal price columns are permanently removed from
+    # the production pipeline. Keep only regime provenance flag.
+    LOGGER.info("Skip reconstructed marginal-price join by design (removed legacy features).")
 
     cutoff_bool = pl.lit(PICASSO_START_UTC).cast(pl.Datetime(time_unit="us", time_zone="UTC"))
     if "is_local_reconstruction_only" in df.columns:
@@ -1206,8 +1157,6 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
             "awarded_capacity_mw_neg",
             "bid_signed_vwap_eur_mwh_pos",
             "bid_signed_vwap_eur_mwh_neg",
-            "bid_provider_to_grid_share_pos",
-            "bid_provider_to_grid_share_neg",
         ):
             c_b = f"{c}_from_bids"
             if c_b in df.columns and c in df.columns:
@@ -1415,6 +1364,12 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
     # Preserve raw provenance columns by design.
     preserved = [c for c in df.columns if c.endswith("_qs") or c.endswith("_op") or c.endswith("source") or c.endswith("is_fallback")]
     LOGGER.info("Preserved provenance columns: %s", preserved)
+
+    # Hard-drop permanently removed legacy columns if they survived any join path.
+    legacy_drop = [c for c in REMOVED_LEGACY_COLS if c in df.columns]
+    if legacy_drop:
+        df = df.drop(legacy_drop)
+        LOGGER.info("Dropped permanently removed legacy columns: %s", legacy_drop)
     return df
 
 

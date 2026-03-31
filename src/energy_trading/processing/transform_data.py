@@ -33,6 +33,27 @@ def transform_data(input_path: Path, output_path: Path) -> None:
             ]
         )
 
+    # Hard removal audit: legacy columns must not pass beyond transformed layer.
+    legacy_cols = [
+        c for c in df.columns
+        if ("reconstructed" in c.lower()) or ("grid_share" in c.lower())
+    ]
+    if legacy_cols:
+        df = df.drop(legacy_cols)
+        print(
+            "[audit] Removed legacy columns from transformed frame: "
+            f"{sorted(legacy_cols)}"
+        )
+    remaining = [
+        c for c in df.columns
+        if ("reconstructed" in c.lower()) or ("grid_share" in c.lower())
+    ]
+    if remaining:
+        raise RuntimeError(
+            "Audit failed: transformed dataframe still contains forbidden columns: "
+            f"{sorted(remaining)}"
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(output_path, compression="zstd")
 

@@ -4,6 +4,8 @@ Target design (explicit h+1 naming):
 - `target_afrr_activation_price_vwap_pos_h1`: next-hour positive aFRR activation-price VWAP target.
 - `target_da_price_h1`: next-hour DA price target.
 - `target_afrr_rate_h1`: next-hour aFRR activation-rate target.
+- `target_afrr_capacity_price_pos_h1`: next-hour positive aFRR capacity-price target.
+- `target_afrr_capacity_price_neg_h1`: next-hour negative aFRR capacity-price target.
 
 Rationale:
 - Targets are explicitly prefixed with `target_` to avoid ambiguity in ML flows.
@@ -55,11 +57,6 @@ DROP_FOR_MODEL = [
     "solar_capacity_source",
     # Streamline residual load representation: keep calculated variant only.
     "residual_load_actual",
-    # Removed due to >98% missing values identified in the feature audit.
-    "bid_provider_to_grid_share_neg",
-    "bid_provider_to_grid_share_pos",
-    "afrr_reconstructed_marginal_price_pos",
-    "afrr_reconstructed_marginal_price_neg",
     # Raw calendar integers are dropped in favor of cyclical sin/cos encodings.
     "hour",
     "dayofweek",
@@ -72,13 +69,9 @@ DROP_FOR_MODEL = [
     "da_price",
 ]
 
-# Removed due to >98% missing values identified in the feature audit.
-DROP_HIGH_MISSING_BEFORE_FEATURES = [
-    "bid_provider_to_grid_share_neg",
-    "bid_provider_to_grid_share_pos",
-    "afrr_reconstructed_marginal_price_pos",
-    "afrr_reconstructed_marginal_price_neg",
-]
+# Backward-compatible guard list (legacy columns are removed upstream in
+# refine_market_data.py and transform_data.py).
+DROP_HIGH_MISSING_BEFORE_FEATURES: list[str] = []
 
 TRUNCATION_CORE_COLUMNS = [
     "da_price_pit",
@@ -112,22 +105,22 @@ def apply_final_feature_aggregations(df: pl.DataFrame) -> pl.DataFrame:
     before_cols = len(df.columns)
 
     # --- Block 1: Foreign Price Spread aggregation ---
-    if "da_price" not in df.columns:
-        LOGGER.info("Skip final aggregation block 1 (missing da_price).")
+    if "da_price_pit" not in df.columns:
+        LOGGER.info("Skip final aggregation block 1 (missing da_price_pit).")
     else:
         foreign_da_cols = [
             c
             for c in (
-                "da_price_AT",
-                "da_price_BE",
-                "da_price_CH",
-                "da_price_CZ",
-                "da_price_DK1",
-                "da_price_DK2",
-                "da_price_FR",
-                "da_price_NL",
-                "da_price_PL",
-                "da_price_SE4",
+                "da_price_AT_pit",
+                "da_price_BE_pit",
+                "da_price_CH_pit",
+                "da_price_CZ_pit",
+                "da_price_DK1_pit",
+                "da_price_DK2_pit",
+                "da_price_FR_pit",
+                "da_price_NL_pit",
+                "da_price_PL_pit",
+                "da_price_SE4_pit",
             )
             if c in df.columns
         ]
@@ -141,9 +134,22 @@ def apply_final_feature_aggregations(df: pl.DataFrame) -> pl.DataFrame:
             df = df.with_columns(
                 (
                     pl.col("neighbor_price_avg").cast(pl.Float64, strict=False)
-                    - pl.col("da_price").cast(pl.Float64, strict=False)
+                    - pl.col("da_price_pit").cast(pl.Float64, strict=False)
                 ).alias("neighbor_spread_avg")
             )
+            # Keep a small set of explicit bilateral spreads as DA alpha probes.
+            bilateral_spread_exprs: list[pl.Expr] = []
+            for country in ("AT", "NL", "FR"):
+                c = f"da_price_{country}_pit"
+                if c in df.columns:
+                    bilateral_spread_exprs.append(
+                        (
+                            pl.col("da_price_pit").cast(pl.Float64, strict=False)
+                            - pl.col(c).cast(pl.Float64, strict=False)
+                        ).alias(f"da_spread_de_{country.lower()}")
+                    )
+            if bilateral_spread_exprs:
+                df = df.with_columns(bilateral_spread_exprs)
             # Keep only DE anchor and spread signal; drop foreign raw prices and
             # intermediate neighbor average to reduce collinearity.
             df = df.drop(foreign_da_cols + ["neighbor_price_avg"])
@@ -213,6 +219,7 @@ def _lag_hours_for_column(col: str) -> int:
     if (
         "afrr_activated_mw" in col
         or "afrr_activated_mwh" in col
+        or "afrr_capacity_" in col
         or "activation_rate" in col
         or "mfrr_activated_mw" in col
         or "mfrr_activated_mwh" in col
@@ -239,9 +246,13 @@ def apply_point_in_time_lag_layer(df: pl.DataFrame) -> pl.DataFrame:
         "__target_source_afrr_activation_price_vwap_pos",
         "__target_source_da_price",
         "__target_source_afrr_rate",
+        "__target_source_afrr_capacity_price_pos",
+        "__target_source_afrr_capacity_price_neg",
         "target_afrr_activation_price_vwap_pos_h1",
         "target_da_price_h1",
         "target_afrr_rate_h1",
+        "target_afrr_capacity_price_pos_h1",
+        "target_afrr_capacity_price_neg_h1",
     }
     exprs: list[pl.Expr] = []
     lagged_cols = 0
@@ -266,7 +277,7 @@ def apply_point_in_time_lag_layer(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def add_day_ahead_publication_feature(df: pl.DataFrame) -> pl.DataFrame:
-    """Build day-ahead price view under a publication-time information gate.
+    """Build day-ahead price views under a publication-time information gate.
 
     Rule:
     - For a delivery hour T, day-ahead price is considered available from
@@ -286,6 +297,13 @@ def add_day_ahead_publication_feature(df: pl.DataFrame) -> pl.DataFrame:
     is_available = ts >= publication_ts
 
     pdf["da_price_pit"] = da.where(is_available, da.shift(24))
+
+    # Apply the same D-1 13:00 UTC gate to foreign DA prices used for cross-border
+    # spreads, so spread features are causally aligned to auction availability.
+    foreign_da_cols = [c for c in pdf.columns if re.match(r"^da_price_[A-Z0-9]+$", c)]
+    for col in foreign_da_cols:
+        s = pd.to_numeric(pdf[col], errors="coerce")
+        pdf[f"{col}_pit"] = s.where(is_available, s.shift(24))
     return pl.from_pandas(pdf)
 
 
@@ -295,7 +313,7 @@ def apply_day_ahead_forecast_availability(df: pl.DataFrame) -> pl.DataFrame:
     Design:
     - DA prices remain strict T-0 and are never gated here.
     - Current-hour DA forecasts (base columns without horizon suffix) remain strict T-0.
-    - Future DA forecast columns (e.g. `*_forecast_da_*_h48`) are gated by publication
+    - Future DA forecast columns (e.g. `*_forecast_da_*_h24`) are gated by publication
       time: D-1 `DA_GATE_HOUR_UTC` in UTC of the target delivery day.
     - If unavailable at decision time, fallback is persistence (`shift(24)`).
     """
@@ -310,7 +328,7 @@ def apply_day_ahead_forecast_availability(df: pl.DataFrame) -> pl.DataFrame:
         "solar_forecast_da_entsoe",
     }
     # Match future-horizon forecast columns like:
-    # - load_forecast_da_entsoe_h48
+    # - load_forecast_da_entsoe_h24
     # - wind_onshore_forecast_da_entsoe_tplus24
     horizon_re = re.compile(
         r"^(?P<base>.+forecast_da(?:_entsoe)?)(?:_(?:h|tplus)(?P<h>\d+))$",
@@ -355,12 +373,94 @@ def apply_day_ahead_forecast_availability(df: pl.DataFrame) -> pl.DataFrame:
     return pl.from_pandas(pdf)
 
 
+def add_da_forecast_curve_features(
+    df: pl.DataFrame,
+    *,
+    sparse_horizons: tuple[int, ...] = (1, 2, 3, 6, 12, 24),
+    max_horizon: int = 24,
+) -> pl.DataFrame:
+    """Add causal DA-forecast trajectory features (sparse + compressed).
+
+    Goal:
+    - expose future forecast shape for the next day in a PiT-safe way
+    - keep dimensionality manageable via sparse horizons + summary stats
+
+    Causality:
+    - For each horizon h and decision time t, forecast for target t+h is only
+      available from D-1 `DA_GATE_HOUR_UTC` of the target delivery day.
+    - If unavailable, fallback uses a causal persistence proxy (`shift(24)`).
+    """
+    if "timestamp_utc" not in df.columns:
+        return df
+
+    pdf = df.to_pandas()
+    pdf["timestamp_utc"] = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
+    pdf = pdf.sort_values("timestamp_utc").reset_index(drop=True)
+    ts = pd.to_datetime(pdf["timestamp_utc"], utc=True, errors="coerce")
+    if ts.isna().any():
+        return df
+
+    # Forecast families that are DA-curve based and meaningful for next-day outlook.
+    candidates = [
+        "load_forecast_da_entsoe",
+        "load_forecast_da",
+        "wind_onshore_forecast_da_entsoe",
+        "wind_offshore_forecast_da_entsoe",
+        "solar_forecast_da_entsoe",
+        "residual_load_forecast_da",
+        "renewable_share_forecast",
+    ]
+    base_cols = [c for c in candidates if c in pdf.columns]
+    if not base_cols:
+        return df
+
+    max_h = int(max_horizon)
+    sparse = tuple(sorted({int(h) for h in sparse_horizons if 1 <= int(h) <= max_h}))
+    if not sparse:
+        return df
+
+    for base in base_cols:
+        s = pd.to_numeric(pdf[base], errors="coerce")
+        fallback_24h = s.shift(24)
+
+        dense_values: dict[int, pd.Series] = {}
+        for h in range(1, max_h + 1):
+            target_ts = ts + pd.to_timedelta(h, unit="h")
+            target_day_utc = target_ts.dt.floor("D")
+            pub_utc = target_day_utc - pd.Timedelta(days=1) + pd.Timedelta(hours=DA_GATE_HOUR_UTC)
+            available = ts >= pub_utc
+
+            future = s.shift(-h)
+            gated = future.where(available, fallback_24h).ffill()
+            dense_values[h] = pd.to_numeric(gated, errors="coerce")
+
+        # Keep sparse horizon points for tree models.
+        for h in sparse:
+            pdf[f"{base}_h{h}"] = dense_values[h]
+
+        # Compressed trajectory descriptors (24h curve shape).
+        arr24 = np.column_stack([dense_values[h].to_numpy(dtype=float) for h in range(1, 25)])
+        with np.errstate(invalid="ignore"):
+            pdf[f"{base}_next24_mean"] = np.nanmean(arr24, axis=1)
+            pdf[f"{base}_next24_min"] = np.nanmin(arr24, axis=1)
+            pdf[f"{base}_next24_max"] = np.nanmax(arr24, axis=1)
+            pdf[f"{base}_next24_std"] = np.nanstd(arr24, axis=1)
+
+        h1 = dense_values[1]
+        h24 = dense_values[24]
+        pdf[f"{base}_next24_ramp"] = h24 - h1
+
+    return pl.from_pandas(pdf)
+
+
 def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
     """Create explicit h+1 targets and drop temporary unlagged target sources."""
     required = {
         "__target_source_afrr_activation_price_vwap_pos",
         "__target_source_da_price",
         "__target_source_afrr_rate",
+        "__target_source_afrr_capacity_price_pos",
+        "__target_source_afrr_capacity_price_neg",
     }
     if not required.issubset(set(df.columns)):
         missing = sorted(required - set(df.columns))
@@ -370,6 +470,8 @@ def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("__target_source_afrr_activation_price_vwap_pos").shift(-1).alias("target_afrr_activation_price_vwap_pos_h1"),
         pl.col("__target_source_da_price").shift(-1).alias("target_da_price_h1"),
         pl.col("__target_source_afrr_rate").shift(-1).alias("target_afrr_rate_h1"),
+        pl.col("__target_source_afrr_capacity_price_pos").shift(-1).alias("target_afrr_capacity_price_pos_h1"),
+        pl.col("__target_source_afrr_capacity_price_neg").shift(-1).alias("target_afrr_capacity_price_neg_h1"),
     ])
     return out.drop([c for c in required if c in out.columns])
 
@@ -388,27 +490,12 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     - `__target_source_afrr_activation_price_vwap_pos`
     - `__target_source_da_price`
     - `__target_source_afrr_rate`
+    - `__target_source_afrr_capacity_price_pos`
+    - `__target_source_afrr_capacity_price_neg`
     """
-    pos_price_col = None
-    neg_price_col = None
-    for cand in (
-        "afrr_activation_price_vwap_pos",
-        "afrr_activation_marginal_price_pos",
-        "afrr_avg_activation_price_pos",
-        "afrr_activation_avg_price_pos",
-    ):
-        if cand in df.columns:
-            pos_price_col = cand
-            break
-    for cand in (
-        "afrr_activation_price_vwap_neg",
-        "afrr_activation_marginal_price_neg",
-        "afrr_avg_activation_price_neg",
-        "afrr_activation_avg_price_neg",
-    ):
-        if cand in df.columns:
-            neg_price_col = cand
-            break
+    # Thesis target policy: enforce explicit positive-direction activation VWAP
+    # as the sole source for target_afrr_activation_price_vwap_pos_h1.
+    pos_price_col = "afrr_activation_price_vwap_pos" if "afrr_activation_price_vwap_pos" in df.columns else None
 
     pos_act_col = (
         "afrr_activated_mwh_pos"
@@ -429,7 +516,7 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
         raise KeyError(f"Missing required target-engineering columns: {missing}")
 
     # 1) Prevent leakage from economically incorrect target candidates.
-    #    Keep only marginal-price-based targets for a pay-as-cleared market.
+    #    Average activation prices are not used as training/evaluation targets.
     drop_avg = [c for c in ("afrr_activation_avg_price_pos", "afrr_activation_avg_price_neg") if c in df.columns]
     if drop_avg:
         df = df.drop(drop_avg)
@@ -489,7 +576,18 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
         rate_expr.clip(0.0, 1.0).alias("afrr_activation_rate"),
     ])
 
-    # 5) Cleanup raw marginal helper columns to avoid accidental downstream use.
+    # 5) Unlagged capacity-price target sources.
+    # Capacity prices are required as supervised labels but must never be part of X.
+    if {"afrr_capacity_price_pos", "afrr_capacity_price_neg"}.issubset(set(df.columns)):
+        df = df.with_columns([
+            pl.col("afrr_capacity_price_pos").cast(pl.Float64).alias("__target_source_afrr_capacity_price_pos"),
+            pl.col("afrr_capacity_price_neg").cast(pl.Float64).alias("__target_source_afrr_capacity_price_neg"),
+        ])
+    else:
+        missing = [c for c in ("afrr_capacity_price_pos", "afrr_capacity_price_neg") if c not in df.columns]
+        raise KeyError(f"Missing required capacity-price target source columns: {missing}")
+
+    # 6) Cleanup raw marginal helper columns to avoid accidental downstream use.
     drop_target_sources = [
         "afrr_activation_marginal_price_pos",
         "afrr_activation_marginal_price_neg",
@@ -598,16 +696,11 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
     if drop_avg_activation_prices:
         df = df.drop(drop_avg_activation_prices)
 
-    price_col = None
-    for candidate in ("da_price", "da_price_d_eur_mwh", "da_price"):
-        if candidate in df.columns:
-            price_col = candidate
-            break
-    if price_col is None:
-        raise KeyError("Missing required column: da_price (or da_price_d_eur_mwh/da_price)")
+    if "da_price_pit" not in df.columns:
+        raise KeyError("Missing required column: da_price_pit")
 
     df = df.with_columns(
-        pl.col(price_col)
+        pl.col("da_price_pit")
         .shift(24)
         .rolling_std(window_size=720, min_samples=1)
         .alias("da_price_volatility_30d")
@@ -632,6 +725,14 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
                 .rolling_mean(window_size=72, min_samples=1)
                 .alias(f"{name}_mae_rolling_72h")
             )
+    # Signed load forecast error (actual - DA forecast) as imbalance driver.
+    if load_fc_col in df.columns and load_act_col in df.columns:
+        df = df.with_columns(
+            (
+                pl.col(load_act_col).cast(pl.Float64)
+                - pl.col(load_fc_col).cast(pl.Float64)
+            ).alias("load_error_da")
+        )
 
     if "solar_forecast_da_entsoe" in df.columns:
         df = df.with_columns(
@@ -749,9 +850,9 @@ def add_confidence_features(df: pl.DataFrame) -> pl.DataFrame:
     # Additional rolling windows requested for key series.
     extra_rolling_specs = [
         ("load_actual_entsoe", "load_actual_entsoe"),
-        ("da_price", "da_price"),
         ("wind_onshore_actual_entsoe", "wind_onshore_actual_entsoe"),
     ]
+    extra_rolling_specs.append(("da_price_pit", "da_price"))
     for col_name, prefix in extra_rolling_specs:
         if col_name in df.columns:
             df = df.with_columns([
@@ -807,8 +908,8 @@ def add_price_offering_features(df: pl.DataFrame) -> pl.DataFrame:
     p_indexed.index = pdf["timestamp_utc"]
 
     # 1) Cross-market spread: strictly against Day-Ahead price.
-    if "da_price" in pdf.columns:
-        p_da = pd.to_numeric(pdf["da_price"], errors="coerce")
+    if "da_price_pit" in pdf.columns:
+        p_da = pd.to_numeric(pdf["da_price_pit"], errors="coerce")
         pdf["afrr_da_price_spread"] = p - p_da
     else:
         pdf["afrr_da_price_spread"] = np.nan
@@ -1132,11 +1233,15 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         out["timestamp_utc"] = pd.to_datetime(out["timestamp_utc"], utc=True, errors="coerce")
         out = out.sort_values("timestamp_utc").reset_index(drop=True)
 
+    # All DA derivatives must use PiT-gated DA information.
+    if "da_price_pit" not in out.columns:
+        raise KeyError("Missing required column for DA derivatives: da_price_pit")
+    da_ref_col = "da_price_pit"
+
     # 1) Point-in-time slices (explicit lags for tree models).
     # Keep the primary T+0 columns unchanged and add lag snapshots for seasonality/memory.
     lag_targets = [
         "load_actual_entsoe",
-        "da_price",
         "wind_onshore_actual_entsoe",
         "load_total_incl_pumping",
         "residual_load_forecast_da",
@@ -1149,6 +1254,11 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{col}_lag_24h"] = s.shift(24)
         out[f"{col}_lag_48h"] = s.shift(48)
         out[f"{col}_lag_168h"] = s.shift(168)
+    if da_ref_col in out.columns:
+        s_da = pd.to_numeric(out[da_ref_col], errors="coerce")
+        out["da_price_lag_24h"] = s_da.shift(24)
+        out["da_price_lag_48h"] = s_da.shift(48)
+        out["da_price_lag_168h"] = s_da.shift(168)
 
     # Historical target lags as valid autoregressive features (no leakage):
     # only past values (t-1h, t-24h) are exposed to the model.
@@ -1170,21 +1280,29 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{col}_lag_24h"] = s.shift(24)
 
     # 2) Momentum/trend features (differences for linear models).
-    momentum_targets = ["load_actual_entsoe", "da_price"]
+    momentum_targets = ["load_actual_entsoe"]
     for col in momentum_targets:
         if col not in out.columns:
             continue
         s = pd.to_numeric(out[col], errors="coerce")
         out[f"{col}_diff1"] = s.diff(1)
         out[f"{col}_diff24"] = s.diff(24)
+    if da_ref_col in out.columns:
+        s_da = pd.to_numeric(out[da_ref_col], errors="coerce")
+        out["da_price_diff1"] = s_da.diff(1)
+        out["da_price_diff24"] = s_da.diff(24)
 
     # 3) EWMA features (recently weighted context for sequence models).
-    ewma_targets = ["da_price", "load_actual_entsoe"]
+    ewma_targets = ["load_actual_entsoe"]
     for col in ewma_targets:
         if col not in out.columns:
             continue
         s = pd.to_numeric(out[col], errors="coerce")
         out[f"{col}_ewma24"] = s.ewm(span=24, adjust=False, min_periods=1, ignore_na=False).mean()
+    if da_ref_col in out.columns:
+        s_da = pd.to_numeric(out[da_ref_col], errors="coerce")
+        out["da_price_ewma24"] = s_da.ewm(span=24, adjust=False, min_periods=1, ignore_na=False).mean()
+        out["da_price_slog1p"] = np.sign(s_da) * np.log1p(np.abs(s_da))
 
     # 4) Cyclical time features.
     if "timestamp_utc" in out.columns:
@@ -1241,9 +1359,11 @@ def apply_pit_audit_corrections(df: pl.DataFrame) -> pl.DataFrame:
         "solar_error_da",
         "wind_onshore_error_da",
         "wind_offshore_error_da",
+        "load_error_da",
         "wind_onshore_error_id",
         "wind_offshore_error_id",
         "solar_error_id",
+        "hydro_pumped_actual_entsoe",
         "total_wind_solar_id_error",
         "wind_onshore_actual_entsoe_mean_24h",
         "wind_onshore_actual_entsoe_std_24h",
@@ -1256,6 +1376,9 @@ def apply_pit_audit_corrections(df: pl.DataFrame) -> pl.DataFrame:
         "price_volatility_short_term",
         "scarcity_price_premium",
         "neighbor_spread_avg",
+        "da_spread_de_at",
+        "da_spread_de_nl",
+        "da_spread_de_fr",
         "generation_baseload_total",
     ]
 
@@ -1278,7 +1401,8 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
     """Create LAG_PLAN features with absolute-latency naming.
 
     Momentum group:
-    - aFRR prices, spread, stress, NRV with additional lags [1, 2, 3]
+    - aFRR prices/spreads, stress/NRV, activation/capacity and forecast-update
+      families with additional intraday lags.
     Seasonal group:
     - weather/DA/load family with additional lags [24, 48, 168]
 
@@ -1301,12 +1425,15 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
             ],
         },
         "momentum_pit2h_nrv": {
-            "lags": [2, 3, 4],
+            "lags": [2, 3, 4, 6, 12, 24],
             "anchors": [
+                "NRV_balance_lag_2h",
                 "nrv_zscore_24h_lag_2h",
                 "nrv_quantile_5_lag_2h",
             ],
-            "fallback_roots": [],
+            "fallback_roots": [
+                "NRV_balance",
+            ],
         },
         "momentum_pit2h_stress": {
             "lags": [2, 3, 6, 12, 24],
@@ -1331,10 +1458,85 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
                 "da_price_pit",
             ],
         },
+        "activation_rate_dynamics": {
+            "lags": [1, 2, 3, 6, 12, 24],
+            "anchors": [
+                "afrr_activation_rate_lag_1h",
+                "is_activated_lag_1h",
+                "mfrr_active_lag",
+            ],
+            "fallback_roots": [
+                "afrr_activation_rate",
+                "is_activated",
+                "mfrr_active_lag",
+            ],
+        },
+        "activation_volume_dynamics": {
+            "lags": [1, 2, 3, 6, 12, 24],
+            "anchors": [
+                "afrr_activated_mw_pos_lag_1h",
+                "afrr_activated_mw_neg_lag_1h",
+                "mfrr_activated_mw_pos_lag_1h",
+                "mfrr_activated_mw_neg_lag_1h",
+                "mfrr_mari_net_mw_lag_1h",
+                "afrr_activation_offered_mw_pos_lag_1h",
+                "afrr_activation_offered_mw_neg_lag_1h",
+            ],
+            "fallback_roots": [
+                "afrr_activated_mw_pos",
+                "afrr_activated_mw_neg",
+                "mfrr_activated_mw_pos",
+                "mfrr_activated_mw_neg",
+                "mfrr_mari_net_mw",
+                "afrr_activation_offered_mw_pos",
+                "afrr_activation_offered_mw_neg",
+            ],
+        },
+        "capacity_market_dynamics": {
+            "lags": [1, 2, 3, 6, 12, 24],
+            "anchors": [
+                "afrr_capacity_awarded_mw_pos_lag_1h",
+                "afrr_capacity_awarded_mw_neg_lag_1h",
+                "afrr_capacity_offered_mw_pos_lag_1h",
+                "afrr_capacity_offered_mw_neg_lag_1h",
+                "afrr_capacity_price_pos_lag_1h",
+                "afrr_capacity_price_neg_lag_1h",
+            ],
+            "fallback_roots": [
+                "afrr_capacity_awarded_mw_pos",
+                "afrr_capacity_awarded_mw_neg",
+                "afrr_capacity_offered_mw_pos",
+                "afrr_capacity_offered_mw_neg",
+                "afrr_capacity_price_pos",
+                "afrr_capacity_price_neg",
+            ],
+        },
+        "forecast_update_dynamics": {
+            "lags": [1, 2, 3, 6, 12, 24],
+            "anchors": [
+                "wind_forecast_update",
+                "wind_onshore_forecast_update",
+                "solar_forecast_update",
+                "wind_total_error_da_lag_2h",
+                "solar_error_da_lag_2h",
+                "wind_onshore_error_da_lag_2h",
+            ],
+            "fallback_roots": [
+                "wind_forecast_update",
+                "wind_onshore_forecast_update",
+                "solar_forecast_update",
+                "wind_total_error_da",
+                "solar_error_da",
+                "wind_onshore_error_da",
+            ],
+        },
         "seasonal": {
             "lags": [24, 48, 168],
             "anchors": [
                 "da_price_pit",
+                "da_spread_de_at_lag_2h",
+                "da_spread_de_nl_lag_2h",
+                "da_spread_de_fr_lag_2h",
                 "wind_onshore_forecast_id_entsoe",
                 "wind_offshore_forecast_id_entsoe",
                 "solar_forecast_id_entsoe",
@@ -1344,6 +1546,9 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
             ],
             "fallback_roots": [
                 "da_price_pit",
+                "da_spread_de_at",
+                "da_spread_de_nl",
+                "da_spread_de_fr",
                 "wind_onshore_forecast_id_entsoe",
                 "wind_offshore_forecast_id_entsoe",
                 "solar_forecast_id_entsoe",
@@ -1504,24 +1709,29 @@ def run_feature_sanity_checks(df_features: pd.DataFrame | pl.DataFrame) -> None:
         return float((pd.to_numeric(aa[valid], errors="coerce") - pd.to_numeric(bb[valid], errors="coerce")).abs().max())
 
     # Test A: explicit slices.
-    assert {"da_price", "da_price_lag_24h"}.issubset(pdf.columns), (
-        "Missing columns for Test A: da_price / da_price_lag_24h"
+    assert {"da_price_pit", "da_price_lag_24h"}.issubset(pdf.columns), (
+        "Missing columns for Test A: da_price_pit / da_price_lag_24h"
     )
-    err_a = _max_abs_err(pdf["da_price_lag_24h"], pd.to_numeric(pdf["da_price"], errors="coerce").shift(24))
+    err_a = _max_abs_err(
+        pdf["da_price_lag_24h"],
+        pd.to_numeric(pdf["da_price_pit"], errors="coerce").shift(24),
+    )
     if err_a == 0.0:
-        print("[PASS] Test A (Explicit Slices): da_price_lag_24h == da_price.shift(24)")
+        print("[PASS] Test A (Explicit Slices): da_price_lag_24h == da_price_pit.shift(24)")
     else:
         print(f"[FAIL] Test A (Explicit Slices): max_abs_error={err_a:.12g}")
     assert err_a == 0.0, f"Test A failed: max_abs_error={err_a}"
 
     # Test B: momentum/diff.
-    assert {"da_price", "da_price_diff1"}.issubset(pdf.columns), (
-        "Missing columns for Test B: da_price / da_price_diff1"
+    assert {"da_price_pit", "da_price_diff1"}.issubset(pdf.columns), (
+        "Missing columns for Test B: da_price_pit / da_price_diff1"
     )
-    expected_b = pd.to_numeric(pdf["da_price"], errors="coerce") - pd.to_numeric(pdf["da_price"], errors="coerce").shift(1)
+    expected_b = pd.to_numeric(pdf["da_price_pit"], errors="coerce") - pd.to_numeric(
+        pdf["da_price_pit"], errors="coerce"
+    ).shift(1)
     err_b = _max_abs_err(pdf["da_price_diff1"], expected_b)
     if err_b == 0.0:
-        print("[PASS] Test B (Momentum): da_price_diff1 == da_price - shift(1)")
+        print("[PASS] Test B (Momentum): da_price_diff1 == da_price_pit - shift(1)")
     else:
         print(f"[FAIL] Test B (Momentum): max_abs_error={err_b:.12g}")
     assert err_b == 0.0, f"Test B failed: max_abs_error={err_b}"
@@ -1570,10 +1780,10 @@ def run_feature_sanity_checks(df_features: pd.DataFrame | pl.DataFrame) -> None:
     assert err_d <= 1e-12, f"Test D failed: max_abs_error={err_d}"
 
     # Test E: EWMA causality and formula check.
-    assert {"da_price", "da_price_ewma24"}.issubset(pdf.columns), (
-        "Missing columns for Test E: da_price / da_price_ewma24"
+    assert {"da_price_pit", "da_price_ewma24"}.issubset(pdf.columns), (
+        "Missing columns for Test E: da_price_pit / da_price_ewma24"
     )
-    base = pd.to_numeric(pdf["da_price"], errors="coerce")
+    base = pd.to_numeric(pdf["da_price_pit"], errors="coerce")
     expected_e = base.ewm(span=24, adjust=False, min_periods=1, ignore_na=False).mean()
     err_e = _max_abs_err(pd.to_numeric(pdf["da_price_ewma24"], errors="coerce"), expected_e)
     if err_e <= 1e-12:
@@ -1655,6 +1865,19 @@ def truncate_to_complete_information_core(df: pl.DataFrame) -> pl.DataFrame:
     return out
 
 
+def assert_removed_legacy_columns_absent(df: pl.DataFrame) -> None:
+    """Final audit guard for removed legacy feature families."""
+    forbidden = [
+        c for c in df.columns
+        if ("reconstructed" in c.lower()) or ("grid_share" in c.lower())
+    ]
+    if forbidden:
+        raise RuntimeError(
+            "Forbidden legacy columns detected in final feature table: "
+            f"{sorted(forbidden)}"
+        )
+
+
 def build_features(input_path: Path, output_path: Path) -> None:
     """Build ML features from transformed parquet."""
     # --- STEP 1: Load Data ---
@@ -1684,6 +1907,9 @@ def build_features(input_path: Path, output_path: Path) -> None:
 
     # --- STEP 4: DERIVED & HYBRID FEATURES (ON LAGGED/GATED BASE) ---
     df = add_confidence_features(df)
+    # Add DA forecast trajectory features for multi-horizon modeling.
+    # This provides both sparse horizon points and compressed curve descriptors.
+    df = add_da_forecast_curve_features(df)
     # Final dimensionality reduction blocks: foreign spreads, balance cleanup, fossil total.
     df = apply_final_feature_aggregations(df)
     df = add_german_holiday_features(df)
@@ -1759,6 +1985,7 @@ def build_features(input_path: Path, output_path: Path) -> None:
 
     # Trim dynamic warmup/horizon NaN zones before final export.
     df = truncate_to_complete_information_core(df)
+    assert_removed_legacy_columns_absent(df)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(output_path, compression="zstd")
