@@ -1,0 +1,295 @@
+"""Run LP-based battery backtest from ML predictions + ground truth parquet files.
+
+Usage (manifest-autoload, recommended):
+    ./.venv/bin/python scripts/run_battery_backtest.py \
+      --run-manifest artifacts/model_runs/latest.json \
+      --split test \
+      --horizon-hours 48 \
+      --reopt-step-hours 1 \
+      --da-gate-hour-utc 11 \
+      --soc-feedback-mode realized
+
+Usage (manual files):
+    ./.venv/bin/python scripts/run_battery_backtest.py \
+      --predictions artifacts/simulation_runs/manual/backtest_table_test.parquet \
+      --ground-truth data/features/all_data_features.parquet \
+      --timestamp-col timestamp_utc \
+      --pred-da-col pred_da_price \
+      --true-da-col da_price
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+import pandas as pd
+
+# Allow direct script execution from repository root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from energy_trading.simulation.battery_backtest import (
+    BacktestColumnMap,
+    BatteryBacktester,
+    load_and_align_market_data,
+    load_prediction_warehouse_long,
+)
+
+
+def _resolve_out_dir(
+    out_dir_arg: str,
+    *,
+    run_id: str | None,
+    split: str,
+) -> Path:
+    if out_dir_arg.strip():
+        out = Path(out_dir_arg)
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+    rid = run_id or "manual"
+    out = Path("artifacts/simulation_runs") / rid / split
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: BacktestColumnMap) -> BacktestColumnMap:
+    """Use project-aware fallback candidates to reduce manual mapping overhead."""
+
+    def pick(frame: pd.DataFrame, primary: str, candidates: list[str]) -> str:
+        for c in [primary, *candidates]:
+            if c in frame.columns:
+                return c
+        raise KeyError(f"Missing required column. Tried: {[primary, *candidates]}")
+
+    return BacktestColumnMap(
+        timestamp=pick(pred if colmap.timestamp in pred.columns else truth, colmap.timestamp, ["timestamp", "datetime", "date"]),
+
+        pred_da_price=pick(
+            pred,
+            colmap.pred_da_price,
+            ["da_price_pred", "y_pred_da_price", "prediction_da_price", "pred_target_da_price_h1"],
+        ),
+        pred_afrr_capacity_price_pos=pick(pred, colmap.pred_afrr_capacity_price_pos, ["afrr_capacity_price_pos_pred", "pred_target_afrr_capacity_price_pos_h1"]),
+        pred_afrr_capacity_price_neg=pick(pred, colmap.pred_afrr_capacity_price_neg, ["afrr_capacity_price_neg_pred", "pred_target_afrr_capacity_price_neg_h1"]),
+        pred_afrr_activation_price_pos=pick(pred, colmap.pred_afrr_activation_price_pos, ["afrr_activation_price_vwap_pos_pred", "pred_target_afrr_activation_price_vwap_pos_h1"]),
+        pred_afrr_activation_price_neg=pick(
+            pred,
+            colmap.pred_afrr_activation_price_neg,
+            ["afrr_activation_price_vwap_neg_pred", "pred_target_afrr_activation_price_vwap_neg_h1"],
+        ),
+        pred_afrr_activation_rate_pos=pick(pred, colmap.pred_afrr_activation_rate_pos, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
+        pred_afrr_activation_rate_neg=pick(pred, colmap.pred_afrr_activation_rate_neg, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
+
+        true_da_price=pick(truth, colmap.true_da_price, ["da_price_actual", "target_da_price_h1"]),
+        true_afrr_capacity_price_pos=pick(truth, colmap.true_afrr_capacity_price_pos, ["target_afrr_capacity_price_pos_h1"]),
+        true_afrr_capacity_price_neg=pick(truth, colmap.true_afrr_capacity_price_neg, ["target_afrr_capacity_price_neg_h1"]),
+        true_afrr_activation_price_pos=pick(truth, colmap.true_afrr_activation_price_pos, ["target_afrr_activation_price_vwap_pos_h1"]),
+        true_afrr_activation_price_neg=pick(truth, colmap.true_afrr_activation_price_neg, ["target_afrr_activation_price_vwap_neg_h1"]),
+        true_afrr_activation_rate_pos=pick(truth, colmap.true_afrr_activation_rate_pos, ["afrr_activation_rate", "target_afrr_rate_h1"]),
+        true_afrr_activation_rate_neg=pick(truth, colmap.true_afrr_activation_rate_neg, ["afrr_activation_rate", "target_afrr_rate_h1"]),
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run battery LP backtest with predicted-vs-realized settlement.")
+    p.add_argument("--predictions", default="", help="Path to predictions parquet file.")
+    p.add_argument("--ground-truth", default="", help="Path to ground-truth parquet file.")
+    p.add_argument(
+        "--run-manifest",
+        default="artifacts/model_runs/latest.json",
+        help="Manifest path or latest-pointer json for simulation autoload.",
+    )
+    p.add_argument("--split", choices=["val", "test"], default="test", help="Prediction split for manifest mode.")
+    p.add_argument(
+        "--out-dir",
+        default="",
+        help="Output directory for hourly/aggregated results. If empty, uses artifacts/simulation_runs/<run_id>/<split>/",
+    )
+
+    p.add_argument("--timestamp-col", default="timestamp_utc")
+    p.add_argument("--pred-da-col", default="pred_da_price")
+    p.add_argument("--pred-cap-pos-col", default="pred_afrr_capacity_price_pos")
+    p.add_argument("--pred-cap-neg-col", default="pred_afrr_capacity_price_neg")
+    p.add_argument("--pred-act-pos-col", default="pred_afrr_activation_price_pos")
+    p.add_argument("--pred-act-neg-col", default="pred_afrr_activation_price_neg")
+    p.add_argument("--pred-rate-pos-col", default="pred_afrr_activation_rate_pos")
+    p.add_argument("--pred-rate-neg-col", default="pred_afrr_activation_rate_neg")
+
+    p.add_argument("--true-da-col", default="da_price")
+    p.add_argument("--true-cap-pos-col", default="afrr_capacity_price_pos")
+    p.add_argument("--true-cap-neg-col", default="afrr_capacity_price_neg")
+    p.add_argument("--true-act-pos-col", default="afrr_activation_price_vwap_pos")
+    p.add_argument("--true-act-neg-col", default="afrr_activation_price_vwap_neg")
+    p.add_argument("--true-rate-pos-col", default="afrr_activation_rate_pos")
+    p.add_argument("--true-rate-neg-col", default="afrr_activation_rate_neg")
+
+    p.add_argument("--start", default=None, help="Optional UTC start filter.")
+    p.add_argument("--end", default=None, help="Optional UTC end filter.")
+    p.add_argument("--horizon-hours", type=int, default=48, help="Rolling-horizon window length in hours.")
+    p.add_argument("--reopt-step-hours", type=int, default=1, help="Re-optimization step in hours.")
+    p.add_argument("--da-gate-hour-utc", type=int, default=11, help="UTC gate-closure hour for locking next-day DA bids.")
+    p.add_argument(
+        "--soc-feedback-mode",
+        choices=["realized", "predicted"],
+        default="realized",
+        help="State carryover mode between re-optimizations.",
+    )
+    p.add_argument(
+        "--enforce-final-soc-min",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enforce final SoC >= soc_target_end (default: enabled).",
+    )
+    p.add_argument(
+        "--disable-rolling-horizon",
+        action="store_true",
+        help="Use a single full-horizon optimization instead of rolling horizon.",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run_id: str | None = None
+
+    predictions_path = args.predictions.strip()
+    ground_truth_path = args.ground_truth.strip()
+
+    if not predictions_path:
+        manifest_path = Path(args.run_manifest)
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Run manifest/latest pointer not found: {manifest_path}")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if "manifest_path" in payload:
+            run_id = payload.get("run_id")
+            manifest_path = Path(payload["manifest_path"])
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        run_id = run_id or payload.get("run_id")
+
+    out_dir = _resolve_out_dir(args.out_dir, run_id=run_id, split=args.split)
+    forecast_warehouse: dict[str, pd.DataFrame] | None = None
+
+    if not predictions_path:
+        da_long = payload.get("bundles", {}).get("da", {}).get("predictions_long", {}).get(args.split, {})
+        afrr_long = payload.get("bundles", {}).get("afrr", {}).get("predictions_long", {}).get(args.split, {})
+        long_map = {**da_long, **afrr_long}
+
+        if long_map:
+            forecast_warehouse = load_prediction_warehouse_long(long_map)
+            print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
+        else:
+            da_pred = Path(payload["bundles"]["da"]["predictions"][args.split])
+            afrr_pred = Path(payload["bundles"]["afrr"]["predictions"][args.split])
+            predictions_path = str((out_dir / f"backtest_table_{args.split}.parquet").resolve())
+
+            da_df = pd.read_parquet(da_pred)
+            afrr_df = pd.read_parquet(afrr_pred)
+            backtest_table = da_df.merge(afrr_df, on="timestamp_utc", how="inner")
+            backtest_table.to_parquet(predictions_path, index=False)
+            print(f"[INFO] Backtest table created: {predictions_path}")
+
+        if not ground_truth_path:
+            ground_truth_path = payload["ground_truth"]["default_path"]
+
+    if not ground_truth_path:
+        raise ValueError("Either provide --predictions and --ground-truth, or use --run-manifest.")
+    truth_preview = pd.read_parquet(ground_truth_path)
+    pred_preview = pd.read_parquet(predictions_path) if predictions_path else pd.DataFrame()
+
+    colmap_in = BacktestColumnMap(
+        timestamp=args.timestamp_col,
+        pred_da_price=args.pred_da_col,
+        pred_afrr_capacity_price_pos=args.pred_cap_pos_col,
+        pred_afrr_capacity_price_neg=args.pred_cap_neg_col,
+        pred_afrr_activation_price_pos=args.pred_act_pos_col,
+        pred_afrr_activation_price_neg=args.pred_act_neg_col,
+        pred_afrr_activation_rate_pos=args.pred_rate_pos_col,
+        pred_afrr_activation_rate_neg=args.pred_rate_neg_col,
+        true_da_price=args.true_da_col,
+        true_afrr_capacity_price_pos=args.true_cap_pos_col,
+        true_afrr_capacity_price_neg=args.true_cap_neg_col,
+        true_afrr_activation_price_pos=args.true_act_pos_col,
+        true_afrr_activation_price_neg=args.true_act_neg_col,
+        true_afrr_activation_rate_pos=args.true_rate_pos_col,
+        true_afrr_activation_rate_neg=args.true_rate_neg_col,
+    )
+
+    colmap = _apply_fallback_column_map(pred_preview, truth_preview, colmap_in) if predictions_path else colmap_in
+
+    if predictions_path:
+        df = load_and_align_market_data(predictions_path, ground_truth_path, colmap)
+    else:
+        df = truth_preview.copy()
+        if colmap.timestamp not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+            df[colmap.timestamp] = df.index
+        df[colmap.timestamp] = pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce")
+        df = df.dropna(subset=[colmap.timestamp]).sort_values(colmap.timestamp).reset_index(drop=True)
+    if args.start:
+        start = pd.to_datetime(args.start, utc=True)
+        df = df[df[colmap.timestamp] >= start].copy()
+    if args.end:
+        end = pd.to_datetime(args.end, utc=True)
+        df = df[df[colmap.timestamp] <= end].copy()
+    if df.empty:
+        raise ValueError("No rows after timestamp filtering.")
+
+    backtester = BatteryBacktester()
+    outputs = backtester.run(
+        df,
+        colmap,
+        use_rolling_horizon=not args.disable_rolling_horizon,
+        horizon_hours=args.horizon_hours,
+        reopt_step_hours=args.reopt_step_hours,
+        forecast_warehouse=forecast_warehouse,
+        da_gate_hour_utc=args.da_gate_hour_utc,
+        soc_feedback_mode=args.soc_feedback_mode,
+        enforce_final_soc_min=args.enforce_final_soc_min,
+    )
+
+    hourly_path = out_dir / "backtest_hourly.parquet"
+    plan_history_path = out_dir / "backtest_plan_history.parquet"
+    global_plan_history_path = Path("artifacts/backtest_plan_history.parquet")
+    global_plan_history_path.parent.mkdir(parents=True, exist_ok=True)
+    volatility_path = out_dir / "backtest_decision_volatility.csv"
+    monthly_path = out_dir / "backtest_monthly.csv"
+    yearly_path = out_dir / "backtest_yearly.csv"
+    summary_path = out_dir / "backtest_summary.json"
+
+    outputs.hourly.to_parquet(hourly_path, index=False)
+    outputs.plan_history.to_parquet(plan_history_path, index=False)
+    outputs.plan_history.to_parquet(global_plan_history_path, index=False)
+    outputs.volatility.to_csv(volatility_path, index=False)
+    outputs.monthly.to_csv(monthly_path, index=False)
+    outputs.yearly.to_csv(yearly_path, index=False)
+    summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+
+    print("[OK] Battery backtest completed.")
+    print(f"- rows: {len(outputs.hourly)}")
+    print(f"- realized_total_pnl_eur: {outputs.summary['realized_total_pnl_eur']:.2f}")
+    print(f"- oracle_total_pnl_eur: {outputs.summary['oracle_total_pnl_eur']:.2f}")
+    print(f"- predicted_total_pnl_eur: {outputs.summary['predicted_total_pnl_eur']:.2f}")
+    print(f"- cost_of_forecast_error_total_eur: {outputs.summary['cost_of_forecast_error_total_eur']:.2f}")
+    print(f"- pnl_gap_total_eur: {outputs.summary['pnl_gap_total_eur']:.2f}")
+    print(f"- max_capital_required_eur: {outputs.summary['max_capital_required_eur']:.2f}")
+    print(
+        "- final_soc: "
+        f"{outputs.summary['final_real_soc_mwh']:.2f} MWh "
+        f"(min target {outputs.summary['final_soc_min_target_mwh']:.2f}, "
+        f"ok={bool(outputs.summary['final_soc_constraint_satisfied'])})"
+    )
+    print(f"- hourly: {hourly_path}")
+    print(f"- plan_history: {plan_history_path}")
+    print(f"- plan_history_global: {global_plan_history_path}")
+    print(f"- decision_volatility: {volatility_path}")
+    print(f"- monthly: {monthly_path}")
+    print(f"- yearly: {yearly_path}")
+    print(f"- summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
