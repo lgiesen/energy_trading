@@ -6,7 +6,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-# TODO: Keep in mind: predict the downward and upward activation probabilities separately!
+# TODO: Keep in mind: predict the downward and upward activation probabilities separately and in intervals for different activation prices!
 
 
 def train_with_purged_cv(

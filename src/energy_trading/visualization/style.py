@@ -45,10 +45,10 @@ GEO_SEQUENTIAL_BLUE: Dict[str, str] = {
 
 # Functional thesis palette (minimalist, high-contrast roles).
 THESIS_PALETTE: Dict[str, str] = {
-    "primary": "#226E9C",
-    "secondary": "#d9b98d",
-    "tertiary": "#7C1D6F",
-    "neutral_dark": "#333333",
+    "primary": "#226E9C", # 34, 110, 156
+    "secondary": "#d9b98d", # 217, 185, 141
+    "tertiary": "#7C1D6F", # 124, 29, 111
+    "neutral_dark": "#333333", # 51, 51, 51
 }
 
 
