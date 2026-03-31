@@ -126,7 +126,7 @@ def main() -> None:
     base_cmd = [
         sys.executable,
         "-m",
-        "src.energy_trading.models.train_xgboost",
+        "src.energy_trading.models.train_xgboost_export",
         "--device",
         args.device,
         "--n-estimators",
