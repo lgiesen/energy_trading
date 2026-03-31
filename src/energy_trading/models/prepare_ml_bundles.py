@@ -37,6 +37,62 @@ from energy_trading.constants import PICASSO_RELEASE_UTC
 BundleName = Literal["da", "afrr"]
 LOGGER = logging.getLogger(__name__)
 
+
+def get_da_optimized_features(df_165: pd.DataFrame) -> pd.DataFrame:
+    """Reduce a full feature matrix to DA-auction-causal features only.
+
+    D-1 auction causality constraint:
+    At DA gate closure, short-horizon balancing and activation signals are not
+    yet physically available for delivery day D and are therefore removed.
+    """
+    df_out = df_165.copy()
+    cols = df_out.columns.tolist()
+
+    keyword_drop_pattern = re.compile(
+        r"^(afrr_|mfrr_|nrv_|rz_saldo_|picasso_|mari_|is_activated_|"
+        r"system_stress_|grid_stress_|scarcity_|nrv_zscore_|nrv_quantile_)"
+    )
+    short_lag_pattern = re.compile(r"_lag_(1|2|3|6|12)h$")
+    da_spread_lag_pattern = re.compile(r"^da_spread_[a-z0-9_]+_lag_(\d+)h$")
+
+    cols_to_drop: list[str] = []
+    for col in cols:
+        if col == "da_price_pit":
+            # Explicit keep-exception: latest DA value available at gate closure.
+            continue
+        if keyword_drop_pattern.search(col):
+            cols_to_drop.append(col)
+            continue
+        if short_lag_pattern.search(col):
+            cols_to_drop.append(col)
+            continue
+        if col.startswith("total_wind_solar_id_error"):
+            cols_to_drop.append(col)
+            continue
+        # For DA model, bilateral spread features are only valid as day-seasonal
+        # memory (>=24h lag). Same-hour spreads are not available at D-1 auction.
+        if col.startswith("da_spread_") and "_lag_" not in col:
+            cols_to_drop.append(col)
+            continue
+        m_spread = da_spread_lag_pattern.match(col)
+        if m_spread and int(m_spread.group(1)) < 24:
+            cols_to_drop.append(col)
+            continue
+
+    cols_to_drop = sorted(set(cols_to_drop))
+    df_out = df_out.drop(columns=cols_to_drop, errors="ignore")
+
+    LOGGER.info(
+        "[da-opt] removed %s columns (from %s to %s) under D-1 auction causality constraint.",
+        len(cols_to_drop),
+        len(cols),
+        df_out.shape[1],
+    )
+    if cols_to_drop:
+        LOGGER.info("[da-opt] sample dropped cols: %s", ", ".join(cols_to_drop[:15]))
+    return df_out
+
+
 @dataclass(frozen=True)
 class SplitBounds:
     train_end_exclusive: pd.Timestamp
@@ -71,6 +127,8 @@ class MLDataFactory:
     AFRR_OPTIONAL_TRAIN_TARGETS = [
         "target_afrr_activation_price_vwap_neg_h1",
         "target_afrr_rate_h1",
+        "target_afrr_capacity_price_pos_h1",
+        "target_afrr_capacity_price_neg_h1",
     ]
 
     # Optional unshifted audit labels (y_true), never used as training targets.
@@ -79,8 +137,6 @@ class MLDataFactory:
         "afrr_activation_price_vwap_pos",
         "afrr_activation_price_vwap_neg",
         "afrr_activation_rate",
-        "afrr_capacity_price_pos",
-        "afrr_capacity_price_neg",
     ]
 
     HARD_META_EXCLUDE = {"timestamp_utc"}
@@ -99,6 +155,7 @@ class MLDataFactory:
         doc_path: str | Path = "docs/features_documentation.md",
         scaler_path: str | Path = "models/preprocessing/scaler.joblib",
         null_report_path: str | Path = "data/reports/null_report_features.csv",
+        quality_report_all_path: str | Path = "data/reports/feature_quality_report_all.csv",
         use_forecast_pca: bool = False,
         forecast_pca_var_threshold: float = 0.95,
         forecast_corr_threshold: float = 0.9,
@@ -110,6 +167,7 @@ class MLDataFactory:
         self.doc_path = Path(doc_path)
         self.scaler_path = Path(scaler_path)
         self.null_report_path = Path(null_report_path)
+        self.quality_report_all_path = Path(quality_report_all_path)
         self.config_path = self.output_dir / "feature_config.json"
         # Law #1: strict causality purge gap between adjacent splits for 1h rows.
         self.gap_rows = 72
@@ -295,7 +353,15 @@ class MLDataFactory:
         part = part.sort_values("timestamp_utc").copy()
 
         before = part[existing].isna().sum()
-        part.loc[:, existing] = part.loc[:, existing].ffill(limit=self.feature_ffill_limit)
+        # Structural capacity series change slowly and can be carried forward across
+        # longer sparse source gaps without violating causality.
+        structural_cols = [c for c in existing if "capacity" in c.lower()]
+        regular_cols = [c for c in existing if c not in structural_cols]
+
+        if structural_cols:
+            part.loc[:, structural_cols] = part.loc[:, structural_cols].ffill()
+        if regular_cols:
+            part.loc[:, regular_cols] = part.loc[:, regular_cols].ffill(limit=self.feature_ffill_limit)
         after_ffill = part[existing].isna().sum()
 
         median_cols = [c for c in existing if c in train_medians.index and pd.notna(train_medians[c])]
@@ -308,15 +374,29 @@ class MLDataFactory:
             medianed = int(after_ffill[c] - after_final[c])
             remaining = int(after_final[c])
             if ffilled > 0 or medianed > 0:
+                median_value = train_medians.get(c, np.nan)
                 LOGGER.info(
-                    "[impute][%s][%s] %s: ffill=%s median=%s remaining=%s",
+                    "[impute][%s][%s] %s: ffill_count=%s median_imputed_count=%s "
+                    "train_median_value=%s remaining=%s",
                     bundle,
                     split_name,
                     c,
                     ffilled,
                     medianed,
+                    median_value,
                     remaining,
                 )
+                # Surface potentially weak columns where constant fallback dominates.
+                if len(part) > 0:
+                    median_ratio = medianed / len(part)
+                    if median_ratio >= 0.05:
+                        LOGGER.warning(
+                            "[impute][%s][%s] %s: high median fallback share %.2f%%",
+                            bundle,
+                            split_name,
+                            c,
+                            median_ratio * 100.0,
+                        )
         return part
 
     @staticmethod
@@ -438,7 +518,11 @@ class MLDataFactory:
         out = part.copy()
         for m in models:
             cols = [c for c in m.columns if c in out.columns]
-            if not cols:
+            if len(cols) != len(m.columns):
+                LOGGER.warning(
+                    "[forecast-pca][skip] %s: missing columns at transform time.",
+                    m.family,
+                )
                 continue
             block = out[cols].copy()
             med = block.median(numeric_only=True)
@@ -569,6 +653,9 @@ class MLDataFactory:
             primary_canonical = self._canonical_primary_target(bundle)
             primary_source = targets[0]
             base_features = self._feature_columns(df, targets=targets)
+            if bundle == "da" and base_features:
+                # DA model uses a stricter, auction-causal subset of X.
+                base_features = get_da_optimized_features(df[base_features]).columns.tolist()
 
             # Train slice for quality diagnostics + train-fitted imputation stats.
             train_cols = ["timestamp_utc", *base_features, *targets]
@@ -669,7 +756,8 @@ class MLDataFactory:
             self._write_null_report(report_df, self.null_report_path)
         if quality_reports:
             quality_all = pd.concat(quality_reports, ignore_index=True, sort=False)
-            quality_all.to_csv(self.output_dir / "feature_quality_report_all.csv", index=False)
+            self.quality_report_all_path.parent.mkdir(parents=True, exist_ok=True)
+            quality_all.to_csv(self.quality_report_all_path, index=False)
         print(f"Remaining NaNs in X : {remaining_nans_x_total}")
         return config
 
@@ -706,6 +794,11 @@ def _build_cli() -> argparse.ArgumentParser:
         "--null-report-out",
         default="data/reports/null_report_features.csv",
         help="Output CSV for post-cleaning null report.",
+    )
+    p.add_argument(
+        "--quality-report-all-out",
+        default="data/reports/feature_quality_report_all.csv",
+        help="Output CSV for combined cross-bundle feature quality report.",
     )
     p.add_argument(
         "--use-forecast-pca",
@@ -747,6 +840,7 @@ def main() -> None:
         doc_path=args.doc_path,
         scaler_path=args.scaler_out,
         null_report_path=args.null_report_out,
+        quality_report_all_path=args.quality_report_all_out,
         use_forecast_pca=args.use_forecast_pca,
         forecast_pca_var_threshold=args.forecast_pca_var_threshold,
         forecast_corr_threshold=args.forecast_corr_threshold,
