@@ -5,7 +5,7 @@ Usage:
         --data-dir data/raw \
         --out data/processed/all_data.parquet \
         --clip-start 2020-11-30T23:00:00Z \
-        --clip-end 2025-12-31T23:00:00Z
+        --clip-end 2026-03-01T02:00:00Z
 
 
 Notes:
@@ -273,7 +273,7 @@ def main():
     parser.add_argument(
         "--clip-end",
         default="",
-        help="Optional clip end (timezone-aware recommended, e.g. 2025-12-31T22:00:00Z). "
+        help="Optional clip end (timezone-aware recommended, e.g. 2026-03-01T02:00:00Z). "
              "Naive values are interpreted as Europe/Berlin.",
     )
     args = parser.parse_args()
@@ -285,6 +285,7 @@ def main():
     parquet_paths: List[Path] = sorted(
         p for p in data_dir.glob("*.parquet")
         if p.name not in {"all_merged.parquet", "all_data.parquet"}
+        and not p.name.endswith("_temp.parquet")
     )
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found in {data_dir}")

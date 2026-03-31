@@ -2,13 +2,13 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_smard \
-        --start 2020-11-30T23:00:00Z --end 2025-12-31T23:00:00Z \
+        --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z \
         --out data/raw/smard.parquet
         --market-data-out data/raw/installed_capacity.csv
 
     Disable CSV download (timeseries-only):
     ./.venv/bin/python -m energy_trading.ingestion.fetch_smard \
-        --start 2020-11-30T23:00:00Z --end 2025-12-31T23:00:00Z \
+        --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z \
         --out data/raw/smard.parquet \
         --skip-market-data-csv
 
@@ -648,7 +648,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="Fetch SMARD data and store as parquet.")
     parser.add_argument("--start", default="2022-01-01", help="Start date (UTC, inclusive), e.g. 2022-01-01")
-    parser.add_argument("--end", default="2025-12-31", help="End date (UTC, inclusive), e.g. 2025-12-31")
+    parser.add_argument("--end", default="2026-03-01", help="End date (UTC, inclusive), e.g. 2026-03-01")
     parser.add_argument("--region", default=DEFAULT_REGION, help="SMARD region code (default DE-LU).")
     parser.add_argument("--resolution", default=DEFAULT_RESOLUTION, help="Resolution string used by SMARD (default hour).")
     parser.add_argument(

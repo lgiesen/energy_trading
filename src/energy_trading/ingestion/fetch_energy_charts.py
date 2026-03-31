@@ -2,7 +2,7 @@
 
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_energy_charts \
-        --start 2020-11-30T23:00:00Z --end 2025-12-31T23:00:00Z \
+        --start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z \
         --out data/raw/energy_charts.parquet
 
 Outputs:

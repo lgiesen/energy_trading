@@ -3,7 +3,7 @@
 Usage:
     ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
         --start 2020-11-30T23:00:00Z \
-        --end 2025-12-31T23:00:00Z \
+        --end 2026-03-01T02:00:00Z \
         --out data/raw/regelleistung.parquet \
         --mol-dir data/raw \
         --bids-dir data/raw/bids
@@ -11,7 +11,7 @@ Usage:
     # Skip bid-based activation reconstruction (faster, no bid files needed)
     ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
         --start 2020-11-30T23:00:00Z \
-        --end 2025-12-31T23:00:00Z \
+        --end 2026-03-01T02:00:00Z \
         --out data/raw/regelleistung.parquet \
         --mol-dir data/raw \
         --skip-bid-activation-prices
@@ -1099,7 +1099,7 @@ def main() -> None:
         epilog=(
             "Example (skip bid-based activation reconstruction):\n"
             "  ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung "
-            "--start 2020-11-30T23:00:00Z --end 2025-12-31T23:00:00Z "
+            "--start 2020-11-30T23:00:00Z --end 2026-03-01T02:00:00Z "
             "--out data/raw/regelleistung.parquet --mol-dir data/raw "
             "--skip-bid-activation-prices"
         ),
