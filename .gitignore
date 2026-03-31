@@ -13,9 +13,11 @@ __pycache__/
 # Keep folder skeletons via .gitkeep, ignore heavy/generated contents.
 data/**
 !data/model_input/
+!data/model_input/**/
 !data/reports/
 !data/**/.gitkeep
 !data/model_input/.gitkeep
+!data/model_input/**/.gitkeep
 !data/reports/.gitkeep
 
 artifacts/**
