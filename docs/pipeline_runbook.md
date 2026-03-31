@@ -25,7 +25,7 @@ Recommended terminal run:
 ```bash
 ./.venv/bin/python scripts/run_full_pipeline.py \
   --start 2020-11-30T23:00:00Z \
-  --end 2025-12-31T23:00:00Z \
+  --end 2026-03-01T02:00:00Z \
   --verify-lags
 ```
 
@@ -81,6 +81,93 @@ Purpose:
   --output-dir data/model_input \
   --doc-path docs/features_documentation.md \
   --scaler-out models/preprocessing/scaler.joblib
+```
+
+Notebook-Hinweis (Pfadstabilitaet):
+- Notebooks sollten Artefakte immer relativ zu `REPO_ROOT` aufloesen
+  (Ordner mit `src/`), nicht relativ zum aktuellen Arbeitsverzeichnis.
+- Dadurch entstehen keine Pfad-Drifts zwischen Starts aus Repo-Root und
+  `notebooks/`.
+
+### Phase 3: Train + Export Versioned Model Run
+
+Purpose:
+- train DA and aFRR models into one versioned run artifact,
+- export predictions (`val`, `test`) in canonical simulation schema,
+- write `manifest.json` + `latest.json` for simulation autoload.
+
+```bash
+./.venv/bin/python scripts/train_and_export_runs.py \
+  --base-dir data/model_input \
+  --run-root artifacts/model_runs \
+  --device cuda
+```
+
+Run outputs:
+- `artifacts/model_runs/<run_id>/manifest.json`
+- `artifacts/model_runs/<run_id>/models/*.joblib`
+- `artifacts/model_runs/<run_id>/metrics/*.json`
+- `artifacts/model_runs/<run_id>/predictions/*.parquet`
+- `artifacts/model_runs/latest.json`
+
+### Phase 4: Simulation from Run Manifest
+
+Purpose:
+- build central `backtest_table` from DA+aFRR prediction files (manifest split),
+- optimize dispatch on predictions,
+- settle on ground truth,
+- report `Actual`, `Oracle`, and `Cost of Forecast Error`.
+
+```bash
+./.venv/bin/python scripts/run_battery_backtest.py \
+  --run-manifest artifacts/model_runs/latest.json \
+  --split test \
+  --horizon-hours 48 \
+  --reopt-step-hours 1 \
+  --da-gate-hour-utc 11 \
+  --soc-feedback-mode realized
+```
+
+Optional explicit merge step (separate utility):
+
+```bash
+./.venv/bin/python scripts/merge_backtest_inputs.py \
+  --run-manifest artifacts/model_runs/latest.json \
+  --split test
+```
+
+Backtest outputs:
+- `artifacts/simulation_runs/<run_id>/<split>/backtest_table_<split>.parquet`
+- `artifacts/simulation_runs/<run_id>/<split>/backtest_hourly.parquet`
+- `artifacts/simulation_runs/<run_id>/<split>/backtest_plan_history.parquet`
+- `artifacts/simulation_runs/<run_id>/<split>/backtest_decision_volatility.csv`
+- `artifacts/simulation_runs/<run_id>/<split>/backtest_monthly.csv`
+- `artifacts/simulation_runs/<run_id>/<split>/backtest_yearly.csv`
+- `artifacts/simulation_runs/<run_id>/<split>/backtest_summary.json`
+- `artifacts/backtest_plan_history.parquet` (global mirror)
+
+CLI usage details (`scripts/run_battery_backtest.py`):
+- `--run-manifest`: autoload DA+aFRR predictions + ground truth from a run.
+- `--split {val,test}`: chooses prediction split from manifest.
+- `--horizon-hours`: rolling MIP horizon length (default/recommended `48`).
+- `--reopt-step-hours`: re-optimization cadence in hours (typically `1`).
+- `--da-gate-hour-utc`: DA bid lock hour (default/recommended `11`).
+- `--soc-feedback-mode {realized,predicted}`:
+  `realized` is operationally realistic and recommended for backtests.
+- `--start/--end`: optional UTC range filters.
+- `--disable-rolling-horizon`: fallback full-horizon optimization.
+
+Manual-file mode (without manifest):
+
+```bash
+./.venv/bin/python scripts/run_battery_backtest.py \
+  --predictions artifacts/simulation_runs/manual/backtest_table_test.parquet \
+  --ground-truth data/features/all_data_features.parquet \
+  --timestamp-col timestamp_utc \
+  --pred-da-col pred_da_price \
+  --true-da-col da_price \
+  --horizon-hours 48 \
+  --reopt-step-hours 1
 ```
 
 ---
@@ -154,7 +241,7 @@ Run everything end-to-end:
 ```bash
 ./.venv/bin/python scripts/collect_and_merge_all_data.py \
   --start 2020-11-30T23:00:00Z \
-  --end 2025-12-31T23:00:00Z
+  --end 2026-03-01T02:00:00Z
 ```
 
 Then fetch outage events, build hourly outages, and re-run merge so outages are
@@ -167,7 +254,7 @@ embedded in `all_data.parquet`:
   --data-dir data/raw \
   --out data/processed/all_data.parquet \
   --clip-start 2020-11-30T23:00:00Z \
-  --clip-end 2025-12-31T23:00:00Z
+  --clip-end 2026-03-01T02:00:00Z
 ```
 
 This corresponds to:
@@ -196,7 +283,7 @@ Skip anonymous-bid activation price reconstruction (faster):
 ```bash
 ./.venv/bin/python scripts/collect_and_merge_all_data.py \
   --start 2020-11-30T23:00:00Z \
-  --end 2025-12-31T23:00:00Z \
+  --end 2026-03-01T02:00:00Z \
   --skip-bid-activation-prices
 ```
 
@@ -205,7 +292,7 @@ Run Regelleistung only:
 ```bash
 ./.venv/bin/python -m energy_trading.ingestion.fetch_regelleistung \
   --start 2020-11-30T23:00:00Z \
-  --end 2025-12-31T23:00:00Z \
+  --end 2026-03-01T02:00:00Z \
   --out data/raw/regelleistung.parquet \
   --bids-dir data/raw/bids
 ```
@@ -217,7 +304,7 @@ Run merge only:
   --data-dir data/raw \
   --out data/processed/all_data.parquet \
   --clip-start 2020-11-30T23:00:00Z \
-  --clip-end 2025-12-31T23:00:00Z
+  --clip-end 2026-03-01T02:00:00Z
 ```
 
 Run strict linear processing chain manually:
@@ -308,6 +395,85 @@ print("start_utc:", df["timestamp_utc"].min())
 print("end_utc:", df["timestamp_utc"].max())
 PY
 ```
+
+### A2) Shape lineage across all major artifacts (rows x cols)
+
+This should be documented in the operational runbook (this file), because it is
+part of reproducibility/audit evidence for every pipeline run.
+
+Recommended export artifact per run:
+- `data/reports/pipeline_shape_lineage.csv`
+
+```bash
+./.venv/bin/python - <<'PY'
+from pathlib import Path
+import polars as pl
+
+stages = [
+    ("raw_regelleistung", "data/raw/regelleistung.parquet"),
+    ("raw_entsoe", "data/raw/entsoe.parquet"),
+    ("raw_energy_charts", "data/raw/energy_charts.parquet"),
+    ("raw_netztransparenz", "data/raw/netztransparenz.parquet"),
+    ("raw_smard", "data/raw/smard.parquet"),
+    ("raw_yfinance", "data/raw/yfinance.parquet"),
+    ("processed_all_data", "data/processed/all_data.parquet"),
+    ("processed_refined", "data/processed/all_data_refined.parquet"),
+    ("processed_cleaned", "data/processed/all_data_cleaned.parquet"),
+    ("processed_pruned", "data/processed/all_data_pruned.parquet"),
+    ("processed_transformed", "data/processed/all_data_transformed.parquet"),
+    ("features_all", "data/features/all_data_features.parquet"),
+    ("bundle_da_X_train", "data/model_input/da/train_X.parquet"),
+    ("bundle_da_y_train", "data/model_input/da/train_y.parquet"),
+    ("bundle_afrr_X_train", "data/model_input/afrr/train_X.parquet"),
+    ("bundle_afrr_y_train", "data/model_input/afrr/train_y.parquet"),
+]
+
+def _ts_bounds(df: pl.DataFrame) -> tuple[str, str]:
+    for c in ("timestamp_utc", "snapshot_time", "target_time"):
+        if c in df.columns:
+            return str(df[c].min()), str(df[c].max())
+    return "", ""
+
+rows = []
+for stage, p in stages:
+    path = Path(p)
+    if not path.exists():
+        rows.append({
+            "stage": stage,
+            "path": p,
+            "exists": False,
+            "rows": None,
+            "cols": None,
+            "min_time": "",
+            "max_time": "",
+        })
+        continue
+    df = pl.read_parquet(path)
+    tmin, tmax = _ts_bounds(df)
+    rows.append({
+        "stage": stage,
+        "path": p,
+        "exists": True,
+        "rows": df.height,
+        "cols": len(df.columns),
+        "min_time": tmin,
+        "max_time": tmax,
+    })
+
+out = pl.DataFrame(rows)
+out_path = Path("data/reports/pipeline_shape_lineage.csv")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out.write_csv(out_path)
+print(out)
+print("\\nwritten:", out_path)
+PY
+```
+
+Interpretation guideline:
+- row drops are expected after clipping, null-handling, and train/val/test
+  slicing,
+- column drops are expected after pruning and leakage-safe `X` construction,
+- any unexpected increase/decrease should be explained in the run notes.
 
 ### B) Null count for activation columns
 
