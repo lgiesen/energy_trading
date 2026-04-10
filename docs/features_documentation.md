@@ -57,6 +57,53 @@ Shape-Lineage-Hinweis:
 
 ## Strategische Design-Entscheidungen
 
+### Runtime-Dynamics-Features im Training (Direct Multi-Output)
+
+Zusätzlich zu den statischen Bundle-Features aus
+`data/model_input/feature_config.json` werden im Training
+(`src/energy_trading/models/train_xgboost_export.py`) dynamische
+Kurzfristfeatures on-the-fly erzeugt:
+
+| Feature | Formel / Aufbau | Einheit | Zweck |
+| --- | --- | --- | --- |
+| `nrv_velocity_1h` | `NRV_balance_lag_2h - NRV_balance_lag_3h` | MW | Kurzfristige Imbalance-Momentum-Approximation (Steigen/Fallen des NRV). |
+| `load_ramp_signed_1h` | bevorzugt `load_forecast_da_entsoe_h1 - load_forecast_da_entsoe` (Fallback: `h2-h1`) | MW | Erfasst Richtung und Stärke der Last-Rampe zwischen benachbarten Forecast-Punkten. |
+| `load_ramp_abs_1h` | `abs(load_ramp_signed_1h)` | MW | Rampenintensität unabhängig von Vorzeichen zur Stressmodellierung. |
+| `res_load_ramp_signed_1h` | bevorzugt `residual_load_forecast_h1 - residual_load_forecast` (Fallback: `h2-h1`) | MW | Kurzfristige Änderung der prognostizierten Residuallast als Flexibilitätsdruck-Signal. |
+| `res_load_ramp_x_wind_total_error_da_lag_2h` | `res_load_ramp_signed_1h * wind_total_error_da_lag_2h` | MW² | Interaktion aus Rampenstress und jüngstem Windfehler als Fragilitätsmerkmal. |
+
+Hinweise:
+- Diese Spalten sind **modellspezifische Runtime-Features** und erscheinen
+  deshalb nicht notwendigerweise als physische Spalten in den statischen
+  Bundle-Parquet-Dateien.
+- Wenn Dynamics-Features aktiv sind, werden redundante Mid-Term-Lags
+  (`*_lag_4h`, `*_lag_6h`) im Training optional entfernt, um Dimensionalität
+  zu reduzieren.
+
+### Erwogene und entfernte Features (aktueller Stand)
+
+Die folgende Übersicht dokumentiert explizit, welche Featurefamilien im
+Projektverlauf geprüft und anschließend (je nach Modellpfad) entfernt bzw.
+beibehalten wurden.
+
+| Status | Scope | Feature/Pattern | Regelquelle | Begründung |
+| --- | --- | --- | --- | --- |
+| **Entfernt** | DA-Bundle | `afrr_*`, `mfrr_*`, `nrv_*`, `rz_saldo_*`, `picasso_*`, `mari_*`, `is_activated_*`, `system_stress_*`, `grid_stress_*`, `scarcity_*`, `nrv_zscore_*`, `nrv_quantile_*` | `prepare_ml_bundles.py:get_da_optimized_features` | D-1-Auktionskausalität: kurzfristige Balancing-/Stresssignale sind ex ante für DA nicht zulässig. |
+| **Entfernt** | DA-Bundle | Kurzfrist-Lags `*_lag_(1|2|3|6|12)h` | `prepare_ml_bundles.py:get_da_optimized_features` | Vermeidung nicht kausaler Nahzeit-Information im DA-Pfad. |
+| **Entfernt** | DA-Bundle | `da_spread_*` ohne Lag sowie `da_spread_*_lag_<24h` | `prepare_ml_bundles.py:get_da_optimized_features` | Bilaterale Spreads im DA-Pfad nur als day-seasonal Memory (>=24h) zugelassen. |
+| **Entfernt** | DA-Bundle | `total_wind_solar_id_error*` | `prepare_ml_bundles.py:get_da_optimized_features` | Intraday-Fehlerindikatoren werden aus dem DA-Feature-Set ausgeschlossen. |
+| **Entfernt (runtime)** | Training (DA+aFRR Export-Training) | `*_lag_4h`, `*_lag_6h` (wenn Dynamics aktiv) | `train_xgboost_export.py:_add_dynamics_features` | Reduktion redundanter Mid-Term-Lags bei vorhandenen 1h-Momentum/Rampenmerkmalen. |
+| **Entfernt (Legacy)** | Transformed-Feature-Layer | Spalten mit `reconstructed` oder `grid_share` | `scripts/check_removed_features.py` | Bereinigung veralteter Featurefamilien; aktueller Audit zeigt `legacy_bad_count=0`. |
+| **Erwogen (optional, standardmäßig aus)** | Bundle-Build | PCA auf Forecast-Familien inkl. optionalem Drop der Rohspalten | `prepare_ml_bundles.py` (`use_forecast_pca`, `forecast_pca_drop_raw`) | Redundanzreduktion wurde implementiert, aber standardmäßig deaktiviert, bis robuste CV/PnL-Verbesserung vorliegt. |
+| **Erwogen (Ablation), aktuell nicht global entfernt** | aFRR-Modellierung | `cross_border`, `hydro_pumped`, `load_error`, `picasso_flow`, `orderbook_depth` | `scripts/run_feature_ablation.py`, `data/reports/feature_ablation_report.csv` | Gruppenweise Removal wird evidenzbasiert geprüft; Entscheidungen werden nicht pauschal in den Bundle-Bau erzwungen. |
+
+Interpretationshinweis:
+- `data/model_input/feature_config.json` beschreibt die **statische**
+  Bundle-Selektion.
+- Zusätzliche Runtime-Transformationen (z. B. Dynamics-Features und Mid-Term-
+  Lag-Pruning) passieren erst im Training und erscheinen daher nicht zwingend
+  als physische Spalten im Bundle-Parquet.
+
 ### Verzicht auf PCA trotz Multikollinearität
 
 - Referenz: `notebooks/13_forecast_collinearity_pca_audit.ipynb`.
