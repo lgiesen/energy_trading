@@ -110,6 +110,18 @@ Run outputs:
 - `artifacts/model_runs/<run_id>/predictions/*.parquet`
 - `artifacts/model_runs/latest.json`
 
+Download challenger artifacts from server to local machine:
+
+```bash
+scripts/pull_challenger_artifacts.sh \
+  --ssh-host <ssh-host-alias-or-ip> \
+  --ssh-user <ssh-user>
+```
+
+Notes:
+- run this command on your local machine terminal, not in the remote server shell.
+- prefer an SSH alias in `~/.ssh/config` (for example `uni-gpu`) to avoid repeatedly typing host/IP.
+
 ### Phase 4: Simulation from Run Manifest
 
 Purpose:
