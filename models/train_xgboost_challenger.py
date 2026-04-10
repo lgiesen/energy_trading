@@ -14,11 +14,16 @@ Usage example:
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import logging
 import os
+import random
 import re
+import shutil
+import socket
 import sys
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +58,35 @@ class FoldResult:
     rmse: float
 
 
+def _build_rsync_pull_file_cmd(remote_file: Path) -> str:
+    """Build a local-machine rsync pull command for a single artifact file."""
+    user = getpass.getuser()
+    host = socket.gethostname()
+    remote_abs = str(remote_file.resolve())
+    return f"rsync -avh --progress {user}@{host}:{remote_abs} ./"
+
+
+def _publish_download_bundle(*, model_out: Path, report_out: Path, trials_out: Path) -> tuple[Path, Path]:
+    """Copy artifacts to ~/download_artifacts and build one tar.gz for easy download."""
+    download_dir = Path.home() / "download_artifacts"
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_model = download_dir / model_out.name
+    copied_report = download_dir / report_out.name
+    copied_trials = download_dir / trials_out.name
+
+    shutil.copy2(model_out, copied_model)
+    shutil.copy2(report_out, copied_report)
+    shutil.copy2(trials_out, copied_trials)
+
+    archive_path = download_dir / "challenger_artifacts.tar.gz"
+    with tarfile.open(archive_path, mode="w:gz") as tar:
+        tar.add(copied_model, arcname=copied_model.name)
+        tar.add(copied_report, arcname=copied_report.name)
+        tar.add(copied_trials, arcname=copied_trials.name)
+    return download_dir, archive_path
+
+
 def _fit_with_early_stopping_compat(
     model: XGBRegressor,
     *,
@@ -63,32 +97,67 @@ def _fit_with_early_stopping_compat(
     early_stopping_rounds: int,
 ) -> None:
     """Fit helper compatible across XGBoost sklearn API variants."""
-    # XGBoost variants differ: some accept early_stopping_rounds in fit(...),
-    # others require callbacks in constructor.
+    # Prefer callback-based early stopping (works for XGBoost 2.x and 3.x
+    # without fit-time deprecation warnings).
+    import xgboost as xgb  # local import to avoid hard dependency differences
+
     try:
+        model.set_params(
+            callbacks=[xgb.callback.EarlyStopping(rounds=int(early_stopping_rounds), save_best=True)]
+        )
         model.fit(
             X_fit,
             y_fit,
             eval_set=[(X_eval, y_eval)],
-            early_stopping_rounds=early_stopping_rounds,
             verbose=False,
         )
         return
-    except TypeError:
-        pass
+    except Exception:
+        # Fall through to legacy APIs.
+        ...
 
-    # Fallback path: use callback API.
-    import xgboost as xgb  # local import to avoid hard dependency differences
+    # Fallback path: constructor/set_params-level early stopping.
+    try:
+        model.set_params(early_stopping_rounds=int(early_stopping_rounds))
+        model.fit(
+            X_fit,
+            y_fit,
+            eval_set=[(X_eval, y_eval)],
+            verbose=False,
+        )
+        return
+    except Exception:
+        ...
 
-    model.set_params(
-        callbacks=[xgb.callback.EarlyStopping(rounds=int(early_stopping_rounds), save_best=True)]
-    )
+    # Last resort for very old variants.
     model.fit(
         X_fit,
         y_fit,
         eval_set=[(X_eval, y_eval)],
+        early_stopping_rounds=early_stopping_rounds,
         verbose=False,
     )
+
+
+def _predict_with_device_compat(
+    model: XGBRegressor,
+    X: pd.DataFrame,
+    *,
+    device: str,
+) -> np.ndarray:
+    """Predict with optional CUDA-aligned input to avoid device mismatch fallback."""
+    if str(device).lower() == "cuda":
+        try:
+            import cupy as cp  # type: ignore
+
+            X_gpu = cp.asarray(X.to_numpy(dtype=np.float32, copy=False))
+            pred = model.predict(X_gpu)
+            return np.asarray(pred, dtype=float)
+        except Exception:
+            # Fallback to CPU-side input if CuPy is unavailable/incompatible.
+            ...
+    pred = model.predict(X)
+    return np.asarray(pred, dtype=float)
 
 
 def _resolve_default_target(bundle: BundleName) -> str:
@@ -160,6 +229,7 @@ def _fit_eval_fold(
     params: dict,
     early_stopping_rounds: int,
     battery_params: BatteryParams,
+    seed: int,
 ) -> FoldResult:
     # Small causal holdout inside fold-train for early stopping (no validation leakage).
     n_tr = len(X_tr)
@@ -176,7 +246,7 @@ def _fit_eval_fold(
     model = XGBRegressor(
         objective="reg:squarederror",
         tree_method="hist",
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
         **params,
     )
@@ -188,7 +258,7 @@ def _fit_eval_fold(
         y_eval=y_es,
         early_stopping_rounds=early_stopping_rounds,
     )
-    pred = model.predict(X_va)
+    pred = _predict_with_device_compat(model, X_va, device=str(params.get("device", "cpu")))
     rmse = float(np.sqrt(mean_squared_error(y_va, pred)))
     pnl = _pnl_metric(y_true=y_va, y_pred=pred, battery_params=battery_params)
     return FoldResult(fold=-1, pnl_eur=pnl, rmse=rmse)
@@ -205,6 +275,7 @@ def _run_optuna_hpo(
     early_stopping_rounds: int,
     battery_params: BatteryParams,
     device: str,
+    seed: int,
 ) -> tuple[dict, pd.DataFrame]:
     try:
         import optuna
@@ -249,6 +320,7 @@ def _run_optuna_hpo(
                 params,
                 early_stopping_rounds=early_stopping_rounds,
                 battery_params=battery_params,
+                seed=seed,
             )
             pnls.append(fr.pnl_eur)
             rmses.append(fr.rmse)
@@ -267,7 +339,10 @@ def _run_optuna_hpo(
         LOGGER.info("trial=%s avg_pnl=%.2f avg_rmse=%.4f", trial.number, avg_pnl, avg_rmse)
         return avg_pnl
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
     study.optimize(objective, n_trials=n_trials)
 
     best_params = dict(study.best_params)
@@ -300,11 +375,12 @@ def _train_final_model(
     y_val: pd.Series,
     params: dict,
     early_stopping_rounds: int,
+    seed: int,
 ) -> XGBRegressor:
     model = XGBRegressor(
         objective="reg:squarederror",
         tree_method="hist",
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
         **params,
     )
@@ -330,6 +406,7 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--cv-test-size", type=int, default=24 * 28)
     p.add_argument("--cv-gap-hours", type=int, default=72)
     p.add_argument("--early-stopping-rounds", type=int, default=50)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--model-out", default="models/checkpoints/xgboost_afrr_challenger.joblib")
     p.add_argument("--report-out", default="data/reports/xgboost_challenger_report.json")
     p.add_argument("--trials-out", default="data/reports/xgboost_optuna_trials.csv")
@@ -339,6 +416,8 @@ def _build_cli() -> argparse.ArgumentParser:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     args = _build_cli().parse_args()
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     bundle: BundleName = args.bundle
     target_col = args.target_col.strip() or _resolve_default_target(bundle)
@@ -377,6 +456,7 @@ def main() -> None:
         early_stopping_rounds=args.early_stopping_rounds,
         battery_params=battery_params,
         device=args.device,
+        seed=args.seed,
     )
 
     model = _train_final_model(
@@ -386,8 +466,9 @@ def main() -> None:
         y_val,
         params=best_params,
         early_stopping_rounds=args.early_stopping_rounds,
+        seed=args.seed,
     )
-    pred_val = model.predict(X_val)
+    pred_val = _predict_with_device_compat(model, X_val, device=args.device)
 
     model_pnl = _pnl_metric(y_true=y_val, y_pred=pred_val, battery_params=battery_params)
     model_rmse = float(np.sqrt(mean_squared_error(y_val, pred_val)))
@@ -417,6 +498,7 @@ def main() -> None:
         "rows_train": int(len(X_train)),
         "rows_val": int(len(X_val)),
         "best_params": best_params,
+        "seed": int(args.seed),
         "val_rmse": model_rmse,
         "val_pnl_eur": model_pnl,
         "baseline_persistence_168h_pnl_eur": baseline_pnl,
@@ -426,6 +508,11 @@ def main() -> None:
         "trials_out": str(trials_out.resolve()),
     }
     report_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    download_dir, download_archive = _publish_download_bundle(
+        model_out=model_out,
+        report_out=report_out,
+        trials_out=trials_out,
+    )
 
     comp = pd.DataFrame(
         [
@@ -453,6 +540,20 @@ def main() -> None:
     print(f"- capacity_mwh={battery_params.capacity_mwh}")
     print(f"- power_mw={battery_params.power_mw}")
     print(f"- roundtrip_efficiency={battery_params.roundtrip_efficiency:.4f}")
+    print("\nArtifacts:")
+    print(f"- model: {model_out.resolve()}")
+    print(f"- report: {report_out.resolve()}")
+    print(f"- trials: {trials_out.resolve()}")
+    print("\nJupyterHub download bundle:")
+    print(f"- folder: {download_dir}")
+    print(f"- archive: {download_archive}")
+    print("\nDownload from your LOCAL machine:")
+    print("Preferred helper:")
+    print("scripts/pull_challenger_artifacts.sh --ssh-host <your-ssh-host-alias-or-ip> --ssh-user <your-ssh-user>")
+    print("\nRaw rsync commands:")
+    print(_build_rsync_pull_file_cmd(model_out))
+    print(_build_rsync_pull_file_cmd(report_out))
+    print(_build_rsync_pull_file_cmd(trials_out))
 
 
 if __name__ == "__main__":

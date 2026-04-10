@@ -6,9 +6,12 @@ chronological val split with early stopping to reduce overfitting.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
+import random
 import re
+import socket
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +25,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.multioutput import MultiOutputRegressor
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_DIR = REPO_ROOT / "src"
@@ -276,6 +278,105 @@ def _build_horizon_matrix(y: pd.Series, horizon_hours: int) -> pd.DataFrame:
     return pd.DataFrame(cols, index=y.index)
 
 
+def _add_dynamics_features(df: pd.DataFrame, *, prune_midterm_lags: bool = True) -> pd.DataFrame:
+    """Add short-term dynamics features used by direct multi-horizon models."""
+    out = df.copy()
+
+    # Imbalance momentum proxy from nearby NRV lags.
+    if {"NRV_balance_lag_2h", "NRV_balance_lag_3h"}.issubset(out.columns):
+        out["nrv_velocity_1h"] = (
+            pd.to_numeric(out["NRV_balance_lag_2h"], errors="coerce")
+            - pd.to_numeric(out["NRV_balance_lag_3h"], errors="coerce")
+        )
+
+    # Load ramp (t+1 - t) using available forecast horizons.
+    load_signed = None
+    if {"load_forecast_da_entsoe_h1", "load_forecast_da_entsoe"}.issubset(out.columns):
+        load_signed = (
+            pd.to_numeric(out["load_forecast_da_entsoe_h1"], errors="coerce")
+            - pd.to_numeric(out["load_forecast_da_entsoe"], errors="coerce")
+        )
+    elif {"load_forecast_da_entsoe_h2", "load_forecast_da_entsoe_h1"}.issubset(out.columns):
+        load_signed = (
+            pd.to_numeric(out["load_forecast_da_entsoe_h2"], errors="coerce")
+            - pd.to_numeric(out["load_forecast_da_entsoe_h1"], errors="coerce")
+        )
+    if load_signed is not None:
+        out["load_ramp_signed_1h"] = load_signed
+        out["load_ramp_abs_1h"] = load_signed.abs()
+
+    # Residual-load ramp using forecast lead columns when available.
+    res_signed = None
+    if {"residual_load_forecast_h1", "residual_load_forecast"}.issubset(out.columns):
+        res_signed = (
+            pd.to_numeric(out["residual_load_forecast_h1"], errors="coerce")
+            - pd.to_numeric(out["residual_load_forecast"], errors="coerce")
+        )
+    elif {"residual_load_forecast_h2", "residual_load_forecast_h1"}.issubset(out.columns):
+        res_signed = (
+            pd.to_numeric(out["residual_load_forecast_h2"], errors="coerce")
+            - pd.to_numeric(out["residual_load_forecast_h1"], errors="coerce")
+        )
+    if res_signed is not None:
+        out["res_load_ramp_signed_1h"] = res_signed
+
+    if {"res_load_ramp_signed_1h", "wind_total_error_da_lag_2h"}.issubset(out.columns):
+        out["res_load_ramp_x_wind_total_error_da_lag_2h"] = (
+            pd.to_numeric(out["res_load_ramp_signed_1h"], errors="coerce")
+            * pd.to_numeric(out["wind_total_error_da_lag_2h"], errors="coerce")
+        )
+
+    # Prune mid-term lag variants once short-term velocity/ramp features exist.
+    if prune_midterm_lags and (
+        "nrv_velocity_1h" in out.columns
+        or "load_ramp_signed_1h" in out.columns
+        or "res_load_ramp_signed_1h" in out.columns
+    ):
+        drop_cols = [c for c in out.columns if c.endswith("_lag_4h") or c.endswith("_lag_6h")]
+        if drop_cols:
+            out = out.drop(columns=drop_cols, errors="ignore")
+    return out
+
+
+def _resolve_training_device(*, requested_device: str, require_cuda: bool) -> str:
+    """Resolve XGBoost device with safe fallbacks for Apple Silicon and CPU-only hosts."""
+    req = (requested_device or "cpu").strip().lower()
+    if req == "mps":
+        print("[WARN] XGBoost does not support MPS device directly; falling back to CPU ('hist').")
+        return "cpu"
+    if req != "cuda":
+        if require_cuda and req == "cpu":
+            raise RuntimeError("CUDA is required, but training device is set to CPU.")
+        return "cpu"
+
+    try:
+        from xgboost import XGBRegressor
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("CUDA requested but xgboost is unavailable.") from exc
+
+    try:
+        X_probe = np.array([[0.0], [1.0], [2.0], [3.0]], dtype=float)
+        y_probe = np.array([0.0, 1.0, 2.0, 3.0], dtype=float)
+        probe = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=1,
+            max_depth=1,
+            learning_rate=0.1,
+            tree_method="hist",
+            device="cuda",
+            n_jobs=1,
+        )
+        probe.fit(X_probe, y_probe, verbose=False)
+        return "cuda"
+    except Exception as exc:
+        if require_cuda:
+            raise RuntimeError(
+                "CUDA training required but not available. Install GPU-enabled XGBoost/CUDA runtime or run with --allow-cpu."
+            ) from exc
+        print(f"[WARN] CUDA probe failed; continuing on CPU fallback: {exc}")
+        return "cpu"
+
+
 def _unwrap_single_xgb(model):
     """Return a single XGBRegressor for importance/SHAP from potentially wrapped model."""
     if hasattr(model, "estimators_") and getattr(model, "estimators_", None):
@@ -290,6 +391,7 @@ def calculate_feature_importance(
     report_out: Path,
     shap_plot_out: Path,
     shap_sample_size: int = 5000,
+    seed: int = 42,
 ) -> pd.DataFrame:
     """Build empirical importance evidence (Gain + SHAP) for thesis reporting."""
     report_out.parent.mkdir(parents=True, exist_ok=True)
@@ -312,7 +414,7 @@ def calculate_feature_importance(
         import shap  # type: ignore
 
         if len(X_train) > shap_sample_size:
-            X_shap = X_train.sample(n=shap_sample_size, random_state=42).copy()
+            X_shap = X_train.sample(n=shap_sample_size, random_state=seed).copy()
         else:
             X_shap = X_train.copy()
 
@@ -346,39 +448,6 @@ def calculate_feature_importance(
     return report
 
 
-def _assert_cuda_available_or_fail(*, device: str, require_cuda: bool) -> None:
-    if device != "cuda":
-        if require_cuda:
-            raise RuntimeError("CUDA is required, but training device is set to CPU.")
-        return
-
-    try:
-        from xgboost import XGBRegressor
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("CUDA requested but xgboost is unavailable.") from exc
-
-    try:
-        X_probe = np.array([[0.0], [1.0], [2.0], [3.0]], dtype=float)
-        y_probe = np.array([0.0, 1.0, 2.0, 3.0], dtype=float)
-        probe = XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=1,
-            max_depth=1,
-            learning_rate=0.1,
-            tree_method="hist",
-            device="cuda",
-            n_jobs=1,
-        )
-        probe.fit(X_probe, y_probe, verbose=False)
-    except Exception as exc:
-        if require_cuda:
-            raise RuntimeError(
-                "CUDA training required but not available. "
-                "Install GPU-enabled XGBoost/CUDA runtime or run with --allow-cpu."
-            ) from exc
-        print(f"[WARN] CUDA probe failed; continuing on CPU fallback: {exc}")
-
-
 def run_purged_cv_with_pipeline(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -390,6 +459,8 @@ def run_purged_cv_with_pipeline(
     max_depth: int,
     learning_rate: float,
     device: str,
+    seed: int,
+    horizon_hours: int,
 ) -> dict[str, float]:
     """Run purged inner CV with strict fold-local fitting (leak-safe).
 
@@ -407,7 +478,7 @@ def run_purged_cv_with_pipeline(
     splitter = PurgedTimeSeriesSplit(
         n_splits=n_splits,
         test_size=test_size,
-        gap_hours=gap_hours,
+        gap_hours=max(gap_hours, horizon_hours),
         frequency="1h",
         min_train_size=500,
     )
@@ -432,7 +503,7 @@ def run_purged_cv_with_pipeline(
             colsample_bytree=0.9,
             reg_alpha=0.0,
             reg_lambda=1.0,
-            random_state=42,
+            random_state=seed,
             n_jobs=-1,
         )
         model.fit(X_tr, y_tr, verbose=False)
@@ -490,6 +561,7 @@ def train_and_evaluate(
     device: str = "cuda",
     require_cuda: bool = True,
     horizon_hours: int = 48,
+    seed: int = 42,
 ) -> tuple[dict[str, float], dict[str, object], list[str]]:
     try:
         from xgboost import XGBRegressor
@@ -498,7 +570,7 @@ def train_and_evaluate(
             "xgboost is not available. Install xgboost (and libomp on macOS if needed)."
         ) from exc
 
-    _assert_cuda_available_or_fail(device=device, require_cuda=require_cuda)
+    resolved_device = _resolve_training_device(requested_device=device, require_cuda=require_cuda)
 
     X_train_df, y_train_df = load_processed_data(bundle=bundle, split="train", base_dir=base_dir)
     X_val_df, y_val_df = load_processed_data(bundle=bundle, split="val", base_dir=base_dir)
@@ -513,6 +585,10 @@ def train_and_evaluate(
     y_train_m = y_train_df.loc[train_mask, target_cols].copy()
     y_val_m = y_val_df.loc[val_mask, target_cols].copy()
 
+    X_train = _add_dynamics_features(X_train, prune_midterm_lags=True)
+    X_val = _add_dynamics_features(X_val, prune_midterm_lags=True)
+    feature_columns = list(X_train.columns)
+
     # CV remains on primary target only.
     cv_metrics: dict[str, float] = {}
     if run_cv:
@@ -525,7 +601,9 @@ def train_and_evaluate(
             n_estimators=max(200, n_estimators // 2),
             max_depth=max_depth,
             learning_rate=learning_rate,
-            device=device,
+            device=resolved_device,
+            seed=seed,
+            horizon_hours=horizon_hours,
         )
 
     models_by_target: dict[str, object] = {}
@@ -534,21 +612,22 @@ def train_and_evaluate(
     primary_X_val_h = None
     primary_y_val_lead1 = None
     for idx, tgt in enumerate(target_cols):
-        base_model = XGBRegressor(
+        model = XGBRegressor(
             objective="reg:squarederror",
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
             tree_method="hist",
-            device=device,
+            device=resolved_device,
+            multi_strategy="multi_output_tree",
             subsample=0.9,
             colsample_bytree=0.9,
             reg_alpha=0.0,
             reg_lambda=1.0,
-            random_state=42 + idx,
+            random_state=seed + idx,
+            early_stopping_rounds=max(0, int(early_stopping_rounds)),
             n_jobs=-1,
         )
-        model = MultiOutputRegressor(base_model)
 
         y_tr_base = pd.to_numeric(y_train_m[tgt], errors="coerce")
         y_va_base = pd.to_numeric(y_val_m[tgt], errors="coerce")
@@ -564,7 +643,7 @@ def train_and_evaluate(
         if X_tr_h.empty or X_va_h.empty:
             raise ValueError(f"Not enough non-null rows for direct multi-output target '{tgt}'.")
 
-        model.fit(X_tr_h, Y_tr_h)
+        model.fit(X_tr_h, Y_tr_h, eval_set=[(X_va_h, Y_va_h)], verbose=False)
         pred_h = np.asarray(model.predict(X_va_h), dtype=float)
         lead1_pred = pd.Series(pred_h[:, 0], index=X_va_h.index)
         val_pred_df[tgt] = np.nan
@@ -608,6 +687,7 @@ def train_and_evaluate(
         X_train,
         report_out=importance_report_out,
         shap_plot_out=shap_summary_out,
+        seed=seed,
     )
 
     metrics = {
@@ -620,7 +700,9 @@ def train_and_evaluate(
         "target_col": primary_target,
         "target_cols": target_cols,
         "multioutput_horizon_hours": float(horizon_hours),
+        "feature_count_after_refactor": float(len(feature_columns)),
         "per_target_metrics": per_target_metrics,
+        "resolved_device": resolved_device,
     }
     metrics.update(cv_metrics)
     return metrics, models_by_target, target_cols
@@ -634,6 +716,14 @@ def _resolve_run_dir(run_dir: str | Path | None) -> Path:
     if run_dir is None or str(run_dir).strip() == "":
         return Path("artifacts/model_runs") / _run_id_now()
     return Path(run_dir)
+
+
+def _build_rsync_pull_cmd(remote_path: Path) -> str:
+    """Build a local-machine rsync pull command for generated artifacts."""
+    user = getpass.getuser()
+    host = socket.gethostname()
+    remote_abs = str(remote_path.resolve())
+    return f"rsync -avh --progress {user}@{host}:{remote_abs}/ ./artifacts/model_runs/{remote_path.name}/"
 
 
 def _predict_split_frame(
@@ -852,11 +942,14 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--cv-n-splits", type=int, default=3)
     p.add_argument("--cv-test-size", type=int, default=24 * 28, help="Validation rows per fold (hourly rows).")
     p.add_argument("--cv-gap-hours", type=int, default=72)
+    p.add_argument("--seed", type=int, default=42)
     return p
 
 
 def main() -> None:
     args = _build_cli().parse_args()
+    np.random.seed(args.seed)
+    random.seed(args.seed)
     base_dir = _resolve_base_dir(args.base_dir)
     run_dir = _resolve_run_dir(args.run_dir)
     bundle_run_dir = run_dir
@@ -914,6 +1007,7 @@ def main() -> None:
         device=args.device,
         require_cuda=not args.allow_cpu,
         horizon_hours=args.forecast_horizon_hours,
+        seed=args.seed,
     )
 
     metrics_json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -974,6 +1068,7 @@ def main() -> None:
     print(f"- Run dir: {run_dir}")
     print(f"- Bundle: {args.bundle}")
     print(f"- Device: {args.device}")
+    print(f"- Seed: {args.seed}")
     print(f"- Target: {metrics['target_col']}")
     print(f"- Train rows: {int(metrics['rows_train'])}")
     print(f"- Val rows: {int(metrics['rows_val'])}")
@@ -994,6 +1089,8 @@ def main() -> None:
     if prediction_paths:
         print(f"- Prediction files: {', '.join(str(p) for p in prediction_paths.values())}")
     print(f"- Manifest fragment: {manifest_fragment_out}")
+    print("\nDownload from your LOCAL machine:")
+    print(_build_rsync_pull_cmd(run_dir))
 
 
 if __name__ == "__main__":
