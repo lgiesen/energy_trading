@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 import random
 import re
@@ -35,6 +36,7 @@ from energy_trading.models.prepare_ml_bundles import BundleName, load_processed_
 from energy_trading.models.cv import PurgedTimeSeriesSplit
 
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+LOGGER = logging.getLogger(__name__)
 
 
 def _qcol(q: float) -> str:
@@ -635,7 +637,7 @@ def train_and_evaluate(
     require_cuda: bool = True,
     horizon_hours: int = 48,
     seed: int = 42,
-) -> tuple[dict[str, float], dict[str, object], list[str]]:
+) -> tuple[dict[str, float], dict[str, dict[int, dict[str, object]]], list[str]]:
     try:
         from xgboost import XGBRegressor
     except Exception as exc:  # pragma: no cover
@@ -679,7 +681,7 @@ def train_and_evaluate(
             horizon_hours=horizon_hours,
         )
 
-    models_by_target: dict[str, dict[str, object]] = {}
+    models_by_target: dict[str, dict[int, dict[str, object]]] = {}
     val_pred_df = pd.DataFrame(index=X_val.index)
     per_target_metrics: dict[str, dict[str, float]] = {}
     primary_X_val_h = None
@@ -690,72 +692,118 @@ def train_and_evaluate(
         Y_tr = _build_horizon_matrix(y_tr_base, horizon_hours=horizon_hours)
         Y_va = _build_horizon_matrix(y_va_base, horizon_hours=horizon_hours)
 
-        tr_mask = Y_tr.notna().all(axis=1)
-        va_mask = Y_va.notna().all(axis=1)
-        X_tr_h = X_train.loc[tr_mask].copy()
-        X_va_h = X_val.loc[va_mask].copy()
-        Y_tr_h = Y_tr.loc[tr_mask].copy()
-        Y_va_h = Y_va.loc[va_mask].copy()
-        if X_tr_h.empty or X_va_h.empty:
-            raise ValueError(f"Not enough non-null rows for direct multi-output target '{tgt}'.")
-
-        quantile_models: dict[str, object] = {}
-        pred_by_q: dict[str, np.ndarray] = {}
         q_cols = [_qcol(q) for q in QUANTILES]
-        for q_idx, q in enumerate(QUANTILES):
-            qcol = q_cols[q_idx]
-            model = XGBRegressor(
-                objective="reg:quantileerror",
-                quantile_alpha=float(q),
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-                tree_method="hist",
-                device=resolved_device,
-                multi_strategy="multi_output_tree",
-                subsample=0.9,
-                colsample_bytree=0.9,
-                reg_alpha=0.0,
-                reg_lambda=1.0,
-                random_state=seed + idx * 100 + q_idx,
-                early_stopping_rounds=max(0, int(early_stopping_rounds)),
-                n_jobs=-1,
+        lead_models: dict[int, dict[str, object]] = {}
+        pred_by_q = {c: np.full((len(X_val), horizon_hours), np.nan, dtype=float) for c in q_cols}
+
+        rows_train_per_lead: list[int] = []
+        rows_val_per_lead: list[int] = []
+
+        for lead in range(1, horizon_hours + 1):
+            y_tr_lead = pd.to_numeric(Y_tr.iloc[:, lead - 1], errors="coerce")
+            y_va_lead = pd.to_numeric(Y_va.iloc[:, lead - 1], errors="coerce")
+
+            tr_mask = y_tr_lead.notna()
+            va_mask = y_va_lead.notna()
+            X_tr_h = X_train.loc[tr_mask].copy()
+            X_va_h = X_val.loc[va_mask].copy()
+            y_tr_h = y_tr_lead.loc[tr_mask].copy()
+            y_va_h = y_va_lead.loc[va_mask].copy()
+
+            if X_tr_h.empty or X_va_h.empty:
+                raise ValueError(
+                    f"Not enough rows for target '{tgt}', lead h{lead} "
+                    f"(train={len(X_tr_h)}, val={len(X_va_h)})."
+                )
+
+            LOGGER.info(
+                "Training target=%s lead=%s/%s (train=%s, val=%s)",
+                tgt,
+                lead,
+                horizon_hours,
+                len(X_tr_h),
+                len(X_va_h),
             )
-            model.fit(X_tr_h, Y_tr_h, eval_set=[(X_va_h, Y_va_h)], verbose=False)
-            pred_h = np.asarray(model.predict(X_va_h), dtype=float)
-            if pred_h.ndim == 1:
-                pred_h = pred_h.reshape(-1, 1)
-            quantile_models[qcol] = model
-            pred_by_q[qcol] = pred_h
+            rows_train_per_lead.append(len(X_tr_h))
+            rows_val_per_lead.append(len(X_va_h))
 
-        # Monotonicity repair against quantile crossing.
-        stack = np.stack([pred_by_q[c] for c in q_cols], axis=2)
-        stack = np.sort(stack, axis=2)
-        for qi, c in enumerate(q_cols):
-            pred_by_q[c] = stack[:, :, qi]
+            quantile_models_for_lead: dict[str, object] = {}
+            lead_pred_by_q: dict[str, np.ndarray] = {}
+            for q_idx, q in enumerate(QUANTILES):
+                qcol = q_cols[q_idx]
+                model = XGBRegressor(
+                    objective="reg:quantileerror",
+                    quantile_alpha=float(q),
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    tree_method="hist",
+                    device=resolved_device,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                    reg_alpha=0.0,
+                    reg_lambda=1.0,
+                    random_state=seed + idx * 10_000 + lead * 100 + q_idx,
+                    early_stopping_rounds=max(0, int(early_stopping_rounds)),
+                    n_jobs=-1,
+                )
+                model.fit(X_tr_h, y_tr_h, eval_set=[(X_va_h, y_va_h)], verbose=False)
 
-        lead1_pred = pd.Series(pred_by_q["p50"][:, 0], index=X_va_h.index)
+                X_pred = _align_features_for_model(X_va_h, model)
+                pred = np.asarray(model.predict(X_pred), dtype=float).reshape(-1)
+                quantile_models_for_lead[qcol] = model
+                lead_pred_by_q[qcol] = pred
+
+            # Monotonicity repair for this lead against quantile crossing.
+            lead_stack = np.column_stack([lead_pred_by_q[c] for c in q_cols])
+            lead_stack = np.sort(lead_stack, axis=1)
+            for qi, qcol in enumerate(q_cols):
+                lead_pred_series = pd.Series(np.nan, index=X_val.index, dtype=float)
+                lead_pred_series.loc[X_va_h.index] = lead_stack[:, qi]
+                pred_by_q[qcol][:, lead - 1] = lead_pred_series.to_numpy(dtype=float)
+
+            lead_models[lead] = quantile_models_for_lead
+
+        lead1_pred = pd.Series(pred_by_q["p50"][:, 0], index=X_val.index)
         val_pred_df[tgt] = np.nan
-        val_pred_df.loc[X_va_h.index, tgt] = lead1_pred
+        val_pred_df.loc[X_val.index, tgt] = lead1_pred
 
         lead24_mae = np.nan
         lead48_mae = np.nan
+        lead1_true = pd.to_numeric(Y_va.iloc[:, 0], errors="coerce").to_numpy(dtype=float)
+        lead1_pred_np = pred_by_q["p50"][:, 0]
+        mask_h1 = np.isfinite(lead1_true) & np.isfinite(lead1_pred_np)
+        if not bool(mask_h1.any()):
+            raise ValueError(f"No valid h1 validation rows for target '{tgt}'.")
+        mae_h1 = float(mean_absolute_error(lead1_true[mask_h1], lead1_pred_np[mask_h1]))
+        rmse_h1 = float(np.sqrt(mean_squared_error(lead1_true[mask_h1], lead1_pred_np[mask_h1])))
+
         if horizon_hours >= 24:
-            lead24_mae = float(mean_absolute_error(Y_va_h.iloc[:, 23], pred_by_q["p50"][:, 23]))
+            y_true_24 = pd.to_numeric(Y_va.iloc[:, 23], errors="coerce").to_numpy(dtype=float)
+            y_pred_24 = pred_by_q["p50"][:, 23]
+            m24 = np.isfinite(y_true_24) & np.isfinite(y_pred_24)
+            if bool(m24.any()):
+                lead24_mae = float(mean_absolute_error(y_true_24[m24], y_pred_24[m24]))
         if horizon_hours >= 48:
-            lead48_mae = float(mean_absolute_error(Y_va_h.iloc[:, 47], pred_by_q["p50"][:, 47]))
+            y_true_48 = pd.to_numeric(Y_va.iloc[:, 47], errors="coerce").to_numpy(dtype=float)
+            y_pred_48 = pred_by_q["p50"][:, 47]
+            m48 = np.isfinite(y_true_48) & np.isfinite(y_pred_48)
+            if bool(m48.any()):
+                lead48_mae = float(mean_absolute_error(y_true_48[m48], y_pred_48[m48]))
         per_target_metrics[tgt] = {
-            "mae": float(mean_absolute_error(Y_va_h.iloc[:, 0], pred_by_q["p50"][:, 0])),
-            "rmse": float(np.sqrt(mean_squared_error(Y_va_h.iloc[:, 0], pred_by_q["p50"][:, 0]))),
+            "mae": mae_h1,
+            "rmse": rmse_h1,
             "mae_h24": lead24_mae,
             "mae_h48": lead48_mae,
-            "rows_train_horizon": float(len(X_tr_h)),
-            "rows_val_horizon": float(len(X_va_h)),
+            "rows_train_horizon_min": float(min(rows_train_per_lead)),
+            "rows_train_horizon_max": float(max(rows_train_per_lead)),
+            "rows_val_horizon_min": float(min(rows_val_per_lead)),
+            "rows_val_horizon_max": float(max(rows_val_per_lead)),
         }
-        models_by_target[tgt] = quantile_models
+        models_by_target[tgt] = lead_models
         if tgt == primary_target:
-            primary_X_val_h = X_va_h
-            primary_y_val_lead1 = pd.to_numeric(Y_va_h.iloc[:, 0], errors="coerce")
+            primary_X_val_h = X_val
+            primary_y_val_lead1 = pd.to_numeric(Y_va.iloc[:, 0], errors="coerce")
 
     if primary_X_val_h is None or primary_y_val_lead1 is None:
         raise ValueError("Primary target horizon-aligned validation set is empty.")
@@ -769,7 +817,7 @@ def train_and_evaluate(
     model_payload = models_by_target if len(models_by_target) > 1 else models_by_target[primary_target]
     joblib.dump(model_payload, model_out)
 
-    primary_model = _unwrap_single_xgb(models_by_target[primary_target]["p50"])
+    primary_model = _unwrap_single_xgb(models_by_target[primary_target][1]["p50"])
     _plot_top_feature_importance(primary_model, feature_names=list(X_train.columns), out_path=importance_out, top_n=20)
     importance_report = calculate_feature_importance(
         primary_model,
@@ -832,7 +880,7 @@ def _predict_split_frame(
     base_dir: Path,
     bundle: BundleName,
     split: str,
-    models_by_target: dict[str, dict[str, object]],
+    models_by_target: dict[str, dict[int, dict[str, object]]],
     target_cols: list[str],
 ) -> pd.DataFrame:
     split_df, bcfg = _load_bundle_split_df(base_dir=base_dir, bundle=bundle, split=split)
@@ -855,13 +903,10 @@ def _predict_split_frame(
             out[c] = np.nan
 
     for tgt in target_cols:
-        model_q = models_by_target[tgt]["p50"]
+        model_q = models_by_target[tgt][1]["p50"]
         X_pred = _align_features_for_model(X, model_q)
-        pred_h = np.asarray(model_q.predict(X_pred), dtype=float)
-        if pred_h.ndim == 1:
-            pred = pd.to_numeric(pd.Series(pred_h, index=split_df.index), errors="coerce")
-        else:
-            pred = pd.to_numeric(pd.Series(pred_h[:, 0], index=split_df.index), errors="coerce")
+        pred_h = np.asarray(model_q.predict(X_pred), dtype=float).reshape(-1)
+        pred = pd.to_numeric(pd.Series(pred_h, index=split_df.index), errors="coerce")
         for pred_col in _pred_column_names_for_target(tgt):
             out[pred_col] = pred.values
     return out
@@ -872,7 +917,7 @@ def _predict_split_long_multistep(
     base_dir: Path,
     bundle: BundleName,
     split: str,
-    models_by_target: dict[str, dict[str, object]],
+    models_by_target: dict[str, dict[int, dict[str, object]]],
     target_cols: list[str],
     horizon_hours: int,
     model_name: str,
@@ -899,24 +944,23 @@ def _predict_split_long_multistep(
 
     for tgt in target_cols:
         q_cols = [_qcol(q) for q in QUANTILES]
-        pred_q: dict[str, np.ndarray] = {}
-        for q in QUANTILES:
-            c = _qcol(q)
-            model_q = models_by_target[tgt][c]
-            X_pred = _align_features_for_model(X, model_q)
-            pred_h = np.asarray(model_q.predict(X_pred), dtype=float)
-            if pred_h.ndim == 1:
-                pred_h = pred_h.reshape(-1, 1)
-            pred_q[c] = pred_h
-
-        # Quantile crossing repair.
-        stack = np.stack([pred_q[c] for c in q_cols], axis=2)
-        stack = np.sort(stack, axis=2)
-        for qi, c in enumerate(q_cols):
-            pred_q[c] = stack[:, :, qi]
-
-        use_h = min(horizon_hours, pred_q["p50"].shape[1])
+        use_h = min(horizon_hours, max(models_by_target[tgt].keys()))
         for lead in range(1, use_h + 1):
+            if lead not in models_by_target[tgt]:
+                continue
+            lead_models = models_by_target[tgt][lead]
+            if not all(c in lead_models for c in q_cols):
+                continue
+
+            # Predict each quantile model for this lead, then enforce monotonicity.
+            lead_pred_q: dict[str, np.ndarray] = {}
+            for c in q_cols:
+                model_q = lead_models[c]
+                X_pred = _align_features_for_model(X, model_q)
+                lead_pred_q[c] = np.asarray(model_q.predict(X_pred), dtype=float).reshape(-1)
+            lead_stack = np.column_stack([lead_pred_q[c] for c in q_cols])
+            lead_stack = np.sort(lead_stack, axis=1)
+
             target_time = snapshots + pd.to_timedelta(lead, unit="h")
             for pred_col in _pred_column_names_for_target(tgt):
                 payload = {
@@ -925,8 +969,11 @@ def _predict_split_long_multistep(
                     "lead_time_h": lead,
                     "model_name": model_name,
                 }
-                for c in q_cols:
-                    payload[c] = pd.to_numeric(pd.Series(pred_q[c][:, lead - 1], index=split_df.index), errors="coerce").values
+                for qi, c in enumerate(q_cols):
+                    payload[c] = pd.to_numeric(
+                        pd.Series(lead_stack[:, qi], index=split_df.index),
+                        errors="coerce",
+                    ).values
                 payload["predicted_value"] = payload["p50"]
                 long_df = pd.DataFrame(
                     payload
@@ -1068,6 +1115,7 @@ def _build_cli() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = _build_cli().parse_args()
     np.random.seed(args.seed)
     random.seed(args.seed)
