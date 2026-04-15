@@ -25,7 +25,6 @@ cycler==0.12.1
 debugpy==1.8.19
 decorator==5.2.1
 defusedxml==0.7.1
--e git+https://github.com/lgiesen/energy_trading.git@188c9401aa6bc9fe4ffdc61a1a8256b60452d622#egg=energy_trading
 entsoe-py==0.7.8
 et_xmlfile==2.0.0
 executing==2.2.1
