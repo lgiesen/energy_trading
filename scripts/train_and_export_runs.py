@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--forecast-horizon-hours", type=int, default=48)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument(
+        "--cleanup-lightning-checkpoints",
+        action="store_true",
+        help="For TFT runs: delete intermediate Lightning checkpoint files under ./checkpoints after training.",
+    )
     p.add_argument("--ground-truth-path", default="data/features/all_data_features.parquet")
     p.add_argument(
         "--enable-da-stacking-afrr",
@@ -203,6 +208,8 @@ def main() -> None:
             "--num-workers",
             str(args.num_workers),
         ]
+        if args.cleanup_lightning_checkpoints:
+            base_cmd.append("--cleanup-lightning-checkpoints")
 
     # Train DA model.
     cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]

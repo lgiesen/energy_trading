@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +43,7 @@ ALLOWED_KNOWN_CATEGORICALS = {"hour", "weekday", "month"}
 CYCLICAL_DROP_FEATURES = {"weekday_sin", "weekday_cos"}
 LAG_FEATURE_RE = re.compile(r".*_lag_\d+h$")
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+LOGGER = logging.getLogger(__name__)
 
 
 def _qcol(q: float) -> str:
@@ -310,6 +313,7 @@ def _train_tft(
     seed: int = 42,
     requested_device: str = "mps",
     num_workers: int = 0,
+    cleanup_lightning_checkpoints: bool = False,
 ) -> dict[str, object]:
     try:
         import lightning.pytorch as pl
@@ -469,12 +473,43 @@ def _train_tft(
         pin_memory=False,
     )
 
+    class _EpochEtaCallback(pl.Callback):
+        """Log ETA after first completed epoch."""
+
+        def __init__(self, max_epochs: int) -> None:
+            super().__init__()
+            self.max_epochs = int(max_epochs)
+            self._epoch_start_ts: float | None = None
+            self._eta_logged = False
+
+        def on_train_epoch_start(self, trainer, pl_module) -> None:  # type: ignore[override]
+            self._epoch_start_ts = time.time()
+
+        def on_train_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
+            if self._eta_logged:
+                return
+            if trainer.current_epoch != 0:
+                return
+            if self._epoch_start_ts is None:
+                return
+            elapsed_s = max(0.0, time.time() - self._epoch_start_ts)
+            remaining_epochs = max(0, self.max_epochs - 1)
+            eta_minutes = (elapsed_s * remaining_epochs) / 60.0
+            LOGGER.info(
+                "ETA for remaining %s epochs: ~ %.1f minutes",
+                remaining_epochs,
+                eta_minutes,
+            )
+            self._eta_logged = True
+
+    max_epochs = 20
     trainer = pl.Trainer(
-        max_epochs=20,
+        max_epochs=max_epochs,
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=0.1,
         enable_checkpointing=True,
+        callbacks=[_EpochEtaCallback(max_epochs=max_epochs)],
         logger=False,
     )
 
@@ -495,6 +530,20 @@ def _train_tft(
 
     model_path = model_dir / f"{bundle}_{tgt}_tft_model.ckpt"
     trainer.save_checkpoint(str(model_path))
+
+    if cleanup_lightning_checkpoints:
+        # Lightning writes extra checkpoint files to ./checkpoints by default.
+        # Keep only the explicit model checkpoint saved in run_dir/models.
+        ckpt_dir = Path("checkpoints")
+        if ckpt_dir.exists():
+            removed = 0
+            for p in ckpt_dir.rglob("*.ckpt"):
+                try:
+                    p.unlink()
+                    removed += 1
+                except Exception as exc:  # pragma: no cover
+                    LOGGER.warning("Could not delete checkpoint %s: %s", p, exc)
+            LOGGER.info("Removed %s Lightning checkpoint file(s) from %s.", removed, ckpt_dir)
 
     # Predict val/test in long format with model_name.
     idx_to_ts = {
@@ -586,12 +635,18 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--max-encoder-length", type=int, default=168)
     p.add_argument("--max-prediction-length", type=int, default=48)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument(
+        "--cleanup-lightning-checkpoints",
+        action="store_true",
+        help="Delete intermediate Lightning *.ckpt files under ./checkpoints after training.",
+    )
     p.add_argument("--metrics-json-out", default="")
     p.add_argument("--manifest-fragment-out", default="")
     return p
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = _build_cli().parse_args()
     run_dir = Path(args.run_dir) if args.run_dir else Path("artifacts/model_runs") / _run_id_now()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -607,6 +662,7 @@ def main() -> None:
         seed=args.seed,
         requested_device=args.device,
         num_workers=args.num_workers,
+        cleanup_lightning_checkpoints=args.cleanup_lightning_checkpoints,
     )
 
     metrics_path = Path(args.metrics_json_out) if args.metrics_json_out else run_dir / "metrics" / f"{args.bundle}_tft_metrics.json"

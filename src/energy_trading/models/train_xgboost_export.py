@@ -1153,7 +1153,8 @@ def main() -> None:
     else:
         target_tag = ""
 
-    file_tag = f"{args.bundle}_{target_tag}" if target_tag else args.bundle
+    # Keep model family explicit in artifact filenames for unambiguous tracking.
+    file_tag = f"xgboost_{args.bundle}_{target_tag}" if target_tag else f"xgboost_{args.bundle}"
 
     default_model_out = models_dir / f"{file_tag}_model.joblib"
     default_importance_out = report_dir / f"{file_tag}_top20_feature_importance.png"
