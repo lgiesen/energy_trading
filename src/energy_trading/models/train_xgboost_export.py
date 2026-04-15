@@ -34,6 +34,12 @@ if str(SRC_DIR) not in sys.path:
 from energy_trading.models.prepare_ml_bundles import BundleName, load_processed_data
 from energy_trading.models.cv import PurgedTimeSeriesSplit
 
+QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+
+def _qcol(q: float) -> str:
+    return f"p{int(round(q * 100)):02d}"
+
 
 def _resolve_base_dir(preferred: str | Path) -> Path:
     p = Path(preferred)
@@ -132,6 +138,29 @@ def _lag_columns_for_source(features: list[str], source_name: str) -> dict[int, 
     return out
 
 
+def calculate_acceptance_probabilities(
+    quantiles: dict[float, float] | pd.Series,
+    price_bins: list[float] | np.ndarray,
+) -> pd.DataFrame:
+    """Approximate acceptance probability via piecewise-linear CDF.
+
+    For bid price b:
+    p_acc(b) = 1 - CDF(b)
+    """
+    if isinstance(quantiles, pd.Series):
+        q_map = {float(k): float(v) for k, v in quantiles.to_dict().items()}
+    else:
+        q_map = {float(k): float(v) for k, v in quantiles.items()}
+    qs = sorted(q_map.keys())
+    if not qs:
+        return pd.DataFrame(columns=["price_bin", "cdf", "p_acc"])
+    vals = np.array([q_map[q] for q in qs], dtype=float)
+    bins = np.asarray(price_bins, dtype=float)
+    cdf = np.interp(bins, vals, np.array(qs, dtype=float), left=0.0, right=1.0)
+    p_acc = 1.0 - cdf
+    return pd.DataFrame({"price_bin": bins, "cdf": cdf, "p_acc": p_acc})
+
+
 def calculate_forecast_decay(
     *,
     pred_long: pd.DataFrame,
@@ -147,7 +176,8 @@ def calculate_forecast_decay(
     for lead in range(1, horizon_hours + 1):
         truth_map[lead] = base.shift(-(lead - 1)).reset_index(drop=True)
 
-    pred = pd.to_numeric(pred_long["predicted_value"], errors="coerce")
+    pred_col = "p50" if "p50" in pred_long.columns else "predicted_value"
+    pred = pd.to_numeric(pred_long[pred_col], errors="coerce")
     lead = pd.to_numeric(pred_long["lead_time_h"], errors="coerce").astype("Int64")
 
     rows: list[dict[str, float]] = []
@@ -281,50 +311,92 @@ def _build_horizon_matrix(y: pd.Series, horizon_hours: int) -> pd.DataFrame:
 def _add_dynamics_features(df: pd.DataFrame, *, prune_midterm_lags: bool = True) -> pd.DataFrame:
     """Add short-term dynamics features used by direct multi-horizon models."""
     out = df.copy()
+    new_cols: list[str] = []
+
+    def _num(col: str) -> pd.Series:
+        return pd.to_numeric(out[col], errors="coerce")
+
+    def _first_available_pairs(pairs: list[tuple[str, str]]) -> pd.Series | None:
+        for a, b in pairs:
+            if {a, b}.issubset(out.columns):
+                return _num(a) - _num(b)
+        return None
 
     # Imbalance momentum proxy from nearby NRV lags.
-    if {"NRV_balance_lag_2h", "NRV_balance_lag_3h"}.issubset(out.columns):
-        out["nrv_velocity_1h"] = (
-            pd.to_numeric(out["NRV_balance_lag_2h"], errors="coerce")
-            - pd.to_numeric(out["NRV_balance_lag_3h"], errors="coerce")
-        )
+    nrv_velocity = _first_available_pairs(
+        [
+            ("NRV_balance_lag_2h", "NRV_balance_lag_3h"),
+            ("nrv_balance_lag_2h", "nrv_balance_lag_3h"),
+        ]
+    )
+    if nrv_velocity is not None:
+        out["nrv_velocity_1h"] = nrv_velocity
+        new_cols.append("nrv_velocity_1h")
 
-    # Load ramp (t+1 - t) using available forecast horizons.
+    # Load ramp (t - t-1) from DA-load forecast history.
+    # Fallback to horizon differences when only horizonized columns exist.
     load_signed = None
-    if {"load_forecast_da_entsoe_h1", "load_forecast_da_entsoe"}.issubset(out.columns):
-        load_signed = (
-            pd.to_numeric(out["load_forecast_da_entsoe_h1"], errors="coerce")
-            - pd.to_numeric(out["load_forecast_da_entsoe"], errors="coerce")
-        )
-    elif {"load_forecast_da_entsoe_h2", "load_forecast_da_entsoe_h1"}.issubset(out.columns):
-        load_signed = (
-            pd.to_numeric(out["load_forecast_da_entsoe_h2"], errors="coerce")
-            - pd.to_numeric(out["load_forecast_da_entsoe_h1"], errors="coerce")
+    for col in ("load_forecast_da_entsoe", "load_forecast_da"):
+        if col in out.columns:
+            load_signed = _num(col).diff(1)
+            break
+    if load_signed is None:
+        load_signed = _first_available_pairs(
+            [
+                ("load_forecast_da_entsoe_h1", "load_forecast_da_entsoe"),
+                ("load_forecast_da_entsoe_h2", "load_forecast_da_entsoe_h1"),
+                ("load_forecast_da_h1", "load_forecast_da"),
+                ("load_forecast_da_h2", "load_forecast_da_h1"),
+            ]
         )
     if load_signed is not None:
         out["load_ramp_signed_1h"] = load_signed
         out["load_ramp_abs_1h"] = load_signed.abs()
+        new_cols.extend(["load_ramp_signed_1h", "load_ramp_abs_1h"])
 
-    # Residual-load ramp using forecast lead columns when available.
+    # Residual-load ramp from history where available; fallback to horizon columns.
     res_signed = None
-    if {"residual_load_forecast_h1", "residual_load_forecast"}.issubset(out.columns):
-        res_signed = (
-            pd.to_numeric(out["residual_load_forecast_h1"], errors="coerce")
-            - pd.to_numeric(out["residual_load_forecast"], errors="coerce")
-        )
-    elif {"residual_load_forecast_h2", "residual_load_forecast_h1"}.issubset(out.columns):
-        res_signed = (
-            pd.to_numeric(out["residual_load_forecast_h2"], errors="coerce")
-            - pd.to_numeric(out["residual_load_forecast_h1"], errors="coerce")
+    for col in ("residual_load_forecast", "residual_load_forecast_da"):
+        if col in out.columns:
+            res_signed = _num(col).diff(1)
+            break
+    if res_signed is None:
+        res_signed = _first_available_pairs(
+            [
+                ("residual_load_forecast_h1", "residual_load_forecast"),
+                ("residual_load_forecast_h2", "residual_load_forecast_h1"),
+                ("residual_load_forecast_da_h1", "residual_load_forecast_da"),
+                ("residual_load_forecast_da_h2", "residual_load_forecast_da_h1"),
+            ]
         )
     if res_signed is not None:
         out["res_load_ramp_signed_1h"] = res_signed
+        new_cols.append("res_load_ramp_signed_1h")
 
+    # Stress interaction: ramp multiplied by lagged renewable forecast-error proxy.
     if {"res_load_ramp_signed_1h", "wind_total_error_da_lag_2h"}.issubset(out.columns):
         out["res_load_ramp_x_wind_total_error_da_lag_2h"] = (
-            pd.to_numeric(out["res_load_ramp_signed_1h"], errors="coerce")
-            * pd.to_numeric(out["wind_total_error_da_lag_2h"], errors="coerce")
+            _num("res_load_ramp_signed_1h")
+            * _num("wind_total_error_da_lag_2h")
         )
+        new_cols.append("res_load_ramp_x_wind_total_error_da_lag_2h")
+    elif {"load_ramp_signed_1h", "wind_total_error_da_lag_2h"}.issubset(out.columns):
+        out["load_ramp_x_wind_total_error_da_lag_2h"] = (
+            _num("load_ramp_signed_1h")
+            * _num("wind_total_error_da_lag_2h")
+        )
+        new_cols.append("load_ramp_x_wind_total_error_da_lag_2h")
+    elif {"load_ramp_signed_1h", "solar_error_da_lag_2h"}.issubset(out.columns):
+        out["load_ramp_x_solar_error_da_lag_2h"] = (
+            _num("load_ramp_signed_1h")
+            * _num("solar_error_da_lag_2h")
+        )
+        new_cols.append("load_ramp_x_solar_error_da_lag_2h")
+
+    # Robust NaN handling for newly-created dynamics columns (e.g., first diff row).
+    if new_cols:
+        for c in list(dict.fromkeys(new_cols)):
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
 
     # Prune mid-term lag variants once short-term velocity/ramp features exist.
     if prune_midterm_lags and (
@@ -493,7 +565,8 @@ def run_purged_cv_with_pipeline(
         y_va = y_train.iloc[va_idx].copy()
 
         model = XGBRegressor(
-            objective="reg:squarederror",
+            objective="reg:quantileerror",
+            quantile_alpha=0.5,
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -606,29 +679,12 @@ def train_and_evaluate(
             horizon_hours=horizon_hours,
         )
 
-    models_by_target: dict[str, object] = {}
+    models_by_target: dict[str, dict[str, object]] = {}
     val_pred_df = pd.DataFrame(index=X_val.index)
     per_target_metrics: dict[str, dict[str, float]] = {}
     primary_X_val_h = None
     primary_y_val_lead1 = None
     for idx, tgt in enumerate(target_cols):
-        model = XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            tree_method="hist",
-            device=resolved_device,
-            multi_strategy="multi_output_tree",
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.0,
-            reg_lambda=1.0,
-            random_state=seed + idx,
-            early_stopping_rounds=max(0, int(early_stopping_rounds)),
-            n_jobs=-1,
-        )
-
         y_tr_base = pd.to_numeric(y_train_m[tgt], errors="coerce")
         y_va_base = pd.to_numeric(y_val_m[tgt], errors="coerce")
         Y_tr = _build_horizon_matrix(y_tr_base, horizon_hours=horizon_hours)
@@ -643,27 +699,60 @@ def train_and_evaluate(
         if X_tr_h.empty or X_va_h.empty:
             raise ValueError(f"Not enough non-null rows for direct multi-output target '{tgt}'.")
 
-        model.fit(X_tr_h, Y_tr_h, eval_set=[(X_va_h, Y_va_h)], verbose=False)
-        pred_h = np.asarray(model.predict(X_va_h), dtype=float)
-        lead1_pred = pd.Series(pred_h[:, 0], index=X_va_h.index)
+        quantile_models: dict[str, object] = {}
+        pred_by_q: dict[str, np.ndarray] = {}
+        q_cols = [_qcol(q) for q in QUANTILES]
+        for q_idx, q in enumerate(QUANTILES):
+            qcol = q_cols[q_idx]
+            model = XGBRegressor(
+                objective="reg:quantileerror",
+                quantile_alpha=float(q),
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+                tree_method="hist",
+                device=resolved_device,
+                multi_strategy="multi_output_tree",
+                subsample=0.9,
+                colsample_bytree=0.9,
+                reg_alpha=0.0,
+                reg_lambda=1.0,
+                random_state=seed + idx * 100 + q_idx,
+                early_stopping_rounds=max(0, int(early_stopping_rounds)),
+                n_jobs=-1,
+            )
+            model.fit(X_tr_h, Y_tr_h, eval_set=[(X_va_h, Y_va_h)], verbose=False)
+            pred_h = np.asarray(model.predict(X_va_h), dtype=float)
+            if pred_h.ndim == 1:
+                pred_h = pred_h.reshape(-1, 1)
+            quantile_models[qcol] = model
+            pred_by_q[qcol] = pred_h
+
+        # Monotonicity repair against quantile crossing.
+        stack = np.stack([pred_by_q[c] for c in q_cols], axis=2)
+        stack = np.sort(stack, axis=2)
+        for qi, c in enumerate(q_cols):
+            pred_by_q[c] = stack[:, :, qi]
+
+        lead1_pred = pd.Series(pred_by_q["p50"][:, 0], index=X_va_h.index)
         val_pred_df[tgt] = np.nan
         val_pred_df.loc[X_va_h.index, tgt] = lead1_pred
 
         lead24_mae = np.nan
         lead48_mae = np.nan
         if horizon_hours >= 24:
-            lead24_mae = float(mean_absolute_error(Y_va_h.iloc[:, 23], pred_h[:, 23]))
+            lead24_mae = float(mean_absolute_error(Y_va_h.iloc[:, 23], pred_by_q["p50"][:, 23]))
         if horizon_hours >= 48:
-            lead48_mae = float(mean_absolute_error(Y_va_h.iloc[:, 47], pred_h[:, 47]))
+            lead48_mae = float(mean_absolute_error(Y_va_h.iloc[:, 47], pred_by_q["p50"][:, 47]))
         per_target_metrics[tgt] = {
-            "mae": float(mean_absolute_error(Y_va_h.iloc[:, 0], pred_h[:, 0])),
-            "rmse": float(np.sqrt(mean_squared_error(Y_va_h.iloc[:, 0], pred_h[:, 0]))),
+            "mae": float(mean_absolute_error(Y_va_h.iloc[:, 0], pred_by_q["p50"][:, 0])),
+            "rmse": float(np.sqrt(mean_squared_error(Y_va_h.iloc[:, 0], pred_by_q["p50"][:, 0]))),
             "mae_h24": lead24_mae,
             "mae_h48": lead48_mae,
             "rows_train_horizon": float(len(X_tr_h)),
             "rows_val_horizon": float(len(X_va_h)),
         }
-        models_by_target[tgt] = model
+        models_by_target[tgt] = quantile_models
         if tgt == primary_target:
             primary_X_val_h = X_va_h
             primary_y_val_lead1 = pd.to_numeric(Y_va_h.iloc[:, 0], errors="coerce")
@@ -680,7 +769,7 @@ def train_and_evaluate(
     model_payload = models_by_target if len(models_by_target) > 1 else models_by_target[primary_target]
     joblib.dump(model_payload, model_out)
 
-    primary_model = _unwrap_single_xgb(models_by_target[primary_target])
+    primary_model = _unwrap_single_xgb(models_by_target[primary_target]["p50"])
     _plot_top_feature_importance(primary_model, feature_names=list(X_train.columns), out_path=importance_out, top_n=20)
     importance_report = calculate_feature_importance(
         primary_model,
@@ -726,15 +815,29 @@ def _build_rsync_pull_cmd(remote_path: Path) -> str:
     return f"rsync -avh --progress {user}@{host}:{remote_abs}/ ./artifacts/model_runs/{remote_path.name}/"
 
 
+def _align_features_for_model(X: pd.DataFrame, model) -> pd.DataFrame:
+    """Align inference feature frame to the exact feature names seen in training."""
+    expected = None
+    try:
+        expected = model.get_booster().feature_names
+    except Exception:
+        expected = None
+    if not expected:
+        return X
+    X_aligned = X.reindex(columns=list(expected))
+    return X_aligned
+
+
 def _predict_split_frame(
     base_dir: Path,
     bundle: BundleName,
     split: str,
-    models_by_target: dict[str, object],
+    models_by_target: dict[str, dict[str, object]],
     target_cols: list[str],
 ) -> pd.DataFrame:
     split_df, bcfg = _load_bundle_split_df(base_dir=base_dir, bundle=bundle, split=split)
     X = split_df[bcfg["features"]].copy()
+    X = _add_dynamics_features(X, prune_midterm_lags=True)
     out = pd.DataFrame({"timestamp_utc": pd.to_datetime(split_df["timestamp_utc"], utc=True, errors="coerce")})
 
     # Keep stable canonical schema for simulation auto-load.
@@ -752,8 +855,9 @@ def _predict_split_frame(
             out[c] = np.nan
 
     for tgt in target_cols:
-        model = models_by_target[tgt]
-        pred_h = np.asarray(model.predict(X), dtype=float)
+        model_q = models_by_target[tgt]["p50"]
+        X_pred = _align_features_for_model(X, model_q)
+        pred_h = np.asarray(model_q.predict(X_pred), dtype=float)
         if pred_h.ndim == 1:
             pred = pd.to_numeric(pd.Series(pred_h, index=split_df.index), errors="coerce")
         else:
@@ -768,21 +872,21 @@ def _predict_split_long_multistep(
     base_dir: Path,
     bundle: BundleName,
     split: str,
-    models_by_target: dict[str, object],
+    models_by_target: dict[str, dict[str, object]],
     target_cols: list[str],
     horizon_hours: int,
+    model_name: str,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Generate direct multi-output predictions and return long-format tables.
 
-    Output per prediction column:
-    - snapshot_time_utc
-    - target_time_utc
-    - lead_time_h
-    - predicted_value
+    Output per prediction column includes quantile surface:
+    - snapshot_time_utc, target_time_utc, lead_time_h, model_name
+    - p10..p90 (+ predicted_value=p50 for compatibility)
     """
     split_df, bcfg = _load_bundle_split_df(base_dir=base_dir, bundle=bundle, split=split)
     features = list(bcfg["features"])
     X = split_df[features].copy()
+    X = _add_dynamics_features(X, prune_midterm_lags=True)
     snapshots = pd.to_datetime(split_df["timestamp_utc"], utc=True, errors="coerce")
 
     pred_frames: dict[str, list[pd.DataFrame]] = {}
@@ -794,22 +898,38 @@ def _predict_split_long_multistep(
             true_h1_by_target[tgt] = pd.to_numeric(split_df[tgt], errors="coerce")
 
     for tgt in target_cols:
-        model = models_by_target[tgt]
-        pred_h = np.asarray(model.predict(X), dtype=float)
-        if pred_h.ndim == 1:
-            pred_h = pred_h.reshape(-1, 1)
-        use_h = min(horizon_hours, pred_h.shape[1])
+        q_cols = [_qcol(q) for q in QUANTILES]
+        pred_q: dict[str, np.ndarray] = {}
+        for q in QUANTILES:
+            c = _qcol(q)
+            model_q = models_by_target[tgt][c]
+            X_pred = _align_features_for_model(X, model_q)
+            pred_h = np.asarray(model_q.predict(X_pred), dtype=float)
+            if pred_h.ndim == 1:
+                pred_h = pred_h.reshape(-1, 1)
+            pred_q[c] = pred_h
+
+        # Quantile crossing repair.
+        stack = np.stack([pred_q[c] for c in q_cols], axis=2)
+        stack = np.sort(stack, axis=2)
+        for qi, c in enumerate(q_cols):
+            pred_q[c] = stack[:, :, qi]
+
+        use_h = min(horizon_hours, pred_q["p50"].shape[1])
         for lead in range(1, use_h + 1):
-            pred = pd.Series(pred_h[:, lead - 1], index=split_df.index)
             target_time = snapshots + pd.to_timedelta(lead, unit="h")
             for pred_col in _pred_column_names_for_target(tgt):
+                payload = {
+                    "snapshot_time_utc": snapshots,
+                    "target_time_utc": target_time,
+                    "lead_time_h": lead,
+                    "model_name": model_name,
+                }
+                for c in q_cols:
+                    payload[c] = pd.to_numeric(pd.Series(pred_q[c][:, lead - 1], index=split_df.index), errors="coerce").values
+                payload["predicted_value"] = payload["p50"]
                 long_df = pd.DataFrame(
-                    {
-                        "snapshot_time_utc": snapshots,
-                        "target_time_utc": target_time,
-                        "lead_time_h": lead,
-                        "predicted_value": pd.to_numeric(pred, errors="coerce").values,
-                    }
+                    payload
                 )
                 pred_frames.setdefault(pred_col, []).append(long_df)
 
@@ -866,7 +986,8 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--base-dir", default="data/model_input", help="Bundle base directory.")
     p.add_argument("--bundle", choices=["da", "afrr"], default="da", help="Bundle to train on.")
     p.add_argument("--target-col", default="", help="Optional explicit target column override.")
-    p.add_argument("--device", choices=["cuda", "cpu"], default="cuda", help="XGBoost device.")
+    p.add_argument("--device", choices=["cuda", "cpu", "mps"], default="cuda", help="XGBoost device.")
+    p.add_argument("--model-name", default="xgboost_v1", help="Name written to long-format prediction export.")
     p.add_argument(
         "--allow-cpu",
         action="store_true",
@@ -1037,6 +1158,7 @@ def main() -> None:
                     models_by_target=models_by_target,
                     target_cols=target_cols,
                     horizon_hours=args.forecast_horizon_hours,
+                    model_name=args.model_name,
                 )
                 prediction_long_paths[split] = {}
                 for pred_col, long_df in long_by_col.items():
