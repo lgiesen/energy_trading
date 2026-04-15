@@ -60,6 +60,11 @@ def get_da_optimized_features(df_165: pd.DataFrame) -> pd.DataFrame:
         if col == "da_price_pit":
             # Explicit keep-exception: latest DA value available at gate closure.
             continue
+        # Intraday forecast snapshots are not available at DA D-1 gate closure.
+        # Keep only causal day-ahead forecast variants.
+        if "_forecast_id_" in col:
+            cols_to_drop.append(col)
+            continue
         if keyword_drop_pattern.search(col):
             cols_to_drop.append(col)
             continue
@@ -90,6 +95,32 @@ def get_da_optimized_features(df_165: pd.DataFrame) -> pd.DataFrame:
     )
     if cols_to_drop:
         LOGGER.info("[da-opt] sample dropped cols: %s", ", ".join(cols_to_drop[:15]))
+    return df_out
+
+
+def get_afrr_optimized_features(df_full: pd.DataFrame) -> pd.DataFrame:
+    """Reduce aFRR feature set by dropping stale long-term forecast lags.
+
+    Rule:
+    - Drop columns that contain `_forecast_` and end with `_lag_48h` or `_lag_168h`.
+    - Keep `_lag_24h` forecast terms and all long lags for realized/market signals.
+    """
+    df_out = df_full.copy()
+    cols = df_out.columns.tolist()
+    long_forecast_lag_pattern = re.compile(r".*forecast.*_lag_(48|168)h$")
+
+    cols_to_drop = [c for c in cols if long_forecast_lag_pattern.match(c)]
+    cols_to_drop = sorted(set(cols_to_drop))
+    df_out = df_out.drop(columns=cols_to_drop, errors="ignore")
+
+    LOGGER.info(
+        "[afrr-opt] removed %s long-term forecast lag columns (from %s to %s).",
+        len(cols_to_drop),
+        len(cols),
+        df_out.shape[1],
+    )
+    if cols_to_drop:
+        LOGGER.info("[afrr-opt] sample dropped cols: %s", ", ".join(cols_to_drop[:15]))
     return df_out
 
 
@@ -656,6 +687,9 @@ class MLDataFactory:
             if bundle == "da" and base_features:
                 # DA model uses a stricter, auction-causal subset of X.
                 base_features = get_da_optimized_features(df[base_features]).columns.tolist()
+            elif bundle == "afrr" and base_features:
+                # aFRR model drops stale long-term forecast lags to reduce feature overkill.
+                base_features = get_afrr_optimized_features(df[base_features]).columns.tolist()
 
             # Train slice for quality diagnostics + train-fitted imputation stats.
             train_cols = ["timestamp_utc", *base_features, *targets]
