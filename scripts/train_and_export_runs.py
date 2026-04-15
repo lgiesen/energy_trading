@@ -37,22 +37,46 @@ def _load_fragment(path: Path) -> dict:
 
 
 def _merge_prediction_files(paths: list[Path], out_path: Path) -> Path:
-    merged: pd.DataFrame | None = None
+    frames: list[pd.DataFrame] = []
     for p in paths:
         if not p.exists():
             continue
         df = pd.read_parquet(p)
-        if merged is None:
-            merged = df
-        else:
-            cols = [c for c in df.columns if c != "timestamp_utc"]
-            merged = merged.merge(df[["timestamp_utc", *cols]], on="timestamp_utc", how="outer")
-    if merged is None:
+        if "timestamp_utc" not in df.columns:
+            continue
+        frames.append(df)
+    if not frames:
         raise FileNotFoundError("No prediction files to merge.")
-    merged = merged.sort_values("timestamp_utc").reset_index(drop=True)
+
+    stacked = pd.concat(frames, axis=0, ignore_index=True, sort=False)
+    stacked["timestamp_utc"] = pd.to_datetime(stacked["timestamp_utc"], utc=True, errors="coerce")
+    stacked = stacked.dropna(subset=["timestamp_utc"]).copy()
+
+    def _first_non_null(s: pd.Series):
+        nn = s.dropna()
+        return nn.iloc[0] if not nn.empty else pd.NA
+
+    merged = (
+        stacked.sort_values("timestamp_utc")
+        .groupby("timestamp_utc", as_index=False)
+        .agg(_first_non_null)
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(out_path, index=False)
     return out_path
+
+
+def _resolve_available_afrr_targets(base_dir: str | Path) -> list[str]:
+    """Return only aFRR targets that are available in prepared bundle config."""
+    cfg_path = Path(base_dir) / "feature_config.json"
+    if not cfg_path.exists():
+        return list(AFRR_TARGETS)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    available = list(cfg.get("bundles", {}).get("afrr", {}).get("targets", []))
+    preferred = [t for t in AFRR_TARGETS if t in available]
+    return preferred if preferred else available
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,13 +84,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-dir", default="data/model_input")
     p.add_argument("--run-root", default="artifacts/model_runs")
     p.add_argument("--run-id", default="")
-    p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    p.add_argument("--model-type", choices=["xgboost", "tft"], default="xgboost")
+    p.add_argument("--device", choices=["cuda", "cpu", "mps"], default="mps")
+    p.add_argument("--model-name", default="")
     p.add_argument("--allow-cpu", action="store_true")
     p.add_argument("--n-estimators", type=int, default=500)
     p.add_argument("--max-depth", type=int, default=6)
     p.add_argument("--learning-rate", type=float, default=0.05)
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument("--forecast-horizon-hours", type=int, default=48)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--ground-truth-path", default="data/features/all_data_features.parquet")
     p.add_argument(
         "--enable-da-stacking-afrr",
@@ -87,6 +115,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.model_type == "tft" and args.enable_da_stacking_afrr:
+        raise ValueError("--enable-da-stacking-afrr is only supported for model-type=xgboost.")
     run_id = args.run_id.strip() or _run_id_now()
     run_dir = Path(args.run_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -123,29 +153,56 @@ def main() -> None:
         _run_train_cmd(stack_cmd)
         afrr_base_dir = args.stacked_base_dir
 
-    base_cmd = [
-        sys.executable,
-        "-m",
-        "src.energy_trading.models.train_xgboost_export",
-        "--device",
-        args.device,
-        "--n-estimators",
-        str(args.n_estimators),
-        "--max-depth",
-        str(args.max_depth),
-        "--learning-rate",
-        str(args.learning_rate),
-        "--early-stopping-rounds",
-        str(args.early_stopping_rounds),
-        "--run-dir",
-        str(run_dir),
-        "--prediction-splits",
-        "val,test",
-        "--forecast-horizon-hours",
-        str(args.forecast_horizon_hours),
-    ]
-    if args.allow_cpu:
-        base_cmd.append("--allow-cpu")
+    if args.model_type == "xgboost":
+        model_name = args.model_name.strip() or "xgboost_v1"
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "src.energy_trading.models.train_xgboost_export",
+            "--device",
+            args.device,
+            "--model-name",
+            model_name,
+            "--n-estimators",
+            str(args.n_estimators),
+            "--max-depth",
+            str(args.max_depth),
+            "--learning-rate",
+            str(args.learning_rate),
+            "--early-stopping-rounds",
+            str(args.early_stopping_rounds),
+            "--run-dir",
+            str(run_dir),
+            "--prediction-splits",
+            "val,test",
+            "--forecast-horizon-hours",
+            str(args.forecast_horizon_hours),
+            "--seed",
+            str(args.seed),
+        ]
+        if args.allow_cpu:
+            base_cmd.append("--allow-cpu")
+    else:
+        model_name = args.model_name.strip() or "tft_v1"
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "src.energy_trading.models.tft_model",
+            "--device",
+            args.device,
+            "--model-name",
+            model_name,
+            "--run-dir",
+            str(run_dir),
+            "--max-encoder-length",
+            "168",
+            "--max-prediction-length",
+            str(args.forecast_horizon_hours),
+            "--seed",
+            str(args.seed),
+            "--num-workers",
+            str(args.num_workers),
+        ]
 
     # Train DA model.
     cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]
@@ -153,7 +210,13 @@ def main() -> None:
     _run_train_cmd(cmd_da)
 
     # Train aFRR models target-wise to produce full canonical prediction columns.
-    for tgt in AFRR_TARGETS:
+    afrr_targets = _resolve_available_afrr_targets(afrr_base_dir)
+    if not afrr_targets:
+        raise RuntimeError(f"No aFRR targets found in bundle config under '{afrr_base_dir}'.")
+    skipped = [t for t in AFRR_TARGETS if t not in afrr_targets]
+    if skipped:
+        print(f"[WARN] Skipping unavailable aFRR targets: {', '.join(skipped)}")
+    for tgt in afrr_targets:
         frag = run_dir / f"afrr_{tgt}_manifest_fragment.json"
         afrr_fragment_paths.append(frag)
         cmd_afrr = [
@@ -173,6 +236,36 @@ def main() -> None:
     afrr_meta_list = [_load_fragment(p) for p in afrr_fragment_paths if p.exists()]
     if not afrr_meta_list:
         raise RuntimeError("No aFRR manifest fragments found.")
+
+    # Lead-time MAE summary logging for both model families.
+    def _print_leadtime_summary(metrics_path: str, label: str) -> None:
+        try:
+            payload = json.loads(Path(metrics_path).read_text(encoding="utf-8"))
+        except Exception:
+            return
+        # TFT metrics
+        if "leadtime_mae_val_h1" in payload:
+            print(
+                f"[MAE] {label}: val h1={payload.get('leadtime_mae_val_h1'):.4f}, "
+                f"val h48={payload.get('leadtime_mae_val_h48'):.4f}, "
+                f"test h1={payload.get('leadtime_mae_test_h1'):.4f}, "
+                f"test h48={payload.get('leadtime_mae_test_h48'):.4f}"
+            )
+            return
+        # XGBoost metrics
+        if "per_target_metrics" in payload:
+            ptm = payload["per_target_metrics"]
+            tgt = payload.get("target_col")
+            if tgt in ptm:
+                m = ptm[tgt]
+                print(
+                    f"[MAE] {label}: val h1={m.get('mae', float('nan')):.4f}, "
+                    f"val h48={m.get('mae_h48', float('nan')):.4f}"
+                )
+
+    _print_leadtime_summary(da_meta["metrics_path"], "da")
+    for i, meta in enumerate(afrr_meta_list, start=1):
+        _print_leadtime_summary(meta["metrics_path"], f"afrr_target_{i}")
 
     # Merge aFRR split prediction files into one file per split.
     afrr_pred_val = _merge_prediction_files(
@@ -219,7 +312,7 @@ def main() -> None:
                     "pred_afrr_activation_rate_pos",
                     "pred_afrr_activation_rate_neg",
                 ],
-                "target_columns": AFRR_TARGETS,
+                "target_columns": afrr_targets,
             },
         },
         "ground_truth": {
