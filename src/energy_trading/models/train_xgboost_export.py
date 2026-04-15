@@ -14,6 +14,7 @@ import random
 import re
 import socket
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -698,6 +699,8 @@ def train_and_evaluate(
 
         rows_train_per_lead: list[int] = []
         rows_val_per_lead: list[int] = []
+        lead_loop_start = time.time()
+        eta_logged = False
 
         for lead in range(1, horizon_hours + 1):
             y_tr_lead = pd.to_numeric(Y_tr.iloc[:, lead - 1], errors="coerce")
@@ -737,6 +740,7 @@ def train_and_evaluate(
                     n_estimators=n_estimators,
                     max_depth=max_depth,
                     learning_rate=learning_rate,
+                    # Use histogram algorithm explicitly for efficient GPU training.
                     tree_method="hist",
                     device=resolved_device,
                     subsample=0.9,
@@ -763,6 +767,16 @@ def train_and_evaluate(
                 pred_by_q[qcol][:, lead - 1] = lead_pred_series.to_numpy(dtype=float)
 
             lead_models[lead] = quantile_models_for_lead
+            if lead == 1 and horizon_hours > 1 and not eta_logged:
+                lead1_minutes = (time.time() - lead_loop_start) / 60.0
+                eta_minutes = lead1_minutes * float(horizon_hours - 1)
+                LOGGER.info(
+                    "ETA for remaining %s leads (target=%s): ~ %.1f minutes",
+                    horizon_hours - 1,
+                    tgt,
+                    eta_minutes,
+                )
+                eta_logged = True
 
         lead1_pred = pd.Series(pred_by_q["p50"][:, 0], index=X_val.index)
         val_pred_df[tgt] = np.nan
