@@ -315,6 +315,7 @@ def _train_tft(
     num_workers: int = 0,
     cleanup_lightning_checkpoints: bool = False,
 ) -> dict[str, object]:
+    total_start = time.perf_counter()
     try:
         import lightning.pytorch as pl
         from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
@@ -526,7 +527,9 @@ def _train_tft(
     )
 
     tft.to(torch_device)
+    fit_start = time.perf_counter()
     trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    fit_seconds = time.perf_counter() - fit_start
 
     model_path = model_dir / f"{bundle}_{tgt}_tft_model.ckpt"
     trainer.save_checkpoint(str(model_path))
@@ -565,9 +568,14 @@ def _train_tft(
             quantiles=QUANTILES,
         )
 
+    pred_val_start = time.perf_counter()
     pred_val_long = _predict(validation)
+    pred_val_seconds = time.perf_counter() - pred_val_start
+    pred_test_start = time.perf_counter()
     pred_test_long = _predict(testing)
+    pred_test_seconds = time.perf_counter() - pred_test_start
 
+    export_start = time.perf_counter()
     pred_col = _pred_column_names_for_target(tgt)[0]
     val_long_path = pred_dir / f"{bundle}_{tgt}_{pred_col}_long.parquet"
     test_long_path = pred_dir / f"{bundle}_{tgt}_{pred_col}_long_test.parquet"
@@ -596,7 +604,9 @@ def _train_tft(
     decay_test_path = report_dir / f"{bundle}_{tgt}_test_forecast_decay.csv"
     decay_val.to_csv(decay_val_path, index=False)
     decay_test.to_csv(decay_test_path, index=False)
+    export_seconds = time.perf_counter() - export_start
 
+    total_seconds = time.perf_counter() - total_start
     metrics = {
         "bundle": bundle,
         "target_col": tgt,
@@ -619,6 +629,11 @@ def _train_tft(
         "pred_test_long": str(test_long_path.resolve()),
         "decay_val_path": str(decay_val_path.resolve()),
         "decay_test_path": str(decay_test_path.resolve()),
+        "timing_fit_seconds": float(fit_seconds),
+        "timing_predict_val_seconds": float(pred_val_seconds),
+        "timing_predict_test_seconds": float(pred_test_seconds),
+        "timing_export_seconds": float(export_seconds),
+        "timing_total_seconds": float(total_seconds),
     }
     return metrics
 

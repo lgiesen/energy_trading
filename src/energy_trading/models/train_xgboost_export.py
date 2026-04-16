@@ -685,9 +685,12 @@ def train_and_evaluate(
     models_by_target: dict[str, dict[int, dict[str, object]]] = {}
     val_pred_df = pd.DataFrame(index=X_val.index)
     per_target_metrics: dict[str, dict[str, float]] = {}
+    per_target_training_seconds: dict[str, float] = {}
+    total_fit_seconds = 0.0
     primary_X_val_h = None
     primary_y_val_lead1 = None
     for idx, tgt in enumerate(target_cols):
+        target_train_start = time.perf_counter()
         y_tr_base = pd.to_numeric(y_train_m[tgt], errors="coerce")
         y_va_base = pd.to_numeric(y_val_m[tgt], errors="coerce")
         Y_tr = _build_horizon_matrix(y_tr_base, horizon_hours=horizon_hours)
@@ -815,6 +818,9 @@ def train_and_evaluate(
             "rows_val_horizon_max": float(max(rows_val_per_lead)),
         }
         models_by_target[tgt] = lead_models
+        target_elapsed = time.perf_counter() - target_train_start
+        per_target_training_seconds[tgt] = float(target_elapsed)
+        total_fit_seconds += float(target_elapsed)
         if tgt == primary_target:
             primary_X_val_h = X_val
             primary_y_val_lead1 = pd.to_numeric(Y_va.iloc[:, 0], errors="coerce")
@@ -854,6 +860,8 @@ def train_and_evaluate(
         "feature_count_after_refactor": float(len(feature_columns)),
         "per_target_metrics": per_target_metrics,
         "resolved_device": resolved_device,
+        "timing_training_seconds": float(total_fit_seconds),
+        "timing_training_seconds_by_target": per_target_training_seconds,
     }
     metrics.update(cv_metrics)
     return metrics, models_by_target, target_cols
@@ -1130,6 +1138,7 @@ def _build_cli() -> argparse.ArgumentParser:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    total_start = time.perf_counter()
     args = _build_cli().parse_args()
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -1172,6 +1181,7 @@ def main() -> None:
         Path(args.manifest_fragment_out) if args.manifest_fragment_out else default_manifest_fragment_out
     )
 
+    train_eval_start = time.perf_counter()
     metrics, models_by_target, target_cols = train_and_evaluate(
         base_dir=base_dir,
         bundle=args.bundle,
@@ -1193,15 +1203,19 @@ def main() -> None:
         horizon_hours=args.forecast_horizon_hours,
         seed=args.seed,
     )
+    train_eval_elapsed = time.perf_counter() - train_eval_start
 
     metrics_json_out.parent.mkdir(parents=True, exist_ok=True)
-    metrics_json_out.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    export_start = time.perf_counter()
 
     prediction_paths: dict[str, Path] = {}
     prediction_long_paths: dict[str, dict[str, Path]] = {}
+    prediction_export_seconds_by_split: dict[str, float] = {}
+    long_export_seconds_by_split: dict[str, float] = {}
     splits = [s.strip() for s in args.prediction_splits.split(",") if s.strip()]
     if args.export_predictions:
         for split in splits:
+            split_start = time.perf_counter()
             pred_df = _predict_split_frame(
                 base_dir=base_dir,
                 bundle=args.bundle,
@@ -1212,8 +1226,10 @@ def main() -> None:
             out_path = pred_dir / f"{file_tag}_{split}.parquet"
             pred_df.to_parquet(out_path, index=False)
             prediction_paths[split] = out_path
+            prediction_export_seconds_by_split[split] = float(time.perf_counter() - split_start)
 
             if args.export_predictions_long:
+                long_split_start = time.perf_counter()
                 long_by_col, decay_by_col = _predict_split_long_multistep(
                     base_dir=base_dir,
                     bundle=args.bundle,
@@ -1234,6 +1250,7 @@ def main() -> None:
                     decay.to_csv(decay_path, index=False)
                     mae_plot_path = report_dir / f"{file_tag}_{split}_{pred_col}_mae_lead_1_24_48.png"
                     _plot_leadtime_mae_points(decay, mae_plot_path)
+                long_export_seconds_by_split[split] = float(time.perf_counter() - long_split_start)
 
     fragment = _write_bundle_manifest_fragment(
         bundle=args.bundle,
@@ -1247,6 +1264,15 @@ def main() -> None:
     )
     manifest_fragment_out.parent.mkdir(parents=True, exist_ok=True)
     manifest_fragment_out.write_text(json.dumps(fragment, indent=2), encoding="utf-8")
+    total_elapsed = time.perf_counter() - total_start
+    export_elapsed = time.perf_counter() - export_start
+
+    metrics["timing_train_eval_seconds"] = float(train_eval_elapsed)
+    metrics["timing_export_seconds"] = float(export_elapsed)
+    metrics["timing_export_prediction_seconds_by_split"] = prediction_export_seconds_by_split
+    metrics["timing_export_long_seconds_by_split"] = long_export_seconds_by_split
+    metrics["timing_total_seconds"] = float(total_elapsed)
+    metrics_json_out.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     print("[OK] XGBoost training finished.")
     print(f"- Base dir: {base_dir}")
