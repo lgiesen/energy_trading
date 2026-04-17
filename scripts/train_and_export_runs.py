@@ -246,17 +246,32 @@ def main() -> None:
 
     # Lead-time MAE summary logging for both model families.
     def _print_leadtime_summary(metrics_path: str, label: str) -> None:
+        def _fmt(x: object) -> str:
+            try:
+                return f"{float(x):.4f}"
+            except Exception:
+                return "nan"
+
         try:
             payload = json.loads(Path(metrics_path).read_text(encoding="utf-8"))
         except Exception:
             return
         # TFT metrics
         if "leadtime_mae_val_h1" in payload:
+            h_last = int(payload.get("leadtime_last_h", 48))
+            val_last = payload.get(
+                f"leadtime_mae_val_h{h_last}",
+                payload.get("leadtime_mae_val_h_last", payload.get("leadtime_mae_val_h48")),
+            )
+            test_last = payload.get(
+                f"leadtime_mae_test_h{h_last}",
+                payload.get("leadtime_mae_test_h_last", payload.get("leadtime_mae_test_h48")),
+            )
             print(
-                f"[MAE] {label}: val h1={payload.get('leadtime_mae_val_h1'):.4f}, "
-                f"val h48={payload.get('leadtime_mae_val_h48'):.4f}, "
-                f"test h1={payload.get('leadtime_mae_test_h1'):.4f}, "
-                f"test h48={payload.get('leadtime_mae_test_h48'):.4f}"
+                f"[MAE] {label}: val h1={_fmt(payload.get('leadtime_mae_val_h1'))}, "
+                f"val h{h_last}={_fmt(val_last)}, "
+                f"test h1={_fmt(payload.get('leadtime_mae_test_h1'))}, "
+                f"test h{h_last}={_fmt(test_last)}"
             )
             return
         # XGBoost metrics

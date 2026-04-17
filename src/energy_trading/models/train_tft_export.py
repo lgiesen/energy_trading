@@ -182,6 +182,9 @@ def _fit_split_scalers(
     def _scaled(df: pd.DataFrame, X_in: pd.DataFrame, y_arr: np.ndarray) -> pd.DataFrame:
         out = X_in.copy()
         if real_cols and f_scaler is not None:
+            # Ensure numeric reals can hold scaled float values (pandas >=2.2
+            # raises on lossy int8/int16 assignment).
+            out = out.astype({c: "float64" for c in real_cols}, copy=False)
             out.loc[:, real_cols] = f_scaler.transform(out[real_cols].to_numpy(dtype=float))
         out[target_col] = y_arr.reshape(-1)
         out["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
@@ -617,6 +620,19 @@ def _train_tft(
     export_seconds = time.perf_counter() - export_start
 
     total_seconds = time.perf_counter() - total_start
+
+    def _mae_for_lead(decay_df: pd.DataFrame, lead: int) -> float:
+        hit = decay_df.loc[decay_df["lead_time_h"] == int(lead), "mae"]
+        if hit.empty:
+            return float("nan")
+        return float(hit.iloc[0])
+
+    h_last = int(max_prediction_length)
+    mae_val_h1 = _mae_for_lead(decay_val, 1)
+    mae_val_h_last = _mae_for_lead(decay_val, h_last)
+    mae_test_h1 = _mae_for_lead(decay_test, 1)
+    mae_test_h_last = _mae_for_lead(decay_test, h_last)
+
     metrics = {
         "bundle": bundle,
         "target_col": tgt,
@@ -625,12 +641,18 @@ def _train_tft(
         "accelerator": accelerator,
         "max_encoder_length": max_encoder_length,
         "max_prediction_length": max_prediction_length,
+        "leadtime_last_h": h_last,
         "known_reals_count": len(known_reals),
         "unknown_reals_count": len(unknown_reals),
-        "leadtime_mae_val_h1": float(decay_val.loc[decay_val["lead_time_h"] == 1, "mae"].iloc[0]),
-        "leadtime_mae_val_h48": float(decay_val.loc[decay_val["lead_time_h"] == 48, "mae"].iloc[0]),
-        "leadtime_mae_test_h1": float(decay_test.loc[decay_test["lead_time_h"] == 1, "mae"].iloc[0]),
-        "leadtime_mae_test_h48": float(decay_test.loc[decay_test["lead_time_h"] == 48, "mae"].iloc[0]),
+        "leadtime_mae_val_h1": mae_val_h1,
+        "leadtime_mae_test_h1": mae_test_h1,
+        "leadtime_mae_val_h_last": mae_val_h_last,
+        "leadtime_mae_test_h_last": mae_test_h_last,
+        f"leadtime_mae_val_h{h_last}": mae_val_h_last,
+        f"leadtime_mae_test_h{h_last}": mae_test_h_last,
+        # Backward-compatible keys used by older report scripts.
+        "leadtime_mae_val_h48": mae_val_h_last if h_last == 48 else float("nan"),
+        "leadtime_mae_test_h48": mae_test_h_last if h_last == 48 else float("nan"),
         "model_path": str(model_path.resolve()),
         "scaler_path": str(scaler_path.resolve()),
         "pred_val_wide": str(val_wide_path.resolve()),
