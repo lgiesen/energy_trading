@@ -73,6 +73,28 @@ def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, q: float) -> float:
     return float(np.mean(np.maximum(q * e, (q - 1.0) * e)))
 
 
+def _interval_score(y_true: np.ndarray, lower: np.ndarray, upper: np.ndarray, alpha: float) -> np.ndarray:
+    base = upper - lower
+    below = (y_true < lower).astype(float)
+    above = (y_true > upper).astype(float)
+    penalty = (2.0 / alpha) * (lower - y_true) * below + (2.0 / alpha) * (y_true - upper) * above
+    return base + penalty
+
+
+def _wis_p10_p50_p90(y_true: np.ndarray, p10: np.ndarray, p50: np.ndarray, p90: np.ndarray) -> float:
+    valid = np.isfinite(y_true) & np.isfinite(p10) & np.isfinite(p50) & np.isfinite(p90)
+    if not bool(valid.any()):
+        return float("nan")
+    yv = y_true[valid]
+    l = p10[valid]
+    m = p50[valid]
+    u = p90[valid]
+    alpha = 0.2
+    s = _interval_score(yv, l, u, alpha=alpha)
+    wis = (0.5 * np.abs(yv - m) + (alpha / 2.0) * s) / 2.0
+    return float(np.mean(wis))
+
+
 def _load_manifest(run_dir: Path) -> dict[str, Any]:
     manifest_path = run_dir / "manifest.json"
     if manifest_path.exists():
@@ -135,6 +157,8 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
         y = pd.to_numeric(part["y_true"], errors="coerce").to_numpy(dtype=float)
         p50 = pd.to_numeric(part["p50"], errors="coerce").to_numpy(dtype=float)
         y_naive = pd.to_numeric(part["naive_24h"], errors="coerce").to_numpy(dtype=float)
+        p10 = pd.to_numeric(part["p10"], errors="coerce").to_numpy(dtype=float) if "p10" in part.columns else p50
+        p90 = pd.to_numeric(part["p90"], errors="coerce").to_numpy(dtype=float) if "p90" in part.columns else p50
 
         valid = np.isfinite(y) & np.isfinite(p50)
         if not bool(valid.any()):
@@ -145,8 +169,12 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
                     "mae": np.nan,
                     "rmse": np.nan,
                     "pinball_mean": np.nan,
+                    "wis_p10_p50_p90": np.nan,
+                    "sharpness_p90_p10": np.nan,
                     "naive_mae_24h": np.nan,
+                    "naive_rmse_24h": np.nan,
                     "skill_score_mae": np.nan,
+                    "skill_score_rmse": np.nan,
                 }
             )
             continue
@@ -155,6 +183,8 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
         p50v = p50[valid]
         mae = float(np.mean(np.abs(yv - p50v)))
         rmse = float(np.sqrt(np.mean((yv - p50v) ** 2)))
+        wis = _wis_p10_p50_p90(y, p10, p50, p90)
+        sharpness = float(np.nanmean(p90 - p10)) if np.isfinite(np.nanmean(p90 - p10)) else np.nan
 
         pbl: list[float] = []
         for q, qcol in zip(QUANTILES, QCOLS):
@@ -168,7 +198,9 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
 
         nvalid = np.isfinite(y) & np.isfinite(y_naive)
         naive_mae = float(np.mean(np.abs(y[nvalid] - y_naive[nvalid]))) if bool(nvalid.any()) else np.nan
+        naive_rmse = float(np.sqrt(np.mean((y[nvalid] - y_naive[nvalid]) ** 2))) if bool(nvalid.any()) else np.nan
         skill = 1.0 - (mae / naive_mae) if np.isfinite(naive_mae) and naive_mae > 0 else np.nan
+        skill_rmse = 1.0 - (rmse / naive_rmse) if np.isfinite(naive_rmse) and naive_rmse > 0 else np.nan
 
         rows.append(
             {
@@ -177,8 +209,12 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
                 "mae": mae,
                 "rmse": rmse,
                 "pinball_mean": pinball_mean,
+                "wis_p10_p50_p90": wis,
+                "sharpness_p90_p10": sharpness,
                 "naive_mae_24h": naive_mae,
+                "naive_rmse_24h": naive_rmse,
                 "skill_score_mae": skill,
+                "skill_score_rmse": skill_rmse,
             }
         )
     return pd.DataFrame(rows).sort_values("lead_time_h").reset_index(drop=True)
@@ -204,6 +240,22 @@ def _plot_skill_score_horizon(metrics_df: pd.DataFrame, out_path: Path, title: s
     ax.axhline(0.0, color="red", linestyle="--", linewidth=1.5, label="Baseline parity (0)")
     ax.set_xlabel("Lead Time [h]")
     ax.set_ylabel("Skill Score (1 - MAE_model / MAE_naive)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    _save_plot_png_pdf(fig, out_path)
+    plt.close(fig)
+
+
+def _plot_decay_horizon(metrics_df: pd.DataFrame, out_path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(metrics_df["lead_time_h"], metrics_df["mae"], linewidth=2, label="MAE")
+    ax.plot(metrics_df["lead_time_h"], metrics_df["pinball_mean"], linewidth=2, label="Pinball")
+    if "wis_p10_p50_p90" in metrics_df.columns:
+        ax.plot(metrics_df["lead_time_h"], metrics_df["wis_p10_p50_p90"], linewidth=2, label="WIS(P10,P50,P90)")
+    ax.set_xlabel("Lead Time [h]")
+    ax.set_ylabel("Metric value")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -254,6 +306,124 @@ def _plot_probabilistic_window(
     fig.tight_layout()
     _save_plot_png_pdf(fig, out_path)
     plt.close(fig)
+
+
+def _compute_quantile_coverage(df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float]] = []
+    y = pd.to_numeric(df["y_true"], errors="coerce").to_numpy(dtype=float)
+    for q, qcol in zip(QUANTILES, QCOLS):
+        if qcol not in df.columns:
+            continue
+        q_pred = pd.to_numeric(df[qcol], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(y) & np.isfinite(q_pred)
+        n = int(valid.sum())
+        if n == 0:
+            empirical = np.nan
+            cal_err = np.nan
+        else:
+            empirical = float(np.mean(y[valid] <= q_pred[valid]))
+            cal_err = float(empirical - q)
+        rows.append(
+            {
+                "quantile": float(q),
+                "quantile_col": qcol,
+                "n": float(n),
+                "empirical_coverage": empirical,
+                "calibration_error": cal_err,
+                "abs_calibration_error": abs(cal_err) if np.isfinite(cal_err) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("quantile").reset_index(drop=True)
+
+
+def _average_calibration_error(coverage_df: pd.DataFrame) -> float:
+    if coverage_df.empty or "abs_calibration_error" not in coverage_df.columns:
+        return float("nan")
+    s = pd.to_numeric(coverage_df["abs_calibration_error"], errors="coerce")
+    s = s[np.isfinite(s)]
+    if s.empty:
+        return float("nan")
+    return float(s.mean())
+
+
+def _plot_reliability_diagram(coverage_df: pd.DataFrame, out_path: Path, title: str) -> None:
+    if coverage_df.empty:
+        return
+    d = coverage_df.copy()
+    d["quantile"] = pd.to_numeric(d["quantile"], errors="coerce")
+    d["empirical_coverage"] = pd.to_numeric(d["empirical_coverage"], errors="coerce")
+    d = d.dropna(subset=["quantile", "empirical_coverage"]).sort_values("quantile")
+    if d.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    x = d["quantile"].to_numpy(dtype=float)
+    y = d["empirical_coverage"].to_numpy(dtype=float)
+    ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.5, color="black", label="Perfect calibration")
+    ax.plot(x, y, marker="o", linewidth=2, label="Model coverage")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Theoretical quantile")
+    ax.set_ylabel("Empirical coverage")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    _save_plot_png_pdf(fig, out_path)
+    plt.close(fig)
+
+
+def _directional_and_event_metrics(df: pd.DataFrame, event_q: float = 0.9) -> dict[str, float]:
+    d = df.copy()
+    d = d.sort_values("target_time_utc").reset_index(drop=True)
+    y = pd.to_numeric(d["y_true"], errors="coerce")
+    p = pd.to_numeric(d["p50"], errors="coerce")
+
+    y_diff = y.diff()
+    p_diff = p.diff()
+    valid_dir = y_diff.notna() & p_diff.notna()
+    if bool(valid_dir.any()):
+        hit = np.sign(y_diff[valid_dir].to_numpy(dtype=float)) == np.sign(p_diff[valid_dir].to_numpy(dtype=float))
+        directional_accuracy = float(np.mean(hit))
+    else:
+        directional_accuracy = float("nan")
+
+    y_valid = y[np.isfinite(y)]
+    if y_valid.empty:
+        return {
+            "directional_accuracy": directional_accuracy,
+            "event_threshold_true_q90": float("nan"),
+            "event_precision": float("nan"),
+            "event_recall": float("nan"),
+            "event_f1": float("nan"),
+        }
+
+    thr = float(np.nanquantile(y_valid.to_numpy(dtype=float), event_q))
+    valid_evt = y.notna() & p.notna()
+    if not bool(valid_evt.any()):
+        return {
+            "directional_accuracy": directional_accuracy,
+            "event_threshold_true_q90": thr,
+            "event_precision": float("nan"),
+            "event_recall": float("nan"),
+            "event_f1": float("nan"),
+        }
+
+    y_evt = (y[valid_evt].to_numpy(dtype=float) >= thr).astype(int)
+    p_evt = (p[valid_evt].to_numpy(dtype=float) >= thr).astype(int)
+    tp = int(((p_evt == 1) & (y_evt == 1)).sum())
+    fp = int(((p_evt == 1) & (y_evt == 0)).sum())
+    fn = int(((p_evt == 0) & (y_evt == 1)).sum())
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
+    f1 = float((2 * precision * recall) / (precision + recall)) if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0 else float("nan")
+    return {
+        "directional_accuracy": directional_accuracy,
+        "event_threshold_true_q90": thr,
+        "event_precision": precision,
+        "event_recall": recall,
+        "event_f1": f1,
+    }
 
 
 def _extract_target_models(payload: Any, target_col: str | None) -> dict[int, dict[str, Any]] | None:
@@ -334,7 +504,20 @@ def _plot_xgb_feature_importance(run_dir: Path, out_path: Path, target_col: str 
 
 def _write_latex_summary_table(summary_df: pd.DataFrame, out_path: Path) -> None:
     table_df = summary_df[
-        ["prediction_column", "truth_column", "mae_mean", "rmse_mean", "pinball_mean", "skill_score_mae_mean"]
+        [
+            "prediction_column",
+            "truth_column",
+            "mae_mean",
+            "rmse_mean",
+            "pinball_mean",
+            "wis_mean",
+            "skill_score_mae_mean",
+            "skill_score_rmse_mean",
+            "average_calibration_error",
+            "sharpness_mean",
+            "directional_accuracy",
+            "event_f1",
+        ]
     ].copy()
     table_df = table_df.rename(
         columns={
@@ -343,7 +526,13 @@ def _write_latex_summary_table(summary_df: pd.DataFrame, out_path: Path) -> None
             "mae_mean": "MAE",
             "rmse_mean": "RMSE",
             "pinball_mean": "Pinball",
+            "wis_mean": "WIS",
             "skill_score_mae_mean": "SkillScore",
+            "skill_score_rmse_mean": "SkillScoreRMSE",
+            "average_calibration_error": "ACE",
+            "sharpness_mean": "Sharpness",
+            "directional_accuracy": "HitRate",
+            "event_f1": "EventF1",
         }
     )
     latex = table_df.to_latex(
@@ -411,6 +600,7 @@ def main() -> None:
 
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
+    coverage_by_prediction: dict[str, pd.DataFrame] = {}
 
     for pred_col, path in sorted(pred_long_paths.items()):
         df = pd.read_parquet(path)
@@ -427,6 +617,10 @@ def main() -> None:
         d = df.copy()
         d["y_true"] = pd.to_numeric(truth_by_ts.reindex(d["target_time_utc"]).values, errors="coerce")
         d["naive_24h"] = _naive_24h_for_target_times(d["target_time_utc"], truth_by_ts)
+        coverage_df = _compute_quantile_coverage(d)
+        coverage_by_prediction[pred_col] = coverage_df
+        ace = _average_calibration_error(coverage_df)
+        evt = _directional_and_event_metrics(d)
 
         metrics_df = _compute_metrics_by_lead(d)
         all_metrics[pred_col] = metrics_df
@@ -437,7 +631,15 @@ def main() -> None:
                 "mae_mean": float(metrics_df["mae"].mean()),
                 "rmse_mean": float(metrics_df["rmse"].mean()),
                 "pinball_mean": float(metrics_df["pinball_mean"].mean()),
+                "wis_mean": float(metrics_df["wis_p10_p50_p90"].mean()),
                 "skill_score_mae_mean": float(metrics_df["skill_score_mae"].mean()),
+                "skill_score_rmse_mean": float(metrics_df["skill_score_rmse"].mean()),
+                "average_calibration_error": ace,
+                "sharpness_mean": float(metrics_df["sharpness_p90_p10"].mean()),
+                "directional_accuracy": evt["directional_accuracy"],
+                "event_precision": evt["event_precision"],
+                "event_recall": evt["event_recall"],
+                "event_f1": evt["event_f1"],
             }
         )
 
@@ -452,12 +654,22 @@ def main() -> None:
                 plots_dir / f"{args.split}_{pred_col}_skill_score_over_horizon.png",
                 title=f"{pred_col} - Forecast Skill Score Over Horizon ({args.split})",
             )
+            _plot_decay_horizon(
+                metrics_df,
+                plots_dir / f"{args.split}_{pred_col}_forecast_decay_metrics.png",
+                title=f"{pred_col} - Forecast Decay (MAE/Pinball/WIS) ({args.split})",
+            )
             _plot_probabilistic_window(
                 d,
                 plots_dir / f"{args.split}_{pred_col}_probabilistic_calibration.png",
                 title=f"{pred_col} - True vs P50 (P10-P90 / P40-P60), highest-volatility 3-day window",
                 lead=args.calibration_lead,
                 window_hours=72,
+            )
+            _plot_reliability_diagram(
+                coverage_df,
+                plots_dir / f"{args.split}_{pred_col}_reliability_diagram.png",
+                title=f"{pred_col} - Reliability Diagram ({args.split})",
             )
 
     target_col = PRED_TO_TARGET.get(selected_pred_col)
@@ -469,6 +681,12 @@ def main() -> None:
 
     for pred_col, mdf in all_metrics.items():
         mdf.to_csv(run_dir / f"{args.split}_{pred_col}_metrics_by_lead.csv", index=False)
+        mdf[["lead_time_h", "mae", "pinball_mean"]].to_csv(
+            run_dir / f"{args.split}_{pred_col}_decay_stats.csv",
+            index=False,
+        )
+    for pred_col, cdf in coverage_by_prediction.items():
+        cdf.to_csv(run_dir / f"{args.split}_{pred_col}_quantile_coverage.csv", index=False)
 
     summary_payload = {
         "run_dir": str(run_dir.resolve()),
@@ -477,6 +695,9 @@ def main() -> None:
         "selected_pred_col": selected_pred_col,
         "feature_importance_plot_created": bool(fi_ok),
         "avg_metrics_by_prediction_column": avg_summary_rows,
+        "quantile_coverage": {
+            k: v.to_dict(orient="records") for k, v in coverage_by_prediction.items()
+        },
     }
     (run_dir / "summary_metrics.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
 

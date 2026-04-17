@@ -915,6 +915,55 @@ class BatteryBacktester:
         pred = self.settle_dispatch(df, dispatch, colmap, predicted_settlement=True)
         real = self.settle_dispatch(df, dispatch, colmap, predicted_settlement=False)
 
+        # Naive-24h benchmark run: y_t_hat := y_{t-24} for predicted market columns.
+        naive_df = df.copy()
+        naive_pairs = [
+            (colmap.pred_da_price, colmap.true_da_price),
+            (colmap.pred_afrr_capacity_price_pos, colmap.true_afrr_capacity_price_pos),
+            (colmap.pred_afrr_capacity_price_neg, colmap.true_afrr_capacity_price_neg),
+            (colmap.pred_afrr_activation_price_pos, colmap.true_afrr_activation_price_pos),
+            (colmap.pred_afrr_activation_price_neg, colmap.true_afrr_activation_price_neg),
+            (colmap.pred_afrr_activation_rate_pos, colmap.true_afrr_activation_rate_pos),
+            (colmap.pred_afrr_activation_rate_neg, colmap.true_afrr_activation_rate_neg),
+        ]
+        naive_plan_history = pd.DataFrame()
+        for pred_col, true_col in naive_pairs:
+            if true_col in naive_df.columns:
+                lagged = pd.to_numeric(naive_df[true_col], errors="coerce").shift(24)
+                fallback = pd.to_numeric(naive_df[pred_col], errors="coerce") if pred_col in naive_df.columns else np.nan
+                naive_df[pred_col] = lagged.fillna(fallback)
+        if use_rolling_horizon:
+            naive_dispatch, naive_plan_history = self.optimize_dispatch_rolling(
+                naive_df,
+                colmap,
+                horizon_hours=horizon_hours,
+                reopt_step_hours=reopt_step_hours,
+                da_gate_hour_utc=da_gate_hour_utc,
+                soc_feedback_mode=soc_feedback_mode,
+                enforce_final_soc_min=enforce_final_soc_min,
+            )
+        else:
+            naive_dispatch = self.optimize_dispatch(
+                naive_df,
+                colmap,
+                soc_start=self.soc_init,
+                soc_end_target=None,
+                soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
+            )
+        naive_real = self.settle_dispatch(df, naive_dispatch, colmap, predicted_settlement=False)
+        naive_real = naive_real.rename(
+            columns={
+                "real_pnl_eur": "naive_pnl_eur",
+                "real_revenue_da_eur": "naive_revenue_da_eur",
+                "real_cost_da_eur": "naive_cost_da_eur",
+                "real_revenue_capacity_eur": "naive_revenue_capacity_eur",
+                "real_revenue_activation_eur": "naive_revenue_activation_eur",
+                "real_transaction_cost_eur": "naive_transaction_cost_eur",
+                "real_degradation_cost_eur": "naive_degradation_cost_eur",
+                "real_soc_mwh": "naive_soc_mwh",
+            }
+        )
+
         # Oracle run: optimize using realized market values as perfect foresight benchmark.
         oracle_df = df.copy()
         oracle_df[colmap.pred_da_price] = oracle_df[colmap.true_da_price]
@@ -960,14 +1009,19 @@ class BatteryBacktester:
             dispatch
             .merge(pred, on=colmap.timestamp, how="left")
             .merge(real, on=colmap.timestamp, how="left")
+            .merge(naive_real, on=colmap.timestamp, how="left")
             .merge(oracle_real, on=colmap.timestamp, how="left")
         )
         hourly = hourly.sort_values(colmap.timestamp).reset_index(drop=True)
 
         hourly["real_cashflow_eur"] = hourly["real_pnl_eur"]
         hourly["pred_cashflow_eur"] = hourly["pred_pnl_eur"]
+        hourly["naive_cashflow_eur"] = hourly["naive_pnl_eur"]
+        hourly["oracle_cashflow_eur"] = hourly["oracle_pnl_eur"]
         hourly["real_cum_cash_eur"] = self.initial_cash + hourly["real_cashflow_eur"].cumsum()
         hourly["pred_cum_cash_eur"] = self.initial_cash + hourly["pred_cashflow_eur"].cumsum()
+        hourly["naive_cum_cash_eur"] = self.initial_cash + hourly["naive_cashflow_eur"].cumsum()
+        hourly["oracle_cum_cash_eur"] = self.initial_cash + hourly["oracle_cashflow_eur"].cumsum()
         hourly["pnl_gap_eur"] = hourly["real_pnl_eur"] - hourly["pred_pnl_eur"]
         hourly["cost_of_forecast_error_eur"] = hourly["oracle_pnl_eur"] - hourly["real_pnl_eur"]
 
@@ -977,13 +1031,22 @@ class BatteryBacktester:
         monthly = aggregate_periodic(hourly, colmap.timestamp, freq="ME")
         yearly = aggregate_periodic(hourly, colmap.timestamp, freq="YE")
         volatility = calculate_volatility(plan_history)
+        naive_volatility = calculate_volatility(naive_plan_history)
 
+        oracle_total = float(hourly["oracle_pnl_eur"].sum())
+        realized_total = float(hourly["real_pnl_eur"].sum())
+        if np.isfinite(oracle_total) and abs(oracle_total) > 1e-9:
+            opportunity_gap_ratio = float((oracle_total - realized_total) / oracle_total)
+        else:
+            opportunity_gap_ratio = float("nan")
         summary = {
             "rows": float(len(hourly)),
             "predicted_total_pnl_eur": float(hourly["pred_pnl_eur"].sum()),
             "realized_total_pnl_eur": float(hourly["real_pnl_eur"].sum()),
+            "naive_total_pnl_eur": float(hourly["naive_pnl_eur"].sum()),
             "oracle_total_pnl_eur": float(hourly["oracle_pnl_eur"].sum()),
             "pnl_gap_total_eur": float(hourly["pnl_gap_eur"].sum()),
+            "economic_opportunity_gap_ratio": opportunity_gap_ratio,
             "cost_of_forecast_error_total_eur": float(hourly["cost_of_forecast_error_eur"].sum()),
             "max_capital_required_eur": float(capital_required),
             "max_hourly_cash_outflow_eur": float(max(0.0, -hourly["real_cashflow_eur"].min())),
@@ -1007,6 +1070,13 @@ class BatteryBacktester:
             summary["decision_volatility_total_flips"] = 0.0
             summary["decision_volatility_mean_flips_per_target"] = 0.0
             summary["decision_volatility_mean_abs_revision_mw"] = 0.0
+        if not naive_volatility.empty:
+            summary["naive_decision_volatility_total_flips"] = float(naive_volatility["action_flips"].sum())
+        else:
+            summary["naive_decision_volatility_total_flips"] = 0.0
+        summary["decision_volatility_vs_naive_delta_flips"] = (
+            float(summary["decision_volatility_total_flips"] - summary["naive_decision_volatility_total_flips"])
+        )
 
         return BacktestOutputs(
             hourly=hourly,
@@ -1030,6 +1100,7 @@ def aggregate_periodic(hourly: pd.DataFrame, timestamp_col: str, freq: str) -> p
 
     out = grouped.agg(
         realized_pnl_eur=("real_pnl_eur", "sum"),
+        naive_pnl_eur=("naive_pnl_eur", "sum"),
         oracle_pnl_eur=("oracle_pnl_eur", "sum"),
         predicted_pnl_eur=("pred_pnl_eur", "sum"),
         pnl_gap_eur=("pnl_gap_eur", "sum"),
@@ -1047,6 +1118,7 @@ def aggregate_periodic(hourly: pd.DataFrame, timestamp_col: str, freq: str) -> p
     ).reset_index()
 
     out["realized_pnl_cum_eur"] = out["realized_pnl_eur"].cumsum()
+    out["naive_pnl_cum_eur"] = out["naive_pnl_eur"].cumsum()
     out["predicted_pnl_cum_eur"] = out["predicted_pnl_eur"].cumsum()
     return out
 

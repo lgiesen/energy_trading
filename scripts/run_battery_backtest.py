@@ -25,6 +25,7 @@ import json
 from pathlib import Path
 import sys
 
+import matplotlib.pyplot as plt
 import pandas as pd
 
 # Allow direct script execution from repository root.
@@ -39,6 +40,35 @@ from energy_trading.simulation.battery_backtest import (
     load_and_align_market_data,
     load_prediction_warehouse_long,
 )
+
+
+def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> None:
+    if hourly.empty:
+        return
+    d = hourly.copy()
+    d[ts_col] = pd.to_datetime(d[ts_col], utc=True, errors="coerce")
+    d = d.dropna(subset=[ts_col]).sort_values(ts_col)
+    required = ["real_pnl_eur", "naive_pnl_eur", "oracle_pnl_eur"]
+    if not set(required).issubset(d.columns):
+        return
+    d["model_cum_pnl_eur"] = pd.to_numeric(d["real_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
+    d["naive_cum_pnl_eur"] = pd.to_numeric(d["naive_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
+    d["oracle_cum_pnl_eur"] = pd.to_numeric(d["oracle_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(d[ts_col], d["model_cum_pnl_eur"], label="Model", linewidth=2)
+    ax.plot(d[ts_col], d["naive_cum_pnl_eur"], label="Naive 24h", linewidth=2)
+    ax.plot(d[ts_col], d["oracle_cum_pnl_eur"], label="Oracle", linewidth=2)
+    ax.set_title("Cumulative PnL Contribution")
+    ax.set_xlabel("Time (UTC)")
+    ax.set_ylabel("Cumulative PnL [EUR]")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
 
 
 def _resolve_out_dir(
@@ -72,7 +102,7 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
             return primary
         return pick(frame, primary, candidates)
 
-    return BacktestColumnMap(
+    mapped = BacktestColumnMap(
         timestamp=pick(pred if colmap.timestamp in pred.columns else truth, colmap.timestamp, ["timestamp", "datetime", "date"]),
 
         pred_da_price=pick_pred(
@@ -94,11 +124,30 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
         true_da_price=pick(truth, colmap.true_da_price, ["da_price_actual", "target_da_price_h1"]),
         true_afrr_capacity_price_pos=pick(truth, colmap.true_afrr_capacity_price_pos, ["target_afrr_capacity_price_pos_h1"]),
         true_afrr_capacity_price_neg=pick(truth, colmap.true_afrr_capacity_price_neg, ["target_afrr_capacity_price_neg_h1"]),
-        true_afrr_activation_price_pos=pick(truth, colmap.true_afrr_activation_price_pos, ["target_afrr_activation_price_vwap_pos_h1"]),
-        true_afrr_activation_price_neg=pick(truth, colmap.true_afrr_activation_price_neg, ["target_afrr_activation_price_vwap_neg_h1"]),
+        true_afrr_activation_price_pos=pick(
+            truth,
+            colmap.true_afrr_activation_price_pos,
+            ["target_afrr_activation_price_vwap_pos_h1", "afrr_activation_price_vwap"],
+        ),
+        true_afrr_activation_price_neg=pick(
+            truth,
+            colmap.true_afrr_activation_price_neg,
+            [
+                "target_afrr_activation_price_vwap_neg_h1",
+                "afrr_activation_price_vwap",
+                "afrr_activation_price_vwap_pos",
+                "target_afrr_activation_price_vwap_pos_h1",
+            ],
+        ),
         true_afrr_activation_rate_pos=pick(truth, colmap.true_afrr_activation_rate_pos, ["afrr_activation_rate", "target_afrr_rate_h1"]),
         true_afrr_activation_rate_neg=pick(truth, colmap.true_afrr_activation_rate_neg, ["afrr_activation_rate", "target_afrr_rate_h1"]),
     )
+    if mapped.true_afrr_activation_price_neg == mapped.true_afrr_activation_price_pos:
+        print(
+            "[WARN] Missing dedicated negative activation-price truth column. "
+            "Using positive activation-price column as fallback for *_neg settlement."
+        )
+    return mapped
 
 
 def parse_args() -> argparse.Namespace:
@@ -282,6 +331,7 @@ def main() -> None:
     monthly_path = out_dir / "backtest_monthly.csv"
     yearly_path = out_dir / "backtest_yearly.csv"
     summary_path = out_dir / "backtest_summary.json"
+    pnl_plot_path = out_dir / "backtest_cumulative_pnl.png"
 
     outputs.hourly.to_parquet(hourly_path, index=False)
     outputs.plan_history.to_parquet(plan_history_path, index=False)
@@ -290,14 +340,17 @@ def main() -> None:
     outputs.monthly.to_csv(monthly_path, index=False)
     outputs.yearly.to_csv(yearly_path, index=False)
     summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+    _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
 
     print("[OK] Battery backtest completed.")
     print(f"- rows: {len(outputs.hourly)}")
     print(f"- realized_total_pnl_eur: {outputs.summary['realized_total_pnl_eur']:.2f}")
     print(f"- oracle_total_pnl_eur: {outputs.summary['oracle_total_pnl_eur']:.2f}")
     print(f"- predicted_total_pnl_eur: {outputs.summary['predicted_total_pnl_eur']:.2f}")
+    print(f"- naive_total_pnl_eur: {outputs.summary['naive_total_pnl_eur']:.2f}")
     print(f"- cost_of_forecast_error_total_eur: {outputs.summary['cost_of_forecast_error_total_eur']:.2f}")
     print(f"- pnl_gap_total_eur: {outputs.summary['pnl_gap_total_eur']:.2f}")
+    print(f"- economic_opportunity_gap_ratio: {outputs.summary['economic_opportunity_gap_ratio']:.4f}")
     print(f"- max_capital_required_eur: {outputs.summary['max_capital_required_eur']:.2f}")
     print(
         "- final_soc: "
@@ -312,6 +365,7 @@ def main() -> None:
     print(f"- monthly: {monthly_path}")
     print(f"- yearly: {yearly_path}")
     print(f"- summary: {summary_path}")
+    print(f"- pnl_contribution_plot: {pnl_plot_path}")
 
 
 if __name__ == "__main__":
