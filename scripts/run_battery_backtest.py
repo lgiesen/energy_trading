@@ -66,24 +66,30 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
                 return c
         raise KeyError(f"Missing required column. Tried: {[primary, *candidates]}")
 
+    def pick_pred(frame: pd.DataFrame, primary: str, candidates: list[str]) -> str:
+        # In long-warehouse mode pred preview can be empty. Keep configured names.
+        if frame.empty:
+            return primary
+        return pick(frame, primary, candidates)
+
     return BacktestColumnMap(
         timestamp=pick(pred if colmap.timestamp in pred.columns else truth, colmap.timestamp, ["timestamp", "datetime", "date"]),
 
-        pred_da_price=pick(
+        pred_da_price=pick_pred(
             pred,
             colmap.pred_da_price,
             ["da_price_pred", "y_pred_da_price", "prediction_da_price", "pred_target_da_price_h1"],
         ),
-        pred_afrr_capacity_price_pos=pick(pred, colmap.pred_afrr_capacity_price_pos, ["afrr_capacity_price_pos_pred", "pred_target_afrr_capacity_price_pos_h1"]),
-        pred_afrr_capacity_price_neg=pick(pred, colmap.pred_afrr_capacity_price_neg, ["afrr_capacity_price_neg_pred", "pred_target_afrr_capacity_price_neg_h1"]),
-        pred_afrr_activation_price_pos=pick(pred, colmap.pred_afrr_activation_price_pos, ["afrr_activation_price_vwap_pos_pred", "pred_target_afrr_activation_price_vwap_pos_h1"]),
-        pred_afrr_activation_price_neg=pick(
+        pred_afrr_capacity_price_pos=pick_pred(pred, colmap.pred_afrr_capacity_price_pos, ["afrr_capacity_price_pos_pred", "pred_target_afrr_capacity_price_pos_h1"]),
+        pred_afrr_capacity_price_neg=pick_pred(pred, colmap.pred_afrr_capacity_price_neg, ["afrr_capacity_price_neg_pred", "pred_target_afrr_capacity_price_neg_h1"]),
+        pred_afrr_activation_price_pos=pick_pred(pred, colmap.pred_afrr_activation_price_pos, ["afrr_activation_price_vwap_pos_pred", "pred_target_afrr_activation_price_vwap_pos_h1"]),
+        pred_afrr_activation_price_neg=pick_pred(
             pred,
             colmap.pred_afrr_activation_price_neg,
             ["afrr_activation_price_vwap_neg_pred", "pred_target_afrr_activation_price_vwap_neg_h1"],
         ),
-        pred_afrr_activation_rate_pos=pick(pred, colmap.pred_afrr_activation_rate_pos, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
-        pred_afrr_activation_rate_neg=pick(pred, colmap.pred_afrr_activation_rate_neg, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
+        pred_afrr_activation_rate_pos=pick_pred(pred, colmap.pred_afrr_activation_rate_pos, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
+        pred_afrr_activation_rate_neg=pick_pred(pred, colmap.pred_afrr_activation_rate_neg, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
 
         true_da_price=pick(truth, colmap.true_da_price, ["da_price_actual", "target_da_price_h1"]),
         true_afrr_capacity_price_pos=pick(truth, colmap.true_afrr_capacity_price_pos, ["target_afrr_capacity_price_pos_h1"]),
@@ -173,6 +179,8 @@ def main() -> None:
 
     out_dir = _resolve_out_dir(args.out_dir, run_id=run_id, split=args.split)
     forecast_warehouse: dict[str, pd.DataFrame] | None = None
+    coverage_min: pd.Timestamp | None = None
+    coverage_max: pd.Timestamp | None = None
 
     if not predictions_path:
         da_long = payload.get("bundles", {}).get("da", {}).get("predictions_long", {}).get(args.split, {})
@@ -182,6 +190,16 @@ def main() -> None:
         if long_map:
             forecast_warehouse = load_prediction_warehouse_long(long_map)
             print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
+            cov_min_list: list[pd.Timestamp] = []
+            cov_max_list: list[pd.Timestamp] = []
+            for wdf in forecast_warehouse.values():
+                t = pd.to_datetime(wdf["target_time_utc"], utc=True, errors="coerce").dropna()
+                if not t.empty:
+                    cov_min_list.append(t.min())
+                    cov_max_list.append(t.max())
+            if cov_min_list and cov_max_list:
+                coverage_min = min(cov_min_list)
+                coverage_max = max(cov_max_list)
         else:
             da_pred = Path(payload["bundles"]["da"]["predictions"][args.split])
             afrr_pred = Path(payload["bundles"]["afrr"]["predictions"][args.split])
@@ -219,7 +237,9 @@ def main() -> None:
         true_afrr_activation_rate_neg=args.true_rate_neg_col,
     )
 
-    colmap = _apply_fallback_column_map(pred_preview, truth_preview, colmap_in) if predictions_path else colmap_in
+    # Always apply fallback mapping, even in long-warehouse mode (pred_preview can
+    # be empty there but truth-side fallbacks are still useful).
+    colmap = _apply_fallback_column_map(pred_preview, truth_preview, colmap_in)
 
     if predictions_path:
         df = load_and_align_market_data(predictions_path, ground_truth_path, colmap)
@@ -229,6 +249,9 @@ def main() -> None:
             df[colmap.timestamp] = df.index
         df[colmap.timestamp] = pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce")
         df = df.dropna(subset=[colmap.timestamp]).sort_values(colmap.timestamp).reset_index(drop=True)
+        # In long-warehouse mode, keep only rows that are covered by forecast targets.
+        if forecast_warehouse and coverage_min is not None and coverage_max is not None:
+            df = df[(df[colmap.timestamp] >= coverage_min) & (df[colmap.timestamp] <= coverage_max)].copy()
     if args.start:
         start = pd.to_datetime(args.start, utc=True)
         df = df[df[colmap.timestamp] >= start].copy()

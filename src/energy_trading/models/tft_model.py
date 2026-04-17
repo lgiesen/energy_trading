@@ -690,7 +690,10 @@ def main() -> None:
         cleanup_lightning_checkpoints=args.cleanup_lightning_checkpoints,
     )
 
-    metrics_path = Path(args.metrics_json_out) if args.metrics_json_out else run_dir / "metrics" / f"{args.bundle}_tft_metrics.json"
+    # Keep metrics path unique per bundle+target to avoid overwrite in target-wise
+    # aFRR training loops (train_and_export_runs.py).
+    default_metrics_path = run_dir / "metrics" / f"{args.bundle}_{metrics['target_col']}_tft_metrics.json"
+    metrics_path = Path(args.metrics_json_out) if args.metrics_json_out else default_metrics_path
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 

@@ -36,6 +36,7 @@ import pandas as pd
 from scipy.optimize import Bounds, LinearConstraint, milp
 
 from energy_trading.config import BATTERY_SPECS, FINANCIAL_PARAMS, MARKET_SPECS, MODEL_SPECS
+from energy_trading.models.train_xgboost_export import calculate_acceptance_probabilities
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ CANONICAL_PREDICTION_COLUMNS = [
     "pred_afrr_activation_rate_pos",
     "pred_afrr_activation_rate_neg",
 ]
+QUANTILE_COLUMNS = [f"p{q:02d}" for q in range(10, 100, 10)]
 
 
 def _coalesce_column(df: pd.DataFrame, candidates: Iterable[str], required: bool = True) -> str | None:
@@ -134,11 +136,14 @@ def load_prediction_warehouse_long(
         missing = required - set(df.columns)
         if missing:
             raise KeyError(f"Long prediction file for {pred_col} is missing columns: {sorted(missing)}")
-        out = df[list(required)].copy()
+        available_quantiles = [c for c in QUANTILE_COLUMNS if c in df.columns]
+        out = df[[*list(required), *available_quantiles]].copy()
         out["snapshot_time_utc"] = pd.to_datetime(out["snapshot_time_utc"], utc=True, errors="coerce")
         out["target_time_utc"] = pd.to_datetime(out["target_time_utc"], utc=True, errors="coerce")
         out["lead_time_h"] = pd.to_numeric(out["lead_time_h"], errors="coerce").astype("Int64")
         out["predicted_value"] = pd.to_numeric(out["predicted_value"], errors="coerce")
+        for qc in available_quantiles:
+            out[qc] = pd.to_numeric(out[qc], errors="coerce")
         out = out.dropna(subset=["snapshot_time_utc", "target_time_utc", "lead_time_h"]).copy()
         out = out.sort_values(["snapshot_time_utc", "lead_time_h", "target_time_utc"]).reset_index(drop=True)
         warehouse[pred_col] = out
@@ -171,6 +176,8 @@ class BatteryBacktester:
 
         self.bid_power_max_mw = float(MARKET_SPECS.get("bid_power_max_mw", self.p_max_mw))
         self.reserve_max_mw = min(self.p_max_mw, self.bid_power_max_mw)
+        # aFRR bid-price bins for expected-value reserve optimization.
+        self.afrr_bid_prices_eur_mwh = np.arange(50.0, 501.0, 50.0, dtype=float)
 
     @staticmethod
     def _clip_rate(x: np.ndarray) -> np.ndarray:
@@ -185,17 +192,33 @@ class BatteryBacktester:
             return 0.0, min(self.p_max_mw, net)
         return min(self.p_max_mw, -net), 0.0
 
-    def _variable_slices(self, n: int) -> dict[str, slice]:
-        # Hourly decisions: charge, discharge, reserve_pos, reserve_neg,
-        # binary is_charging flag, and soc state.
+    def _variable_slices(self, n: int, n_bins: int) -> dict[str, slice]:
+        # Hourly decisions:
+        # - charge/discharge,
+        # - bin-specific reserve offers for pos/neg activation,
+        # - binary is_charging flag,
+        # - soc state.
+        n_r = n * n_bins
         return {
             "ch": slice(0, n),
             "dis": slice(n, 2 * n),
-            "rpos": slice(2 * n, 3 * n),
-            "rneg": slice(3 * n, 4 * n),
-            "u": slice(4 * n, 5 * n),
-            "soc": slice(5 * n, 6 * n + 1),
+            "rpos_bin": slice(2 * n, 2 * n + n_r),
+            "rneg_bin": slice(2 * n + n_r, 2 * n + 2 * n_r),
+            "u": slice(2 * n + 2 * n_r, 3 * n + 2 * n_r),
+            "soc": slice(3 * n + 2 * n_r, 4 * n + 2 * n_r + 1),
         }
+
+    @staticmethod
+    def _quantile_map_from_row(row: pd.Series) -> dict[float, float]:
+        qmap: dict[float, float] = {}
+        for q in range(10, 100, 10):
+            col = f"p{q:02d}"
+            if col not in row.index:
+                continue
+            val = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
+            if pd.notna(val):
+                qmap[q / 100.0] = float(val)
+        return qmap
 
     def optimize_dispatch(
         self,
@@ -207,41 +230,67 @@ class BatteryBacktester:
         soc_end_min_target: float | None = None,
         fixed_da_dispatch: dict[pd.Timestamp, tuple[float, float]] | None = None,
     ) -> pd.DataFrame:
-        """Solve LP on predicted market signals to obtain hourly dispatch."""
+        """Solve LP on predicted market signals to obtain hourly dispatch.
+
+        aFRR reserve offers are optimized over bid-price bins using expected value:
+            sum_j p_acc[j,t] * bid_price[j] * reserve_bin[j,t]
+        """
         n = len(df)
-        sl = self._variable_slices(n)
-        n_vars = 6 * n + 1
+        n_bins = int(len(self.afrr_bid_prices_eur_mwh))
+        sl = self._variable_slices(n, n_bins=n_bins)
+        n_vars = int(sl["soc"].stop)
 
         p_da = pd.to_numeric(df[colmap.pred_da_price], errors="coerce").to_numpy(dtype=float)
         p_cap_pos = pd.to_numeric(df[colmap.pred_afrr_capacity_price_pos], errors="coerce").to_numpy(dtype=float)
         p_cap_neg = pd.to_numeric(df[colmap.pred_afrr_capacity_price_neg], errors="coerce").to_numpy(dtype=float)
-        p_act_pos = pd.to_numeric(df[colmap.pred_afrr_activation_price_pos], errors="coerce").to_numpy(dtype=float)
-        p_act_neg = pd.to_numeric(df[colmap.pred_afrr_activation_price_neg], errors="coerce").to_numpy(dtype=float)
-        r_act_pos = self._clip_rate(pd.to_numeric(df[colmap.pred_afrr_activation_rate_pos], errors="coerce").to_numpy(dtype=float))
-        r_act_neg = self._clip_rate(pd.to_numeric(df[colmap.pred_afrr_activation_rate_neg], errors="coerce").to_numpy(dtype=float))
+        # Fallback acceptance-rate priors (used when no quantile-derived p_acc bins are available).
+        r_act_pos_base = self._clip_rate(
+            pd.to_numeric(df[colmap.pred_afrr_activation_rate_pos], errors="coerce").to_numpy(dtype=float)
+        )
+        r_act_neg_base = self._clip_rate(
+            pd.to_numeric(df[colmap.pred_afrr_activation_rate_neg], errors="coerce").to_numpy(dtype=float)
+        )
+
+        # Acceptance probabilities by price-bin and hour.
+        p_acc_pos = np.zeros((n, n_bins), dtype=float)
+        p_acc_neg = np.zeros((n, n_bins), dtype=float)
+        for b in range(n_bins):
+            c_pos = f"pacc_pos_bin_{b}"
+            c_neg = f"pacc_neg_bin_{b}"
+            if c_pos in df.columns:
+                p_acc_pos[:, b] = self._clip_rate(pd.to_numeric(df[c_pos], errors="coerce").to_numpy(dtype=float))
+            else:
+                p_acc_pos[:, b] = r_act_pos_base
+            if c_neg in df.columns:
+                p_acc_neg[:, b] = self._clip_rate(pd.to_numeric(df[c_neg], errors="coerce").to_numpy(dtype=float))
+            else:
+                p_acc_neg[:, b] = r_act_neg_base
 
         c = np.zeros(n_vars, dtype=float)
 
-        # Objective (maximize predicted margin, linprog minimizes => negate coefficients).
+        # Objective (maximize predicted margin, scipy.milp minimizes => negate coefficients).
+        # Keep DA opportunity-cost structure intact.
         ch_coef = -(p_da / self.eta_in) - self.trans_eur_mwh / self.eta_in - self.deg_eur_mwh
         dis_coef = (p_da * self.eta_out) - self.trans_eur_mwh * self.eta_out - self.deg_eur_mwh
-        rpos_coef = (
-            p_cap_pos
-            + p_act_pos * r_act_pos * self.eta_out
-            - self.trans_eur_mwh * r_act_pos * self.eta_out
-            - self.deg_eur_mwh * r_act_pos
-        )
-        rneg_coef = (
-            p_cap_neg
-            + p_act_neg * r_act_neg / self.eta_in
-            - self.trans_eur_mwh * r_act_neg / self.eta_in
-            - self.deg_eur_mwh * r_act_neg
-        )
-
         c[sl["ch"]] = -ch_coef
         c[sl["dis"]] = -dis_coef
-        c[sl["rpos"]] = -rpos_coef
-        c[sl["rneg"]] = -rneg_coef
+        for b, bid_price in enumerate(self.afrr_bid_prices_eur_mwh):
+            rpos_coef = (
+                p_cap_pos
+                + p_acc_pos[:, b] * bid_price * self.eta_out
+                - self.trans_eur_mwh * p_acc_pos[:, b] * self.eta_out
+                - self.deg_eur_mwh * p_acc_pos[:, b]
+            )
+            rneg_coef = (
+                p_cap_neg
+                + p_acc_neg[:, b] * bid_price / self.eta_in
+                - self.trans_eur_mwh * p_acc_neg[:, b] / self.eta_in
+                - self.deg_eur_mwh * p_acc_neg[:, b]
+            )
+            s_pos = sl["rpos_bin"].start + b * n
+            s_neg = sl["rneg_bin"].start + b * n
+            c[s_pos : s_pos + n] = -rpos_coef
+            c[s_neg : s_neg + n] = -rneg_coef
         # Terminal SoC opportunity value:
         # V_terminal = SoC_T * mean(predicted_DA_price over horizon)
         # scipy.milp minimizes, so we add a negative coefficient on terminal SoC.
@@ -259,8 +308,9 @@ class BatteryBacktester:
             row[sl["soc"].start + t] = -1.0
             row[sl["ch"].start + t] = -self.eta_in
             row[sl["dis"].start + t] = 1.0 / self.eta_out
-            row[sl["rpos"].start + t] = r_act_pos[t] / self.eta_out
-            row[sl["rneg"].start + t] = -self.eta_in * r_act_neg[t]
+            for b in range(n_bins):
+                row[sl["rpos_bin"].start + b * n + t] = p_acc_pos[t, b] / self.eta_out
+                row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * p_acc_neg[t, b]
             a_eq.append(row)
             b_eq.append(-self.aux_mwh)
 
@@ -285,21 +335,24 @@ class BatteryBacktester:
             # charge + reserve_neg <= Pmax
             row = np.zeros(n_vars, dtype=float)
             row[sl["ch"].start + t] = 1.0
-            row[sl["rneg"].start + t] = 1.0
+            for b in range(n_bins):
+                row[sl["rneg_bin"].start + b * n + t] = 1.0
             a_ub.append(row)
             b_ub.append(self.p_max_mw)
 
             # discharge + reserve_pos <= Pmax
             row = np.zeros(n_vars, dtype=float)
             row[sl["dis"].start + t] = 1.0
-            row[sl["rpos"].start + t] = 1.0
+            for b in range(n_bins):
+                row[sl["rpos_bin"].start + b * n + t] = 1.0
             a_ub.append(row)
             b_ub.append(self.p_max_mw)
 
             # reserve_pos + reserve_neg <= reserve_max
             row = np.zeros(n_vars, dtype=float)
-            row[sl["rpos"].start + t] = 1.0
-            row[sl["rneg"].start + t] = 1.0
+            for b in range(n_bins):
+                row[sl["rpos_bin"].start + b * n + t] = 1.0
+                row[sl["rneg_bin"].start + b * n + t] = 1.0
             a_ub.append(row)
             b_ub.append(self.reserve_max_mw)
 
@@ -348,10 +401,10 @@ class BatteryBacktester:
         ub.extend([self.p_max_mw] * n)
         lb.extend([0.0] * n)  # discharge
         ub.extend([self.p_max_mw] * n)
-        lb.extend([0.0] * n)  # reserve pos
-        ub.extend([self.reserve_max_mw] * n)
-        lb.extend([0.0] * n)  # reserve neg
-        ub.extend([self.reserve_max_mw] * n)
+        lb.extend([0.0] * (n * n_bins))  # reserve pos bins
+        ub.extend([self.reserve_max_mw] * (n * n_bins))
+        lb.extend([0.0] * (n * n_bins))  # reserve neg bins
+        ub.extend([self.reserve_max_mw] * (n * n_bins))
         lb.extend([0.0] * n)  # is_charging
         ub.extend([1.0] * n)
         lb.extend([self.soc_min] * (n + 1))  # soc
@@ -381,11 +434,13 @@ class BatteryBacktester:
             raise RuntimeError(f"MIP optimization failed: {sol.message}")
 
         x = sol.x
+        rpos_bin = x[sl["rpos_bin"]].reshape(n_bins, n).T
+        rneg_bin = x[sl["rneg_bin"]].reshape(n_bins, n).T
         out = df[[colmap.timestamp]].copy()
         out["charge_mw"] = x[sl["ch"]]
         out["discharge_mw"] = x[sl["dis"]]
-        out["reserve_pos_mw"] = x[sl["rpos"]]
-        out["reserve_neg_mw"] = x[sl["rneg"]]
+        out["reserve_pos_mw"] = rpos_bin.sum(axis=1)
+        out["reserve_neg_mw"] = rneg_bin.sum(axis=1)
         out["is_charging"] = x[sl["u"]]
         out["soc_lp_mwh"] = x[sl["soc"].start + 1 : sl["soc"].start + n + 1]
         out["predicted_objective_eur"] = -sol.fun
@@ -552,6 +607,64 @@ class BatteryBacktester:
                         if bool(miss.any()):
                             fb_vals = pd.to_numeric(window.loc[miss, colmap.timestamp].map(source[pred_col]), errors="coerce")
                             window.loc[miss, pred_col] = fb_vals.to_numpy()
+
+                    # Build quantile->CDF acceptance bridge for aFRR activation prices.
+                    if pred_col in {colmap.pred_afrr_activation_price_pos, colmap.pred_afrr_activation_price_neg}:
+                        q_cols = [c for c in QUANTILE_COLUMNS if c in sub.columns]
+                        if q_cols:
+                            sub_u = (
+                                sub.drop_duplicates(subset=["target_time_utc"])
+                                .set_index("target_time_utc")
+                                .sort_index()
+                            )
+                            for b, bid_price in enumerate(self.afrr_bid_prices_eur_mwh):
+                                p_acc_vals: list[float] = []
+                                for ts in target_times:
+                                    if ts not in sub_u.index:
+                                        p_acc_vals.append(np.nan)
+                                        continue
+                                    row = sub_u.loc[ts]
+                                    if isinstance(row, pd.DataFrame):
+                                        row = row.iloc[0]
+                                    qmap = self._quantile_map_from_row(row)
+                                    if len(qmap) < 2:
+                                        p_acc_vals.append(np.nan)
+                                        continue
+                                    pacc_df = calculate_acceptance_probabilities(
+                                        quantiles=qmap,
+                                        price_bins=[float(bid_price)],
+                                    )
+                                    p_acc_vals.append(float(pacc_df["p_acc"].iloc[0]))
+                                side = "pos" if pred_col == colmap.pred_afrr_activation_price_pos else "neg"
+                                col = f"pacc_{side}_bin_{b}"
+                                window[col] = pd.to_numeric(pd.Series(p_acc_vals), errors="coerce").to_numpy(dtype=float)
+
+                # Ensure every p_acc bin has a robust fallback from scalar activation-rate predictions.
+                base_pos = self._clip_rate(
+                    pd.to_numeric(window[colmap.pred_afrr_activation_rate_pos], errors="coerce").to_numpy(dtype=float)
+                )
+                base_neg = self._clip_rate(
+                    pd.to_numeric(window[colmap.pred_afrr_activation_rate_neg], errors="coerce").to_numpy(dtype=float)
+                )
+                for b in range(len(self.afrr_bid_prices_eur_mwh)):
+                    c_pos = f"pacc_pos_bin_{b}"
+                    c_neg = f"pacc_neg_bin_{b}"
+                    if c_pos not in window.columns:
+                        window[c_pos] = base_pos
+                    else:
+                        window[c_pos] = (
+                            pd.to_numeric(window[c_pos], errors="coerce")
+                            .fillna(pd.Series(base_pos, index=window.index))
+                            .to_numpy(dtype=float)
+                        )
+                    if c_neg not in window.columns:
+                        window[c_neg] = base_neg
+                    else:
+                        window[c_neg] = (
+                            pd.to_numeric(window[c_neg], errors="coerce")
+                            .fillna(pd.Series(base_neg, index=window.index))
+                            .to_numpy(dtype=float)
+                        )
             else:
                 w_end = min(n, i + horizon_hours)
                 window = df.iloc[i:w_end].copy()
