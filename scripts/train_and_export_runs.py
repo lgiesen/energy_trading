@@ -192,7 +192,7 @@ def main() -> None:
         base_cmd = [
             sys.executable,
             "-m",
-            "src.energy_trading.models.tft_model",
+            "src.energy_trading.models.train_tft_export",
             "--device",
             args.device,
             "--model-name",

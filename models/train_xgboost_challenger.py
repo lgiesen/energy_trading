@@ -1,7 +1,7 @@
 """Phase-2 challenger training: XGBoost + Optuna with Purged CV and PnL objective.
 
 Usage example:
-    ./.venv/bin/python models/train_xgboost.py \
+    ./.venv/bin/python models/train_xgboost_challenger.py \
       --base-dir data/model_input \
       --bundle afrr \
       --target-col target_afrr_activation_price_vwap_pos_h1 \

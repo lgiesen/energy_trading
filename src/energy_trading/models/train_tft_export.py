@@ -531,7 +531,7 @@ def _train_tft(
     trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
     fit_seconds = time.perf_counter() - fit_start
 
-    model_path = model_dir / f"{bundle}_{tgt}_tft_model.ckpt"
+    model_path = model_dir / f"{bundle}_{tgt}_tft_export_model.ckpt"
     trainer.save_checkpoint(str(model_path))
 
     if cleanup_lightning_checkpoints:
