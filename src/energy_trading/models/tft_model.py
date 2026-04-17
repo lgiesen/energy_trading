@@ -556,7 +556,17 @@ def _train_tft(
 
     def _predict(ds: TimeSeriesDataSet) -> pd.DataFrame:
         dl = ds.to_dataloader(train=False, batch_size=batch_size, num_workers=num_workers, pin_memory=False)
-        raw_pred, x = tft.predict(dl, mode="raw", return_x=True)
+        pred_out = tft.predict(dl, mode="raw", return_x=True)
+        # pytorch-forecasting returns a Prediction object in newer versions
+        # (fields: output, x, index, decoder_lengths, y). Keep tuple fallback
+        # for compatibility with older API shapes.
+        if hasattr(pred_out, "output") and hasattr(pred_out, "x"):
+            raw_pred = pred_out.output
+            x = pred_out.x
+        elif isinstance(pred_out, tuple) and len(pred_out) >= 2:
+            raw_pred, x = pred_out[0], pred_out[1]
+        else:
+            raise TypeError(f"Unsupported TFT predict() return type: {type(pred_out)}")
         pred_tensor = raw_pred["prediction"] if isinstance(raw_pred, dict) else raw_pred.prediction
         decoder_idx = x["decoder_time_idx"]
         return _build_long_prediction_table(
