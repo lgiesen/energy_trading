@@ -1,6 +1,6 @@
 {
   "artifact_path": "data/features/all_data_features.parquet",
-  "generated_at_utc": "2026-04-15T10:25:29.150878+00:00",
+  "generated_at_utc": "2026-04-18T11:23:22.098969+00:00",
   "options": {
     "use_forecast_pca": false,
     "forecast_pca_var_threshold": 0.95,
@@ -11,7 +11,7 @@
   "splits": {
     "train_end_exclusive": "2024-01-01T00:00:00+00:00",
     "val_end_exclusive": "2024-07-01T00:00:00+00:00",
-    "test_end_inclusive": "2026-04-15T10:25:29.147683+00:00",
+    "test_end_inclusive": "2026-04-18T11:23:22.097161+00:00",
     "purge_gap_rows": 72
   },
   "bundles": {
@@ -137,6 +137,7 @@
         "renewable_share_forecast_lag_24h",
         "renewable_share_forecast_lag_48h",
         "renewable_share_forecast_lag_168h",
+        "target_afrr_activation_price_vwap_neg_h1",
         "weekday_sin",
         "weekday_cos",
         "is_weekend",
@@ -152,18 +153,13 @@
       "audit_targets": [],
       "feature_quality_report": "data/model_input/da/feature_quality_report.csv",
       "forecast_pca": [],
-      "n_features": 124,
+      "n_features": 125,
       "n_targets": 1,
       "files": {
         "train": "data/model_input/da/train.parquet",
         "val": "data/model_input/da/val.parquet",
         "test": "data/model_input/da/test.parquet"
-      },
-      "canonical_targets_expected": [
-        "target_da_price_h1"
-      ],
-      "missing_targets": [],
-      "is_target_set_complete": true
+      }
     },
     "afrr": {
       "primary_target": "target_afrr_activation_price_vwap_pos_h1",
@@ -529,25 +525,7 @@
         "train": "data/model_input/afrr/train.parquet",
         "val": "data/model_input/afrr/val.parquet",
         "test": "data/model_input/afrr/test.parquet"
-      },
-      "canonical_targets_expected": [
-        "target_afrr_activation_price_vwap_pos_h1",
-        "target_afrr_activation_price_vwap_neg_h1",
-        "target_afrr_rate_h1",
-        "target_afrr_capacity_price_pos_h1",
-        "target_afrr_capacity_price_neg_h1"
-      ],
-      "missing_targets": [],
-      "is_target_set_complete": true
-    }
-  },
-  "model_contract": {
-    "shared_bundle_contract": {
-      "description": "Bundles are model-agnostic and used by both XGBoost and TFT trainers.",
-      "models_using_contract": [
-        "xgboost",
-        "tft"
-      ]
+      }
     }
   }
 }

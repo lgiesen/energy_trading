@@ -1,0 +1,206 @@
+column,missing_count,missing_pct,leading_nan_run_h,trailing_nan_run_h,internal_nan_count,max_internal_gap_h,first_missing_ts,last_missing_ts,refined_missing_count,inherited_vs_introduced,likely_cause
+co2_price,7749,16.842356930165835,7727,22,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,7755.0,"inherited=7749, introduced=0",Mixed pattern; requires manual column-level review
+gas_capacity,676,1.4692777500054337,0,676,0,0,2026-01-31 23:00:00+00:00,2026-03-01 02:00:00+00:00,1444.0,"inherited=676, introduced=0",Tail-only truncation (future-shift target/horizon feature)
+hard_coal_capacity,676,1.4692777500054337,0,676,0,0,2026-01-31 23:00:00+00:00,2026-03-01 02:00:00+00:00,18819.0,"inherited=676, introduced=0",Tail-only truncation (future-shift target/horizon feature)
+lignite_capacity,676,1.4692777500054337,0,676,0,0,2026-01-31 23:00:00+00:00,2026-03-01 02:00:00+00:00,27723.0,"inherited=676, introduced=0",Tail-only truncation (future-shift target/horizon feature)
+pumped_storage_capacity,676,1.4692777500054337,0,676,0,0,2026-01-31 23:00:00+00:00,2026-03-01 02:00:00+00:00,10083.0,"inherited=676, introduced=0",Tail-only truncation (future-shift target/horizon feature)
+solar_capacity,676,1.4692777500054337,0,676,0,0,2026-01-31 23:00:00+00:00,2026-03-01 02:00:00+00:00,1444.0,"inherited=676, introduced=0",Tail-only truncation (future-shift target/horizon feature)
+wind_offshore_capacity,676,1.4692777500054337,0,676,0,0,2026-01-31 23:00:00+00:00,2026-03-01 02:00:00+00:00,27723.0,"inherited=676, introduced=0",Tail-only truncation (future-shift target/horizon feature)
+wind_onshore_capacity,676,1.4692777500054337,0,676,0,0,2026-01-31 23:00:00+00:00,2026-03-01 02:00:00+00:00,1444.0,"inherited=676, introduced=0",Tail-only truncation (future-shift target/horizon feature)
+load_actual_entsoe_lag_168h,168,0.36514594970549236,168,0,0,0,2020-11-30 01:00:00+00:00,2020-12-07 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+wind_onshore_actual_entsoe_lag_168h,168,0.36514594970549236,168,0,0,0,2020-11-30 01:00:00+00:00,2020-12-07 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activation_price_vwap_neg_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_price_vwap_pos_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_da_price_spread_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_price_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+da_price_pit_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+da_spread_de_at_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_spread_de_fr_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_spread_de_nl_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+renewable_share_forecast_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+residual_load_forecast_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_forecast_id_entsoe_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_offshore_forecast_id_entsoe_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_forecast_id_entsoe_lag_168h,166,0.36079897411376033,166,0,0,0,2020-11-30 01:00:00+00:00,2020-12-06 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_offered_mw_neg_lag_24h,70,0.15214414571062185,22,0,48,24,2020-11-30 01:00:00+00:00,2021-11-30 22:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_pos_lag_24h,70,0.15214414571062185,22,0,48,24,2020-11-30 01:00:00+00:00,2021-11-30 22:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_neg_lag_12h,58,0.12606229216022952,10,0,48,24,2020-11-30 01:00:00+00:00,2021-11-30 10:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_pos_lag_12h,58,0.12606229216022952,10,0,48,24,2020-11-30 01:00:00+00:00,2021-11-30 10:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_neg_lag_6h,52,0.11302136538503336,4,0,48,24,2020-11-30 01:00:00+00:00,2021-11-30 04:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_pos_lag_6h,52,0.11302136538503336,4,0,48,24,2020-11-30 01:00:00+00:00,2021-11-30 04:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_neg_lag_1h,51,0.11084787758916734,0,3,48,24,2021-06-23 19:00:00+00:00,2026-03-01 02:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_pos_lag_1h,51,0.11084787758916734,0,3,48,24,2021-06-23 19:00:00+00:00,2026-03-01 02:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_neg_lag_2h,50,0.10867438979330131,0,2,48,24,2021-06-23 20:00:00+00:00,2026-03-01 02:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_neg_lag_3h,50,0.10867438979330131,1,1,48,24,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_pos_lag_2h,50,0.10867438979330131,0,2,48,24,2021-06-23 20:00:00+00:00,2026-03-01 02:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activation_offered_mw_pos_lag_3h,50,0.10867438979330131,1,1,48,24,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Inherited source gap(s) inside series
+load_actual_entsoe_lag_48h,48,0.10432741420156927,48,0,0,0,2020-11-30 01:00:00+00:00,2020-12-02 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+wind_onshore_actual_entsoe_lag_48h,48,0.10432741420156927,48,0,0,0,2020-11-30 01:00:00+00:00,2020-12-02 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activation_price_vwap_neg_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_price_vwap_pos_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_da_price_spread_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_price_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+da_price_pit_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+da_spread_de_at_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_spread_de_fr_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_spread_de_nl_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+renewable_share_forecast_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+residual_load_forecast_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_forecast_id_entsoe_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_offshore_forecast_id_entsoe_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_forecast_id_entsoe_lag_48h,46,0.0999804386098372,46,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+gas_price,45,0.09780695081397117,23,22,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,51.0,"inherited=45, introduced=0",Mixed pattern; requires manual column-level review
+wind_total_error_da_lag_24h,25,0.054337194896650655,22,0,3,1,2020-11-30 01:00:00+00:00,2025-10-26 22:00:00+00:00,,,Inherited source gap(s) inside series
+afrr_activated_mw_neg_lag_24h,24,0.052163707100784634,24,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_pos_lag_24h,24,0.052163707100784634,24,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+load_actual_entsoe_diff24,24,0.052163707100784634,24,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+load_actual_entsoe_lag_24h,24,0.052163707100784634,24,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+load_mae_rolling_72h,24,0.052163707100784634,24,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 00:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+wind_onshore_actual_entsoe_lag_24h,24,0.052163707100784634,24,0,0,0,2020-11-30 01:00:00+00:00,2020-12-01 00:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+NRV_balance_lag_24h,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activation_price_vwap_neg_lag_24h,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_price_vwap_pos_lag_24h,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_rate_lag_24h,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+coal_price,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,51.0,"inherited=23, introduced=0",Head-only warmup (lag/rolling initialization)
+da_price_volatility_30d,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+mfrr_activated_mw_neg_lag_24h,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_pos_lag_24h,23,0.0499902193049186,23,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 23:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_da_price_spread_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_price_diff24,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+da_price_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+da_price_pit_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+da_spread_de_at_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_spread_de_fr_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_spread_de_nl_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+grid_stress_index_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+is_activated_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+mfrr_active_lag_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+mfrr_mari_net_mw_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_quantile_5_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_zscore_24h_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+renewable_share_forecast_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+residual_load_forecast_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_error_da_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_forecast_id_entsoe_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_forecast_update_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+system_stress_signal_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_forecast_update_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_offshore_forecast_id_entsoe_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_error_da_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_forecast_id_entsoe_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_forecast_update_lag_24h,22,0.04781673150905258,22,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 22:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_price_BE,20,0.043469755917320524,0,0,20,20,2025-09-30 02:00:00+00:00,2025-09-30 21:00:00+00:00,24.0,"inherited=20, introduced=0",Unexpected for DA price; check ingestion alignment
+wind_total_error_da_lag_12h,13,0.02825534134625834,10,0,3,1,2020-11-30 01:00:00+00:00,2025-10-26 10:00:00+00:00,,,Inherited source gap(s) inside series
+NRV_balance_lag_12h,11,0.02390836575452629,11,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 11:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_neg_lag_12h,11,0.02390836575452629,11,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 11:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_pos_lag_12h,11,0.02390836575452629,11,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 11:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_neg_lag_12h,11,0.02390836575452629,11,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 11:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_pos_lag_12h,11,0.02390836575452629,11,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 11:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activation_price_vwap_neg_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_price_vwap_pos_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_rate_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_da_price_spread_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_price_pit_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+grid_stress_index_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+is_activated_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+mfrr_active_lag_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+mfrr_mari_net_mw_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_quantile_5_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_zscore_24h_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+solar_error_da_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_forecast_update_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+system_stress_signal_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_forecast_update_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_error_da_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_forecast_update_lag_12h,10,0.021734877958660262,10,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 10:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_total_error_da_lag_6h,7,0.015214414571062184,4,0,3,1,2020-11-30 01:00:00+00:00,2025-10-26 04:00:00+00:00,,,Inherited source gap(s) inside series
+NRV_balance_lag_6h,5,0.010867438979330131,5,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 05:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_neg_lag_6h,5,0.010867438979330131,5,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 05:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_pos_lag_6h,5,0.010867438979330131,5,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 05:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_neg_lag_6h,5,0.010867438979330131,5,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 05:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_pos_lag_6h,5,0.010867438979330131,5,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 05:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activation_price_vwap_neg_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_price_vwap_pos_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_rate_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_da_price_spread_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_price_pit_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+grid_stress_index_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+is_activated_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+mfrr_active_lag_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+mfrr_mari_net_mw_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_quantile_5_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_zscore_24h_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+solar_error_da_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_forecast_update_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+system_stress_signal_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_forecast_update_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_error_da_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_forecast_update_lag_6h,4,0.008693951183464105,4,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 04:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_total_error_da_lag_1h,4,0.008693951183464105,1,0,3,1,2020-11-30 01:00:00+00:00,2025-10-26 01:00:00+00:00,,,Inherited source gap(s) inside series
+wind_total_error_da_lag_3h,4,0.008693951183464105,1,0,3,1,2020-11-30 01:00:00+00:00,2025-10-26 01:00:00+00:00,,,Inherited source gap(s) inside series
+NRV_balance_lag_4h,3,0.006520463387598079,3,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 03:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_neg_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_neg_lag_2h,3,0.006520463387598079,1,2,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_neg_lag_3h,3,0.006520463387598079,2,1,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_pos_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_pos_lag_2h,3,0.006520463387598079,1,2,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activated_mw_pos_lag_3h,3,0.006520463387598079,2,1,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_capacity_awarded_mw_neg_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_awarded_mw_pos_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_offered_mw_neg_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_offered_mw_pos_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+mfrr_activated_mw_neg_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_neg_lag_2h,3,0.006520463387598079,1,2,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_neg_lag_3h,3,0.006520463387598079,2,1,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_pos_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_pos_lag_2h,3,0.006520463387598079,1,2,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_activated_mw_pos_lag_3h,3,0.006520463387598079,2,1,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+mfrr_mari_net_mw_lag_1h,3,0.006520463387598079,0,3,0,0,2026-03-01 00:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+wind_onshore_actual_entsoe_std_168h_lag_2h,3,0.006520463387598079,3,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 03:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+wind_onshore_actual_entsoe_std_24h_lag_2h,3,0.006520463387598079,3,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 03:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+wind_total_error_da_lag_2h,3,0.006520463387598079,0,0,3,1,2023-10-29 00:00:00+00:00,2025-10-26 00:00:00+00:00,,,Inherited source gap(s) inside series
+NRV_balance_lag_3h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_capacity_awarded_mw_neg_lag_2h,2,0.0043469755917320526,0,2,0,0,2026-03-01 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_awarded_mw_pos_lag_2h,2,0.0043469755917320526,0,2,0,0,2026-03-01 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_offered_mw_neg_lag_2h,2,0.0043469755917320526,0,2,0,0,2026-03-01 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_offered_mw_pos_lag_2h,2,0.0043469755917320526,0,2,0,0,2026-03-01 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+load_error_da_lag_2h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+mfrr_mari_net_mw_lag_2h,2,0.0043469755917320526,0,2,0,0,2026-03-01 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+mfrr_mari_net_mw_lag_3h,2,0.0043469755917320526,1,1,0,0,2020-11-30 01:00:00+00:00,2026-03-01 02:00:00+00:00,,,Mixed pattern; requires manual column-level review
+nrv_quantile_5_lag_4h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_zscore_24h_lag_4h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+solar_error_id_lag_2h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_offshore_error_id_lag_2h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_actual_entsoe_mean_168h_lag_2h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+wind_onshore_actual_entsoe_mean_24h_lag_2h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+wind_onshore_error_id_lag_2h,2,0.0043469755917320526,2,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 02:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+NRV_balance_lag_2h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+afrr_activation_price_vwap_neg_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_price_vwap_pos_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_activation_rate_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+afrr_capacity_awarded_mw_neg_lag_3h,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_awarded_mw_pos_lag_3h,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_offered_mw_neg_lag_3h,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_capacity_offered_mw_pos_lag_3h,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+afrr_da_price_spread_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+da_price_pit_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Unexpected for DA price; check ingestion alignment
+grid_stress_index_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+is_activated_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+load_actual_entsoe_diff1,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,PiT lag layer or source latency (head NaNs expected)
+load_actual_entsoe_std_168h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+load_actual_entsoe_std_24h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+mfrr_active_lag_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_quantile_5_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+nrv_zscore_24h_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Rolling/statistical warmup window introduces head NaNs
+solar_error_da_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+solar_forecast_update_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+system_stress_signal_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+target_afrr_activation_price_vwap_neg_h1,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+target_afrr_activation_price_vwap_pos_h1,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+target_afrr_capacity_price_neg_h1,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+target_afrr_capacity_price_pos_h1,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+target_afrr_rate_h1,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+target_da_price_h1,1,0.0021734877958660263,0,1,0,0,2026-03-01 02:00:00+00:00,2026-03-01 02:00:00+00:00,,,Tail-only truncation (future-shift target/horizon feature)
+wind_forecast_update_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_error_da_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)
+wind_onshore_forecast_update_lag_3h,1,0.0021734877958660263,1,0,0,0,2020-11-30 01:00:00+00:00,2020-11-30 01:00:00+00:00,,,Head-only warmup (lag/rolling initialization)

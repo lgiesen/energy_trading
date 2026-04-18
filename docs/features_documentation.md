@@ -185,8 +185,13 @@ Interpretationshinweis:
 ### Beobachtete Imputationen (letzter Bundle-Run)
 
 Die operative Imputation in `prepare_ml_bundles.py` erfolgt auf `X` je Split
-mit `ffill(limit=12)` und anschließendem train-fitted Median-Fallback. Die
-folgenden Spalten wurden im letzten Lauf tatsächlich betroffen geloggt:
+mit `ffill(limit=12)` und anschließendem train-fitted Median-Fallback. Bereits
+in `handle_missing_values.py` gelten folgende Spezialfälle:
+- Commodity-Preise (`co2_price`, `gas_price`, `coal_price`): `ffill()` ohne Limit
+  plus `bfill()` nur für verbleibende führende Startlücken
+- Strukturkapazitäten (`*_capacity`): `ffill()` ohne Limit
+- `da_price_BE`: Fallback auf exakt gleichen UTC-Stundenwert des Vortags (`t-24h`)
+Die folgenden Spalten wurden im letzten Lauf tatsächlich betroffen geloggt:
 
 | Bundle / Split | Betroffene Spalten (Auszug)                                                                                                                                                                                                                                                                                                                                                                                                                                          | Methode                                                            |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |

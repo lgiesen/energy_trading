@@ -93,6 +93,44 @@ def _impute_forecasts(series: pd.Series) -> tuple[pd.Series, int]:
     return s_out, max(0, before - after)
 
 
+def _impute_co2_price(series: pd.Series) -> tuple[pd.Series, int]:
+    """Special policy for CO2 commodity price.
+
+    Use unlimited forward-fill to keep the latest known traded quote available.
+    Then backward-fill only the remaining leading gap to remove startup NaNs.
+    """
+    s = pd.to_numeric(series, errors="coerce").copy()
+    before = int(s.isna().sum())
+    s_out = s.ffill()
+    if s_out.isna().any():
+        # After unlimited ffill, any remaining NaNs are at the series start.
+        # Fill that leading block from the first observed quote.
+        s_out = s_out.bfill()
+    after = int(s_out.isna().sum())
+    return s_out, max(0, before - after)
+
+
+def _impute_unlimited_ffill(series: pd.Series) -> tuple[pd.Series, int]:
+    """Generic causal imputation via unlimited forward fill."""
+    s = pd.to_numeric(series, errors="coerce").copy()
+    before = int(s.isna().sum())
+    s_out = s.ffill()
+    after = int(s_out.isna().sum())
+    return s_out, max(0, before - after)
+
+
+def _impute_prev_day_same_hour(series: pd.Series) -> tuple[pd.Series, int]:
+    """Fill NaNs from the same UTC hour on the previous day (t-24h)."""
+    s = pd.to_numeric(series, errors="coerce").copy()
+    before = int(s.isna().sum())
+    s_out = s.copy()
+    mask = s_out.isna()
+    if mask.any():
+        s_out.loc[mask] = s_out.shift(24).loc[mask]
+    after = int(s_out.isna().sum())
+    return s_out, max(0, before - after)
+
+
 def _strip_warmup_rows(pdf: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Strip leading warmup rows caused by lag/rolling feature construction."""
     warmup_patterns = (
@@ -268,6 +306,50 @@ def clean(df: pl.DataFrame) -> pl.DataFrame:
         s, n = _impute_forecasts(pdf[c])
         pdf[c] = s
         imputation_counts[c] = n
+
+    # Commodity exceptions: use unlimited carry-forward and then close any
+    # remaining leading startup gaps via backward fill.
+    for commodity_col in ("co2_price", "gas_price", "coal_price"):
+        if commodity_col not in pdf.columns:
+            continue
+        s, n = _impute_co2_price(pdf[commodity_col])
+        pdf[commodity_col] = s
+        # Merge with prior category-B count if present.
+        imputation_counts[commodity_col] = int(imputation_counts.get(commodity_col, 0) + n)
+        remaining = int(pd.to_numeric(pdf[commodity_col], errors="coerce").isna().sum())
+        LOGGER.info(
+            "[impute][special] %s: ffill_plus_leading_bfill_added=%s remaining_after_special=%s",
+            commodity_col,
+            n,
+            remaining,
+        )
+
+    # Capacity structural features: unlimited carry-forward is causal and stable.
+    capacity_cols = [c for c in pdf.columns if c.lower().endswith("_capacity")]
+    for c in capacity_cols:
+        s, n = _impute_unlimited_ffill(pdf[c])
+        pdf[c] = s
+        imputation_counts[c] = int(imputation_counts.get(c, 0) + n)
+        remaining = int(pd.to_numeric(pdf[c], errors="coerce").isna().sum())
+        if n > 0:
+            LOGGER.info(
+                "[impute][special] %s: unlimited_ffill_added=%s remaining_after_special=%s",
+                c,
+                n,
+                remaining,
+            )
+
+    # Cross-border DA fallback: use previous-day same-hour value for small/isolated gaps.
+    if "da_price_BE" in pdf.columns:
+        s, n = _impute_prev_day_same_hour(pdf["da_price_BE"])
+        pdf["da_price_BE"] = s
+        imputation_counts["da_price_BE"] = int(imputation_counts.get("da_price_BE", 0) + n)
+        remaining = int(pd.to_numeric(pdf["da_price_BE"], errors="coerce").isna().sum())
+        LOGGER.info(
+            "[impute][special] da_price_BE: prev_day_same_hour_added=%s remaining_after_special=%s",
+            n,
+            remaining,
+        )
 
     # Category D
     for c in rare_event_cols:

@@ -122,6 +122,75 @@ Notes:
 - run this command on your local machine terminal, not in the remote server shell.
 - prefer an SSH alias in `~/.ssh/config` (for example `uni-gpu`) to avoid repeatedly typing host/IP.
 
+### Phase 3b: Final Thesis Repro Run (One Scripted Flow)
+
+For the final supervisor handover, run the full sequence once and keep both
+model run IDs (`xgboost` and `tft`) in text files.
+
+```bash
+set -euo pipefail
+
+# 1) Build canonical features and bundles (includes latest target definitions)
+./.venv/bin/python scripts/run_full_pipeline.py \
+  --start 2020-11-30T23:00:00Z \
+  --end 2026-03-01T02:00:00Z \
+  --verify-lags
+
+./.venv/bin/python -m src.energy_trading.models.prepare_ml_bundles \
+  --input data/features/all_data_features.parquet \
+  --output-dir data/model_input \
+  --doc-path docs/features_documentation.md \
+  --scaler-out models/preprocessing/scaler.joblib
+
+# 2) Train XGBoost run (DA + aFRR)
+./.venv/bin/python scripts/train_and_export_runs.py \
+  --model-type xgboost \
+  --base-dir data/model_input \
+  --device cuda \
+  --n-estimators 500 \
+  --max-depth 6 \
+  --learning-rate 0.05 \
+  --early-stopping-rounds 50 \
+  --forecast-horizon-hours 48 \
+  --seed 42
+
+./.venv/bin/python - <<'PY'
+import json, pathlib
+latest = json.loads(pathlib.Path("artifacts/model_runs/latest.json").read_text())
+run_id = latest["run_id"]
+pathlib.Path("artifacts/model_runs/latest_xgboost_run_id.txt").write_text(run_id + "\n")
+print("XGBoost run_id:", run_id)
+PY
+
+# 3) Train TFT run (DA + aFRR)
+# Recommended for constrained server / shm issues: --num-workers 0
+./.venv/bin/python scripts/train_and_export_runs.py \
+  --model-type tft \
+  --base-dir data/model_input \
+  --device cuda \
+  --forecast-horizon-hours 48 \
+  --seed 42 \
+  --num-workers 0
+
+./.venv/bin/python - <<'PY'
+import json, pathlib
+latest = json.loads(pathlib.Path("artifacts/model_runs/latest.json").read_text())
+run_id = latest["run_id"]
+pathlib.Path("artifacts/model_runs/latest_tft_run_id.txt").write_text(run_id + "\n")
+print("TFT run_id:", run_id)
+PY
+```
+
+Why this is the recommended "final" path:
+- identical data snapshot and bundle schema for both model families,
+- deterministic split policy from `prepare_ml_bundles`,
+- explicit run IDs persisted for audit/reproduction.
+
+When an aFRR-only rerun is acceptable:
+- only for quick regression checks after aFRR-target changes,
+- not as final thesis baseline comparison (for final results, rerun both
+  model families from the same data/bundle state).
+
 ### Phase 4: Simulation from Run Manifest
 
 Purpose:
@@ -342,6 +411,19 @@ Run strict linear processing chain manually:
   --in data/processed/all_data_transformed.parquet \
   --out data/features/all_data_features.parquet
 ```
+
+Missingness note:
+- `handle_missing_values.py` applies category-based imputation first.
+- Commodity prices `co2_price`, `gas_price`, `coal_price` have explicit special
+  rules: unlimited `ffill()` plus leading-gap `bfill()` to ensure no startup
+  NaNs remain.
+- Capacity columns (`*_capacity`) use unlimited `ffill()` due to their
+  structural/slow-moving nature.
+- `da_price_BE` uses a deterministic fallback from the previous day at the same
+  UTC hour (`t-24h`) for missing timestamps.
+- Remaining leading NaNs before first quote availability are intentionally kept
+  at this stage and later resolved in bundle creation via train-fitted median
+  fallback (`prepare_ml_bundles.py`).
 
 ---
 
