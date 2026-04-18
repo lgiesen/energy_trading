@@ -183,6 +183,26 @@ class BatteryBacktester:
     def _clip_rate(x: np.ndarray) -> np.ndarray:
         return np.clip(np.nan_to_num(x, nan=0.0), 0.0, 1.0)
 
+    @staticmethod
+    def _finite_numeric_series(
+        frame: pd.DataFrame,
+        primary_col: str,
+        *,
+        fallback_cols: list[str] | None = None,
+        default: float = 0.0,
+    ) -> pd.Series:
+        """Return a finite numeric series using ordered fallbacks and safe fills."""
+        vals = pd.to_numeric(frame.get(primary_col), errors="coerce")
+        if vals is None:
+            vals = pd.Series(index=frame.index, dtype="float64")
+        vals = vals.astype("float64")
+        for c in (fallback_cols or []):
+            if c in frame.columns:
+                vals = vals.fillna(pd.to_numeric(frame[c], errors="coerce"))
+        vals = vals.replace([np.inf, -np.inf], np.nan)
+        vals = vals.ffill().bfill().fillna(float(default))
+        return vals
+
     def _normalize_da_bid(self, charge_mw: float, discharge_mw: float) -> tuple[float, float]:
         """Project DA bid pair to a single net direction to avoid binary lock conflicts."""
         ch = max(0.0, float(charge_mw))
@@ -240,15 +260,40 @@ class BatteryBacktester:
         sl = self._variable_slices(n, n_bins=n_bins)
         n_vars = int(sl["soc"].stop)
 
-        p_da = pd.to_numeric(df[colmap.pred_da_price], errors="coerce").to_numpy(dtype=float)
-        p_cap_pos = pd.to_numeric(df[colmap.pred_afrr_capacity_price_pos], errors="coerce").to_numpy(dtype=float)
-        p_cap_neg = pd.to_numeric(df[colmap.pred_afrr_capacity_price_neg], errors="coerce").to_numpy(dtype=float)
+        p_da = self._finite_numeric_series(
+            df,
+            colmap.pred_da_price,
+            fallback_cols=[colmap.true_da_price],
+            default=0.0,
+        ).to_numpy(dtype=float)
+        p_cap_pos = self._finite_numeric_series(
+            df,
+            colmap.pred_afrr_capacity_price_pos,
+            fallback_cols=[colmap.pred_afrr_capacity_price_neg, colmap.true_afrr_capacity_price_pos],
+            default=0.0,
+        ).to_numpy(dtype=float)
+        p_cap_neg = self._finite_numeric_series(
+            df,
+            colmap.pred_afrr_capacity_price_neg,
+            fallback_cols=[colmap.pred_afrr_capacity_price_pos, colmap.true_afrr_capacity_price_neg],
+            default=0.0,
+        ).to_numpy(dtype=float)
         # Fallback acceptance-rate priors (used when no quantile-derived p_acc bins are available).
         r_act_pos_base = self._clip_rate(
-            pd.to_numeric(df[colmap.pred_afrr_activation_rate_pos], errors="coerce").to_numpy(dtype=float)
+            self._finite_numeric_series(
+                df,
+                colmap.pred_afrr_activation_rate_pos,
+                fallback_cols=[colmap.pred_afrr_activation_rate_neg, colmap.true_afrr_activation_rate_pos],
+                default=0.0,
+            ).to_numpy(dtype=float)
         )
         r_act_neg_base = self._clip_rate(
-            pd.to_numeric(df[colmap.pred_afrr_activation_rate_neg], errors="coerce").to_numpy(dtype=float)
+            self._finite_numeric_series(
+                df,
+                colmap.pred_afrr_activation_rate_neg,
+                fallback_cols=[colmap.pred_afrr_activation_rate_pos, colmap.true_afrr_activation_rate_neg],
+                default=0.0,
+            ).to_numpy(dtype=float)
         )
 
         # Acceptance probabilities by price-bin and hour.
@@ -297,6 +342,12 @@ class BatteryBacktester:
         da_ref = pd.Series(p_da).dropna()
         ref_da_price = float(da_ref.mean()) if not da_ref.empty else 0.0
         c[sl["soc"].start + n] = -ref_da_price
+        if not np.isfinite(c).all():
+            bad = np.where(~np.isfinite(c))[0]
+            raise ValueError(
+                "Non-finite objective coefficients detected in MILP objective vector "
+                f"(count={len(bad)}). Check prediction coverage/fallback mapping."
+            )
 
         a_eq = []
         b_eq = []
@@ -638,6 +689,45 @@ class BatteryBacktester:
                                 side = "pos" if pred_col == colmap.pred_afrr_activation_price_pos else "neg"
                                 col = f"pacc_{side}_bin_{b}"
                                 window[col] = pd.to_numeric(pd.Series(p_acc_vals), errors="coerce").to_numpy(dtype=float)
+
+                # Ensure required prediction columns are finite even if some long files are absent.
+                # Ordered fallbacks: paired prediction column -> truth-side column.
+                pred_fallbacks: dict[str, list[str]] = {
+                    colmap.pred_da_price: [colmap.true_da_price],
+                    colmap.pred_afrr_capacity_price_pos: [
+                        colmap.pred_afrr_capacity_price_neg,
+                        colmap.true_afrr_capacity_price_pos,
+                    ],
+                    colmap.pred_afrr_capacity_price_neg: [
+                        colmap.pred_afrr_capacity_price_pos,
+                        colmap.true_afrr_capacity_price_neg,
+                    ],
+                    colmap.pred_afrr_activation_price_pos: [
+                        colmap.pred_afrr_activation_price_neg,
+                        colmap.true_afrr_activation_price_pos,
+                    ],
+                    colmap.pred_afrr_activation_price_neg: [
+                        colmap.pred_afrr_activation_price_pos,
+                        colmap.true_afrr_activation_price_neg,
+                    ],
+                    colmap.pred_afrr_activation_rate_pos: [
+                        colmap.pred_afrr_activation_rate_neg,
+                        colmap.true_afrr_activation_rate_pos,
+                    ],
+                    colmap.pred_afrr_activation_rate_neg: [
+                        colmap.pred_afrr_activation_rate_pos,
+                        colmap.true_afrr_activation_rate_neg,
+                    ],
+                }
+                for pred_col, fallbacks in pred_fallbacks.items():
+                    if pred_col not in window.columns:
+                        window[pred_col] = np.nan
+                    window[pred_col] = self._finite_numeric_series(
+                        window,
+                        pred_col,
+                        fallback_cols=[c for c in fallbacks if c in window.columns],
+                        default=0.0,
+                    ).to_numpy(dtype=float)
 
                 # Ensure every p_acc bin has a robust fallback from scalar activation-rate predictions.
                 base_pos = self._clip_rate(

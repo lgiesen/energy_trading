@@ -2,6 +2,7 @@
 
 Target design (explicit h+1 naming):
 - `target_afrr_activation_price_vwap_pos_h1`: next-hour positive aFRR activation-price VWAP target.
+- `target_afrr_activation_price_vwap_neg_h1`: next-hour negative aFRR activation-price VWAP target.
 - `target_da_price_h1`: next-hour DA price target.
 - `target_afrr_rate_h1`: next-hour aFRR activation-rate target.
 - `target_afrr_capacity_price_pos_h1`: next-hour positive aFRR capacity-price target.
@@ -244,11 +245,13 @@ def apply_point_in_time_lag_layer(df: pl.DataFrame) -> pl.DataFrame:
     protected = {
         "timestamp_utc",
         "__target_source_afrr_activation_price_vwap_pos",
+        "__target_source_afrr_activation_price_vwap_neg",
         "__target_source_da_price",
         "__target_source_afrr_rate",
         "__target_source_afrr_capacity_price_pos",
         "__target_source_afrr_capacity_price_neg",
         "target_afrr_activation_price_vwap_pos_h1",
+        "target_afrr_activation_price_vwap_neg_h1",
         "target_da_price_h1",
         "target_afrr_rate_h1",
         "target_afrr_capacity_price_pos_h1",
@@ -457,6 +460,7 @@ def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
     """Create explicit h+1 targets and drop temporary unlagged target sources."""
     required = {
         "__target_source_afrr_activation_price_vwap_pos",
+        "__target_source_afrr_activation_price_vwap_neg",
         "__target_source_da_price",
         "__target_source_afrr_rate",
         "__target_source_afrr_capacity_price_pos",
@@ -468,6 +472,7 @@ def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
 
     out = df.with_columns([
         pl.col("__target_source_afrr_activation_price_vwap_pos").shift(-1).alias("target_afrr_activation_price_vwap_pos_h1"),
+        pl.col("__target_source_afrr_activation_price_vwap_neg").shift(-1).alias("target_afrr_activation_price_vwap_neg_h1"),
         pl.col("__target_source_da_price").shift(-1).alias("target_da_price_h1"),
         pl.col("__target_source_afrr_rate").shift(-1).alias("target_afrr_rate_h1"),
         pl.col("__target_source_afrr_capacity_price_pos").shift(-1).alias("target_afrr_capacity_price_pos_h1"),
@@ -488,14 +493,15 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
 
     Outputs created:
     - `__target_source_afrr_activation_price_vwap_pos`
+    - `__target_source_afrr_activation_price_vwap_neg`
     - `__target_source_da_price`
     - `__target_source_afrr_rate`
     - `__target_source_afrr_capacity_price_pos`
     - `__target_source_afrr_capacity_price_neg`
     """
-    # Thesis target policy: enforce explicit positive-direction activation VWAP
-    # as the sole source for target_afrr_activation_price_vwap_pos_h1.
+    # Activation-price targets are built separately for positive and negative sides.
     pos_price_col = "afrr_activation_price_vwap_pos" if "afrr_activation_price_vwap_pos" in df.columns else None
+    neg_price_col = "afrr_activation_price_vwap_neg" if "afrr_activation_price_vwap_neg" in df.columns else None
 
     pos_act_col = (
         "afrr_activated_mwh_pos"
@@ -510,8 +516,12 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     missing = []
     if pos_price_col is None:
         missing.append("afrr activation price (pos)")
+    if neg_price_col is None:
+        missing.append("afrr activation price (neg)")
     if pos_act_col is None:
         missing.append("afrr activation volume/power (pos)")
+    if neg_act_col is None:
+        missing.append("afrr activation volume/power (neg)")
     if missing:
         raise KeyError(f"Missing required target-engineering columns: {missing}")
 
@@ -521,9 +531,11 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     if drop_avg:
         df = df.drop(drop_avg)
 
+    # Technical sentinel threshold (~+/-99,999) from source data artifacts.
+    # This is NOT a regulatory/economic market cap (e.g. 15,000 EUR/MWh).
     sentinel_abs = 90_000.0
 
-    # 2) Unlagged target source for economically valid pay-as-cleared VWAP,
+    # 2) Unlagged target sources for economically valid pay-as-cleared VWAP,
     # with only technical sentinel values neutralized when activation is effectively zero.
     df = df.with_columns([
         pl.when(
@@ -533,6 +545,13 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
         .then(0.0)
         .otherwise(pl.col(pos_price_col).cast(pl.Float64))
         .alias("__target_source_afrr_activation_price_vwap_pos"),
+        pl.when(
+            (pl.col(neg_price_col).cast(pl.Float64).abs() > sentinel_abs)
+            & (pl.col(neg_act_col).cast(pl.Float64).fill_null(0.0).abs() == 0.0)
+        )
+        .then(0.0)
+        .otherwise(pl.col(neg_price_col).cast(pl.Float64))
+        .alias("__target_source_afrr_activation_price_vwap_neg"),
     ])
 
     # 3) Unlagged DA target source.
