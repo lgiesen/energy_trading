@@ -1,6 +1,6 @@
 {
   "artifact_path": "data/features/all_data_features.parquet",
-  "generated_at_utc": "2026-04-19T16:27:42.067713+00:00",
+  "generated_at_utc": "2026-04-19T16:29:10.459882+00:00",
   "options": {
     "use_forecast_pca": false,
     "forecast_pca_var_threshold": 0.95,
@@ -11,7 +11,7 @@
   "splits": {
     "train_end_exclusive": "2024-01-01T00:00:00+00:00",
     "val_end_exclusive": "2024-07-01T00:00:00+00:00",
-    "test_end_inclusive": "2026-04-19T16:27:42.066759+00:00",
+    "test_end_inclusive": "2026-04-19T16:29:10.458847+00:00",
     "purge_gap_rows": 72
   },
   "bundles": {
