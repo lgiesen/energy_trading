@@ -1,12 +1,13 @@
 """Feature engineering for model-ready training/backtest data.
 
-Target design (explicit h+1 naming):
-- `target_afrr_activation_price_vwap_pos_h1`: next-hour positive aFRR activation-price VWAP target.
-- `target_afrr_activation_price_vwap_neg_h1`: next-hour negative aFRR activation-price VWAP target.
-- `target_da_price_h1`: next-hour DA price target.
-- `target_afrr_rate_h1`: next-hour aFRR activation-rate target.
-- `target_afrr_capacity_price_pos_h1`: next-hour positive aFRR capacity-price target.
-- `target_afrr_capacity_price_neg_h1`: next-hour negative aFRR capacity-price target.
+Target design (next-hour shift, canonical names without suffix):
+- `target_afrr_activation_price_vwap_pos`: next-hour positive aFRR activation-price VWAP target.
+- `target_afrr_activation_price_vwap_neg`: next-hour negative aFRR activation-price VWAP target.
+- `target_da_price`: next-hour DA price target.
+- `target_afrr_activation_rate_pos`: next-hour positive aFRR activation-rate target.
+- `target_afrr_activation_rate_neg`: next-hour negative aFRR activation-rate target.
+- `target_afrr_capacity_price_pos`: next-hour positive aFRR capacity-price target.
+- `target_afrr_capacity_price_neg`: next-hour negative aFRR capacity-price target.
 
 Rationale:
 - Targets are explicitly prefixed with `target_` to avoid ambiguity in ML flows.
@@ -247,15 +248,17 @@ def apply_point_in_time_lag_layer(df: pl.DataFrame) -> pl.DataFrame:
         "__target_source_afrr_activation_price_vwap_pos",
         "__target_source_afrr_activation_price_vwap_neg",
         "__target_source_da_price",
-        "__target_source_afrr_rate",
+        "__target_source_afrr_rate_pos",
+        "__target_source_afrr_rate_neg",
         "__target_source_afrr_capacity_price_pos",
         "__target_source_afrr_capacity_price_neg",
-        "target_afrr_activation_price_vwap_pos_h1",
-        "target_afrr_activation_price_vwap_neg_h1",
-        "target_da_price_h1",
-        "target_afrr_rate_h1",
-        "target_afrr_capacity_price_pos_h1",
-        "target_afrr_capacity_price_neg_h1",
+        "target_afrr_activation_price_vwap_pos",
+        "target_afrr_activation_price_vwap_neg",
+        "target_da_price",
+        "target_afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg",
     }
     exprs: list[pl.Expr] = []
     lagged_cols = 0
@@ -456,13 +459,14 @@ def add_da_forecast_curve_features(
     return pl.from_pandas(pdf)
 
 
-def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
-    """Create explicit h+1 targets and drop temporary unlagged target sources."""
+def add_explicit_targets(df: pl.DataFrame) -> pl.DataFrame:
+    """Create explicit next-hour targets and drop temporary unlagged target sources."""
     required = {
         "__target_source_afrr_activation_price_vwap_pos",
         "__target_source_afrr_activation_price_vwap_neg",
         "__target_source_da_price",
-        "__target_source_afrr_rate",
+        "__target_source_afrr_rate_pos",
+        "__target_source_afrr_rate_neg",
         "__target_source_afrr_capacity_price_pos",
         "__target_source_afrr_capacity_price_neg",
     }
@@ -471,18 +475,19 @@ def add_explicit_h1_targets(df: pl.DataFrame) -> pl.DataFrame:
         raise KeyError(f"Missing required target-source columns: {missing}")
 
     out = df.with_columns([
-        pl.col("__target_source_afrr_activation_price_vwap_pos").shift(-1).alias("target_afrr_activation_price_vwap_pos_h1"),
-        pl.col("__target_source_afrr_activation_price_vwap_neg").shift(-1).alias("target_afrr_activation_price_vwap_neg_h1"),
-        pl.col("__target_source_da_price").shift(-1).alias("target_da_price_h1"),
-        pl.col("__target_source_afrr_rate").shift(-1).alias("target_afrr_rate_h1"),
-        pl.col("__target_source_afrr_capacity_price_pos").shift(-1).alias("target_afrr_capacity_price_pos_h1"),
-        pl.col("__target_source_afrr_capacity_price_neg").shift(-1).alias("target_afrr_capacity_price_neg_h1"),
+        pl.col("__target_source_afrr_activation_price_vwap_pos").shift(-1).alias("target_afrr_activation_price_vwap_pos"),
+        pl.col("__target_source_afrr_activation_price_vwap_neg").shift(-1).alias("target_afrr_activation_price_vwap_neg"),
+        pl.col("__target_source_da_price").shift(-1).alias("target_da_price"),
+        pl.col("__target_source_afrr_rate_pos").shift(-1).alias("target_afrr_activation_rate_pos"),
+        pl.col("__target_source_afrr_rate_neg").shift(-1).alias("target_afrr_activation_rate_neg"),
+        pl.col("__target_source_afrr_capacity_price_pos").shift(-1).alias("target_afrr_capacity_price_pos"),
+        pl.col("__target_source_afrr_capacity_price_neg").shift(-1).alias("target_afrr_capacity_price_neg"),
     ])
     return out.drop([c for c in required if c in out.columns])
 
 
 def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
-    """Create temporary unlagged target-source columns used for explicit h+1 targets.
+    """Create temporary unlagged target-source columns used for explicit next-hour targets.
 
     Inputs required:
     - primary: `afrr_activation_price_vwap_pos`, `afrr_activation_price_vwap_neg`
@@ -495,7 +500,8 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
     - `__target_source_afrr_activation_price_vwap_pos`
     - `__target_source_afrr_activation_price_vwap_neg`
     - `__target_source_da_price`
-    - `__target_source_afrr_rate`
+    - `__target_source_afrr_rate_pos`
+    - `__target_source_afrr_rate_neg`
     - `__target_source_afrr_capacity_price_pos`
     - `__target_source_afrr_capacity_price_neg`
     """
@@ -561,38 +567,47 @@ def engineer_targets(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("da_price").cast(pl.Float64).alias("__target_source_da_price"),
     ])
 
-    # 4) Unlagged activation-rate target source.
-    rate_expr: pl.Expr | None = None
-    if "afrr_activation_rate" in df.columns:
-        rate_expr = pl.col("afrr_activation_rate").cast(pl.Float64)
-    elif {"afrr_activation_rate_pos", "afrr_activation_rate_neg"}.issubset(set(df.columns)):
-        rate_expr = (
-            (
-                pl.col("afrr_activation_rate_pos").cast(pl.Float64).fill_null(0.0)
-                + pl.col("afrr_activation_rate_neg").cast(pl.Float64).fill_null(0.0)
-            )
-            / 2.0
-        )
-    elif {"afrr_activated_mw_pos", "afrr_activated_mw_neg", "afrr_activation_offered_mw_pos", "afrr_activation_offered_mw_neg"}.issubset(set(df.columns)):
-        num = (
-            pl.col("afrr_activated_mw_pos").cast(pl.Float64).abs().fill_null(0.0)
-            + pl.col("afrr_activated_mw_neg").cast(pl.Float64).abs().fill_null(0.0)
-        )
-        den = (
-            pl.col("afrr_activation_offered_mw_pos").cast(pl.Float64).abs().fill_null(0.0)
-            + pl.col("afrr_activation_offered_mw_neg").cast(pl.Float64).abs().fill_null(0.0)
-        )
-        rate_expr = pl.when(den > 0.0).then(num / den).otherwise(0.0)
-    else:
-        raise KeyError(
-            "Missing required activation-rate inputs: "
-            "need `afrr_activation_rate` or POS/NEG rate columns "
-            "or activated/offered MW pairs."
-        )
+    # 4) Unlagged directional activation-rate target sources (ML-stable).
+    #    Strictly directional to preserve charging/discharging asymmetry.
+    def _activation_rate_expr(side: str) -> pl.Expr:
+        ml_rate_col = f"activation_rate_ml_{side}"
+        if ml_rate_col in df.columns:
+            return pl.col(ml_rate_col).cast(pl.Float64).fill_null(0.0).clip(0.0, 1.0)
 
+        activated_mw_col = f"afrr_activated_mw_{side}"
+        activated_mwh_col = f"afrr_activated_mwh_{side}"
+        awarded_col = f"afrr_capacity_awarded_mw_{side}"
+        offered_col = f"afrr_activation_offered_mw_{side}"
+
+        if activated_mw_col in df.columns:
+            numerator = pl.col(activated_mw_col).cast(pl.Float64).abs().fill_null(0.0)
+        elif activated_mwh_col in df.columns:
+            numerator = pl.col(activated_mwh_col).cast(pl.Float64).abs().fill_null(0.0)
+        else:
+            raise KeyError(
+                f"Missing required activation magnitude for side='{side}': "
+                f"`{activated_mw_col}` or `{activated_mwh_col}`."
+            )
+
+        if awarded_col in df.columns:
+            denominator = pl.col(awarded_col).cast(pl.Float64).abs().fill_null(0.0)
+        elif offered_col in df.columns:
+            denominator = pl.col(offered_col).cast(pl.Float64).abs().fill_null(0.0)
+        else:
+            raise KeyError(
+                f"Missing required awarded/offered capacity for side='{side}': "
+                f"`{awarded_col}` or `{offered_col}`."
+            )
+
+        return pl.when(denominator > 0.0).then(numerator / denominator).otherwise(0.0).clip(0.0, 1.0)
+
+    rate_pos = _activation_rate_expr("pos")
+    rate_neg = _activation_rate_expr("neg")
     df = df.with_columns([
-        rate_expr.clip(0.0, 1.0).alias("__target_source_afrr_rate"),
-        rate_expr.clip(0.0, 1.0).alias("afrr_activation_rate"),
+        rate_pos.alias("__target_source_afrr_rate_pos"),
+        rate_neg.alias("__target_source_afrr_rate_neg"),
+        rate_pos.alias("afrr_activation_rate_pos"),
+        rate_neg.alias("afrr_activation_rate_neg"),
     ])
 
     # 5) Unlagged capacity-price target sources.
@@ -1017,7 +1032,7 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     """Add market-regime and grid-stress features without target leakage.
 
     Features created:
-    - `mfrr_active_lag`: lagged mFRR activity flag (1 if activation > 0 else 0)
+    - `mfrr_active_lag`: mFRR activity flag (1 if activation > 0 else 0)
     - `nrv_zscore_24h`: 24h z-score of NRV balance
     - `picasso_flow_rate`: cross-border balancing flow proxy
     - `picasso_flow_rate_lag_1h`: 1-hour lag of PICASSO flow
@@ -1284,7 +1299,8 @@ def add_advanced_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     target_history_cols = [
         "afrr_activation_price_vwap_pos",
         "afrr_activation_price_vwap_neg",
-        "afrr_activation_rate",
+        "afrr_activation_rate_pos",
+        "afrr_activation_rate_neg",
         "afrr_activated_mw_pos",
         "afrr_activated_mw_neg",
         "afrr_activated_mwh_pos",
@@ -1480,12 +1496,14 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
         "activation_rate_dynamics": {
             "lags": [1, 2, 3, 6, 12, 24],
             "anchors": [
-                "afrr_activation_rate_lag_1h",
+                "afrr_activation_rate_pos_lag_1h",
+                "afrr_activation_rate_neg_lag_1h",
                 "is_activated_lag_1h",
                 "mfrr_active_lag",
             ],
             "fallback_roots": [
-                "afrr_activation_rate",
+                "afrr_activation_rate_pos",
+                "afrr_activation_rate_neg",
                 "is_activated",
                 "mfrr_active_lag",
             ],
@@ -1592,6 +1610,10 @@ def add_strategic_momentum_lags(df: pl.DataFrame) -> pl.DataFrame:
 
         for anchor in candidates:
             root, anchor_lag = _split_effective_lag(anchor)
+            # Avoid names like `*_lag_lag_1h` when an anchor ends with `_lag`
+            # but does not carry a numeric lag suffix (e.g. `mfrr_active_lag`).
+            if anchor_lag == 0 and root.endswith("_lag"):
+                root = root[:-4]
             for target_h in lags:
                 if target_h < anchor_lag:
                     continue
@@ -1909,7 +1931,7 @@ def build_features(input_path: Path, output_path: Path) -> None:
         df = df.drop(high_missing_drop)
 
     # Target-source engineering is intentionally performed on raw market
-    # observations. Source columns stay unlagged until explicit h+1 targets are built.
+    # observations. Source columns stay unlagged until explicit next-hour targets are built.
     df = engineer_targets(df)
 
     # --- STEP 2: CAUSAL FIREWALL (GLOBAL PiT LAG LAYER) ---
@@ -1945,8 +1967,8 @@ def build_features(input_path: Path, output_path: Path) -> None:
     # Multi-strategy market-aware imputation for internal feature gaps.
     df = apply_multi_strategy_imputation(df)
 
-    # --- STEP 5: EXPLICIT TARGETS (h+1) ---
-    df = add_explicit_h1_targets(df)
+    # --- STEP 5: EXPLICIT TARGETS (t+1) ---
+    df = add_explicit_targets(df)
 
     # --- STEP 6: CLEANUP & DROP ---
     # Market-time features are always added when timestamp is available.
