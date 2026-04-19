@@ -987,7 +987,7 @@ def add_aggregated_features(df: pl.DataFrame) -> pl.DataFrame:
 
     Leakage control:
     - Target encoding uses `shift(1)` + `expanding().mean()` inside each
-      (`market_regime_picasso`, `hour`) group.
+      (`is_picasso_active`, `hour`) group.
     """
     if "timestamp_utc" not in df.columns:
         return df
@@ -999,9 +999,9 @@ def add_aggregated_features(df: pl.DataFrame) -> pl.DataFrame:
     # Ensure required grouping columns exist.
     if "hour" not in pdf.columns:
         pdf["hour"] = pdf["timestamp_utc"].dt.hour.astype(np.int8)
-    if "market_regime_picasso" not in pdf.columns:
+    if "is_picasso_active" not in pdf.columns:
         picasso_start = pd.Timestamp(PICASSO_RELEASE_UTC, tz="UTC")
-        pdf["market_regime_picasso"] = (pdf["timestamp_utc"] >= picasso_start).astype(np.int8)
+        pdf["is_picasso_active"] = (pdf["timestamp_utc"] >= picasso_start).astype(np.int8)
 
     # Ensure binary target is available.
     if "is_activated" not in pdf.columns:
@@ -1015,9 +1015,8 @@ def add_aggregated_features(df: pl.DataFrame) -> pl.DataFrame:
 
     # 1) Leakage-safe target encoding by regime/hour.
     global_mean = float(pd.to_numeric(pdf["is_activated"], errors="coerce").fillna(0.0).mean())
-    te = (
-        pdf.groupby(["market_regime_picasso", "hour"])["is_activated"]
-        .transform(lambda x: x.shift(1).expanding().mean())
+    te = pdf.groupby(["is_picasso_active", "hour"])["is_activated"].transform(
+        lambda x: x.shift(1).expanding().mean()
     )
     pdf["TE_hour_regime_activation"] = pd.to_numeric(te, errors="coerce").fillna(global_mean).astype(np.float64)
 
@@ -1039,7 +1038,7 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     - `picasso_flow_rate_lag_24h`: 24-hour lag of PICASSO flow
     - `is_picasso_regime`: 1 from 2024-06-01 UTC onward, else 0
     - `grid_stress_index`: composite stress score in [0, 1]
-    - `market_regime_picasso`: 0 before PICASSO release, 1 from release onward
+    - `is_picasso_active`: 0 before PICASSO release, 1 from release onward
 
     Notes:
     - Inputs may already be globally lagged by the PiT layer.
@@ -1110,10 +1109,6 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     pic_norm = (pic_abs / pic_norm_den).fillna(0.0).clip(0.0, 1.0)
     gsi = 0.4 * nrv_norm + 0.4 * pdf["mfrr_active_lag"].astype(float) + 0.2 * pic_norm
     pdf["grid_stress_index"] = gsi.clip(0.0, 1.0)
-
-    # 5) Market regime flag (PICASSO structural break).
-    picasso_start = pd.Timestamp(PICASSO_RELEASE_UTC, tz="UTC")
-    pdf["market_regime_picasso"] = (pdf["timestamp_utc"] >= picasso_start).astype(int)
 
     return pl.from_pandas(pdf)
 

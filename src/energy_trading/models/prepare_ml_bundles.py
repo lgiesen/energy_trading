@@ -172,7 +172,11 @@ class MLDataFactory:
         "afrr_activation_rate_neg",
     ]
 
-    HARD_META_EXCLUDE = {"timestamp_utc"}
+    HARD_META_EXCLUDE = {
+        "timestamp_utc",
+        # Analysis-only regime marker; excluded from model training features.
+        "is_picasso_active",
+    }
     FORECAST_FAMILY_PATTERNS: dict[str, str] = {
         "load_forecast": r"^load_forecast",
         "residual_load_forecast": r"^residual_load_forecast",

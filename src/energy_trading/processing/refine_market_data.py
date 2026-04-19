@@ -1106,9 +1106,10 @@ def add_specialized_activation_rates(lf: pl.LazyFrame) -> pl.LazyFrame:
             phys_neg_expr.alias("activation_rate_phys_neg"),
             ml_pos_expr.alias("activation_rate_ml_pos"),
             ml_neg_expr.alias("activation_rate_ml_neg"),
-            # Backward-compatible aliases for existing downstream usage.
-            phys_pos_expr.alias("afrr_activation_rate_pos"),
-            phys_neg_expr.alias("afrr_activation_rate_neg"),
+            # Downstream ML-facing aliases:
+            # use clipped/absolute ML-stable definition by default.
+            ml_pos_expr.alias("afrr_activation_rate_pos"),
+            ml_neg_expr.alias("afrr_activation_rate_neg"),
         ]
     )
 

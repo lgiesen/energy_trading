@@ -58,8 +58,8 @@ class BacktestColumnMap:
     true_afrr_capacity_price_neg: str = "afrr_capacity_price_neg"
     true_afrr_activation_price_pos: str = "afrr_activation_price_vwap_pos"
     true_afrr_activation_price_neg: str = "afrr_activation_price_vwap_neg"
-    true_afrr_activation_rate_pos: str = "afrr_activation_rate_pos"
-    true_afrr_activation_rate_neg: str = "afrr_activation_rate_neg"
+    true_afrr_activation_rate_pos: str = "activation_rate_phys_pos"
+    true_afrr_activation_rate_neg: str = "activation_rate_phys_neg"
 
 
 @dataclass(frozen=True)

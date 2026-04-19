@@ -183,7 +183,6 @@ is_evening,0.0,keep
 is_morning,0.0,keep
 is_night,0.0,keep
 is_payday_period,0.0,keep
-is_picasso_active,0.0,keep
 is_picasso_regime,0.0,keep
 is_weekend,0.0,keep
 lignite_capacity,0.0,keep
@@ -213,7 +212,6 @@ load_forecast_da_entsoe_next24_min,0.0,keep
 load_forecast_da_entsoe_next24_ramp,0.0,keep
 load_forecast_da_entsoe_next24_std,0.0,keep
 load_mae_rolling_72h,0.0,keep
-market_regime_picasso,0.0,keep
 mfrr_activated_mw_neg_lag_12h,0.0,keep
 mfrr_activated_mw_neg_lag_1h,0.0,keep
 mfrr_activated_mw_neg_lag_24h,0.0,keep

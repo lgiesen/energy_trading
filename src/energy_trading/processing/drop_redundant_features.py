@@ -63,8 +63,6 @@ USER_REQUESTED_DROPS = [
 EXACT_DUPLICATES_AUDIT = [
     "afrr_activated_mw_pos_regelleistung",
     "afrr_activated_mw_neg_regelleistung",
-    "afrr_activation_rate_pos",
-    "afrr_activation_rate_neg",
     "awarded_capacity_mw_pos",
     "awarded_capacity_mw_neg",
     "bid_alloc_mw_pos",
@@ -81,7 +79,6 @@ ADDITIONAL_AUDIT_DROPS: list[str] = []
 # Protection clause: keep causal lag features and regime flags even if a future
 # wildcard/regex drop rule becomes too broad.
 PROTECTED_KEEP = {
-    "market_regime_picasso",
     "is_picasso_regime",
     # Needed for downstream alpha feature construction in build_features.py.
     "load_actual_entsoe",

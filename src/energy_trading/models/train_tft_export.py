@@ -452,14 +452,19 @@ def _train_tft(
         full_sc.loc[full_sc["time_idx"] <= idx_val_end].copy(),
         min_prediction_idx=idx_train_end + 1,
         stop_randomization=True,
-        predict=True,
+        # IMPORTANT:
+        # `predict=True` would keep only the last prediction window per series,
+        # which collapses val/test exports to a single forecast block.
+        # We need full rolling coverage over the whole split.
+        predict=False,
     )
     testing = TimeSeriesDataSet.from_dataset(
         training,
         full_sc.copy(),
         min_prediction_idx=idx_val_end + 1,
         stop_randomization=True,
-        predict=True,
+        # Keep all rolling windows in test for full forecast-vintage export.
+        predict=False,
     )
 
     torch_device, accelerator = _resolve_torch_device(requested_device)
