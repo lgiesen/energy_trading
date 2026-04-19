@@ -111,7 +111,6 @@ solar_capacity,0.0,keep
 solar_error_da_lag_24h,0.0,keep
 solar_forecast_update,0.0,keep
 solar_forecast_update_lag_24h,0.0,keep
-target_afrr_activation_price_vwap_neg_h1,0.0,keep
 weekday_cos,0.0,keep
 weekday_sin,0.0,keep
 wind_forecast_update,0.0,keep

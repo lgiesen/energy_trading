@@ -1,6 +1,6 @@
 {
   "artifact_path": "data/features/all_data_features.parquet",
-  "generated_at_utc": "2026-04-18T11:23:22.098969+00:00",
+  "generated_at_utc": "2026-04-19T15:04:43.618136+00:00",
   "options": {
     "use_forecast_pca": false,
     "forecast_pca_var_threshold": 0.95,
@@ -11,14 +11,14 @@
   "splits": {
     "train_end_exclusive": "2024-01-01T00:00:00+00:00",
     "val_end_exclusive": "2024-07-01T00:00:00+00:00",
-    "test_end_inclusive": "2026-04-18T11:23:22.097161+00:00",
+    "test_end_inclusive": "2026-04-19T15:04:43.616857+00:00",
     "purge_gap_rows": 72
   },
   "bundles": {
     "da": {
-      "primary_target": "target_da_price_h1",
+      "primary_target": "target_da_price",
       "target_source_columns": [
-        "target_da_price_h1"
+        "target_da_price"
       ],
       "features": [
         "da_price_AT",
@@ -137,7 +137,6 @@
         "renewable_share_forecast_lag_24h",
         "renewable_share_forecast_lag_48h",
         "renewable_share_forecast_lag_168h",
-        "target_afrr_activation_price_vwap_neg_h1",
         "weekday_sin",
         "weekday_cos",
         "is_weekend",
@@ -148,12 +147,12 @@
         "is_night"
       ],
       "targets": [
-        "target_da_price_h1"
+        "target_da_price"
       ],
       "audit_targets": [],
       "feature_quality_report": "data/model_input/da/feature_quality_report.csv",
       "forecast_pca": [],
-      "n_features": 125,
+      "n_features": 124,
       "n_targets": 1,
       "files": {
         "train": "data/model_input/da/train.parquet",
@@ -162,13 +161,14 @@
       }
     },
     "afrr": {
-      "primary_target": "target_afrr_activation_price_vwap_pos_h1",
+      "primary_target": "target_afrr_activation_price_vwap_pos",
       "target_source_columns": [
-        "target_afrr_activation_price_vwap_pos_h1",
-        "target_afrr_activation_price_vwap_neg_h1",
-        "target_afrr_rate_h1",
-        "target_afrr_capacity_price_pos_h1",
-        "target_afrr_capacity_price_neg_h1"
+        "target_afrr_activation_price_vwap_pos",
+        "target_afrr_activation_price_vwap_neg",
+        "target_afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg"
       ],
       "features": [
         "da_price_AT",
@@ -226,9 +226,10 @@
         "afrr_capacity_awarded_mw_neg_lag_1h",
         "wind_total_error_da_lag_2h",
         "residual_load_calc_lag_2h",
+        "afrr_activation_rate_pos_lag_1h",
+        "afrr_activation_rate_neg_lag_1h",
         "generation_fossil_total_mw_lag_2h",
         "generation_hydro_actual_total_lag_2h",
-        "afrr_activation_rate_lag_1h",
         "da_price_pit",
         "da_price_volatility_30d",
         "load_abs_error",
@@ -282,7 +283,8 @@
         "da_price_lag_168h",
         "afrr_activation_price_vwap_pos_lag_24h",
         "afrr_activation_price_vwap_neg_lag_24h",
-        "afrr_activation_rate_lag_24h",
+        "afrr_activation_rate_pos_lag_24h",
+        "afrr_activation_rate_neg_lag_24h",
         "afrr_activated_mw_pos_lag_24h",
         "afrr_activated_mw_neg_lag_24h",
         "afrr_da_price_spread_lag_24h",
@@ -377,21 +379,25 @@
         "da_price_pit_lag_24h",
         "da_price_pit_lag_48h",
         "da_price_pit_lag_168h",
-        "afrr_activation_rate_lag_2h",
-        "afrr_activation_rate_lag_3h",
-        "afrr_activation_rate_lag_6h",
-        "afrr_activation_rate_lag_12h",
+        "afrr_activation_rate_pos_lag_2h",
+        "afrr_activation_rate_pos_lag_3h",
+        "afrr_activation_rate_pos_lag_6h",
+        "afrr_activation_rate_pos_lag_12h",
+        "afrr_activation_rate_neg_lag_2h",
+        "afrr_activation_rate_neg_lag_3h",
+        "afrr_activation_rate_neg_lag_6h",
+        "afrr_activation_rate_neg_lag_12h",
         "is_activated_lag_2h",
         "is_activated_lag_3h",
         "is_activated_lag_6h",
         "is_activated_lag_12h",
         "is_activated_lag_24h",
-        "mfrr_active_lag_lag_1h",
-        "mfrr_active_lag_lag_2h",
-        "mfrr_active_lag_lag_3h",
-        "mfrr_active_lag_lag_6h",
-        "mfrr_active_lag_lag_12h",
-        "mfrr_active_lag_lag_24h",
+        "mfrr_active_lag_1h",
+        "mfrr_active_lag_2h",
+        "mfrr_active_lag_3h",
+        "mfrr_active_lag_6h",
+        "mfrr_active_lag_12h",
+        "mfrr_active_lag_24h",
         "afrr_activated_mw_pos_lag_2h",
         "afrr_activated_mw_pos_lag_3h",
         "afrr_activated_mw_pos_lag_6h",
@@ -510,17 +516,18 @@
         "is_night"
       ],
       "targets": [
-        "target_afrr_activation_price_vwap_pos_h1",
-        "target_afrr_activation_price_vwap_neg_h1",
-        "target_afrr_rate_h1",
-        "target_afrr_capacity_price_pos_h1",
-        "target_afrr_capacity_price_neg_h1"
+        "target_afrr_activation_price_vwap_pos",
+        "target_afrr_activation_price_vwap_neg",
+        "target_afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg"
       ],
       "audit_targets": [],
       "feature_quality_report": "data/model_input/afrr/feature_quality_report.csv",
       "forecast_pca": [],
-      "n_features": 337,
-      "n_targets": 5,
+      "n_features": 343,
+      "n_targets": 6,
       "files": {
         "train": "data/model_input/afrr/train.parquet",
         "val": "data/model_input/afrr/val.parquet",
