@@ -67,6 +67,9 @@ DROP_FOR_MODEL = [
     "dayofyear",
     # Keep only lagged PICASSO flow features in final ML table.
     "picasso_flow_rate",
+    # Remove raw real-time PICASSO channels; keep only engineered lagged proxy.
+    "afrr_picasso_mw_pos",
+    "afrr_picasso_mw_neg",
     # Use publication-gated DA view in X.
     "da_price",
 ]
@@ -1036,7 +1039,6 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     - `picasso_flow_rate`: cross-border balancing flow proxy
     - `picasso_flow_rate_lag_1h`: 1-hour lag of PICASSO flow
     - `picasso_flow_rate_lag_24h`: 24-hour lag of PICASSO flow
-    - `is_picasso_regime`: 1 from 2024-06-01 UTC onward, else 0
     - `grid_stress_index`: composite stress score in [0, 1]
     - `is_picasso_active`: 0 before PICASSO release, 1 from release onward
 
@@ -1098,9 +1100,6 @@ def add_market_regime_features(df: pl.DataFrame) -> pl.DataFrame:
     pdf["picasso_flow_rate"] = picasso
     pdf["picasso_flow_rate_lag_1h"] = picasso.shift(steps_per_hour).fillna(0.0)
     pdf["picasso_flow_rate_lag_24h"] = picasso.shift(24 * steps_per_hour).fillna(0.0)
-    picasso_regime_start = pd.Timestamp("2024-06-01 00:00:00+00:00")
-    pdf["is_picasso_regime"] = (pdf["timestamp_utc"] >= picasso_regime_start).astype(np.int8)
-
     # 4) Composite stress index in [0, 1].
     nrv_norm_den = nrv_abs.rolling(window_24h, min_periods=2).max().replace(0.0, np.nan)
     nrv_norm = (nrv_abs / nrv_norm_den).fillna(0.0).clip(0.0, 1.0)

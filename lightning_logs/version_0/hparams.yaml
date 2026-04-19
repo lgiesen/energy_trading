@@ -2716,7 +2716,6 @@ dataset_parameters:
           AAAAAAAAAAA=
       with_mean: true
       with_std: true
-    is_picasso_regime: !!python/object:sklearn.preprocessing._data.StandardScaler
       _sklearn_version: 1.8.0
       copy: true
       feature_names_in_: !!python/object/apply:numpy._core.multiarray._reconstruct
@@ -2732,7 +2731,6 @@ dataset_parameters:
           - 1
         - *id003
         - false
-        - - is_picasso_regime
       mean_: !!python/object/apply:numpy._core.multiarray._reconstruct
         args:
         - *id001
@@ -6467,7 +6465,6 @@ dataset_parameters:
   - holiday_severity
   - is_bridge_day
   - is_christmas_break
-  - is_picasso_regime
   - market_regime_picasso
   - load_actual_entsoe_diff1
   - load_actual_entsoe_diff24
@@ -6622,7 +6619,6 @@ time_varying_reals_encoder:
 - holiday_severity
 - is_bridge_day
 - is_christmas_break
-- is_picasso_regime
 - market_regime_picasso
 - load_actual_entsoe_diff1
 - load_actual_entsoe_diff24
@@ -6717,7 +6713,6 @@ x_reals:
 - holiday_severity
 - is_bridge_day
 - is_christmas_break
-- is_picasso_regime
 - market_regime_picasso
 - load_actual_entsoe_diff1
 - load_actual_entsoe_diff24

@@ -54,9 +54,6 @@ USER_REQUESTED_DROPS = [
     "day_of_week",
     "month",
     "dayofyear",
-    # Remove raw real-time PICASSO base channels (leakage risk as direct inputs).
-    "afrr_picasso_mw_pos",
-    "afrr_picasso_mw_neg",
 ]
 
 # Exact duplicates identified in audit (Pearson r=1.000 against canonical columns).
@@ -70,7 +67,6 @@ EXACT_DUPLICATES_AUDIT = [
     # Remove linear combinations of POS/NEG channels to reduce perfect collinearity.
     "afrr_picasso_net_mw",
     "afrr_picasso_churn_mw",
-    "picasso_flow_rate",
 ]
 
 # Extend this list as audit iterations discover additional non-ML/redundant fields.
@@ -79,7 +75,6 @@ ADDITIONAL_AUDIT_DROPS: list[str] = []
 # Protection clause: keep causal lag features and regime flags even if a future
 # wildcard/regex drop rule becomes too broad.
 PROTECTED_KEEP = {
-    "is_picasso_regime",
     # Needed for downstream alpha feature construction in build_features.py.
     "load_actual_entsoe",
     "load_forecast_da_entsoe",
@@ -366,6 +361,25 @@ def refine_dataset(df: pl.DataFrame) -> pl.DataFrame:
                 "generation_hydro_actual_total"
             )
         )
+
+    # PICASSO flow proxy for downstream lag-feature engineering.
+    # Keep this derived signal even if raw POS/NEG channels are removed later.
+    if "picasso_flow_rate" not in df_out.columns:
+        if {"afrr_picasso_mw_pos", "afrr_picasso_mw_neg"}.issubset(df_out.columns):
+            df_out = df_out.with_columns(
+                (
+                    pl.col("afrr_picasso_mw_pos").cast(pl.Float64, strict=False).abs()
+                    + pl.col("afrr_picasso_mw_neg").cast(pl.Float64, strict=False).abs()
+                ).alias("picasso_flow_rate")
+            )
+        elif "afrr_picasso_churn_mw" in df_out.columns:
+            df_out = df_out.with_columns(
+                pl.col("afrr_picasso_churn_mw").cast(pl.Float64, strict=False).abs().alias("picasso_flow_rate")
+            )
+        elif "afrr_picasso_net_mw" in df_out.columns:
+            df_out = df_out.with_columns(
+                pl.col("afrr_picasso_net_mw").cast(pl.Float64, strict=False).abs().alias("picasso_flow_rate")
+            )
 
     exprs, added, _ = _build_feature_exprs(df_out)
     if exprs:

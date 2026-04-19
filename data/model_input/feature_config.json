@@ -1,6 +1,6 @@
 {
   "artifact_path": "data/features/all_data_features.parquet",
-  "generated_at_utc": "2026-04-19T16:29:10.459882+00:00",
+  "generated_at_utc": "2026-04-19T21:11:14.549094+00:00",
   "options": {
     "use_forecast_pca": false,
     "forecast_pca_var_threshold": 0.95,
@@ -11,7 +11,7 @@
   "splits": {
     "train_end_exclusive": "2024-01-01T00:00:00+00:00",
     "val_end_exclusive": "2024-07-01T00:00:00+00:00",
-    "test_end_inclusive": "2026-04-19T16:29:10.458847+00:00",
+    "test_end_inclusive": "2026-04-19T21:11:14.547634+00:00",
     "purge_gap_rows": 72
   },
   "bundles": {
@@ -86,7 +86,6 @@
         "holiday_severity",
         "is_bridge_day",
         "is_christmas_break",
-        "is_picasso_regime",
         "load_actual_entsoe_lag_24h",
         "load_actual_entsoe_lag_48h",
         "load_actual_entsoe_lag_168h",
@@ -150,7 +149,7 @@
       "audit_targets": [],
       "feature_quality_report": "data/model_input/da/feature_quality_report.csv",
       "forecast_pca": [],
-      "n_features": 122,
+      "n_features": 121,
       "n_targets": 1,
       "files": {
         "train": "data/model_input/da/train.parquet",
@@ -209,6 +208,8 @@
         "afrr_activated_mw_neg_lag_1h",
         "mfrr_activated_mw_pos_lag_1h",
         "mfrr_activated_mw_neg_lag_1h",
+        "afrr_picasso_mw_pos_lag_1h",
+        "afrr_picasso_mw_neg_lag_1h",
         "mfrr_mari_net_mw_lag_1h",
         "afrr_capacity_price_neg_lag_1h",
         "afrr_capacity_price_pos_lag_1h",
@@ -267,7 +268,6 @@
         "mfrr_active_lag",
         "picasso_flow_rate_lag_1h",
         "picasso_flow_rate_lag_24h",
-        "is_picasso_regime",
         "load_actual_entsoe_lag_24h",
         "load_actual_entsoe_lag_48h",
         "load_actual_entsoe_lag_168h",
@@ -522,7 +522,7 @@
       "audit_targets": [],
       "feature_quality_report": "data/model_input/afrr/feature_quality_report.csv",
       "forecast_pca": [],
-      "n_features": 341,
+      "n_features": 342,
       "n_targets": 6,
       "files": {
         "train": "data/model_input/afrr/train.parquet",

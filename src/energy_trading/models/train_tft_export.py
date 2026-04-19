@@ -40,8 +40,17 @@ CALENDAR_FEATURES = {
     "weekofyear",
 }
 ALLOWED_KNOWN_CATEGORICALS = {"hour", "weekday", "month"}
-CYCLICAL_DROP_FEATURES = {"weekday_sin", "weekday_cos"}
 LAG_FEATURE_RE = re.compile(r".*_lag_\d+h$")
+PASSTHROUGH_REAL_RE = re.compile(r".*(_sin|_cos|_slog1p)$")
+VOLATILE_PRICE_RE = re.compile(r"(?:^|_)(da_price|afrr_.*price|.*_price_)", re.IGNORECASE)
+VOLATILE_VOLUME_FEATURES = {
+    "planned_outages_mw",
+    "unplanned_outages_mw",
+    "total_outages_mw",
+    "wind_offshore_forecast_update",
+}
+TFT_CLIP_MIN = -5.0
+TFT_CLIP_MAX = 5.0
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 LOGGER = logging.getLogger(__name__)
 
@@ -97,8 +106,7 @@ def _classify_feature_columns(feature_columns: list[str]) -> tuple[list[str], li
 
     Rules:
     - Drop all explicit lag features (`*_lag_<h>h`).
-    - Drop `weekday_sin` / `weekday_cos`.
-    - known categoricals: only `hour`, `weekday`, `month`.
+    - known categoricals: calendar ids + binary/flag-style regime indicators.
     - known reals: remaining features containing `forecast` plus forecast-ramp proxies.
     - unknown reals: everything else remaining.
     """
@@ -107,14 +115,18 @@ def _classify_feature_columns(feature_columns: list[str]) -> tuple[list[str], li
     for c in feature_columns:
         if LAG_FEATURE_RE.match(c):
             continue
-        if c in CYCLICAL_DROP_FEATURES:
-            continue
         if c in seen:
             continue
         seen.add(c)
         pruned.append(c)
 
-    known_categoricals = [c for c in pruned if c in ALLOWED_KNOWN_CATEGORICALS]
+    known_categoricals: list[str] = []
+    for c in pruned:
+        if c in ALLOWED_KNOWN_CATEGORICALS:
+            known_categoricals.append(c)
+            continue
+        if c.startswith("is_") or c == "holiday_severity":
+            known_categoricals.append(c)
 
     # Explicit assignment for dynamics columns:
     # - forecast/ramp signals are known at prediction time
@@ -142,11 +154,21 @@ def _fit_split_scalers(
     target_col: str,
     categorical_columns: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
-    """Fit robust scalers on train only and transform all splits."""
-    y_scaler = RobustScaler()
+    """Fit train-only robust scalers with passthrough + clipped volatile prices.
+
+    Strategy:
+    - Real features ending in `_sin`, `_cos`, `_slog1p` bypass scaling.
+    - Remaining real features are RobustScaler-fitted on train only.
+    - Highly volatile price/volume features are clipped post-scale to improve TFT stability.
+    """
     categorical_columns = list(categorical_columns or [])
     categorical_cols = [c for c in categorical_columns if c in feature_columns]
     real_cols = [c for c in feature_columns if c not in categorical_cols]
+    passthrough_real_cols = [c for c in real_cols if PASSTHROUGH_REAL_RE.match(c)]
+    scaled_real_cols = [c for c in real_cols if c not in passthrough_real_cols]
+    clipped_volatile_cols = [
+        c for c in scaled_real_cols if VOLATILE_PRICE_RE.search(c) or c in VOLATILE_VOLUME_FEATURES
+    ]
 
     X_tr = train_df[feature_columns].copy()
     X_va = val_df[feature_columns].copy()
@@ -167,39 +189,45 @@ def _fit_split_scalers(
         X_va.loc[:, categorical_cols] = X_va.loc[:, categorical_cols].fillna(cat_fill).fillna("0")
         X_te.loc[:, categorical_cols] = X_te.loc[:, categorical_cols].fillna(cat_fill).fillna("0")
 
-    y_tr = pd.to_numeric(train_df[target_col], errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
-    y_va = pd.to_numeric(val_df[target_col], errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
-    y_te = pd.to_numeric(test_df[target_col], errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
-
-    y_scaler.fit(y_tr)
-
-    if real_cols:
+    if scaled_real_cols:
         f_scaler = RobustScaler()
-        f_scaler.fit(X_tr[real_cols].to_numpy(dtype=float))
+        f_scaler.fit(X_tr[scaled_real_cols].to_numpy(dtype=float))
     else:
         f_scaler = None
 
-    def _scaled(df: pd.DataFrame, X_in: pd.DataFrame, y_arr: np.ndarray) -> pd.DataFrame:
+    def _scaled(df: pd.DataFrame, X_in: pd.DataFrame) -> pd.DataFrame:
         out = X_in.copy()
-        if real_cols and f_scaler is not None:
+        if scaled_real_cols and f_scaler is not None:
             # Ensure numeric reals can hold scaled float values (pandas >=2.2
             # raises on lossy int8/int16 assignment).
-            out = out.astype({c: "float64" for c in real_cols}, copy=False)
-            out.loc[:, real_cols] = f_scaler.transform(out[real_cols].to_numpy(dtype=float))
-        out[target_col] = y_arr.reshape(-1)
+            out = out.astype({c: "float64" for c in scaled_real_cols}, copy=False)
+            out.loc[:, scaled_real_cols] = f_scaler.transform(out[scaled_real_cols].to_numpy(dtype=float))
+            if clipped_volatile_cols:
+                out.loc[:, clipped_volatile_cols] = np.clip(
+                    out[clipped_volatile_cols].to_numpy(dtype=float),
+                    TFT_CLIP_MIN,
+                    TFT_CLIP_MAX,
+                )
+        if passthrough_real_cols:
+            out = out.astype({c: "float64" for c in passthrough_real_cols}, copy=False)
+        out[target_col] = pd.to_numeric(df[target_col], errors="coerce").to_numpy(dtype=float)
         out["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
         return out
 
-    tr_sc = _scaled(train_df, X_tr, y_scaler.transform(y_tr))
-    va_sc = _scaled(val_df, X_va, y_scaler.transform(y_va))
-    te_sc = _scaled(test_df, X_te, y_scaler.transform(y_te))
+    tr_sc = _scaled(train_df, X_tr)
+    va_sc = _scaled(val_df, X_va)
+    te_sc = _scaled(test_df, X_te)
 
     scaler_payload = {
         "feature_scaler": f_scaler,
-        "target_scaler": y_scaler,
         "feature_columns": feature_columns,
         "categorical_columns": categorical_cols,
         "real_feature_columns": real_cols,
+        "scaled_real_feature_columns": scaled_real_cols,
+        "passthrough_real_feature_columns": passthrough_real_cols,
+        # Backward-compatible key name kept for downstream consumers.
+        "clipped_price_feature_columns": clipped_volatile_cols,
+        "clipped_volatile_feature_columns": clipped_volatile_cols,
         "target_col": target_col,
     }
     return tr_sc, va_sc, te_sc, scaler_payload
@@ -210,7 +238,6 @@ def _build_long_prediction_table(
     prediction: np.ndarray,
     decoder_time_idx: np.ndarray,
     idx_to_ts: dict[int, pd.Timestamp],
-    target_scaler: RobustScaler,
     model_name: str,
     quantiles: list[float],
 ) -> pd.DataFrame:
@@ -230,15 +257,8 @@ def _build_long_prediction_table(
     if dti.ndim != 2 or dti.shape != pred[:, :, 0].shape:
         raise ValueError("decoder_time_idx shape mismatch against prediction tensor.")
 
-    # Inverse-transform each quantile back to original unit.
-    pred_inv = np.zeros_like(pred, dtype=float)
-    for q_idx in range(pred.shape[2]):
-        flat = pred[:, :, q_idx].reshape(-1, 1)
-        inv = target_scaler.inverse_transform(flat).reshape(pred.shape[0], pred.shape[1])
-        pred_inv[:, :, q_idx] = inv
-
     # Enforce monotonic quantile ordering to avoid quantile crossing.
-    pred_inv = np.sort(pred_inv, axis=2)
+    pred_inv = np.sort(pred, axis=2)
     q_cols = [_qcol(q) for q in quantiles]
     median_col = _qcol(0.5)
 
@@ -322,7 +342,7 @@ def _train_tft(
     try:
         import lightning.pytorch as pl
         from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-        from pytorch_forecasting.data.encoders import NaNLabelEncoder
+        from pytorch_forecasting.data.encoders import EncoderNormalizer, NaNLabelEncoder
         from pytorch_forecasting.metrics import QuantileLoss
         import torch
     except Exception as exc:  # pragma: no cover
@@ -427,7 +447,12 @@ def _train_tft(
     # Calendar features must be discrete classes for embedding learning.
     for c in known_categoricals:
         if c in full_sc.columns:
-            full_sc[c] = full_sc[c].astype("Int64").astype(str)
+            ser = pd.to_numeric(full_sc[c], errors="coerce")
+            if c in ALLOWED_KNOWN_CATEGORICALS:
+                ser = ser.round().astype("Int64")
+            else:
+                ser = ser.round(6)
+            full_sc[c] = ser.where(ser.isna(), ser.astype(str))
 
     idx_train_end = int(full_sc.loc[full_sc["split"] == "train", "time_idx"].max())
     idx_val_end = int(full_sc.loc[full_sc["split"] == "val", "time_idx"].max())
@@ -443,6 +468,7 @@ def _train_tft(
         time_varying_known_reals=["time_idx", *known_reals],
         time_varying_known_categoricals=known_categoricals,
         time_varying_unknown_reals=[tgt, *unknown_reals],
+        target_normalizer=EncoderNormalizer(method="robust", center=True),
         categorical_encoders={c: NaNLabelEncoder(add_nan=True) for c in known_categoricals},
         allow_missing_timesteps=True,
     )
@@ -564,7 +590,7 @@ def _train_tft(
 
     def _predict(ds: TimeSeriesDataSet) -> pd.DataFrame:
         dl = ds.to_dataloader(train=False, batch_size=batch_size, num_workers=num_workers, pin_memory=False)
-        pred_out = tft.predict(dl, mode="raw", return_x=True)
+        pred_out = tft.predict(dl, mode="quantiles", return_x=True)
         # pytorch-forecasting returns a Prediction object in newer versions
         # (fields: output, x, index, decoder_lengths, y). Keep tuple fallback
         # for compatibility with older API shapes.
@@ -575,13 +601,19 @@ def _train_tft(
             raw_pred, x = pred_out[0], pred_out[1]
         else:
             raise TypeError(f"Unsupported TFT predict() return type: {type(pred_out)}")
-        pred_tensor = raw_pred["prediction"] if isinstance(raw_pred, dict) else raw_pred.prediction
+        if isinstance(raw_pred, dict):
+            pred_tensor = raw_pred.get("prediction")
+            if pred_tensor is None:
+                raise KeyError("TFT predict(mode='quantiles') returned dict without 'prediction'.")
+        elif hasattr(raw_pred, "prediction"):
+            pred_tensor = raw_pred.prediction
+        else:
+            pred_tensor = raw_pred
         decoder_idx = x["decoder_time_idx"]
         return _build_long_prediction_table(
             prediction=np.asarray(pred_tensor.detach().cpu()),
             decoder_time_idx=np.asarray(decoder_idx.detach().cpu()),
             idx_to_ts=idx_to_ts,
-            target_scaler=scalers["target_scaler"],
             model_name=model_name,
             quantiles=QUANTILES,
         )

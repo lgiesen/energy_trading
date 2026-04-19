@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Iterable, List
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import polars as pl
 
 LOGGER = logging.getLogger(__name__)
@@ -155,11 +156,21 @@ def _merge_outages_sidecar(merged: pl.DataFrame, outages_path: Path) -> pl.DataF
     elif "__index_level_0__" in outages.columns:
         ts_col = "__index_level_0__"
     else:
-        LOGGER.warning("Outage sidecar has no timestamp column. Filling outages with 0.0.")
-        return merged.with_columns([
-            pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
-            pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
-        ])
+        # Fallback for sidecars where timestamp is persisted as pandas index metadata.
+        outages_pd = pd.read_parquet(outages_path).reset_index()
+        if "timestamp_utc" in outages_pd.columns:
+            ts_col = "timestamp_utc"
+        elif "timestamp" in outages_pd.columns:
+            ts_col = "timestamp"
+        elif "__index_level_0__" in outages_pd.columns:
+            ts_col = "__index_level_0__"
+        else:
+            LOGGER.warning("Outage sidecar has no timestamp key. Filling outages with 0.0.")
+            return merged.with_columns([
+                pl.lit(0.0).cast(pl.Float64).alias("planned_outages_mw"),
+                pl.lit(0.0).cast(pl.Float64).alias("unplanned_outages_mw"),
+            ])
+        outages = pl.from_pandas(outages_pd)
 
     outages = _normalize_timestamp(outages, ts_col)
     if ts_col != "timestamp":
@@ -168,6 +179,20 @@ def _merge_outages_sidecar(merged: pl.DataFrame, outages_path: Path) -> pl.DataF
     keep = [c for c in ("timestamp", "planned_outages_mw", "unplanned_outages_mw") if c in outages.columns]
     outages = outages.select(keep)
     outages = _drop_nulls_and_dedup(outages, "timestamp", "outages sidecar")
+
+    merged_min = merged.select(pl.col("timestamp").min()).item()
+    merged_max = merged.select(pl.col("timestamp").max()).item()
+    out_min = outages.select(pl.col("timestamp").min()).item()
+    out_max = outages.select(pl.col("timestamp").max()).item()
+    if (out_max < merged_min) or (out_min > merged_max):
+        LOGGER.warning(
+            "Outage sidecar range [%s, %s] does not overlap merged range [%s, %s]; "
+            "outage features will become 0.0 after join.",
+            out_min,
+            out_max,
+            merged_min,
+            merged_max,
+        )
 
     joined = merged.join(outages, on="timestamp", how="left")
     for c in ("planned_outages_mw", "unplanned_outages_mw"):

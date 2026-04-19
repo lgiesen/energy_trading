@@ -54,7 +54,6 @@ is_evening,0.0,keep
 is_morning,0.0,keep
 is_night,0.0,keep
 is_payday_period,0.0,keep
-is_picasso_regime,0.0,keep
 is_weekend,0.0,keep
 lignite_capacity,0.0,keep
 load_abs_error,0.0,keep

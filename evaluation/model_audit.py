@@ -52,7 +52,7 @@ def _feature_groups(feature_cols: list[str]) -> dict[str, list[str]]:
         r"^(hour|dayofweek|weekday|month)_(sin|cos)$",
         r"^is_(weekend|morning|afternoon|evening|night|bridge_day|christmas_break|payday_period)$",
         r"^da_price_(pit|lag_|diff|mean_|std_|ewma|slog1p)",
-        r"^(da_price_pit|market_regime_picasso|is_picasso_active|is_picasso_regime)$",
+        r"^(da_price_pit|market_regime_picasso|is_picasso_active)$",
     ]
     weather_patterns = [
         r"(wind|solar|load_forecast|residual_load_forecast|renewable_share_forecast)",

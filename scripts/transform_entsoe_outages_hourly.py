@@ -38,6 +38,17 @@ def _ensure_utc(ts: pd.Series) -> pd.Series:
     return out
 
 
+def _parse_utc_opt(value: str | None) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
 def _load_outages(path: Path, *, require_end: bool = True) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing outage file: {path}")
@@ -123,16 +134,43 @@ def transform_outages_hourly(
     unplanned_path: Path,
     out_path: Path,
     days_ahead: int = 7,
+    range_start: pd.Timestamp | None = None,
+    range_end: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    now_utc = pd.Timestamp.now("UTC")
-    range_start = now_utc.floor("h")
-    range_end = range_start + pd.Timedelta(days=days_ahead)
-    hourly_index = pd.date_range(range_start, range_end, freq="1h", inclusive="left", tz="UTC")
-
     planned = _load_outages(planned_path, require_end=True)
     unplanned_raw = _load_outages(unplanned_path, require_end=False)
     # Causal safety: ignore retroactively known repair time for unplanned outages.
     unplanned = _apply_unplanned_persistence_window(unplanned_raw, hours=24)
+
+    if range_start is None or range_end is None:
+        starts = [
+            s for s in (
+                planned["start"].min() if not planned.empty else pd.NaT,
+                unplanned["start"].min() if not unplanned.empty else pd.NaT,
+            )
+            if pd.notna(s)
+        ]
+        ends = [
+            e for e in (
+                planned["end"].max() if not planned.empty else pd.NaT,
+                unplanned["end"].max() if not unplanned.empty else pd.NaT,
+            )
+            if pd.notna(e)
+        ]
+        if not starts or not ends:
+            now_utc = pd.Timestamp.now("UTC").floor("h")
+            range_start = now_utc
+            range_end = now_utc + pd.Timedelta(days=days_ahead)
+        else:
+            range_start = min(starts).floor("h")
+            range_end = max(ends).ceil("h")
+    else:
+        range_start = pd.Timestamp(range_start).tz_convert("UTC") if pd.Timestamp(range_start).tzinfo else pd.Timestamp(range_start).tz_localize("UTC")
+        range_end = pd.Timestamp(range_end).tz_convert("UTC") if pd.Timestamp(range_end).tzinfo else pd.Timestamp(range_end).tz_localize("UTC")
+    if range_end <= range_start:
+        raise ValueError("range_end must be after range_start")
+
+    hourly_index = pd.date_range(range_start, range_end, freq="1h", inclusive="left", tz="UTC")
 
     planned_series = _build_hourly_outage_series(planned, range_start, range_end, hourly_index)
     unplanned_series = _build_hourly_outage_series(unplanned, range_start, range_end, hourly_index)
@@ -176,7 +214,17 @@ def main() -> None:
         "--days-ahead",
         type=int,
         default=7,
-        help="Forecast horizon in days (default: 7).",
+        help="Fallback horizon in days if no usable event bounds exist (default: 7).",
+    )
+    parser.add_argument(
+        "--start",
+        default=None,
+        help="Optional UTC start override, e.g. 2020-11-29T23:00:00Z.",
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="Optional UTC end override, e.g. 2026-03-01T02:00:00Z.",
     )
     args = parser.parse_args()
 
@@ -186,6 +234,8 @@ def main() -> None:
             unplanned_path=Path(args.unplanned),
             out_path=Path(args.out),
             days_ahead=args.days_ahead,
+            range_start=_parse_utc_opt(args.start),
+            range_end=_parse_utc_opt(args.end),
         )
     except Exception as exc:
         LOGGER.error("Failed to transform outage events: %s", exc)

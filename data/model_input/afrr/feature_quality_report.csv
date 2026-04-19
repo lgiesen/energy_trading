@@ -108,6 +108,8 @@ afrr_da_price_spread_lag_2h,0.0,keep
 afrr_da_price_spread_lag_3h,0.0,keep
 afrr_da_price_spread_lag_48h,0.0,keep
 afrr_da_price_spread_lag_6h,0.0,keep
+afrr_picasso_mw_neg_lag_1h,0.0,keep
+afrr_picasso_mw_pos_lag_1h,0.0,keep
 co2_price,0.0,keep
 coal_price,0.0,keep
 da_price_AT,0.0,keep
@@ -183,7 +185,6 @@ is_evening,0.0,keep
 is_morning,0.0,keep
 is_night,0.0,keep
 is_payday_period,0.0,keep
-is_picasso_regime,0.0,keep
 is_weekend,0.0,keep
 lignite_capacity,0.0,keep
 load_abs_error,0.0,keep

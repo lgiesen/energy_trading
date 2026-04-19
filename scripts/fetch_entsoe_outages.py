@@ -57,6 +57,9 @@ BUSINESS_TYPE_REASON = {
     BUSINESS_TYPE_PLANNED: "Planned maintenance",
     BUSINESS_TYPE_UNPLANNED: "Unplanned outage",
 }
+DEFAULT_HISTORY_START_UTC = pd.Timestamp("2020-11-29T23:00:00Z")
+DEFAULT_CHUNK_DAYS = 90
+ENTSOE_PAGE_SIZE = 200
 
 
 def _parse_utc(ts: str) -> pd.Timestamp:
@@ -90,30 +93,84 @@ def _query_generation_unavailability(
     explicitly, then parse the ZIP/XML payload with the library parser.
     """
     area = lookup_area(Area.DE_LU)
-    params = {
-        "documentType": DOCUMENT_TYPE_GENERATION_UNAVAILABILITY,
-        "biddingZone_Domain": area.code,
-        "businessType": business_type,
-    }
-    response = client._base_request(params=params, start=start, end=end)
-    df = parse_unavailabilities(response.content, DOCUMENT_TYPE_GENERATION_UNAVAILABILITY)
+    pages: list[pd.DataFrame] = []
+    offset = 0
+    while True:
+        params = {
+            "documentType": DOCUMENT_TYPE_GENERATION_UNAVAILABILITY,
+            # Use the same canonical key casing as entsoe-py internals.
+            "biddingZone_domain": area.code,
+            "businessType": business_type,
+            "offset": offset,
+        }
+        response = client._base_request(params=params, start=start, end=end)
+        page = parse_unavailabilities(response.content, DOCUMENT_TYPE_GENERATION_UNAVAILABILITY)
+        if page.empty:
+            break
 
-    if df.empty:
-        return df
+        # entsoe-py returns the parsed frame indexed by created_doc_time in area tz.
+        if not isinstance(page.index, pd.DatetimeIndex):
+            page.index = pd.to_datetime(page.index, utc=True, errors="coerce")
+        elif page.index.tz is None:
+            page.index = page.index.tz_localize(area.tz).tz_convert("UTC")
+        else:
+            page.index = page.index.tz_convert("UTC")
 
-    # entsoe-py returns the parsed frame indexed by created_doc_time in area tz.
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-    elif df.index.tz is None:
-        df.index = df.index.tz_localize(area.tz).tz_convert("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
+        for col in ("start", "end"):
+            if col in page.columns:
+                page[col] = pd.to_datetime(page[col], utc=True, errors="coerce")
 
-    for col in ("start", "end"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+        pages.append(page)
+        if len(page) < ENTSOE_PAGE_SIZE:
+            break
+        offset += ENTSOE_PAGE_SIZE
 
-    return df
+    if not pages:
+        return pd.DataFrame()
+    return pd.concat(pages, axis=0, ignore_index=False)
+
+
+def _query_generation_unavailability_chunked(
+    client: EntsoePandasClient,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    business_type: str,
+    chunk_days: int = DEFAULT_CHUNK_DAYS,
+) -> pd.DataFrame:
+    """Fetch outage events in chunks to avoid oversized ENTSO-E requests."""
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    cur = start
+    step = pd.Timedelta(days=max(1, int(chunk_days)))
+
+    while cur < end:
+        cur_end = min(cur + step, end)
+        LOGGER.info("Fetching %s chunk [%s, %s)", business_type, cur, cur_end)
+        try:
+            chunk = _query_generation_unavailability(
+                client=client,
+                start=cur,
+                end=cur_end,
+                business_type=business_type,
+            )
+        except Exception as exc:  # pragma: no cover - network/API behavior
+            msg = f"Chunk [{cur}, {cur_end}) failed: {exc}"
+            LOGGER.error(msg)
+            errors.append(msg)
+            cur = cur_end
+            continue
+        if not chunk.empty:
+            frames.append(chunk)
+        cur = cur_end
+
+    if not frames:
+        if errors:
+            raise RuntimeError(
+                f"All chunk requests failed for businessType={business_type}. "
+                f"First error: {errors[0]}"
+            )
+        return pd.DataFrame()
+    return pd.concat(frames, axis=0, ignore_index=False)
 
 
 def _clean_outages(df: pd.DataFrame, business_type: str) -> pd.DataFrame:
@@ -188,7 +245,7 @@ def get_planned_outages(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Fetch planned generation outages (A80 + A53) for DE-LU."""
     client = _get_client()
     try:
-        raw = _query_generation_unavailability(
+        raw = _query_generation_unavailability_chunked(
             client=client,
             start=start,
             end=end,
@@ -204,7 +261,7 @@ def get_unplanned_outages(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFram
     """Fetch unplanned generation outages (A80 + A54) for DE-LU."""
     client = _get_client()
     try:
-        raw = _query_generation_unavailability(
+        raw = _query_generation_unavailability_chunked(
             client=client,
             start=start,
             end=end,
@@ -221,13 +278,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch planned and unplanned ENTSO-E generation outages for DE-LU.")
     parser.add_argument("--start", help="UTC start timestamp, e.g. 2026-03-20T00:00:00Z")
     parser.add_argument("--end", help="UTC end timestamp, e.g. 2026-03-27T00:00:00Z")
-    parser.add_argument("--days-ahead", type=int, default=7, help="If start/end are omitted, fetch next N days (default: 7).")
+    parser.add_argument(
+        "--days-ahead",
+        type=int,
+        default=7,
+        help=(
+            "If --end is omitted, extend end by N days from start. "
+            "If both --start/--end are omitted, start defaults to project history start."
+        ),
+    )
     parser.add_argument("--out-dir", default="data/raw/entsoe_outages", help="Output directory for parquet/csv files.")
     args = parser.parse_args()
 
     now_utc = pd.Timestamp.now("UTC")
-    start = _parse_utc(args.start) if args.start else now_utc.floor("h")
-    end = _parse_utc(args.end) if args.end else start + pd.Timedelta(days=args.days_ahead)
+    start = _parse_utc(args.start) if args.start else DEFAULT_HISTORY_START_UTC
+    end = _parse_utc(args.end) if args.end else (now_utc.ceil("h") + pd.Timedelta(days=args.days_ahead))
 
     if end <= start:
         raise ValueError("--end must be after --start")
@@ -239,6 +304,12 @@ def main() -> None:
     LOGGER.info("Fetching DE-LU unplanned outages from %s to %s", start, end)
     unplanned = get_unplanned_outages(start, end)
     LOGGER.info("Fetched %s unplanned outage rows", len(unplanned))
+
+    if planned.empty and unplanned.empty:
+        raise RuntimeError(
+            "Outage fetch returned 0 rows for both planned and unplanned outages. "
+            "Check ENTSOE_API_TOKEN/ENTSOE_API_KEY and request range."
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
