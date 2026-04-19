@@ -363,10 +363,10 @@ def prepare_model_data(
     Examples
     --------
     >>> X_train, X_test, y_train, y_test = prepare_model_data(
-    ...     df, target_col="target_afrr_activation_price_vwap_pos_h1", model_type="xgboost"
+    ...     df, target_col="target_afrr_activation_price_vwap_pos", model_type="xgboost"
     ... )
     >>> X_train_lin, X_test_lin, y_train_lin, y_test_lin = prepare_model_data(
-    ...     df, target_col="target_afrr_activation_price_vwap_pos_h1", model_type="linear"
+    ...     df, target_col="target_afrr_activation_price_vwap_pos", model_type="linear"
     ... )
     """
     if target_col not in df.columns:

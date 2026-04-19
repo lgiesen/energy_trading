@@ -32,7 +32,7 @@ from energy_trading.models.prepare_ml_bundles import load_processed_data
 
 
 STACK_COL = "da_price_predicted_h1"
-DA_TARGET = "target_da_price_h1"
+DA_TARGET = "target_da_price"
 
 
 def _build_cli() -> argparse.ArgumentParser:

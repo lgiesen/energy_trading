@@ -24,7 +24,7 @@ def _resolve_target(bundle: BundleName, requested: str | None, y_cols: list[str]
         if requested not in y_cols:
             raise KeyError(f"Requested target '{requested}' not found in available targets: {y_cols}")
         return requested
-    default = "target_da_price_h1" if bundle == "da" else "target_afrr_activation_price_vwap_pos_h1"
+    default = "target_da_price" if bundle == "da" else "target_afrr_activation_price_vwap_pos"
     if default not in y_cols:
         raise KeyError(f"Default target '{default}' not found in targets: {y_cols}")
     return default

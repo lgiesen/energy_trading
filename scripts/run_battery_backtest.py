@@ -108,39 +108,67 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
         pred_da_price=pick_pred(
             pred,
             colmap.pred_da_price,
-            ["da_price_pred", "y_pred_da_price", "prediction_da_price", "pred_target_da_price_h1"],
+            ["da_price_pred", "y_pred_da_price", "prediction_da_price", "pred_target_da_price"],
         ),
-        pred_afrr_capacity_price_pos=pick_pred(pred, colmap.pred_afrr_capacity_price_pos, ["afrr_capacity_price_pos_pred", "pred_target_afrr_capacity_price_pos_h1"]),
-        pred_afrr_capacity_price_neg=pick_pred(pred, colmap.pred_afrr_capacity_price_neg, ["afrr_capacity_price_neg_pred", "pred_target_afrr_capacity_price_neg_h1"]),
-        pred_afrr_activation_price_pos=pick_pred(pred, colmap.pred_afrr_activation_price_pos, ["afrr_activation_price_vwap_pos_pred", "pred_target_afrr_activation_price_vwap_pos_h1"]),
+        pred_afrr_capacity_price_pos=pick_pred(pred, colmap.pred_afrr_capacity_price_pos, ["afrr_capacity_price_pos_pred", "pred_target_afrr_capacity_price_pos"]),
+        pred_afrr_capacity_price_neg=pick_pred(pred, colmap.pred_afrr_capacity_price_neg, ["afrr_capacity_price_neg_pred", "pred_target_afrr_capacity_price_neg"]),
+        pred_afrr_activation_price_pos=pick_pred(pred, colmap.pred_afrr_activation_price_pos, ["afrr_activation_price_vwap_pos_pred", "pred_target_afrr_activation_price_vwap_pos"]),
         pred_afrr_activation_price_neg=pick_pred(
             pred,
             colmap.pred_afrr_activation_price_neg,
-            ["afrr_activation_price_vwap_neg_pred", "pred_target_afrr_activation_price_vwap_neg_h1"],
+            ["afrr_activation_price_vwap_neg_pred", "pred_target_afrr_activation_price_vwap_neg"],
         ),
-        pred_afrr_activation_rate_pos=pick_pred(pred, colmap.pred_afrr_activation_rate_pos, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
-        pred_afrr_activation_rate_neg=pick_pred(pred, colmap.pred_afrr_activation_rate_neg, ["afrr_activation_rate_pred", "pred_target_afrr_rate_h1"]),
+        pred_afrr_activation_rate_pos=pick_pred(
+            pred,
+            colmap.pred_afrr_activation_rate_pos,
+            ["pred_target_afrr_activation_rate_pos", "afrr_activation_rate_pred", "pred_target_afrr_rate"],
+        ),
+        pred_afrr_activation_rate_neg=pick_pred(
+            pred,
+            colmap.pred_afrr_activation_rate_neg,
+            ["pred_target_afrr_activation_rate_neg", "afrr_activation_rate_pred", "pred_target_afrr_rate"],
+        ),
 
-        true_da_price=pick(truth, colmap.true_da_price, ["da_price_actual", "target_da_price_h1"]),
-        true_afrr_capacity_price_pos=pick(truth, colmap.true_afrr_capacity_price_pos, ["target_afrr_capacity_price_pos_h1"]),
-        true_afrr_capacity_price_neg=pick(truth, colmap.true_afrr_capacity_price_neg, ["target_afrr_capacity_price_neg_h1"]),
+        true_da_price=pick(truth, colmap.true_da_price, ["da_price_actual", "target_da_price"]),
+        true_afrr_capacity_price_pos=pick(truth, colmap.true_afrr_capacity_price_pos, ["target_afrr_capacity_price_pos"]),
+        true_afrr_capacity_price_neg=pick(truth, colmap.true_afrr_capacity_price_neg, ["target_afrr_capacity_price_neg"]),
         true_afrr_activation_price_pos=pick(
             truth,
             colmap.true_afrr_activation_price_pos,
-            ["target_afrr_activation_price_vwap_pos_h1", "afrr_activation_price_vwap"],
+            ["target_afrr_activation_price_vwap_pos", "afrr_activation_price_vwap"],
         ),
         true_afrr_activation_price_neg=pick(
             truth,
             colmap.true_afrr_activation_price_neg,
             [
-                "target_afrr_activation_price_vwap_neg_h1",
+                "target_afrr_activation_price_vwap_neg",
                 "afrr_activation_price_vwap",
                 "afrr_activation_price_vwap_pos",
-                "target_afrr_activation_price_vwap_pos_h1",
+                "target_afrr_activation_price_vwap_pos",
             ],
         ),
-        true_afrr_activation_rate_pos=pick(truth, colmap.true_afrr_activation_rate_pos, ["afrr_activation_rate", "target_afrr_rate_h1"]),
-        true_afrr_activation_rate_neg=pick(truth, colmap.true_afrr_activation_rate_neg, ["afrr_activation_rate", "target_afrr_rate_h1"]),
+        true_afrr_activation_rate_pos=pick(
+            truth,
+            colmap.true_afrr_activation_rate_pos,
+            [
+                "activation_rate_phys_pos",
+                "afrr_activation_rate_pos",
+                "target_afrr_activation_rate_pos",
+                "afrr_activation_rate",
+                "target_afrr_rate",
+            ],
+        ),
+        true_afrr_activation_rate_neg=pick(
+            truth,
+            colmap.true_afrr_activation_rate_neg,
+            [
+                "activation_rate_phys_neg",
+                "afrr_activation_rate_neg",
+                "target_afrr_activation_rate_neg",
+                "afrr_activation_rate",
+                "target_afrr_rate",
+            ],
+        ),
     )
     if mapped.true_afrr_activation_price_neg == mapped.true_afrr_activation_price_pos:
         print(
@@ -180,8 +208,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--true-cap-neg-col", default="afrr_capacity_price_neg")
     p.add_argument("--true-act-pos-col", default="afrr_activation_price_vwap_pos")
     p.add_argument("--true-act-neg-col", default="afrr_activation_price_vwap_neg")
-    p.add_argument("--true-rate-pos-col", default="afrr_activation_rate_pos")
-    p.add_argument("--true-rate-neg-col", default="afrr_activation_rate_neg")
+    p.add_argument("--true-rate-pos-col", default="activation_rate_phys_pos")
+    p.add_argument("--true-rate-neg-col", default="activation_rate_phys_neg")
 
     p.add_argument("--start", default=None, help="Optional UTC start filter.")
     p.add_argument("--end", default=None, help="Optional UTC end filter.")

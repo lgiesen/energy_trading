@@ -13,11 +13,14 @@ import pandas as pd
 
 
 AFRR_TARGETS = [
-    "target_afrr_activation_price_vwap_pos_h1",
-    "target_afrr_activation_price_vwap_neg_h1",
-    "target_afrr_rate_h1",
-    "target_afrr_capacity_price_pos_h1",
-    "target_afrr_capacity_price_neg_h1",
+    "target_afrr_activation_price_vwap_pos",
+    "target_afrr_activation_price_vwap_neg",
+    "target_afrr_activation_rate_pos",
+    "target_afrr_activation_rate_neg",
+    "target_afrr_capacity_price_pos",
+    "target_afrr_capacity_price_neg",
+    # Backward compatibility for older bundles.
+    "target_afrr_rate",
 ]
 
 

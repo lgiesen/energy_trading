@@ -24,23 +24,23 @@ QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 QCOLS: list[str] = [f"p{int(round(q * 100)):02d}" for q in QUANTILES]
 
 PRED_TO_TARGET = {
-    "pred_da_price": "target_da_price_h1",
-    "pred_afrr_activation_price_pos": "target_afrr_activation_price_vwap_pos_h1",
-    "pred_afrr_activation_price_neg": "target_afrr_activation_price_vwap_neg_h1",
-    "pred_afrr_capacity_price_pos": "target_afrr_capacity_price_pos_h1",
-    "pred_afrr_capacity_price_neg": "target_afrr_capacity_price_neg_h1",
-    "pred_afrr_activation_rate_pos": "target_afrr_rate_h1",
-    "pred_afrr_activation_rate_neg": "target_afrr_rate_h1",
+    "pred_da_price": "target_da_price",
+    "pred_afrr_activation_price_pos": "target_afrr_activation_price_vwap_pos",
+    "pred_afrr_activation_price_neg": "target_afrr_activation_price_vwap_neg",
+    "pred_afrr_capacity_price_pos": "target_afrr_capacity_price_pos",
+    "pred_afrr_capacity_price_neg": "target_afrr_capacity_price_neg",
+    "pred_afrr_activation_rate_pos": "target_afrr_activation_rate_pos",
+    "pred_afrr_activation_rate_neg": "target_afrr_activation_rate_neg",
 }
 
 PRED_TO_TRUE = {
-    "pred_da_price": ["da_price", "target_da_price_h1"],
-    "pred_afrr_activation_price_pos": ["afrr_activation_price_vwap_pos", "target_afrr_activation_price_vwap_pos_h1"],
-    "pred_afrr_activation_price_neg": ["afrr_activation_price_vwap_neg", "target_afrr_activation_price_vwap_neg_h1"],
-    "pred_afrr_capacity_price_pos": ["afrr_capacity_price_pos", "target_afrr_capacity_price_pos_h1"],
-    "pred_afrr_capacity_price_neg": ["afrr_capacity_price_neg", "target_afrr_capacity_price_neg_h1"],
-    "pred_afrr_activation_rate_pos": ["afrr_activation_rate", "afrr_activation_rate_pos", "target_afrr_rate_h1"],
-    "pred_afrr_activation_rate_neg": ["afrr_activation_rate", "afrr_activation_rate_neg", "target_afrr_rate_h1"],
+    "pred_da_price": ["da_price", "target_da_price"],
+    "pred_afrr_activation_price_pos": ["afrr_activation_price_vwap_pos", "target_afrr_activation_price_vwap_pos"],
+    "pred_afrr_activation_price_neg": ["afrr_activation_price_vwap_neg", "target_afrr_activation_price_vwap_neg"],
+    "pred_afrr_capacity_price_pos": ["afrr_capacity_price_pos", "target_afrr_capacity_price_pos"],
+    "pred_afrr_capacity_price_neg": ["afrr_capacity_price_neg", "target_afrr_capacity_price_neg"],
+    "pred_afrr_activation_rate_pos": ["afrr_activation_rate_pos", "target_afrr_activation_rate_pos", "afrr_activation_rate", "target_afrr_rate"],
+    "pred_afrr_activation_rate_neg": ["afrr_activation_rate_neg", "target_afrr_activation_rate_neg", "afrr_activation_rate", "target_afrr_rate"],
 }
 
 
@@ -119,7 +119,12 @@ def _discover_long_prediction_files(run_dir: Path, split: str, manifest: dict[st
     pred_dir = run_dir / "predictions"
     if not pred_dir.exists():
         return out
-    for p in pred_dir.glob(f"*{split}*long*.parquet"):
+    # Support both naming orders used by different exporters:
+    # - ...<split>...long...
+    # - ...long...<split>...
+    candidates = list(pred_dir.glob(f"*{split}*long*.parquet"))
+    candidates += [p for p in pred_dir.glob(f"*long*{split}*.parquet") if p not in candidates]
+    for p in candidates:
         name = p.name
         for pred_col in PRED_TO_TARGET:
             if pred_col in name:

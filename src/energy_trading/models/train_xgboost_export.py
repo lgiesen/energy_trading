@@ -55,19 +55,20 @@ def _resolve_base_dir(preferred: str | Path) -> Path:
 
 def _default_target_for_bundle(bundle: BundleName) -> str:
     if bundle == "da":
-        return "target_da_price_h1"
+        return "target_da_price"
     if bundle == "afrr":
-        return "target_afrr_activation_price_vwap_pos_h1"
+        return "target_afrr_activation_price_vwap_pos"
     raise KeyError(f"Unsupported bundle: {bundle}")
 
 
 def _default_afrr_targets() -> list[str]:
     return [
-        "target_afrr_activation_price_vwap_pos_h1",
-        "target_afrr_activation_price_vwap_neg_h1",
-        "target_afrr_rate_h1",
-        "target_afrr_capacity_price_pos_h1",
-        "target_afrr_capacity_price_neg_h1",
+        "target_afrr_activation_price_vwap_pos",
+        "target_afrr_activation_price_vwap_neg",
+        "target_afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg",
     ]
 
 
@@ -95,38 +96,43 @@ def _resolve_targets(
 
 def _pred_column_names_for_target(target_col: str) -> list[str]:
     mapping = {
-        "target_da_price_h1": ["pred_da_price"],
-        "target_afrr_activation_price_vwap_pos_h1": ["pred_afrr_activation_price_pos"],
-        "target_afrr_activation_price_vwap_neg_h1": ["pred_afrr_activation_price_neg"],
-        "target_afrr_capacity_price_pos_h1": ["pred_afrr_capacity_price_pos"],
-        "target_afrr_capacity_price_neg_h1": ["pred_afrr_capacity_price_neg"],
-        # Single rate target is reused for both directions by convention.
-        "target_afrr_rate_h1": ["pred_afrr_activation_rate_pos", "pred_afrr_activation_rate_neg"],
+        "target_da_price": ["pred_da_price"],
+        "target_afrr_activation_price_vwap_pos": ["pred_afrr_activation_price_pos"],
+        "target_afrr_activation_price_vwap_neg": ["pred_afrr_activation_price_neg"],
+        "target_afrr_activation_rate_pos": ["pred_afrr_activation_rate_pos"],
+        "target_afrr_activation_rate_neg": ["pred_afrr_activation_rate_neg"],
+        "target_afrr_capacity_price_pos": ["pred_afrr_capacity_price_pos"],
+        "target_afrr_capacity_price_neg": ["pred_afrr_capacity_price_neg"],
+        # Backward compatibility for legacy bundles with a single rate target.
+        "target_afrr_rate": ["pred_afrr_activation_rate_pos", "pred_afrr_activation_rate_neg"],
     }
     return mapping.get(target_col, [f"pred_{target_col}"])
 
 
 def _source_series_name_for_target(target_col: str) -> str | None:
     mapping = {
-        "target_da_price_h1": "da_price",
-        "target_afrr_activation_price_vwap_pos_h1": "afrr_activation_price_vwap_pos",
-        "target_afrr_activation_price_vwap_neg_h1": "afrr_activation_price_vwap_neg",
-        "target_afrr_capacity_price_pos_h1": "afrr_capacity_price_pos",
-        "target_afrr_capacity_price_neg_h1": "afrr_capacity_price_neg",
-        "target_afrr_rate_h1": "afrr_activation_rate",
+        "target_da_price": "da_price",
+        "target_afrr_activation_price_vwap_pos": "afrr_activation_price_vwap_pos",
+        "target_afrr_activation_price_vwap_neg": "afrr_activation_price_vwap_neg",
+        "target_afrr_activation_rate_pos": "afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg": "afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos": "afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg": "afrr_capacity_price_neg",
+        # Backward compatibility for legacy bundles.
+        "target_afrr_rate": "afrr_activation_rate",
     }
     return mapping.get(target_col)
 
 
 def _target_for_pred_column(pred_col: str) -> str | None:
     mapping = {
-        "pred_da_price": "target_da_price_h1",
-        "pred_afrr_activation_price_pos": "target_afrr_activation_price_vwap_pos_h1",
-        "pred_afrr_activation_price_neg": "target_afrr_activation_price_vwap_neg_h1",
-        "pred_afrr_capacity_price_pos": "target_afrr_capacity_price_pos_h1",
-        "pred_afrr_capacity_price_neg": "target_afrr_capacity_price_neg_h1",
-        "pred_afrr_activation_rate_pos": "target_afrr_rate_h1",
-        "pred_afrr_activation_rate_neg": "target_afrr_rate_h1",
+        "pred_da_price": "target_da_price",
+        "pred_afrr_activation_price_pos": "target_afrr_activation_price_vwap_pos",
+        "pred_afrr_activation_price_neg": "target_afrr_activation_price_vwap_neg",
+        "pred_afrr_activation_rate_pos": "target_afrr_activation_rate_pos",
+        "pred_afrr_activation_rate_neg": "target_afrr_activation_rate_neg",
+        "pred_afrr_capacity_price_pos": "target_afrr_capacity_price_pos",
+        "pred_afrr_capacity_price_neg": "target_afrr_capacity_price_neg",
     }
     return mapping.get(pred_col)
 

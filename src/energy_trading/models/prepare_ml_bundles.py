@@ -153,13 +153,14 @@ class MLDataFactory:
     """
 
     # Strict forecast labels for training (h+1 only).
-    DA_TRAIN_TARGET = "target_da_price_h1"
-    AFRR_PRIMARY_TRAIN_TARGET = "target_afrr_activation_price_vwap_pos_h1"
+    DA_TRAIN_TARGET = "target_da_price"
+    AFRR_PRIMARY_TRAIN_TARGET = "target_afrr_activation_price_vwap_pos"
     AFRR_OPTIONAL_TRAIN_TARGETS = [
-        "target_afrr_activation_price_vwap_neg_h1",
-        "target_afrr_rate_h1",
-        "target_afrr_capacity_price_pos_h1",
-        "target_afrr_capacity_price_neg_h1",
+        "target_afrr_activation_price_vwap_neg",
+        "target_afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg",
     ]
 
     # Optional unshifted audit labels (y_true), never used as training targets.
@@ -167,7 +168,8 @@ class MLDataFactory:
     AFRR_AUDIT_CANDIDATES = [
         "afrr_activation_price_vwap_pos",
         "afrr_activation_price_vwap_neg",
-        "afrr_activation_rate",
+        "afrr_activation_rate_pos",
+        "afrr_activation_rate_neg",
     ]
 
     HARD_META_EXCLUDE = {"timestamp_utc"}
@@ -298,9 +300,9 @@ class MLDataFactory:
     @staticmethod
     def _canonical_primary_target(bundle: BundleName) -> str:
         if bundle == "da":
-            return "target_da_price_h1"
+            return "target_da_price"
         if bundle == "afrr":
-            return "target_afrr_activation_price_vwap_pos_h1"
+            return "target_afrr_activation_price_vwap_pos"
         raise ValueError(f"Unsupported bundle: {bundle}")
 
     def _bundle_targets(self, df: pd.DataFrame, bundle: BundleName) -> tuple[list[str], list[str]]:
