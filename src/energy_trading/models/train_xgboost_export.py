@@ -921,8 +921,22 @@ def _predict_with_device_alignment(model, X: pd.DataFrame, *, resolved_device: s
             pred_gpu = booster.inplace_predict(x_gpu)
             return np.asarray(cp.asnumpy(pred_gpu), dtype=float).reshape(-1)
         except Exception:
-            # Keep robust fallback path when CuPy/GPU inplace predict is unavailable.
-            return np.asarray(model.predict(X_pred), dtype=float).reshape(-1)
+            # If CuPy is unavailable, avoid sklearn's CUDA/CPU inplace-predict
+            # mismatch path by explicitly using DMatrix with the booster.
+            try:
+                import xgboost as xgb  # type: ignore
+
+                booster = model.get_booster()
+                booster.set_param({"device": resolved_device})
+                x_dm = xgb.DMatrix(
+                    X_pred.to_numpy(dtype=np.float32, copy=False),
+                    feature_names=list(X_pred.columns),
+                )
+                pred = booster.predict(x_dm)
+                return np.asarray(pred, dtype=float).reshape(-1)
+            except Exception:
+                # Last-resort fallback for environments with incompatible XGBoost APIs.
+                return np.asarray(model.predict(X_pred), dtype=float).reshape(-1)
     return np.asarray(model.predict(X_pred), dtype=float).reshape(-1)
 
 
