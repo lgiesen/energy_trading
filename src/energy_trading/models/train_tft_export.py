@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -324,6 +325,235 @@ def _leadtime_mae(
     return pd.DataFrame(rows)
 
 
+def _save_tft_attention_plot(
+    *,
+    tft_model,
+    dataset,
+    out_path: Path,
+    batch_size: int,
+    num_workers: int,
+) -> str | None:
+    """Export TFT interpretation/attention plot for thesis diagnostics.
+
+    Uses `predict(mode="raw", return_x=True)` + `interpret_output`.
+    Falls back to manual attention plotting if `plot_interpretation` shape/API differs.
+    Returns absolute output path string on success, else None.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        LOGGER.warning("Could not import matplotlib for attention plotting: %s", exc)
+        return None
+
+    try:
+        dl = dataset.to_dataloader(
+            train=False,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=False,
+        )
+        raw_out = tft_model.predict(dl, mode="raw", return_x=True)
+        if hasattr(raw_out, "output") and hasattr(raw_out, "x"):
+            network_out = raw_out.output
+        elif isinstance(raw_out, tuple) and len(raw_out) >= 2:
+            network_out = raw_out[0]
+        else:
+            raise TypeError(f"Unsupported TFT raw predict() return type: {type(raw_out)}")
+
+        interpretation = tft_model.interpret_output(network_out, reduction="mean")
+        fig_obj = tft_model.plot_interpretation(interpretation)
+
+        fig = None
+        if hasattr(fig_obj, "savefig"):
+            fig = fig_obj
+        elif isinstance(fig_obj, dict):
+            for v in fig_obj.values():
+                if hasattr(v, "savefig"):
+                    fig = v
+                    break
+                if hasattr(v, "figure"):
+                    fig = v.figure
+                    break
+        elif isinstance(fig_obj, (list, tuple)) and fig_obj:
+            v = fig_obj[0]
+            if hasattr(v, "savefig"):
+                fig = v
+            elif hasattr(v, "figure"):
+                fig = v.figure
+
+        if fig is None:
+            # Fallback: manual attention visualization.
+            att = interpretation.get("attention") if isinstance(interpretation, dict) else None
+            if att is None:
+                raise ValueError("interpret_output produced no 'attention' entry.")
+            att_np = np.asarray(att.detach().cpu() if hasattr(att, "detach") else att, dtype=float)
+            if att_np.ndim == 0:
+                att_np = att_np.reshape(1)
+            if att_np.ndim > 1:
+                # average over non-time dimensions
+                reduce_axes = tuple(range(att_np.ndim - 1))
+                att_np = np.nanmean(att_np, axis=reduce_axes)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(np.arange(att_np.shape[0]), att_np, linewidth=2)
+            ax.set_title("TFT Attention Weights (mean)")
+            ax.set_xlabel("Relative Time Step")
+            ax.set_ylabel("Attention Weight")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return str(out_path.resolve())
+    except Exception as exc:  # pragma: no cover
+        LOGGER.warning("Could not export TFT attention plot: %s", exc)
+        return None
+
+
+def _save_tft_interpretation_artifacts(
+    *,
+    tft_model,
+    dataset,
+    out_dir: Path,
+    prefix: str,
+    batch_size: int,
+    num_workers: int,
+    max_encoder_length: int,
+) -> dict[str, str]:
+    """Export thesis-oriented TFT interpretation artifacts.
+
+    Outputs (if possible):
+    - Combined interpretation plot from pytorch-forecasting.
+    - Attention-history line plot focused on encoder horizon (t-enc ... t-1).
+    - Variable-importance bar plot (top features).
+    """
+    out: dict[str, str] = {}
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        LOGGER.warning("Could not import matplotlib for interpretation artifacts: %s", exc)
+        return out
+
+    try:
+        dl = dataset.to_dataloader(
+            train=False,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=False,
+        )
+        raw_out = tft_model.predict(dl, mode="raw", return_x=True)
+        if hasattr(raw_out, "output") and hasattr(raw_out, "x"):
+            network_out = raw_out.output
+        elif isinstance(raw_out, tuple) and len(raw_out) >= 2:
+            network_out = raw_out[0]
+        else:
+            raise TypeError(f"Unsupported TFT raw predict() return type: {type(raw_out)}")
+
+        interpretation = tft_model.interpret_output(network_out, reduction="mean")
+
+        # 1) framework interpretation plot
+        try:
+            fig_obj = tft_model.plot_interpretation(interpretation)
+            fig = None
+            if hasattr(fig_obj, "savefig"):
+                fig = fig_obj
+            elif isinstance(fig_obj, dict):
+                for v in fig_obj.values():
+                    if hasattr(v, "savefig"):
+                        fig = v
+                        break
+                    if hasattr(v, "figure"):
+                        fig = v.figure
+                        break
+            elif isinstance(fig_obj, (list, tuple)) and fig_obj:
+                v = fig_obj[0]
+                if hasattr(v, "savefig"):
+                    fig = v
+                elif hasattr(v, "figure"):
+                    fig = v.figure
+            if fig is not None:
+                p = out_dir / f"{prefix}_attention_interpretation.png"
+                fig.savefig(p, dpi=300, bbox_inches="tight")
+                plt.close(fig)
+                out["attention_plot_path"] = str(p.resolve())
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning("plot_interpretation export failed: %s", exc)
+
+        # 2) encoder attention history (t-enc ... t-1)
+        try:
+            att = interpretation.get("attention") if isinstance(interpretation, dict) else None
+            if att is not None:
+                att_np = np.asarray(att.detach().cpu() if hasattr(att, "detach") else att, dtype=float)
+                if att_np.ndim == 1:
+                    att_hist = att_np
+                else:
+                    # reduce all non-time axes
+                    reduce_axes = tuple(range(att_np.ndim - 1))
+                    att_hist = np.nanmean(att_np, axis=reduce_axes)
+                if att_hist.ndim == 1 and att_hist.size > 0:
+                    if att_hist.size >= max_encoder_length:
+                        hist = att_hist[-max_encoder_length:]
+                    else:
+                        hist = att_hist
+                    x = np.arange(-len(hist), 0, 1)
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    ax.plot(x, hist, linewidth=2)
+                    ax.set_title("TFT Attention over Encoder History")
+                    ax.set_xlabel("Relative time step (hours, t=0 forecast origin)")
+                    ax.set_ylabel("Attention weight")
+                    ax.grid(True, alpha=0.3)
+                    fig.tight_layout()
+                    p = out_dir / f"{prefix}_attention_history_tminus.png"
+                    fig.savefig(p, dpi=300, bbox_inches="tight")
+                    plt.close(fig)
+                    out["attention_history_plot_path"] = str(p.resolve())
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning("Attention history export failed: %s", exc)
+
+        # 3) variable importance summary
+        try:
+            blocks = []
+            if isinstance(interpretation, dict):
+                for key in ["static_variables", "encoder_variables", "decoder_variables"]:
+                    val = interpretation.get(key)
+                    if val is None:
+                        continue
+                    arr = np.asarray(val.detach().cpu() if hasattr(val, "detach") else val, dtype=float)
+                    if arr.ndim == 0:
+                        continue
+                    # average all non-feature axes; keep last axis as features
+                    if arr.ndim > 1:
+                        reduce_axes = tuple(range(arr.ndim - 1))
+                        arr = np.nanmean(arr, axis=reduce_axes)
+                    blocks.append((key, arr))
+            if blocks:
+                feat_scores: dict[str, float] = {}
+                for key, arr in blocks:
+                    for i, v in enumerate(np.asarray(arr).ravel().tolist()):
+                        feat_scores[f"{key}[{i}]"] = float(v)
+                top = sorted(feat_scores.items(), key=lambda kv: abs(kv[1]), reverse=True)[:20]
+                if top:
+                    labels = [k for k, _ in top][::-1]
+                    vals = [v for _, v in top][::-1]
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    ax.barh(labels, vals)
+                    ax.set_title("TFT Variable Importance (Interpretation Summary)")
+                    ax.set_xlabel("Importance score")
+                    fig.tight_layout()
+                    p = out_dir / f"{prefix}_feature_importance.png"
+                    fig.savefig(p, dpi=300, bbox_inches="tight")
+                    plt.close(fig)
+                    out["feature_importance_plot_path"] = str(p.resolve())
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning("Feature-importance export failed: %s", exc)
+
+    except Exception as exc:  # pragma: no cover
+        LOGGER.warning("Could not export TFT interpretation artifacts: %s", exc)
+    return out
+
+
 def _train_tft(
     *,
     base_dir: Path,
@@ -344,6 +574,8 @@ def _train_tft(
         from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
         from pytorch_forecasting.data.encoders import EncoderNormalizer, NaNLabelEncoder
         from pytorch_forecasting.metrics import QuantileLoss
+        from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+        from lightning.pytorch.loggers import TensorBoardLogger
         import torch
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
@@ -494,6 +726,11 @@ def _train_tft(
     )
 
     torch_device, accelerator = _resolve_torch_device(requested_device)
+    if torch_device == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:  # pragma: no cover - older torch variants
+            pass
     batch_size = 64
     train_loader = training.to_dataloader(
         train=True,
@@ -537,22 +774,44 @@ def _train_tft(
             )
             self._eta_logged = True
 
-    max_epochs = 20
+    max_epochs = 100
+    early_stopping_patience = 15
+    tb_root = REPO_ROOT / "artifacts" / "tensorboard_logs"
+    tb_logger = TensorBoardLogger(
+        save_dir=str(tb_root),
+        name=run_dir.name,
+        version=f"{bundle}_{tgt}",
+    )
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=str(model_dir),
+        filename=f"{bundle}_{tgt}_best-{{epoch:02d}}-{{val_loss:.4f}}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+    )
+    early_stopping_cb = EarlyStopping(
+        monitor="val_loss",
+        mode="min",
+        patience=early_stopping_patience,
+        min_delta=0.0,
+        strict=False,
+    )
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=0.1,
         enable_checkpointing=True,
-        callbacks=[_EpochEtaCallback(max_epochs=max_epochs)],
-        logger=False,
+        callbacks=[_EpochEtaCallback(max_epochs=max_epochs), checkpoint_cb, early_stopping_cb],
+        logger=tb_logger,
     )
 
     tft = TemporalFusionTransformer.from_dataset(
         training,
         learning_rate=1e-3,
-        hidden_size=32,
-        attention_head_size=4,
+        hidden_size=64,
+        attention_head_size=8,
         dropout=0.1,
         hidden_continuous_size=16,
         loss=QuantileLoss(quantiles=QUANTILES),
@@ -566,7 +825,13 @@ def _train_tft(
     fit_seconds = time.perf_counter() - fit_start
 
     model_path = model_dir / f"{bundle}_{tgt}_tft_export_model.ckpt"
-    trainer.save_checkpoint(str(model_path))
+    best_model_path = checkpoint_cb.best_model_path
+    if best_model_path:
+        shutil.copy2(best_model_path, model_path)
+        tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+        tft.to(torch_device)
+    else:
+        trainer.save_checkpoint(str(model_path))
 
     if cleanup_lightning_checkpoints:
         # Lightning writes extra checkpoint files to ./checkpoints by default.
@@ -626,6 +891,15 @@ def _train_tft(
     pred_test_seconds = time.perf_counter() - pred_test_start
 
     export_start = time.perf_counter()
+    interpretation_artifacts = _save_tft_interpretation_artifacts(
+        tft_model=tft,
+        dataset=validation,
+        out_dir=report_dir,
+        prefix=f"{bundle}_{tgt}",
+        batch_size=batch_size,
+        num_workers=num_workers,
+        max_encoder_length=max_encoder_length,
+    )
     pred_col = _pred_column_names_for_target(tgt)[0]
     val_long_path = pred_dir / f"{bundle}_{tgt}_{pred_col}_long.parquet"
     test_long_path = pred_dir / f"{bundle}_{tgt}_{pred_col}_long_test.parquet"
@@ -691,6 +965,17 @@ def _train_tft(
         "leadtime_mae_val_h48": mae_val_h_last if h_last == 48 else float("nan"),
         "leadtime_mae_test_h48": mae_test_h_last if h_last == 48 else float("nan"),
         "model_path": str(model_path.resolve()),
+        "best_checkpoint_path": str(Path(best_model_path).resolve()) if best_model_path else str(model_path.resolve()),
+        "stopped_epoch": int(trainer.current_epoch),
+        "max_epochs": int(max_epochs),
+        "early_stopping_patience": int(early_stopping_patience),
+        "hidden_size": 64,
+        "attention_head_size": 8,
+        "dropout": 0.1,
+        "tensorboard_log_dir": str(Path(tb_logger.log_dir).resolve()),
+        "attention_plot_path": interpretation_artifacts.get("attention_plot_path"),
+        "attention_history_plot_path": interpretation_artifacts.get("attention_history_plot_path"),
+        "feature_importance_plot_path": interpretation_artifacts.get("feature_importance_plot_path"),
         "scaler_path": str(scaler_path.resolve()),
         "pred_val_wide": str(val_wide_path.resolve()),
         "pred_test_wide": str(test_wide_path.resolve()),

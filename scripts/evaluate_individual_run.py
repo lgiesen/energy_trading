@@ -39,8 +39,8 @@ PRED_TO_TRUE = {
     "pred_afrr_activation_price_neg": ["afrr_activation_price_vwap_neg", "target_afrr_activation_price_vwap_neg"],
     "pred_afrr_capacity_price_pos": ["afrr_capacity_price_pos", "target_afrr_capacity_price_pos"],
     "pred_afrr_capacity_price_neg": ["afrr_capacity_price_neg", "target_afrr_capacity_price_neg"],
-    "pred_afrr_activation_rate_pos": ["afrr_activation_rate_pos", "target_afrr_activation_rate_pos", "afrr_activation_rate", "target_afrr_rate"],
-    "pred_afrr_activation_rate_neg": ["afrr_activation_rate_neg", "target_afrr_activation_rate_neg", "afrr_activation_rate", "target_afrr_rate"],
+    "pred_afrr_activation_rate_pos": ["afrr_activation_rate_pos", "target_afrr_activation_rate_pos", "afrr_activation_rate"],
+    "pred_afrr_activation_rate_neg": ["afrr_activation_rate_neg", "target_afrr_activation_rate_neg", "afrr_activation_rate"],
 }
 
 

@@ -26,6 +26,7 @@ from pathlib import Path
 import sys
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 # Allow direct script execution from repository root.
@@ -69,6 +70,42 @@ def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> N
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     fig.savefig(out_path.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
+
+
+def _build_backtest_diagnostics(hourly: pd.DataFrame, summary: dict[str, object]) -> dict[str, object]:
+    d = hourly.copy()
+    numeric = d.select_dtypes(include=["number"])
+    nonfinite_total = int((~np.isfinite(numeric.to_numpy(dtype=float))).sum()) if not numeric.empty else 0
+    nan_total = int(numeric.isna().sum().sum()) if not numeric.empty else 0
+
+    key_cols = [
+        "real_pnl_eur",
+        "pred_pnl_eur",
+        "naive_pnl_eur",
+        "oracle_pnl_eur",
+        "soc_mwh",
+        "charge_mw",
+        "discharge_mw",
+        "reserve_pos_mw",
+        "reserve_neg_mw",
+    ]
+    key_col_nan_counts = {
+        c: int(pd.to_numeric(d[c], errors="coerce").isna().sum())
+        for c in key_cols
+        if c in d.columns
+    }
+
+    infeasibility_flags = {
+        "final_soc_constraint_satisfied": bool(summary.get("final_soc_constraint_satisfied", False)),
+        "numeric_nonfinite_total": nonfinite_total,
+    }
+    return {
+        "rows_hourly": int(len(d)),
+        "numeric_nan_total": nan_total,
+        "numeric_nonfinite_total": nonfinite_total,
+        "key_column_nan_counts": key_col_nan_counts,
+        "infeasibility_flags": infeasibility_flags,
+    }
 
 
 def _resolve_out_dir(
@@ -121,12 +158,12 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
         pred_afrr_activation_rate_pos=pick_pred(
             pred,
             colmap.pred_afrr_activation_rate_pos,
-            ["pred_target_afrr_activation_rate_pos", "afrr_activation_rate_pred", "pred_target_afrr_rate"],
+            ["pred_target_afrr_activation_rate_pos", "afrr_activation_rate_pred"],
         ),
         pred_afrr_activation_rate_neg=pick_pred(
             pred,
             colmap.pred_afrr_activation_rate_neg,
-            ["pred_target_afrr_activation_rate_neg", "afrr_activation_rate_pred", "pred_target_afrr_rate"],
+            ["pred_target_afrr_activation_rate_neg", "afrr_activation_rate_pred"],
         ),
 
         true_da_price=pick(truth, colmap.true_da_price, ["da_price_actual", "target_da_price"]),
@@ -155,7 +192,6 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
                 "afrr_activation_rate_pos",
                 "target_afrr_activation_rate_pos",
                 "afrr_activation_rate",
-                "target_afrr_rate",
             ],
         ),
         true_afrr_activation_rate_neg=pick(
@@ -166,7 +202,6 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
                 "afrr_activation_rate_neg",
                 "target_afrr_activation_rate_neg",
                 "afrr_activation_rate",
-                "target_afrr_rate",
             ],
         ),
     )
@@ -359,6 +394,8 @@ def main() -> None:
     monthly_path = out_dir / "backtest_monthly.csv"
     yearly_path = out_dir / "backtest_yearly.csv"
     summary_path = out_dir / "backtest_summary.json"
+    diagnostics_path = out_dir / "backtest_diagnostics.json"
+    diagnostics_txt_path = out_dir / "backtest_diagnostics.txt"
     pnl_plot_path = out_dir / "backtest_cumulative_pnl.png"
 
     outputs.hourly.to_parquet(hourly_path, index=False)
@@ -368,6 +405,24 @@ def main() -> None:
     outputs.monthly.to_csv(monthly_path, index=False)
     outputs.yearly.to_csv(yearly_path, index=False)
     summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+    diagnostics = _build_backtest_diagnostics(outputs.hourly, outputs.summary)
+    diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+    diagnostics_txt_path.write_text(
+        "\n".join(
+            [
+                "Backtest Diagnostics",
+                f"rows_hourly={diagnostics['rows_hourly']}",
+                f"numeric_nan_total={diagnostics['numeric_nan_total']}",
+                f"numeric_nonfinite_total={diagnostics['numeric_nonfinite_total']}",
+                (
+                    "final_soc_constraint_satisfied="
+                    f"{diagnostics['infeasibility_flags']['final_soc_constraint_satisfied']}"
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
 
     print("[OK] Battery backtest completed.")
@@ -393,6 +448,8 @@ def main() -> None:
     print(f"- monthly: {monthly_path}")
     print(f"- yearly: {yearly_path}")
     print(f"- summary: {summary_path}")
+    print(f"- diagnostics: {diagnostics_path}")
+    print(f"- diagnostics_txt: {diagnostics_txt_path}")
     print(f"- pnl_contribution_plot: {pnl_plot_path}")
 
 

@@ -103,8 +103,6 @@ def _pred_column_names_for_target(target_col: str) -> list[str]:
         "target_afrr_activation_rate_neg": ["pred_afrr_activation_rate_neg"],
         "target_afrr_capacity_price_pos": ["pred_afrr_capacity_price_pos"],
         "target_afrr_capacity_price_neg": ["pred_afrr_capacity_price_neg"],
-        # Backward compatibility for legacy bundles with a single rate target.
-        "target_afrr_rate": ["pred_afrr_activation_rate_pos", "pred_afrr_activation_rate_neg"],
     }
     return mapping.get(target_col, [f"pred_{target_col}"])
 
@@ -118,8 +116,6 @@ def _source_series_name_for_target(target_col: str) -> str | None:
         "target_afrr_activation_rate_neg": "afrr_activation_rate_neg",
         "target_afrr_capacity_price_pos": "afrr_capacity_price_pos",
         "target_afrr_capacity_price_neg": "afrr_capacity_price_neg",
-        # Backward compatibility for legacy bundles.
-        "target_afrr_rate": "afrr_activation_rate",
     }
     return mapping.get(target_col)
 
@@ -539,6 +535,7 @@ def run_purged_cv_with_pipeline(
     n_estimators: int,
     max_depth: int,
     learning_rate: float,
+    colsample_bytree: float,
     device: str,
     seed: int,
     horizon_hours: int,
@@ -582,14 +579,14 @@ def run_purged_cv_with_pipeline(
             tree_method="hist",
             device=device,
             subsample=0.9,
-            colsample_bytree=0.9,
+            colsample_bytree=colsample_bytree,
             reg_alpha=0.0,
             reg_lambda=1.0,
             random_state=seed,
             n_jobs=-1,
         )
         model.fit(X_tr, y_tr, verbose=False)
-        pred = model.predict(X_va)
+        pred = _predict_with_device_alignment(model, X_va, resolved_device=device)
         mae = float(mean_absolute_error(y_va, pred))
         rmse = float(np.sqrt(mean_squared_error(y_va, pred)))
         spread_capture = np.nan
@@ -632,9 +629,10 @@ def train_and_evaluate(
     importance_out: Path,
     importance_report_out: Path,
     shap_summary_out: Path,
-    n_estimators: int = 500,
-    max_depth: int = 6,
+    n_estimators: int = 1000,
+    max_depth: int = 8,
     learning_rate: float = 0.05,
+    colsample_bytree: float = 0.8,
     early_stopping_rounds: int = 50,
     run_cv: bool = False,
     cv_n_splits: int = 3,
@@ -683,6 +681,7 @@ def train_and_evaluate(
             n_estimators=max(200, n_estimators // 2),
             max_depth=max_depth,
             learning_rate=learning_rate,
+            colsample_bytree=colsample_bytree,
             device=resolved_device,
             seed=seed,
             horizon_hours=horizon_hours,
@@ -753,7 +752,7 @@ def train_and_evaluate(
                     tree_method="hist",
                     device=resolved_device,
                     subsample=0.9,
-                    colsample_bytree=0.9,
+                    colsample_bytree=colsample_bytree,
                     reg_alpha=0.0,
                     reg_lambda=1.0,
                     random_state=seed + idx * 10_000 + lead * 100 + q_idx,
@@ -762,8 +761,7 @@ def train_and_evaluate(
                 )
                 model.fit(X_tr_h, y_tr_h, eval_set=[(X_va_h, y_va_h)], verbose=False)
 
-                X_pred = _align_features_for_model(X_va_h, model)
-                pred = np.asarray(model.predict(X_pred), dtype=float).reshape(-1)
+                pred = _predict_with_device_alignment(model, X_va_h, resolved_device=resolved_device)
                 quantile_models_for_lead[qcol] = model
                 lead_pred_by_q[qcol] = pred
 
@@ -904,12 +902,37 @@ def _align_features_for_model(X: pd.DataFrame, model) -> pd.DataFrame:
     return X_aligned
 
 
+def _predict_with_device_alignment(model, X: pd.DataFrame, *, resolved_device: str) -> np.ndarray:
+    """Predict with a GPU-compatible path when CUDA is active.
+
+    If CuPy is available and model device is CUDA, use booster.inplace_predict on
+    a CuPy array to avoid device mismatch fallback warnings and extra host-device
+    conversions. Falls back to sklearn-wrapper predict otherwise.
+    """
+    X_pred = _align_features_for_model(X, model)
+    dev = (resolved_device or "").lower()
+    if dev.startswith("cuda"):
+        try:
+            import cupy as cp  # type: ignore
+
+            booster = model.get_booster()
+            booster.set_param({"device": resolved_device})
+            x_gpu = cp.asarray(X_pred.to_numpy(dtype=np.float32, copy=False))
+            pred_gpu = booster.inplace_predict(x_gpu)
+            return np.asarray(cp.asnumpy(pred_gpu), dtype=float).reshape(-1)
+        except Exception:
+            # Keep robust fallback path when CuPy/GPU inplace predict is unavailable.
+            return np.asarray(model.predict(X_pred), dtype=float).reshape(-1)
+    return np.asarray(model.predict(X_pred), dtype=float).reshape(-1)
+
+
 def _predict_split_frame(
     base_dir: Path,
     bundle: BundleName,
     split: str,
     models_by_target: dict[str, dict[int, dict[str, object]]],
     target_cols: list[str],
+    resolved_device: str = "cpu",
 ) -> pd.DataFrame:
     split_df, bcfg = _load_bundle_split_df(base_dir=base_dir, bundle=bundle, split=split)
     X = split_df[bcfg["features"]].copy()
@@ -932,8 +955,7 @@ def _predict_split_frame(
 
     for tgt in target_cols:
         model_q = models_by_target[tgt][1]["p50"]
-        X_pred = _align_features_for_model(X, model_q)
-        pred_h = np.asarray(model_q.predict(X_pred), dtype=float).reshape(-1)
+        pred_h = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
         pred = pd.to_numeric(pd.Series(pred_h, index=split_df.index), errors="coerce")
         for pred_col in _pred_column_names_for_target(tgt):
             out[pred_col] = pred.values
@@ -949,6 +971,7 @@ def _predict_split_long_multistep(
     target_cols: list[str],
     horizon_hours: int,
     model_name: str,
+    resolved_device: str = "cpu",
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Generate direct multi-output predictions and return long-format tables.
 
@@ -984,8 +1007,7 @@ def _predict_split_long_multistep(
             lead_pred_q: dict[str, np.ndarray] = {}
             for c in q_cols:
                 model_q = lead_models[c]
-                X_pred = _align_features_for_model(X, model_q)
-                lead_pred_q[c] = np.asarray(model_q.predict(X_pred), dtype=float).reshape(-1)
+                lead_pred_q[c] = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
             lead_stack = np.column_stack([lead_pred_q[c] for c in q_cols])
             lead_stack = np.sort(lead_stack, axis=1)
 
@@ -1126,9 +1148,10 @@ def _build_cli() -> argparse.ArgumentParser:
         default="",
         help="Optional path to write bundle manifest fragment JSON.",
     )
-    p.add_argument("--n-estimators", type=int, default=500)
-    p.add_argument("--max-depth", type=int, default=6)
+    p.add_argument("--n-estimators", type=int, default=1000)
+    p.add_argument("--max-depth", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=0.05)
+    p.add_argument("--colsample-bytree", type=float, default=0.8)
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument(
         "--run-cv",
@@ -1199,6 +1222,7 @@ def main() -> None:
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         learning_rate=args.learning_rate,
+        colsample_bytree=args.colsample_bytree,
         early_stopping_rounds=args.early_stopping_rounds,
         run_cv=args.run_cv,
         cv_n_splits=args.cv_n_splits,
@@ -1220,6 +1244,7 @@ def main() -> None:
     long_export_seconds_by_split: dict[str, float] = {}
     splits = [s.strip() for s in args.prediction_splits.split(",") if s.strip()]
     if args.export_predictions:
+        resolved_pred_device = str(metrics.get("resolved_device", args.device))
         for split in splits:
             split_start = time.perf_counter()
             pred_df = _predict_split_frame(
@@ -1228,6 +1253,7 @@ def main() -> None:
                 split=split,
                 models_by_target=models_by_target,
                 target_cols=target_cols,
+                resolved_device=resolved_pred_device,
             )
             out_path = pred_dir / f"{file_tag}_{split}.parquet"
             pred_df.to_parquet(out_path, index=False)
@@ -1244,6 +1270,7 @@ def main() -> None:
                     target_cols=target_cols,
                     horizon_hours=args.forecast_horizon_hours,
                     model_name=args.model_name,
+                    resolved_device=resolved_pred_device,
                 )
                 prediction_long_paths[split] = {}
                 for pred_col, long_df in long_by_col.items():

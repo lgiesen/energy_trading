@@ -19,8 +19,6 @@ AFRR_TARGETS = [
     "target_afrr_activation_rate_neg",
     "target_afrr_capacity_price_pos",
     "target_afrr_capacity_price_neg",
-    # Backward compatibility for older bundles.
-    "target_afrr_rate",
 ]
 
 
@@ -91,9 +89,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", choices=["cuda", "cpu", "mps"], default="mps")
     p.add_argument("--model-name", default="")
     p.add_argument("--allow-cpu", action="store_true")
-    p.add_argument("--n-estimators", type=int, default=500)
-    p.add_argument("--max-depth", type=int, default=6)
+    p.add_argument("--n-estimators", type=int, default=1000)
+    p.add_argument("--max-depth", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=0.05)
+    p.add_argument("--colsample-bytree", type=float, default=0.8)
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument("--forecast-horizon-hours", type=int, default=48)
     p.add_argument("--seed", type=int, default=42)
@@ -177,6 +176,8 @@ def main() -> None:
             str(args.max_depth),
             "--learning-rate",
             str(args.learning_rate),
+            "--colsample-bytree",
+            str(args.colsample_bytree),
             "--early-stopping-rounds",
             str(args.early_stopping_rounds),
             "--run-dir",

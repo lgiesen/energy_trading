@@ -32,6 +32,8 @@ artifacts/**
 !artifacts/model_runs/.gitkeep
 !artifacts/simulation_runs/.gitkeep
 artifacts/model_runs/2026-*/
+lightning_logs/
+checkpoints/
 
 models/checkpoints/**
 !models/checkpoints/.gitkeep
