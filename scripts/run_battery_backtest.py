@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 import sys
 
@@ -124,6 +125,95 @@ def _resolve_out_dir(
     return out
 
 
+def _matches_model_key(path: Path, model_key: str) -> bool:
+    if not model_key:
+        return True
+    mk = model_key.strip().lower()
+    name = path.name.lower()
+    if mk in {"xgb", "xgboost"}:
+        return "xgboost" in name
+    if mk == "tft":
+        return "xgboost" not in name
+    return mk in name
+
+
+def _resolve_existing_file(path_like: str | Path, *, manifest_dir: Path) -> Path:
+    p = Path(path_like)
+    if p.exists():
+        return p
+    repo_root = Path(__file__).resolve().parents[1]
+    # Common case for downloaded artifacts: manifest keeps server-absolute path.
+    cands = [
+        manifest_dir / p.name,
+        manifest_dir / "predictions" / p.name,
+        Path.cwd() / p.name,
+        Path.cwd() / "data" / "features" / p.name,
+        repo_root / "data" / "features" / p.name,
+        repo_root / "data" / "features" / "all_data_features.parquet",
+    ]
+    for c in cands:
+        if c.exists():
+            return c
+    raise FileNotFoundError(f"File not found from manifest path '{p}'. Tried local fallbacks near {manifest_dir}.")
+
+
+def _resolve_long_prediction_path(
+    *,
+    pred_col: str,
+    configured_path: str | Path,
+    manifest_dir: Path,
+    split: str,
+    model_key: str,
+) -> Path:
+    p = Path(configured_path)
+    if p.exists() and _matches_model_key(p, model_key):
+        return p
+
+    pred_dir = manifest_dir / "predictions"
+    candidates: list[Path] = []
+    if pred_dir.exists():
+        patterns = [
+            f"*{split}*{pred_col}*long*.parquet",
+            f"*{pred_col}*long*{split}*.parquet",
+            f"*{pred_col}*{split}*long*.parquet",
+        ]
+        for pat in patterns:
+            candidates.extend(sorted(pred_dir.glob(pat)))
+    if model_key:
+        candidates = [c for c in candidates if _matches_model_key(c, model_key)]
+    if candidates:
+        return candidates[0]
+
+    # Final explicit fallbacks by filename
+    for c in [manifest_dir / p.name, manifest_dir / "predictions" / p.name]:
+        if c.exists() and _matches_model_key(c, model_key):
+            return c
+    raise FileNotFoundError(
+        f"Could not resolve long prediction file for pred_col='{pred_col}', split='{split}', model_key='{model_key}'. "
+        f"Configured path: {p}"
+    )
+
+
+def _resolve_long_map(
+    *,
+    long_map: dict[str, str],
+    manifest_dir: Path,
+    split: str,
+    model_key: str,
+) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for pred_col, p in long_map.items():
+        rp = _resolve_long_prediction_path(
+            pred_col=pred_col,
+            configured_path=p,
+            manifest_dir=manifest_dir,
+            split=split,
+            model_key=model_key,
+        )
+        resolved[pred_col] = str(rp)
+    return resolved
+
+
 def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: BacktestColumnMap) -> BacktestColumnMap:
     """Use project-aware fallback candidates to reduce manual mapping overhead."""
 
@@ -224,6 +314,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--split", choices=["val", "test"], default="test", help="Prediction split for manifest mode.")
     p.add_argument(
+        "--model-key",
+        default="",
+        help="Optional model selector when one run dir contains multiple models (e.g. 'xgboost' or 'tft').",
+    )
+    p.add_argument(
         "--out-dir",
         default="",
         help="Output directory for hourly/aggregated results. If empty, uses artifacts/simulation_runs/<run_id>/<split>/",
@@ -288,6 +383,9 @@ def main() -> None:
             manifest_path = Path(payload["manifest_path"])
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         run_id = run_id or payload.get("run_id")
+        manifest_dir = manifest_path.parent
+    else:
+        manifest_dir = Path.cwd()
 
     out_dir = _resolve_out_dir(args.out_dir, run_id=run_id, split=args.split)
     forecast_warehouse: dict[str, pd.DataFrame] | None = None
@@ -300,7 +398,13 @@ def main() -> None:
         long_map = {**da_long, **afrr_long}
 
         if long_map:
-            forecast_warehouse = load_prediction_warehouse_long(long_map)
+            resolved_long_map = _resolve_long_map(
+                long_map=long_map,
+                manifest_dir=manifest_dir,
+                split=args.split,
+                model_key=args.model_key.strip(),
+            )
+            forecast_warehouse = load_prediction_warehouse_long(resolved_long_map)
             print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
             cov_min_list: list[pd.Timestamp] = []
             cov_max_list: list[pd.Timestamp] = []
@@ -313,8 +417,8 @@ def main() -> None:
                 coverage_min = min(cov_min_list)
                 coverage_max = max(cov_max_list)
         else:
-            da_pred = Path(payload["bundles"]["da"]["predictions"][args.split])
-            afrr_pred = Path(payload["bundles"]["afrr"]["predictions"][args.split])
+            da_pred = _resolve_existing_file(payload["bundles"]["da"]["predictions"][args.split], manifest_dir=manifest_dir)
+            afrr_pred = _resolve_existing_file(payload["bundles"]["afrr"]["predictions"][args.split], manifest_dir=manifest_dir)
             predictions_path = str((out_dir / f"backtest_table_{args.split}.parquet").resolve())
 
             da_df = pd.read_parquet(da_pred)
@@ -324,7 +428,9 @@ def main() -> None:
             print(f"[INFO] Backtest table created: {predictions_path}")
 
         if not ground_truth_path:
-            ground_truth_path = payload["ground_truth"]["default_path"]
+            ground_truth_path = str(
+                _resolve_existing_file(payload["ground_truth"]["default_path"], manifest_dir=manifest_dir)
+            )
 
     if not ground_truth_path:
         raise ValueError("Either provide --predictions and --ground-truth, or use --run-manifest.")
