@@ -4,8 +4,11 @@ Usage:
     ./.venv/bin/python evaluation/model_audit.py \
       --base-dir data/model_input \
       --bundle afrr \
-      --target-col target_afrr_activation_price_vwap_pos_h1 \
+      --target-col target_afrr_activation_price_vwap_pos \
       --out-dir data/reports/model_audit
+
+Notes:
+    - If --target-col is omitted, all targets of the selected bundle are audited.
 """
 
 from __future__ import annotations
@@ -37,10 +40,29 @@ def _resolve_target(bundle: BundleName, requested: str | None, y_cols: list[str]
         if requested not in y_cols:
             raise KeyError(f"Requested target '{requested}' not available in y columns.")
         return requested
-    default = "target_da_price_h1" if bundle == "da" else "target_afrr_activation_price_vwap_pos_h1"
+    default = "target_da_price" if bundle == "da" else "target_afrr_activation_price_vwap_pos"
     if default not in y_cols:
         raise KeyError(f"Default target '{default}' not found in y columns.")
     return default
+
+
+def _resolve_targets(bundle: BundleName, requested: str | None, y_cols: list[str]) -> list[str]:
+    if requested:
+        return [_resolve_target(bundle, requested, y_cols)]
+    if bundle == "da":
+        return [_resolve_target(bundle, None, y_cols)]
+    ordered = [
+        "target_afrr_activation_price_vwap_pos",
+        "target_afrr_activation_price_vwap_neg",
+        "target_afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg",
+    ]
+    targets = [t for t in ordered if t in y_cols]
+    if not targets:
+        raise KeyError("No aFRR targets found in y columns.")
+    return targets
 
 
 def _feature_groups(feature_cols: list[str]) -> dict[str, list[str]]:
@@ -240,185 +262,200 @@ def main() -> None:
     ts_train = _load_split_timestamps(base_dir, args.bundle, "train")
     ts_val = _load_split_timestamps(base_dir, args.bundle, "val")
     ts_test = _load_split_timestamps(base_dir, args.bundle, "test")
-    target = _resolve_target(args.bundle, args.target_col, list(y_train_df.columns))
+    targets = _resolve_targets(args.bundle, args.target_col, list(y_train_df.columns))
+    aggregate_rows: list[dict[str, object]] = []
 
-    y_train = pd.to_numeric(y_train_df[target], errors="coerce")
-    y_val = pd.to_numeric(y_val_df[target], errors="coerce")
-    y_test = pd.to_numeric(y_test_df[target], errors="coerce")
-    m_train = y_train.notna()
-    m_val = y_val.notna()
-    m_test = y_test.notna()
-    X_train_raw = X_train_raw.loc[m_train].copy()
-    X_val_raw = X_val_raw.loc[m_val].copy()
-    X_test_raw = X_test_raw.loc[m_test].copy()
-    ts_train = ts_train.loc[m_train].copy()
-    ts_val = ts_val.loc[m_val].copy()
-    ts_test = ts_test.loc[m_test].copy()
-    y_train = y_train.loc[m_train].copy()
-    y_val = y_val.loc[m_val].copy()
-    y_test = y_test.loc[m_test].copy()
+    for idx, target in enumerate(targets, start=1):
+        print(f"[audit] ({idx}/{len(targets)}) target={target}")
+        target_out_dir = out_dir if len(targets) == 1 else (out_dir / target)
+        target_out_dir.mkdir(parents=True, exist_ok=True)
 
-    groups = _feature_groups(list(X_train_raw.columns))
-    results = []
-    trained_models: dict[str, XGBRegressor] = {}
-    prev_rmse = None
-    prev_pnl = None
+        y_train = pd.to_numeric(y_train_df[target], errors="coerce")
+        y_val = pd.to_numeric(y_val_df[target], errors="coerce")
+        y_test = pd.to_numeric(y_test_df[target], errors="coerce")
+        m_train = y_train.notna()
+        m_val = y_val.notna()
+        m_test = y_test.notna()
+        X_train_t = X_train_raw.loc[m_train].copy()
+        X_val_t = X_val_raw.loc[m_val].copy()
+        X_test_t = X_test_raw.loc[m_test].copy()
+        ts_test_t = ts_test.loc[m_test].copy()
+        y_train_t = y_train.loc[m_train].copy()
+        y_test_t = y_test.loc[m_test].copy()
 
-    for name, cols in groups.items():
-        use_cols = [c for c in cols if c in X_train_raw.columns]
-        Xtr = X_train_raw[use_cols].copy()
-        Xte = X_test_raw[use_cols].copy()
+        groups = _feature_groups(list(X_train_t.columns))
+        results = []
+        trained_models: dict[str, XGBRegressor] = {}
+        prev_rmse = None
+        prev_pnl = None
 
-        model, rmse, pnl = _evaluate_variant(
-            Xtr,
-            y_train,
-            Xte,
-            y_test,
-            n_estimators=args.n_estimators,
-            max_depth=args.max_depth,
-            learning_rate=args.learning_rate,
-            device=args.device,
-        )
-        trained_models[name] = model
-        results.append(
+        for name, cols in groups.items():
+            use_cols = [c for c in cols if c in X_train_t.columns]
+            Xtr = X_train_t[use_cols].copy()
+            Xte = X_test_t[use_cols].copy()
+
+            model, rmse, pnl = _evaluate_variant(
+                Xtr,
+                y_train_t,
+                Xte,
+                y_test_t,
+                n_estimators=args.n_estimators,
+                max_depth=args.max_depth,
+                learning_rate=args.learning_rate,
+                device=args.device,
+            )
+            trained_models[name] = model
+            results.append(
+                {
+                    "variant": name,
+                    "n_features": len(use_cols),
+                    "rmse": rmse,
+                    "pnl_proxy_eur": pnl,
+                    "delta_rmse_vs_prev": (rmse - prev_rmse) if prev_rmse is not None else np.nan,
+                    "delta_pnl_vs_prev_eur": (pnl - prev_pnl) if prev_pnl is not None else np.nan,
+                }
+            )
+            prev_rmse = rmse
+            prev_pnl = pnl
+            print(f"[ablation] {target}::{name}: n_features={len(use_cols)} rmse={rmse:.4f} pnl_proxy_eur={pnl:.2f}")
+
+        manifesto = pd.DataFrame(results)
+        manifesto.to_csv(target_out_dir / "feature_value_manifesto.csv", index=False)
+
+        final_variant = "plus_neighbors"
+        final_cols = [c for c in groups[final_variant] if c in X_train_t.columns]
+        final_model = trained_models[final_variant]
+        X_test_final = X_test_t[final_cols].copy()
+        pred_test_final = final_model.predict(X_test_final)
+
+        X_eval_local = X_test_final.copy()
+        da_ref = pd.to_numeric(X_test_final["da_price_pit"], errors="coerce") if "da_price_pit" in X_test_final.columns else pd.Series(0.0, index=X_test_final.index)
+        y_eval = pd.to_numeric(y_test_t, errors="coerce")
+        pnl_hour = np.sign(pred_test_final - da_ref.to_numpy()) * (y_eval.to_numpy() - da_ref.to_numpy())
+        spike_threshold = float(np.nanquantile(pred_test_final, 0.95)) if len(pred_test_final) else np.nan
+        local_df = pd.DataFrame(
             {
-                "variant": name,
-                "n_features": len(use_cols),
-                "rmse": rmse,
-                "pnl_proxy_eur": pnl,
-                "delta_rmse_vs_prev": (rmse - prev_rmse) if prev_rmse is not None else np.nan,
-                "delta_pnl_vs_prev_eur": (pnl - prev_pnl) if prev_pnl is not None else np.nan,
+                "timestamp_utc": ts_test_t.to_numpy(),
+                "pnl_proxy_hour_eur": pnl_hour,
+                "y_true": y_eval.to_numpy(),
+                "y_pred": pred_test_final,
             }
+        ).dropna(subset=["timestamp_utc", "pnl_proxy_hour_eur"])
+        spike_df = local_df[local_df["y_pred"] >= spike_threshold].copy() if np.isfinite(spike_threshold) else local_df.copy()
+        top3 = spike_df.sort_values("pnl_proxy_hour_eur", ascending=False).head(3)
+        if len(top3) < 3:
+            fallback = local_df.sort_values("pnl_proxy_hour_eur", ascending=False).head(3)
+            top3 = pd.concat([top3, fallback], axis=0).drop_duplicates(subset=["timestamp_utc"]).head(3)
+        top3.to_csv(target_out_dir / "top3_profitable_spikes.csv", index=False)
+
+        beeswarm_path = target_out_dir / "shap_summary_beeswarm_top20.png"
+        local_plot_paths: list[str] = []
+        shap_top20_path = target_out_dir / "shap_top20_features.csv"
+        shap_leak_path = target_out_dir / "shap_leak_safety_audit.csv"
+        try:
+            import shap  # type: ignore
+
+            sample_n = min(5000, len(X_test_final))
+            X_shap = X_test_final.sample(n=sample_n, random_state=42) if sample_n < len(X_test_final) else X_test_final.copy()
+            explainer = shap.TreeExplainer(final_model)
+            shap_values = explainer(X_shap)
+
+            plt.figure(figsize=(11, 7))
+            shap.plots.beeswarm(shap_values, max_display=20, show=False)
+            plt.tight_layout()
+            plt.savefig(beeswarm_path, dpi=220)
+            plt.close()
+
+            mean_abs = np.abs(shap_values.values).mean(axis=0)
+            shap_rank = (
+                pd.DataFrame({"feature": X_shap.columns, "mean_abs_shap": mean_abs})
+                .sort_values("mean_abs_shap", ascending=False)
+                .reset_index(drop=True)
+            )
+            top20 = shap_rank.head(20).copy()
+            top20.to_csv(shap_top20_path, index=False)
+
+            leak_audit = _safety_leak_check(top20["feature"].tolist())
+            leak_audit.to_csv(shap_leak_path, index=False)
+
+            shap_values_full = explainer(X_test_final)
+            explain_prediction = _build_local_explainer_fn(
+                shap_values=shap_values_full,
+                X_eval=X_eval_local,
+                timestamps=ts_test_t,
+                out_dir=target_out_dir,
+            )
+            for ts in top3["timestamp_utc"].tolist():
+                try:
+                    local_plot_paths.append(str(explain_prediction(ts)))
+                except Exception as exc:
+                    local_plot_paths.append(f"ERROR:{ts}:{exc}")
+        except ModuleNotFoundError:
+            pd.DataFrame(
+                [{"feature": "N/A", "mean_abs_shap": np.nan, "note": "Install shap to enable SHAP audit."}]
+            ).to_csv(shap_top20_path, index=False)
+            pd.DataFrame(
+                [{"feature": "N/A", "risk_flags": "N/A", "note": "Install shap to enable leak safety SHAP audit."}]
+            ).to_csv(shap_leak_path, index=False)
+            print("[WARN] SHAP is not installed in this environment. Global/local SHAP outputs were skipped.")
+
+        mae_points = pd.DataFrame(
+            [
+                {"lead_time_h": 1, "mae": float(np.mean(np.abs(y_eval.to_numpy() - pred_test_final)))},
+                {"lead_time_h": 24, "mae": np.nan},
+                {"lead_time_h": 48, "mae": np.nan},
+            ]
         )
-        prev_rmse = rmse
-        prev_pnl = pnl
-        print(f"[ablation] {name}: n_features={len(use_cols)} rmse={rmse:.4f} pnl_proxy_eur={pnl:.2f}")
-
-    manifesto = pd.DataFrame(results)
-    manifesto.to_csv(out_dir / "feature_value_manifesto.csv", index=False)
-
-    # Final model = richest variant in defined chain.
-    final_variant = "plus_neighbors"
-    final_cols = [c for c in groups[final_variant] if c in X_train_raw.columns]
-    final_model = trained_models[final_variant]
-    X_test_final = X_test_raw[final_cols].copy()
-    pred_test_final = final_model.predict(X_test_final)
-
-    # Local explanations for top-3 profitable spikes (proxy pre-selection).
-    X_eval_local = X_test_final.copy()
-    da_ref = pd.to_numeric(X_test_final["da_price_pit"], errors="coerce") if "da_price_pit" in X_test_final.columns else pd.Series(0.0, index=X_test_final.index)
-    y_eval = pd.to_numeric(y_test, errors="coerce")
-    pnl_hour = np.sign(pred_test_final - da_ref.to_numpy()) * (y_eval.to_numpy() - da_ref.to_numpy())
-    spike_threshold = float(np.nanquantile(pred_test_final, 0.95)) if len(pred_test_final) else np.nan
-    local_df = pd.DataFrame(
-        {
-            "timestamp_utc": ts_test.to_numpy(),
-            "pnl_proxy_hour_eur": pnl_hour,
-            "y_true": y_eval.to_numpy(),
-            "y_pred": pred_test_final,
-        }
-    ).dropna(subset=["timestamp_utc", "pnl_proxy_hour_eur"])
-    spike_df = local_df[local_df["y_pred"] >= spike_threshold].copy() if np.isfinite(spike_threshold) else local_df.copy()
-    top3 = spike_df.sort_values("pnl_proxy_hour_eur", ascending=False).head(3)
-    if len(top3) < 3:
-        fallback = local_df.sort_values("pnl_proxy_hour_eur", ascending=False).head(3)
-        top3 = pd.concat([top3, fallback], axis=0).drop_duplicates(subset=["timestamp_utc"]).head(3)
-    top3.to_csv(out_dir / "top3_profitable_spikes.csv", index=False)
-
-    # SHAP global + local (optional dependency).
-    beeswarm_path = out_dir / "shap_summary_beeswarm_top20.png"
-    local_plot_paths: list[str] = []
-    shap_top20_path = out_dir / "shap_top20_features.csv"
-    shap_leak_path = out_dir / "shap_leak_safety_audit.csv"
-    try:
-        import shap  # type: ignore
-
-        sample_n = min(5000, len(X_test_final))
-        X_shap = X_test_final.sample(n=sample_n, random_state=42) if sample_n < len(X_test_final) else X_test_final.copy()
-        explainer = shap.TreeExplainer(final_model)
-        shap_values = explainer(X_shap)
-
-        plt.figure(figsize=(11, 7))
-        shap.plots.beeswarm(shap_values, max_display=20, show=False)
+        mae_points.to_csv(target_out_dir / "mae_leadtime_1_24_48.csv", index=False)
+        plt.figure(figsize=(7, 4))
+        pp = mae_points.dropna(subset=["mae"])
+        plt.plot(pp["lead_time_h"], pp["mae"], marker="o", linewidth=2, color="#2C7FB8")
+        plt.xticks([1, 24, 48])
+        plt.xlabel("Lead Time (h)")
+        plt.ylabel("MAE")
+        plt.title("MAE by Lead Time (1h / 24h / 48h)")
+        plt.grid(alpha=0.25)
         plt.tight_layout()
-        plt.savefig(beeswarm_path, dpi=220)
+        plt.savefig(target_out_dir / "mae_leadtime_1_24_48.png", dpi=220)
         plt.close()
 
-        mean_abs = np.abs(shap_values.values).mean(axis=0)
-        shap_rank = (
-            pd.DataFrame({"feature": X_shap.columns, "mean_abs_shap": mean_abs})
-            .sort_values("mean_abs_shap", ascending=False)
-            .reset_index(drop=True)
+        summary = {
+            "bundle": args.bundle,
+            "target_col": target,
+            "final_variant": final_variant,
+            "final_n_features": len(final_cols),
+            "outputs": {
+                "feature_value_manifesto": str((target_out_dir / "feature_value_manifesto.csv").resolve()),
+                "shap_summary_beeswarm": str(beeswarm_path.resolve()),
+                "shap_top20": str((target_out_dir / "shap_top20_features.csv").resolve()),
+                "shap_leak_safety_audit": str((target_out_dir / "shap_leak_safety_audit.csv").resolve()),
+                "top3_profitable_spikes": str((target_out_dir / "top3_profitable_spikes.csv").resolve()),
+                "mae_leadtime_points": str((target_out_dir / "mae_leadtime_1_24_48.csv").resolve()),
+                "mae_leadtime_plot": str((target_out_dir / "mae_leadtime_1_24_48.png").resolve()),
+                "local_waterfalls": local_plot_paths,
+            },
+        }
+        (target_out_dir / "model_audit_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+        aggregate_rows.append(
+            {
+                "target_col": target,
+                "out_dir": str(target_out_dir.resolve()),
+                "final_variant": final_variant,
+                "final_n_features": len(final_cols),
+                "mae_h1": float(mae_points.loc[mae_points["lead_time_h"] == 1, "mae"].iloc[0]),
+                "final_rmse": float(manifesto.loc[manifesto["variant"] == final_variant, "rmse"].iloc[0]),
+                "final_pnl_proxy_eur": float(manifesto.loc[manifesto["variant"] == final_variant, "pnl_proxy_eur"].iloc[0]),
+            }
         )
-        top20 = shap_rank.head(20).copy()
-        top20.to_csv(shap_top20_path, index=False)
 
-        leak_audit = _safety_leak_check(top20["feature"].tolist())
-        leak_audit.to_csv(shap_leak_path, index=False)
-
-        # Build local explainer function using full test set to ensure timestamps exist.
-        shap_values_full = explainer(X_test_final)
-        explain_prediction = _build_local_explainer_fn(
-            shap_values=shap_values_full,
-            X_eval=X_eval_local,
-            timestamps=ts_test,
-            out_dir=out_dir,
-        )
-        for ts in top3["timestamp_utc"].tolist():
-            try:
-                local_plot_paths.append(str(explain_prediction(ts)))
-            except Exception as exc:
-                local_plot_paths.append(f"ERROR:{ts}:{exc}")
-    except ModuleNotFoundError:
-        pd.DataFrame(
-            [{"feature": "N/A", "mean_abs_shap": np.nan, "note": "Install shap to enable SHAP audit."}]
-        ).to_csv(shap_top20_path, index=False)
-        pd.DataFrame(
-            [{"feature": "N/A", "risk_flags": "N/A", "note": "Install shap to enable leak safety SHAP audit."}]
-        ).to_csv(shap_leak_path, index=False)
-        print("[WARN] SHAP is not installed in this environment. Global/local SHAP outputs were skipped.")
-
-    # MAE lead-time reference points (1/24/48) from direct predictions:
-    # for direct model, MAE by lead is approximated by shifting true target.
-    # Here we persist canonical points for report compatibility.
-    mae_points = pd.DataFrame(
-        [
-            {"lead_time_h": 1, "mae": float(np.mean(np.abs(y_eval.to_numpy() - pred_test_final)))},
-            {"lead_time_h": 24, "mae": np.nan},
-            {"lead_time_h": 48, "mae": np.nan},
-        ]
+    aggregate_df = pd.DataFrame(aggregate_rows).sort_values("target_col").reset_index(drop=True)
+    aggregate_df.to_csv(out_dir / "model_audit_targets_overview.csv", index=False)
+    (out_dir / "model_audit_targets_overview.json").write_text(
+        json.dumps(aggregate_df.to_dict(orient="records"), indent=2),
+        encoding="utf-8",
     )
-    mae_points.to_csv(out_dir / "mae_leadtime_1_24_48.csv", index=False)
-    plt.figure(figsize=(7, 4))
-    pp = mae_points.dropna(subset=["mae"])
-    plt.plot(pp["lead_time_h"], pp["mae"], marker="o", linewidth=2, color="#2C7FB8")
-    plt.xticks([1, 24, 48])
-    plt.xlabel("Lead Time (h)")
-    plt.ylabel("MAE")
-    plt.title("MAE by Lead Time (1h / 24h / 48h)")
-    plt.grid(alpha=0.25)
-    plt.tight_layout()
-    plt.savefig(out_dir / "mae_leadtime_1_24_48.png", dpi=220)
-    plt.close()
-
-    summary = {
-        "bundle": args.bundle,
-        "target_col": target,
-        "final_variant": final_variant,
-        "final_n_features": len(final_cols),
-        "outputs": {
-            "feature_value_manifesto": str((out_dir / "feature_value_manifesto.csv").resolve()),
-            "shap_summary_beeswarm": str(beeswarm_path.resolve()),
-            "shap_top20": str((out_dir / "shap_top20_features.csv").resolve()),
-            "shap_leak_safety_audit": str((out_dir / "shap_leak_safety_audit.csv").resolve()),
-            "top3_profitable_spikes": str((out_dir / "top3_profitable_spikes.csv").resolve()),
-            "mae_leadtime_points": str((out_dir / "mae_leadtime_1_24_48.csv").resolve()),
-            "mae_leadtime_plot": str((out_dir / "mae_leadtime_1_24_48.png").resolve()),
-            "local_waterfalls": local_plot_paths,
-        },
-    }
-    (out_dir / "model_audit_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"[OK] Model audit completed. Outputs in: {out_dir}")
+    print(f"[OK] Model audit completed for {len(targets)} target(s). Outputs in: {out_dir}")
 
 
 if __name__ == "__main__":
