@@ -3,7 +3,7 @@
 
 Usage example:
     python3 scripts/benchmark_models.py \
-      --run-dirs artifacts/model_runs/2026-04-19T21-32-05Z artifacts/model_runs/2026-04-19T22-38-28Z \
+      --run-dirs artifacts/model_runs/2026-04-20T15-36-58Z artifacts/model_runs/2026-04-20T15-36-58Z \
       --labels XGBoost TFT \
       --out-dir artifacts/benchmarks/xgb_vs_tft
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,27 @@ def _load_manifest(run_dir: Path) -> dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+def _infer_model_key(label: str) -> str:
+    l = (label or "").strip().lower()
+    if "xgb" in l or "xgboost" in l:
+        return "xgboost"
+    if "tft" in l:
+        return "tft"
+    return ""
+
+
+def _matches_model_key(path: Path, model_key: str) -> bool:
+    if not model_key:
+        return True
+    mk = model_key.strip().lower()
+    name = path.name.lower()
+    if mk in {"xgb", "xgboost"}:
+        return "xgboost" in name
+    if mk == "tft":
+        return "xgboost" not in name
+    return mk in name
+
+
 def _resolve_truth_path(manifest: dict[str, Any]) -> Path:
     mpath = str(manifest.get("ground_truth", {}).get("default_path", "")).strip()
     if not mpath:
@@ -103,12 +125,13 @@ def _discover_long_prediction_file(
     split: str,
     pred_col: str,
     manifest: dict[str, Any],
+    model_key: str = "",
 ) -> Path:
     for bcfg in manifest.get("bundles", {}).values():
         p = bcfg.get("predictions_long", {}).get(split, {}).get(pred_col)
         if p:
             pp = Path(p)
-            if pp.exists():
+            if pp.exists() and _matches_model_key(pp, model_key):
                 return pp
 
     pred_dir = run_dir / "predictions"
@@ -120,6 +143,8 @@ def _discover_long_prediction_file(
         candidates = list(pred_dir.glob(f"*{pred_col}*long*{split}*.parquet"))
     if not candidates:
         candidates = list(pred_dir.glob(f"*{pred_col}*{split}*long*.parquet"))
+    if model_key:
+        candidates = [c for c in candidates if _matches_model_key(c, model_key)]
     if not candidates:
         raise FileNotFoundError(
             f"Could not find long prediction parquet for pred_col='{pred_col}', split='{split}' in {pred_dir}"
@@ -127,9 +152,9 @@ def _discover_long_prediction_file(
     return candidates[0]
 
 
-def _discover_raw_prediction_file(run_dir: Path, split: str, pred_col: str) -> Path:
+def _discover_raw_prediction_file(run_dir: Path, split: str, pred_col: str, model_key: str = "") -> Path:
     direct = run_dir / f"{split}_{pred_col}.parquet"
-    if direct.exists():
+    if direct.exists() and _matches_model_key(direct, model_key):
         return direct
 
     pred_dir = run_dir / "predictions"
@@ -141,6 +166,8 @@ def _discover_raw_prediction_file(run_dir: Path, split: str, pred_col: str) -> P
         ]
         for pat in patterns:
             candidates = sorted(pred_dir.glob(pat))
+            if model_key:
+                candidates = [c for c in candidates if _matches_model_key(c, model_key)]
             if candidates:
                 return candidates[0]
 
@@ -187,18 +214,24 @@ def _calculate_economic_metrics(y_true: pd.Series, y_pred: pd.Series) -> dict[st
     }
 
 
-def _load_economic_metrics_for_run(
+def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, q: float) -> float:
+    e = y_true - y_pred
+    return float(np.mean(np.maximum(q * e, (q - 1.0) * e)))
+
+
+def _load_model_long_with_truth(
     run_dir: Path,
     summary: dict[str, Any],
     split: str,
     pred_col: str,
-) -> dict[str, float]:
+    model_key: str = "",
+) -> pd.DataFrame:
     manifest = _load_manifest(run_dir)
     try:
-        pred_path = _discover_raw_prediction_file(run_dir, split, pred_col)
+        pred_path = _discover_raw_prediction_file(run_dir, split, pred_col, model_key=model_key)
     except FileNotFoundError:
         # Backward-compatible fallback for older runs that only exported long warehouse files.
-        pred_path = _discover_long_prediction_file(run_dir, split, pred_col, manifest)
+        pred_path = _discover_long_prediction_file(run_dir, split, pred_col, manifest, model_key=model_key)
     pred_df = pd.read_parquet(pred_path)
 
     truth_path = _resolve_truth_path(manifest)
@@ -220,15 +253,28 @@ def _load_economic_metrics_for_run(
             f"{pred_path} must contain one of timestamp/target_time_utc/timestamp_utc. "
             f"Found: {list(pred_df.columns)}"
         )
-    pred_col_candidates = ["p50", "predicted_value", "prediction", "y_pred"]
-    pred_value_col = next((c for c in pred_col_candidates if c in pred_df.columns), None)
-    if pred_value_col is None:
-        raise KeyError(
-            f"{pred_path} must contain one of {pred_col_candidates}. Found: {list(pred_df.columns)}"
-        )
 
     pred_df = pred_df.copy()
     pred_df["target_time_utc"] = pd.to_datetime(pred_df[ts_col], utc=True, errors="coerce")
+    if "lead_time_h" in pred_df.columns:
+        pred_df["lead_time_h"] = pd.to_numeric(pred_df["lead_time_h"], errors="coerce")
+    else:
+        pred_df["lead_time_h"] = 1.0
+
+    if "p50" not in pred_df.columns:
+        for c in ["predicted_value", "prediction", "y_pred"]:
+            if c in pred_df.columns:
+                pred_df["p50"] = pd.to_numeric(pred_df[c], errors="coerce")
+                break
+    if "p50" not in pred_df.columns:
+        raise KeyError(f"{pred_path} must provide p50/predicted_value/prediction/y_pred.")
+
+    q_cols = [c for c in pred_df.columns if re.fullmatch(r"p\d{2}", str(c))]
+    if "p50" not in q_cols:
+        q_cols.append("p50")
+    for c in q_cols:
+        pred_df[c] = pd.to_numeric(pred_df[c], errors="coerce")
+
     truth_df = truth_df.copy()
     truth_df["timestamp_utc"] = pd.to_datetime(truth_df["timestamp_utc"], utc=True, errors="coerce")
     truth_df = truth_df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc")
@@ -244,22 +290,14 @@ def _load_economic_metrics_for_run(
         pred_df["y_true"] = pd.to_numeric(pred_df["actuals"], errors="coerce")
     else:
         pred_df["y_true"] = pd.to_numeric(truth_by_ts.reindex(pred_df["target_time_utc"]).values, errors="coerce")
-    pred_df["y_pred"] = pd.to_numeric(pred_df[pred_value_col], errors="coerce")
-
-    # Use lead=1 when available to avoid multi-horizon duplicates in directional metrics.
-    if "lead_time_h" in pred_df.columns:
-        lead1 = pred_df[pd.to_numeric(pred_df["lead_time_h"], errors="coerce") == 1].copy()
-        if not lead1.empty:
-            pred_df = lead1
-
-    s = (
-        pred_df[["target_time_utc", "y_true", "y_pred"]]
-        .dropna(subset=["target_time_utc"])
-        .sort_values("target_time_utc")
-        .groupby("target_time_utc", as_index=False)
-        .agg({"y_true": "mean", "y_pred": "mean"})
+    pred_df["y_pred"] = pd.to_numeric(pred_df["p50"], errors="coerce")
+    pred_df["y_naive_24h"] = pd.to_numeric(
+        truth_by_ts.reindex(pred_df["target_time_utc"] - pd.Timedelta(hours=24)).values,
+        errors="coerce",
     )
-    return _calculate_economic_metrics(s["y_true"], s["y_pred"])
+    keep = ["target_time_utc", "lead_time_h", "y_true", "y_pred", "y_naive_24h", *sorted(set(q_cols))]
+    pred_df = pred_df[keep].dropna(subset=["target_time_utc"]).sort_values(["lead_time_h", "target_time_utc"])
+    return pred_df
 
 
 def _detect_pred_col(summary: dict[str, Any], requested_pred_col: str) -> str:
@@ -299,35 +337,100 @@ def _resolve_pred_cols(summaries: list[dict[str, Any]], requested_pred_col: str)
     return pred_cols
 
 
-def _load_per_lead(run_dir: Path, split: str, pred_col: str) -> pd.DataFrame:
-    p = run_dir / f"{split}_{pred_col}_metrics_by_lead.csv"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing metrics-by-lead file: {p}")
-    return pd.read_csv(p)
+def _compute_per_lead_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    out: list[dict[str, float]] = []
+    for lead, d in df.groupby("lead_time_h", dropna=True):
+        yt = pd.to_numeric(d["y_true"], errors="coerce").to_numpy(dtype=float)
+        yp = pd.to_numeric(d["y_pred"], errors="coerce").to_numpy(dtype=float)
+        yn = pd.to_numeric(d["y_naive_24h"], errors="coerce").to_numpy(dtype=float)
+        m = np.isfinite(yt) & np.isfinite(yp)
+        mn = m & np.isfinite(yn)
+        if not np.any(m):
+            continue
+        mae = float(np.mean(np.abs(yt[m] - yp[m])))
+        rmse = float(np.sqrt(np.mean((yt[m] - yp[m]) ** 2)))
+        pin = _pinball_loss(yt[m], yp[m], 0.5)
+        skill = float("nan")
+        if np.any(mn):
+            mae_naive = float(np.mean(np.abs(yt[mn] - yn[mn])))
+            if np.isfinite(mae_naive) and mae_naive != 0:
+                skill = float(1.0 - (mae / mae_naive))
+        out.append(
+            {
+                "lead_time_h": float(lead),
+                "n": float(np.sum(m)),
+                "mae": mae,
+                "rmse": rmse,
+                "pinball_mean": pin,
+                "skill_score_mae": skill,
+            }
+        )
+    return pd.DataFrame(out).sort_values("lead_time_h").reset_index(drop=True)
 
 
-def _load_coverage(run_dir: Path, split: str, pred_col: str) -> pd.DataFrame:
-    p = run_dir / f"{split}_{pred_col}_quantile_coverage.csv"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing quantile coverage file: {p}")
-    return pd.read_csv(p)
+def _compute_coverage(df: pd.DataFrame) -> pd.DataFrame:
+    q_cols = sorted([c for c in df.columns if re.fullmatch(r"p\d{2}", str(c))], key=lambda x: int(x[1:]))
+    rows: list[dict[str, float]] = []
+    yt = pd.to_numeric(df["y_true"], errors="coerce").to_numpy(dtype=float)
+    for c in q_cols:
+        q = int(c[1:]) / 100.0
+        yp = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+        m = np.isfinite(yt) & np.isfinite(yp)
+        if not np.any(m):
+            continue
+        cov = float(np.mean(yt[m] <= yp[m]))
+        rows.append({"quantile": q, "empirical_coverage": cov, "n": float(np.sum(m))})
+    return pd.DataFrame(rows).sort_values("quantile").reset_index(drop=True)
 
 
-def _get_scalar_metric(summary: dict[str, Any], pred_col: str, metric: str) -> float:
-    rows = summary.get("avg_metrics_by_prediction_column", [])
-    for r in rows:
-        if r.get("prediction_column") == pred_col:
-            v = r.get(metric, np.nan)
-            try:
-                return float(v)
-            except Exception:
-                return float("nan")
-    return float("nan")
+def _compute_scalar_metrics(df: pd.DataFrame, per_lead: pd.DataFrame, coverage: pd.DataFrame) -> dict[str, float]:
+    mae_mean = float(per_lead["mae"].mean()) if not per_lead.empty else float("nan")
+    rmse_mean = float(per_lead["rmse"].mean()) if not per_lead.empty else float("nan")
+    pinball_mean = float(per_lead["pinball_mean"].mean()) if not per_lead.empty else float("nan")
+    skill_mean = float(per_lead["skill_score_mae"].mean()) if not per_lead.empty else float("nan")
+    ace = float(np.mean(np.abs(coverage["empirical_coverage"] - coverage["quantile"]))) if not coverage.empty else float("nan")
+
+    # WIS (approx.) from available quantiles around p50.
+    q_cols = sorted([c for c in df.columns if re.fullmatch(r"p\d{2}", str(c))], key=lambda x: int(x[1:]))
+    wis = float("nan")
+    if "p50" in q_cols:
+        yt = pd.to_numeric(df["y_true"], errors="coerce").to_numpy(dtype=float)
+        p50 = pd.to_numeric(df["p50"], errors="coerce").to_numpy(dtype=float)
+        m = np.isfinite(yt) & np.isfinite(p50)
+        if np.any(m):
+            parts = [0.5 * np.abs(yt[m] - p50[m])]
+            k = 0
+            for lo, hi in [("p10", "p90"), ("p20", "p80"), ("p30", "p70"), ("p40", "p60")]:
+                if lo not in q_cols or hi not in q_cols:
+                    continue
+                l = pd.to_numeric(df[lo], errors="coerce").to_numpy(dtype=float)
+                u = pd.to_numeric(df[hi], errors="coerce").to_numpy(dtype=float)
+                mm = m & np.isfinite(l) & np.isfinite(u) & (u >= l)
+                if not np.any(mm):
+                    continue
+                alpha = 2.0 * (1.0 - (int(hi[1:]) / 100.0))
+                width = u[mm] - l[mm]
+                iscore = width + (2.0 / alpha) * np.maximum(l[mm] - yt[mm], 0.0) + (2.0 / alpha) * np.maximum(
+                    yt[mm] - u[mm], 0.0
+                )
+                parts.append((alpha / 2.0) * iscore)
+                k += 1
+            if parts:
+                wis = float(np.mean(np.sum(np.column_stack(parts), axis=1) / (k + 1.0)))
+
+    return {
+        "mae_mean": mae_mean,
+        "rmse_mean": rmse_mean,
+        "pinball_mean": pinball_mean,
+        "wis_mean": wis,
+        "average_calibration_error": ace,
+        "skill_score_mae_mean": skill_mean,
+    }
 
 
 def _build_summary_table(
     labels: list[str],
-    summaries: list[dict[str, Any]],
+    scalar_metrics: list[dict[str, float]],
     pred_col: str,
     economic_metrics: list[dict[str, float]],
 ) -> pd.DataFrame:
@@ -347,11 +450,11 @@ def _build_summary_table(
     for display_name, key in metric_rows:
         row: dict[str, float | str] = {"metric": display_name}
         vals: list[float] = []
-        for idx, (lbl, summ) in enumerate(zip(labels, summaries)):
+        for idx, lbl in enumerate(labels):
             if key in {"spike_mae_top5", "spike_rmse_top5", "negative_tail_mae_bottom5", "mean_directional_accuracy"}:
                 v = float(economic_metrics[idx].get(key, np.nan))
             else:
-                v = _get_scalar_metric(summ, pred_col, key)
+                v = float(scalar_metrics[idx].get(key, np.nan))
             row[lbl] = v
             vals.append(v)
 
@@ -467,6 +570,12 @@ def _build_cli() -> argparse.ArgumentParser:
         default="",
         help="Prediction column key (e.g., pred_da_price). If omitted, selected automatically from first run.",
     )
+    p.add_argument(
+        "--model-keys",
+        nargs="+",
+        default=[],
+        help="Optional model key per run-dir (e.g., xgboost tft). Needed when multiple models share one run folder.",
+    )
     return p
 
 
@@ -478,6 +587,10 @@ def main() -> None:
         raise ValueError("Length mismatch: --run-dirs and --labels must have same number of entries.")
     if len(run_dirs) < 2:
         raise ValueError("Provide at least 2 run dirs for comparison.")
+    if args.model_keys and len(args.model_keys) != len(run_dirs):
+        raise ValueError("Length mismatch: --model-keys must match --run-dirs when provided.")
+
+    model_keys = args.model_keys if args.model_keys else [_infer_model_key(lbl) for lbl in labels]
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -493,12 +606,24 @@ def main() -> None:
     plots_root.mkdir(parents=True, exist_ok=True)
 
     for pred_col in pred_cols:
-        per_lead = [_load_per_lead(rd, args.split, pred_col) for rd in run_dirs]
-        econ_metrics = [
-            _load_economic_metrics_for_run(rd, summ, args.split, pred_col)
-            for rd, summ in zip(run_dirs, summaries)
+        long_frames = [
+            _load_model_long_with_truth(rd, summ, args.split, pred_col, model_key=mk)
+            for rd, summ, mk in zip(run_dirs, summaries, model_keys)
         ]
-        summary_df_one = _build_summary_table(labels, summaries, pred_col, econ_metrics)
+        per_lead = [_compute_per_lead_metrics(df) for df in long_frames]
+        coverages = [_compute_coverage(df) for df in long_frames]
+        scalar_metrics = [_compute_scalar_metrics(df, pl, cv) for df, pl, cv in zip(long_frames, per_lead, coverages)]
+        econ_metrics = []
+        for df in long_frames:
+            d = df.copy()
+            if "lead_time_h" in d.columns:
+                d1 = d[pd.to_numeric(d["lead_time_h"], errors="coerce") == 1]
+                if not d1.empty:
+                    d = d1
+            d = d.sort_values("target_time_utc").drop_duplicates(subset=["target_time_utc"], keep="last")
+            econ_metrics.append(_calculate_economic_metrics(d["y_true"], d["y_pred"]))
+
+        summary_df_one = _build_summary_table(labels, scalar_metrics, pred_col, econ_metrics)
         summary_df_one.insert(0, "prediction_column", pred_col)
         all_summary_tables.append(summary_df_one)
 
@@ -517,7 +642,6 @@ def main() -> None:
             pred_col=pred_col,
         )
         try:
-            coverages = [_load_coverage(rd, args.split, pred_col) for rd in run_dirs]
             _plot_calibration_overlay(
                 labels=labels,
                 coverages=coverages,
@@ -544,6 +668,7 @@ def main() -> None:
     meta = {
         "run_dirs": [str(p.resolve()) for p in run_dirs],
         "labels": labels,
+        "model_keys": model_keys,
         "split": args.split,
         "pred_cols": pred_cols,
         "plotted_targets": plotted_targets,
