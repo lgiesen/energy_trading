@@ -2,12 +2,17 @@
 
 Usage (manifest-autoload, recommended):
     ./.venv/bin/python scripts/run_battery_backtest.py \
-      --run-manifest artifacts/model_runs/latest.json \
+      --run-id 2026-04-20T15-36-58Z \
       --split test \
       --horizon-hours 48 \
       --reopt-step-hours 1 \
-      --da-gate-hour-utc 11 \
+      --da-gate-hour-cet 11 \
       --soc-feedback-mode realized
+
+Usage (explicit manifest path override):
+    ./.venv/bin/python scripts/run_battery_backtest.py \
+      --run-manifest artifacts/model_runs/latest.json \
+      --split test
 
 Usage (manual files):
     ./.venv/bin/python scripts/run_battery_backtest.py \
@@ -109,6 +114,54 @@ def _build_backtest_diagnostics(hourly: pd.DataFrame, summary: dict[str, object]
     }
 
 
+def _build_state_machine_audit(hourly: pd.DataFrame) -> dict[str, object]:
+    d = hourly.copy()
+    if d.empty:
+        return {
+            "rows": 0,
+            "gate_09_reopt_triggers": 0,
+            "gate_12_da_locked_rows": 0,
+            "t25_energy_bid_rows": 0,
+            "da_submitted_buy_mw_total": 0.0,
+            "da_submitted_sell_mw_total": 0.0,
+            "da_executed_buy_mw_total": 0.0,
+            "da_executed_sell_mw_total": 0.0,
+            "afrr_capacity_awarded_pos_mw_total": 0.0,
+            "afrr_capacity_awarded_neg_mw_total": 0.0,
+            "afrr_activation_accept_pos_count": 0,
+            "afrr_activation_accept_neg_count": 0,
+            "obligation_fulfilled_rate": float("nan"),
+        }
+
+    def _sum_col(name: str) -> float:
+        return float(pd.to_numeric(d[name], errors="coerce").fillna(0.0).sum()) if name in d.columns else 0.0
+
+    def _count_true(name: str) -> int:
+        if name not in d.columns:
+            return 0
+        return int((pd.to_numeric(d[name], errors="coerce").fillna(0.0) > 0.5).sum())
+
+    out: dict[str, object] = {
+        "rows": int(len(d)),
+        "gate_09_reopt_triggers": _count_true("event_reopt_triggered"),
+        "gate_12_da_locked_rows": _count_true("da_bid_locked"),
+        "t25_energy_bid_rows": _count_true("real_aFRR_Energy_Gate_Closure_Min"),
+        "da_submitted_buy_mw_total": _sum_col("real_submitted_da_buy_mw"),
+        "da_submitted_sell_mw_total": _sum_col("real_submitted_da_sell_mw"),
+        "da_executed_buy_mw_total": _sum_col("real_executed_charge_mw"),
+        "da_executed_sell_mw_total": _sum_col("real_executed_discharge_mw"),
+        "afrr_capacity_awarded_pos_mw_total": _sum_col("real_executed_reserve_pos_mw"),
+        "afrr_capacity_awarded_neg_mw_total": _sum_col("real_executed_reserve_neg_mw"),
+        "afrr_activation_accept_pos_count": _count_true("real_afrr_act_pos_accepted"),
+        "afrr_activation_accept_neg_count": _count_true("real_afrr_act_neg_accepted"),
+    }
+    if "real_Obligation_Fulfilled" in d.columns:
+        out["obligation_fulfilled_rate"] = float(pd.to_numeric(d["real_Obligation_Fulfilled"], errors="coerce").fillna(0.0).mean())
+    else:
+        out["obligation_fulfilled_rate"] = float("nan")
+    return out
+
+
 def _resolve_out_dir(
     out_dir_arg: str,
     *,
@@ -135,6 +188,17 @@ def _matches_model_key(path: Path, model_key: str) -> bool:
     if mk == "tft":
         return "xgboost" not in name
     return mk in name
+
+
+def _score_long_candidate(path: Path, *, split: str) -> tuple[int, int]:
+    """Higher score = better split match for long prediction files."""
+    name = path.name.lower()
+    has_test = "test" in name
+    # Prefer explicit split markers first.
+    if split == "test":
+        return (2 if has_test else 1, len(name))
+    # val: prefer files without test marker; many val files have no explicit "val" token
+    return (2 if not has_test else 1, len(name))
 
 
 def _resolve_existing_file(path_like: str | Path, *, manifest_dir: Path) -> Path:
@@ -176,12 +240,25 @@ def _resolve_long_prediction_path(
             f"*{split}*{pred_col}*long*.parquet",
             f"*{pred_col}*long*{split}*.parquet",
             f"*{pred_col}*{split}*long*.parquet",
+            f"*{pred_col}*long*.parquet",
         ]
         for pat in patterns:
             candidates.extend(sorted(pred_dir.glob(pat)))
+        # Deduplicate while preserving order
+        if candidates:
+            seen: set[str] = set()
+            deduped: list[Path] = []
+            for c in candidates:
+                key = str(c.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(c)
+            candidates = deduped
     if model_key:
         candidates = [c for c in candidates if _matches_model_key(c, model_key)]
     if candidates:
+        candidates = sorted(candidates, key=lambda c: _score_long_candidate(c, split=split), reverse=True)
         return candidates[0]
 
     # Final explicit fallbacks by filename
@@ -212,6 +289,53 @@ def _resolve_long_map(
         )
         resolved[pred_col] = str(rp)
     return resolved
+
+
+def _resolve_bundle_prediction_path(
+    *,
+    configured_path: str | Path,
+    manifest_dir: Path,
+    split: str,
+    model_key: str,
+) -> Path:
+    """Resolve wide prediction parquet for bundle fallback mode."""
+    p = Path(configured_path)
+    if p.exists() and _matches_model_key(p, model_key):
+        return p
+
+    pred_dir = manifest_dir / "predictions"
+    candidates: list[Path] = []
+    if pred_dir.exists():
+        patterns = [
+            f"*{split}*.parquet",
+            "*.parquet",
+        ]
+        for pat in patterns:
+            candidates.extend(sorted(pred_dir.glob(pat)))
+        candidates = [c for c in candidates if "long" not in c.name.lower()]
+    if model_key:
+        candidates = [c for c in candidates if _matches_model_key(c, model_key)]
+    if candidates:
+        candidates = sorted(candidates, key=lambda c: _score_long_candidate(c, split=split), reverse=True)
+        # Prefer same bundle family where possible.
+        name_hint = p.name.lower()
+        if "da" in name_hint:
+            da_cands = [c for c in candidates if "da" in c.name.lower()]
+            if da_cands:
+                return da_cands[0]
+        if "afrr" in name_hint:
+            afrr_cands = [c for c in candidates if "afrr" in c.name.lower()]
+            if afrr_cands:
+                return afrr_cands[0]
+        return candidates[0]
+
+    for c in [manifest_dir / p.name, manifest_dir / "predictions" / p.name]:
+        if c.exists() and _matches_model_key(c, model_key):
+            return c
+    raise FileNotFoundError(
+        f"Could not resolve prediction parquet for split='{split}', model_key='{model_key}'. "
+        f"Configured path: {p}"
+    )
 
 
 def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: BacktestColumnMap) -> BacktestColumnMap:
@@ -308,9 +432,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--predictions", default="", help="Path to predictions parquet file.")
     p.add_argument("--ground-truth", default="", help="Path to ground-truth parquet file.")
     p.add_argument(
+        "--run-id",
+        default="2026-04-20T15-36-58Z",
+        help=(
+            "Run id used to resolve manifest path when --run-manifest is not set. "
+            "Default: 2026-04-20T15-36-58Z"
+        ),
+    )
+    p.add_argument(
         "--run-manifest",
-        default="artifacts/model_runs/latest.json",
-        help="Manifest path or latest-pointer json for simulation autoload.",
+        default="",
+        help=(
+            "Optional manifest path or latest-pointer json for simulation autoload. "
+            "If omitted, resolves to artifacts/model_runs/<run-id>/manifest.json."
+        ),
     )
     p.add_argument("--split", choices=["val", "test"], default="test", help="Prediction split for manifest mode.")
     p.add_argument(
@@ -345,7 +480,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", default=None, help="Optional UTC end filter.")
     p.add_argument("--horizon-hours", type=int, default=48, help="Rolling-horizon window length in hours.")
     p.add_argument("--reopt-step-hours", type=int, default=1, help="Re-optimization step in hours.")
-    p.add_argument("--da-gate-hour-utc", type=int, default=11, help="UTC gate-closure hour for locking next-day DA bids.")
+    p.add_argument(
+        "--da-gate-hour-cet",
+        type=int,
+        default=12,
+        help="Day-Ahead gate-closure hour in CET/CEST used for locking next-day DA bids (default: 12).",
+    )
+    p.add_argument(
+        "--da-gate-hour-utc",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument(
         "--soc-feedback-mode",
         choices=["realized", "predicted"],
@@ -368,21 +514,29 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run_id: str | None = None
+    run_id: str | None = args.run_id.strip() or None
 
     predictions_path = args.predictions.strip()
     ground_truth_path = args.ground_truth.strip()
 
     if not predictions_path:
-        manifest_path = Path(args.run_manifest)
+        if args.run_manifest.strip():
+            manifest_path = Path(args.run_manifest.strip())
+        else:
+            if not run_id:
+                raise ValueError("Missing run id. Provide --run-id or --run-manifest.")
+            manifest_path = Path("artifacts/model_runs") / run_id / "manifest.json"
         if not manifest_path.exists():
-            raise FileNotFoundError(f"Run manifest/latest pointer not found: {manifest_path}")
+            raise FileNotFoundError(
+                f"Run manifest/latest pointer not found: {manifest_path}. "
+                "Pass --run-id <RUN_ID> or --run-manifest <PATH>."
+            )
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if "manifest_path" in payload:
             run_id = payload.get("run_id")
             manifest_path = Path(payload["manifest_path"])
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        run_id = run_id or payload.get("run_id")
+        run_id = run_id or payload.get("run_id") or (args.run_id.strip() or None)
         manifest_dir = manifest_path.parent
     else:
         manifest_dir = Path.cwd()
@@ -417,8 +571,18 @@ def main() -> None:
                 coverage_min = min(cov_min_list)
                 coverage_max = max(cov_max_list)
         else:
-            da_pred = _resolve_existing_file(payload["bundles"]["da"]["predictions"][args.split], manifest_dir=manifest_dir)
-            afrr_pred = _resolve_existing_file(payload["bundles"]["afrr"]["predictions"][args.split], manifest_dir=manifest_dir)
+            da_pred = _resolve_bundle_prediction_path(
+                configured_path=payload["bundles"]["da"]["predictions"][args.split],
+                manifest_dir=manifest_dir,
+                split=args.split,
+                model_key=args.model_key.strip(),
+            )
+            afrr_pred = _resolve_bundle_prediction_path(
+                configured_path=payload["bundles"]["afrr"]["predictions"][args.split],
+                manifest_dir=manifest_dir,
+                split=args.split,
+                model_key=args.model_key.strip(),
+            )
             predictions_path = str((out_dir / f"backtest_table_{args.split}.parquet").resolve())
 
             da_df = pd.read_parquet(da_pred)
@@ -487,12 +651,15 @@ def main() -> None:
         horizon_hours=args.horizon_hours,
         reopt_step_hours=args.reopt_step_hours,
         forecast_warehouse=forecast_warehouse,
-        da_gate_hour_utc=args.da_gate_hour_utc,
+        da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
         soc_feedback_mode=args.soc_feedback_mode,
         enforce_final_soc_min=args.enforce_final_soc_min,
     )
 
     hourly_path = out_dir / "backtest_hourly.parquet"
+    planned_ledger_path = out_dir / "planned_ledger.parquet"
+    executed_ledger_path = out_dir / "executed_ledger.parquet"
+    realized_ledger_path = out_dir / "realized_ledger.parquet"
     plan_history_path = out_dir / "backtest_plan_history.parquet"
     global_plan_history_path = Path("artifacts/backtest_plan_history.parquet")
     global_plan_history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -500,17 +667,109 @@ def main() -> None:
     monthly_path = out_dir / "backtest_monthly.csv"
     yearly_path = out_dir / "backtest_yearly.csv"
     summary_path = out_dir / "backtest_summary.json"
+    state_machine_audit_path = out_dir / "state_machine_audit.json"
     diagnostics_path = out_dir / "backtest_diagnostics.json"
     diagnostics_txt_path = out_dir / "backtest_diagnostics.txt"
     pnl_plot_path = out_dir / "backtest_cumulative_pnl.png"
 
     outputs.hourly.to_parquet(hourly_path, index=False)
+    # Ledger 1: planned MILP path
+    planned_cols_pref = [
+        colmap.timestamp,
+        "charge_mw",
+        "discharge_mw",
+        "reserve_pos_mw",
+        "reserve_neg_mw",
+        "soc_lp_mwh",
+        "planned_soc_mwh",
+        "aFRR_Capacity_Won_Pos_MW",
+        "aFRR_Capacity_Won_Neg_MW",
+        "aFRR_Capacity_Won_MW",
+        "aFRR_Energy_Price_EUR_MWh_Pos",
+        "aFRR_Energy_Price_EUR_MWh_Neg",
+        "event_reopt_triggered",
+        "event_reopt_rejected_mw_total",
+        "predicted_objective_eur",
+    ]
+    planned_cols = [c for c in planned_cols_pref if c in outputs.hourly.columns]
+    outputs.hourly[planned_cols].to_parquet(planned_ledger_path, index=False)
+
+    # Ledger 2: executed market-clearing path
+    executed_cols = [colmap.timestamp]
+    executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_planned_")])
+    executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_submitted_")])
+    executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_executed_")])
+    executed_cols.extend(
+        [
+            c
+            for c in [
+                "real_da_buy_accepted",
+                "real_da_sell_accepted",
+                "real_afrr_cap_pos_awarded",
+                "real_afrr_cap_neg_awarded",
+                "real_afrr_act_pos_accepted",
+                "real_afrr_act_neg_accepted",
+                "real_aFRR_Capacity_Won_MW",
+                "real_DA_Energy_Sold_MW",
+                "real_aFRR_Energy_Price_EUR_MWh",
+                "real_Obligation_Fulfilled",
+                "real_aFRR_Energy_Gate_Closure_Min",
+                "shock_source",
+                "soc_before_mwh",
+                "soc_after_planned_mwh",
+                "soc_after_executed_mwh",
+                "soc_shock_mwh",
+            ]
+            if c in outputs.hourly.columns
+        ]
+    )
+    # preserve order + dedupe
+    executed_cols = [*dict.fromkeys(executed_cols)]
+    outputs.hourly[executed_cols].to_parquet(executed_ledger_path, index=False)
+
+    # Ledger 3: realized financial settlement
+    realized_cols = [colmap.timestamp]
+    realized_cols.extend(
+        [
+            c
+            for c in outputs.hourly.columns
+            if c.startswith("real_")
+            and c
+            in {
+                "real_pnl_eur",
+                "real_da_buy_mwh",
+                "real_da_sell_mwh",
+                "real_act_pos_mwh",
+                "real_act_neg_mwh",
+                "real_revenue_da_eur",
+                "real_cost_da_eur",
+                "real_revenue_capacity_eur",
+                "real_revenue_activation_eur",
+                "real_transaction_cost_eur",
+                "real_degradation_cost_eur",
+                "real_penalty_eur",
+                "real_missed_activation_mwh",
+                "real_missed_capacity_mw",
+                "real_missed_capacity_pos_mw",
+                "real_missed_capacity_neg_mw",
+                "real_requested_activation_revenue_eur",
+                "real_delivered_activation_revenue_eur",
+                "real_missed_activation_revenue_eur",
+                "real_soc_mwh",
+            }
+        ]
+    )
+    realized_cols = [*dict.fromkeys(realized_cols)]
+    outputs.hourly[realized_cols].to_parquet(realized_ledger_path, index=False)
+
     outputs.plan_history.to_parquet(plan_history_path, index=False)
     outputs.plan_history.to_parquet(global_plan_history_path, index=False)
     outputs.volatility.to_csv(volatility_path, index=False)
     outputs.monthly.to_csv(monthly_path, index=False)
     outputs.yearly.to_csv(yearly_path, index=False)
     summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+    state_machine_audit = _build_state_machine_audit(outputs.hourly)
+    state_machine_audit_path.write_text(json.dumps(state_machine_audit, indent=2), encoding="utf-8")
     diagnostics = _build_backtest_diagnostics(outputs.hourly, outputs.summary)
     diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
     diagnostics_txt_path.write_text(
@@ -533,9 +792,33 @@ def main() -> None:
 
     print("[OK] Battery backtest completed.")
     print(f"- rows: {len(outputs.hourly)}")
+    if "planned_total_pnl_eur" in outputs.summary:
+        print(f"- planned_total_pnl_eur: {outputs.summary['planned_total_pnl_eur']:.2f}")
     print(f"- realized_total_pnl_eur: {outputs.summary['realized_total_pnl_eur']:.2f}")
+    print("- realized_pnl_breakdown:")
+    print(f"  - total_da_revenue_eur: {outputs.summary.get('total_da_revenue_eur', 0.0):.2f}")
+    print(f"  - total_afrr_capacity_revenue_eur: {outputs.summary.get('total_afrr_capacity_revenue_eur', 0.0):.2f}")
+    print(f"  - total_afrr_activation_revenue_eur: {outputs.summary.get('total_afrr_activation_revenue_eur', 0.0):.2f}")
+    print(f"  - total_da_cost_eur: {outputs.summary.get('total_da_cost_eur', 0.0):.2f}")
+    print(f"  - total_degradation_cost_eur: {outputs.summary.get('total_degradation_cost_eur', 0.0):.2f}")
+    print(f"  - total_transaction_cost_eur: {outputs.summary.get('total_transaction_cost_eur', 0.0):.2f}")
+    print(f"  - total_penalty_cost_eur: {outputs.summary.get('total_penalty_cost_eur', 0.0):.2f}")
+    print(f"  - realized_pnl_from_components_eur: {outputs.summary.get('realized_pnl_from_components_eur', 0.0):.2f}")
+    print(f"  - realized_pnl_balance_error_eur: {outputs.summary.get('realized_pnl_balance_error_eur', 0.0):.6f}")
+    print(f"  - realized_pnl_balance_ok: {bool(outputs.summary.get('realized_pnl_balance_ok', 0.0))}")
+    print("- operational_kpis:")
+    print(f"  - total_equivalent_full_cycles: {outputs.summary.get('total_equivalent_full_cycles', float('nan')):.4f}")
+    print(f"  - afrr_capacity_award_rate: {outputs.summary.get('afrr_capacity_award_rate', float('nan')):.4f}")
+    print(f"  - total_missed_activation_mwh: {outputs.summary.get('total_missed_activation_mwh', 0.0):.4f}")
+    print(f"  - roi_on_max_capital: {outputs.summary.get('roi_on_max_capital', float('nan')):.4f}")
     print(f"- oracle_total_pnl_eur: {outputs.summary['oracle_total_pnl_eur']:.2f}")
+    if "oracle_pnl_from_components_eur" in outputs.summary:
+        print(f"- oracle_pnl_from_components_eur: {outputs.summary['oracle_pnl_from_components_eur']:.2f}")
+        print(f"- oracle_pnl_balance_error_eur: {outputs.summary.get('oracle_pnl_balance_error_eur', 0.0):.6f}")
+        print(f"- oracle_pnl_balance_ok: {bool(outputs.summary.get('oracle_pnl_balance_ok', 0.0))}")
     print(f"- predicted_total_pnl_eur: {outputs.summary['predicted_total_pnl_eur']:.2f}")
+    if "oracle_upper_bound_ok" in outputs.summary:
+        print(f"- oracle_upper_bound_ok: {bool(outputs.summary['oracle_upper_bound_ok'])}")
     print(f"- naive_total_pnl_eur: {outputs.summary['naive_total_pnl_eur']:.2f}")
     print(f"- cost_of_forecast_error_total_eur: {outputs.summary['cost_of_forecast_error_total_eur']:.2f}")
     print(f"- pnl_gap_total_eur: {outputs.summary['pnl_gap_total_eur']:.2f}")
@@ -548,12 +831,16 @@ def main() -> None:
         f"ok={bool(outputs.summary['final_soc_constraint_satisfied'])})"
     )
     print(f"- hourly: {hourly_path}")
+    print(f"- planned_ledger: {planned_ledger_path}")
+    print(f"- executed_ledger: {executed_ledger_path}")
+    print(f"- realized_ledger: {realized_ledger_path}")
     print(f"- plan_history: {plan_history_path}")
     print(f"- plan_history_global: {global_plan_history_path}")
     print(f"- decision_volatility: {volatility_path}")
     print(f"- monthly: {monthly_path}")
     print(f"- yearly: {yearly_path}")
     print(f"- summary: {summary_path}")
+    print(f"- state_machine_audit: {state_machine_audit_path}")
     print(f"- diagnostics: {diagnostics_path}")
     print(f"- diagnostics_txt: {diagnostics_txt_path}")
     print(f"- pnl_contribution_plot: {pnl_plot_path}")
