@@ -39,12 +39,23 @@ FINANCIAL_PARAMS = {
     "annual_opex_fixed": 5000.0,
     "transaction_cost_eur_per_mwh": 1.0,  # C_trans in thesis
     "risk_margin_eur_per_mwh": 0.0,  # Optional conservative margin for thresholds
+    "imbalance_penalty_eur_mwh": 500.0,  # Non-delivery/imbalance penalty proxy
 }
 
 # --- MARKET CONSTRAINTS ---
 MARKET_SPECS = {
+    "da_min_bid_size": 0.1,  # Minimum bid size in MW (Germany)
+    "da_bid_granularity": 0.1,  # Bid steps
     "afrr_min_bid_size": 1.0,  # Minimum bid size in MW (Germany)
-    "afrr_bid_granularity": 1.0,  # Bid steps (often 1 MW units)
+    "afrr_bid_granularity": 1.0,  # Bid steps
+    "da_execution_mode": "price_taker",  # "price_taker" or "limit"
+    "da_arbitrage_mode": "limit",  # mode for non-hedging DA volumes
+    "da_link_to_awarded_afrr": True,  # cancel hedges if aFRR capacity was not awarded
+    "afrr_capacity_bid_risk_lambda": 0.2,
+    "afrr_activation_bid_risk_lambda": 0.2,
+    "afrr_energy_bid_strategy": "forecast",  # "forecast" | "marginal_cost" | "hybrid"
+    "da_buy_limit_price_eur_mwh": 3000.0,
+    "da_sell_limit_price_eur_mwh": -500.0,
     # Keep separate from optimization step on purpose:
     # optimization uses 60 min, settlement/input granularity is 15 min.
     "settlement_period_min": 15,  # Settlement/input granularity for imbalance/SRL
@@ -92,6 +103,16 @@ def _validate_config() -> None:
 
     if MARKET_SPECS["afrr_bid_granularity"] <= 0:
         raise ValueError("afrr_bid_granularity must be > 0.")
+    if MARKET_SPECS["da_execution_mode"] not in {"price_taker", "limit"}:
+        raise ValueError("da_execution_mode must be one of {'price_taker', 'limit'}.")
+    if MARKET_SPECS["da_arbitrage_mode"] not in {"price_taker", "limit"}:
+        raise ValueError("da_arbitrage_mode must be one of {'price_taker', 'limit'}.")
+    if MARKET_SPECS["afrr_energy_bid_strategy"] not in {"forecast", "marginal_cost", "hybrid"}:
+        raise ValueError("afrr_energy_bid_strategy must be one of {'forecast', 'marginal_cost', 'hybrid'}.")
+    if MARKET_SPECS["afrr_capacity_bid_risk_lambda"] < 0:
+        raise ValueError("afrr_capacity_bid_risk_lambda must be >= 0.")
+    if MARKET_SPECS["afrr_activation_bid_risk_lambda"] < 0:
+        raise ValueError("afrr_activation_bid_risk_lambda must be >= 0.")
     if MARKET_SPECS["afrr_min_bid_size"] < 0:
         raise ValueError("afrr_min_bid_size must be >= 0.")
     if MARKET_SPECS["settlement_period_min"] <= 0:
