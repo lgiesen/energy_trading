@@ -15,7 +15,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import RobustScaler
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -28,6 +28,10 @@ from energy_trading.models.train_xgboost_export import (
     _add_dynamics_features,
     _pred_column_names_for_target,
     _resolve_targets,
+)
+from energy_trading.models.training_policy import (
+    resolve_feature_columns_for_target,
+    resolve_tft_params_for_target,
 )
 
 
@@ -309,7 +313,7 @@ def _leadtime_mae(
     horizon_hours: int,
 ) -> pd.DataFrame:
     if pred_long.empty:
-        return pd.DataFrame(columns=["lead_time_h", "n", "mae"])
+        return pd.DataFrame(columns=["lead_time_h", "n", "mae", "rmse"])
     base = pd.to_numeric(true_h1, errors="coerce").reset_index(drop=True)
     truth_by_lead = {h: base.shift(-(h - 1)) for h in range(1, horizon_hours + 1)}
     pred_col = "p50" if "p50" in pred_long.columns else "predicted_value"
@@ -321,7 +325,8 @@ def _leadtime_mae(
         m = p.notna() & t.notna()
         n = int(m.sum())
         mae = float(mean_absolute_error(t[m], p[m])) if n > 0 else np.nan
-        rows.append({"lead_time_h": float(lead), "n": float(n), "mae": mae})
+        rmse = float(np.sqrt(mean_squared_error(t[m], p[m]))) if n > 0 else np.nan
+        rows.append({"lead_time_h": float(lead), "n": float(n), "mae": mae, "rmse": rmse})
     return pd.DataFrame(rows)
 
 
@@ -606,7 +611,7 @@ def _train_tft(
     train_df = _add_dynamics_features(train_df, prune_midterm_lags=True)
     val_df = _add_dynamics_features(val_df, prune_midterm_lags=True)
     test_df = _add_dynamics_features(test_df, prune_midterm_lags=True)
-    feature_columns = [
+    all_feature_columns = [
         c
         for c in train_df.columns
         if (
@@ -617,7 +622,8 @@ def _train_tft(
             or "_ramp_x_" in c
         )
     ]
-    feature_columns = [c for c in feature_columns if c in train_df.columns]
+    all_feature_columns = [c for c in all_feature_columns if c in train_df.columns]
+    target_feature_variant, feature_columns = resolve_feature_columns_for_target(all_feature_columns, tgt)
     known_reals, known_categoricals, unknown_reals = _classify_feature_columns(feature_columns)
     feature_columns = list(dict.fromkeys([*known_reals, *known_categoricals, *unknown_reals]))
 
@@ -774,8 +780,15 @@ def _train_tft(
             )
             self._eta_logged = True
 
-    max_epochs = 100
-    early_stopping_patience = 15
+    base_tft_params = {
+        "dropout": 0.1,
+        "early_stopping_patience": 15.0,
+        "max_epochs": 100.0,
+    }
+    target_tft_params = resolve_tft_params_for_target(tgt, base_tft_params)
+    max_epochs = int(target_tft_params["max_epochs"])
+    early_stopping_patience = int(target_tft_params["early_stopping_patience"])
+    dropout = float(target_tft_params["dropout"])
     tb_root = REPO_ROOT / "artifacts" / "tensorboard_logs"
     tb_logger = TensorBoardLogger(
         save_dir=str(tb_root),
@@ -812,7 +825,7 @@ def _train_tft(
         learning_rate=1e-3,
         hidden_size=64,
         attention_head_size=8,
-        dropout=0.1,
+        dropout=dropout,
         hidden_continuous_size=16,
         loss=QuantileLoss(quantiles=QUANTILES),
         output_size=len(QUANTILES),
@@ -938,15 +951,27 @@ def _train_tft(
             return float("nan")
         return float(hit.iloc[0])
 
+    def _rmse_for_lead(decay_df: pd.DataFrame, lead: int) -> float:
+        hit = decay_df.loc[decay_df["lead_time_h"] == int(lead), "rmse"]
+        if hit.empty:
+            return float("nan")
+        return float(hit.iloc[0])
+
     h_last = int(max_prediction_length)
     mae_val_h1 = _mae_for_lead(decay_val, 1)
     mae_val_h_last = _mae_for_lead(decay_val, h_last)
     mae_test_h1 = _mae_for_lead(decay_test, 1)
     mae_test_h_last = _mae_for_lead(decay_test, h_last)
+    rmse_val_h1 = _rmse_for_lead(decay_val, 1)
+    rmse_val_h_last = _rmse_for_lead(decay_val, h_last)
+    rmse_test_h1 = _rmse_for_lead(decay_test, 1)
+    rmse_test_h_last = _rmse_for_lead(decay_test, h_last)
 
     metrics = {
         "bundle": bundle,
         "target_col": tgt,
+        "target_feature_variant": target_feature_variant,
+        "target_feature_count": int(len(feature_columns)),
         "model_name": model_name,
         "resolved_device": torch_device,
         "accelerator": accelerator,
@@ -959,19 +984,33 @@ def _train_tft(
         "leadtime_mae_test_h1": mae_test_h1,
         "leadtime_mae_val_h_last": mae_val_h_last,
         "leadtime_mae_test_h_last": mae_test_h_last,
+        "leadtime_rmse_val_h1": rmse_val_h1,
+        "leadtime_rmse_test_h1": rmse_test_h1,
+        "leadtime_rmse_val_h_last": rmse_val_h_last,
+        "leadtime_rmse_test_h_last": rmse_test_h_last,
         f"leadtime_mae_val_h{h_last}": mae_val_h_last,
         f"leadtime_mae_test_h{h_last}": mae_test_h_last,
+        f"leadtime_rmse_val_h{h_last}": rmse_val_h_last,
+        f"leadtime_rmse_test_h{h_last}": rmse_test_h_last,
         # Backward-compatible keys used by older report scripts.
         "leadtime_mae_val_h48": mae_val_h_last if h_last == 48 else float("nan"),
         "leadtime_mae_test_h48": mae_test_h_last if h_last == 48 else float("nan"),
+        "leadtime_rmse_val_h48": rmse_val_h_last if h_last == 48 else float("nan"),
+        "leadtime_rmse_test_h48": rmse_test_h_last if h_last == 48 else float("nan"),
         "model_path": str(model_path.resolve()),
         "best_checkpoint_path": str(Path(best_model_path).resolve()) if best_model_path else str(model_path.resolve()),
         "stopped_epoch": int(trainer.current_epoch),
         "max_epochs": int(max_epochs),
         "early_stopping_patience": int(early_stopping_patience),
+        "restore_best_weights_equivalent": True,
+        "target_tft_params": {
+            "dropout": dropout,
+            "max_epochs": int(max_epochs),
+            "early_stopping_patience": int(early_stopping_patience),
+        },
         "hidden_size": 64,
         "attention_head_size": 8,
-        "dropout": 0.1,
+        "dropout": dropout,
         "tensorboard_log_dir": str(Path(tb_logger.log_dir).resolve()),
         "attention_plot_path": interpretation_artifacts.get("attention_plot_path"),
         "attention_history_plot_path": interpretation_artifacts.get("attention_history_plot_path"),
@@ -1071,6 +1110,8 @@ def main() -> None:
     print(f"- Target: {metrics['target_col']}")
     print(f"- MAE val h1/h48: {metrics['leadtime_mae_val_h1']:.4f} / {metrics['leadtime_mae_val_h48']:.4f}")
     print(f"- MAE test h1/h48: {metrics['leadtime_mae_test_h1']:.4f} / {metrics['leadtime_mae_test_h48']:.4f}")
+    print(f"- RMSE val h1/h48: {metrics['leadtime_rmse_val_h1']:.4f} / {metrics['leadtime_rmse_val_h48']:.4f}")
+    print(f"- RMSE test h1/h48: {metrics['leadtime_rmse_test_h1']:.4f} / {metrics['leadtime_rmse_test_h48']:.4f}")
     print(f"- Metrics JSON: {metrics_path}")
     print(f"- Manifest fragment: {fragment_path}")
 

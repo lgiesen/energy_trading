@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-
 
 AFRR_TARGETS = [
     "target_afrr_activation_price_vwap_pos",
@@ -26,9 +28,40 @@ def _run_id_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 
 
-def _run_train_cmd(cmd: list[str]) -> None:
-    print("[CMD]", " ".join(cmd))
+def _cmd_to_shell_string(cmd: list[str]) -> str:
+    try:
+        return shlex.join(cmd)
+    except Exception:
+        return " ".join(cmd)
+
+
+def _safe_git_commit() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = proc.stdout.strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _run_train_cmd(cmd: list[str]) -> dict[str, object]:
+    shell_cmd = _cmd_to_shell_string(cmd)
+    print("[CMD]", shell_cmd)
+    t0 = time.time()
     subprocess.run(cmd, check=True)
+    t1 = time.time()
+    return {
+        "command": cmd,
+        "command_shell": shell_cmd,
+        "started_at_utc": datetime.fromtimestamp(t0, tz=timezone.utc).isoformat(),
+        "finished_at_utc": datetime.fromtimestamp(t1, tz=timezone.utc).isoformat(),
+        "duration_seconds": float(t1 - t0),
+    }
 
 
 def _load_fragment(path: Path) -> dict:
@@ -127,6 +160,8 @@ def main() -> None:
     run_id = args.run_id.strip() or _run_id_now()
     run_dir = Path(args.run_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    run_started_utc = datetime.now(timezone.utc)
+    cmd_records: list[dict[str, object]] = []
 
     da_fragment = run_dir / "da_manifest_fragment.json"
     afrr_fragment_paths: list[Path] = []
@@ -157,7 +192,7 @@ def main() -> None:
         ]
         if args.allow_cpu:
             stack_cmd.append("--allow-cpu")
-        _run_train_cmd(stack_cmd)
+        cmd_records.append(_run_train_cmd(stack_cmd))
         afrr_base_dir = args.stacked_base_dir
 
     if args.model_type == "xgboost":
@@ -218,7 +253,7 @@ def main() -> None:
     # Train DA model.
     cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]
     cmd_da = [*cmd_da, "--base-dir", args.base_dir]
-    _run_train_cmd(cmd_da)
+    cmd_records.append(_run_train_cmd(cmd_da))
 
     # Train aFRR models target-wise to produce full canonical prediction columns.
     afrr_targets = _resolve_available_afrr_targets(afrr_base_dir)
@@ -241,7 +276,7 @@ def main() -> None:
             "--manifest-fragment-out",
             str(frag),
         ]
-        _run_train_cmd(cmd_afrr)
+        cmd_records.append(_run_train_cmd(cmd_afrr))
 
     da_meta = _load_fragment(da_fragment)
     afrr_meta_list = [_load_fragment(p) for p in afrr_fragment_paths if p.exists()]
@@ -310,9 +345,41 @@ def main() -> None:
                 afrr_long_by_split.setdefault(split, {})
                 afrr_long_by_split[split][pred_col] = path
 
+    training_context = {
+        "run_id": run_id,
+        "started_at_utc": run_started_utc.isoformat(),
+        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        "duration_seconds": float(sum(float(r.get("duration_seconds", 0.0)) for r in cmd_records)),
+        "launcher_script": str(Path(__file__).resolve()),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "git_commit": _safe_git_commit(),
+        "cli_args": vars(args),
+        "resolved": {
+            "run_root": str(Path(args.run_root).resolve()),
+            "run_dir": str(run_dir.resolve()),
+            "afrr_base_dir": str(Path(afrr_base_dir).resolve()),
+            "model_type": args.model_type,
+            "model_name": model_name,
+            "available_afrr_targets": afrr_targets,
+            "skipped_afrr_targets": skipped,
+            "target_policy_source": "energy_trading.models.training_policy",
+        },
+        "executed_commands": cmd_records,
+    }
+    training_context_path = run_dir / "training_run_context.json"
+    training_context_path.write_text(json.dumps(training_context, indent=2), encoding="utf-8")
+
     manifest = {
         "run_id": run_id,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "training": {
+            "context_path": str(training_context_path.resolve()),
+            "model_type": args.model_type,
+            "model_name": model_name,
+            "git_commit": training_context.get("git_commit"),
+        },
         "bundles": {
             "da": {
                 "model_path": da_meta["model_path"],
@@ -364,6 +431,7 @@ def main() -> None:
     print("[OK] Run export complete.")
     print(f"- run_id: {run_id}")
     print(f"- run_dir: {run_dir}")
+    print(f"- training_context: {training_context_path}")
     print(f"- manifest: {manifest_path}")
     if not args.skip_latest_pointer:
         print(f"- latest: {Path(args.run_root) / 'latest.json'}")

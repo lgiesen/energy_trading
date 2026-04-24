@@ -35,6 +35,10 @@ if str(SRC_DIR) not in sys.path:
 
 from energy_trading.models.prepare_ml_bundles import BundleName, load_processed_data
 from energy_trading.models.cv import PurgedTimeSeriesSplit
+from energy_trading.models.training_policy import (
+    resolve_feature_columns_for_target,
+    resolve_xgb_params_for_target,
+)
 
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 LOGGER = logging.getLogger(__name__)
@@ -536,6 +540,10 @@ def run_purged_cv_with_pipeline(
     max_depth: int,
     learning_rate: float,
     colsample_bytree: float,
+    min_child_weight: float,
+    reg_alpha: float,
+    reg_lambda: float,
+    subsample: float,
     device: str,
     seed: int,
     horizon_hours: int,
@@ -575,13 +583,14 @@ def run_purged_cv_with_pipeline(
             quantile_alpha=0.5,
             n_estimators=n_estimators,
             max_depth=max_depth,
+            min_child_weight=min_child_weight,
             learning_rate=learning_rate,
             tree_method="hist",
             device=device,
-            subsample=0.9,
+            subsample=subsample,
             colsample_bytree=colsample_bytree,
-            reg_alpha=0.0,
-            reg_lambda=1.0,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
             random_state=seed,
             n_jobs=-1,
         )
@@ -652,8 +661,18 @@ def train_and_evaluate(
 
     resolved_device = _resolve_training_device(requested_device=device, require_cuda=require_cuda)
 
-    X_train_df, y_train_df = load_processed_data(bundle=bundle, split="train", base_dir=base_dir)
-    X_val_df, y_val_df = load_processed_data(bundle=bundle, split="val", base_dir=base_dir)
+    X_train_df, y_train_df = load_processed_data(
+        bundle=bundle,
+        split="train",
+        base_dir=base_dir,
+        target_col_for_feature_routing=target_col or None,
+    )
+    X_val_df, y_val_df = load_processed_data(
+        bundle=bundle,
+        split="val",
+        base_dir=base_dir,
+        target_col_for_feature_routing=target_col or None,
+    )
     target_cols = _resolve_targets(bundle, list(y_train_df.columns), target_col)
     primary_target = target_cols[0]
 
@@ -667,21 +686,40 @@ def train_and_evaluate(
 
     X_train = _add_dynamics_features(X_train, prune_midterm_lags=True)
     X_val = _add_dynamics_features(X_val, prune_midterm_lags=True)
-    feature_columns = list(X_train.columns)
+    all_feature_columns = list(X_train.columns)
+
+    base_xgb_params: dict[str, float] = {
+        "max_depth": float(max_depth),
+        "min_child_weight": 1.0,
+        "learning_rate": float(learning_rate),
+        "subsample": 0.9,
+        "colsample_bytree": float(colsample_bytree),
+        "reg_alpha": 0.0,
+        "reg_lambda": 1.0,
+        "early_stopping_rounds": float(max(0, int(early_stopping_rounds))),
+    }
+    primary_policy = resolve_xgb_params_for_target(primary_target, base_xgb_params)
+    primary_variant, primary_cols = resolve_feature_columns_for_target(all_feature_columns, primary_target)
+    X_train_primary = X_train[primary_cols].copy()
+    X_val_primary = X_val[primary_cols].copy()
 
     # CV remains on primary target only.
     cv_metrics: dict[str, float] = {}
     if run_cv:
         cv_metrics = run_purged_cv_with_pipeline(
-            X_train=X_train,
+            X_train=X_train_primary,
             y_train=pd.to_numeric(y_train_m[primary_target], errors="coerce"),
             n_splits=cv_n_splits,
             test_size=cv_test_size,
             gap_hours=cv_gap_hours,
             n_estimators=max(200, n_estimators // 2),
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            colsample_bytree=colsample_bytree,
+            max_depth=int(primary_policy["max_depth"]),
+            min_child_weight=float(primary_policy["min_child_weight"]),
+            learning_rate=float(primary_policy["learning_rate"]),
+            colsample_bytree=float(primary_policy["colsample_bytree"]),
+            reg_alpha=float(primary_policy["reg_alpha"]),
+            reg_lambda=float(primary_policy["reg_lambda"]),
+            subsample=float(primary_policy["subsample"]),
             device=resolved_device,
             seed=seed,
             horizon_hours=horizon_hours,
@@ -690,11 +728,17 @@ def train_and_evaluate(
     models_by_target: dict[str, dict[int, dict[str, object]]] = {}
     val_pred_df = pd.DataFrame(index=X_val.index)
     per_target_metrics: dict[str, dict[str, float]] = {}
+    per_target_policy: dict[str, dict[str, object]] = {}
     per_target_training_seconds: dict[str, float] = {}
     total_fit_seconds = 0.0
     primary_X_val_h = None
     primary_y_val_lead1 = None
     for idx, tgt in enumerate(target_cols):
+        target_policy = resolve_xgb_params_for_target(tgt, base_xgb_params)
+        target_variant, target_feature_cols = resolve_feature_columns_for_target(all_feature_columns, tgt)
+        X_train_t = X_train[target_feature_cols].copy()
+        X_val_t = X_val[target_feature_cols].copy()
+
         target_train_start = time.perf_counter()
         y_tr_base = pd.to_numeric(y_train_m[tgt], errors="coerce")
         y_va_base = pd.to_numeric(y_val_m[tgt], errors="coerce")
@@ -716,8 +760,8 @@ def train_and_evaluate(
 
             tr_mask = y_tr_lead.notna()
             va_mask = y_va_lead.notna()
-            X_tr_h = X_train.loc[tr_mask].copy()
-            X_va_h = X_val.loc[va_mask].copy()
+            X_tr_h = X_train_t.loc[tr_mask].copy()
+            X_va_h = X_val_t.loc[va_mask].copy()
             y_tr_h = y_tr_lead.loc[tr_mask].copy()
             y_va_h = y_va_lead.loc[va_mask].copy()
 
@@ -746,17 +790,18 @@ def train_and_evaluate(
                     objective="reg:quantileerror",
                     quantile_alpha=float(q),
                     n_estimators=n_estimators,
-                    max_depth=max_depth,
-                    learning_rate=learning_rate,
+                    max_depth=int(target_policy["max_depth"]),
+                    min_child_weight=float(target_policy["min_child_weight"]),
+                    learning_rate=float(target_policy["learning_rate"]),
                     # Use histogram algorithm explicitly for efficient GPU training.
                     tree_method="hist",
                     device=resolved_device,
-                    subsample=0.9,
-                    colsample_bytree=colsample_bytree,
-                    reg_alpha=0.0,
-                    reg_lambda=1.0,
+                    subsample=float(target_policy["subsample"]),
+                    colsample_bytree=float(target_policy["colsample_bytree"]),
+                    reg_alpha=float(target_policy["reg_alpha"]),
+                    reg_lambda=float(target_policy["reg_lambda"]),
                     random_state=seed + idx * 10_000 + lead * 100 + q_idx,
-                    early_stopping_rounds=max(0, int(early_stopping_rounds)),
+                    early_stopping_rounds=max(0, int(target_policy["early_stopping_rounds"])),
                     n_jobs=-1,
                 )
                 model.fit(X_tr_h, y_tr_h, eval_set=[(X_va_h, y_va_h)], verbose=False)
@@ -821,6 +866,20 @@ def train_and_evaluate(
             "rows_val_horizon_min": float(min(rows_val_per_lead)),
             "rows_val_horizon_max": float(max(rows_val_per_lead)),
         }
+        per_target_policy[tgt] = {
+            "feature_variant": target_variant,
+            "n_features": int(len(target_feature_cols)),
+            "xgb_params": {
+                "max_depth": int(target_policy["max_depth"]),
+                "min_child_weight": float(target_policy["min_child_weight"]),
+                "learning_rate": float(target_policy["learning_rate"]),
+                "subsample": float(target_policy["subsample"]),
+                "colsample_bytree": float(target_policy["colsample_bytree"]),
+                "reg_alpha": float(target_policy["reg_alpha"]),
+                "reg_lambda": float(target_policy["reg_lambda"]),
+                "early_stopping_rounds": int(target_policy["early_stopping_rounds"]),
+            },
+        }
         models_by_target[tgt] = lead_models
         target_elapsed = time.perf_counter() - target_train_start
         per_target_training_seconds[tgt] = float(target_elapsed)
@@ -842,10 +901,10 @@ def train_and_evaluate(
     joblib.dump(model_payload, model_out)
 
     primary_model = _unwrap_single_xgb(models_by_target[primary_target][1]["p50"])
-    _plot_top_feature_importance(primary_model, feature_names=list(X_train.columns), out_path=importance_out, top_n=20)
+    _plot_top_feature_importance(primary_model, feature_names=list(primary_cols), out_path=importance_out, top_n=20)
     importance_report = calculate_feature_importance(
         primary_model,
-        X_train,
+        X_train_primary,
         report_out=importance_report_out,
         shap_plot_out=shap_summary_out,
         seed=seed,
@@ -861,8 +920,11 @@ def train_and_evaluate(
         "target_col": primary_target,
         "target_cols": target_cols,
         "multioutput_horizon_hours": float(horizon_hours),
-        "feature_count_after_refactor": float(len(feature_columns)),
+        "feature_count_after_refactor": float(len(all_feature_columns)),
         "per_target_metrics": per_target_metrics,
+        "per_target_policy": per_target_policy,
+        "primary_feature_variant": primary_variant,
+        "primary_feature_count": float(len(primary_cols)),
         "resolved_device": resolved_device,
         "timing_training_seconds": float(total_fit_seconds),
         "timing_training_seconds_by_target": per_target_training_seconds,

@@ -806,8 +806,14 @@ def load_processed_data(
     bundle: BundleName,
     split: Literal["train", "val", "test"] = "train",
     base_dir: str | Path = "data/model_input",
+    *,
+    target_col_for_feature_routing: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load prepared X/y matrices for a given bundle and split."""
+    """Load prepared X/y matrices for a given bundle and split.
+
+    If `target_col_for_feature_routing` is provided, X is reduced to the
+    policy-selected feature variant for that target.
+    """
     base = Path(base_dir)
     cfg = json.loads((base / "feature_config.json").read_text(encoding="utf-8"))
     if bundle not in cfg["bundles"]:
@@ -817,6 +823,15 @@ def load_processed_data(
     df = pd.read_parquet(file_path)
     X = df[bcfg["features"]].copy()
     y = df[bcfg["targets"]].copy()
+    if target_col_for_feature_routing:
+        try:
+            from energy_trading.models.training_policy import resolve_feature_columns_for_target
+
+            _, routed_cols = resolve_feature_columns_for_target(list(X.columns), target_col_for_feature_routing)
+            X = X[routed_cols].copy()
+        except Exception:
+            # Keep default full-feature behavior if policy routing is unavailable.
+            pass
     return X, y
 
 
