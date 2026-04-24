@@ -22,17 +22,17 @@ The simulation enforces chronological market sequencing:
 
 1. **D-1 09:00 CET**: aFRR Capacity Gate
 2. **D-1 12:00 CET**: Day-Ahead Gate
-3. **Rolling T-25**: aFRR Activation Gate (energy bid update before delivery)
+3. **Rolling T-25 min**: aFRR Activation Gate (energy bid update before delivery)
 
 This chronological structure is implemented as a state machine that carries the
-executed physical state of charge ($SoC^{\text{exec}}$) into subsequent decisions.
+executed physical state of charge ($SoC_t$) into subsequent decisions.
 
 ### Event-Driven Replanning
 
 If a gate outcome materially invalidates the active plan (for example reserve
-capacity rejection at 09:00, or downstream execution mismatch causing a strong
+capacity rejection at 09:00 am, or downstream execution mismatch causing a strong
 SoC shock), the system triggers immediate re-optimization from the current
-snapshot state. This hard restart logic prevents stranded schedules and restores
+snapshot state. This restart logic prevents stranded schedules and restores
 causal consistency before the next gate decisions are finalized.
 
 ---
@@ -43,12 +43,32 @@ The dispatch planner is formulated as a mixed-integer linear program (MILP).
 
 ### Objective Function
 
-At high level, the optimizer maximizes expected net economic value:
+The MILP objective is **total expected profit over the horizon**, not
+activation rate or any single remuneration component in isolation.
 
-- DA margin
-- aFRR capacity remuneration
-- aFRR activation value
-- minus transaction and degradation costs
+For each interval $t$, the optimizer solves:
+
+$\max \sum_{t=1}^{T} \hat{\Pi}_t$
+
+with
+
+$\hat{\Pi}_t =
+\underbrace{P^{DA}_t\!\left(q^{sell}_{t}-q^{buy}_{t}\right)}_{\text{DA gross margin}}
++\underbrace{P^{cap,+}_t r^{+}_t + P^{cap,-}_t r^{-}_t}_{\text{aFRR capacity remuneration}}
++\underbrace{\hat{\alpha}^{+}_t P^{act,+}_t r^{+}_t - \hat{\alpha}^{-}_t P^{act,-}_t r^{-}_t}_{\text{expected activation value}}
+-\underbrace{C^{tx}_t(q^{buy}_{t}+q^{sell}_{t})}_{\text{transaction cost}}
+-\underbrace{C^{deg}_t}_{\text{degradation cost}}$
+
+Interpretation:
+
+- $\hat{\alpha}^{+}_t,\hat{\alpha}^{-}_t$ are **predicted activation rates**
+  (or expected called fractions) and enter as coefficients in expected
+  activation remuneration.
+- $P^{act,+}_t,P^{act,-}_t$ are **predicted activation prices** and also enter
+  as coefficients.
+- The optimizer compares all feasible actions per hour (DA, aFRR, or no trade)
+  and picks the decision vector that maximizes the **sum of expected net profit**
+  under battery and market constraints.
 
 ### Asymmetric Bidding
 
@@ -121,7 +141,7 @@ $\hat{y}^{naive}_t = y_{t-24}$
 
 Perfect-foresight benchmark using realized values as optimization inputs. Oracle
 uses **Oracle-Aware bidding** (extreme guaranteed-clearing bid levels, e.g.
-\(-9999\) where required) to ensure the perfect-foresight schedule is executable
+$-9999$ where required) to ensure the perfect-foresight schedule is executable
 through the same clearing pipeline. Settlement remains pay-as-cleared on true
 market prices. This defines a strict mathematical upper bound.
 
@@ -131,23 +151,32 @@ market prices. This defines a strict mathematical upper bound.
 
 ### Full PnL Identity
 
-Per interval \(t\):
+Per interval $t$:
 $\Pi_t = R^{DA}_t - C^{DA}_t + R^{cap}_t + R^{act}_t - C^{deg}_t - C^{tx}_t - C^{pen}_t$
 
 Horizon total:
 $\Pi^{raw} = \sum_{t=1}^{T} \Pi_t$
 
 Terminal mark-to-market inventory value (liquidatable grid value):
-$V^{term} = \max\!\left(0, (SoC_T - SoC_{min})\right)\cdot \eta_{out}\cdot P_{DA,T}$
+$V_{term} = \max\!\left(0, (SoC_T - SoC_{min})\right)\cdot \eta_{out}\cdot P_{DA,T}$
 
 Reported total:
-$\Pi^{total} = \Pi^{raw} + V^{term}$
+$\Pi_{total} = \Pi^{raw} + V_{term}$
 
 ### Capacity Revenue Time-Scaling
 
 If capacity prices are interpreted in €/MW/h, capacity remuneration is scaled by
-interval length \(\Delta t\):
+interval length $\Delta t$:
 $R^{cap}_t = \left(Q^{cap,+}_{t,del}\,P^{cap,+}_t + Q^{cap,-}_{t,del}\,P^{cap,-}_t\right)\Delta t$
+
+Capacity non-delivery penalties include an explicit 2.0 multiplier and a
+penalty-price floor to avoid zero-price loopholes:
+$C^{cap,pen}_t =
+2.0\cdot\left(
+M^{cap,+}_t\cdot\max(P^{cap,+}_t, 10.0) +
+M^{cap,-}_t\cdot\max(P^{cap,-}_t, 10.0)
+\right)\Delta t$
+where $M^{cap,+}_t$ and $M^{cap,-}_t$ are missed positive/negative capacity MW.
 
 ### No-Double-Counting Rule
 
@@ -159,19 +188,33 @@ double-counting of activation-related energy replacement.
 
 For working-capital analysis, the simulation uses net cashflow excluding
 non-cash degradation accounting:
-$CF^{net}_t = R^{DA}_t - C^{DA}_t + R^{cap}_t + R^{act}_t - C^{tx}_t - C^{pen}_t$
+$CF_{net,t} = R^{DA}_t - C^{DA}_t + R^{cap}_t + R^{act}_t - C^{tx}_t - C^{pen}_t$
 The cumulative cash trajectory is:
-$Cash_t = Cash_0 + \sum_{\tau=1}^{t} CF^{net}_\tau$
+$Cash_t = Cash_0 + \sum_{\tau=1}^{t} CF_{net,\tau}$
 and peak capital requirement is:
-$\text{max\_capital\_required} = \max\left(0,\,-\min_t\left(Cash_0 + \sum_{\tau=1}^{t} CF^{net}_\tau\right)\right)$
+$\text{max\_cap\_req} = \max\left(0,\,-\min_t\left(Cash_0 + \sum_{\tau=1}^{t} CF_{net,\tau}\right)\right)$
 
 ### Operational KPIs
 
 Equivalent Full Cycles (EFC):
-$\text{EFC} = \frac{\left(\sum_t E_{sent,t} + \sum_t E^{+}_{act,t}\right)/\eta_{out}}{E_{cap}}$
+$\text{EFC} = \frac{\left(\sum_t E_{sent,t} + \sum_t E_{act,t}^{+}\right)/\eta_{out}}{E_{cap}}$
 
 Return on Capital Requirement:
-$ROI_{cap} = \begin{cases} \dfrac{\Pi^{total}_{realized}}{\text{max\_capital\_required}}, & \text{if } \text{max\_capital\_required} > 0 \\ \text{undefined}, & \text{otherwise} \end{cases}$
+$ROI_{cap} = \dfrac{\Pi_{total}}{\max(1.0,\text{max\_cap\_req})}$
+
+### 6.5 Nomenclature Alignment & Code Mapping
+
+To ensure traceability between the simulation results and the thesis text, the
+following mapping is used:
+
+- $\Pi_{total}$ : `realized_total_pnl_eur`
+- $\text{max\_cap\_req}$ : `max_capital_required_eur`
+- EFC : `total_equivalent_full_cycles`
+- $SoC_t$ : `executed_soc_mwh`
+
+Note: While code variables use descriptive underscores for JSON serialization,
+this document and the main thesis text strictly adhere to the LaTeX notation
+defined in the Appendix.
 
 ---
 
