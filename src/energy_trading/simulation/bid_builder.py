@@ -133,7 +133,14 @@ class BidBuilder:
                     ts=ts,
                     side="pos",
                     quantity_mw=q_pos,
-                    capacity_price_eur_mw=(-9999.0 if is_oracle else self.pricing.capacity_price(pred=float(pred_cap_pos))),
+                    # Capacity is settled pay-as-bid: in oracle mode (pred=true),
+                    # bid at forecast/true capacity price to both clear and keep
+                    # economically consistent remuneration.
+                    capacity_price_eur_mw=(
+                        float(pred_cap_pos)
+                        if is_oracle
+                        else self.pricing.capacity_price(pred=float(pred_cap_pos))
+                    ),
                     energy_price_eur_mwh=self.pricing.energy_price(
                         side="pos",
                         pred=float(pred_act_pos),
@@ -148,7 +155,11 @@ class BidBuilder:
                     ts=ts,
                     side="neg",
                     quantity_mw=q_neg,
-                    capacity_price_eur_mw=(-9999.0 if is_oracle else self.pricing.capacity_price(pred=float(pred_cap_neg))),
+                    capacity_price_eur_mw=(
+                        float(pred_cap_neg)
+                        if is_oracle
+                        else self.pricing.capacity_price(pred=float(pred_cap_neg))
+                    ),
                     energy_price_eur_mwh=self.pricing.energy_price(
                         side="neg",
                         pred=float(pred_act_neg),

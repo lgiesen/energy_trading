@@ -439,12 +439,16 @@ class BatteryBacktester:
             s_neg = sl["rneg_bin"].start + b * n
             c[s_pos : s_pos + n] = -(rpos_coef * afrr_step)
             c[s_neg : s_neg + n] = -(rneg_coef * afrr_step)
-        # Terminal SoC opportunity value:
-        # V_terminal = SoC_T * mean(predicted_DA_price over horizon)
+        # Terminal SoC opportunity value (anti end-of-horizon dumping):
+        # Reward terminal inventory using a trailing DA reference with non-negative
+        # floor and export efficiency scaling to approximate realizable grid value.
         # scipy.milp minimizes, so we add a negative coefficient on terminal SoC.
-        da_ref = pd.Series(p_da).dropna()
-        ref_da_price = float(da_ref.mean()) if not da_ref.empty else 0.0
-        c[sl["soc"].start + n] = -ref_da_price
+        tail_k = max(1, min(6, n))
+        da_tail = pd.Series(p_da[-tail_k:], dtype="float64").dropna()
+        da_ref = da_tail if not da_tail.empty else pd.Series(p_da, dtype="float64").dropna()
+        ref_da_price = max(0.0, float(da_ref.mean()) if not da_ref.empty else 0.0)
+        terminal_soc_value_eur_per_mwh = self.eta_out * ref_da_price
+        c[sl["soc"].start + n] = -terminal_soc_value_eur_per_mwh
         if not np.isfinite(c).all():
             bad = np.where(~np.isfinite(c))[0]
             raise ValueError(
@@ -640,6 +644,8 @@ class BatteryBacktester:
         act_neg_price: float,
         act_pos_rate: float,
         act_neg_rate: float,
+        cap_bid_pos: float | None = None,
+        cap_bid_neg: float | None = None,
     ) -> tuple[float, dict[str, float]]:
         # Requested internal energies for this hour.
         act_pos_internal_req = max(0.0, act_pos_rate) * reserve_pos * self.dt_h
@@ -695,11 +701,13 @@ class BatteryBacktester:
         delivered_capacity_pos_mw = max(0.0, reserve_pos - missed_capacity_pos_mw)
         delivered_capacity_neg_mw = max(0.0, reserve_neg - missed_capacity_neg_mw)
 
-        # Capacity remuneration scaling: prices are interpreted as EUR/MW/h,
-        # therefore multiply by settlement interval duration (dt_h).
+        # Capacity remuneration must follow pay-as-bid:
+        # awarded_MW * submitted_capacity_bid_price * dt_h.
+        cap_pos_settlement = float(cap_pos if cap_bid_pos is None else cap_bid_pos)
+        cap_neg_settlement = float(cap_neg if cap_bid_neg is None else cap_bid_neg)
         rev_cap = (
-            delivered_capacity_pos_mw * cap_pos * self.dt_h
-            + delivered_capacity_neg_mw * cap_neg * self.dt_h
+            delivered_capacity_pos_mw * cap_pos_settlement * self.dt_h
+            + delivered_capacity_neg_mw * cap_neg_settlement * self.dt_h
         )
 
         # Activation revenue is paid on delivered activation energy. We still avoid
@@ -716,9 +724,12 @@ class BatteryBacktester:
         degr_cost = self.deg_eur_mwh * (ch_internal + dis_internal + act_pos_internal + act_neg_internal)
 
         penalty_activation_eur = missed_activation_mwh * self.imbalance_penalty_eur_mwh
+        # Capacity non-delivery penalties must remain binding even in zero-price
+        # clearing hours. Apply a strict €/MW/h floor before the 2.0 multiplier.
+        cap_penalty_price_floor_eur_mw_h = 10.0
         penalty_capacity_eur = 2.0 * (
-            missed_capacity_pos_mw * max(0.0, cap_pos) * self.dt_h
-            + missed_capacity_neg_mw * max(0.0, cap_neg) * self.dt_h
+            missed_capacity_pos_mw * max(cap_penalty_price_floor_eur_mw_h, float(cap_pos)) * self.dt_h
+            + missed_capacity_neg_mw * max(cap_penalty_price_floor_eur_mw_h, float(cap_neg)) * self.dt_h
         )
         penalty_eur = penalty_activation_eur + penalty_capacity_eur
 
@@ -931,10 +942,46 @@ class BatteryBacktester:
             true_rate_pos=float(true_rate_pos),
             true_rate_neg=float(true_rate_neg),
         )
+        # Pay-as-bid settlement price for awarded capacity (weighted by awarded MW).
+        def _weighted_awarded_bid_price(
+            *,
+            side: str,
+            awarded_mw: float,
+            true_cap_price: float,
+        ) -> float:
+            aw = max(0.0, float(awarded_mw))
+            if aw <= 1e-12:
+                return 0.0
+            side_bids = [b for b in cap_bids if b.side == side and float(b.quantity_mw) > 0.0]
+            if not side_bids:
+                return 0.0
+            accepted = [
+                b for b in side_bids if float(b.capacity_price_eur_mw) <= float(true_cap_price) + 1e-12
+            ]
+            accepted_qty = float(sum(float(b.quantity_mw) for b in accepted))
+            if accepted_qty + 1e-12 >= aw and accepted_qty > 1e-12:
+                num = float(sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in accepted))
+                return float(num / max(accepted_qty, 1e-12))
+            # Fallback for forced obligation awards (already-awarded lockbooks):
+            # settle with submitted bid price of the obligated bids.
+            sub_qty = float(sum(float(b.quantity_mw) for b in side_bids))
+            num = float(sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in side_bids))
+            return float(num / max(sub_qty, 1e-12))
+
         ch_exec = float(da_res.executed_buy_mw)
         dis_exec = float(da_res.executed_sell_mw)
         res_pos_exec = float(cap_res.awarded_pos_mw)
         res_neg_exec = float(cap_res.awarded_neg_mw)
+        cap_bid_pos_settlement = _weighted_awarded_bid_price(
+            side="pos",
+            awarded_mw=res_pos_exec,
+            true_cap_price=float(true_cap_pos),
+        )
+        cap_bid_neg_settlement = _weighted_awarded_bid_price(
+            side="neg",
+            awarded_mw=res_neg_exec,
+            true_cap_price=float(true_cap_neg),
+        )
         rate_pos_exec = float(act_res.executed_rate_pos)
         rate_neg_exec = float(act_res.executed_rate_neg)
         da_buy_accepted = bool(da_res.buy_accepted)
@@ -963,6 +1010,8 @@ class BatteryBacktester:
             "executed_discharge_mw": dis_exec,
             "executed_reserve_pos_mw": res_pos_exec,
             "executed_reserve_neg_mw": res_neg_exec,
+            "settlement_cap_bid_price_pos_eur_mw": float(cap_bid_pos_settlement),
+            "settlement_cap_bid_price_neg_eur_mw": float(cap_bid_neg_settlement),
             "executed_rate_pos": rate_pos_exec,
             "executed_rate_neg": rate_neg_exec,
             "da_buy_accepted": float(da_buy_accepted),
@@ -1299,10 +1348,15 @@ class BatteryBacktester:
                 w_end = min(n, i + horizon_hours)
                 window = df.iloc[i:w_end].copy()
 
-            # Keep terminal equality soft in rolling mode, but optionally enforce
-            # a minimum final SoC for the very last optimization window.
+            # Terminal SoC floor policy:
+            # - Intermediate rolling windows: only enforce physical minimum SoC.
+            # - Final global window: enforce configured terminal target SoC.
+            # Terminal valuation in objective governs economic carry-over behavior.
             enforce_end = None
-            enforce_end_min = self.soc_target_end if (enforce_final_soc_min and w_end == n) else None
+            if enforce_final_soc_min:
+                enforce_end_min = self.soc_target_end if (w_end == n) else self.soc_min
+            else:
+                enforce_end_min = None
             optimization_fallback = "none"
             optimization_error = ""
             try:
@@ -1668,6 +1722,8 @@ class BatteryBacktester:
             "executed_discharge_mw",
             "executed_reserve_pos_mw",
             "executed_reserve_neg_mw",
+            "settlement_cap_bid_price_pos_eur_mw",
+            "settlement_cap_bid_price_neg_eur_mw",
             "executed_rate_pos",
             "executed_rate_neg",
             "da_buy_accepted",
@@ -1795,6 +1851,16 @@ class BatteryBacktester:
                     rate_neg = float(cleared["executed_rate_neg"])
                     clearing_rec = cleared
 
+            cap_bid_pos_settlement = (
+                float(clearing_rec.get("settlement_cap_bid_price_pos_eur_mw"))
+                if "settlement_cap_bid_price_pos_eur_mw" in clearing_rec
+                else None
+            )
+            cap_bid_neg_settlement = (
+                float(clearing_rec.get("settlement_cap_bid_price_neg_eur_mw"))
+                if "settlement_cap_bid_price_neg_eur_mw" in clearing_rec
+                else None
+            )
             soc, m = self._settle_one_hour(
                 soc=soc,
                 charge=charge,
@@ -1808,6 +1874,8 @@ class BatteryBacktester:
                 act_neg_price=float(getattr(r, act_neg_col)),
                 act_pos_rate=rate_pos,
                 act_neg_rate=rate_neg,
+                cap_bid_pos=cap_bid_pos_settlement,
+                cap_bid_neg=cap_bid_neg_settlement,
             )
             rec = {colmap.timestamp: ts, **m, **clearing_rec}
             rows.append(rec)
@@ -1826,6 +1894,8 @@ class BatteryBacktester:
             "executed_discharge_mw",
             "executed_reserve_pos_mw",
             "executed_reserve_neg_mw",
+            "settlement_cap_bid_price_pos_eur_mw",
+            "settlement_cap_bid_price_neg_eur_mw",
             "executed_rate_pos",
             "executed_rate_neg",
             "da_buy_accepted",
@@ -1939,7 +2009,10 @@ class BatteryBacktester:
                 fallback_cols=[colmap.pred_da_price],
                 default=0.0,
             )
-            terminal_price_local = float(da_true_last_local.iloc[-1]) if len(da_true_last_local) else 0.0
+            terminal_price_local = max(
+                0.0,
+                float(da_true_last_local.iloc[-1]) if len(da_true_last_local) else 0.0,
+            )
             terminal_value_local = max(0.0, final_soc - self.soc_min) * self.eta_out * terminal_price_local
             return float(pnl_excl + terminal_value_local), True
 
@@ -2176,8 +2249,14 @@ class BatteryBacktester:
             fallback_cols=[colmap.pred_da_price],
             default=0.0,
         )
-        terminal_price_pred_eur_mwh = float(da_pred_last.iloc[-1]) if len(da_pred_last) else 0.0
-        terminal_price_true_eur_mwh = float(da_true_last.iloc[-1]) if len(da_true_last) else 0.0
+        terminal_price_pred_eur_mwh = max(
+            0.0,
+            float(da_pred_last.iloc[-1]) if len(da_pred_last) else 0.0,
+        )
+        terminal_price_true_eur_mwh = max(
+            0.0,
+            float(da_true_last.iloc[-1]) if len(da_true_last) else 0.0,
+        )
 
         liquidatable_pred_mwh = max(0.0, final_pred_soc_mwh - self.soc_min) * self.eta_out
         liquidatable_real_mwh = max(0.0, final_real_soc_mwh - self.soc_min) * self.eta_out
@@ -2330,13 +2409,9 @@ class BatteryBacktester:
             awarded_afrr_mw += float(hourly["real_executed_reserve_neg_mw"].sum())
         summary["afrr_capacity_award_rate"] = float(awarded_afrr_mw / submitted_afrr_mw) if submitted_afrr_mw > 1e-12 else float("nan")
         summary["total_missed_activation_mwh"] = float(hourly["real_missed_activation_mwh"].sum()) if "real_missed_activation_mwh" in hourly.columns else 0.0
-        if summary["max_capital_required_eur"] > 1e-6:
-            summary["roi_on_max_capital"] = float(
-                summary["realized_total_pnl_eur"] / summary["max_capital_required_eur"]
-            )
-        else:
-            # Undefined/infinite ROI case when no external working capital is required.
-            summary["roi_on_max_capital"] = 0.0
+        # Keep ROI numerically stable by flooring denominator at 1 EUR.
+        roi_denom = max(1.0, float(summary["max_capital_required_eur"]))
+        summary["roi_on_max_capital"] = float(summary["realized_total_pnl_eur"] / roi_denom)
         summary["oracle_upper_bound_ok"] = float(summary["oracle_total_pnl_eur"] >= summary["realized_total_pnl_eur"] - 1e-9)
         if "shock_source" in hourly.columns:
             ss = hourly["shock_source"].fillna("none").astype(str)
