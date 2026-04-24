@@ -3,7 +3,7 @@
 # --- MODEL / TIME CONVENTIONS ---
 MODEL_SPECS = {
     "time_step_hours": 1.0,  # Optimization time step (Delta t): 1h
-    "reserve_product_duration_h": 1.0,  # Duration used for activation-energy bounds
+    "reserve_product_duration_h": 4.0,  # Duration used for activation-energy bounds
     "market_scope": "DE_LU",  # Sign/settlement convention scope
 }
 MODEL_SPECS["optimization_step_min"] = int(MODEL_SPECS["time_step_hours"] * 60)
