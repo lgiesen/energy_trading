@@ -17,6 +17,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from collections.abc import Callable
 from pathlib import Path
 
@@ -33,6 +34,227 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from energy_trading.models.prepare_ml_bundles import BundleName, load_processed_data
+
+
+def _pick_scalar_tag(tags: list[str], patterns: list[str]) -> str | None:
+    """Pick the first scalar tag matching any regex pattern (case-insensitive)."""
+    if not tags:
+        return None
+    for pat in patterns:
+        rx = re.compile(pat, re.IGNORECASE)
+        for t in tags:
+            if rx.search(t):
+                return t
+    return None
+
+
+def _series_from_events(events: list) -> tuple[list[int], list[float]]:
+    """Convert EventAccumulator scalar events to plain step/value arrays."""
+    steps = [int(e.step) for e in events]
+    vals = [float(e.value) for e in events]
+    return steps, vals
+
+
+def _training_status(
+    train_vals: list[float],
+    val_vals: list[float],
+    *,
+    min_points: int = 8,
+) -> str:
+    """
+    Heuristic training-status classification:
+    - Converged
+    - Overfitting Detected
+    - Underfitting Suspected
+    - Unstable
+    """
+    if len(val_vals) < min_points or len(train_vals) < min_points:
+        return "Insufficient Data"
+
+    train_final = train_vals[-1]
+    val_final = val_vals[-1]
+    val_best = min(val_vals)
+    best_idx = int(np.argmin(val_vals))
+    tail = max(3, int(0.2 * len(val_vals)))
+    val_tail = val_vals[-tail:]
+
+    # Overfitting: validation clearly degrades after best epoch while train still improves.
+    if best_idx < len(val_vals) - 3 and val_final > (val_best * 1.05):
+        if train_final <= min(train_vals[max(0, best_idx - 1) :]):
+            return "Overfitting Detected"
+
+    # Underfitting: both losses stay high and almost flat in tail.
+    val_range = float(np.max(val_tail) - np.min(val_tail))
+    if val_range <= max(1e-8, 0.01 * max(abs(val_final), 1.0)):
+        if val_final > train_final * 0.95:
+            return "Underfitting Suspected"
+
+    # Unstable: large oscillations in validation tail.
+    if len(val_tail) >= 4:
+        diffs = np.diff(np.asarray(val_tail, dtype=float))
+        if float(np.std(diffs)) > max(1e-8, 0.05 * max(abs(val_final), 1.0)):
+            return "Unstable"
+
+    return "Converged"
+
+
+def audit_training_logs(log_dir: str | Path) -> dict[str, dict[str, object]]:
+    """
+    Audit TensorBoard scalar logs for each run directory.
+
+    Returns JSON-ready dict keyed by run-name with fields:
+        final_train_loss, final_val_loss, best_epoch, total_epochs, status
+    """
+    try:
+        from tensorboard.backend.event_processing import event_accumulator
+    except ModuleNotFoundError as exc:
+        return {
+            "_meta": {
+                "log_dir": str(Path(log_dir).resolve()),
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status": "Dependency Missing",
+                "message": f"tensorboard not installed: {exc}",
+            }
+        }
+
+    root = Path(log_dir)
+    if not root.exists():
+        return {
+            "_meta": {
+                "log_dir": str(root.resolve()),
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status": "Missing Directory",
+                "message": f"log_dir not found: {root}",
+            }
+        }
+
+    out: dict[str, dict[str, object]] = {}
+    size_guidance = {"scalars": 0}
+
+    for run_root in sorted([p for p in root.iterdir() if p.is_dir()]):
+        run_key = run_root.name
+        target_rows: list[dict[str, object]] = []
+
+        # Typical structure: run_root/<target_dir>/events.out.tfevents...
+        target_dirs = sorted([p for p in run_root.iterdir() if p.is_dir()])
+        if not target_dirs:
+            # Fallback: run_root itself might contain event files.
+            target_dirs = [run_root]
+
+        for tdir in target_dirs:
+            event_files = sorted(tdir.glob("events.out.tfevents.*"))
+            if not event_files:
+                continue
+
+            ea = event_accumulator.EventAccumulator(str(tdir), size_guidance=size_guidance)
+            try:
+                ea.Reload()
+            except Exception as exc:  # pragma: no cover - defensive parser guard
+                target_rows.append(
+                    {
+                        "target": tdir.name,
+                        "status": "Parse Error",
+                        "message": str(exc),
+                    }
+                )
+                continue
+
+            scalar_tags = ea.Tags().get("scalars", [])
+            train_tag = _pick_scalar_tag(
+                scalar_tags,
+                patterns=[
+                    r"train.*loss.*epoch",
+                    r"train.*loss",
+                    r"loss/train",
+                    r"train_loss",
+                ],
+            )
+            val_tag = _pick_scalar_tag(
+                scalar_tags,
+                patterns=[
+                    r"val.*loss.*epoch",
+                    r"valid.*loss",
+                    r"loss/val",
+                    r"val_loss",
+                ],
+            )
+
+            if not train_tag or not val_tag:
+                target_rows.append(
+                    {
+                        "target": tdir.name,
+                        "status": "Missing Loss Scalars",
+                        "train_tag": train_tag,
+                        "val_tag": val_tag,
+                        "available_tags": scalar_tags,
+                    }
+                )
+                continue
+
+            train_steps, train_vals = _series_from_events(ea.Scalars(train_tag))
+            val_steps, val_vals = _series_from_events(ea.Scalars(val_tag))
+            if not train_vals or not val_vals:
+                target_rows.append(
+                    {
+                        "target": tdir.name,
+                        "status": "Missing Loss Values",
+                        "train_tag": train_tag,
+                        "val_tag": val_tag,
+                    }
+                )
+                continue
+
+            best_idx = int(np.argmin(np.asarray(val_vals, dtype=float)))
+            best_epoch = int(val_steps[best_idx]) if best_idx < len(val_steps) else best_idx
+            total_epochs = int(max(train_steps[-1] if train_steps else 0, val_steps[-1] if val_steps else 0) + 1)
+            status = _training_status(train_vals, val_vals)
+
+            target_rows.append(
+                {
+                    "target": tdir.name,
+                    "train_loss_tag": train_tag,
+                    "val_loss_tag": val_tag,
+                    "final_train_loss": float(train_vals[-1]),
+                    "final_val_loss": float(val_vals[-1]),
+                    "best_epoch": best_epoch,
+                    "total_epochs": total_epochs,
+                    "status": status,
+                }
+            )
+
+        # Aggregate run-level status from targets.
+        statuses = [str(r.get("status", "")) for r in target_rows if "status" in r]
+        if any(s == "Overfitting Detected" for s in statuses):
+            run_status = "Overfitting Detected"
+        elif any(s == "Unstable" for s in statuses):
+            run_status = "Unstable"
+        elif any(s == "Converged" for s in statuses):
+            run_status = "Converged"
+        elif target_rows:
+            run_status = statuses[0]
+        else:
+            run_status = "No Event Files Found"
+
+        final_train = [float(r["final_train_loss"]) for r in target_rows if "final_train_loss" in r]
+        final_val = [float(r["final_val_loss"]) for r in target_rows if "final_val_loss" in r]
+        best_epochs = [int(r["best_epoch"]) for r in target_rows if "best_epoch" in r]
+        total_epochs = [int(r["total_epochs"]) for r in target_rows if "total_epochs" in r]
+
+        out[run_key] = {
+            "final_train_loss": float(np.mean(final_train)) if final_train else None,
+            "final_val_loss": float(np.mean(final_val)) if final_val else None,
+            "best_epoch": int(np.median(best_epochs)) if best_epochs else None,
+            "total_epochs": int(np.max(total_epochs)) if total_epochs else 0,
+            "status": run_status,
+            "targets": target_rows,
+        }
+
+    out["_meta"] = {
+        "log_dir": str(root.resolve()),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "n_runs": int(sum(1 for k in out if k != "_meta")),
+    }
+    return out
 
 
 def _resolve_target(bundle: BundleName, requested: str | None, y_cols: list[str]) -> str:
@@ -250,6 +472,8 @@ def main() -> None:
     p.add_argument("--max-depth", type=int, default=6)
     p.add_argument("--learning-rate", type=float, default=0.05)
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    p.add_argument("--tb-log-dir", default=None, help="Optional TensorBoard log root (e.g. artifacts/tensorboard_logs).")
+    p.add_argument("--tb-audit-json", default=None, help="Optional output path for TensorBoard audit JSON.")
     args = p.parse_args()
 
     base_dir = Path(args.base_dir)
@@ -455,6 +679,15 @@ def main() -> None:
         json.dumps(aggregate_df.to_dict(orient="records"), indent=2),
         encoding="utf-8",
     )
+
+    # Optional training-curve audit from TensorBoard logs.
+    if args.tb_log_dir:
+        tb_audit = audit_training_logs(args.tb_log_dir)
+        tb_out = Path(args.tb_audit_json) if args.tb_audit_json else (out_dir / "training_log_audit.json")
+        tb_out.parent.mkdir(parents=True, exist_ok=True)
+        tb_out.write_text(json.dumps(tb_audit, indent=2), encoding="utf-8")
+        print(f"[OK] Training-log audit written to: {tb_out}")
+
     print(f"[OK] Model audit completed for {len(targets)} target(s). Outputs in: {out_dir}")
 
 
