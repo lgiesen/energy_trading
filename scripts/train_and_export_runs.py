@@ -1,8 +1,9 @@
-"""Train DA + aFRR XGBoost models and export a versioned run artifact."""
+"""Train DA + aFRR models and export a versioned run artifact."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import platform
 import shlex
@@ -113,12 +114,63 @@ def _resolve_available_afrr_targets(base_dir: str | Path) -> list[str]:
     return preferred if preferred else available
 
 
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _bundle_input_checksums(base_dir: str | Path) -> dict[str, object]:
+    """Compute checksums for feature_config and referenced split files."""
+    root = Path(base_dir)
+    out: dict[str, object] = {
+        "base_dir": str(root.resolve()),
+        "feature_config_path": str((root / "feature_config.json").resolve()),
+        "feature_config_sha256": None,
+        "bundles": {},
+        "missing_files": [],
+    }
+    cfg_path = root / "feature_config.json"
+    if not cfg_path.exists():
+        out["missing_files"] = [str(cfg_path.resolve())]
+        return out
+
+    out["feature_config_sha256"] = _sha256_file(cfg_path)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    bundles = cfg.get("bundles", {})
+
+    for bundle_name, bcfg in bundles.items():
+        files = bcfg.get("files", {}) or {}
+        bundle_rec: dict[str, object] = {"files": {}}
+        for split_name, split_path_raw in files.items():
+            split_path = Path(split_path_raw)
+            rec = {
+                "path": str(split_path.resolve()),
+                "exists": split_path.exists(),
+                "sha256": None,
+                "size_bytes": None,
+            }
+            if split_path.exists():
+                rec["sha256"] = _sha256_file(split_path)
+                rec["size_bytes"] = int(split_path.stat().st_size)
+            else:
+                out["missing_files"].append(str(split_path.resolve()))
+            bundle_rec["files"][split_name] = rec
+        out["bundles"][bundle_name] = bundle_rec
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train and export DA+aFRR model run artifacts.")
     p.add_argument("--base-dir", default="data/model_input")
     p.add_argument("--run-root", default="artifacts/model_runs")
     p.add_argument("--run-id", default="")
-    p.add_argument("--model-type", choices=["xgboost", "tft"], default="xgboost")
+    p.add_argument("--model-type", choices=["xgboost", "tft", "linear"], default="xgboost")
     p.add_argument("--device", choices=["cuda", "cpu", "mps"], default="mps")
     p.add_argument("--model-name", default="")
     p.add_argument("--allow-cpu", action="store_true")
@@ -156,6 +208,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.model_type == "tft" and args.enable_da_stacking_afrr:
+        raise ValueError("--enable-da-stacking-afrr is only supported for model-type=xgboost.")
+    if args.model_type == "linear" and args.enable_da_stacking_afrr:
         raise ValueError("--enable-da-stacking-afrr is only supported for model-type=xgboost.")
     run_id = args.run_id.strip() or _run_id_now()
     run_dir = Path(args.run_root) / run_id
@@ -226,7 +280,7 @@ def main() -> None:
         ]
         if args.allow_cpu:
             base_cmd.append("--allow-cpu")
-    else:
+    elif args.model_type == "tft":
         model_name = args.model_name.strip() or "tft_v1"
         base_cmd = [
             sys.executable,
@@ -249,6 +303,21 @@ def main() -> None:
         ]
         if args.cleanup_lightning_checkpoints:
             base_cmd.append("--cleanup-lightning-checkpoints")
+    else:
+        model_name = args.model_name.strip() or "linear_ridge_v1"
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "src.energy_trading.models.train_linear_export",
+            "--model-name",
+            model_name,
+            "--run-dir",
+            str(run_dir),
+            "--alpha",
+            "1.0",
+            "--seed",
+            str(args.seed),
+        ]
 
     # Train DA model.
     cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]
@@ -359,12 +428,17 @@ def main() -> None:
         "resolved": {
             "run_root": str(Path(args.run_root).resolve()),
             "run_dir": str(run_dir.resolve()),
+            "base_dir": str(Path(args.base_dir).resolve()),
             "afrr_base_dir": str(Path(afrr_base_dir).resolve()),
             "model_type": args.model_type,
             "model_name": model_name,
             "available_afrr_targets": afrr_targets,
             "skipped_afrr_targets": skipped,
             "target_policy_source": "energy_trading.models.training_policy",
+        },
+        "input_checksums": {
+            "da_base_dir": _bundle_input_checksums(args.base_dir),
+            "afrr_base_dir": _bundle_input_checksums(afrr_base_dir),
         },
         "executed_commands": cmd_records,
     }

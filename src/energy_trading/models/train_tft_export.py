@@ -33,6 +33,15 @@ from energy_trading.models.training_policy import (
     resolve_feature_columns_for_target,
     resolve_tft_params_for_target,
 )
+from energy_trading.evaluation.metrics import (
+    compute_forecast_metrics,
+    compute_gate_closure_metrics,
+    gate_hour_for_target,
+)
+from energy_trading.evaluation.tensorboard_utils import (
+    tensorboard_log_root,
+    tensorboard_target_version,
+)
 
 
 CALENDAR_FEATURES = {
@@ -56,7 +65,7 @@ VOLATILE_VOLUME_FEATURES = {
 }
 TFT_CLIP_MIN = -5.0
 TFT_CLIP_MAX = 5.0
-QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+QUANTILES: list[float] = [0.1, 0.5, 0.9, 0.95]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -303,6 +312,17 @@ def _build_long_prediction_table(
             ]
         )
     out = out.sort_values(["snapshot_time_utc", "lead_time_h", "target_time_utc"]).reset_index(drop=True)
+    return out
+
+
+def _clip_activation_rate_predictions(df: pd.DataFrame) -> pd.DataFrame:
+    """Clip activation-rate prediction columns to [0, 1] in long-format output."""
+    if df.empty:
+        return df
+    out = df.copy()
+    for c in ("predicted_value", "p10", "p50", "p90", "p95"):
+        if c in out.columns:
+            out[c] = np.clip(pd.to_numeric(out[c], errors="coerce").to_numpy(dtype=float), 0.0, 1.0)
     return out
 
 
@@ -782,18 +802,36 @@ def _train_tft(
 
     base_tft_params = {
         "dropout": 0.1,
-        "early_stopping_patience": 15.0,
+        "early_stopping_patience": 10.0,
         "max_epochs": 100.0,
     }
     target_tft_params = resolve_tft_params_for_target(tgt, base_tft_params)
     max_epochs = int(target_tft_params["max_epochs"])
     early_stopping_patience = int(target_tft_params["early_stopping_patience"])
     dropout = float(target_tft_params["dropout"])
-    tb_root = REPO_ROOT / "artifacts" / "tensorboard_logs"
+
+    # Asymmetric regularization by target family:
+    # - DA targets: higher capacity, light regularization.
+    # - aFRR targets: constrained capacity, stronger regularization.
+    is_afrr_target = "afrr" in tgt.lower()
+    if is_afrr_target:
+        hidden_size = 32
+        effective_dropout = min(0.30, max(0.25, dropout))
+        early_stopping_patience = min(4, max(3, early_stopping_patience))
+    else:
+        hidden_size = 96
+        effective_dropout = 0.10
+        early_stopping_patience = min(10, max(8, early_stopping_patience))
+    tb_root = tensorboard_log_root()
+    tb_version = tensorboard_target_version(
+        model_family="tft",
+        bundle=bundle,
+        target_col=tgt,
+    )
     tb_logger = TensorBoardLogger(
         save_dir=str(tb_root),
         name=run_dir.name,
-        version=f"{bundle}_{tgt}",
+        version=tb_version,
     )
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(model_dir),
@@ -808,7 +846,7 @@ def _train_tft(
         mode="min",
         patience=early_stopping_patience,
         min_delta=0.0,
-        strict=False,
+        strict=True,
     )
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -823,9 +861,9 @@ def _train_tft(
     tft = TemporalFusionTransformer.from_dataset(
         training,
         learning_rate=1e-3,
-        hidden_size=64,
+        hidden_size=hidden_size,
         attention_head_size=8,
-        dropout=dropout,
+        dropout=effective_dropout,
         hidden_continuous_size=16,
         loss=QuantileLoss(quantiles=QUANTILES),
         output_size=len(QUANTILES),
@@ -839,12 +877,14 @@ def _train_tft(
 
     model_path = model_dir / f"{bundle}_{tgt}_tft_export_model.ckpt"
     best_model_path = checkpoint_cb.best_model_path
-    if best_model_path:
-        shutil.copy2(best_model_path, model_path)
-        tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
-        tft.to(torch_device)
-    else:
-        trainer.save_checkpoint(str(model_path))
+    if not best_model_path:
+        raise RuntimeError(
+            "ModelCheckpoint did not produce a best checkpoint. "
+            "Cannot continue without explicit best-weight restoration."
+        )
+    shutil.copy2(best_model_path, model_path)
+    tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+    tft.to(torch_device)
 
     if cleanup_lightning_checkpoints:
         # Lightning writes extra checkpoint files to ./checkpoints by default.
@@ -903,6 +943,10 @@ def _train_tft(
     pred_test_long = _predict(testing)
     pred_test_seconds = time.perf_counter() - pred_test_start
 
+    if tgt in {"target_afrr_activation_rate_pos", "target_afrr_activation_rate_neg"}:
+        pred_val_long = _clip_activation_rate_predictions(pred_val_long)
+        pred_test_long = _clip_activation_rate_predictions(pred_test_long)
+
     export_start = time.perf_counter()
     interpretation_artifacts = _save_tft_interpretation_artifacts(
         tft_model=tft,
@@ -921,8 +965,26 @@ def _train_tft(
 
     # Lead-1 wide export for existing runner/backtester path.
     def _to_wide_lead1(df_long: pd.DataFrame) -> pd.DataFrame:
-        d = df_long.loc[df_long["lead_time_h"] == 1, ["target_time_utc", "predicted_value"]].copy()
-        d = d.rename(columns={"target_time_utc": "timestamp_utc", "predicted_value": pred_col})
+        base_cols = ["target_time_utc"]
+        if "p50" in df_long.columns:
+            base_cols.append("p50")
+        elif "predicted_value" in df_long.columns:
+            base_cols.append("predicted_value")
+        for q_col in ("p90", "p95"):
+            if q_col in df_long.columns:
+                base_cols.append(q_col)
+
+        d = df_long.loc[df_long["lead_time_h"] == 1, base_cols].copy()
+        rename_map = {"target_time_utc": "timestamp_utc"}
+        if "p50" in d.columns:
+            rename_map["p50"] = pred_col
+        elif "predicted_value" in d.columns:
+            rename_map["predicted_value"] = pred_col
+        if "p90" in d.columns:
+            rename_map["p90"] = f"{pred_col}_p90"
+        if "p95" in d.columns:
+            rename_map["p95"] = f"{pred_col}_p95"
+        d = d.rename(columns=rename_map)
         d = d.sort_values("timestamp_utc").drop_duplicates(subset=["timestamp_utc"])
         return d
 
@@ -935,6 +997,53 @@ def _train_tft(
 
     y_val_true = pd.to_numeric(val_df[tgt], errors="coerce").reset_index(drop=True)
     y_test_true = pd.to_numeric(test_df[tgt], errors="coerce").reset_index(drop=True)
+
+    def _h1_metric_suite(pred_long: pd.DataFrame, y_true_h1: pd.Series) -> dict[str, object]:
+        if pred_long.empty:
+            return {}
+        cols = ["lead_time_h"]
+        for c in ("predicted_value", "p10", "p50", "p90", "p95"):
+            if c in pred_long.columns:
+                cols.append(c)
+        h1 = pred_long.loc[pred_long["lead_time_h"] == 1, cols].copy()
+        if h1.empty:
+            return {}
+        metric_df = pd.DataFrame(
+            {
+                "y_true": pd.to_numeric(y_true_h1, errors="coerce").iloc[: len(h1)].to_numpy(dtype=float),
+                "y_pred": pd.to_numeric(
+                    h1["p50"] if "p50" in h1.columns else h1["predicted_value"], errors="coerce"
+                ).to_numpy(dtype=float),
+            }
+        )
+        for q in ("p10", "p50", "p90", "p95"):
+            if q in h1.columns:
+                metric_df[f"y_pred_{q}"] = pd.to_numeric(h1[q], errors="coerce").to_numpy(dtype=float)
+        return compute_forecast_metrics(metric_df, y_true_col="y_true", y_pred_col="y_pred")
+
+    val_metric_suite_h1 = _h1_metric_suite(pred_val_long, y_val_true)
+    test_metric_suite_h1 = _h1_metric_suite(pred_test_long, y_test_true)
+    gate_hour = gate_hour_for_target(tgt)
+    val_gate_metrics: dict[str, object] = {}
+    test_gate_metrics: dict[str, object] = {}
+    if gate_hour is not None:
+        val_gate_metrics = compute_gate_closure_metrics(
+            pred_val_long,
+            truth_df=val_df[["timestamp_utc", tgt]].copy(),
+            y_true_col=tgt,
+            y_pred_col="p50" if "p50" in pred_val_long.columns else "predicted_value",
+            gate_hour_local=gate_hour,
+            timezone="Europe/Berlin",
+        )
+        test_gate_metrics = compute_gate_closure_metrics(
+            pred_test_long,
+            truth_df=test_df[["timestamp_utc", tgt]].copy(),
+            y_true_col=tgt,
+            y_pred_col="p50" if "p50" in pred_test_long.columns else "predicted_value",
+            gate_hour_local=gate_hour,
+            timezone="Europe/Berlin",
+        )
+
     decay_val = _leadtime_mae(pred_val_long, true_h1=y_val_true, horizon_hours=max_prediction_length)
     decay_test = _leadtime_mae(pred_test_long, true_h1=y_test_true, horizon_hours=max_prediction_length)
     decay_val_path = report_dir / f"{bundle}_{tgt}_val_forecast_decay.csv"
@@ -997,6 +1106,25 @@ def _train_tft(
         "leadtime_mae_test_h48": mae_test_h_last if h_last == 48 else float("nan"),
         "leadtime_rmse_val_h48": rmse_val_h_last if h_last == 48 else float("nan"),
         "leadtime_rmse_test_h48": rmse_test_h_last if h_last == 48 else float("nan"),
+        "val_metric_suite_h1": val_metric_suite_h1,
+        "test_metric_suite_h1": test_metric_suite_h1,
+        "wmape_val_h1": val_metric_suite_h1.get("wmape"),
+        "wmape_test_h1": test_metric_suite_h1.get("wmape"),
+        "directional_accuracy_val_h1": val_metric_suite_h1.get("directional_accuracy"),
+        "directional_accuracy_test_h1": test_metric_suite_h1.get("directional_accuracy"),
+        "pinball_loss_p10_val_h1": val_metric_suite_h1.get("pinball_loss_p10"),
+        "pinball_loss_p50_val_h1": val_metric_suite_h1.get("pinball_loss_p50"),
+        "pinball_loss_p90_val_h1": val_metric_suite_h1.get("pinball_loss_p90"),
+        "pinball_loss_p95_val_h1": val_metric_suite_h1.get("pinball_loss_p95"),
+        "picp_80_val_h1": val_metric_suite_h1.get("picp_80"),
+        "pinball_loss_p10_test_h1": test_metric_suite_h1.get("pinball_loss_p10"),
+        "pinball_loss_p50_test_h1": test_metric_suite_h1.get("pinball_loss_p50"),
+        "pinball_loss_p90_test_h1": test_metric_suite_h1.get("pinball_loss_p90"),
+        "pinball_loss_p95_test_h1": test_metric_suite_h1.get("pinball_loss_p95"),
+        "picp_80_test_h1": test_metric_suite_h1.get("picp_80"),
+        "gate_closure_hour_local": gate_hour,
+        "gate_closure_metrics_val": val_gate_metrics,
+        "gate_closure_metrics_test": test_gate_metrics,
         "model_path": str(model_path.resolve()),
         "best_checkpoint_path": str(Path(best_model_path).resolve()) if best_model_path else str(model_path.resolve()),
         "stopped_epoch": int(trainer.current_epoch),
@@ -1004,13 +1132,14 @@ def _train_tft(
         "early_stopping_patience": int(early_stopping_patience),
         "restore_best_weights_equivalent": True,
         "target_tft_params": {
-            "dropout": dropout,
+            "dropout": effective_dropout,
             "max_epochs": int(max_epochs),
             "early_stopping_patience": int(early_stopping_patience),
+            "is_afrr_target": bool(is_afrr_target),
         },
-        "hidden_size": 64,
+        "hidden_size": hidden_size,
         "attention_head_size": 8,
-        "dropout": dropout,
+        "dropout": effective_dropout,
         "tensorboard_log_dir": str(Path(tb_logger.log_dir).resolve()),
         "attention_plot_path": interpretation_artifacts.get("attention_plot_path"),
         "attention_history_plot_path": interpretation_artifacts.get("attention_history_plot_path"),

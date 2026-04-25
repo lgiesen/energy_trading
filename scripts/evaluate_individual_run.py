@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,17 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from energy_trading.evaluation.metrics import (  # noqa: E402
+    compute_forecast_metrics,
+    compute_gate_closure_metrics,
+    gate_hour_for_target,
+)
+from energy_trading.visualization.style import apply_geo_style, get_color  # noqa: E402
 
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 QCOLS: list[str] = [f"p{int(round(q * 100)):02d}" for q in QUANTILES]
@@ -46,7 +58,8 @@ PRED_TO_TRUE = {
 
 def _configure_plot_style() -> None:
     plt.style.use("seaborn-v0_8-paper")
-    sns.set_palette("colorblind")
+    sns.set_palette([get_color("primary"), get_color("secondary"), get_color("tertiary"), get_color("neutral_dark")])
+    apply_geo_style()
     plt.rcParams.update(
         {
             "figure.dpi": 300,
@@ -173,6 +186,9 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
                     "n": 0.0,
                     "mae": np.nan,
                     "rmse": np.nan,
+                    "wmape": np.nan,
+                    "mbe": np.nan,
+                    "over_prediction_ratio": np.nan,
                     "pinball_mean": np.nan,
                     "wis_p10_p50_p90": np.nan,
                     "sharpness_p90_p10": np.nan,
@@ -188,6 +204,11 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
         p50v = p50[valid]
         mae = float(np.mean(np.abs(yv - p50v)))
         rmse = float(np.sqrt(np.mean((yv - p50v) ** 2)))
+        lead_suite = compute_forecast_metrics(
+            pd.DataFrame({"y_true": yv, "y_pred": p50v}),
+            y_true_col="y_true",
+            y_pred_col="y_pred",
+        )
         wis = _wis_p10_p50_p90(y, p10, p50, p90)
         sharpness = float(np.nanmean(p90 - p10)) if np.isfinite(np.nanmean(p90 - p10)) else np.nan
 
@@ -213,6 +234,9 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
                 "n": float(int(valid.sum())),
                 "mae": mae,
                 "rmse": rmse,
+                "wmape": lead_suite.get("wmape"),
+                "mbe": lead_suite.get("mbe"),
+                "over_prediction_ratio": lead_suite.get("over_prediction_ratio"),
                 "pinball_mean": pinball_mean,
                 "wis_p10_p50_p90": wis,
                 "sharpness_p90_p10": sharpness,
@@ -431,6 +455,184 @@ def _directional_and_event_metrics(df: pd.DataFrame, event_q: float = 0.9) -> di
     }
 
 
+def _latest_h1_frame(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.loc[pd.to_numeric(df["lead_time_h"], errors="coerce") == 1].copy()
+    if d.empty:
+        return d
+    d["target_time_utc"] = pd.to_datetime(d["target_time_utc"], utc=True, errors="coerce")
+    d["snapshot_time_utc"] = pd.to_datetime(d["snapshot_time_utc"], utc=True, errors="coerce")
+    d = d.sort_values(["target_time_utc", "snapshot_time_utc"]).drop_duplicates(
+        subset=["target_time_utc"], keep="last"
+    )
+    return d.reset_index(drop=True)
+
+
+def _spike_top5_metrics(df: pd.DataFrame) -> dict[str, float]:
+    h1 = _latest_h1_frame(df)
+    if h1.empty:
+        return {
+            "spike_threshold_true_q95_h1": float("nan"),
+            "spike_mae_top5_h1": float("nan"),
+            "spike_rmse_top5_h1": float("nan"),
+            "spike_recall_top5_h1": float("nan"),
+            "spike_precision_top5_h1": float("nan"),
+            "spike_f1_top5_h1": float("nan"),
+        }
+    y = pd.to_numeric(h1["y_true"], errors="coerce")
+    p = pd.to_numeric(h1["p50"], errors="coerce")
+    m = y.notna() & p.notna()
+    if not bool(m.any()):
+        return {
+            "spike_threshold_true_q95_h1": float("nan"),
+            "spike_mae_top5_h1": float("nan"),
+            "spike_rmse_top5_h1": float("nan"),
+            "spike_recall_top5_h1": float("nan"),
+            "spike_precision_top5_h1": float("nan"),
+            "spike_f1_top5_h1": float("nan"),
+        }
+    yv = y.loc[m].to_numpy(dtype=float)
+    pv = p.loc[m].to_numpy(dtype=float)
+    thr = float(np.nanquantile(yv, 0.95))
+    is_spike_true = yv >= thr
+    is_spike_pred = pv >= thr
+    if not bool(np.any(is_spike_true)):
+        spike_mae = float("nan")
+        spike_rmse = float("nan")
+    else:
+        err = yv[is_spike_true] - pv[is_spike_true]
+        spike_mae = float(np.mean(np.abs(err)))
+        spike_rmse = float(np.sqrt(np.mean(err**2)))
+
+    tp = int(np.sum(is_spike_true & is_spike_pred))
+    fp = int(np.sum(~is_spike_true & is_spike_pred))
+    fn = int(np.sum(is_spike_true & ~is_spike_pred))
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
+    f1 = (
+        float((2 * precision * recall) / (precision + recall))
+        if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0
+        else float("nan")
+    )
+    return {
+        "spike_threshold_true_q95_h1": thr,
+        "spike_mae_top5_h1": spike_mae,
+        "spike_rmse_top5_h1": spike_rmse,
+        "spike_recall_top5_h1": recall,
+        "spike_precision_top5_h1": precision,
+        "spike_f1_top5_h1": f1,
+    }
+
+
+def _lag_cross_correlation_metrics(df: pd.DataFrame, max_lag_h: int = 24) -> tuple[dict[str, float], pd.DataFrame]:
+    h1 = _latest_h1_frame(df)
+    if h1.empty:
+        return (
+            {
+                "lag_best_h_h1": float("nan"),
+                "lag_best_corr_h1": float("nan"),
+                "lag_corr_h0_h1": float("nan"),
+            },
+            pd.DataFrame(columns=["lag_h", "corr"]),
+        )
+    d = h1.sort_values("target_time_utc").copy()
+    y = pd.to_numeric(d["y_true"], errors="coerce")
+    p = pd.to_numeric(d["p50"], errors="coerce")
+
+    rows: list[dict[str, float]] = []
+    for lag in range(-int(max_lag_h), int(max_lag_h) + 1):
+        ps = p.shift(lag)
+        m = y.notna() & ps.notna()
+        if bool(m.any()):
+            corr = float(np.corrcoef(y.loc[m].to_numpy(dtype=float), ps.loc[m].to_numpy(dtype=float))[0, 1])
+        else:
+            corr = float("nan")
+        rows.append({"lag_h": float(lag), "corr": corr})
+    cdf = pd.DataFrame(rows)
+    cvalid = cdf.dropna(subset=["corr"]).copy()
+    if cvalid.empty:
+        return (
+            {
+                "lag_best_h_h1": float("nan"),
+                "lag_best_corr_h1": float("nan"),
+                "lag_corr_h0_h1": float("nan"),
+            },
+            cdf,
+        )
+    cvalid["abs_corr"] = cvalid["corr"].abs()
+    best = cvalid.sort_values("abs_corr", ascending=False).iloc[0]
+    corr0 = cdf.loc[cdf["lag_h"] == 0.0, "corr"]
+    return (
+        {
+            "lag_best_h_h1": float(best["lag_h"]),
+            "lag_best_corr_h1": float(best["corr"]),
+            "lag_corr_h0_h1": float(corr0.iloc[0]) if not corr0.empty else float("nan"),
+        },
+        cdf,
+    )
+
+
+def _plot_spike_top5_window(df: pd.DataFrame, out_path: Path, title: str) -> None:
+    h1 = _latest_h1_frame(df)
+    if h1.empty:
+        return
+    h1 = h1.sort_values("target_time_utc").copy()
+    h1["y_true"] = pd.to_numeric(h1["y_true"], errors="coerce")
+    h1["p50"] = pd.to_numeric(h1["p50"], errors="coerce")
+    h1 = h1.dropna(subset=["y_true", "p50"])
+    if h1.empty:
+        return
+    thr = float(np.nanquantile(h1["y_true"].to_numpy(dtype=float), 0.95))
+    is_spike = h1["y_true"] >= thr
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    x = pd.to_datetime(h1["target_time_utc"], utc=True, errors="coerce")
+    ax.plot(x, h1["y_true"], linewidth=1.8, color=get_color("primary"), label="True")
+    ax.plot(x, h1["p50"], linewidth=1.6, color=get_color("tertiary"), label="Pred (P50)")
+    ax.scatter(
+        x[is_spike],
+        h1.loc[is_spike, "y_true"],
+        color=get_color("secondary"),
+        edgecolor=get_color("neutral_dark"),
+        s=28,
+        label="Top 5% true spikes",
+        zorder=4,
+    )
+    ax.axhline(thr, color=get_color("neutral_dark"), linestyle="--", linewidth=1.2, label="Q95 threshold")
+    ax.set_xlabel("Target Time (UTC)")
+    ax.set_ylabel("Value")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    _save_plot_png_pdf(fig, out_path)
+    plt.close(fig)
+
+
+def _plot_lag_crosscorr(cdf: pd.DataFrame, out_path: Path, title: str) -> None:
+    if cdf.empty:
+        return
+    d = cdf.copy()
+    d["lag_h"] = pd.to_numeric(d["lag_h"], errors="coerce")
+    d["corr"] = pd.to_numeric(d["corr"], errors="coerce")
+    d = d.dropna(subset=["lag_h", "corr"])
+    if d.empty:
+        return
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    ax.bar(d["lag_h"].astype(int), d["corr"], color=get_color("primary"), alpha=0.8)
+    ax.axvline(0, color=get_color("neutral_dark"), linestyle="--", linewidth=1.2)
+    ax.axhline(0, color=get_color("neutral_dark"), linewidth=1.0)
+    best_idx = d["corr"].abs().idxmax()
+    best_lag = int(d.loc[best_idx, "lag_h"])
+    best_corr = float(d.loc[best_idx, "corr"])
+    ax.scatter([best_lag], [best_corr], color=get_color("secondary"), s=45, zorder=5, label="Best |corr| lag")
+    ax.set_xlabel("Lag (h)   (positive => prediction lags true)")
+    ax.set_ylabel("Correlation")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    _save_plot_png_pdf(fig, out_path)
+    plt.close(fig)
+
+
 def _extract_target_models(payload: Any, target_col: str | None) -> dict[int, dict[str, Any]] | None:
     if not isinstance(payload, dict) or not payload:
         return None
@@ -606,6 +808,7 @@ def main() -> None:
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     coverage_by_prediction: dict[str, pd.DataFrame] = {}
+    lag_crosscorr_by_prediction: dict[str, pd.DataFrame] = {}
 
     for pred_col, path in sorted(pred_long_paths.items()):
         df = pd.read_parquet(path)
@@ -626,6 +829,25 @@ def main() -> None:
         coverage_by_prediction[pred_col] = coverage_df
         ace = _average_calibration_error(coverage_df)
         evt = _directional_and_event_metrics(d)
+        spike = _spike_top5_metrics(d)
+        lag_metrics, lag_corr_df = _lag_cross_correlation_metrics(d, max_lag_h=24)
+        lag_crosscorr_by_prediction[pred_col] = lag_corr_df
+
+        gate_metrics: dict[str, Any] = {}
+        target_col_for_gate = PRED_TO_TARGET.get(pred_col, "")
+        gate_h = gate_hour_for_target(target_col_for_gate)
+        if gate_h is not None:
+            d_gate = df.copy()
+            gate_metrics = compute_gate_closure_metrics(
+                pred_long_df=d_gate,
+                truth_df=truth_df[["timestamp_utc", truth_col]].copy(),
+                y_true_col=truth_col,
+                y_pred_col="p50" if "p50" in d.columns else "predicted_value",
+                gate_hour_local=gate_h,
+                timezone="Europe/Berlin",
+                snapshot_col="snapshot_time_utc",
+                target_time_col="target_time_utc",
+            )
 
         metrics_df = _compute_metrics_by_lead(d)
         all_metrics[pred_col] = metrics_df
@@ -635,6 +857,9 @@ def main() -> None:
                 "truth_column": truth_col,
                 "mae_mean": float(metrics_df["mae"].mean()),
                 "rmse_mean": float(metrics_df["rmse"].mean()),
+                "wmape_mean": float(metrics_df["wmape"].mean()),
+                "mbe_mean": float(metrics_df["mbe"].mean()),
+                "over_prediction_ratio_mean": float(metrics_df["over_prediction_ratio"].mean()),
                 "pinball_mean": float(metrics_df["pinball_mean"].mean()),
                 "wis_mean": float(metrics_df["wis_p10_p50_p90"].mean()),
                 "skill_score_mae_mean": float(metrics_df["skill_score_mae"].mean()),
@@ -645,7 +870,30 @@ def main() -> None:
                 "event_precision": evt["event_precision"],
                 "event_recall": evt["event_recall"],
                 "event_f1": evt["event_f1"],
+                "spike_mae_top5_h1": spike["spike_mae_top5_h1"],
+                "spike_rmse_top5_h1": spike["spike_rmse_top5_h1"],
+                "spike_recall_top5_h1": spike["spike_recall_top5_h1"],
+                "spike_precision_top5_h1": spike["spike_precision_top5_h1"],
+                "spike_f1_top5_h1": spike["spike_f1_top5_h1"],
+                "lag_best_h_h1": lag_metrics["lag_best_h_h1"],
+                "lag_best_corr_h1": lag_metrics["lag_best_corr_h1"],
+                "lag_corr_h0_h1": lag_metrics["lag_corr_h0_h1"],
+                "gate_hour_local": gate_metrics.get("gate_hour_local"),
+                "gate_mae": gate_metrics.get("mae_gate"),
+                "gate_rmse": gate_metrics.get("rmse_gate"),
+                "gate_acceptance_rate": gate_metrics.get("acceptance_rate_gate"),
+                "gate_n_rows": gate_metrics.get("n_rows_gate"),
             }
+        )
+        _plot_spike_top5_window(
+            d,
+            plots_dir / f"{args.split}_{pred_col}_spike_top5_analysis.png",
+            title=f"{pred_col} - Top 5% Spike Capture (h1, {args.split})",
+        )
+        _plot_lag_crosscorr(
+            lag_corr_df,
+            plots_dir / f"{args.split}_{pred_col}_lag_crosscorr.png",
+            title=f"{pred_col} - Lead/Lag Cross-Correlation (h1, {args.split})",
         )
 
         if pred_col == selected_pred_col:
@@ -692,6 +940,8 @@ def main() -> None:
         )
     for pred_col, cdf in coverage_by_prediction.items():
         cdf.to_csv(run_dir / f"{args.split}_{pred_col}_quantile_coverage.csv", index=False)
+    for pred_col, cdf in lag_crosscorr_by_prediction.items():
+        cdf.to_csv(run_dir / f"{args.split}_{pred_col}_lag_crosscorr.csv", index=False)
 
     summary_payload = {
         "run_dir": str(run_dir.resolve()),

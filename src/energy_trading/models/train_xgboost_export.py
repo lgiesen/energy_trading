@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import itertools
 import json
 import logging
 import os
@@ -39,9 +40,22 @@ from energy_trading.models.training_policy import (
     resolve_feature_columns_for_target,
     resolve_xgb_params_for_target,
 )
+from energy_trading.evaluation.metrics import (
+    compute_forecast_metrics,
+    compute_gate_closure_metrics,
+    gate_hour_for_target,
+)
+from energy_trading.evaluation.tensorboard_utils import (
+    create_summary_writer,
+    tensorboard_target_log_dir,
+)
 
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 LOGGER = logging.getLogger(__name__)
+_ACTIVATION_RATE_TARGETS = {
+    "target_afrr_activation_rate_pos",
+    "target_afrr_activation_rate_neg",
+}
 
 
 def _qcol(q: float) -> str:
@@ -634,6 +648,7 @@ def train_and_evaluate(
     base_dir: Path,
     bundle: BundleName,
     target_col: str | None,
+    run_dir: Path,
     model_out: Path,
     importance_out: Path,
     importance_report_out: Path,
@@ -730,10 +745,23 @@ def train_and_evaluate(
     per_target_metrics: dict[str, dict[str, float]] = {}
     per_target_policy: dict[str, dict[str, object]] = {}
     per_target_training_seconds: dict[str, float] = {}
+    per_target_tb_log_dir: dict[str, str] = {}
+    xgb_best_iteration_rows: list[dict[str, object]] = []
     total_fit_seconds = 0.0
     primary_X_val_h = None
     primary_y_val_lead1 = None
     for idx, tgt in enumerate(target_cols):
+        tb_writer = None
+        tb_target_log_dir = tensorboard_target_log_dir(
+            run_dir=run_dir,
+            model_family="xgb",
+            bundle=bundle,
+            target_col=tgt,
+        )
+        tb_writer = create_summary_writer(tb_target_log_dir)
+        if tb_writer is not None:
+            per_target_tb_log_dir[tgt] = str(tb_target_log_dir.resolve())
+
         target_policy = resolve_xgb_params_for_target(tgt, base_xgb_params)
         target_variant, target_feature_cols = resolve_feature_columns_for_target(all_feature_columns, tgt)
         X_train_t = X_train[target_feature_cols].copy()
@@ -751,6 +779,7 @@ def train_and_evaluate(
 
         rows_train_per_lead: list[int] = []
         rows_val_per_lead: list[int] = []
+        best_iteration_by_lead: dict[str, dict[str, object]] = {}
         lead_loop_start = time.time()
         eta_logged = False
 
@@ -784,6 +813,9 @@ def train_and_evaluate(
 
             quantile_models_for_lead: dict[str, object] = {}
             lead_pred_by_q: dict[str, np.ndarray] = {}
+            lead_best_iteration: dict[str, int | None] = {}
+            lead_best_score: dict[str, float | None] = {}
+            lead_boosted_rounds: dict[str, int | None] = {}
             for q_idx, q in enumerate(QUANTILES):
                 qcol = q_cols[q_idx]
                 model = XGBRegressor(
@@ -804,7 +836,69 @@ def train_and_evaluate(
                     early_stopping_rounds=max(0, int(target_policy["early_stopping_rounds"])),
                     n_jobs=-1,
                 )
-                model.fit(X_tr_h, y_tr_h, eval_set=[(X_va_h, y_va_h)], verbose=False)
+                model.fit(
+                    X_tr_h,
+                    y_tr_h,
+                    eval_set=[(X_tr_h, y_tr_h), (X_va_h, y_va_h)],
+                    verbose=False,
+                )
+
+                # Track early-stopping outcome per lead/quantile.
+                best_it = getattr(model, "best_iteration", None)
+                if best_it is not None:
+                    best_it = int(best_it)
+                best_sc = getattr(model, "best_score", None)
+                if best_sc is not None:
+                    try:
+                        best_sc = float(best_sc)
+                    except Exception:
+                        best_sc = None
+                rounds = None
+                try:
+                    rounds = int(model.get_booster().num_boosted_rounds())
+                except Exception:
+                    rounds = None
+                lead_best_iteration[qcol] = best_it
+                lead_best_score[qcol] = best_sc
+                lead_boosted_rounds[qcol] = rounds
+                xgb_best_iteration_rows.append(
+                    {
+                        "target_col": str(tgt),
+                        "lead_time_h": int(lead),
+                        "quantile": str(qcol),
+                        "best_iteration": best_it,
+                        "best_score": best_sc,
+                        "num_boosted_rounds": rounds,
+                        "early_stopping_rounds": int(target_policy["early_stopping_rounds"]),
+                        "n_train_rows": int(len(X_tr_h)),
+                        "n_val_rows": int(len(X_va_h)),
+                    }
+                )
+
+                # Log one representative target curve per trained target
+                # (p50, lead-1) to TensorBoard for direct comparability with TFT logs.
+                if tb_writer is not None and abs(float(q) - 0.5) < 1e-12 and lead == 1:
+                    try:
+                        evals = model.evals_result()
+                        train_block = evals.get("validation_0", {})
+                        val_block = evals.get("validation_1", {})
+                        train_metric = next(iter(train_block.keys()), None)
+                        val_metric = next(iter(val_block.keys()), None)
+                        train_hist = list(train_block.get(train_metric, [])) if train_metric else []
+                        val_hist = list(val_block.get(val_metric, [])) if val_metric else []
+                        for ep, (tr_v, va_v) in enumerate(
+                            itertools.zip_longest(train_hist, val_hist, fillvalue=np.nan)
+                        ):
+                            if np.isfinite(float(tr_v)):
+                                tb_writer.add_scalar("train_loss_epoch", float(tr_v), ep)
+                            if np.isfinite(float(va_v)):
+                                tb_writer.add_scalar("val_loss", float(va_v), ep)
+                    except Exception as exc:  # pragma: no cover
+                        LOGGER.warning(
+                            "Could not write TensorBoard loss curves for target=%s: %s",
+                            tgt,
+                            exc,
+                        )
 
                 pred = _predict_with_device_alignment(model, X_va_h, resolved_device=resolved_device)
                 quantile_models_for_lead[qcol] = model
@@ -819,6 +913,22 @@ def train_and_evaluate(
                 pred_by_q[qcol][:, lead - 1] = lead_pred_series.to_numpy(dtype=float)
 
             lead_models[lead] = quantile_models_for_lead
+            # Lightweight per-lead summary for quick inspection.
+            p50_best_it = lead_best_iteration.get("p50")
+            p50_rounds = lead_boosted_rounds.get("p50")
+            p50_early_stopped = (
+                bool((p50_best_it is not None) and (p50_rounds is not None) and (p50_best_it < (p50_rounds - 1)))
+                if (p50_best_it is not None and p50_rounds is not None)
+                else None
+            )
+            best_iteration_by_lead[str(int(lead))] = {
+                "p10": lead_best_iteration.get("p10"),
+                "p50": p50_best_it,
+                "p90": lead_best_iteration.get("p90"),
+                "p95": lead_best_iteration.get("p95"),
+                "p50_num_boosted_rounds": p50_rounds,
+                "p50_early_stopped": p50_early_stopped,
+            }
             if lead == 1 and horizon_hours > 1 and not eta_logged:
                 lead1_minutes = (time.time() - lead_loop_start) / 60.0
                 eta_minutes = lead1_minutes * float(horizon_hours - 1)
@@ -844,6 +954,16 @@ def train_and_evaluate(
         mae_h1 = float(mean_absolute_error(lead1_true[mask_h1], lead1_pred_np[mask_h1]))
         rmse_h1 = float(np.sqrt(mean_squared_error(lead1_true[mask_h1], lead1_pred_np[mask_h1])))
 
+        h1_metrics_df = pd.DataFrame(
+            {
+                "y_true": lead1_true,
+                "y_pred": lead1_pred_np,
+            }
+        )
+        for qcol in q_cols:
+            h1_metrics_df[f"y_pred_{qcol}"] = pred_by_q[qcol][:, 0]
+        h1_metric_suite = compute_forecast_metrics(h1_metrics_df, y_true_col="y_true", y_pred_col="y_pred")
+
         if horizon_hours >= 24:
             y_true_24 = pd.to_numeric(Y_va.iloc[:, 23], errors="coerce").to_numpy(dtype=float)
             y_pred_24 = pred_by_q["p50"][:, 23]
@@ -861,10 +981,19 @@ def train_and_evaluate(
             "rmse": rmse_h1,
             "mae_h24": lead24_mae,
             "mae_h48": lead48_mae,
+            "wmape_h1": h1_metric_suite.get("wmape"),
+            "directional_accuracy_h1": h1_metric_suite.get("directional_accuracy"),
+            "pinball_loss_p10_h1": h1_metric_suite.get("pinball_loss_p10"),
+            "pinball_loss_p50_h1": h1_metric_suite.get("pinball_loss_p50"),
+            "pinball_loss_p90_h1": h1_metric_suite.get("pinball_loss_p90"),
+            "pinball_loss_p95_h1": h1_metric_suite.get("pinball_loss_p95"),
+            "picp_80_h1": h1_metric_suite.get("picp_80"),
             "rows_train_horizon_min": float(min(rows_train_per_lead)),
             "rows_train_horizon_max": float(max(rows_train_per_lead)),
             "rows_val_horizon_min": float(min(rows_val_per_lead)),
             "rows_val_horizon_max": float(max(rows_val_per_lead)),
+            "best_iteration_by_lead": best_iteration_by_lead,
+            "metric_suite_h1": h1_metric_suite,
         }
         per_target_policy[tgt] = {
             "feature_variant": target_variant,
@@ -884,6 +1013,9 @@ def train_and_evaluate(
         target_elapsed = time.perf_counter() - target_train_start
         per_target_training_seconds[tgt] = float(target_elapsed)
         total_fit_seconds += float(target_elapsed)
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
         if tgt == primary_target:
             primary_X_val_h = X_val
             primary_y_val_lead1 = pd.to_numeric(Y_va.iloc[:, 0], errors="coerce")
@@ -894,6 +1026,7 @@ def train_and_evaluate(
     y_pred_primary = pd.to_numeric(val_pred_df.loc[primary_X_val_h.index, primary_target], errors="coerce")
     mae = float(mean_absolute_error(y_val_primary, y_pred_primary))
     rmse = float(np.sqrt(mean_squared_error(y_val_primary, y_pred_primary)))
+    primary_metric_suite_h1 = per_target_metrics.get(primary_target, {}).get("metric_suite_h1", {})
     baseline_mae = _naive_baseline_mae(bundle, primary_X_val_h, y_val_primary)
 
     model_out.parent.mkdir(parents=True, exist_ok=True)
@@ -913,6 +1046,13 @@ def train_and_evaluate(
     metrics = {
         "mae": mae,
         "rmse": rmse,
+        "wmape_h1": primary_metric_suite_h1.get("wmape"),
+        "directional_accuracy_h1": primary_metric_suite_h1.get("directional_accuracy"),
+        "pinball_loss_p10_h1": primary_metric_suite_h1.get("pinball_loss_p10"),
+        "pinball_loss_p50_h1": primary_metric_suite_h1.get("pinball_loss_p50"),
+        "pinball_loss_p90_h1": primary_metric_suite_h1.get("pinball_loss_p90"),
+        "pinball_loss_p95_h1": primary_metric_suite_h1.get("pinball_loss_p95"),
+        "picp_80_h1": primary_metric_suite_h1.get("picp_80"),
         "baseline_mae_24h": baseline_mae,
         "rows_train": float(len(X_train)),
         "rows_val": float(len(X_val)),
@@ -928,6 +1068,8 @@ def train_and_evaluate(
         "resolved_device": resolved_device,
         "timing_training_seconds": float(total_fit_seconds),
         "timing_training_seconds_by_target": per_target_training_seconds,
+        "tensorboard_log_dirs_by_target": per_target_tb_log_dir,
+        "xgb_best_iteration_by_target_lead_quantile": xgb_best_iteration_rows,
     }
     metrics.update(cv_metrics)
     return metrics, models_by_target, target_cols
@@ -1033,6 +1175,8 @@ def _predict_split_frame(
         model_q = models_by_target[tgt][1]["p50"]
         pred_h = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
         pred = pd.to_numeric(pd.Series(pred_h, index=split_df.index), errors="coerce")
+        if tgt in _ACTIVATION_RATE_TARGETS:
+            pred = pred.clip(lower=0.0, upper=1.0)
         for pred_col in _pred_column_names_for_target(tgt):
             out[pred_col] = pred.values
     return out
@@ -1086,6 +1230,9 @@ def _predict_split_long_multistep(
                 lead_pred_q[c] = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
             lead_stack = np.column_stack([lead_pred_q[c] for c in q_cols])
             lead_stack = np.sort(lead_stack, axis=1)
+            if tgt in _ACTIVATION_RATE_TARGETS:
+                # Activation rate predictions are bounded probabilities/fractions.
+                lead_stack = np.clip(lead_stack, 0.0, 1.0)
 
             target_time = snapshots + pd.to_timedelta(lead, unit="h")
             for pred_col in _pred_column_names_for_target(tgt):
@@ -1291,6 +1438,7 @@ def main() -> None:
         base_dir=base_dir,
         bundle=args.bundle,
         target_col=(args.target_col.strip() or None),
+        run_dir=run_dir,
         model_out=model_out,
         importance_out=importance_out,
         importance_report_out=importance_report_out,
@@ -1318,6 +1466,7 @@ def main() -> None:
     prediction_long_paths: dict[str, dict[str, Path]] = {}
     prediction_export_seconds_by_split: dict[str, float] = {}
     long_export_seconds_by_split: dict[str, float] = {}
+    gate_closure_metrics_by_split: dict[str, dict[str, dict[str, object]]] = {}
     splits = [s.strip() for s in args.prediction_splits.split(",") if s.strip()]
     if args.export_predictions:
         resolved_pred_device = str(metrics.get("resolved_device", args.device))
@@ -1338,6 +1487,7 @@ def main() -> None:
 
             if args.export_predictions_long:
                 long_split_start = time.perf_counter()
+                split_df, _ = _load_bundle_split_df(base_dir=base_dir, bundle=args.bundle, split=split)
                 long_by_col, decay_by_col = _predict_split_long_multistep(
                     base_dir=base_dir,
                     bundle=args.bundle,
@@ -1359,6 +1509,20 @@ def main() -> None:
                     decay.to_csv(decay_path, index=False)
                     mae_plot_path = report_dir / f"{file_tag}_{split}_{pred_col}_mae_lead_1_24_48.png"
                     _plot_leadtime_mae_points(decay, mae_plot_path)
+
+                    tgt_for_pred = _target_for_pred_column(pred_col)
+                    if tgt_for_pred:
+                        gate_hour = gate_hour_for_target(tgt_for_pred)
+                        if gate_hour is not None and tgt_for_pred in split_df.columns:
+                            gate_metrics = compute_gate_closure_metrics(
+                                long_df,
+                                truth_df=split_df[["timestamp_utc", tgt_for_pred]].copy(),
+                                y_true_col=tgt_for_pred,
+                                y_pred_col="p50" if "p50" in long_df.columns else "predicted_value",
+                                gate_hour_local=gate_hour,
+                                timezone="Europe/Berlin",
+                            )
+                            gate_closure_metrics_by_split.setdefault(split, {})[pred_col] = gate_metrics
                 long_export_seconds_by_split[split] = float(time.perf_counter() - long_split_start)
 
     fragment = _write_bundle_manifest_fragment(
@@ -1380,7 +1544,15 @@ def main() -> None:
     metrics["timing_export_seconds"] = float(export_elapsed)
     metrics["timing_export_prediction_seconds_by_split"] = prediction_export_seconds_by_split
     metrics["timing_export_long_seconds_by_split"] = long_export_seconds_by_split
+    metrics["gate_closure_metrics_by_split"] = gate_closure_metrics_by_split
     metrics["timing_total_seconds"] = float(total_elapsed)
+    # Export early-stopping diagnostics per target/lead/quantile for QA.
+    best_it_rows = metrics.get("xgb_best_iteration_by_target_lead_quantile", [])
+    best_it_csv_path = report_dir / f"{file_tag}_best_iteration_by_lead.csv"
+    if isinstance(best_it_rows, list) and best_it_rows:
+        best_it_df = pd.DataFrame(best_it_rows)
+        best_it_df.to_csv(best_it_csv_path, index=False)
+        metrics["xgb_best_iteration_csv"] = str(best_it_csv_path.resolve())
     metrics_json_out.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     print("[OK] XGBoost training finished.")
