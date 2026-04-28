@@ -27,6 +27,10 @@ The simulation enforces chronological market sequencing:
 This chronological structure is implemented as a state machine that carries the
 executed physical state of charge ($SoC_t$) into subsequent decisions.
 
+At the capacity gate, awards are propagated as lockbook obligations for next-day
+delivery intervals (implemented in 4-hour auction blocks and then mapped to
+hourly dispatch/settlement steps).
+
 ### Event-Driven Replanning
 
 If a gate outcome materially invalidates the active plan (for example reserve
@@ -46,26 +50,30 @@ The dispatch planner is formulated as a mixed-integer linear program (MILP).
 The MILP objective is **total expected profit over the horizon**, not
 activation rate or any single remuneration component in isolation.
 
-For each interval $t$, the optimizer solves:
+For each interval $t$, and bid-price bin $j$, the optimizer solves:
 
 $\max \sum_{t=1}^{T} \hat{\Pi}_t$
 
 with
 
-$\hat{\Pi}_t =
+\[
+\hat{\Pi}_t =
 \underbrace{P^{DA}_t\!\left(q^{sell}_{t}-q^{buy}_{t}\right)}_{\text{DA gross margin}}
-+\underbrace{P^{cap,+}_t r^{+}_t + P^{cap,-}_t r^{-}_t}_{\text{aFRR capacity remuneration}}
-+\underbrace{\hat{\alpha}^{+}_t P^{act,+}_t r^{+}_t - \hat{\alpha}^{-}_t P^{act,-}_t r^{-}_t}_{\text{expected activation value}}
++\underbrace{\sum_j p^{cap,+}_{acc,j,t}\,P^{cap,+}_t\,r^{+}_{j,t}
+           +\sum_j p^{cap,-}_{acc,j,t}\,P^{cap,-}_t\,r^{-}_{j,t}}_{\text{expected capacity remuneration}}
++\underbrace{\sum_j p^{cap,+}_{acc,j,t}\,\hat{\alpha}^{+}_t\,\tilde{P}^{act,+}_{j,t}\,r^{+}_{j,t}
+           -\sum_j p^{cap,-}_{acc,j,t}\,\hat{\alpha}^{-}_t\,\tilde{P}^{act,-}_{j,t}\,r^{-}_{j,t}}_{\text{expected activation value}}
 -\underbrace{C^{tx}_t(q^{buy}_{t}+q^{sell}_{t})}_{\text{transaction cost}}
--\underbrace{C^{deg}_t}_{\text{degradation cost}}$
+-\underbrace{C^{deg}_t}_{\text{degradation cost}}
+\]
 
 Interpretation:
 
+- $p^{cap,\pm}_{acc,j,t}$ are **capacity acceptance probabilities by bid bin**.
 - $\hat{\alpha}^{+}_t,\hat{\alpha}^{-}_t$ are **predicted activation rates**
-  (or expected called fractions) and enter as coefficients in expected
-  activation remuneration.
-- $P^{act,+}_t,P^{act,-}_t$ are **predicted activation prices** and also enter
-  as coefficients.
+  used for expected activated volume conditional on capacity award.
+- $\tilde{P}^{act,\pm}_{j,t}$ are bid/settlement-side activation-price terms
+  used in expected activation remuneration.
 - The optimizer compares all feasible actions per hour (DA, aFRR, or no trade)
   and picks the decision vector that maximizes the **sum of expected net profit**
   under battery and market constraints.
@@ -78,19 +86,42 @@ $r_t^{+} \;\text{and}\; r_t^{-} \quad \text{(strictly decoupled)}$
 
 This allows economically and physically asymmetric reserve positioning.
 
-### Worst-Case Feasibility Buffers
+### Capacity Acceptance vs Activation (Decoupled)
 
-To ensure physical deliverability under severe activation, the MILP enforces
-reserve feasibility buffers with efficiency-adjusted SoC constraints:
+Capacity acceptance and activation are modeled as distinct processes:
 
-Upward reserve buffer:
-$SoC_t - \frac{r_t^{+}\Delta t}{\eta_{out}} \ge SoC_{min}$
+- Capacity acceptance uses a CDF bridge from **capacity-price quantiles**
+  (when available), yielding $p^{cap}_{acc,j,t}$ per bid bin.
+- Activation rate forecasts ($\hat{\alpha}^{\pm}_t$ and quantiles) are used for
+  expected activation volume/value and SoC drift, not to determine capacity
+  award probabilities.
 
-Downward reserve buffer:
-$SoC_t + r_t^{-}\Delta t\,\eta_{in} \le SoC_{max}$
+Fallback policy when quantile-derived capacity CDF is unavailable:
 
-These constraints guarantee that reserve awards remain physically supportable
-even under continuous 100% activation assumptions.
+- scalar fallback acceptance is applied **only** to the most competitive
+  bid bin (price-taker bin),
+- all higher bins receive probability 0.
+
+This prevents the optimizer from exploiting high-price bins with unsupported
+uniform acceptance assumptions.
+
+### p90 SoC Safety Buffers (Chance Constraints)
+
+To ensure physical deliverability under stressed activation, the MILP keeps
+expected-value SoC dynamics but adds p90 safety constraints:
+
+Upward reserve safety:
+\[
+SoC_t - \sum_j\left(p^{cap,+}_{acc,j,t}\,\alpha^{+}_{p90,t}\,r^{+}_{j,t}\,\frac{\Delta t}{\eta_{out}}\right)\ge SoC_{min}
+\]
+
+Downward reserve safety:
+\[
+SoC_t + \sum_j\left(p^{cap,-}_{acc,j,t}\,\alpha^{-}_{p90,t}\,r^{-}_{j,t}\,\Delta t\,\eta_{in}\right)\le SoC_{max}
+\]
+
+SoC trajectories are therefore optimized on expected activation rates while
+remaining feasible under high (p90) activation stress scenarios.
 
 ---
 

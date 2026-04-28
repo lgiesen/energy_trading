@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from energy_trading.models.cv import PurgedTimeSeriesSplit
+from energy_trading.evaluation.gate_synced_analysis import gate_time_dplus1_filter
 
 LOWER_IS_BETTER = {
     "mae_mean",
@@ -428,6 +437,146 @@ def _compute_scalar_metrics(df: pd.DataFrame, per_lead: pd.DataFrame, coverage: 
     }
 
 
+def _latest_h1_frame(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.loc[pd.to_numeric(df["lead_time_h"], errors="coerce") == 1].copy()
+    if d.empty:
+        return d
+    d["target_time_utc"] = pd.to_datetime(d["target_time_utc"], utc=True, errors="coerce")
+    d["y_true"] = pd.to_numeric(d["y_true"], errors="coerce")
+    d["y_pred"] = pd.to_numeric(d["y_pred"], errors="coerce")
+    d = d.dropna(subset=["target_time_utc", "y_true", "y_pred"])
+    d = d.sort_values("target_time_utc").drop_duplicates(subset=["target_time_utc"], keep="last")
+    return d.reset_index(drop=True)
+
+
+def _directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if len(y_true) < 2 or len(y_pred) < 2:
+        return float("nan")
+    dy_true = np.sign(np.diff(y_true))
+    dy_pred = np.sign(np.diff(y_pred))
+    m = np.isfinite(dy_true) & np.isfinite(dy_pred)
+    if not bool(np.any(m)):
+        return float("nan")
+    return float(np.mean(dy_true[m] == dy_pred[m]))
+
+
+def _compute_time_cv_fold_metrics(
+    aligned: pd.DataFrame,
+    *,
+    n_splits: int,
+    test_size: int,
+    gap_hours: int,
+    min_train_size: int,
+) -> pd.DataFrame:
+    splitter = PurgedTimeSeriesSplit(
+        n_splits=int(n_splits),
+        test_size=int(test_size),
+        gap_hours=int(gap_hours),
+        frequency="1h",
+        min_train_size=int(min_train_size),
+    )
+    rows: list[dict[str, float | int | str]] = []
+    for fold, (_, va_idx) in enumerate(splitter.split(aligned), start=1):
+        part = aligned.iloc[va_idx].copy()
+        yt = pd.to_numeric(part["y_true"], errors="coerce").to_numpy(dtype=float)
+        yp = pd.to_numeric(part["y_pred"], errors="coerce").to_numpy(dtype=float)
+        m = np.isfinite(yt) & np.isfinite(yp)
+        yt = yt[m]
+        yp = yp[m]
+        if yt.size == 0:
+            continue
+        err = yp - yt
+        mae = float(np.mean(np.abs(err)))
+        rmse = float(np.sqrt(np.mean(err**2)))
+        mbe = float(np.mean(err))
+        da = _directional_accuracy(yt, yp)
+        rows.append(
+            {
+                "fold": int(fold),
+                "n": int(yt.size),
+                "start_utc": str(pd.Timestamp(part["target_time_utc"].min()).isoformat()),
+                "end_utc": str(pd.Timestamp(part["target_time_utc"].max()).isoformat()),
+                "mae": mae,
+                "rmse": rmse,
+                "mbe": mbe,
+                "directional_accuracy": da,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _build_time_cv_ranking(
+    *,
+    pred_col: str,
+    labels: list[str],
+    h1_frames: list[pd.DataFrame],
+    n_splits: int,
+    test_size: int,
+    gap_hours: int,
+    min_train_size: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not h1_frames or len(h1_frames) != len(labels):
+        return pd.DataFrame(), pd.DataFrame()
+
+    common_ts: set[pd.Timestamp] | None = None
+    for d in h1_frames:
+        ts = set(pd.to_datetime(d["target_time_utc"], utc=True, errors="coerce").dropna().tolist())
+        common_ts = ts if common_ts is None else common_ts.intersection(ts)
+    common_ts_sorted = sorted(common_ts or [])
+    if len(common_ts_sorted) < (n_splits * test_size + gap_hours + 1):
+        return pd.DataFrame(), pd.DataFrame()
+
+    fold_tables: list[pd.DataFrame] = []
+    rank_rows: list[dict[str, float | str | int]] = []
+
+    for lbl, d in zip(labels, h1_frames):
+        cur = d.copy()
+        cur["target_time_utc"] = pd.to_datetime(cur["target_time_utc"], utc=True, errors="coerce")
+        cur = cur[cur["target_time_utc"].isin(common_ts_sorted)].copy()
+        cur = cur.sort_values("target_time_utc").reset_index(drop=True)
+        fold_df = _compute_time_cv_fold_metrics(
+            cur,
+            n_splits=n_splits,
+            test_size=test_size,
+            gap_hours=gap_hours,
+            min_train_size=min_train_size,
+        )
+        if fold_df.empty:
+            continue
+        fold_df.insert(0, "model", lbl)
+        fold_df.insert(0, "prediction_column", pred_col)
+        fold_tables.append(fold_df)
+        rank_rows.append(
+            {
+                "prediction_column": pred_col,
+                "model": lbl,
+                "cv_folds": int(len(fold_df)),
+                "cv_mae_mean": float(fold_df["mae"].mean()),
+                "cv_mae_std": float(fold_df["mae"].std(ddof=0)),
+                "cv_rmse_mean": float(fold_df["rmse"].mean()),
+                "cv_rmse_std": float(fold_df["rmse"].std(ddof=0)),
+                "cv_mbe_mean": float(fold_df["mbe"].mean()),
+                "cv_directional_accuracy_mean": float(fold_df["directional_accuracy"].mean()),
+                "common_h1_rows": int(len(common_ts_sorted)),
+            }
+        )
+
+    if not rank_rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    ranking = pd.DataFrame(rank_rows).sort_values(
+        ["prediction_column", "cv_mae_mean", "cv_rmse_mean", "cv_mae_std"],
+        ascending=[True, True, True, True],
+    )
+    ranking["rank"] = ranking.groupby("prediction_column")["cv_mae_mean"].rank(method="dense").astype(int)
+    ranking["winner_by_cv_mae"] = ranking["rank"] == 1
+
+    folds = pd.concat(fold_tables, axis=0, ignore_index=True).sort_values(
+        ["prediction_column", "model", "fold"]
+    )
+    return folds, ranking
+
+
 def _build_summary_table(
     labels: list[str],
     scalar_metrics: list[dict[str, float]],
@@ -576,6 +725,22 @@ def _build_cli() -> argparse.ArgumentParser:
         default=[],
         help="Optional model key per run-dir (e.g., xgboost tft). Needed when multiple models share one run folder.",
     )
+    p.add_argument("--time-cv-n-splits", type=int, default=5, help="Rolling CV folds for final model choice.")
+    p.add_argument("--time-cv-test-size-hours", type=int, default=24 * 14, help="Validation window size per fold.")
+    p.add_argument("--time-cv-gap-hours", type=int, default=72, help="Purge gap between train and validation windows.")
+    p.add_argument("--time-cv-min-train-hours", type=int, default=24 * 30, help="Minimum train rows per fold.")
+    p.add_argument(
+        "--gate-eval",
+        action="store_true",
+        help="Enable strict gate-time D+1 evaluation outputs (execution-relevant benchmarking).",
+    )
+    p.add_argument(
+        "--gate-hours-local",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Optional gate-hour override(s) for gate mode, e.g. --gate-hours-local 8 11.",
+    )
     return p
 
 
@@ -599,6 +764,10 @@ def main() -> None:
     summaries = [_load_summary(rd) for rd in run_dirs]
     pred_cols = _resolve_pred_cols(summaries, args.pred_col.strip())
     all_summary_tables: list[pd.DataFrame] = []
+    all_time_cv_folds: list[pd.DataFrame] = []
+    all_time_cv_rankings: list[pd.DataFrame] = []
+    gate_summary_rows: list[dict[str, Any]] = []
+    gate_lead_rows: list[dict[str, Any]] = []
     plotted_targets: list[str] = []
     skipped_calibration: list[str] = []
 
@@ -622,6 +791,21 @@ def main() -> None:
                     d = d1
             d = d.sort_values("target_time_utc").drop_duplicates(subset=["target_time_utc"], keep="last")
             econ_metrics.append(_calculate_economic_metrics(d["y_true"], d["y_pred"]))
+
+        h1_frames = [_latest_h1_frame(df) for df in long_frames]
+        cv_folds_df, cv_rank_df = _build_time_cv_ranking(
+            pred_col=pred_col,
+            labels=labels,
+            h1_frames=h1_frames,
+            n_splits=int(args.time_cv_n_splits),
+            test_size=int(args.time_cv_test_size_hours),
+            gap_hours=int(args.time_cv_gap_hours),
+            min_train_size=int(args.time_cv_min_train_hours),
+        )
+        if not cv_folds_df.empty:
+            all_time_cv_folds.append(cv_folds_df)
+        if not cv_rank_df.empty:
+            all_time_cv_rankings.append(cv_rank_df)
 
         summary_df_one = _build_summary_table(labels, scalar_metrics, pred_col, econ_metrics)
         summary_df_one.insert(0, "prediction_column", pred_col)
@@ -650,6 +834,86 @@ def main() -> None:
             )
         except FileNotFoundError:
             skipped_calibration.append(pred_col)
+
+        if args.gate_eval:
+            gate_hours = args.gate_hours_local if args.gate_hours_local else [None]
+            gate_mae_series: list[tuple[str, pd.DataFrame]] = []
+            for lbl, df in zip(labels, long_frames):
+                for gh in gate_hours:
+                    gdf = gate_time_dplus1_filter(
+                        df,
+                        pred_col=pred_col,
+                        local_tz="Europe/Berlin",
+                        gate_hour_override=gh,
+                    )
+                    if gdf.empty:
+                        gate_summary_rows.append(
+                            {
+                                "prediction_column": pred_col,
+                                "model": lbl,
+                                "gate_hour_local": gh,
+                                "n_rows_gate_dplus1": 0,
+                                "gate_dplus1_mae": np.nan,
+                                "gate_dplus1_rmse": np.nan,
+                                "gate_dplus1_mbe": np.nan,
+                                "gate_dplus1_directional_accuracy": np.nan,
+                            }
+                        )
+                        continue
+
+                    yt = pd.to_numeric(gdf["y_true"], errors="coerce").to_numpy(dtype=float)
+                    yp = pd.to_numeric(gdf["y_pred"], errors="coerce").to_numpy(dtype=float)
+                    m = np.isfinite(yt) & np.isfinite(yp)
+                    if not bool(np.any(m)):
+                        continue
+                    err = yp[m] - yt[m]
+                    mae = float(np.mean(np.abs(err)))
+                    rmse = float(np.sqrt(np.mean(err**2)))
+                    mbe = float(np.mean(err))
+                    da = _directional_accuracy(yt[m], yp[m])
+                    gate_summary_rows.append(
+                        {
+                            "prediction_column": pred_col,
+                            "model": lbl,
+                            "gate_hour_local": int(gh) if gh is not None else np.nan,
+                            "n_rows_gate_dplus1": int(np.sum(m)),
+                            "gate_dplus1_mae": mae,
+                            "gate_dplus1_rmse": rmse,
+                            "gate_dplus1_mbe": mbe,
+                            "gate_dplus1_directional_accuracy": da,
+                        }
+                    )
+
+                    per_lead_gate = _compute_per_lead_metrics(gdf)
+                    if not per_lead_gate.empty:
+                        per_lead_gate = per_lead_gate.copy()
+                        per_lead_gate["prediction_column"] = pred_col
+                        per_lead_gate["model"] = lbl
+                        per_lead_gate["gate_hour_local"] = int(gh) if gh is not None else np.nan
+                        gate_lead_rows.extend(per_lead_gate.to_dict(orient="records"))
+                        gate_mae_series.append((f"{lbl} (gate={gh if gh is not None else 'default'})", per_lead_gate))
+
+            # Gate-time lead-decay overlay.
+            if gate_mae_series:
+                fig, ax = plt.subplots(figsize=(10, 5))
+                markers = ["o", "s", "D", "^", "v", "P", "X"]
+                for i, (name, plg) in enumerate(gate_mae_series):
+                    d = plg.sort_values("lead_time_h")
+                    ax.plot(
+                        d["lead_time_h"],
+                        d["mae"],
+                        label=name,
+                        linewidth=2,
+                        marker=markers[i % len(markers)],
+                        markevery=max(1, len(d) // 12),
+                        markersize=4,
+                    )
+                ax.set_title(f"Gate-Time D+1 Lead Decay (MAE) - {pred_col}")
+                ax.set_xlabel("Lead Time [h]")
+                ax.set_ylabel("MAE")
+                ax.legend()
+                fig.tight_layout()
+                _save_plot_png_pdf(fig, target_plot_dir / "plot_d_gate_time_degradation_overlay_mae.png")
         plotted_targets.append(pred_col)
 
     summary_df = pd.concat(all_summary_tables, axis=0, ignore_index=True)
@@ -665,6 +929,23 @@ def main() -> None:
         escape=False,
     )
 
+    time_cv_folds_csv = out_dir / "time_cv_fold_metrics.csv"
+    time_cv_rank_csv = out_dir / "time_cv_model_choice.csv"
+    if all_time_cv_folds:
+        pd.concat(all_time_cv_folds, axis=0, ignore_index=True).to_csv(time_cv_folds_csv, index=False)
+    if all_time_cv_rankings:
+        rank_df = pd.concat(all_time_cv_rankings, axis=0, ignore_index=True).sort_values(
+            ["prediction_column", "rank", "cv_mae_mean"]
+        )
+        rank_df.to_csv(time_cv_rank_csv, index=False)
+
+    gate_summary_csv = out_dir / "gate_time_benchmark_summary.csv"
+    gate_lead_csv = out_dir / "gate_time_lead_metrics.csv"
+    if args.gate_eval and gate_summary_rows:
+        pd.DataFrame(gate_summary_rows).sort_values(["prediction_column", "model"]).to_csv(gate_summary_csv, index=False)
+    if args.gate_eval and gate_lead_rows:
+        pd.DataFrame(gate_lead_rows).sort_values(["prediction_column", "model", "lead_time_h"]).to_csv(gate_lead_csv, index=False)
+
     meta = {
         "run_dirs": [str(p.resolve()) for p in run_dirs],
         "labels": labels,
@@ -675,12 +956,32 @@ def main() -> None:
         "skipped_calibration_targets": skipped_calibration,
         "summary_csv": str(summary_csv.resolve()),
         "summary_tex": str(summary_tex.resolve()),
+        "time_cv_folds_csv": str(time_cv_folds_csv.resolve()) if all_time_cv_folds else None,
+        "time_cv_model_choice_csv": str(time_cv_rank_csv.resolve()) if all_time_cv_rankings else None,
+        "time_cv": {
+            "n_splits": int(args.time_cv_n_splits),
+            "test_size_hours": int(args.time_cv_test_size_hours),
+            "gap_hours": int(args.time_cv_gap_hours),
+            "min_train_hours": int(args.time_cv_min_train_hours),
+        },
+        "gate_eval_enabled": bool(args.gate_eval),
+        "gate_hours_local": [int(x) for x in args.gate_hours_local] if args.gate_hours_local else [],
+        "gate_time_summary_csv": str(gate_summary_csv.resolve()) if (args.gate_eval and gate_summary_rows) else None,
+        "gate_time_lead_csv": str(gate_lead_csv.resolve()) if (args.gate_eval and gate_lead_rows) else None,
     }
     (out_dir / "benchmark_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     print("Saved benchmark outputs:")
     print(f"- {summary_csv}")
     print(f"- {summary_tex}")
+    if all_time_cv_folds:
+        print(f"- {time_cv_folds_csv}")
+    if all_time_cv_rankings:
+        print(f"- {time_cv_rank_csv}")
+    if args.gate_eval and gate_summary_rows:
+        print(f"- {gate_summary_csv}")
+    if args.gate_eval and gate_lead_rows:
+        print(f"- {gate_lead_csv}")
     print(f"- plots root: {plots_root}")
     print(f"- {out_dir / 'benchmark_meta.json'}")
 

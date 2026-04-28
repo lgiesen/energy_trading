@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import joblib
 import numpy as np
@@ -154,14 +154,23 @@ def _make_prediction_frame(bundle: BundleName, timestamp: pd.Series, pred_col: s
     return out
 
 
-def _make_long_h1(timestamp: pd.Series, y_pred: np.ndarray, model_name: str) -> pd.DataFrame:
-    target_ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
-    snap_ts = target_ts - pd.to_timedelta(1, unit="h")
+def _make_long_rows(
+    *,
+    h1_target_timestamp: pd.Series,
+    lead_time_h: int,
+    y_pred: np.ndarray,
+    model_name: str,
+) -> pd.DataFrame:
+    # Prepared bundles are aligned to h1 target timestamps.
+    # For lead=h, snapshot is h hours before target, i.e. target-h.
+    h1_ts = pd.to_datetime(h1_target_timestamp, utc=True, errors="coerce")
+    target_ts = h1_ts + pd.to_timedelta(int(lead_time_h - 1), unit="h")
+    snap_ts = target_ts - pd.to_timedelta(int(lead_time_h), unit="h")
     return pd.DataFrame(
         {
             "snapshot_time_utc": snap_ts,
             "target_time_utc": target_ts,
-            "lead_time_h": 1,
+            "lead_time_h": int(lead_time_h),
             "model_name": model_name,
             "predicted_value": pd.to_numeric(pd.Series(y_pred), errors="coerce"),
             "p50": pd.to_numeric(pd.Series(y_pred), errors="coerce"),
@@ -176,7 +185,8 @@ def _train_target(
     target_col: str,
     alpha: float,
     model_name: str,
-) -> tuple[Pipeline, dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    forecast_horizon_hours: int,
+) -> tuple[dict[int, Pipeline], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     cfg = json.loads((base_dir / "feature_config.json").read_text(encoding="utf-8"))
     bcfg = cfg["bundles"][bundle]
     train_ts = pd.to_datetime(
@@ -217,47 +227,133 @@ def _train_target(
     if target_col not in y_train_df.columns:
         raise KeyError(f"Target '{target_col}' not found in train labels.")
 
-    tr_mask = pd.to_numeric(y_train_df[target_col], errors="coerce").notna()
-    va_mask = pd.to_numeric(y_val_df[target_col], errors="coerce").notna()
-    te_mask = pd.to_numeric(y_test_df[target_col], errors="coerce").notna()
-
-    X_tr = X_train.loc[tr_mask].copy()
-    y_tr = pd.to_numeric(y_train_df.loc[tr_mask, target_col], errors="coerce")
-    X_va = X_val.loc[va_mask].copy()
-    y_va = pd.to_numeric(y_val_df.loc[va_mask, target_col], errors="coerce")
-    X_te = X_test.loc[te_mask].copy()
-    y_te = pd.to_numeric(y_test_df.loc[te_mask, target_col], errors="coerce")
-    ts_va = val_ts.loc[va_mask].copy()
-    ts_te = test_ts.loc[te_mask].copy()
-
-    if X_tr.empty or X_va.empty:
-        raise ValueError(f"Not enough rows for target '{target_col}' (train={len(X_tr)}, val={len(X_va)}).")
-
-    pipe = _build_linear_pipeline(alpha=alpha)
-    fit_t0 = time.perf_counter()
-    pipe.fit(X_tr, y_tr)
-    fit_seconds = float(time.perf_counter() - fit_t0)
-
-    pred_va = pipe.predict(X_va)
-    pred_te = pipe.predict(X_te)
+    y_train_all = pd.to_numeric(y_train_df[target_col], errors="coerce")
+    y_val_all = pd.to_numeric(y_val_df[target_col], errors="coerce")
+    y_test_all = pd.to_numeric(y_test_df[target_col], errors="coerce")
 
     pred_col = _pred_column_names_for_target(target_col)[0]
-    pred_frames = {
-        "val": _make_prediction_frame(bundle=bundle, timestamp=ts_va, pred_col=pred_col, y_pred=pred_va),
-        "test": _make_prediction_frame(bundle=bundle, timestamp=ts_te, pred_col=pred_col, y_pred=pred_te),
-    }
+    lead_models: dict[int, Pipeline] = {}
+    lead_rows_val: list[pd.DataFrame] = []
+    lead_rows_test: list[pd.DataFrame] = []
+    lead_metric_rows: list[dict[str, float]] = []
+    fit_seconds_total = 0.0
+
+    # Keep canonical wide-format prediction files as h1 for compatibility.
+    pred_frames: dict[str, pd.DataFrame] | None = None
+    y_va_h1: pd.Series | None = None
+    y_te_h1: pd.Series | None = None
+    pred_va_h1: np.ndarray | None = None
+    pred_te_h1: np.ndarray | None = None
+
+    for lead_h in range(1, int(forecast_horizon_hours) + 1):
+        shift_n = int(lead_h - 1)
+        y_tr_shift = y_train_all.shift(-shift_n)
+        y_va_shift = y_val_all.shift(-shift_n)
+        y_te_shift = y_test_all.shift(-shift_n)
+
+        tr_mask = y_tr_shift.notna()
+        va_mask = y_va_shift.notna()
+        te_mask = y_te_shift.notna()
+
+        X_tr = X_train.loc[tr_mask].copy()
+        y_tr = pd.to_numeric(y_tr_shift.loc[tr_mask], errors="coerce")
+        X_va = X_val.loc[va_mask].copy()
+        y_va = pd.to_numeric(y_va_shift.loc[va_mask], errors="coerce")
+        X_te = X_test.loc[te_mask].copy()
+        y_te = pd.to_numeric(y_te_shift.loc[te_mask], errors="coerce")
+        ts_va = val_ts.loc[va_mask].copy()
+        ts_te = test_ts.loc[te_mask].copy()
+
+        if X_tr.empty or X_va.empty:
+            LOGGER.warning(
+                "Skipping lead h=%s for target '%s' due to insufficient rows (train=%s, val=%s).",
+                lead_h,
+                target_col,
+                len(X_tr),
+                len(X_va),
+            )
+            continue
+
+        pipe = _build_linear_pipeline(alpha=alpha)
+        fit_t0 = time.perf_counter()
+        pipe.fit(X_tr, y_tr)
+        fit_seconds_total += float(time.perf_counter() - fit_t0)
+
+        pred_va = pipe.predict(X_va)
+        pred_te = pipe.predict(X_te)
+
+        lead_models[int(lead_h)] = pipe
+        lead_rows_val.append(
+            _make_long_rows(
+                h1_target_timestamp=ts_va,
+                lead_time_h=int(lead_h),
+                y_pred=pred_va,
+                model_name=model_name,
+            )
+        )
+        lead_rows_test.append(
+            _make_long_rows(
+                h1_target_timestamp=ts_te,
+                lead_time_h=int(lead_h),
+                y_pred=pred_te,
+                model_name=model_name,
+            )
+        )
+
+        val_metric_suite_h = compute_forecast_metrics(
+            pd.DataFrame({"y_true": y_va.to_numpy(dtype=float), "y_pred": pred_va}),
+            y_true_col="y_true",
+            y_pred_col="y_pred",
+        )
+        test_metric_suite_h = compute_forecast_metrics(
+            pd.DataFrame({"y_true": y_te.to_numpy(dtype=float), "y_pred": pred_te}),
+            y_true_col="y_true",
+            y_pred_col="y_pred",
+        )
+        lead_metric_rows.append(
+            {
+                "lead_time_h": float(lead_h),
+                "n_val": float(len(y_va)),
+                "n_test": float(len(y_te)),
+                "mae_val": float(val_metric_suite_h.get("mae", np.nan)),
+                "mae_test": float(test_metric_suite_h.get("mae", np.nan)),
+                "rmse_val": float(val_metric_suite_h.get("rmse", np.nan)),
+                "rmse_test": float(test_metric_suite_h.get("rmse", np.nan)),
+            }
+        )
+
+        if int(lead_h) == 1:
+            y_va_h1 = y_va
+            y_te_h1 = y_te
+            pred_va_h1 = pred_va
+            pred_te_h1 = pred_te
+            pred_frames = {
+                "val": _make_prediction_frame(bundle=bundle, timestamp=ts_va, pred_col=pred_col, y_pred=pred_va),
+                "test": _make_prediction_frame(bundle=bundle, timestamp=ts_te, pred_col=pred_col, y_pred=pred_te),
+            }
+
+    if not lead_models:
+        raise ValueError(f"No linear lead models trained for target '{target_col}'.")
+    if pred_frames is None or y_va_h1 is None or y_te_h1 is None or pred_va_h1 is None or pred_te_h1 is None:
+        raise ValueError(f"Lead h1 training failed for target '{target_col}', cannot build canonical exports.")
+
     long_frames = {
-        "val": _make_long_h1(timestamp=ts_va, y_pred=pred_va, model_name=model_name),
-        "test": _make_long_h1(timestamp=ts_te, y_pred=pred_te, model_name=model_name),
+        "val": pd.concat(lead_rows_val, axis=0, ignore_index=True).sort_values(
+            ["snapshot_time_utc", "lead_time_h", "target_time_utc"]
+        ),
+        "test": pd.concat(lead_rows_test, axis=0, ignore_index=True).sort_values(
+            ["snapshot_time_utc", "lead_time_h", "target_time_utc"]
+        ),
     }
 
+    # Maintain top-level metrics on h1 for continuity + add lead-wise summary.
     val_metric_suite = compute_forecast_metrics(
-        pd.DataFrame({"y_true": y_va.to_numpy(dtype=float), "y_pred": pred_va}),
+        pd.DataFrame({"y_true": y_va_h1.to_numpy(dtype=float), "y_pred": pred_va_h1}),
         y_true_col="y_true",
         y_pred_col="y_pred",
     )
     test_metric_suite = compute_forecast_metrics(
-        pd.DataFrame({"y_true": y_te.to_numpy(dtype=float), "y_pred": pred_te}),
+        pd.DataFrame({"y_true": y_te_h1.to_numpy(dtype=float), "y_pred": pred_te_h1}),
         y_true_col="y_true",
         y_pred_col="y_pred",
     )
@@ -265,13 +361,15 @@ def _train_target(
     gate_hour = gate_hour_for_target(target_col)
     val_gate: dict[str, object] = {}
     test_gate: dict[str, object] = {}
+    val_h1_long = long_frames["val"].loc[long_frames["val"]["lead_time_h"] == 1].copy()
+    test_h1_long = long_frames["test"].loc[long_frames["test"]["lead_time_h"] == 1].copy()
     if gate_hour is not None:
         val_gate = compute_gate_closure_metrics(
-            long_frames["val"],
+            val_h1_long,
             truth_df=pd.DataFrame(
                 {
-                    "timestamp_utc": pd.to_datetime(ts_va, utc=True, errors="coerce"),
-                    target_col: y_va.to_numpy(dtype=float),
+                    "timestamp_utc": pd.to_datetime(val_h1_long["target_time_utc"], utc=True, errors="coerce"),
+                    target_col: y_va_h1.to_numpy(dtype=float),
                 }
             ),
             y_true_col=target_col,
@@ -280,11 +378,11 @@ def _train_target(
             timezone="Europe/Berlin",
         )
         test_gate = compute_gate_closure_metrics(
-            long_frames["test"],
+            test_h1_long,
             truth_df=pd.DataFrame(
                 {
-                    "timestamp_utc": pd.to_datetime(ts_te, utc=True, errors="coerce"),
-                    target_col: y_te.to_numpy(dtype=float),
+                    "timestamp_utc": pd.to_datetime(test_h1_long["target_time_utc"], utc=True, errors="coerce"),
+                    target_col: y_te_h1.to_numpy(dtype=float),
                 }
             ),
             y_true_col=target_col,
@@ -293,34 +391,55 @@ def _train_target(
             timezone="Europe/Berlin",
         )
 
+    lead_df = pd.DataFrame(lead_metric_rows).sort_values("lead_time_h").reset_index(drop=True)
+    last_h = int(lead_df["lead_time_h"].max()) if not lead_df.empty else 1
+    lead_mae_val_h1 = float(lead_df.loc[lead_df["lead_time_h"] == 1.0, "mae_val"].iloc[0]) if (lead_df["lead_time_h"] == 1.0).any() else np.nan
+    lead_mae_test_h1 = float(lead_df.loc[lead_df["lead_time_h"] == 1.0, "mae_test"].iloc[0]) if (lead_df["lead_time_h"] == 1.0).any() else np.nan
+    lead_mae_val_last = float(lead_df.loc[lead_df["lead_time_h"] == float(last_h), "mae_val"].iloc[0]) if not lead_df.empty else np.nan
+    lead_mae_test_last = float(lead_df.loc[lead_df["lead_time_h"] == float(last_h), "mae_test"].iloc[0]) if not lead_df.empty else np.nan
+
     metrics: dict[str, object] = {
         "target_col": target_col,
         "model_name": model_name,
         "model_family": "linear_ridge",
         "alpha": float(alpha),
-        "n_features": int(X_tr.shape[1]),
-        "rows_train": int(len(X_tr)),
-        "rows_val": int(len(X_va)),
-        "rows_test": int(len(X_te)),
+        "n_features": int(X_train.shape[1]),
+        "rows_train_h1": int(y_train_all.notna().sum()),
+        "rows_val_h1": int(len(y_va_h1)),
+        "rows_test_h1": int(len(y_te_h1)),
+        "forecast_horizon_hours": int(forecast_horizon_hours),
+        "leadtime_last_h": int(last_h),
+        "leadtime_mae_val_h1": lead_mae_val_h1,
+        "leadtime_mae_test_h1": lead_mae_test_h1,
+        f"leadtime_mae_val_h{last_h}": lead_mae_val_last,
+        f"leadtime_mae_test_h{last_h}": lead_mae_test_last,
+        "leadtime_mae_val_h_last": lead_mae_val_last,
+        "leadtime_mae_test_h_last": lead_mae_test_last,
+        "leadtime_metrics": lead_df.to_dict(orient="records"),
         "metric_suite_val": val_metric_suite,
         "metric_suite_test": test_metric_suite,
         "mae_val": val_metric_suite.get("mae"),
         "rmse_val": val_metric_suite.get("rmse"),
+        "mape_val": val_metric_suite.get("mape"),
         "wmape_val": val_metric_suite.get("wmape"),
+        "r2_val": val_metric_suite.get("r2"),
         "mbe_val": val_metric_suite.get("mbe"),
         "over_prediction_ratio_val": val_metric_suite.get("over_prediction_ratio"),
         "mae_test": test_metric_suite.get("mae"),
         "rmse_test": test_metric_suite.get("rmse"),
+        "mape_test": test_metric_suite.get("mape"),
         "wmape_test": test_metric_suite.get("wmape"),
+        "r2_test": test_metric_suite.get("r2"),
         "mbe_test": test_metric_suite.get("mbe"),
         "over_prediction_ratio_test": test_metric_suite.get("over_prediction_ratio"),
         "directional_accuracy_test": test_metric_suite.get("directional_accuracy"),
         "gate_closure_hour_local": gate_hour,
         "gate_closure_metrics_val": val_gate,
         "gate_closure_metrics_test": test_gate,
-        "timing_fit_seconds": fit_seconds,
+        "timing_fit_seconds_total": fit_seconds_total,
+        "trained_leads": sorted(int(k) for k in lead_models.keys()),
     }
-    return pipe, metrics, pred_frames, long_frames
+    return lead_models, metrics, pred_frames, long_frames
 
 
 def _build_cli() -> argparse.ArgumentParser:
@@ -331,6 +450,7 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--run-dir", default="", help="Run directory under artifacts/model_runs.")
     p.add_argument("--model-name", default="linear_ridge_v1")
     p.add_argument("--alpha", type=float, default=1.0)
+    p.add_argument("--forecast-horizon-hours", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--metrics-json-out", default="")
     p.add_argument("--metrics-csv-out", default="")
@@ -363,17 +483,24 @@ def main() -> None:
         )
     tgt = target_cols[0]
 
-    pipe, metrics, pred_frames, long_frames = _train_target(
+    lead_models, metrics, pred_frames, long_frames = _train_target(
         base_dir=Path(args.base_dir),
         bundle=args.bundle,
         target_col=tgt,
         alpha=float(args.alpha),
         model_name=args.model_name,
+        forecast_horizon_hours=max(1, int(args.forecast_horizon_hours)),
     )
 
     file_tag = f"linear_{args.bundle}_{tgt.replace('target_', '')}"
     model_path = model_dir / f"{file_tag}_model.joblib"
-    joblib.dump(pipe, model_path)
+    model_payload: dict[str, Any] = {
+        "model_family": "linear_ridge",
+        "target_col": tgt,
+        "forecast_horizon_hours": int(max(1, int(args.forecast_horizon_hours))),
+        "lead_models": lead_models,
+    }
+    joblib.dump(model_payload, model_path)
 
     pred_col = _pred_column_names_for_target(tgt)[0]
     pred_val_path = pred_dir / f"{file_tag}_val.parquet"
@@ -428,12 +555,16 @@ def main() -> None:
         "n_features": int(metrics["n_features"]),
         "mae_val": metrics.get("mae_val"),
         "rmse_val": metrics.get("rmse_val"),
+        "mape_val": metrics.get("mape_val"),
         "wmape_val": metrics.get("wmape_val"),
+        "r2_val": metrics.get("r2_val"),
         "mbe_val": metrics.get("mbe_val"),
         "over_prediction_ratio_val": metrics.get("over_prediction_ratio_val"),
         "mae_test": metrics.get("mae_test"),
         "rmse_test": metrics.get("rmse_test"),
+        "mape_test": metrics.get("mape_test"),
         "wmape_test": metrics.get("wmape_test"),
+        "r2_test": metrics.get("r2_test"),
         "mbe_test": metrics.get("mbe_test"),
         "over_prediction_ratio_test": metrics.get("over_prediction_ratio_test"),
         "directional_accuracy_test": metrics.get("directional_accuracy_test"),

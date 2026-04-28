@@ -80,6 +80,27 @@ def _load_summary_rows(run_dir: Path, expected_split: str) -> pd.DataFrame:
     return df
 
 
+def _load_gate_time_rows(run_dir: Path, expected_split: str) -> pd.DataFrame:
+    p = run_dir / f"{expected_split}_gate_time_metrics_by_target.csv"
+    if not p.exists():
+        return pd.DataFrame()
+    d = pd.read_csv(p)
+    if d.empty:
+        return d
+    d["prediction_column"] = d["prediction_column"].astype(str)
+    return d
+
+
+def _load_spread_metrics(run_dir: Path, expected_split: str) -> dict[str, Any]:
+    p = run_dir / f"{expected_split}_gate_time_spread_metrics.json"
+    if not p.exists():
+        return {}
+    try:
+        return _read_json(p)
+    except Exception:
+        return {}
+
+
 def _load_context_checksums(run_dir: Path) -> dict[str, Any]:
     p = run_dir / "training_run_context.json"
     if not p.exists():
@@ -89,27 +110,39 @@ def _load_context_checksums(run_dir: Path) -> dict[str, Any]:
 
 
 def _score_row(row: pd.Series) -> dict[str, float]:
+    gate_dplus1_mae = _safe_float(row.get("gate_dplus1_mae"))
     gate_mae = _safe_float(row.get("gate_mae"))
     mae = _safe_float(row.get("mae_mean"))
-    err_ref = gate_mae if np.isfinite(gate_mae) else mae
+    err_ref = gate_dplus1_mae if np.isfinite(gate_dplus1_mae) else (gate_mae if np.isfinite(gate_mae) else mae)
     err_score = 1.0 / (1.0 + max(0.0, err_ref)) if np.isfinite(err_ref) else 0.0
 
-    dir_acc = _safe_float(row.get("directional_accuracy"))
+    dir_acc = _safe_float(row.get("gate_dplus1_directional_accuracy"))
+    if not np.isfinite(dir_acc):
+        dir_acc = _safe_float(row.get("directional_accuracy"))
     dir_score = float(np.clip(dir_acc, 0.0, 1.0)) if np.isfinite(dir_acc) else 0.5
 
-    acc = _safe_float(row.get("gate_acceptance_rate"))
-    acc_score = float(np.clip(acc, 0.0, 1.0)) if np.isfinite(acc) else 0.5
+    spread_err = _safe_float(row.get("spread_directional_error"))
+    spread_score = float(np.clip(1.0 - spread_err, 0.0, 1.0)) if np.isfinite(spread_err) else 0.5
 
     spike_mae = _safe_float(row.get("spike_mae_top5_h1"))
     spike_score = 1.0 / (1.0 + max(0.0, spike_mae)) if np.isfinite(spike_mae) else err_score
 
-    # Trading-relevance composite: gate-critical error + direction + acceptance + spike handling.
-    composite = 0.45 * err_score + 0.25 * dir_score + 0.20 * acc_score + 0.10 * spike_score
+    # Global sanity check: penalize catastrophic global behavior without dominating gate-time score.
+    global_err_score = 1.0 / (1.0 + max(0.0, mae)) if np.isfinite(mae) else 0.0
+    sanity_penalty = 0.0
+    if np.isfinite(mae) and np.isfinite(gate_dplus1_mae) and mae > 3.0 * max(gate_dplus1_mae, 1e-9):
+        sanity_penalty = 0.05
+
+    # Gate-time-first composite.
+    composite = 0.55 * err_score + 0.25 * spread_score + 0.10 * dir_score + 0.05 * spike_score + 0.05 * global_err_score
+    composite = max(0.0, composite - sanity_penalty)
     return {
         "score_err_component": err_score,
+        "score_spread_component": spread_score,
         "score_dir_component": dir_score,
-        "score_accept_component": acc_score,
         "score_spike_component": spike_score,
+        "score_global_sanity_component": global_err_score,
+        "score_sanity_penalty": sanity_penalty,
         "score_trading_relevance": composite,
     }
 
@@ -150,7 +183,9 @@ def _protocol_audit(
         common_preds, union_preds = [], []
 
     gate_present = False
-    if "gate_mae" in score_df.columns:
+    if "gate_dplus1_mae" in score_df.columns:
+        gate_present = bool(pd.to_numeric(score_df["gate_dplus1_mae"], errors="coerce").notna().any())
+    elif "gate_mae" in score_df.columns:
         gate_present = bool(pd.to_numeric(score_df["gate_mae"], errors="coerce").notna().any())
 
     return {
@@ -236,12 +271,45 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     frames: list[pd.DataFrame] = []
+    spread_rows: list[dict[str, Any]] = []
     for rd, lbl in zip(run_dirs, labels):
         sdf = _load_summary_rows(rd, expected_split=args.split)
+        gdf = _load_gate_time_rows(rd, expected_split=args.split)
+        if not gdf.empty:
+            # Primary strict metric per target: protocol strict_dplus1 at target-specific default gate.
+            gsmall = (
+                gdf[gdf["protocol"].astype(str) == "strict_dplus1"]
+                .sort_values(["prediction_column", "n_rows_gate_dplus1"], ascending=[True, False])
+                .groupby("prediction_column", as_index=False)
+                .head(1)
+            )
+            keep = [
+                "prediction_column",
+                "gate_dplus1_mae",
+                "gate_dplus1_rmse",
+                "gate_dplus1_mbe",
+                "gate_dplus1_directional_accuracy",
+                "n_rows_gate_dplus1",
+            ]
+            gsmall = gsmall[[c for c in keep if c in gsmall.columns]].drop_duplicates(subset=["prediction_column"])
+            sdf = sdf.merge(gsmall, on="prediction_column", how="left")
         sdf["model_label"] = lbl
         sdf["run_dir"] = str(rd.resolve())
         frames.append(sdf)
+        spread = _load_spread_metrics(rd, expected_split=args.split)
+        spread_rows.append(
+            {
+                "model_label": lbl,
+                "run_dir": str(rd.resolve()),
+                "spread_directional_error": _safe_float(spread.get("spread_directional_error")),
+                "spread_directional_accuracy": _safe_float(spread.get("spread_directional_accuracy")),
+                "spread_n_rows": _safe_float(spread.get("n_rows")),
+            }
+        )
     all_df = pd.concat(frames, axis=0, ignore_index=True)
+    spread_df = pd.DataFrame(spread_rows)
+    if not spread_df.empty:
+        all_df = all_df.merge(spread_df[["model_label", "spread_directional_error", "spread_directional_accuracy", "spread_n_rows"]], on="model_label", how="left")
 
     # Fair comparison: keep common targets only.
     pred_sets = {

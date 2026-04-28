@@ -58,19 +58,52 @@ def get_color(role: str, default: str = "#333333") -> str:
 
 
 def apply_geo_style() -> None:
-    """Apply global matplotlib style for scientific thesis plots."""
+    """Apply global plotting style for scientific thesis plots."""
+    # Keep seaborn optional to avoid hard dependency in scripts.
+    try:
+        import seaborn as sns  # type: ignore
+
+        sns.set_theme(style="whitegrid", context="paper")
+    except Exception:
+        pass
+
+    # Deterministic default color cycle aligned to semantic roles.
+    color_cycle = [
+        THESIS_PALETTE["primary"],
+        THESIS_PALETTE["secondary"],
+        THESIS_PALETTE["tertiary"],
+        THESIS_PALETTE["neutral_dark"],
+    ]
+
     plt.rcParams.update(
         {
             "font.family": "sans-serif",
+            "figure.dpi": 140,
+            "savefig.dpi": 300,
             "figure.figsize": (12, 6),
+            "axes.titlesize": 13,
+            "axes.labelsize": 11,
+            "axes.titleweight": "semibold",
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "legend.fontsize": 9,
+            "legend.frameon": True,
+            "lines.linewidth": 2.0,
+            "lines.markersize": 5.0,
+            "axes.prop_cycle": plt.cycler(color=color_cycle),
             "axes.grid": True,
             "axes.axisbelow": True,
             "grid.color": "#EEEEEE",
-            "grid.linestyle": "--",
+            "grid.linestyle": "-",
+            "grid.alpha": 0.35,
             "patch.edgecolor": "#333333",
             "patch.linewidth": 0.8,
             "patch.force_edgecolor": True,
             "axes.spines.top": False,
             "axes.spines.right": False,
+            "axes.facecolor": "white",
+            "figure.facecolor": "white",
+            "savefig.facecolor": "white",
+            "savefig.bbox": "tight",
         }
     )

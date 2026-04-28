@@ -39,6 +39,28 @@ def _wmape(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
     return num / denom
 
 
+def _mape(y_true: np.ndarray, y_pred: np.ndarray, *, eps: float = 1e-8) -> float | None:
+    mask = np.isfinite(y_true) & np.isfinite(y_pred) & (np.abs(y_true) > eps)
+    if not mask.any():
+        return None
+    ape = np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])
+    return float(np.mean(ape))
+
+
+def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if int(mask.sum()) < 2:
+        return None
+    yt = y_true[mask]
+    yp = y_pred[mask]
+    ss_res = float(np.sum((yt - yp) ** 2))
+    y_bar = float(np.mean(yt))
+    ss_tot = float(np.sum((yt - y_bar) ** 2))
+    if ss_tot <= 1e-12:
+        return None
+    return float(1.0 - (ss_res / ss_tot))
+
+
 def _directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
     if y_true.size < 2 or y_pred.size < 2:
         return None
@@ -120,7 +142,9 @@ def compute_forecast_metrics(
         "n_rows_scored": int(base_mask.sum()),
         "mae": None,
         "rmse": None,
+        "mape": None,
         "wmape": None,
+        "r2": None,
         "directional_accuracy": None,
         "mbe": None,
         "over_prediction_ratio": None,
@@ -131,7 +155,9 @@ def compute_forecast_metrics(
         sq_err = (yt - yp) ** 2
         out["mae"] = _safe_mean(abs_err)
         out["rmse"] = _safe_scalar(float(np.sqrt(np.nanmean(sq_err))))
+        out["mape"] = _mape(yt, yp)
         out["wmape"] = _wmape(yt, yp)
+        out["r2"] = _r2(yt, yp)
         out["directional_accuracy"] = _directional_accuracy(yt, yp)
         out["mbe"] = _mbe(yt, yp)
         out["over_prediction_ratio"] = _over_prediction_ratio(yt, yp)

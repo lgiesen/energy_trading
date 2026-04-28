@@ -30,6 +30,7 @@ from energy_trading.evaluation.metrics import (  # noqa: E402
     compute_gate_closure_metrics,
     gate_hour_for_target,
 )
+from energy_trading.evaluation.gate_synced_analysis import gate_time_dplus1_filter  # noqa: E402
 from energy_trading.visualization.style import apply_geo_style, get_color  # noqa: E402
 
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -186,7 +187,9 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
                     "n": 0.0,
                     "mae": np.nan,
                     "rmse": np.nan,
+                    "mape": np.nan,
                     "wmape": np.nan,
+                    "r2": np.nan,
                     "mbe": np.nan,
                     "over_prediction_ratio": np.nan,
                     "pinball_mean": np.nan,
@@ -234,7 +237,9 @@ def _compute_metrics_by_lead(df: pd.DataFrame) -> pd.DataFrame:
                 "n": float(int(valid.sum())),
                 "mae": mae,
                 "rmse": rmse,
+                "mape": lead_suite.get("mape"),
                 "wmape": lead_suite.get("wmape"),
+                "r2": lead_suite.get("r2"),
                 "mbe": lead_suite.get("mbe"),
                 "over_prediction_ratio": lead_suite.get("over_prediction_ratio"),
                 "pinball_mean": pinball_mean,
@@ -716,12 +721,14 @@ def _write_latex_summary_table(summary_df: pd.DataFrame, out_path: Path) -> None
             "truth_column",
             "mae_mean",
             "rmse_mean",
+            "mape_mean",
             "pinball_mean",
             "wis_mean",
             "skill_score_mae_mean",
             "skill_score_rmse_mean",
             "average_calibration_error",
             "sharpness_mean",
+            "r2_mean",
             "directional_accuracy",
             "event_f1",
         ]
@@ -732,12 +739,14 @@ def _write_latex_summary_table(summary_df: pd.DataFrame, out_path: Path) -> None
             "truth_column": "Truth",
             "mae_mean": "MAE",
             "rmse_mean": "RMSE",
+            "mape_mean": "MAPE",
             "pinball_mean": "Pinball",
             "wis_mean": "WIS",
             "skill_score_mae_mean": "SkillScore",
             "skill_score_rmse_mean": "SkillScoreRMSE",
             "average_calibration_error": "ACE",
             "sharpness_mean": "Sharpness",
+            "r2_mean": "R2",
             "directional_accuracy": "HitRate",
             "event_f1": "EventF1",
         }
@@ -768,6 +777,14 @@ def _build_cli() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Lead time used for the calibration window plot (default: 1).",
+    )
+    p.add_argument(
+        "--gate-hours-local",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Optional gate-hour override(s), e.g. --gate-hours-local 8 11. "
+        "If omitted, strict protocol is used (aFRR=08, DA=11 local time).",
     )
     return p
 
@@ -804,6 +821,8 @@ def main() -> None:
 
     all_metrics: dict[str, pd.DataFrame] = {}
     avg_summary_rows: list[dict[str, Any]] = []
+    gate_time_rows: list[dict[str, Any]] = []
+    enriched_by_pred: dict[str, pd.DataFrame] = {}
 
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -825,6 +844,7 @@ def main() -> None:
         d = df.copy()
         d["y_true"] = pd.to_numeric(truth_by_ts.reindex(d["target_time_utc"]).values, errors="coerce")
         d["naive_24h"] = _naive_24h_for_target_times(d["target_time_utc"], truth_by_ts)
+        enriched_by_pred[pred_col] = d.copy()
         coverage_df = _compute_quantile_coverage(d)
         coverage_by_prediction[pred_col] = coverage_df
         ace = _average_calibration_error(coverage_df)
@@ -849,6 +869,76 @@ def main() -> None:
                 target_time_col="target_time_utc",
             )
 
+        # Strict execution-relevant gate-time protocol (D+1 delivery slice).
+        gate_hours = args.gate_hours_local if args.gate_hours_local else [None]
+        for gate_h_override in gate_hours:
+            d_gate_eval = gate_time_dplus1_filter(
+                d,
+                pred_col=pred_col,
+                local_tz="Europe/Berlin",
+                gate_hour_override=gate_h_override,
+            )
+            if d_gate_eval.empty:
+                gate_time_rows.append(
+                    {
+                        "prediction_column": pred_col,
+                        "truth_column": truth_col,
+                        "gate_hour_local": gate_h_override if gate_h_override is not None else gate_h,
+                        "protocol": "strict_dplus1",
+                        "n_rows_gate_dplus1": 0,
+                        "gate_dplus1_mae": np.nan,
+                        "gate_dplus1_rmse": np.nan,
+                        "gate_dplus1_mbe": np.nan,
+                        "gate_dplus1_directional_accuracy": np.nan,
+                    }
+                )
+                continue
+            y_true = pd.to_numeric(d_gate_eval["y_true"], errors="coerce")
+            y_pred = pd.to_numeric(d_gate_eval["p50"], errors="coerce")
+            suite = compute_forecast_metrics(
+                pd.DataFrame({"y_true": y_true, "y_pred": y_pred}),
+                y_true_col="y_true",
+                y_pred_col="y_pred",
+            )
+            dir_gate = _directional_and_event_metrics(
+                d_gate_eval[["target_time_utc", "y_true", "p50"]].copy()
+            )["directional_accuracy"]
+            gate_time_rows.append(
+                {
+                    "prediction_column": pred_col,
+                    "truth_column": truth_col,
+                    "gate_hour_local": int(gate_h_override if gate_h_override is not None else gate_h),
+                    "protocol": "strict_dplus1",
+                    "n_rows_gate_dplus1": int(suite.get("n_rows_scored", 0) or 0),
+                    "gate_dplus1_mae": suite.get("mae"),
+                    "gate_dplus1_rmse": suite.get("rmse"),
+                    "gate_dplus1_mbe": suite.get("mbe"),
+                    "gate_dplus1_directional_accuracy": dir_gate,
+                }
+            )
+
+        gate_dplus1_mae = np.nan
+        gate_dplus1_rmse = np.nan
+        gate_dplus1_mbe = np.nan
+        gate_dplus1_da = np.nan
+        d_gate_default = gate_time_dplus1_filter(
+            d, pred_col=pred_col, local_tz="Europe/Berlin", gate_hour_override=None
+        )
+        if not d_gate_default.empty:
+            y_true_def = pd.to_numeric(d_gate_default["y_true"], errors="coerce")
+            y_pred_def = pd.to_numeric(d_gate_default["p50"], errors="coerce")
+            suite_def = compute_forecast_metrics(
+                pd.DataFrame({"y_true": y_true_def, "y_pred": y_pred_def}),
+                y_true_col="y_true",
+                y_pred_col="y_pred",
+            )
+            gate_dplus1_mae = suite_def.get("mae")
+            gate_dplus1_rmse = suite_def.get("rmse")
+            gate_dplus1_mbe = suite_def.get("mbe")
+            gate_dplus1_da = _directional_and_event_metrics(
+                d_gate_default[["target_time_utc", "y_true", "p50"]].copy()
+            )["directional_accuracy"]
+
         metrics_df = _compute_metrics_by_lead(d)
         all_metrics[pred_col] = metrics_df
         avg_summary_rows.append(
@@ -857,7 +947,9 @@ def main() -> None:
                 "truth_column": truth_col,
                 "mae_mean": float(metrics_df["mae"].mean()),
                 "rmse_mean": float(metrics_df["rmse"].mean()),
+                "mape_mean": float(metrics_df["mape"].mean()),
                 "wmape_mean": float(metrics_df["wmape"].mean()),
+                "r2_mean": float(metrics_df["r2"].mean()),
                 "mbe_mean": float(metrics_df["mbe"].mean()),
                 "over_prediction_ratio_mean": float(metrics_df["over_prediction_ratio"].mean()),
                 "pinball_mean": float(metrics_df["pinball_mean"].mean()),
@@ -883,6 +975,10 @@ def main() -> None:
                 "gate_rmse": gate_metrics.get("rmse_gate"),
                 "gate_acceptance_rate": gate_metrics.get("acceptance_rate_gate"),
                 "gate_n_rows": gate_metrics.get("n_rows_gate"),
+                "gate_dplus1_mae": gate_dplus1_mae,
+                "gate_dplus1_rmse": gate_dplus1_rmse,
+                "gate_dplus1_mbe": gate_dplus1_mbe,
+                "gate_dplus1_directional_accuracy": gate_dplus1_da,
             }
         )
         _plot_spike_top5_window(
@@ -943,6 +1039,52 @@ def main() -> None:
     for pred_col, cdf in lag_crosscorr_by_prediction.items():
         cdf.to_csv(run_dir / f"{args.split}_{pred_col}_lag_crosscorr.csv", index=False)
 
+    # Spread directional allocation error (DA vs aFRR capacity pos), strict gate-time D+1.
+    spread_metrics = {
+        "prediction_pair": ["pred_da_price", "pred_afrr_capacity_price_pos"],
+        "n_rows": 0,
+        "spread_directional_accuracy": np.nan,
+        "spread_directional_error": np.nan,
+    }
+    if "pred_da_price" in enriched_by_pred and "pred_afrr_capacity_price_pos" in enriched_by_pred:
+        da_gate = gate_time_dplus1_filter(
+            enriched_by_pred["pred_da_price"], pred_col="pred_da_price", local_tz="Europe/Berlin"
+        )
+        cap_gate = gate_time_dplus1_filter(
+            enriched_by_pred["pred_afrr_capacity_price_pos"],
+            pred_col="pred_afrr_capacity_price_pos",
+            local_tz="Europe/Berlin",
+        )
+        if not da_gate.empty and not cap_gate.empty:
+            da_small = da_gate[["target_time_utc", "y_true", "p50"]].rename(
+                columns={"y_true": "da_true", "p50": "da_pred"}
+            )
+            cap_small = cap_gate[["target_time_utc", "y_true", "p50"]].rename(
+                columns={"y_true": "cap_true", "p50": "cap_pred"}
+            )
+            m = da_small.merge(cap_small, on="target_time_utc", how="inner")
+            if not m.empty:
+                true_sign = np.sign(pd.to_numeric(m["da_true"], errors="coerce") - pd.to_numeric(m["cap_true"], errors="coerce"))
+                pred_sign = np.sign(pd.to_numeric(m["da_pred"], errors="coerce") - pd.to_numeric(m["cap_pred"], errors="coerce"))
+                valid = np.isfinite(true_sign) & np.isfinite(pred_sign)
+                if bool(np.any(valid)):
+                    acc = float(np.mean(true_sign[valid] == pred_sign[valid]))
+                    spread_metrics = {
+                        "prediction_pair": ["pred_da_price", "pred_afrr_capacity_price_pos"],
+                        "n_rows": int(np.sum(valid)),
+                        "spread_directional_accuracy": acc,
+                        "spread_directional_error": float(1.0 - acc),
+                    }
+
+    if gate_time_rows:
+        gate_df = pd.DataFrame(gate_time_rows).sort_values(
+            ["prediction_column", "gate_hour_local"]
+        )
+        gate_df.to_csv(run_dir / f"{args.split}_gate_time_metrics_by_target.csv", index=False)
+    (run_dir / f"{args.split}_gate_time_spread_metrics.json").write_text(
+        json.dumps(spread_metrics, indent=2), encoding="utf-8"
+    )
+
     summary_payload = {
         "run_dir": str(run_dir.resolve()),
         "split": args.split,
@@ -964,6 +1106,9 @@ def main() -> None:
     print("\nSaved:")
     print(f"- {run_dir / 'summary_metrics.json'}")
     print(f"- {run_dir / 'summary_metrics.tex'}")
+    if gate_time_rows:
+        print(f"- {run_dir / f'{args.split}_gate_time_metrics_by_target.csv'}")
+    print(f"- {run_dir / f'{args.split}_gate_time_spread_metrics.json'}")
     print(f"- {plots_dir}")
 
 

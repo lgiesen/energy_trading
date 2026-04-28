@@ -50,15 +50,48 @@ def _safe_git_commit() -> str | None:
         return None
 
 
-def _run_train_cmd(cmd: list[str]) -> dict[str, object]:
+def _slugify_token(value: str) -> str:
+    out = "".join(ch if (ch.isalnum() or ch in {"_", "-", "."}) else "_" for ch in str(value))
+    out = out.strip("._")
+    return out or "cmd"
+
+
+def _isoformat_or_none(ts: pd.Timestamp | None) -> str | None:
+    if ts is None or pd.isna(ts):
+        return None
+    return pd.Timestamp(ts).isoformat()
+
+
+def _run_train_cmd(cmd: list[str], *, run_dir: Path, log_stem: str) -> dict[str, object]:
     shell_cmd = _cmd_to_shell_string(cmd)
     print("[CMD]", shell_cmd)
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{_slugify_token(log_stem)}.log"
     t0 = time.time()
-    subprocess.run(cmd, check=True)
+    return_code = 0
+    with log_path.open("w", encoding="utf-8") as log_f:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            log_f.write(line)
+        proc.wait()
+        return_code = int(proc.returncode or 0)
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd)
     t1 = time.time()
     return {
         "command": cmd,
         "command_shell": shell_cmd,
+        "return_code": return_code,
+        "log_path": str(log_path.resolve()),
         "started_at_utc": datetime.fromtimestamp(t0, tz=timezone.utc).isoformat(),
         "finished_at_utc": datetime.fromtimestamp(t1, tz=timezone.utc).isoformat(),
         "duration_seconds": float(t1 - t0),
@@ -165,6 +198,306 @@ def _bundle_input_checksums(base_dir: str | Path) -> dict[str, object]:
     return out
 
 
+def _bundle_data_integrity_report(base_dir: str | Path) -> dict[str, object]:
+    """Build hard-proof checks for split alignment and leakage assertions."""
+    root = Path(base_dir)
+    cfg_path = root / "feature_config.json"
+    out: dict[str, object] = {
+        "base_dir": str(root.resolve()),
+        "config_path": str(cfg_path.resolve()),
+        "config_exists": cfg_path.exists(),
+        "splits": {},
+        "bundles": {},
+        "passed": True,
+        "failures": [],
+    }
+    if not cfg_path.exists():
+        out["passed"] = False
+        out["failures"].append("feature_config.json missing")
+        return out
+
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    split_cfg = cfg.get("splits", {}) or {}
+    train_end = pd.to_datetime(split_cfg.get("train_end_exclusive"), utc=True, errors="coerce")
+    val_end = pd.to_datetime(split_cfg.get("val_end_exclusive"), utc=True, errors="coerce")
+    test_end = pd.to_datetime(split_cfg.get("test_end_inclusive"), utc=True, errors="coerce")
+    out["splits"] = {
+        "train_end_exclusive": _isoformat_or_none(train_end),
+        "val_end_exclusive": _isoformat_or_none(val_end),
+        "test_end_inclusive": _isoformat_or_none(test_end),
+        "purge_gap_rows": int(split_cfg.get("purge_gap_rows", 0)),
+    }
+
+    bundles = cfg.get("bundles", {}) or {}
+    for bundle_name, bcfg in bundles.items():
+        features = [str(c) for c in (bcfg.get("features", []) or [])]
+        targets = [str(c) for c in (bcfg.get("targets", []) or [])]
+        files = bcfg.get("files", {}) or {}
+        bundle_rec: dict[str, object] = {
+            "n_features": len(features),
+            "n_targets": len(targets),
+            "files": {},
+            "leakage_assertions": {},
+            "split_alignment": {},
+            "passed": True,
+            "failures": [],
+        }
+
+        feature_target_overlap = sorted(set(features).intersection(targets))
+        feature_target_prefixed = sorted([c for c in features if c.startswith("target_")])
+        bundle_rec["leakage_assertions"] = {
+            "feature_target_overlap_count": len(feature_target_overlap),
+            "feature_target_overlap_sample": feature_target_overlap[:20],
+            "target_prefixed_features_count": len(feature_target_prefixed),
+            "target_prefixed_features_sample": feature_target_prefixed[:20],
+        }
+        if feature_target_overlap:
+            bundle_rec["passed"] = False
+            bundle_rec["failures"].append("features overlap with targets")
+
+        split_dfs: dict[str, pd.DataFrame] = {}
+        split_ts_sets: dict[str, set[pd.Timestamp]] = {}
+        for split_name in ("train", "val", "test"):
+            p_raw = files.get(split_name, "")
+            p = Path(p_raw) if p_raw else Path("")
+            split_info = {
+                "path": str(p.resolve()) if p_raw else "",
+                "exists": bool(p_raw) and p.exists(),
+                "rows": 0,
+                "timestamp_min": None,
+                "timestamp_max": None,
+                "timestamp_monotonic_non_decreasing": None,
+                "timestamp_duplicate_count": None,
+                "timestamp_null_count": None,
+                "missing_feature_columns_count": None,
+                "missing_feature_columns_sample": [],
+                "missing_target_columns_count": None,
+                "missing_target_columns_sample": [],
+            }
+            if split_info["exists"]:
+                df = pd.read_parquet(p)
+                if "timestamp_utc" not in df.columns:
+                    bundle_rec["passed"] = False
+                    bundle_rec["failures"].append(f"{split_name}: timestamp_utc missing")
+                else:
+                    ts = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+                    split_info["rows"] = int(len(df))
+                    split_info["timestamp_null_count"] = int(ts.isna().sum())
+                    ts_clean = ts.dropna()
+                    split_info["timestamp_min"] = _isoformat_or_none(ts_clean.min() if not ts_clean.empty else None)
+                    split_info["timestamp_max"] = _isoformat_or_none(ts_clean.max() if not ts_clean.empty else None)
+                    split_info["timestamp_monotonic_non_decreasing"] = bool(ts_clean.is_monotonic_increasing)
+                    split_info["timestamp_duplicate_count"] = int(ts_clean.duplicated().sum())
+                    split_ts_sets[split_name] = set(pd.DatetimeIndex(ts_clean))
+                    split_dfs[split_name] = pd.DataFrame({"timestamp_utc": ts_clean})
+                    if split_info["timestamp_null_count"] > 0:
+                        bundle_rec["passed"] = False
+                        bundle_rec["failures"].append(f"{split_name}: null timestamps > 0")
+                    if split_info["timestamp_duplicate_count"] > 0:
+                        bundle_rec["passed"] = False
+                        bundle_rec["failures"].append(f"{split_name}: duplicate timestamps > 0")
+
+                cols = set(df.columns)
+                missing_features = [c for c in features if c not in cols]
+                missing_targets = [c for c in targets if c not in cols]
+                split_info["missing_feature_columns_count"] = len(missing_features)
+                split_info["missing_feature_columns_sample"] = missing_features[:20]
+                split_info["missing_target_columns_count"] = len(missing_targets)
+                split_info["missing_target_columns_sample"] = missing_targets[:20]
+                if missing_features:
+                    bundle_rec["passed"] = False
+                    bundle_rec["failures"].append(f"{split_name}: missing configured feature columns")
+                if missing_targets:
+                    bundle_rec["passed"] = False
+                    bundle_rec["failures"].append(f"{split_name}: missing configured target columns")
+            else:
+                bundle_rec["passed"] = False
+                bundle_rec["failures"].append(f"{split_name}: split file missing")
+            bundle_rec["files"][split_name] = split_info
+
+        # Split alignment proofs (no overlap + chronological order).
+        train_ts = split_ts_sets.get("train", set())
+        val_ts = split_ts_sets.get("val", set())
+        test_ts = split_ts_sets.get("test", set())
+        overlap_train_val = int(len(train_ts.intersection(val_ts)))
+        overlap_train_test = int(len(train_ts.intersection(test_ts)))
+        overlap_val_test = int(len(val_ts.intersection(test_ts)))
+        train_max = pd.Timestamp(max(train_ts)) if train_ts else None
+        val_min = pd.Timestamp(min(val_ts)) if val_ts else None
+        val_max = pd.Timestamp(max(val_ts)) if val_ts else None
+        test_min = pd.Timestamp(min(test_ts)) if test_ts else None
+
+        align = {
+            "timestamp_overlap_train_val": overlap_train_val,
+            "timestamp_overlap_train_test": overlap_train_test,
+            "timestamp_overlap_val_test": overlap_val_test,
+            "train_max_lt_val_min": bool(train_max < val_min) if train_max is not None and val_min is not None else None,
+            "val_max_lt_test_min": bool(val_max < test_min) if val_max is not None and test_min is not None else None,
+            "train_max": _isoformat_or_none(train_max),
+            "val_min": _isoformat_or_none(val_min),
+            "val_max": _isoformat_or_none(val_max),
+            "test_min": _isoformat_or_none(test_min),
+        }
+        if train_max is not None and pd.notna(train_end):
+            align["train_max_lt_train_end_exclusive"] = bool(train_max < train_end)
+        if val_min is not None and pd.notna(train_end):
+            align["val_min_ge_train_end_exclusive"] = bool(val_min >= train_end)
+        if val_max is not None and pd.notna(val_end):
+            align["val_max_lt_val_end_exclusive"] = bool(val_max < val_end)
+        if test_min is not None and pd.notna(val_end):
+            align["test_min_ge_val_end_exclusive"] = bool(test_min >= val_end)
+        bundle_rec["split_alignment"] = align
+        if overlap_train_val or overlap_train_test or overlap_val_test:
+            bundle_rec["passed"] = False
+            bundle_rec["failures"].append("timestamp overlap between splits")
+        if align.get("train_max_lt_val_min") is False:
+            bundle_rec["passed"] = False
+            bundle_rec["failures"].append("train max timestamp is not < val min timestamp")
+        if align.get("val_max_lt_test_min") is False:
+            bundle_rec["passed"] = False
+            bundle_rec["failures"].append("val max timestamp is not < test min timestamp")
+
+        out["bundles"][bundle_name] = bundle_rec
+        if not bundle_rec["passed"]:
+            out["passed"] = False
+            for msg in bundle_rec["failures"]:
+                out["failures"].append(f"{bundle_name}: {msg}")
+    return out
+
+
+def _infer_prediction_family(pred_col: str) -> str:
+    p = str(pred_col).lower()
+    if "activation_rate" in p:
+        return "activation_rate"
+    if "activation_price" in p:
+        return "activation_price"
+    if "capacity_price" in p:
+        return "capacity_price"
+    if "da_price" in p:
+        return "da_price"
+    return "other"
+
+
+def _prediction_output_quality_report(
+    *,
+    da_meta: dict[str, object],
+    afrr_meta_list: list[dict[str, object]],
+    afrr_pred_val: Path,
+    afrr_pred_test: Path,
+) -> dict[str, object]:
+    """Centralized quality checks for prediction artifacts."""
+    report: dict[str, object] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "files_checked": [],
+        "summary": {
+            "n_files": 0,
+            "n_failures": 0,
+            "n_warnings": 0,
+        },
+        "passed": True,
+    }
+
+    checks: list[tuple[str, Path, str | None, str]] = []
+    # Wide DA files
+    for split, p in (da_meta.get("predictions", {}) or {}).items():
+        checks.append((f"da_wide_{split}", Path(p), None, "wide"))
+    # Wide merged aFRR files
+    checks.append(("afrr_wide_val", afrr_pred_val, None, "wide"))
+    checks.append(("afrr_wide_test", afrr_pred_test, None, "wide"))
+    # Long DA files
+    for split, pred_map in (da_meta.get("predictions_long", {}) or {}).items():
+        for pred_col, p in (pred_map or {}).items():
+            checks.append((f"da_long_{split}_{pred_col}", Path(p), pred_col, "long"))
+    # Long aFRR files
+    for meta in afrr_meta_list:
+        for split, pred_map in (meta.get("predictions_long", {}) or {}).items():
+            for pred_col, p in (pred_map or {}).items():
+                checks.append((f"afrr_long_{split}_{pred_col}", Path(p), pred_col, "long"))
+
+    dedup: dict[str, tuple[str, Path, str | None, str]] = {}
+    for rec in checks:
+        _, path, _, _ = rec
+        dedup[str(path.resolve())] = rec
+    checks = list(dedup.values())
+
+    for file_id, path, pred_col_hint, file_kind in checks:
+        rec: dict[str, object] = {
+            "file_id": file_id,
+            "path": str(path.resolve()),
+            "kind": file_kind,
+            "exists": path.exists(),
+            "rows": 0,
+            "pred_columns_checked": [],
+            "failures": [],
+            "warnings": [],
+        }
+        if not path.exists():
+            rec["failures"].append("missing file")
+            report["files_checked"].append(rec)
+            continue
+
+        df = pd.read_parquet(path)
+        rec["rows"] = int(len(df))
+        if len(df) == 0:
+            rec["failures"].append("empty file")
+            report["files_checked"].append(rec)
+            continue
+
+        pred_cols: list[str] = []
+        if file_kind == "long":
+            if "predicted_value" in df.columns:
+                pred_cols.append("predicted_value")
+            pred_cols += [c for c in df.columns if c.lower() in {"p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80", "p90"}]
+            if not pred_cols:
+                rec["failures"].append("no prediction columns found in long file")
+        else:
+            pred_cols = [c for c in df.columns if str(c).startswith("pred_")]
+            if not pred_cols:
+                rec["warnings"].append("no pred_* columns found in wide file")
+
+        for c in sorted(set(pred_cols)):
+            s = pd.to_numeric(df[c], errors="coerce")
+            nan_count = int(s.isna().sum())
+            inf_count = int(np.isinf(s.to_numpy(dtype=float, na_value=np.nan)).sum()) if len(s) else 0
+            min_v = float(s.min()) if s.notna().any() else None
+            max_v = float(s.max()) if s.notna().any() else None
+            csum = {
+                "column": c,
+                "nan_count": nan_count,
+                "inf_count": inf_count,
+                "min": min_v,
+                "max": max_v,
+            }
+            family_src = pred_col_hint or c
+            fam = _infer_prediction_family(family_src)
+            if fam == "activation_rate" and s.notna().any():
+                oor = int(((s < 0.0) | (s > 1.0)).sum())
+                csum["out_of_range_0_1_count"] = oor
+                if oor > 0:
+                    rec["failures"].append(f"{c}: activation rate out of [0,1] in {oor} rows")
+            if fam in {"da_price", "activation_price", "capacity_price"} and s.notna().any():
+                extreme = int((s.abs() > 10000.0).sum())
+                csum["extreme_abs_gt_10000_count"] = extreme
+                if extreme > 0:
+                    rec["warnings"].append(f"{c}: extreme |value| > 10000 in {extreme} rows")
+            if inf_count > 0:
+                rec["failures"].append(f"{c}: contains inf values ({inf_count})")
+            rec["pred_columns_checked"].append(csum)
+
+        report["files_checked"].append(rec)
+
+    n_fail = 0
+    n_warn = 0
+    for r in report["files_checked"]:
+        n_fail += len(r.get("failures", []))
+        n_warn += len(r.get("warnings", []))
+    report["summary"]["n_files"] = len(report["files_checked"])
+    report["summary"]["n_failures"] = int(n_fail)
+    report["summary"]["n_warnings"] = int(n_warn)
+    report["passed"] = bool(n_fail == 0)
+    return report
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train and export DA+aFRR model run artifacts.")
     p.add_argument("--base-dir", default="data/model_input")
@@ -202,6 +535,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stack-cv-test-size", type=int, default=24 * 7)
     p.add_argument("--stack-cv-gap-hours", type=int, default=72)
     p.add_argument("--skip-latest-pointer", action="store_true")
+    p.add_argument(
+        "--strict-data-integrity",
+        action="store_true",
+        help="Fail the run if generated data-integrity proof report contains failing assertions.",
+    )
+    p.add_argument(
+        "--strict-output-correctness",
+        action="store_true",
+        help="Fail the run if centralized prediction output quality checks detect failures.",
+    )
     return p.parse_args()
 
 
@@ -246,7 +589,7 @@ def main() -> None:
         ]
         if args.allow_cpu:
             stack_cmd.append("--allow-cpu")
-        cmd_records.append(_run_train_cmd(stack_cmd))
+        cmd_records.append(_run_train_cmd(stack_cmd, run_dir=run_dir, log_stem="00_build_afrr_da_stacking_feature"))
         afrr_base_dir = args.stacked_base_dir
 
     if args.model_type == "xgboost":
@@ -315,6 +658,8 @@ def main() -> None:
             str(run_dir),
             "--alpha",
             "1.0",
+            "--forecast-horizon-hours",
+            str(args.forecast_horizon_hours),
             "--seed",
             str(args.seed),
         ]
@@ -322,7 +667,7 @@ def main() -> None:
     # Train DA model.
     cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]
     cmd_da = [*cmd_da, "--base-dir", args.base_dir]
-    cmd_records.append(_run_train_cmd(cmd_da))
+    cmd_records.append(_run_train_cmd(cmd_da, run_dir=run_dir, log_stem=f"01_train_da_{args.model_type}"))
 
     # Train aFRR models target-wise to produce full canonical prediction columns.
     afrr_targets = _resolve_available_afrr_targets(afrr_base_dir)
@@ -345,7 +690,13 @@ def main() -> None:
             "--manifest-fragment-out",
             str(frag),
         ]
-        cmd_records.append(_run_train_cmd(cmd_afrr))
+        cmd_records.append(
+            _run_train_cmd(
+                cmd_afrr,
+                run_dir=run_dir,
+                log_stem=f"02_train_afrr_{args.model_type}_{tgt}",
+            )
+        )
 
     da_meta = _load_fragment(da_fragment)
     afrr_meta_list = [_load_fragment(p) for p in afrr_fragment_paths if p.exists()]
@@ -414,6 +765,15 @@ def main() -> None:
                 afrr_long_by_split.setdefault(split, {})
                 afrr_long_by_split[split][pred_col] = path
 
+    prediction_quality_report = _prediction_output_quality_report(
+        da_meta=da_meta,
+        afrr_meta_list=afrr_meta_list,
+        afrr_pred_val=afrr_pred_val,
+        afrr_pred_test=afrr_pred_test,
+    )
+    prediction_quality_report_path = run_dir / "prediction_output_quality_report.json"
+    prediction_quality_report_path.write_text(json.dumps(prediction_quality_report, indent=2), encoding="utf-8")
+
     training_context = {
         "run_id": run_id,
         "started_at_utc": run_started_utc.isoformat(),
@@ -442,14 +802,42 @@ def main() -> None:
         },
         "executed_commands": cmd_records,
     }
+    training_context["prediction_output_quality_report_path"] = str(prediction_quality_report_path.resolve())
+    training_context["prediction_output_quality_passed"] = bool(prediction_quality_report.get("passed", False))
+    data_integrity_report = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "da_base_dir_report": _bundle_data_integrity_report(args.base_dir),
+        "afrr_base_dir_report": _bundle_data_integrity_report(afrr_base_dir),
+    }
+    data_integrity_report["passed"] = bool(
+        data_integrity_report["da_base_dir_report"].get("passed", False)
+        and data_integrity_report["afrr_base_dir_report"].get("passed", False)
+    )
+    data_integrity_report_path = run_dir / "data_integrity_report.json"
+    data_integrity_report_path.write_text(json.dumps(data_integrity_report, indent=2), encoding="utf-8")
+    training_context["data_integrity_report_path"] = str(data_integrity_report_path.resolve())
+    training_context["data_integrity_passed"] = bool(data_integrity_report["passed"])
     training_context_path = run_dir / "training_run_context.json"
     training_context_path.write_text(json.dumps(training_context, indent=2), encoding="utf-8")
+    if args.strict_data_integrity and not bool(data_integrity_report["passed"]):
+        raise RuntimeError(
+            "Data integrity report contains failing assertions. "
+            f"See: {data_integrity_report_path}"
+        )
+    if args.strict_output_correctness and not bool(prediction_quality_report.get("passed", False)):
+        raise RuntimeError(
+            "Prediction output quality report contains failing assertions. "
+            f"See: {prediction_quality_report_path}"
+        )
 
     manifest = {
         "run_id": run_id,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "training": {
             "context_path": str(training_context_path.resolve()),
+            "data_integrity_report_path": str(data_integrity_report_path.resolve()),
+            "prediction_output_quality_report_path": str(prediction_quality_report_path.resolve()),
             "model_type": args.model_type,
             "model_name": model_name,
             "git_commit": training_context.get("git_commit"),

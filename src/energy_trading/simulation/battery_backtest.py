@@ -315,8 +315,10 @@ class BatteryBacktester:
     ) -> pd.DataFrame:
         """Solve LP on predicted market signals to obtain hourly dispatch.
 
-        aFRR reserve offers are optimized over bid-price bins using expected value:
-            sum_j p_acc[j,t] * bid_price[j] * reserve_bin[j,t]
+        aFRR reserve offers are optimized over bid-price bins using expected value.
+        The LP decouples:
+        - p_acc_cap[j,t]: probability that capacity bid in bin j clears.
+        - r_act[t]: expected activation-rate conditional on awarded capacity.
         """
         n = len(df)
         n_bins = int(len(self.afrr_bid_prices_eur_mwh))
@@ -361,6 +363,33 @@ class BatteryBacktester:
                 default=0.0,
             ).to_numpy(dtype=float)
         )
+        # p90 activation-rate chance-constraint rates (fallback to point rates).
+        r_act_pos_p90 = self._clip_rate(
+            self._finite_numeric_series(
+                df,
+                f"{colmap.pred_afrr_activation_rate_pos}_p90",
+                fallback_cols=[
+                    colmap.pred_afrr_activation_rate_pos,
+                    f"{colmap.pred_afrr_activation_rate_neg}_p90",
+                    colmap.pred_afrr_activation_rate_neg,
+                    colmap.true_afrr_activation_rate_pos,
+                ],
+                default=0.0,
+            ).to_numpy(dtype=float)
+        )
+        r_act_neg_p90 = self._clip_rate(
+            self._finite_numeric_series(
+                df,
+                f"{colmap.pred_afrr_activation_rate_neg}_p90",
+                fallback_cols=[
+                    colmap.pred_afrr_activation_rate_neg,
+                    f"{colmap.pred_afrr_activation_rate_pos}_p90",
+                    colmap.pred_afrr_activation_rate_pos,
+                    colmap.true_afrr_activation_rate_neg,
+                ],
+                default=0.0,
+            ).to_numpy(dtype=float)
+        )
         act_price_pos = self._finite_numeric_series(
             df,
             colmap.pred_afrr_activation_price_pos,
@@ -374,27 +403,40 @@ class BatteryBacktester:
             default=0.0,
         ).to_numpy(dtype=float)
 
-        # Acceptance probabilities by price-bin and hour.
-        p_acc_pos = np.zeros((n, n_bins), dtype=float)
-        p_acc_neg = np.zeros((n, n_bins), dtype=float)
+        # Capacity acceptance probabilities by bid-price bin and hour.
+        p_acc_cap_pos = np.zeros((n, n_bins), dtype=float)
+        p_acc_cap_neg = np.zeros((n, n_bins), dtype=float)
         if deterministic_reserve_settlement:
-            # Oracle mode: deterministic activation rates directly in MILP
-            # dynamics/objective to align optimization with settlement logic.
+            # Oracle mode keeps deterministic activation rates, but capacity
+            # acceptance remains bin-specific where available.
             for b in range(n_bins):
-                p_acc_pos[:, b] = r_act_pos_base
-                p_acc_neg[:, b] = r_act_neg_base
+                c_pos = f"pacc_pos_bin_{b}"
+                c_neg = f"pacc_neg_bin_{b}"
+                if c_pos in df.columns:
+                    p_acc_cap_pos[:, b] = self._clip_rate(pd.to_numeric(df[c_pos], errors="coerce").to_numpy(dtype=float))
+                else:
+                    # Price-taker fallback: only most-competitive bin may clear.
+                    p_acc_cap_pos[:, b] = r_act_pos_base if b == 0 else 0.0
+                if c_neg in df.columns:
+                    p_acc_cap_neg[:, b] = self._clip_rate(pd.to_numeric(df[c_neg], errors="coerce").to_numpy(dtype=float))
+                else:
+                    p_acc_cap_neg[:, b] = r_act_neg_base if b == 0 else 0.0
         else:
             for b in range(n_bins):
                 c_pos = f"pacc_pos_bin_{b}"
                 c_neg = f"pacc_neg_bin_{b}"
                 if c_pos in df.columns:
-                    p_acc_pos[:, b] = self._clip_rate(pd.to_numeric(df[c_pos], errors="coerce").to_numpy(dtype=float))
+                    p_acc_cap_pos[:, b] = self._clip_rate(pd.to_numeric(df[c_pos], errors="coerce").to_numpy(dtype=float))
                 else:
-                    p_acc_pos[:, b] = r_act_pos_base
+                    # Fix "flat fallback" loophole:
+                    # when quantile-derived p_acc is unavailable, enforce
+                    # price-taker behavior by allowing acceptance only in the
+                    # lowest bid-price bin.
+                    p_acc_cap_pos[:, b] = r_act_pos_base if b == 0 else 0.0
                 if c_neg in df.columns:
-                    p_acc_neg[:, b] = self._clip_rate(pd.to_numeric(df[c_neg], errors="coerce").to_numpy(dtype=float))
+                    p_acc_cap_neg[:, b] = self._clip_rate(pd.to_numeric(df[c_neg], errors="coerce").to_numpy(dtype=float))
                 else:
-                    p_acc_neg[:, b] = r_act_neg_base
+                    p_acc_cap_neg[:, b] = r_act_neg_base if b == 0 else 0.0
 
         c = np.zeros(n_vars, dtype=float)
 
@@ -408,32 +450,36 @@ class BatteryBacktester:
         c[sl["ch"]] = -(ch_coef * da_step)
         c[sl["dis"]] = -(dis_coef * da_step)
         for b, bid_price in enumerate(self.afrr_bid_prices_eur_mwh):
+            # Expected activated-share (conditional on both capacity clearing and
+            # activation-rate forecast).
+            exp_act_pos = p_acc_cap_pos[:, b] * r_act_pos_base
+            exp_act_neg = p_acc_cap_neg[:, b] * r_act_neg_base
             if deterministic_reserve_settlement:
                 # Deterministic oracle EV equals settlement EV under perfect foresight.
                 rpos_coef = (
-                    p_cap_pos
-                    + r_act_pos_base * act_price_pos * self.eta_out
-                    - self.trans_eur_mwh * r_act_pos_base * self.eta_out
-                    - self.deg_eur_mwh * r_act_pos_base
+                    p_acc_cap_pos[:, b] * p_cap_pos
+                    + exp_act_pos * act_price_pos * self.eta_out
+                    - self.trans_eur_mwh * exp_act_pos * self.eta_out
+                    - self.deg_eur_mwh * exp_act_pos
                 )
                 rneg_coef = (
-                    p_cap_neg
-                    + r_act_neg_base * act_price_neg / self.eta_in
-                    - self.trans_eur_mwh * r_act_neg_base / self.eta_in
-                    - self.deg_eur_mwh * r_act_neg_base
+                    p_acc_cap_neg[:, b] * p_cap_neg
+                    + exp_act_neg * act_price_neg / self.eta_in
+                    - self.trans_eur_mwh * exp_act_neg / self.eta_in
+                    - self.deg_eur_mwh * exp_act_neg
                 )
             else:
                 rpos_coef = (
-                    p_cap_pos
-                    + p_acc_pos[:, b] * bid_price * self.eta_out
-                    - self.trans_eur_mwh * p_acc_pos[:, b] * self.eta_out
-                    - self.deg_eur_mwh * p_acc_pos[:, b]
+                    p_acc_cap_pos[:, b] * p_cap_pos
+                    + exp_act_pos * bid_price * self.eta_out
+                    - self.trans_eur_mwh * exp_act_pos * self.eta_out
+                    - self.deg_eur_mwh * exp_act_pos
                 )
                 rneg_coef = (
-                    p_cap_neg
-                    + p_acc_neg[:, b] * bid_price / self.eta_in
-                    - self.trans_eur_mwh * p_acc_neg[:, b] / self.eta_in
-                    - self.deg_eur_mwh * p_acc_neg[:, b]
+                    p_acc_cap_neg[:, b] * p_cap_neg
+                    + exp_act_neg * bid_price / self.eta_in
+                    - self.trans_eur_mwh * exp_act_neg / self.eta_in
+                    - self.deg_eur_mwh * exp_act_neg
                 )
             s_pos = sl["rpos_bin"].start + b * n
             s_neg = sl["rneg_bin"].start + b * n
@@ -467,8 +513,11 @@ class BatteryBacktester:
             row[sl["ch"].start + t] = -self.eta_in * da_step
             row[sl["dis"].start + t] = (1.0 / self.eta_out) * da_step
             for b in range(n_bins):
-                row[sl["rpos_bin"].start + b * n + t] = (p_acc_pos[t, b] / self.eta_out) * afrr_step
-                row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * p_acc_neg[t, b] * afrr_step
+                # Base SoC drift on expected awarded-and-activated reserve.
+                exp_pos = p_acc_cap_pos[t, b] * r_act_pos_base[t]
+                exp_neg = p_acc_cap_neg[t, b] * r_act_neg_base[t]
+                row[sl["rpos_bin"].start + b * n + t] = (exp_pos / self.eta_out) * afrr_step
+                row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * exp_neg * afrr_step
             a_eq.append(row)
             b_eq.append(-self.aux_mwh)
 
@@ -514,23 +563,28 @@ class BatteryBacktester:
             a_ub.append(row)
             b_ub.append(self.reserve_max_mw)
 
-            # Worst-case physical feasibility for awarded reserve (100% activation
-            # over the full interval), enforced endogenously in MILP.
+            # p90 chance-constraint safety bounds:
+            # enforce sufficient SoC footroom/headroom for p90 activation-rate
+            # on expected awarded reserve (capacity acceptance by bin).
             # pos reserve needs discharge energy from SoC:
-            # soc_t - (reserve_pos_t * dt / eta_out) >= soc_min
+            # soc_t - sum_b(p_acc_cap_pos[t,b] * r_act_pos_p90[t] * reserve_bin[b,t] * dt / eta_out) >= soc_min
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = -1.0
             for b in range(n_bins):
-                row[sl["rpos_bin"].start + b * n + t] = (self.dt_h / max(self.eta_out, 1e-12)) * afrr_step
+                chance_pos = p_acc_cap_pos[t, b] * r_act_pos_p90[t]
+                row[sl["rpos_bin"].start + b * n + t] = (
+                    chance_pos * self.dt_h / max(self.eta_out, 1e-12)
+                ) * afrr_step
             a_ub.append(row)
             b_ub.append(-self.soc_min)
 
             # neg reserve needs charging headroom in SoC:
-            # soc_t + (reserve_neg_t * dt * eta_in) <= soc_max
+            # soc_t + sum_b(p_acc_cap_neg[t,b] * r_act_neg_p90[t] * reserve_bin[b,t] * dt * eta_in) <= soc_max
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = 1.0
             for b in range(n_bins):
-                row[sl["rneg_bin"].start + b * n + t] = (self.dt_h * self.eta_in) * afrr_step
+                chance_neg = p_acc_cap_neg[t, b] * r_act_neg_p90[t]
+                row[sl["rneg_bin"].start + b * n + t] = (chance_neg * self.dt_h * self.eta_in) * afrr_step
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
@@ -1248,8 +1302,10 @@ class BatteryBacktester:
                             fb_vals = pd.to_numeric(window.loc[miss, colmap.timestamp].map(source[pred_col]), errors="coerce")
                             window.loc[miss, pred_col] = fb_vals.to_numpy()
 
-                    # Build quantile->CDF acceptance bridge for aFRR activation prices.
-                    if pred_col in {colmap.pred_afrr_activation_price_pos, colmap.pred_afrr_activation_price_neg}:
+                    # Build quantile->CDF acceptance bridge for aFRR CAPACITY prices.
+                    # These probabilities are interpreted as capacity-market
+                    # acceptance by bid-price bin.
+                    if pred_col in {colmap.pred_afrr_capacity_price_pos, colmap.pred_afrr_capacity_price_neg}:
                         q_cols = [c for c in QUANTILE_COLUMNS if c in sub.columns]
                         if q_cols:
                             sub_u = (
@@ -1275,9 +1331,24 @@ class BatteryBacktester:
                                         price_bins=[float(bid_price)],
                                     )
                                     p_acc_vals.append(float(pacc_df["p_acc"].iloc[0]))
-                                side = "pos" if pred_col == colmap.pred_afrr_activation_price_pos else "neg"
+                                side = "pos" if pred_col == colmap.pred_afrr_capacity_price_pos else "neg"
                                 col = f"pacc_{side}_bin_{b}"
                                 window[col] = pd.to_numeric(pd.Series(p_acc_vals), errors="coerce").to_numpy(dtype=float)
+                    # Propagate activation-rate quantiles into window columns
+                    # for p90 chance constraints in optimize_dispatch().
+                    if pred_col in {colmap.pred_afrr_activation_rate_pos, colmap.pred_afrr_activation_rate_neg}:
+                        q_cols = [c for c in QUANTILE_COLUMNS if c in sub.columns]
+                        if q_cols:
+                            sub_u = (
+                                sub.drop_duplicates(subset=["target_time_utc"])
+                                .set_index("target_time_utc")
+                                .sort_index()
+                            )
+                            base = colmap.pred_afrr_activation_rate_pos if pred_col == colmap.pred_afrr_activation_rate_pos else colmap.pred_afrr_activation_rate_neg
+                            for qc in q_cols:
+                                q_map = sub_u[qc]
+                                filled_q = target_times.map(q_map)
+                                window[f"{base}_{qc}"] = pd.to_numeric(filled_q, errors="coerce").to_numpy(dtype=float)
 
                 # Ensure required prediction columns are finite even if some long files are absent.
                 # Ordered fallbacks: paired prediction column -> truth-side column.
@@ -1318,7 +1389,10 @@ class BatteryBacktester:
                         default=0.0,
                     ).to_numpy(dtype=float)
 
-                # Ensure every p_acc bin has a robust fallback from scalar activation-rate predictions.
+                # Ensure every p_acc bin has a robust fallback.
+                # Price-taker fallback policy: when no quantile-derived p_acc is
+                # available, only the most-competitive bin (b=0) carries the
+                # scalar prior; higher bins get 0 probability.
                 base_pos = self._clip_rate(
                     pd.to_numeric(window[colmap.pred_afrr_activation_rate_pos], errors="coerce").to_numpy(dtype=float)
                 )
@@ -1329,19 +1403,19 @@ class BatteryBacktester:
                     c_pos = f"pacc_pos_bin_{b}"
                     c_neg = f"pacc_neg_bin_{b}"
                     if c_pos not in window.columns:
-                        window[c_pos] = base_pos
+                        window[c_pos] = base_pos if b == 0 else np.zeros_like(base_pos)
                     else:
                         window[c_pos] = (
                             pd.to_numeric(window[c_pos], errors="coerce")
-                            .fillna(pd.Series(base_pos, index=window.index))
+                            .fillna(pd.Series(base_pos if b == 0 else np.zeros_like(base_pos), index=window.index))
                             .to_numpy(dtype=float)
                         )
                     if c_neg not in window.columns:
-                        window[c_neg] = base_neg
+                        window[c_neg] = base_neg if b == 0 else np.zeros_like(base_neg)
                     else:
                         window[c_neg] = (
                             pd.to_numeric(window[c_neg], errors="coerce")
-                            .fillna(pd.Series(base_neg, index=window.index))
+                            .fillna(pd.Series(base_neg if b == 0 else np.zeros_like(base_neg), index=window.index))
                             .to_numpy(dtype=float)
                         )
             else:

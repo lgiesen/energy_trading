@@ -33,6 +33,11 @@ RECOMMENDED_METRICS = [
     "spike_mae_top5_h1",
     "spike_recall_top5_h1",
     "lag_best_h_h1",
+    "gate_dplus1_mae",
+    "gate_dplus1_rmse",
+    "gate_dplus1_mbe",
+    "gate_dplus1_directional_accuracy",
+    "spread_directional_error",
 ]
 
 TARGET_FAMILY_ORDER = [
@@ -84,6 +89,25 @@ def _score_row(row: pd.Series) -> float:
     return 0.45 * err_score + 0.20 * direction + 0.20 * spike_recall + 0.15 * skill_score
 
 
+def _score_row_execution(row: pd.Series) -> float:
+    gate_dplus1_mae = _safe_float(row.get("gate_dplus1_mae"))
+    gate_mae = _safe_float(row.get("gate_mae"))
+    mae = _safe_float(row.get("mae_mean"))
+    err = gate_dplus1_mae if np.isfinite(gate_dplus1_mae) else (gate_mae if np.isfinite(gate_mae) else mae)
+    err_score = 1.0 / (1.0 + max(0.0, err)) if np.isfinite(err) else 0.0
+
+    spread_err = _safe_float(row.get("spread_directional_error"))
+    spread_score = float(np.clip(1.0 - spread_err, 0.0, 1.0)) if np.isfinite(spread_err) else 0.5
+
+    direction = _safe_float(row.get("gate_dplus1_directional_accuracy"))
+    if not np.isfinite(direction):
+        direction = _safe_float(row.get("directional_accuracy"))
+    direction = float(np.clip(direction, 0.0, 1.0)) if np.isfinite(direction) else 0.5
+
+    global_sanity = 1.0 / (1.0 + max(0.0, mae)) if np.isfinite(mae) else 0.0
+    return 0.60 * err_score + 0.25 * spread_score + 0.10 * direction + 0.05 * global_sanity
+
+
 def _label_to_expected_family(label: str) -> str | None:
     l = (label or "").strip().lower()
     if "xgb" in l or "xgboost" in l:
@@ -128,6 +152,34 @@ def _load_rows(model: ModelInput, expected_split: str) -> pd.DataFrame:
         raise ValueError(f"No avg_metrics_by_prediction_column rows in: {summary_path}")
     df["model_label"] = model.label
     df["run_dir"] = str(model.run_dir.resolve())
+    gate_path = model.run_dir / f"{expected_split}_gate_time_metrics_by_target.csv"
+    if gate_path.exists():
+        gdf = pd.read_csv(gate_path)
+        if not gdf.empty:
+            gsel = (
+                gdf[gdf["protocol"].astype(str) == "strict_dplus1"]
+                .sort_values(["prediction_column", "n_rows_gate_dplus1"], ascending=[True, False])
+                .groupby("prediction_column", as_index=False)
+                .head(1)
+            )
+            keep = [
+                "prediction_column",
+                "gate_dplus1_mae",
+                "gate_dplus1_rmse",
+                "gate_dplus1_mbe",
+                "gate_dplus1_directional_accuracy",
+            ]
+            gsel = gsel[[c for c in keep if c in gsel.columns]].drop_duplicates(subset=["prediction_column"])
+            df = df.merge(gsel, on="prediction_column", how="left")
+
+    spread_path = model.run_dir / f"{expected_split}_gate_time_spread_metrics.json"
+    if spread_path.exists():
+        try:
+            spread = _read_json(spread_path)
+            df["spread_directional_error"] = _safe_float(spread.get("spread_directional_error"))
+            df["spread_directional_accuracy"] = _safe_float(spread.get("spread_directional_accuracy"))
+        except Exception:
+            pass
     return df
 
 
@@ -138,6 +190,7 @@ def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
             out[c] = np.nan
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out["recommendation_score"] = out.apply(_score_row, axis=1)
+    out["execution_relevance_score"] = out.apply(_score_row_execution, axis=1)
     out["target_sort"] = out["prediction_column"].apply(
         lambda x: TARGET_FAMILY_ORDER.index(x) if x in TARGET_FAMILY_ORDER else 999
     )
@@ -168,6 +221,17 @@ def _recommend_per_target(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     cols = ["prediction_column", "truth_column", "model_label", "recommendation_score", *RECOMMENDED_METRICS, "run_dir"]
+    return best[[c for c in cols if c in best.columns]]
+
+
+def _recommend_per_target_execution(df: pd.DataFrame) -> pd.DataFrame:
+    best = (
+        df.sort_values(["prediction_column", "execution_relevance_score"], ascending=[True, False])
+        .groupby("prediction_column", as_index=False)
+        .head(1)
+        .reset_index(drop=True)
+    )
+    cols = ["prediction_column", "truth_column", "model_label", "execution_relevance_score", *RECOMMENDED_METRICS, "run_dir"]
     return best[[c for c in cols if c in best.columns]]
 
 
@@ -295,6 +359,7 @@ def _write_markdown_report(
     split: str,
     unified_df: pd.DataFrame,
     reco_df: pd.DataFrame,
+    reco_exec_df: pd.DataFrame,
     risks: list[str],
     models: list[ModelInput],
 ) -> None:
@@ -319,6 +384,18 @@ def _write_markdown_report(
         "spike_recall_top5_h1",
     ]
     reco_show = reco_show[[c for c in keep_reco_cols if c in reco_show.columns]]
+    reco_exec_show = reco_exec_df.copy()
+    keep_exec_cols = [
+        "prediction_column",
+        "model_label",
+        "execution_relevance_score",
+        "gate_dplus1_mae",
+        "gate_dplus1_rmse",
+        "spread_directional_error",
+        "gate_dplus1_directional_accuracy",
+        "mae_mean",
+    ]
+    reco_exec_show = reco_exec_show[[c for c in keep_exec_cols if c in reco_exec_show.columns]]
 
     model_lines = "\n".join([f"- `{m.label}`: `{m.run_dir}`" for m in models])
     risk_lines = "\n".join([f"- {r}" for r in risks])
@@ -340,11 +417,17 @@ Highest-scoring model by target based on gate-aware error, directional quality, 
 
 {_markdown_table(reco_show, [c for c in reco_show.columns])}
 
-## 3) Explicit Open-Risk List Before Backtest
+## 3) Execution-Relevant (Gate-Time) Performance
+Highest-scoring model by target under strict gate-time D+1 criteria.
+
+{_markdown_table(reco_exec_show, [c for c in reco_exec_show.columns])}
+
+## 4) Explicit Open-Risk List Before Backtest
 {risk_lines}
 
 ## Notes for Thesis Use
 - Use this report for final model-selection transparency before simulation.
+- Distinguish global winner from gate-time execution winner in final thesis text.
 - Keep split discipline: `val` for tuning, `test` for final claims.
 - Archive this report together with simulation run IDs used for final chapters.
 """
@@ -403,6 +486,7 @@ def main() -> None:
     norm_df = _normalize_table(long_df)
     unified_wide_df = _build_unified_wide(norm_df)
     reco_df = _recommend_per_target(norm_df)
+    reco_exec_df = _recommend_per_target_execution(norm_df)
     risks = _open_risks(norm_df, models=models, split=args.split)
 
     out_dir = Path(args.out_dir)
@@ -411,18 +495,21 @@ def main() -> None:
     long_csv = out_dir / f"unified_table_{args.split}_long.csv"
     wide_csv = out_dir / f"unified_table_{args.split}_wide.csv"
     reco_csv = out_dir / f"recommendation_per_target_{args.split}.csv"
+    reco_exec_csv = out_dir / f"recommendation_per_target_execution_{args.split}.csv"
     risk_json = out_dir / f"open_risk_list_{args.split}.json"
     report_md = out_dir / f"final_benchmark_report_{args.split}.md"
 
     norm_df.to_csv(long_csv, index=False)
     unified_wide_df.to_csv(wide_csv, index=False)
     reco_df.to_csv(reco_csv, index=False)
+    reco_exec_df.to_csv(reco_exec_csv, index=False)
     risk_json.write_text(json.dumps({"split": args.split, "open_risks": risks}, indent=2), encoding="utf-8")
     _write_markdown_report(
         out_path=report_md,
         split=args.split,
         unified_df=unified_wide_df,
         reco_df=reco_df,
+        reco_exec_df=reco_exec_df,
         risks=risks,
         models=models,
     )
@@ -431,6 +518,7 @@ def main() -> None:
     print(f"- unified_long: {long_csv}")
     print(f"- unified_wide: {wide_csv}")
     print(f"- recommendations: {reco_csv}")
+    print(f"- execution_recommendations: {reco_exec_csv}")
     print(f"- open_risks: {risk_json}")
     print(f"- report_md: {report_md}")
 
