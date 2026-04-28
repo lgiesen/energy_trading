@@ -54,6 +54,8 @@ def gate_time_dplus1_filter(
     snapshot_col: str = "snapshot_time_utc",
     target_col: str = "target_time_utc",
     tz: str = MARKET_TZ,
+    local_tz: str | None = None,
+    gate_hour_override: int | None = None,
 ) -> pd.DataFrame:
     """Strictly isolate decision snapshots and D+1 delivery targets.
 
@@ -68,11 +70,13 @@ def gate_time_dplus1_filter(
     if out.empty:
         return out
 
+    tz_eff = local_tz or tz
     pol = target_policy(pred_col)
-    snap_local = out[snapshot_col].dt.tz_convert(tz)
-    tgt_local = out[target_col].dt.tz_convert(tz)
+    gate_hour = int(gate_hour_override) if gate_hour_override is not None else int(pol.gate_hour_local)
+    snap_local = out[snapshot_col].dt.tz_convert(tz_eff)
+    tgt_local = out[target_col].dt.tz_convert(tz_eff)
 
-    m_gate = snap_local.dt.hour == int(pol.gate_hour_local)
+    m_gate = snap_local.dt.hour == gate_hour
     m_dplus1 = tgt_local.dt.floor("D") == (snap_local.dt.floor("D") + pd.Timedelta(days=1))
 
     # Bound delivery day by target type.

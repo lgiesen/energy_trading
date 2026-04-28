@@ -1465,7 +1465,29 @@ class BatteryBacktester:
                     )
                     optimization_fallback = "relaxed_final_soc_min"
                 else:
-                    raise
+                    # Last-resort fallback: if rolling MILP is infeasible even
+                    # without terminal floor, degrade to a physically safe hold
+                    # plan for this window so the simulation can proceed.
+                    # This avoids full-run aborts from local pathological windows.
+                    ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+                    hold = pd.DataFrame(
+                        {
+                            # Keep timezone-aware timestamps to avoid merge dtype
+                            # mismatches (datetime64[ns, UTC] vs naive datetime64).
+                            colmap.timestamp: ts_vals,
+                            "charge_mw": np.zeros(len(window), dtype=float),
+                            "discharge_mw": np.zeros(len(window), dtype=float),
+                            "reserve_pos_mw": np.zeros(len(window), dtype=float),
+                            "reserve_neg_mw": np.zeros(len(window), dtype=float),
+                            "soc_lp_mwh": np.full(len(window), float(soc), dtype=float),
+                        },
+                        index=window.index,
+                    )
+                    for b in range(len(self.afrr_bid_prices_eur_mwh)):
+                        hold[f"reserve_pos_bin_{b}_mw"] = 0.0
+                        hold[f"reserve_neg_bin_{b}_mw"] = 0.0
+                    plan = hold
+                    optimization_fallback = "safe_hold_plan"
 
             snapshot_plan = plan.copy()
             snapshot_plan["snapshot_time_utc"] = snapshot_ts if forecast_warehouse else pd.to_datetime(window.iloc[0][colmap.timestamp], utc=True, errors="coerce")
@@ -1543,7 +1565,14 @@ class BatteryBacktester:
             pred_cols = [c for c in CANONICAL_PREDICTION_COLUMNS if c in window.columns]
             if pred_cols:
                 pred_take = window[[colmap.timestamp, *pred_cols]].iloc[:k].copy()
-                take = take.merge(pred_take, on=colmap.timestamp, how="left")
+                # Defensive normalization: ensure same tz-aware dtype on merge key.
+                take[colmap.timestamp] = pd.to_datetime(take[colmap.timestamp], utc=True, errors="coerce")
+                pred_take[colmap.timestamp] = pd.to_datetime(pred_take[colmap.timestamp], utc=True, errors="coerce")
+                # Merge on explicit epoch key to avoid pandas tz/unit merge mismatches.
+                take["_merge_ts_key"] = pd.to_datetime(take[colmap.timestamp], utc=True, errors="coerce").astype("int64")
+                pred_take["_merge_ts_key"] = pd.to_datetime(pred_take[colmap.timestamp], utc=True, errors="coerce").astype("int64")
+                pred_take = pred_take.drop(columns=[colmap.timestamp], errors="ignore")
+                take = take.merge(pred_take, on="_merge_ts_key", how="left").drop(columns=["_merge_ts_key"], errors="ignore")
             tsu_take = pd.to_datetime(take[colmap.timestamp], utc=True, errors="coerce")
             take["aFRR_Capacity_Won_Pos_MW"] = tsu_take.map(lambda ts: float(afrr_cap_pos_lockbook.get(ts, 0.0)))
             take["aFRR_Capacity_Won_Neg_MW"] = tsu_take.map(lambda ts: float(afrr_cap_neg_lockbook.get(ts, 0.0)))

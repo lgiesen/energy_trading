@@ -31,6 +31,7 @@ from energy_trading.evaluation.metrics import (  # noqa: E402
     gate_hour_for_target,
 )
 from energy_trading.evaluation.gate_synced_analysis import gate_time_dplus1_filter  # noqa: E402
+from energy_trading.evaluation.gate_synced_analysis import target_policy  # noqa: E402
 from energy_trading.visualization.style import apply_geo_style, get_color  # noqa: E402
 
 QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -152,7 +153,14 @@ def _resolve_truth_path(manifest: dict[str, Any], arg_truth_path: str) -> Path:
         return Path(arg_truth_path)
     mpath = manifest.get("ground_truth", {}).get("default_path", "")
     if mpath:
-        return Path(mpath)
+        p = Path(mpath)
+        if p.exists():
+            return p
+        # Fallback for artifacts copied from remote/server paths.
+        local_default = Path("data/features/all_data_features.parquet")
+        if local_default.exists():
+            return local_default
+        return p
     return Path("data/features/all_data_features.parquet")
 
 
@@ -682,8 +690,25 @@ def _plot_xgb_feature_importance(run_dir: Path, out_path: Path, target_col: str 
     if not lead_map or 1 not in lead_map:
         return False
 
-    model_h1 = lead_map[1].get("p50")
-    model_h24 = lead_map.get(24, {}).get("p50")
+    # XGBoost payloads are dict-like at each lead with {"p50": fitted_model, ...}.
+    # Other families (e.g., linear Pipeline) can store direct estimator objects.
+    lead1 = lead_map.get(1)
+    if isinstance(lead1, dict):
+        model_h1 = lead1.get("p50")
+    else:
+        model_h1 = lead1
+
+    lead24 = lead_map.get(24)
+    if isinstance(lead24, dict):
+        model_h24 = lead24.get("p50")
+    else:
+        model_h24 = lead24
+
+    # Skip gracefully when model is not XGBoost-like.
+    if model_h1 is not None and not hasattr(model_h1, "get_booster"):
+        return False
+    if model_h24 is not None and not hasattr(model_h24, "get_booster"):
+        model_h24 = None
     if model_h1 is None:
         return False
 
@@ -856,6 +881,9 @@ def main() -> None:
         gate_metrics: dict[str, Any] = {}
         target_col_for_gate = PRED_TO_TARGET.get(pred_col, "")
         gate_h = gate_hour_for_target(target_col_for_gate)
+        if gate_h is None:
+            # Fallback to strict gate protocol defaults (DA=11, aFRR=8).
+            gate_h = int(target_policy(pred_col).gate_hour_local)
         if gate_h is not None:
             d_gate = df.copy()
             gate_metrics = compute_gate_closure_metrics(
@@ -903,11 +931,12 @@ def main() -> None:
             dir_gate = _directional_and_event_metrics(
                 d_gate_eval[["target_time_utc", "y_true", "p50"]].copy()
             )["directional_accuracy"]
+            resolved_gate_h = gate_h_override if gate_h_override is not None else gate_h
             gate_time_rows.append(
                 {
                     "prediction_column": pred_col,
                     "truth_column": truth_col,
-                    "gate_hour_local": int(gate_h_override if gate_h_override is not None else gate_h),
+                    "gate_hour_local": int(resolved_gate_h),
                     "protocol": "strict_dplus1",
                     "n_rows_gate_dplus1": int(suite.get("n_rows_scored", 0) or 0),
                     "gate_dplus1_mae": suite.get("mae"),

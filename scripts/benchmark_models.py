@@ -265,6 +265,16 @@ def _load_model_long_with_truth(
 
     pred_df = pred_df.copy()
     pred_df["target_time_utc"] = pd.to_datetime(pred_df[ts_col], utc=True, errors="coerce")
+    # Gate-time analytics require snapshot timestamps. Reconstruct if missing.
+    if "snapshot_time_utc" in pred_df.columns:
+        pred_df["snapshot_time_utc"] = pd.to_datetime(pred_df["snapshot_time_utc"], utc=True, errors="coerce")
+    else:
+        if "lead_time_h" in pred_df.columns:
+            lead_h = pd.to_numeric(pred_df["lead_time_h"], errors="coerce").fillna(0.0)
+            pred_df["snapshot_time_utc"] = pred_df["target_time_utc"] - pd.to_timedelta(lead_h, unit="h")
+        else:
+            # Best-effort fallback for legacy files without lead/snapshot fields.
+            pred_df["snapshot_time_utc"] = pred_df["target_time_utc"]
     if "lead_time_h" in pred_df.columns:
         pred_df["lead_time_h"] = pd.to_numeric(pred_df["lead_time_h"], errors="coerce")
     else:
@@ -304,7 +314,7 @@ def _load_model_long_with_truth(
         truth_by_ts.reindex(pred_df["target_time_utc"] - pd.Timedelta(hours=24)).values,
         errors="coerce",
     )
-    keep = ["target_time_utc", "lead_time_h", "y_true", "y_pred", "y_naive_24h", *sorted(set(q_cols))]
+    keep = ["snapshot_time_utc", "target_time_utc", "lead_time_h", "y_true", "y_pred", "y_naive_24h", *sorted(set(q_cols))]
     pred_df = pred_df[keep].dropna(subset=["target_time_utc"]).sort_values(["lead_time_h", "target_time_utc"])
     return pred_df
 
