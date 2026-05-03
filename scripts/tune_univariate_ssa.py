@@ -11,9 +11,11 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import argparse
 import sys
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -51,6 +53,16 @@ class HourlySSAResult:
     val_score: float
     n_train: int
     n_val: int
+
+
+AFRR_TARGETS = [
+    "target_afrr_activation_price_vwap_pos",
+    "target_afrr_activation_price_vwap_neg",
+    "target_afrr_activation_rate_pos",
+    "target_afrr_activation_rate_neg",
+    "target_afrr_capacity_price_pos",
+    "target_afrr_capacity_price_neg",
+]
 
 
 def _metric(y_true: np.ndarray, y_pred: np.ndarray, metric: MetricName) -> float:
@@ -222,12 +234,199 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-points-per-hour", type=int, default=220)
     p.add_argument("--n-jobs", type=int, default=-1, help="Parallel workers across 24 hourly models.")
     p.add_argument(
+        "--all-targets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train/tune all canonical univariate targets in one command (DA + 6 aFRR targets).",
+    )
+    p.add_argument(
+        "--afrr-train-path",
+        default="data/model_input/afrr/train.parquet",
+        help="aFRR train path used when --all-targets is enabled.",
+    )
+    p.add_argument(
+        "--afrr-val-path",
+        default="data/model_input/afrr/val.parquet",
+        help="aFRR val path used when --all-targets is enabled.",
+    )
+    p.add_argument(
+        "--output-dir",
+        default="artifacts/model_runs/ssa_univariate",
+        help="Directory where per-target/hour best params and fitted models are saved.",
+    )
+    p.add_argument(
         "--smoke-test",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Use tiny search (L=25..26, r=3..4) and last 48 validation rows.",
     )
     return p.parse_args()
+
+
+def _run_hourly_tuning_for_target(
+    *,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    target_col: str,
+    L_values: Iterable[int],
+    r_values: Iterable[int],
+    metric: MetricName,
+    min_points_per_hour: int,
+    n_jobs: int,
+) -> tuple[list[HourlySSAResult], float, dict[int, pd.Series]]:
+    train_hourly = _split_hourly(train_df, target_col)
+    val_hourly = _split_hourly(val_df, target_col)
+
+    if Parallel is None or delayed is None:
+        print("[WARN] joblib not installed. Falling back to sequential hourly tuning.")
+        raw_results = [
+            _train_hour(
+                h,
+                train_hourly[h],
+                val_hourly[h],
+                L_values=L_values,
+                r_values=r_values,
+                metric=metric,
+                min_points_per_hour=min_points_per_hour,
+            )
+            for h in range(24)
+        ]
+    else:
+        jobs = [
+            delayed(_train_hour)(
+                h,
+                train_hourly[h],
+                val_hourly[h],
+                L_values=L_values,
+                r_values=r_values,
+                metric=metric,
+                min_points_per_hour=min_points_per_hour,
+            )
+            for h in range(24)
+        ]
+        raw_results = Parallel(n_jobs=n_jobs, prefer="processes")(jobs)
+
+    results = [r for r in raw_results if r is not None]
+    if not results:
+        raise RuntimeError(
+            f"No hourly models were trained for {target_col}. "
+            f"Check min-points-per-hour / split sizes."
+        )
+    weighted_score = float(
+        np.average(np.array([r.val_score for r in results]), weights=np.array([r.n_val for r in results]))
+    )
+    return results, weighted_score, train_hourly
+
+
+def _save_target_artifacts(
+    *,
+    output_dir: Path,
+    target_col: str,
+    metric: MetricName,
+    weighted_score: float,
+    results: list[HourlySSAResult],
+    train_hourly: dict[int, pd.Series],
+) -> None:
+    target_dir = output_dir / target_col
+    models_dir = target_dir / "models"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for r in sorted(results, key=lambda x: x.hour):
+        rows.append(
+            {
+                "target_col": target_col,
+                "hour": r.hour,
+                "window_length": r.best.window_length,
+                "rank": r.best.rank,
+                "val_score": r.val_score,
+                "n_train": r.n_train,
+                "n_val": r.n_val,
+            }
+        )
+        # Fit final per-hour model on full train series for this target/hour and persist.
+        model = UnivariateSSA(window_length=r.best.window_length, rank=r.best.rank).fit(train_hourly[r.hour])
+        with (models_dir / f"hour_{r.hour:02d}.pkl").open("wb") as f:
+            pickle.dump(model, f)
+
+    df = pd.DataFrame(rows).sort_values("hour")
+    df.to_csv(target_dir / "hourly_best_params.csv", index=False)
+
+    summary = {
+        "target_col": target_col,
+        "metric": metric,
+        "weighted_validation_score": weighted_score,
+        "trained_hours": len(results),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    (target_dir / "summary.json").write_text(pd.Series(summary).to_json(indent=2), encoding="utf-8")
+
+
+def _run_single_target(
+    *,
+    train_path: str,
+    val_path: str,
+    target_col: str,
+    L_values: Iterable[int],
+    r_values: Iterable[int],
+    metric: MetricName,
+    min_points_per_hour: int,
+    n_jobs: int,
+    horizon_demo: int,
+    output_dir: Path,
+) -> dict[str, object]:
+    train_df = _load_univariate_frame(train_path, target_col)
+    val_df = _load_univariate_frame(val_path, target_col)
+
+    results, weighted_score, train_hourly = _run_hourly_tuning_for_target(
+        train_df=train_df,
+        val_df=val_df,
+        target_col=target_col,
+        L_values=L_values,
+        r_values=r_values,
+        metric=metric,
+        min_points_per_hour=min_points_per_hour,
+        n_jobs=n_jobs,
+    )
+
+    _save_target_artifacts(
+        output_dir=output_dir,
+        target_col=target_col,
+        metric=metric,
+        weighted_score=weighted_score,
+        results=results,
+        train_hourly=train_hourly,
+    )
+
+    # demo forecast from hour 00 model if present
+    h0 = next((r for r in results if r.hour == 0), results[0])
+    model = UnivariateSSA(window_length=h0.best.window_length, rank=h0.best.rank).fit(train_hourly[h0.hour])
+    fcst = model.forecast(horizon=int(horizon_demo), refit_each_step=True)
+
+    out = pd.DataFrame(
+        {
+            "hour": [r.hour for r in results],
+            "window_length": [r.best.window_length for r in results],
+            "rank": [r.best.rank for r in results],
+            "val_score": [r.val_score for r in results],
+            "n_train": [r.n_train for r in results],
+            "n_val": [r.n_val for r in results],
+        }
+    ).sort_values("hour")
+
+    print(f"\n=== Target: {target_col} ===")
+    print(f"trained_hours={len(results)}/24")
+    print(f"weighted_validation_{metric}={weighted_score:.6f}")
+    print(out.to_string(index=False))
+    print(f"Demo: hour={h0.hour:02d} {horizon_demo}-step first10: {np.round(fcst[:10], 4)}")
+    print(f"Saved artifacts: {(output_dir / target_col).resolve()}")
+
+    return {
+        "target_col": target_col,
+        "weighted_score": weighted_score,
+        "trained_hours": len(results),
+    }
 
 
 def main() -> None:
@@ -241,76 +440,76 @@ def main() -> None:
         L_values = range(25, 65)   # 24 < L < 65
         r_values = range(3, 15)    # 3 <= r <= 14
 
-    train_df = _load_univariate_frame(args.train_path, args.target_col)
-    val_df = _load_univariate_frame(args.val_path, args.target_col)
+    output_dir = Path(args.output_dir)
+    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    run_dir = output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Additional smoke-test acceleration: last 48 hours only.
-    if args.smoke_test:
-        val_df = val_df.tail(48).reset_index(drop=True)
-
-    train_hourly = _split_hourly(train_df, args.target_col)
-    val_hourly = _split_hourly(val_df, args.target_col)
-
-    # Optimization 3: parallelize by independent hourly sub-series.
-    if Parallel is None or delayed is None:
-        print("[WARN] joblib not installed. Falling back to sequential hourly tuning.")
-        raw_results = [
-            _train_hour(
-                h,
-                train_hourly[h],
-                val_hourly[h],
-                L_values=L_values,
-                r_values=r_values,
-                metric=args.metric,
-                min_points_per_hour=args.min_points_per_hour,
-            )
-            for h in range(24)
-        ]
+    # Additional smoke-test acceleration: last 48 rows of validation series in each target.
+    # Applied by pre-trimming val parquet frames in single-target path below.
+    if args.all_targets:
+        targets = [("data/model_input/da/train.parquet", "data/model_input/da/val.parquet", "target_da_price")]
+        targets += [(args.afrr_train_path, args.afrr_val_path, t) for t in AFRR_TARGETS]
     else:
-        jobs = [
-            delayed(_train_hour)(
-                h,
-                train_hourly[h],
-                val_hourly[h],
+        targets = [(args.train_path, args.val_path, args.target_col)]
+
+    summary_rows = []
+    for train_path, val_path, target_col in targets:
+        train_df = _load_univariate_frame(train_path, target_col)
+        val_df = _load_univariate_frame(val_path, target_col)
+        if args.smoke_test:
+            val_df = val_df.tail(48).reset_index(drop=True)
+            # Persist temp in-memory by writing to temporary parquet is unnecessary; run helper directly.
+            # Reuse core hourly runner directly.
+            results, weighted_score, train_hourly = _run_hourly_tuning_for_target(
+                train_df=train_df,
+                val_df=val_df,
+                target_col=target_col,
                 L_values=L_values,
                 r_values=r_values,
                 metric=args.metric,
                 min_points_per_hour=args.min_points_per_hour,
+                n_jobs=args.n_jobs,
             )
-            for h in range(24)
-        ]
-        raw_results = Parallel(n_jobs=args.n_jobs, prefer="processes")(jobs)
-    results = [r for r in raw_results if r is not None]
+            _save_target_artifacts(
+                output_dir=run_dir,
+                target_col=target_col,
+                metric=args.metric,
+                weighted_score=weighted_score,
+                results=results,
+                train_hourly=train_hourly,
+            )
+            h0 = next((r for r in results if r.hour == 0), results[0])
+            model = UnivariateSSA(window_length=h0.best.window_length, rank=h0.best.rank).fit(train_hourly[h0.hour])
+            fcst = model.forecast(horizon=int(args.horizon_demo), refit_each_step=True)
+            print(f"\n=== Target: {target_col} ===")
+            print(f"trained_hours={len(results)}/24")
+            print(f"weighted_validation_{args.metric}={weighted_score:.6f}")
+            print(f"Demo: hour={h0.hour:02d} {args.horizon_demo}-step first10: {np.round(fcst[:10], 4)}")
+            print(f"Saved artifacts: {(run_dir / target_col).resolve()}")
+            summary_rows.append(
+                {"target_col": target_col, "weighted_score": weighted_score, "trained_hours": len(results)}
+            )
+        else:
+            result = _run_single_target(
+                train_path=train_path,
+                val_path=val_path,
+                target_col=target_col,
+                L_values=L_values,
+                r_values=r_values,
+                metric=args.metric,
+                min_points_per_hour=args.min_points_per_hour,
+                n_jobs=args.n_jobs,
+                horizon_demo=args.horizon_demo,
+                output_dir=run_dir,
+            )
+            summary_rows.append(result)
 
-    if not results:
-        raise RuntimeError("No hourly models were trained. Check min-points-per-hour / data.")
-
-    weighted_score = float(
-        np.average(np.array([r.val_score for r in results]), weights=np.array([r.n_val for r in results]))
-    )
-
-    out = pd.DataFrame(
-        {
-            "hour": [r.hour for r in results],
-            "window_length": [r.best.window_length for r in results],
-            "rank": [r.best.rank for r in results],
-            "val_score": [r.val_score for r in results],
-            "n_train": [r.n_train for r in results],
-            "n_val": [r.n_val for r in results],
-        }
-    ).sort_values("hour")
-
-    print("=== Hourly-Specified SSA (Optimized) ===")
-    print(f"trained_hours={len(results)}/24")
-    print(f"weighted_validation_{args.metric}={weighted_score:.6f}")
-    print(out.to_string(index=False))
-
-    # quick recursive forecast demo from one hour-model
-    h0 = next((r for r in results if r.hour == 0), results[0])
-    model = UnivariateSSA(window_length=h0.best.window_length, rank=h0.best.rank).fit(train_hourly[h0.hour])
-    fcst = model.forecast(horizon=int(args.horizon_demo), refit_each_step=True)
-    print(f"\nDemo: hour={h0.hour:02d} {args.horizon_demo}-step recursive forecast first10:")
-    print(np.array2string(fcst[:10], precision=4, separator=", "))
+    summary_df = pd.DataFrame(summary_rows).sort_values("target_col").reset_index(drop=True)
+    summary_df.to_csv(run_dir / "run_summary.csv", index=False)
+    print("\n=== Run Summary ===")
+    print(summary_df.to_string(index=False))
+    print(f"\nAll outputs saved under: {run_dir.resolve()}")
 
 
 if __name__ == "__main__":
