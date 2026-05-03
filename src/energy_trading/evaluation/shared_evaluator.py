@@ -16,6 +16,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    recall_score,
+)
 
 
 def _as_1d_float(x: Any) -> np.ndarray:
@@ -31,14 +38,57 @@ def _safe_mean(x: np.ndarray) -> float | None:
     return float(np.nanmean(x))
 
 
-def compute_shared_metrics(y_true: Any, y_pred: Any) -> dict[str, float | None]:
+def _extract_point_prediction(predictions: Any) -> np.ndarray:
+    """Extract deterministic/median forecast from either array-like or dict-like input."""
+    if isinstance(predictions, dict):
+        if "point" not in predictions:
+            raise KeyError("predictions_dict must contain key 'point'.")
+        return _as_1d_float(predictions["point"])
+    return _as_1d_float(predictions)
+
+
+def _extract_quantile_predictions(predictions: Any) -> dict[float, np.ndarray]:
+    """Extract quantile prediction arrays from dict keys like p01/p05/.../p99."""
+    if not isinstance(predictions, dict):
+        return {}
+    out: dict[float, np.ndarray] = {}
+    for k, v in predictions.items():
+        ks = str(k).strip().lower()
+        if ks == "point":
+            continue
+        if ks.startswith("p") and len(ks) in (3, 4) and ks[1:].isdigit():
+            q = float(int(ks[1:])) / 100.0
+            if 0.0 < q < 1.0:
+                out[q] = _as_1d_float(v)
+    return out
+
+
+def _tail_regression_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[float | None, float | None]:
+    if y_true.size == 0 or mask.size == 0 or not bool(mask.any()):
+        return None, None
+    yt = y_true[mask]
+    yp = y_pred[mask]
+    if yt.size == 0:
+        return None, None
+    return (
+        float(mean_absolute_error(yt, yp)),
+        float(np.sqrt(mean_squared_error(yt, yp))),
+    )
+
+
+def compute_shared_metrics(y_true: Any, predictions: Any) -> dict[str, float | None]:
     """Compute unified deterministic metric suite.
 
     Returns:
       rmse, mae, wmape, mbe, directional_accuracy, directional_mae, over_prediction_ratio
     """
     yt = _as_1d_float(y_true)
-    yp = _as_1d_float(y_pred)
+    yp = _extract_point_prediction(predictions)
+    qmap = _extract_quantile_predictions(predictions)
     mask = np.isfinite(yt) & np.isfinite(yp)
     yt = yt[mask]
     yp = yp[mask]
@@ -51,6 +101,13 @@ def compute_shared_metrics(y_true: Any, y_pred: Any) -> dict[str, float | None]:
         "directional_accuracy": None,
         "directional_mae": None,
         "over_prediction_ratio": None,
+        "tail_upper_mae": None,
+        "tail_upper_rmse": None,
+        "spike_precision": None,
+        "spike_recall": None,
+        "spike_f1": None,
+        "tail_lower_mae": None,
+        "tail_lower_rmse": None,
     }
     if yt.size == 0:
         return out
@@ -73,6 +130,52 @@ def compute_shared_metrics(y_true: Any, y_pred: Any) -> dict[str, float | None]:
         if dmask.any():
             out["directional_accuracy"] = float(np.mean(np.sign(dyt[dmask]) == np.sign(dyp[dmask])))
             out["directional_mae"] = float(np.mean(np.abs(dyt[dmask] - dyp[dmask])))
+
+    # Tail / extreme-event metrics
+    try:
+        p90 = float(np.percentile(yt, 90))
+        p10 = float(np.percentile(yt, 10))
+    except Exception:
+        return out
+
+    upper_mask = yt >= p90
+    lower_mask = yt <= p10
+
+    upper_mae, upper_rmse = _tail_regression_metrics(yt, yp, upper_mask)
+    out["tail_upper_mae"] = upper_mae
+    out["tail_upper_rmse"] = upper_rmse
+
+    lower_mae, lower_rmse = _tail_regression_metrics(yt, yp, lower_mask)
+    out["tail_lower_mae"] = lower_mae
+    out["tail_lower_rmse"] = lower_rmse
+
+    # Spike classification at dynamic upper-tail threshold.
+    y_true_spike = (yt >= p90).astype(int)
+    y_pred_spike = (yp >= p90).astype(int)
+    if y_true_spike.size > 0:
+        out["spike_precision"] = float(precision_score(y_true_spike, y_pred_spike, zero_division=0.0))
+        out["spike_recall"] = float(recall_score(y_true_spike, y_pred_spike, zero_division=0.0))
+        out["spike_f1"] = float(f1_score(y_true_spike, y_pred_spike, zero_division=0.0))
+
+    # Optional probabilistic calibration diagnostics:
+    # coverage_q = mean(y_true <= y_q), coverage_error_q = coverage_q - q
+    for q, qpred_raw in sorted(qmap.items(), key=lambda kv: kv[0]):
+        qpred = np.asarray(qpred_raw, dtype=float).reshape(-1)
+        n = min(yt.size, qpred.size)
+        if n == 0:
+            out[f"coverage_p{int(round(q * 100)):02d}"] = None
+            out[f"coverage_error_p{int(round(q * 100)):02d}"] = None
+            continue
+        yq = qpred[:n]
+        yv = yt[:n]
+        m = np.isfinite(yv) & np.isfinite(yq)
+        if not np.any(m):
+            out[f"coverage_p{int(round(q * 100)):02d}"] = None
+            out[f"coverage_error_p{int(round(q * 100)):02d}"] = None
+            continue
+        cov = float(np.mean(yv[m] <= yq[m]))
+        out[f"coverage_p{int(round(q * 100)):02d}"] = cov
+        out[f"coverage_error_p{int(round(q * 100)):02d}"] = float(cov - q)
     return out
 
 
@@ -196,4 +299,3 @@ def log_metrics_tensorboard_canonical(
         writer.add_scalar(f"{split}/{name}/{target_col}", float(value), int(step))
         n += 1
     return n
-

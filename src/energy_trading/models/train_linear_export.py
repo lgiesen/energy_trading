@@ -1,4 +1,4 @@
-"""Train Ridge linear baseline on prepared DA/aFRR bundles and export artifacts."""
+"""Train linear quantile baseline on prepared DA/aFRR bundles and export artifacts."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import SGDRegressor
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_DIR = REPO_ROOT / "src"
@@ -35,10 +35,15 @@ from energy_trading.evaluation.tensorboard_utils import (  # noqa: E402
     log_numeric_scalars,
     tensorboard_target_log_dir,
 )
+from energy_trading.evaluation.conformal_calibration import (  # noqa: E402
+    apply_conformal_shifts,
+    calculate_conformal_shifts,
+)
 from energy_trading.models.prepare_ml_bundles import load_processed_data  # noqa: E402
 
 BundleName = Literal["da", "afrr"]
 LOGGER = logging.getLogger(__name__)
+QUANTILES: tuple[float, ...] = (0.01, 0.05, 0.10, 0.50, 0.90, 0.95, 0.99)
 
 
 AFRR_TARGETS = [
@@ -125,13 +130,32 @@ def _write_bundle_manifest_fragment(
     }
 
 
-def _build_linear_pipeline(alpha: float) -> Pipeline:
-    # Linear baseline with robust preprocessing for missing values + scaling.
+def _qcol(q: float) -> str:
+    return f"p{int(round(q * 100)):02d}"
+
+
+def _build_linear_pipeline(alpha: float, quantile: float) -> Pipeline:
+    # Fast linear quantile baseline using SGD quantile loss.
     return Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("model", Ridge(alpha=float(alpha))),
+            ("scaler", RobustScaler(quantile_range=(10.0, 90.0))),
+            (
+                "model",
+                SGDRegressor(
+                    loss="quantile",
+                    quantile=float(quantile),
+                    alpha=float(alpha),
+                    penalty="elasticnet",
+                    l1_ratio=0.15,
+                    max_iter=3000,
+                    tol=1e-4,
+                    learning_rate="invscaling",
+                    eta0=0.01,
+                    power_t=0.25,
+                    random_state=42,
+                ),
+            ),
         ]
     )
 
@@ -158,7 +182,7 @@ def _make_long_rows(
     *,
     h1_target_timestamp: pd.Series,
     lead_time_h: int,
-    y_pred: np.ndarray,
+    pred_by_q: dict[str, np.ndarray],
     model_name: str,
 ) -> pd.DataFrame:
     # Prepared bundles are aligned to h1 target timestamps.
@@ -166,16 +190,22 @@ def _make_long_rows(
     h1_ts = pd.to_datetime(h1_target_timestamp, utc=True, errors="coerce")
     target_ts = h1_ts + pd.to_timedelta(int(lead_time_h - 1), unit="h")
     snap_ts = target_ts - pd.to_timedelta(int(lead_time_h), unit="h")
-    return pd.DataFrame(
+    n = len(h1_ts)
+    q_cols = [_qcol(q) for q in QUANTILES]
+    q_stack = np.column_stack([pd.to_numeric(pd.Series(pred_by_q[c]), errors="coerce").to_numpy(dtype=float) for c in q_cols])
+    q_stack = np.sort(q_stack, axis=1)  # crossing repair
+    out = pd.DataFrame(
         {
             "snapshot_time_utc": snap_ts,
             "target_time_utc": target_ts,
             "lead_time_h": int(lead_time_h),
             "model_name": model_name,
-            "predicted_value": pd.to_numeric(pd.Series(y_pred), errors="coerce"),
-            "p50": pd.to_numeric(pd.Series(y_pred), errors="coerce"),
+            "predicted_value": q_stack[:, q_cols.index("p50")] if n > 0 else np.array([], dtype=float),
         }
     )
+    for i, c in enumerate(q_cols):
+        out[c] = q_stack[:, i]
+    return out
 
 
 def _train_target(
@@ -186,7 +216,7 @@ def _train_target(
     alpha: float,
     model_name: str,
     forecast_horizon_hours: int,
-) -> tuple[dict[int, Pipeline], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+) -> tuple[dict[int, dict[str, Pipeline]], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     cfg = json.loads((base_dir / "feature_config.json").read_text(encoding="utf-8"))
     bcfg = cfg["bundles"][bundle]
     train_ts = pd.to_datetime(
@@ -232,7 +262,7 @@ def _train_target(
     y_test_all = pd.to_numeric(y_test_df[target_col], errors="coerce")
 
     pred_col = _pred_column_names_for_target(target_col)[0]
-    lead_models: dict[int, Pipeline] = {}
+    lead_models: dict[int, dict[str, Pipeline]] = {}
     lead_rows_val: list[pd.DataFrame] = []
     lead_rows_test: list[pd.DataFrame] = []
     lead_metric_rows: list[dict[str, float]] = []
@@ -274,20 +304,38 @@ def _train_target(
             )
             continue
 
-        pipe = _build_linear_pipeline(alpha=alpha)
+        q_models: dict[str, Pipeline] = {}
+        preds_va: dict[str, np.ndarray] = {}
+        preds_te: dict[str, np.ndarray] = {}
         fit_t0 = time.perf_counter()
-        pipe.fit(X_tr, y_tr)
+        for q in QUANTILES:
+            qcol = _qcol(q)
+            pipe = _build_linear_pipeline(alpha=alpha, quantile=q)
+            pipe.fit(X_tr, y_tr)
+            q_models[qcol] = pipe
+            preds_va[qcol] = pipe.predict(X_va)
+            preds_te[qcol] = pipe.predict(X_te)
         fit_seconds_total += float(time.perf_counter() - fit_t0)
 
-        pred_va = pipe.predict(X_va)
-        pred_te = pipe.predict(X_te)
+        # Post-process to enforce monotone quantiles row-wise.
+        q_cols = [_qcol(q) for q in QUANTILES]
+        va_stack = np.column_stack([pd.to_numeric(pd.Series(preds_va[c]), errors="coerce").to_numpy(dtype=float) for c in q_cols])
+        te_stack = np.column_stack([pd.to_numeric(pd.Series(preds_te[c]), errors="coerce").to_numpy(dtype=float) for c in q_cols])
+        va_stack = np.sort(va_stack, axis=1)
+        te_stack = np.sort(te_stack, axis=1)
+        for i, c in enumerate(q_cols):
+            preds_va[c] = va_stack[:, i]
+            preds_te[c] = te_stack[:, i]
 
-        lead_models[int(lead_h)] = pipe
+        pred_va = preds_va["p50"]
+        pred_te = preds_te["p50"]
+
+        lead_models[int(lead_h)] = q_models
         lead_rows_val.append(
             _make_long_rows(
                 h1_target_timestamp=ts_va,
                 lead_time_h=int(lead_h),
-                y_pred=pred_va,
+                pred_by_q=preds_va,
                 model_name=model_name,
             )
         )
@@ -295,7 +343,7 @@ def _train_target(
             _make_long_rows(
                 h1_target_timestamp=ts_te,
                 lead_time_h=int(lead_h),
-                y_pred=pred_te,
+                pred_by_q=preds_te,
                 model_name=model_name,
             )
         )
@@ -345,6 +393,42 @@ def _train_target(
             ["snapshot_time_utc", "lead_time_h", "target_time_utc"]
         ),
     }
+
+    # Conformal calibration (split-conformal): fit shifts on validation long set,
+    # then apply to test long set before export.
+    q_cols = [_qcol(q) for q in QUANTILES]
+    truth_calib = pd.DataFrame(
+        {
+            "timestamp_utc": pd.to_datetime(pred_frames["val"]["timestamp_utc"], utc=True, errors="coerce"),
+            "y_true": pd.to_numeric(y_va_h1, errors="coerce").to_numpy(dtype=float),
+        }
+    )
+    # Prefer lead-1 calibration to preserve horizon semantics.
+    calib_base = long_frames["val"].loc[long_frames["val"]["lead_time_h"] == 1].copy()
+    if not calib_base.empty:
+        calib_base["target_time_utc"] = pd.to_datetime(calib_base["target_time_utc"], utc=True, errors="coerce")
+        calib_join = calib_base.merge(
+            truth_calib,
+            left_on="target_time_utc",
+            right_on="timestamp_utc",
+            how="inner",
+        )
+        if not calib_join.empty:
+            q_dict = {c: pd.to_numeric(calib_join[c], errors="coerce").to_numpy(dtype=float) for c in q_cols if c in calib_join.columns}
+            shifts = calculate_conformal_shifts(
+                y_true_calib=pd.to_numeric(calib_join["y_true"], errors="coerce").to_numpy(dtype=float),
+                q_preds_calib_dict=q_dict,
+                alphas=list(QUANTILES),
+            )
+            test_df = long_frames["test"].copy()
+            q_test = {c: pd.to_numeric(test_df[c], errors="coerce").to_numpy(dtype=float) for c in q_cols if c in test_df.columns}
+            q_cal = apply_conformal_shifts(q_test, shifts)
+            for c in q_cols:
+                if c in q_cal:
+                    test_df[c] = q_cal[c]
+            if "p50" in test_df.columns:
+                test_df["predicted_value"] = pd.to_numeric(test_df["p50"], errors="coerce")
+            long_frames["test"] = test_df
 
     # Maintain top-level metrics on h1 for continuity + add lead-wise summary.
     val_metric_suite = compute_forecast_metrics(
@@ -443,7 +527,7 @@ def _train_target(
 
 
 def _build_cli() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Train Ridge linear baseline on prepared DA/aFRR bundles.")
+    p = argparse.ArgumentParser(description="Train linear quantile baseline on prepared DA/aFRR bundles.")
     p.add_argument("--base-dir", default="data/model_input")
     p.add_argument("--bundle", choices=["da", "afrr"], default="da")
     p.add_argument("--target-col", default="")
@@ -597,7 +681,7 @@ def main() -> None:
     fragment_path.parent.mkdir(parents=True, exist_ok=True)
     fragment_path.write_text(json.dumps(fragment, indent=2), encoding="utf-8")
 
-    print("[OK] Linear Ridge training finished.")
+    print("[OK] Linear Quantile training finished.")
     print(f"- Bundle: {args.bundle}")
     print(f"- Target: {tgt}")
     print(f"- MAE val/test: {metrics.get('mae_val')} / {metrics.get('mae_test')}")

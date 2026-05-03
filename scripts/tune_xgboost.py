@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Optuna tuning for XGBoost with spike/tail-weighted optimization.
+"""Tail-risk tuning for XGBoost with shared evaluator objective.
 
 This script keeps the project's fixed chronological split (train/val) and
-optimizes hyperparameters against an asymmetric weighted MAE objective that
-penalizes tail hours more strongly.
+optimizes hyperparameters against tail-focused objectives from shared evaluator.
 """
 from __future__ import annotations
 
@@ -24,6 +23,7 @@ if str(SRC_DIR) not in sys.path:
 
 from energy_trading.models.prepare_ml_bundles import BundleName, load_processed_data
 from energy_trading.models.train_xgboost_export import _add_dynamics_features, _resolve_targets
+from energy_trading.evaluation.shared_evaluator import compute_shared_metrics
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +72,19 @@ def _weighted_mae(y_true: np.ndarray, y_pred: np.ndarray, w: np.ndarray) -> floa
     return float(np.average(np.abs(y_true[m] - y_pred[m]), weights=w[m]))
 
 
+def _asymmetric_mae(y_true: np.ndarray, y_pred: np.ndarray, penalty: float = 3.0) -> float:
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    yt = y_true[m]
+    yp = y_pred[m]
+    if yt.size == 0:
+        return float("nan")
+    q90 = float(np.percentile(yt, 90))
+    err = yp - yt
+    w = np.ones_like(err, dtype=float)
+    w[(yt >= q90) & (err < 0)] = float(penalty)
+    return float(np.mean(np.abs(err) * w))
+
+
 def _build_cli() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Tune XGBoost with tail-weighted objective via Optuna.")
     p.add_argument("--base-dir", default="data/model_input")
@@ -86,6 +99,11 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--q-low", type=float, default=0.05)
     p.add_argument("--q-high", type=float, default=0.95)
     p.add_argument("--tail-weight", type=float, default=3.0)
+    p.add_argument(
+        "--selection-metric",
+        choices=["tail_upper_mae", "asymmetric_mae"],
+        default="tail_upper_mae",
+    )
     p.add_argument("--study-name", default="xgb_tail_weighted_tuning")
     p.add_argument("--out-dir", default="artifacts/hpo")
     return p
@@ -150,14 +168,17 @@ def main() -> None:
     trial_rows: list[dict[str, float | int]] = []
 
     def _objective(trial: "optuna.Trial") -> float:
-        max_depth = trial.suggest_int("max_depth", 5, 10)
+        max_depth = trial.suggest_int("max_depth", 3, 6)
         learning_rate = trial.suggest_float("learning_rate", 0.01, 0.12, log=True)
         subsample = trial.suggest_float("subsample", 0.65, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.55, 1.0)
-        min_child_weight = trial.suggest_float("min_child_weight", 1.0, 12.0)
+        min_child_weight = trial.suggest_float("min_child_weight", 8.0, 40.0)
+        reg_alpha = trial.suggest_float("reg_alpha", 2.0, 30.0, log=True)
+        reg_lambda = trial.suggest_float("reg_lambda", 5.0, 80.0, log=True)
 
         model = XGBRegressor(
-            objective="reg:absoluteerror",
+            objective="reg:quantileerror",
+            quantile_alpha=0.5,
             n_estimators=int(args.n_estimators),
             max_depth=int(max_depth),
             learning_rate=float(learning_rate),
@@ -166,8 +187,8 @@ def main() -> None:
             subsample=float(subsample),
             colsample_bytree=float(colsample_bytree),
             min_child_weight=float(min_child_weight),
-            reg_alpha=0.0,
-            reg_lambda=1.0,
+            reg_alpha=float(reg_alpha),
+            reg_lambda=float(reg_lambda),
             random_state=int(args.seed),
             early_stopping_rounds=max(0, int(args.early_stopping_rounds)),
             n_jobs=-1,
@@ -184,20 +205,35 @@ def main() -> None:
         pred = model.predict(X_va)
         wmae = _weighted_mae(y_va_np, pred, va_w)
         mae = float(np.mean(np.abs(y_va_np - pred)))
+        shared = compute_shared_metrics(y_va_np, {"point": pred})
+        tail_upper_mae = shared.get("tail_upper_mae")
+        asym = _asymmetric_mae(y_va_np, pred, penalty=float(args.tail_weight))
+        if args.selection_metric == "tail_upper_mae":
+            objective = float(tail_upper_mae) if tail_upper_mae is not None and np.isfinite(tail_upper_mae) else float(wmae)
+        else:
+            objective = float(asym) if np.isfinite(asym) else float(wmae)
         trial_rows.append(
             {
                 "trial": int(trial.number),
+                "objective": float(objective),
                 "weighted_mae": float(wmae),
                 "mae": float(mae),
+                "tail_upper_mae": float(tail_upper_mae) if tail_upper_mae is not None and np.isfinite(tail_upper_mae) else np.nan,
+                "asymmetric_mae": float(asym) if np.isfinite(asym) else np.nan,
                 "max_depth": int(max_depth),
                 "learning_rate": float(learning_rate),
                 "subsample": float(subsample),
                 "colsample_bytree": float(colsample_bytree),
                 "min_child_weight": float(min_child_weight),
+                "reg_alpha": float(reg_alpha),
+                "reg_lambda": float(reg_lambda),
             }
         )
         trial.set_user_attr("mae", float(mae))
-        return float(wmae)
+        trial.set_user_attr("weighted_mae", float(wmae))
+        trial.set_user_attr("tail_upper_mae", float(tail_upper_mae) if tail_upper_mae is not None and np.isfinite(tail_upper_mae) else np.nan)
+        trial.set_user_attr("asymmetric_mae", float(asym) if np.isfinite(asym) else np.nan)
+        return float(objective)
 
     study = optuna.create_study(direction="minimize", study_name=args.study_name)
     study.optimize(_objective, n_trials=int(args.n_trials))
@@ -219,8 +255,12 @@ def main() -> None:
             "train_threshold_high": float(qh),
         },
         "best_trial": int(best.number),
-        "best_weighted_mae": float(best.value),
+        "selection_metric": str(args.selection_metric),
+        "best_objective_value": float(best.value),
+        "best_weighted_mae": float(best.user_attrs.get("weighted_mae", np.nan)),
         "best_mae": float(best.user_attrs.get("mae", np.nan)),
+        "best_tail_upper_mae": float(best.user_attrs.get("tail_upper_mae", np.nan)),
+        "best_asymmetric_mae": float(best.user_attrs.get("asymmetric_mae", np.nan)),
         "best_params": best.params,
     }
 
@@ -230,7 +270,8 @@ def main() -> None:
     pd.DataFrame(trial_rows).to_csv(out_csv, index=False)
 
     print("[OK] Optuna tuning finished.")
-    print(f"- Best weighted MAE: {result['best_weighted_mae']:.6f}")
+    print(f"- Selection metric: {result['selection_metric']}")
+    print(f"- Best objective value: {result['best_objective_value']:.6f}")
     print(f"- Best params: {result['best_params']}")
     print(f"- Result JSON: {out_json}")
     print(f"- Trials CSV: {out_csv}")
@@ -238,4 +279,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

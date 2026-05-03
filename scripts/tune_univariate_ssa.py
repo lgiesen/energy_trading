@@ -38,6 +38,11 @@ from src.energy_trading.models.univariate_ssa import (
     _truncated_svd,
 )
 from src.energy_trading.evaluation.metrics import compute_forecast_metrics
+from src.energy_trading.evaluation.shared_evaluator import (
+    EvalMetadata,
+    append_canonical_predictions_parquet,
+    predictions_to_canonical_df,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -46,6 +51,7 @@ except Exception:  # pragma: no cover
 
 
 MetricName = str
+QUANTILE_LEVELS: tuple[float, ...] = (0.01, 0.05, 0.10, 0.50, 0.90, 0.95, 0.99)
 
 
 @dataclass
@@ -74,6 +80,13 @@ def _metric(y_true: np.ndarray, y_pred: np.ndarray, metric: MetricName) -> float
         return float(np.mean(np.abs(err)))
     if metric == "rmse":
         return float(np.sqrt(np.mean(err * err)))
+    if metric == "asymmetric_mae":
+        # 3x penalty for under-predicting upper-tail events.
+        q90 = float(np.percentile(y_true, 90))
+        w = np.ones_like(err, dtype=float)
+        under_tail = (y_true >= q90) & (y_pred < y_true)
+        w[under_tail] = 3.0
+        return float(np.mean(w * np.abs(err)))
     raise ValueError(f"Unsupported metric: {metric}")
 
 
@@ -96,6 +109,32 @@ def _directional_mae(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
     if not np.any(mask):
         return None
     return float(np.mean(np.abs(dy_true[mask] - dy_pred[mask])))
+
+
+def _qcol(q: float) -> str:
+    return f"p{int(round(q * 100)):02d}"
+
+
+def _compute_error_quantiles(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """Empirical residual quantiles for pseudo-quantile SSA intervals."""
+    yt = np.asarray(y_true, dtype=float).reshape(-1)
+    yp = np.asarray(y_pred, dtype=float).reshape(-1)
+    m = np.isfinite(yt) & np.isfinite(yp)
+    if not np.any(m):
+        return {_qcol(q): float("nan") for q in QUANTILE_LEVELS}
+    err = yt[m] - yp[m]
+    return {_qcol(q): float(np.percentile(err, q * 100.0)) for q in QUANTILE_LEVELS}
+
+
+def _apply_error_quantiles(point_pred: np.ndarray, err_q: dict[str, float]) -> pd.DataFrame:
+    """Broadcast error quantiles around point forecast and enforce monotonicity."""
+    p = np.asarray(point_pred, dtype=float).reshape(-1)
+    q_cols = [_qcol(q) for q in QUANTILE_LEVELS]
+    stack = np.column_stack([p + float(err_q.get(c, np.nan)) for c in q_cols])
+    stack = np.sort(stack, axis=1)
+    out = pd.DataFrame({c: stack[:, i] for i, c in enumerate(q_cols)})
+    out["predicted_value"] = out["p50"]
+    return out
 
 
 def _cached_grid_score_one_hour(
@@ -289,8 +328,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Optimized hourly univariate recurrent SSA tuner.")
     p.add_argument("--train-path", default="data/model_input/da/train.parquet")
     p.add_argument("--val-path", default="data/model_input/da/val.parquet")
+    p.add_argument("--calib-path", default="data/model_input/da/test.parquet")
     p.add_argument("--target-col", default="target_da_price")
-    p.add_argument("--metric", choices=["rmse", "mae"], default="rmse")
+    p.add_argument("--metric", choices=["rmse", "mae", "asymmetric_mae"], default="asymmetric_mae")
     p.add_argument("--horizon-demo", type=int, default=48)
     p.add_argument("--min-points-per-hour", type=int, default=220)
     p.add_argument("--n-jobs", type=int, default=-1, help="Parallel workers across 24 hourly models.")
@@ -309,6 +349,11 @@ def parse_args() -> argparse.Namespace:
         "--afrr-val-path",
         default="data/model_input/afrr/val.parquet",
         help="aFRR val path used when --all-targets is enabled.",
+    )
+    p.add_argument(
+        "--afrr-calib-path",
+        default="data/model_input/afrr/test.parquet",
+        help="aFRR calibration path used when --all-targets is enabled.",
     )
     p.add_argument(
         "--output-dir",
@@ -417,6 +462,7 @@ def _save_target_artifacts(
     weighted_score: float,
     results: list[HourlySSAResult],
     train_hourly: dict[int, pd.Series],
+    error_quantiles: dict[str, float] | None = None,
 ) -> None:
     target_dir = output_dir / target_col
     models_dir = target_dir / "models"
@@ -468,15 +514,22 @@ def _save_target_artifacts(
         "mean_directional_mae": float(pd.to_numeric(df.get("directional_mae"), errors="coerce").mean())
         if "directional_mae" in df.columns
         else None,
+        "error_quantiles": error_quantiles or {},
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     (target_dir / "summary.json").write_text(pd.Series(summary).to_json(indent=2), encoding="utf-8")
+    if error_quantiles:
+        (target_dir / "error_quantiles.json").write_text(
+            pd.Series(error_quantiles).to_json(indent=2),
+            encoding="utf-8",
+        )
 
 
 def _run_single_target(
     *,
     train_path: str,
     val_path: str,
+    calib_path: str,
     target_col: str,
     L_values: Iterable[int],
     r_values: Iterable[int],
@@ -489,6 +542,7 @@ def _run_single_target(
 ) -> dict[str, object]:
     train_df = _load_univariate_frame(train_path, target_col)
     val_df = _load_univariate_frame(val_path, target_col)
+    calib_df = _load_univariate_frame(calib_path, target_col)
 
     results, weighted_score, train_hourly = _run_hourly_tuning_for_target(
         train_df=train_df,
@@ -501,6 +555,81 @@ def _run_single_target(
         n_jobs=n_jobs,
     )
 
+    # Validation traces used for canonical export (selection set).
+    val_hourly = _split_hourly(val_df, target_col)
+    canonical_rows: list[pd.DataFrame] = []
+    trace_rows: list[pd.DataFrame] = []
+    for r in results:
+        preds = _rolling_preds_for_params(
+            train_hourly[r.hour].to_numpy(dtype=float),
+            val_hourly[r.hour].to_numpy(dtype=float),
+            window_length=r.best.window_length,
+            rank=r.best.rank,
+        )
+        base_ts = pd.to_datetime(val_df["timestamp_utc"], utc=True)
+        ts_hour = base_ts[base_ts.dt.hour == int(r.hour)].reset_index(drop=True)
+        n = min(len(ts_hour), len(preds), len(val_hourly[r.hour]))
+        trace_rows.append(
+            pd.DataFrame(
+                {
+                    "timestamp_utc": ts_hour.iloc[:n].to_numpy(),
+                    "hour": int(r.hour),
+                    "y_true": val_hourly[r.hour].to_numpy(dtype=float)[:n],
+                    "y_pred": preds[:n],
+                }
+            )
+        )
+        pred_df = predictions_to_canonical_df(
+            timestamps=ts_hour,
+            y_true=val_hourly[r.hour].to_numpy(dtype=float),
+            y_pred=preds,
+            meta=EvalMetadata(
+                model_family="ssa_univariate",
+                target_col=target_col,
+                split="val",
+                lead_h=1,
+            ),
+        )
+        canonical_rows.append(pred_df)
+
+    if canonical_rows:
+        all_pred = pd.concat(canonical_rows, axis=0, ignore_index=True)
+        append_canonical_predictions_parquet(
+            all_pred,
+            output_dir / "canonical_predictions.parquet",
+        )
+
+    trace_df = pd.concat(trace_rows, axis=0, ignore_index=True) if trace_rows else pd.DataFrame()
+
+    # Calibration traces (out-of-sample wrt (L,r) selection) for pseudo-quantile residuals.
+    calib_hourly = _split_hourly(calib_df, target_col)
+    calib_trace_rows: list[pd.DataFrame] = []
+    for r in results:
+        preds_cal = _rolling_preds_for_params(
+            train_hourly[r.hour].to_numpy(dtype=float),
+            calib_hourly[r.hour].to_numpy(dtype=float),
+            window_length=r.best.window_length,
+            rank=r.best.rank,
+        )
+        base_ts_cal = pd.to_datetime(calib_df["timestamp_utc"], utc=True)
+        ts_hour_cal = base_ts_cal[base_ts_cal.dt.hour == int(r.hour)].reset_index(drop=True)
+        n_cal = min(len(ts_hour_cal), len(preds_cal), len(calib_hourly[r.hour]))
+        calib_trace_rows.append(
+            pd.DataFrame(
+                {
+                    "timestamp_utc": ts_hour_cal.iloc[:n_cal].to_numpy(),
+                    "hour": int(r.hour),
+                    "y_true": calib_hourly[r.hour].to_numpy(dtype=float)[:n_cal],
+                    "y_pred": preds_cal[:n_cal],
+                }
+            )
+        )
+    calib_trace_df = pd.concat(calib_trace_rows, axis=0, ignore_index=True) if calib_trace_rows else pd.DataFrame()
+    error_quantiles = _compute_error_quantiles(
+        calib_trace_df["y_true"].to_numpy(dtype=float) if not calib_trace_df.empty else np.array([], dtype=float),
+        calib_trace_df["y_pred"].to_numpy(dtype=float) if not calib_trace_df.empty else np.array([], dtype=float),
+    )
+
     _save_target_artifacts(
         output_dir=output_dir,
         target_col=target_col,
@@ -508,7 +637,22 @@ def _run_single_target(
         weighted_score=weighted_score,
         results=results,
         train_hourly=train_hourly,
+        error_quantiles=error_quantiles,
     )
+
+    # Export pseudo-quantile traces on calibration split for downstream parity.
+    if not calib_trace_df.empty:
+        qdf = _apply_error_quantiles(calib_trace_df["y_pred"].to_numpy(dtype=float), error_quantiles)
+        pseudo = pd.concat(
+            [
+                calib_trace_df.loc[:, ["timestamp_utc", "hour", "y_true", "y_pred"]].rename(
+                    columns={"y_pred": "point_pred"}
+                ),
+                qdf,
+            ],
+            axis=1,
+        )
+        pseudo.to_parquet(output_dir / target_col / "calibration_pseudo_quantiles.parquet", index=False)
 
     # demo forecast from hour 00 model if present
     h0 = next((r for r in results if r.hour == 0), results[0])
@@ -593,15 +737,16 @@ def main() -> None:
             tb_writer = SummaryWriter(log_dir=str(tb_dir))
 
     if args.all_targets:
-        targets = [("data/model_input/da/train.parquet", "data/model_input/da/val.parquet", "target_da_price")]
-        targets += [(args.afrr_train_path, args.afrr_val_path, t) for t in AFRR_TARGETS]
+        targets = [("data/model_input/da/train.parquet", "data/model_input/da/val.parquet", args.calib_path, "target_da_price")]
+        targets += [(args.afrr_train_path, args.afrr_val_path, args.afrr_calib_path, t) for t in AFRR_TARGETS]
     else:
-        targets = [(args.train_path, args.val_path, args.target_col)]
+        targets = [(args.train_path, args.val_path, args.calib_path, args.target_col)]
 
     summary_rows = []
-    for train_path, val_path, target_col in targets:
+    for train_path, val_path, calib_path, target_col in targets:
         train_df = _load_univariate_frame(train_path, target_col)
         val_df = _load_univariate_frame(val_path, target_col)
+        calib_df = _load_univariate_frame(calib_path, target_col)
 
         if args.smoke_test:
             val_df = val_df.tail(48).reset_index(drop=True)
@@ -615,6 +760,56 @@ def main() -> None:
                 min_points_per_hour=args.min_points_per_hour,
                 n_jobs=args.n_jobs,
             )
+            val_hourly = _split_hourly(val_df, target_col)
+            smoke_trace_rows: list[pd.DataFrame] = []
+            for rr in results:
+                preds = _rolling_preds_for_params(
+                    train_hourly[rr.hour].to_numpy(dtype=float),
+                    val_hourly[rr.hour].to_numpy(dtype=float),
+                    window_length=rr.best.window_length,
+                    rank=rr.best.rank,
+                )
+                base_ts = pd.to_datetime(val_df["timestamp_utc"], utc=True)
+                ts_hour = base_ts[base_ts.dt.hour == int(rr.hour)].reset_index(drop=True)
+                n = min(len(ts_hour), len(preds), len(val_hourly[rr.hour]))
+                smoke_trace_rows.append(
+                    pd.DataFrame(
+                        {
+                            "timestamp_utc": ts_hour.iloc[:n].to_numpy(),
+                            "hour": int(rr.hour),
+                            "y_true": val_hourly[rr.hour].to_numpy(dtype=float)[:n],
+                            "y_pred": preds[:n],
+                        }
+                    )
+                )
+            smoke_trace_df = pd.concat(smoke_trace_rows, axis=0, ignore_index=True) if smoke_trace_rows else pd.DataFrame()
+            calib_hourly = _split_hourly(calib_df, target_col)
+            calib_trace_rows: list[pd.DataFrame] = []
+            for rr in results:
+                preds_cal = _rolling_preds_for_params(
+                    train_hourly[rr.hour].to_numpy(dtype=float),
+                    calib_hourly[rr.hour].to_numpy(dtype=float),
+                    window_length=rr.best.window_length,
+                    rank=rr.best.rank,
+                )
+                base_ts_cal = pd.to_datetime(calib_df["timestamp_utc"], utc=True)
+                ts_hour_cal = base_ts_cal[base_ts_cal.dt.hour == int(rr.hour)].reset_index(drop=True)
+                n_cal = min(len(ts_hour_cal), len(preds_cal), len(calib_hourly[rr.hour]))
+                calib_trace_rows.append(
+                    pd.DataFrame(
+                        {
+                            "timestamp_utc": ts_hour_cal.iloc[:n_cal].to_numpy(),
+                            "hour": int(rr.hour),
+                            "y_true": calib_hourly[rr.hour].to_numpy(dtype=float)[:n_cal],
+                            "y_pred": preds_cal[:n_cal],
+                        }
+                    )
+                )
+            calib_trace_df = pd.concat(calib_trace_rows, axis=0, ignore_index=True) if calib_trace_rows else pd.DataFrame()
+            error_quantiles = _compute_error_quantiles(
+                calib_trace_df["y_true"].to_numpy(dtype=float) if not calib_trace_df.empty else np.array([], dtype=float),
+                calib_trace_df["y_pred"].to_numpy(dtype=float) if not calib_trace_df.empty else np.array([], dtype=float),
+            )
             _save_target_artifacts(
                 output_dir=run_dir,
                 target_col=target_col,
@@ -622,6 +817,7 @@ def main() -> None:
                 weighted_score=weighted_score,
                 results=results,
                 train_hourly=train_hourly,
+                error_quantiles=error_quantiles,
             )
 
             h0 = next((r for r in results if r.hour == 0), results[0])
@@ -632,6 +828,47 @@ def main() -> None:
             print(f"weighted_validation_{args.metric}={weighted_score:.6f}")
             print(f"Demo: hour={h0.hour:02d} {args.horizon_demo}-step first10: {np.round(fcst[:10], 4)}")
             print(f"Saved artifacts: {(run_dir / target_col).resolve()}")
+
+            # Export canonical validation prediction traces for shared evaluator.
+            canonical_rows: list[pd.DataFrame] = []
+            for rr in results:
+                preds = _rolling_preds_for_params(
+                    train_hourly[rr.hour].to_numpy(dtype=float),
+                    val_hourly[rr.hour].to_numpy(dtype=float),
+                    window_length=rr.best.window_length,
+                    rank=rr.best.rank,
+                )
+                base_ts = pd.to_datetime(val_df["timestamp_utc"], utc=True)
+                ts_hour = base_ts[base_ts.dt.hour == int(rr.hour)].reset_index(drop=True)
+                pred_df = predictions_to_canonical_df(
+                    timestamps=ts_hour,
+                    y_true=val_hourly[rr.hour].to_numpy(dtype=float),
+                    y_pred=preds,
+                    meta=EvalMetadata(
+                        model_family="ssa_univariate",
+                        target_col=target_col,
+                        split="val",
+                        lead_h=1,
+                    ),
+                )
+                canonical_rows.append(pred_df)
+            if canonical_rows:
+                append_canonical_predictions_parquet(
+                    pd.concat(canonical_rows, axis=0, ignore_index=True),
+                    run_dir / "canonical_predictions.parquet",
+                )
+            if not calib_trace_df.empty:
+                qdf = _apply_error_quantiles(calib_trace_df["y_pred"].to_numpy(dtype=float), error_quantiles)
+                pseudo = pd.concat(
+                    [
+                        calib_trace_df.loc[:, ["timestamp_utc", "hour", "y_true", "y_pred"]].rename(
+                            columns={"y_pred": "point_pred"}
+                        ),
+                        qdf,
+                    ],
+                    axis=1,
+                )
+                pseudo.to_parquet(run_dir / target_col / "calibration_pseudo_quantiles.parquet", index=False)
 
             out_smoke = pd.DataFrame(
                 {
@@ -672,6 +909,7 @@ def main() -> None:
             result = _run_single_target(
                 train_path=train_path,
                 val_path=val_path,
+                calib_path=calib_path,
                 target_col=target_col,
                 L_values=L_values,
                 r_values=r_values,

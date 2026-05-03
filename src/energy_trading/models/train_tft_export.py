@@ -42,6 +42,10 @@ from energy_trading.evaluation.tensorboard_utils import (
     tensorboard_log_root,
     tensorboard_target_version,
 )
+from energy_trading.evaluation.conformal_calibration import (
+    apply_conformal_shifts,
+    calculate_conformal_shifts,
+)
 
 
 CALENDAR_FEATURES = {
@@ -65,7 +69,7 @@ VOLATILE_VOLUME_FEATURES = {
 }
 TFT_CLIP_MIN = -5.0
 TFT_CLIP_MAX = 5.0
-QUANTILES: list[float] = [0.1, 0.5, 0.9, 0.95]
+QUANTILES: list[float] = [0.01, 0.05, 0.1, 0.5, 0.9, 0.95, 0.99]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -320,7 +324,8 @@ def _clip_activation_rate_predictions(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    for c in ("predicted_value", "p10", "p50", "p90", "p95"):
+    q_cols = [_qcol(q) for q in QUANTILES]
+    for c in ("predicted_value", *q_cols):
         if c in out.columns:
             out[c] = np.clip(pd.to_numeric(out[c], errors="coerce").to_numpy(dtype=float), 0.0, 1.0)
     return out
@@ -592,6 +597,8 @@ def _train_tft(
     requested_device: str = "mps",
     num_workers: int = 0,
     cleanup_lightning_checkpoints: bool = False,
+    learning_rate: float = 1e-3,
+    gradient_clip_val: float = 0.05,
 ) -> dict[str, object]:
     total_start = time.perf_counter()
     try:
@@ -852,7 +859,7 @@ def _train_tft(
         max_epochs=max_epochs,
         accelerator=accelerator,
         devices=1,
-        gradient_clip_val=0.1,
+        gradient_clip_val=float(gradient_clip_val),
         enable_checkpointing=True,
         callbacks=[_EpochEtaCallback(max_epochs=max_epochs), checkpoint_cb, early_stopping_cb],
         logger=tb_logger,
@@ -860,7 +867,7 @@ def _train_tft(
 
     tft = TemporalFusionTransformer.from_dataset(
         training,
-        learning_rate=1e-3,
+        learning_rate=float(learning_rate),
         hidden_size=hidden_size,
         attention_head_size=8,
         dropout=effective_dropout,
@@ -947,6 +954,33 @@ def _train_tft(
         pred_val_long = _clip_activation_rate_predictions(pred_val_long)
         pred_test_long = _clip_activation_rate_predictions(pred_test_long)
 
+    # Split-conformal: derive shifts on validation lead-1 quantiles, apply to test.
+    q_cols = [_qcol(q) for q in QUANTILES]
+    val_h1 = pred_val_long.loc[pred_val_long["lead_time_h"] == 1].copy()
+    if not val_h1.empty:
+        val_h1["target_time_utc"] = pd.to_datetime(val_h1["target_time_utc"], utc=True, errors="coerce")
+        truth_val = (
+            val_df.loc[:, ["timestamp_utc", tgt]]
+            .rename(columns={"timestamp_utc": "target_time_utc", tgt: "y_true"})
+            .copy()
+        )
+        truth_val["target_time_utc"] = pd.to_datetime(truth_val["target_time_utc"], utc=True, errors="coerce")
+        calib_join = val_h1.merge(truth_val, on="target_time_utc", how="inner")
+        if not calib_join.empty:
+            q_calib = {c: pd.to_numeric(calib_join[c], errors="coerce").to_numpy(dtype=float) for c in q_cols if c in calib_join.columns}
+            shifts = calculate_conformal_shifts(
+                y_true_calib=pd.to_numeric(calib_join["y_true"], errors="coerce").to_numpy(dtype=float),
+                q_preds_calib_dict=q_calib,
+                alphas=list(QUANTILES),
+            )
+            q_test = {c: pd.to_numeric(pred_test_long[c], errors="coerce").to_numpy(dtype=float) for c in q_cols if c in pred_test_long.columns}
+            q_test_cal = apply_conformal_shifts(q_test, shifts)
+            for c in q_cols:
+                if c in q_test_cal:
+                    pred_test_long[c] = q_test_cal[c]
+            if "p50" in pred_test_long.columns:
+                pred_test_long["predicted_value"] = pd.to_numeric(pred_test_long["p50"], errors="coerce")
+
     export_start = time.perf_counter()
     interpretation_artifacts = _save_tft_interpretation_artifacts(
         tft_model=tft,
@@ -970,7 +1004,8 @@ def _train_tft(
             base_cols.append("p50")
         elif "predicted_value" in df_long.columns:
             base_cols.append("predicted_value")
-        for q_col in ("p90", "p95"):
+        q_cols = [_qcol(q) for q in QUANTILES if _qcol(q) != "p50"]
+        for q_col in q_cols:
             if q_col in df_long.columns:
                 base_cols.append(q_col)
 
@@ -980,10 +1015,9 @@ def _train_tft(
             rename_map["p50"] = pred_col
         elif "predicted_value" in d.columns:
             rename_map["predicted_value"] = pred_col
-        if "p90" in d.columns:
-            rename_map["p90"] = f"{pred_col}_p90"
-        if "p95" in d.columns:
-            rename_map["p95"] = f"{pred_col}_p95"
+        for q_col in q_cols:
+            if q_col in d.columns:
+                rename_map[q_col] = f"{pred_col}_{q_col}"
         d = d.rename(columns=rename_map)
         d = d.sort_values("timestamp_utc").drop_duplicates(subset=["timestamp_utc"])
         return d
@@ -1002,7 +1036,8 @@ def _train_tft(
         if pred_long.empty:
             return {}
         cols = ["lead_time_h"]
-        for c in ("predicted_value", "p10", "p50", "p90", "p95"):
+        q_cols = [_qcol(q) for q in QUANTILES]
+        for c in ("predicted_value", *q_cols):
             if c in pred_long.columns:
                 cols.append(c)
         h1 = pred_long.loc[pred_long["lead_time_h"] == 1, cols].copy()
@@ -1016,7 +1051,7 @@ def _train_tft(
                 ).to_numpy(dtype=float),
             }
         )
-        for q in ("p10", "p50", "p90", "p95"):
+        for q in q_cols:
             if q in h1.columns:
                 metric_df[f"y_pred_{q}"] = pd.to_numeric(h1[q], errors="coerce").to_numpy(dtype=float)
         return compute_forecast_metrics(metric_df, y_true_col="y_true", y_pred_col="y_pred")
@@ -1149,6 +1184,8 @@ def _train_tft(
         "attention_head_size": 8,
         "dropout": effective_dropout,
         "tensorboard_log_dir": str(Path(tb_logger.log_dir).resolve()),
+        "learning_rate": float(learning_rate),
+        "gradient_clip_val": float(gradient_clip_val),
         "attention_plot_path": interpretation_artifacts.get("attention_plot_path"),
         "attention_history_plot_path": interpretation_artifacts.get("attention_history_plot_path"),
         "feature_importance_plot_path": interpretation_artifacts.get("feature_importance_plot_path"),
@@ -1180,6 +1217,8 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--max-encoder-length", type=int, default=168)
     p.add_argument("--max-prediction-length", type=int, default=48)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+    p.add_argument("--gradient-clip-val", type=float, default=0.05)
     p.add_argument(
         "--cleanup-lightning-checkpoints",
         action="store_true",
@@ -1208,6 +1247,8 @@ def main() -> None:
         requested_device=args.device,
         num_workers=args.num_workers,
         cleanup_lightning_checkpoints=args.cleanup_lightning_checkpoints,
+        learning_rate=float(args.learning_rate),
+        gradient_clip_val=float(args.gradient_clip_val),
     )
 
     # Keep metrics path unique per bundle+target to avoid overwrite in target-wise

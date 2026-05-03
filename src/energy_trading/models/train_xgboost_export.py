@@ -49,17 +49,37 @@ from energy_trading.evaluation.tensorboard_utils import (
     create_summary_writer,
     tensorboard_target_log_dir,
 )
+from energy_trading.evaluation.conformal_calibration import (
+    apply_conformal_shifts,
+    calculate_conformal_shifts,
+)
 
-QUANTILES: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+QUANTILES: list[float] = [0.01, 0.05, 0.10, 0.50, 0.90, 0.95, 0.99]
 LOGGER = logging.getLogger(__name__)
 _ACTIVATION_RATE_TARGETS = {
     "target_afrr_activation_rate_pos",
     "target_afrr_activation_rate_neg",
 }
+TAIL_WEIGHT_MULTIPLIER = 3.0
 
 
 def _qcol(q: float) -> str:
     return f"p{int(round(q * 100)):02d}"
+
+
+def _tail_sample_weights(y: pd.Series, multiplier: float = TAIL_WEIGHT_MULTIPLIER) -> np.ndarray:
+    """Upweight lower/upper tail samples based on empirical 10th/90th percentiles."""
+    yv = pd.to_numeric(y, errors="coerce").to_numpy(dtype=float)
+    w = np.ones_like(yv, dtype=float)
+    finite = np.isfinite(yv)
+    if not np.any(finite):
+        return w
+    yt = yv[finite]
+    q10 = float(np.percentile(yt, 10))
+    q90 = float(np.percentile(yt, 90))
+    tail_mask = (yv <= q10) | (yv >= q90)
+    w[tail_mask & finite] = float(multiplier)
+    return w
 
 
 def _resolve_base_dir(preferred: str | Path) -> Path:
@@ -608,7 +628,12 @@ def run_purged_cv_with_pipeline(
             random_state=seed,
             n_jobs=-1,
         )
-        model.fit(X_tr, y_tr, verbose=False)
+        model.fit(
+            X_tr,
+            y_tr,
+            sample_weight=_tail_sample_weights(y_tr),
+            verbose=False,
+        )
         pred = _predict_with_device_alignment(model, X_va, resolved_device=device)
         mae = float(mean_absolute_error(y_va, pred))
         rmse = float(np.sqrt(mean_squared_error(y_va, pred)))
@@ -839,6 +864,7 @@ def train_and_evaluate(
                 model.fit(
                     X_tr_h,
                     y_tr_h,
+                    sample_weight=_tail_sample_weights(y_tr_h),
                     eval_set=[(X_tr_h, y_tr_h), (X_va_h, y_va_h)],
                     verbose=False,
                 )
@@ -1478,6 +1504,8 @@ def main() -> None:
     splits = [s.strip() for s in args.prediction_splits.split(",") if s.strip()]
     if args.export_predictions:
         resolved_pred_device = str(metrics.get("resolved_device", args.device))
+        calib_long_by_col: dict[str, pd.DataFrame] = {}
+        calib_truth_by_target: dict[str, pd.DataFrame] = {}
         for split in splits:
             split_start = time.perf_counter()
             pred_df = _predict_split_frame(
@@ -1506,6 +1534,49 @@ def main() -> None:
                     model_name=args.model_name,
                     resolved_device=resolved_pred_device,
                 )
+                if split == "val":
+                    calib_long_by_col = {k: v.copy() for k, v in long_by_col.items()}
+                    for tgt in target_cols:
+                        if tgt in split_df.columns:
+                            tdf = split_df.loc[:, ["timestamp_utc", tgt]].rename(
+                                columns={"timestamp_utc": "target_time_utc", tgt: "y_true"}
+                            )
+                            tdf["target_time_utc"] = pd.to_datetime(tdf["target_time_utc"], utc=True, errors="coerce")
+                            calib_truth_by_target[tgt] = tdf
+                if split == "test" and calib_long_by_col:
+                    for pred_col, test_long in list(long_by_col.items()):
+                        calib_long = calib_long_by_col.get(pred_col)
+                        if calib_long is None:
+                            continue
+                        tgt_for_pred = _target_for_pred_column(pred_col)
+                        if not tgt_for_pred or tgt_for_pred not in split_df.columns:
+                            continue
+                        q_cols = [c for c in test_long.columns if c.startswith("p") and c[1:].isdigit()]
+                        if not q_cols:
+                            continue
+                        calib_h1 = calib_long.loc[calib_long["lead_time_h"] == 1].copy()
+                        calib_h1["target_time_utc"] = pd.to_datetime(calib_h1["target_time_utc"], utc=True, errors="coerce")
+                        truth = calib_truth_by_target.get(tgt_for_pred)
+                        if truth is None or truth.empty:
+                            continue
+                        calib_join = calib_h1.merge(truth, on="target_time_utc", how="inner")
+                        if calib_join.empty:
+                            continue
+                        q_dict = {c: pd.to_numeric(calib_join[c], errors="coerce").to_numpy(dtype=float) for c in q_cols}
+                        alphas = [float(int(c[1:])) / 100.0 for c in q_cols]
+                        shifts = calculate_conformal_shifts(
+                            y_true_calib=pd.to_numeric(calib_join["y_true"], errors="coerce").to_numpy(dtype=float),
+                            q_preds_calib_dict=q_dict,
+                            alphas=alphas,
+                        )
+                        q_test = {c: pd.to_numeric(test_long[c], errors="coerce").to_numpy(dtype=float) for c in q_cols}
+                        q_cal = apply_conformal_shifts(q_test, shifts)
+                        for c in q_cols:
+                            if c in q_cal:
+                                test_long[c] = q_cal[c]
+                        if "p50" in test_long.columns:
+                            test_long["predicted_value"] = pd.to_numeric(test_long["p50"], errors="coerce")
+                        long_by_col[pred_col] = test_long
                 prediction_long_paths[split] = {}
                 for pred_col, long_df in long_by_col.items():
                     long_path = pred_dir / f"{file_tag}_{split}_{pred_col}_long.parquet"
