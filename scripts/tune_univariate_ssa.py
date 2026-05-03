@@ -16,15 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 from datetime import datetime, timezone
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
-
-try:
-    from joblib import Parallel, delayed
-except Exception:  # pragma: no cover
-    Parallel = None  # type: ignore[assignment]
-    delayed = None  # type: ignore[assignment]
 
 # Ensure project root import path when executed as `python scripts/...`.
 ROOT = Path(__file__).resolve().parents[1]
@@ -353,8 +349,7 @@ def _run_hourly_tuning_for_target(
     train_hourly = _split_hourly(train_df, target_col)
     val_hourly = _split_hourly(val_df, target_col)
 
-    if Parallel is None or delayed is None:
-        print("[WARN] joblib not installed. Falling back to sequential hourly tuning.")
+    if n_jobs == 1:
         raw_results = [
             _train_hour(
                 h,
@@ -368,19 +363,39 @@ def _run_hourly_tuning_for_target(
             for h in range(24)
         ]
     else:
-        jobs = [
-            delayed(_train_hour)(
-                h,
-                train_hourly[h],
-                val_hourly[h],
-                L_values=L_values,
-                r_values=r_values,
-                metric=metric,
-                min_points_per_hour=min_points_per_hour,
-            )
-            for h in range(24)
-        ]
-        raw_results = Parallel(n_jobs=n_jobs, prefer="processes")(jobs)
+        # Use spawn context to avoid fork-related deadlocks with multithreaded libs (JAX/TF).
+        ctx = mp.get_context("spawn")
+        max_workers = mp.cpu_count() if n_jobs is None or n_jobs < 0 else int(n_jobs)
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+                futures = [
+                    ex.submit(
+                        _train_hour,
+                        h,
+                        train_hourly[h],
+                        val_hourly[h],
+                        L_values=L_values,
+                        r_values=r_values,
+                        metric=metric,
+                        min_points_per_hour=min_points_per_hour,
+                    )
+                    for h in range(24)
+                ]
+                raw_results = [f.result() for f in futures]
+        except Exception as ex:
+            print(f"[WARN] Spawn-based multiprocessing unavailable ({ex}); falling back to n_jobs=1.")
+            raw_results = [
+                _train_hour(
+                    h,
+                    train_hourly[h],
+                    val_hourly[h],
+                    L_values=L_values,
+                    r_values=r_values,
+                    metric=metric,
+                    min_points_per_hour=min_points_per_hour,
+                )
+                for h in range(24)
+            ]
 
     results = [r for r in raw_results if r is not None]
     if not results:
