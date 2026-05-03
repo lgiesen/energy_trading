@@ -13,6 +13,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import SGDRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
+from sklearn.linear_model import QuantileRegressor
 
 import sys
 
@@ -47,26 +48,32 @@ def _build_model(
     quantile: float = 0.5,
     seed: int = 42,
 ) -> Pipeline:
+    try:
+        model = SGDRegressor(
+            loss="quantile",
+            quantile=float(quantile),
+            alpha=float(alpha),
+            penalty="elasticnet",
+            l1_ratio=float(l1_ratio),
+            max_iter=3000,
+            tol=1e-4,
+            learning_rate=str(learning_rate),
+            eta0=float(eta0),
+            power_t=0.25,
+            random_state=int(seed),
+        )
+    except TypeError:
+        # Fallback for sklearn versions where SGD quantile is unavailable.
+        model = QuantileRegressor(
+            quantile=float(quantile),
+            alpha=float(alpha),
+            solver="highs",
+        )
     return Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", RobustScaler(quantile_range=(10.0, 90.0))),
-            (
-                "model",
-                SGDRegressor(
-                    loss="quantile",
-                    quantile=float(quantile),
-                    alpha=float(alpha),
-                    penalty="elasticnet",
-                    l1_ratio=float(l1_ratio),
-                    max_iter=3000,
-                    tol=1e-4,
-                    learning_rate=str(learning_rate),
-                    eta0=float(eta0),
-                    power_t=0.25,
-                    random_state=int(seed),
-                ),
-            ),
+            ("model", model),
         ]
     )
 

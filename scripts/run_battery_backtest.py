@@ -441,6 +441,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--run-manifest",
+        "--manifest",
         default="",
         help=(
             "Optional manifest path or latest-pointer json for simulation autoload. "
