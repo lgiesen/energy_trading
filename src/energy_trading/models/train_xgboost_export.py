@@ -6,14 +6,12 @@ chronological val split with early stopping to reduce overfitting.
 from __future__ import annotations
 
 import argparse
-import getpass
 import itertools
 import json
 import logging
 import os
 import random
 import re
-import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -1119,14 +1117,6 @@ def _resolve_run_dir(run_dir: str | Path | None) -> Path:
     return Path(run_dir)
 
 
-def _build_rsync_pull_cmd(remote_path: Path) -> str:
-    """Build a local-machine rsync pull command for generated artifacts."""
-    user = getpass.getuser()
-    host = socket.gethostname()
-    remote_abs = str(remote_path.resolve())
-    return f"rsync -avh --progress {user}@{host}:{remote_abs}/ ./artifacts/model_runs/{remote_path.name}/"
-
-
 def _align_features_for_model(X: pd.DataFrame, model) -> pd.DataFrame:
     """Align inference feature frame to the exact feature names seen in training."""
     expected = None
@@ -1660,8 +1650,6 @@ def main() -> None:
     if prediction_paths:
         print(f"- Prediction files: {', '.join(str(p) for p in prediction_paths.values())}")
     print(f"- Manifest fragment: {manifest_fragment_out}")
-    print("\nDownload from your LOCAL machine:")
-    print(_build_rsync_pull_cmd(run_dir))
 
 
 if __name__ == "__main__":
