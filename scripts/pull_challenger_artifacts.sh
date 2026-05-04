@@ -72,13 +72,13 @@ mkdir -p "$dest"
 remote_prefix="${ssh_user}@${ssh_host}:${remote_root}"
 
 echo "Pulling challenger artifacts from ${remote_prefix}"
-rsync -avh --progress \
+rsync -ah --quiet \
   "${remote_prefix}/models/checkpoints/xgboost_afrr_challenger.joblib" \
   "${dest}/"
-rsync -avh --progress \
+rsync -ah --quiet \
   "${remote_prefix}/data/reports/xgboost_challenger_report.json" \
   "${dest}/"
-rsync -avh --progress \
+rsync -ah --quiet \
   "${remote_prefix}/data/reports/xgboost_optuna_trials.csv" \
   "${dest}/"
 
