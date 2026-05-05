@@ -82,7 +82,7 @@ help: ## Show available commands
 
 doctor: ## Preflight checks for data and python dependencies
 	@test -d data/model_input || (echo "Missing data/model_input" && exit 1)
-	@python3 -c "import importlib; mods=['pandas','numpy','xgboost','optuna','lightning','torch']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; (_ for _ in ()).throw(SystemExit(f'Missing python deps: {missing}')) if missing else print('[OK] Python deps available.')"
+	@python3 -c "import pkgutil; mods=['pandas','numpy','xgboost','optuna','lightning','torch']; missing=[m for m in mods if pkgutil.find_loader(m) is None]; raise SystemExit(f'Missing python deps: {missing}') if missing else print('[OK] Python deps available.')"
 
 all-xgb: audit-xgb ## Full XGBoost DAG
 all-linear: audit-linear ## Full Linear DAG
