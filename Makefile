@@ -82,14 +82,7 @@ help: ## Show available commands
 
 doctor: ## Preflight checks for data and python dependencies
 	@test -d data/model_input || (echo "Missing data/model_input" && exit 1)
-	@python3 - <<-'PY'
-	import importlib.util
-	mods = ["pandas", "numpy", "xgboost", "optuna", "lightning", "torch"]
-	missing = [m for m in mods if importlib.util.find_spec(m) is None]
-	if missing:
-	    raise RuntimeError(f"Missing python deps: {missing}")
-	print("[OK] Python deps available.")
-	PY
+	@python3 -c "import importlib.util; mods=['pandas','numpy','xgboost','optuna','lightning','torch']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; (_ for _ in ()).throw(RuntimeError(f'Missing python deps: {missing}')) if missing else print('[OK] Python deps available.')"
 
 all-xgb: audit-xgb ## Full XGBoost DAG
 all-linear: audit-linear ## Full Linear DAG
