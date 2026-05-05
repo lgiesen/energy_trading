@@ -10,7 +10,7 @@ export NUMEXPR_NUM_THREADS := 1
 
 SEED ?= 42
 FORECAST_HOURS ?= 48
-IS_SMOKE_TEST ?= 0
+export IS_SMOKE_TEST ?= 0
 DEVICE ?= cuda
 SIM_QUANTILE_PAIRS ?=
 DA_QUANTILE_ROLE ?= mid
@@ -233,7 +233,7 @@ $(eval $(call SIM_RULE,TFT,tft))
 sim-xgb: $(XGB_SIM_DONE) ## Run XGBoost simulation
 sim-linear: $(LINEAR_SIM_DONE) ## Run Linear simulation
 sim-tft: $(TFT_SIM_DONE) ## Run TFT simulation
-sim-all-quantiles: ## Run quantile sweep simulation for xgb, linear, tft
+sim-all-quantiles: clean-markers ## Run quantile sweep simulation for xgb, linear, tft
 	$(MAKE) sim-xgb SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
 	$(MAKE) sim-linear SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
 	$(MAKE) sim-tft SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
