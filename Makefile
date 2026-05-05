@@ -11,11 +11,15 @@ export NUMEXPR_NUM_THREADS := 1
 SEED ?= 42
 FORECAST_HOURS ?= 48
 IS_SMOKE_TEST ?= 0
+DEVICE ?= cuda
+SIM_QUANTILE_PAIRS ?=
+DA_QUANTILE_ROLE ?= mid
+SIM_QUANTILE_SWEEP_DEFAULT ?= p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90
 
-# Run IDs (dynamic, but fixed during one make invocation)
-RUN_ID_XGB ?= xgb_$(shell date +%Y%m%d_%H%M%S)
-RUN_ID_LINEAR ?= linear_$(shell date +%Y%m%d_%H%M%S)
-RUN_ID_TFT ?= tft_$(shell date +%Y%m%d_%H%M%S)
+# Run IDs (evaluated once per make invocation; command-line/env overrides still win)
+RUN_ID_XGB := $(or $(RUN_ID_XGB),xgb_$(shell date +%Y%m%d_%H%M%S))
+RUN_ID_LINEAR := $(or $(RUN_ID_LINEAR),linear_$(shell date +%Y%m%d_%H%M%S))
+RUN_ID_TFT := $(or $(RUN_ID_TFT),tft_$(shell date +%Y%m%d_%H%M%S))
 
 # Common artifacts
 DATA_HASH_FILE := artifacts/hpo/data_model_input.md5
@@ -42,11 +46,14 @@ LINEAR_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_LINEAR)_deliverable.zip
 TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 
 .PHONY: help \
+	doctor \
 	data_hash \
 	tune-xgb tune-linear \
 	train-xgb train-linear train-tft \
 	sim-xgb sim-linear sim-tft \
+	sim-all-quantiles \
 	audit-xgb audit-linear audit-tft \
+	thesis-report \
 	all-xgb all-linear all-tft \
 	smoke-test clean-markers
 
@@ -64,9 +71,23 @@ help: ## Show available commands
 	@echo ""
 	@echo "Global:"
 	@echo "  make smoke-test   # runs all-xgb, all-linear, all-tft with IS_SMOKE_TEST=1"
+	@echo "  make sim-all-quantiles  # run xgb/linear/tft simulation with standard thesis quantile sweep"
+	@echo "  make thesis-report      # aggregate quantile sweep outputs into one benchmark report"
 	@echo ""
 	@echo "Optional overrides:"
-	@echo "  RUN_ID_XGB=... RUN_ID_LINEAR=... RUN_ID_TFT=... SEED=42 FORECAST_HOURS=48"
+	@echo "  RUN_ID_XGB=... RUN_ID_LINEAR=... RUN_ID_TFT=... SEED=42 FORECAST_HOURS=48 DEVICE=cuda|cpu"
+	@echo "  SIM_QUANTILE_PAIRS='p50-p50,p30-p70,p10-p90' DA_QUANTILE_ROLE=mid|low|high"
+
+doctor: ## Preflight checks for data and python dependencies
+	@test -d data/model_input || (echo "Missing data/model_input" && exit 1)
+	@python3 - <<-'PY'
+	import importlib
+	mods = ["pandas", "numpy", "xgboost", "optuna", "lightning", "torch"]
+	missing = [m for m in mods if importlib.util.find_spec(m) is None]
+	if missing:
+	    raise SystemExit(f"Missing python deps: {missing}")
+	print("[OK] Python deps available.")
+	PY
 
 all-xgb: audit-xgb ## Full XGBoost DAG
 all-linear: audit-linear ## Full Linear DAG
@@ -75,31 +96,31 @@ all-tft: audit-tft ## Full TFT DAG
 smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
 	$(MAKE) IS_SMOKE_TEST=1 all-xgb
 	$(MAKE) IS_SMOKE_TEST=1 all-linear
-	$(MAKE) IS_SMOKE_TEST=1 all-tft
+	$(MAKE) IS_SMOKE_TEST=1 DEVICE=cpu all-tft
 
-$(DATA_HASH_FILE): ## Generate MD5 provenance hash for data/model_input parquet files
+$(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
 	@mkdir -p $(dir $(DATA_HASH_FILE))
-	@python3 - <<'PY'
-from pathlib import Path
-import hashlib
+	@python3 - <<-'PY'
+	from pathlib import Path
+	import hashlib
 
-root = Path("data/model_input")
-files = sorted(root.rglob("*.parquet"))
-if not files:
-    raise SystemExit("No parquet files found under data/model_input")
+	root = Path("data/model_input")
+	files = sorted(root.rglob("*.parquet"))
+	if not files:
+	    raise SystemExit("No parquet files found under data/model_input")
 
-lines = []
-for p in files:
-    h = hashlib.md5()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    lines.append(f"{h.hexdigest()}  {p.as_posix()}")
+	lines = []
+	for p in files:
+	    h = hashlib.md5()
+	    with p.open("rb") as f:
+	        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+	            h.update(chunk)
+	    lines.append(f"{h.hexdigest()}  {p.as_posix()}")
 
-out = Path("artifacts/hpo/data_model_input.md5")
-out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-print(f"[OK] wrote {out} with {len(lines)} entries")
-PY
+	out = Path("artifacts/hpo/data_model_input.md5")
+	out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+	print(f"[OK] wrote {out} with {len(lines)} entries")
+	PY
 
 data_hash: $(DATA_HASH_FILE) ## Alias for provenance hash generation
 
@@ -129,13 +150,13 @@ $(LINEAR_TUNE_JSON): $(DATA_HASH_FILE)
 tune-linear: $(LINEAR_TUNE_JSON) ## Tune Linear model (depends on data_hash)
 
 $(XGB_MANIFEST): $(XGB_TUNE_JSON)
-	@MAX_DEPTH=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)')['best_params']['max_depth'])"); \
-	LEARNING_RATE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)')['best_params']['learning_rate'])"); \
-	SUBSAMPLE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)')['best_params']['subsample'])"); \
-	COLSAMPLE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)')['best_params']['colsample_bytree'])"); \
-	MIN_CHILD=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)')['best_params']['min_child_weight'])"); \
-	REG_ALPHA=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)')['best_params']['reg_alpha'])"); \
-	REG_LAMBDA=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)')['best_params']['reg_lambda'])"); \
+	@MAX_DEPTH=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['max_depth'])"); \
+	LEARNING_RATE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['learning_rate'])"); \
+	SUBSAMPLE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['subsample'])"); \
+	COLSAMPLE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['colsample_bytree'])"); \
+	MIN_CHILD=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['min_child_weight'])"); \
+	REG_ALPHA=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['reg_alpha'])"); \
+	REG_LAMBDA=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['reg_lambda'])"); \
 	python3 scripts/train_and_export_runs.py \
 	  --model-type xgboost \
 	  --run-id "$(RUN_ID_XGB)" \
@@ -155,21 +176,39 @@ $(XGB_MANIFEST): $(XGB_TUNE_JSON)
 train-xgb: $(XGB_MANIFEST) ## Train+evaluate XGBoost (depends on tune-xgb output)
 
 $(LINEAR_MANIFEST): $(LINEAR_TUNE_JSON)
+	@LINEAR_ALPHA=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['alpha'])"); \
+	LINEAR_L1_RATIO=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['l1_ratio'])"); \
+	LINEAR_LR_MODE=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['learning_rate'])"); \
+	LINEAR_ETA0=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['eta0'])"); \
 	python3 scripts/train_and_export_runs.py \
 	  --model-type linear \
 	  --run-id "$(RUN_ID_LINEAR)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
-	  --seed $(SEED)
+	  --seed $(SEED) \
+	  --linear-alpha $$LINEAR_ALPHA \
+	  --linear-l1-ratio $$LINEAR_L1_RATIO \
+	  --linear-learning-rate $$LINEAR_LR_MODE \
+	  --linear-eta0 $$LINEAR_ETA0
 
 train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on tune-linear output)
 
 $(TFT_MANIFEST): $(DATA_HASH_FILE)
+	@DEVICE_USE="$(DEVICE)"; \
+	if [ "$(IS_SMOKE_TEST)" = "1" ]; then DEVICE_USE="cpu"; fi; \
+	if [ "$(IS_SMOKE_TEST)" != "1" ] && [ "$$DEVICE_USE" != "cuda" ]; then \
+	  echo "TFT final runs must use CUDA. Got DEVICE=$$DEVICE_USE"; \
+	  exit 1; \
+	fi; \
+	if [ "$(IS_SMOKE_TEST)" != "1" ]; then \
+	  command -v nvidia-smi >/dev/null 2>&1 || (echo "CUDA requested but nvidia-smi not found." && exit 1); \
+	  nvidia-smi >/dev/null 2>&1 || (echo "CUDA requested but GPU is unavailable." && exit 1); \
+	fi; \
 	python3 scripts/train_and_export_runs.py \
 	  --model-type tft \
 	  --run-id "$(RUN_ID_TFT)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
 	  --seed $(SEED) \
-	  --device cuda \
+	  --device $$DEVICE_USE \
 	  --num-workers 0
 
 train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends only on data_hash; no tune)
@@ -180,6 +219,8 @@ $($(1)_SIM_DONE): $$($(1)_MANIFEST)
 	  --run-manifest "$$($(1)_MANIFEST)" \
 	  --split test \
 	  --model-key $(2) \
+	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
 	  --start 2024-01-01T00:00:00Z \
 	  --end 2024-03-31T23:00:00Z
 	@touch $$($(1)_SIM_DONE)
@@ -192,24 +233,36 @@ $(eval $(call SIM_RULE,TFT,tft))
 sim-xgb: $(XGB_SIM_DONE) ## Run XGBoost simulation
 sim-linear: $(LINEAR_SIM_DONE) ## Run Linear simulation
 sim-tft: $(TFT_SIM_DONE) ## Run TFT simulation
+sim-all-quantiles: ## Run quantile sweep simulation for xgb, linear, tft
+	$(MAKE) sim-xgb SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
+	$(MAKE) sim-linear SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
+	$(MAKE) sim-tft SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
 
 define AUDIT_RULE
 $($(1)_AUDIT_ZIP): $$($(1)_SIM_DONE)
 	@test -f "$$($(1)_MANIFEST)"
-	@test -d "artifacts/model_runs/$$($(3))/metrics"
-	@python3 - <<'PY'
-from pathlib import Path
-import zipfile
+	@test -d "artifacts/model_runs/$(3)/metrics"
+	@METRIC_COUNT=$$$$(find artifacts/model_runs/$(3)/metrics -type f | wc -l); test "$$$$METRIC_COUNT" -gt 0
+	@SIM_COUNT=$$$$(find artifacts/model_runs/$(3) -type f | grep -E 'backtest|simulation|summary|ledger|pnl' | wc -l); test "$$$$SIM_COUNT" -gt 0
+	@mkdir -p "artifacts/model_runs/$(3)/metadata"
+	@python3 --version > "artifacts/model_runs/$(3)/metadata/python_version.txt"
+	@pip freeze > "artifacts/model_runs/$(3)/metadata/pip_freeze.txt"
+	@git rev-parse HEAD > "artifacts/model_runs/$(3)/metadata/git_commit.txt" || true
+	@date -u +"%Y-%m-%dT%H:%M:%SZ" > "artifacts/model_runs/$(3)/metadata/timestamp_utc.txt"
+	@printf "SEED=%s\nFORECAST_HOURS=%s\nDEVICE=%s\nSIM_QUANTILE_PAIRS=%s\nDA_QUANTILE_ROLE=%s\n" "$(SEED)" "$(FORECAST_HOURS)" "$(DEVICE)" "$(SIM_QUANTILE_PAIRS)" "$(DA_QUANTILE_ROLE)" > "artifacts/model_runs/$(3)/metadata/run_parameters.txt"
+	@python3 - <<-'PY'
+	from pathlib import Path
+	import zipfile
 
-run_id = "$(3)"
-run_dir = Path("artifacts/model_runs") / run_id
-zip_path = Path("artifacts/model_runs") / f"{run_id}_deliverable.zip"
-with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    for p in sorted(run_dir.rglob("*")):
-        if p.is_file():
-            zf.write(p, p.relative_to(run_dir.parent))
-print(f"[OK] wrote {zip_path}")
-PY
+	run_id = "$(3)"
+	run_dir = Path("artifacts/model_runs") / run_id
+	zip_path = Path("artifacts/model_runs") / f"{run_id}_deliverable.zip"
+	with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+	    for p in sorted(run_dir.rglob("*")):
+	        if p.is_file():
+	            zf.write(p, p.relative_to(run_dir.parent))
+	print(f"[OK] wrote {zip_path}")
+	PY
 endef
 
 $(eval $(call AUDIT_RULE,XGB,xgboost,$(RUN_ID_XGB)))
@@ -219,7 +272,8 @@ $(eval $(call AUDIT_RULE,TFT,tft,$(RUN_ID_TFT)))
 audit-xgb: $(XGB_AUDIT_ZIP) ## Audit+package XGBoost run
 audit-linear: $(LINEAR_AUDIT_ZIP) ## Audit+package Linear run
 audit-tft: $(TFT_AUDIT_ZIP) ## Audit+package TFT run
+thesis-report: ## Merge quantile sweep summaries into artifacts/thesis_benchmark_report.csv
+	python3 scripts/generate_thesis_report.py
 
 clean-markers: ## Remove simulation markers only (forces re-sim)
 	rm -f $(XGB_SIM_DONE) $(LINEAR_SIM_DONE) $(TFT_SIM_DONE)
-

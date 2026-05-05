@@ -30,6 +30,7 @@ import json
 import re
 from pathlib import Path
 import sys
+from typing import Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -47,6 +48,8 @@ from energy_trading.simulation.battery_backtest import (
     load_and_align_market_data,
     load_prediction_warehouse_long,
 )
+
+REQUIRED_QUANTILES_P01_P99 = [f"p{i:02d}" for i in range(1, 100)]
 
 
 def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> None:
@@ -178,6 +181,78 @@ def _resolve_out_dir(
     return out
 
 
+def _parse_quantile_token(token: str) -> str:
+    t = token.strip().lower()
+    if not t:
+        raise ValueError("Empty quantile token.")
+    if t.startswith("p") and len(t) == 3 and t[1:].isdigit():
+        q = int(t[1:])
+        if q <= 0 or q >= 100:
+            raise ValueError(f"Quantile out of range: {token}")
+        return f"p{q:02d}"
+    val = float(t)
+    if val <= 0.0 or val >= 1.0:
+        raise ValueError(f"Quantile out of range: {token}")
+    q = int(round(val * 100.0))
+    q = max(1, min(99, q))
+    return f"p{q:02d}"
+
+
+def _parse_quantile_pairs(raw: str) -> list[tuple[str, str]]:
+    s = raw.strip()
+    if not s:
+        return []
+    out: list[tuple[str, str]] = []
+    for part in s.split(","):
+        pair = part.strip()
+        if not pair:
+            continue
+        if "-" not in pair:
+            raise ValueError(f"Invalid quantile pair '{pair}'. Use p10-p90 or 0.1-0.9.")
+        lo_raw, hi_raw = pair.split("-", 1)
+        q_lo = _parse_quantile_token(lo_raw)
+        q_hi = _parse_quantile_token(hi_raw)
+        if int(q_lo[1:]) > int(q_hi[1:]):
+            raise ValueError(f"Invalid pair '{pair}': low quantile must be <= high quantile.")
+        out.append((q_lo, q_hi))
+    return out
+
+
+def _apply_quantile_pair_to_warehouse(
+    warehouse: dict[str, pd.DataFrame],
+    *,
+    q_low: str,
+    q_high: str,
+    da_role: str,
+) -> dict[str, pd.DataFrame]:
+    da_q = {"low": q_low, "high": q_high, "mid": "p50"}[da_role]
+    quantile_by_target = {
+        "pred_da_price": da_q,
+        "pred_afrr_capacity_price_pos": q_high,
+        "pred_afrr_activation_price_pos": q_high,
+        "pred_afrr_activation_rate_pos": q_high,
+        "pred_afrr_capacity_price_neg": q_low,
+        "pred_afrr_activation_price_neg": q_low,
+        "pred_afrr_activation_rate_neg": q_low,
+    }
+    out: dict[str, pd.DataFrame] = {}
+    for pred_col, df in warehouse.items():
+        q_col = quantile_by_target.get(pred_col, "p50")
+        cur = df.copy()
+        if q_col not in cur.columns:
+            available = [c for c in cur.columns if re.fullmatch(r"p\d{2}", str(c))]
+            raise KeyError(
+                f"Requested quantile '{q_col}' missing for {pred_col}. Available: {available}"
+            )
+        cur["predicted_value"] = pd.to_numeric(cur[q_col], errors="coerce")
+        out[pred_col] = cur
+    return out
+
+
+def _scenario_suffix(q_low: str, q_high: str) -> str:
+    return f"{q_low}_{q_high}"
+
+
 def _matches_model_key(path: Path, model_key: str) -> bool:
     if not model_key:
         return True
@@ -289,6 +364,60 @@ def _resolve_long_map(
         )
         resolved[pred_col] = str(rp)
     return resolved
+
+
+def _read_parquet_columns(path: Path) -> list[str]:
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+
+        return list(pq.ParquetFile(path).schema.names)
+    except Exception:
+        # Fallback if pyarrow schema access is unavailable.
+        return list(pd.read_parquet(path).columns)
+
+
+def _preflight_manifest_and_quantiles(
+    *,
+    manifest_path: Path,
+    manifest_payload: dict[str, object],
+    split: str,
+    model_key: str,
+    manifest_dir: Path,
+) -> None:
+    if not manifest_path.exists():
+        raise RuntimeError(f"Manifest not found: {manifest_path}")
+
+    bundles = manifest_payload.get("bundles", {}) if isinstance(manifest_payload, dict) else {}
+    da_long = bundles.get("da", {}).get("predictions_long", {}).get(split, {}) if isinstance(bundles, dict) else {}
+    afrr_long = bundles.get("afrr", {}).get("predictions_long", {}).get(split, {}) if isinstance(bundles, dict) else {}
+    long_map = {**da_long, **afrr_long}
+    if not long_map:
+        raise RuntimeError(
+            "Preflight failed: no long-format prediction files in manifest. "
+            "Quantile simulation requires predictions_long entries."
+        )
+
+    resolved = _resolve_long_map(
+        long_map=long_map,
+        manifest_dir=manifest_dir,
+        split=split,
+        model_key=model_key,
+    )
+    expected = set(REQUIRED_QUANTILES_P01_P99)
+    failures: list[str] = []
+    for pred_col, file_path in sorted(resolved.items()):
+        cols = set(_read_parquet_columns(Path(file_path)))
+        missing = sorted(expected - cols)
+        if missing:
+            failures.append(
+                f"{pred_col}: missing {len(missing)} quantile columns (first 12: {missing[:12]}) in {file_path}"
+            )
+    if failures:
+        msg = (
+            "Preflight failed: required quantile grid P01..P99 is not fully available.\n"
+            + "\n".join(failures)
+        )
+        raise RuntimeError(msg)
 
 
 def _resolve_bundle_prediction_path(
@@ -459,6 +588,21 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Output directory for hourly/aggregated results. If empty, uses artifacts/simulation_runs/<run_id>/<split>/",
     )
+    p.add_argument(
+        "--quantile-pairs",
+        default="",
+        help=(
+            "Optional comma-separated sweep list, e.g. "
+            "'p50-p50,p30-p70,p10-p90' or '0.5-0.5,0.3-0.7'. "
+            "Requires long-format prediction warehouse."
+        ),
+    )
+    p.add_argument(
+        "--da-quantile-role",
+        choices=["low", "mid", "high"],
+        default="mid",
+        help="How DA uses quantile pair in sweep mode: low/high/mid (mid -> p50).",
+    )
 
     p.add_argument("--timestamp-col", default="timestamp_utc")
     p.add_argument("--pred-da-col", default="pred_da_price")
@@ -519,6 +663,8 @@ def main() -> None:
 
     predictions_path = args.predictions.strip()
     ground_truth_path = args.ground_truth.strip()
+    payload: dict[str, object] = {}
+    manifest_path: Path | None = None
 
     if not predictions_path:
         if args.run_manifest.strip():
@@ -539,6 +685,16 @@ def main() -> None:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         run_id = run_id or payload.get("run_id") or (args.run_id.strip() or None)
         manifest_dir = manifest_path.parent
+
+        # Strict fail-fast preflight for thesis reproducibility:
+        # verify manifest and complete P01..P99 quantile grid before simulation allocation.
+        _preflight_manifest_and_quantiles(
+            manifest_path=manifest_path,
+            manifest_payload=payload,
+            split=args.split,
+            model_key=args.model_key.strip(),
+            manifest_dir=manifest_dir,
+        )
     else:
         manifest_dir = Path.cwd()
 
@@ -551,7 +707,6 @@ def main() -> None:
         da_long = payload.get("bundles", {}).get("da", {}).get("predictions_long", {}).get(args.split, {})
         afrr_long = payload.get("bundles", {}).get("afrr", {}).get("predictions_long", {}).get(args.split, {})
         long_map = {**da_long, **afrr_long}
-
         if long_map:
             resolved_long_map = _resolve_long_map(
                 long_map=long_map,
@@ -585,7 +740,6 @@ def main() -> None:
                 model_key=args.model_key.strip(),
             )
             predictions_path = str((out_dir / f"backtest_table_{args.split}.parquet").resolve())
-
             da_df = pd.read_parquet(da_pred)
             afrr_df = pd.read_parquet(afrr_pred)
             backtest_table = da_df.merge(afrr_df, on="timestamp_utc", how="inner")
@@ -593,9 +747,7 @@ def main() -> None:
             print(f"[INFO] Backtest table created: {predictions_path}")
 
         if not ground_truth_path:
-            ground_truth_path = str(
-                _resolve_existing_file(payload["ground_truth"]["default_path"], manifest_dir=manifest_dir)
-            )
+            ground_truth_path = str(_resolve_existing_file(payload["ground_truth"]["default_path"], manifest_dir=manifest_dir))
 
     if not ground_truth_path:
         raise ValueError("Either provide --predictions and --ground-truth, or use --run-manifest.")
@@ -619,9 +771,6 @@ def main() -> None:
         true_afrr_activation_rate_pos=args.true_rate_pos_col,
         true_afrr_activation_rate_neg=args.true_rate_neg_col,
     )
-
-    # Always apply fallback mapping, even in long-warehouse mode (pred_preview can
-    # be empty there but truth-side fallbacks are still useful).
     colmap = _apply_fallback_column_map(pred_preview, truth_preview, colmap_in)
 
     if predictions_path:
@@ -632,219 +781,154 @@ def main() -> None:
             df[colmap.timestamp] = df.index
         df[colmap.timestamp] = pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce")
         df = df.dropna(subset=[colmap.timestamp]).sort_values(colmap.timestamp).reset_index(drop=True)
-        # In long-warehouse mode, keep only rows that are covered by forecast targets.
         if forecast_warehouse and coverage_min is not None and coverage_max is not None:
             df = df[(df[colmap.timestamp] >= coverage_min) & (df[colmap.timestamp] <= coverage_max)].copy()
     if args.start:
-        start = pd.to_datetime(args.start, utc=True)
-        df = df[df[colmap.timestamp] >= start].copy()
+        df = df[df[colmap.timestamp] >= pd.to_datetime(args.start, utc=True)].copy()
     if args.end:
-        end = pd.to_datetime(args.end, utc=True)
-        df = df[df[colmap.timestamp] <= end].copy()
+        df = df[df[colmap.timestamp] <= pd.to_datetime(args.end, utc=True)].copy()
     if df.empty:
         raise ValueError("No rows after timestamp filtering.")
 
+    quantile_pairs = _parse_quantile_pairs(args.quantile_pairs)
+    scenarios: list[tuple[str, dict[str, pd.DataFrame] | None]] = [("default", forecast_warehouse)]
+    if quantile_pairs:
+        if forecast_warehouse is None:
+            raise ValueError("--quantile-pairs requires long-format predictions from --run-manifest.")
+        scenarios = []
+        for q_low, q_high in quantile_pairs:
+            name = _scenario_suffix(q_low, q_high)
+            wh = _apply_quantile_pair_to_warehouse(
+                forecast_warehouse,
+                q_low=q_low,
+                q_high=q_high,
+                da_role=args.da_quantile_role,
+            )
+            scenarios.append((name, wh))
+
     backtester = BatteryBacktester()
-    outputs = backtester.run(
-        df,
-        colmap,
-        use_rolling_horizon=not args.disable_rolling_horizon,
-        horizon_hours=args.horizon_hours,
-        reopt_step_hours=args.reopt_step_hours,
-        forecast_warehouse=forecast_warehouse,
-        da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
-        soc_feedback_mode=args.soc_feedback_mode,
-        enforce_final_soc_min=args.enforce_final_soc_min,
-    )
+    sweep_rows: list[dict[str, object]] = []
+    for scenario_name, scenario_warehouse in scenarios:
+        scenario_out_dir = out_dir if scenario_name == "default" and not quantile_pairs else out_dir / scenario_name
+        scenario_out_dir.mkdir(parents=True, exist_ok=True)
 
-    hourly_path = out_dir / "backtest_hourly.parquet"
-    planned_ledger_path = out_dir / "planned_ledger.parquet"
-    executed_ledger_path = out_dir / "executed_ledger.parquet"
-    realized_ledger_path = out_dir / "realized_ledger.parquet"
-    plan_history_path = out_dir / "backtest_plan_history.parquet"
-    global_plan_history_path = Path("artifacts/backtest_plan_history.parquet")
-    global_plan_history_path.parent.mkdir(parents=True, exist_ok=True)
-    volatility_path = out_dir / "backtest_decision_volatility.csv"
-    monthly_path = out_dir / "backtest_monthly.csv"
-    yearly_path = out_dir / "backtest_yearly.csv"
-    summary_path = out_dir / "backtest_summary.json"
-    state_machine_audit_path = out_dir / "state_machine_audit.json"
-    diagnostics_path = out_dir / "backtest_diagnostics.json"
-    diagnostics_txt_path = out_dir / "backtest_diagnostics.txt"
-    pnl_plot_path = out_dir / "backtest_cumulative_pnl.png"
+        outputs = backtester.run(
+            df,
+            colmap,
+            use_rolling_horizon=not args.disable_rolling_horizon,
+            horizon_hours=args.horizon_hours,
+            reopt_step_hours=args.reopt_step_hours,
+            forecast_warehouse=scenario_warehouse,
+            da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
+            soc_feedback_mode=args.soc_feedback_mode,
+            enforce_final_soc_min=args.enforce_final_soc_min,
+        )
 
-    outputs.hourly.to_parquet(hourly_path, index=False)
-    # Ledger 1: planned MILP path
-    planned_cols_pref = [
-        colmap.timestamp,
-        "charge_mw",
-        "discharge_mw",
-        "reserve_pos_mw",
-        "reserve_neg_mw",
-        "soc_lp_mwh",
-        "planned_soc_mwh",
-        "aFRR_Capacity_Won_Pos_MW",
-        "aFRR_Capacity_Won_Neg_MW",
-        "aFRR_Capacity_Won_MW",
-        "aFRR_Energy_Price_EUR_MWh_Pos",
-        "aFRR_Energy_Price_EUR_MWh_Neg",
-        "event_reopt_triggered",
-        "event_reopt_rejected_mw_total",
-        "predicted_objective_eur",
-    ]
-    planned_cols = [c for c in planned_cols_pref if c in outputs.hourly.columns]
-    outputs.hourly[planned_cols].to_parquet(planned_ledger_path, index=False)
+        hourly_path = scenario_out_dir / "backtest_hourly.parquet"
+        planned_ledger_path = scenario_out_dir / "planned_ledger.parquet"
+        executed_ledger_path = scenario_out_dir / "executed_ledger.parquet"
+        realized_ledger_path = scenario_out_dir / "realized_ledger.parquet"
+        plan_history_path = scenario_out_dir / "backtest_plan_history.parquet"
+        volatility_path = scenario_out_dir / "backtest_decision_volatility.csv"
+        monthly_path = scenario_out_dir / "backtest_monthly.csv"
+        yearly_path = scenario_out_dir / "backtest_yearly.csv"
+        summary_path = scenario_out_dir / "backtest_summary.json"
+        state_machine_audit_path = scenario_out_dir / "state_machine_audit.json"
+        diagnostics_path = scenario_out_dir / "backtest_diagnostics.json"
+        diagnostics_txt_path = scenario_out_dir / "backtest_diagnostics.txt"
+        pnl_plot_path = scenario_out_dir / "backtest_cumulative_pnl.png"
 
-    # Ledger 2: executed market-clearing path
-    executed_cols = [colmap.timestamp]
-    executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_planned_")])
-    executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_submitted_")])
-    executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_executed_")])
-    executed_cols.extend(
-        [
-            c
-            for c in [
-                "real_da_buy_accepted",
-                "real_da_sell_accepted",
-                "real_afrr_cap_pos_awarded",
-                "real_afrr_cap_neg_awarded",
-                "real_afrr_act_pos_accepted",
-                "real_afrr_act_neg_accepted",
-                "real_aFRR_Capacity_Won_MW",
-                "real_DA_Energy_Sold_MW",
-                "real_aFRR_Energy_Price_EUR_MWh",
-                "real_Obligation_Fulfilled",
-                "real_aFRR_Energy_Gate_Closure_Min",
-                "shock_source",
-                "soc_before_mwh",
-                "soc_after_planned_mwh",
-                "soc_after_executed_mwh",
-                "soc_shock_mwh",
-            ]
-            if c in outputs.hourly.columns
-        ]
-    )
-    # preserve order + dedupe
-    executed_cols = [*dict.fromkeys(executed_cols)]
-    outputs.hourly[executed_cols].to_parquet(executed_ledger_path, index=False)
+        outputs.hourly.to_parquet(hourly_path, index=False)
+        planned_cols = [c for c in [
+            colmap.timestamp, "charge_mw", "discharge_mw", "reserve_pos_mw", "reserve_neg_mw", "soc_lp_mwh",
+            "planned_soc_mwh", "aFRR_Capacity_Won_Pos_MW", "aFRR_Capacity_Won_Neg_MW", "aFRR_Capacity_Won_MW",
+            "aFRR_Energy_Price_EUR_MWh_Pos", "aFRR_Energy_Price_EUR_MWh_Neg", "event_reopt_triggered",
+            "event_reopt_rejected_mw_total", "predicted_objective_eur"
+        ] if c in outputs.hourly.columns]
+        outputs.hourly[planned_cols].to_parquet(planned_ledger_path, index=False)
 
-    # Ledger 3: realized financial settlement
-    realized_cols = [colmap.timestamp]
-    realized_cols.extend(
-        [
-            c
-            for c in outputs.hourly.columns
-            if c.startswith("real_")
-            and c
-            in {
-                "real_pnl_eur",
-                "real_da_buy_mwh",
-                "real_da_sell_mwh",
-                "real_act_pos_mwh",
-                "real_act_neg_mwh",
-                "real_revenue_da_eur",
-                "real_cost_da_eur",
-                "real_revenue_capacity_eur",
-                "real_revenue_activation_eur",
-                "real_transaction_cost_eur",
-                "real_degradation_cost_eur",
-                "real_penalty_eur",
-                "real_missed_activation_mwh",
-                "real_missed_capacity_mw",
-                "real_missed_capacity_pos_mw",
-                "real_missed_capacity_neg_mw",
-                "real_requested_activation_revenue_eur",
-                "real_delivered_activation_revenue_eur",
-                "real_missed_activation_revenue_eur",
-                "real_soc_mwh",
+        executed_cols = [colmap.timestamp]
+        executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_planned_")])
+        executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_submitted_")])
+        executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_executed_")])
+        executed_cols.extend([c for c in [
+            "real_da_buy_accepted", "real_da_sell_accepted", "real_afrr_cap_pos_awarded", "real_afrr_cap_neg_awarded",
+            "real_afrr_act_pos_accepted", "real_afrr_act_neg_accepted", "real_aFRR_Capacity_Won_MW",
+            "real_DA_Energy_Sold_MW", "real_aFRR_Energy_Price_EUR_MWh", "real_Obligation_Fulfilled",
+            "real_aFRR_Energy_Gate_Closure_Min", "shock_source", "soc_before_mwh", "soc_after_planned_mwh",
+            "soc_after_executed_mwh", "soc_shock_mwh"
+        ] if c in outputs.hourly.columns])
+        outputs.hourly[[*dict.fromkeys(executed_cols)]].to_parquet(executed_ledger_path, index=False)
+
+        realized_cols = [colmap.timestamp]
+        realized_cols.extend([
+            c for c in outputs.hourly.columns if c.startswith("real_") and c in {
+                "real_pnl_eur", "real_da_buy_mwh", "real_da_sell_mwh", "real_act_pos_mwh", "real_act_neg_mwh",
+                "real_revenue_da_eur", "real_cost_da_eur", "real_revenue_capacity_eur", "real_revenue_activation_eur",
+                "real_transaction_cost_eur", "real_degradation_cost_eur", "real_penalty_eur",
+                "real_missed_activation_mwh", "real_missed_capacity_mw", "real_missed_capacity_pos_mw",
+                "real_missed_capacity_neg_mw", "real_requested_activation_revenue_eur",
+                "real_delivered_activation_revenue_eur", "real_missed_activation_revenue_eur", "real_soc_mwh",
             }
-        ]
-    )
-    realized_cols = [*dict.fromkeys(realized_cols)]
-    outputs.hourly[realized_cols].to_parquet(realized_ledger_path, index=False)
+        ])
+        outputs.hourly[[*dict.fromkeys(realized_cols)]].to_parquet(realized_ledger_path, index=False)
 
-    outputs.plan_history.to_parquet(plan_history_path, index=False)
-    outputs.plan_history.to_parquet(global_plan_history_path, index=False)
-    outputs.volatility.to_csv(volatility_path, index=False)
-    outputs.monthly.to_csv(monthly_path, index=False)
-    outputs.yearly.to_csv(yearly_path, index=False)
-    summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
-    state_machine_audit = _build_state_machine_audit(outputs.hourly)
-    state_machine_audit_path.write_text(json.dumps(state_machine_audit, indent=2), encoding="utf-8")
-    diagnostics = _build_backtest_diagnostics(outputs.hourly, outputs.summary)
-    diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
-    diagnostics_txt_path.write_text(
-        "\n".join(
-            [
+        outputs.plan_history.to_parquet(plan_history_path, index=False)
+        outputs.volatility.to_csv(volatility_path, index=False)
+        outputs.monthly.to_csv(monthly_path, index=False)
+        outputs.yearly.to_csv(yearly_path, index=False)
+        summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+        state_machine_audit_path.write_text(json.dumps(_build_state_machine_audit(outputs.hourly), indent=2), encoding="utf-8")
+        diagnostics = _build_backtest_diagnostics(outputs.hourly, outputs.summary)
+        diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+        diagnostics_txt_path.write_text(
+            "\n".join([
                 "Backtest Diagnostics",
                 f"rows_hourly={diagnostics['rows_hourly']}",
                 f"numeric_nan_total={diagnostics['numeric_nan_total']}",
                 f"numeric_nonfinite_total={diagnostics['numeric_nonfinite_total']}",
-                (
-                    "final_soc_constraint_satisfied="
-                    f"{diagnostics['infeasibility_flags']['final_soc_constraint_satisfied']}"
-                ),
-            ]
+                f"final_soc_constraint_satisfied={diagnostics['infeasibility_flags']['final_soc_constraint_satisfied']}",
+            ]) + "\n",
+            encoding="utf-8",
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
+        _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
 
-    print("[OK] Battery backtest completed.")
-    print(f"- rows: {len(outputs.hourly)}")
-    if "planned_total_pnl_eur" in outputs.summary:
-        print(f"- planned_total_pnl_eur: {outputs.summary['planned_total_pnl_eur']:.2f}")
-    print(f"- realized_total_pnl_eur: {outputs.summary['realized_total_pnl_eur']:.2f}")
-    print("- realized_pnl_breakdown:")
-    print(f"  - total_da_revenue_eur: {outputs.summary.get('total_da_revenue_eur', 0.0):.2f}")
-    print(f"  - total_afrr_capacity_revenue_eur: {outputs.summary.get('total_afrr_capacity_revenue_eur', 0.0):.2f}")
-    print(f"  - total_afrr_activation_revenue_eur: {outputs.summary.get('total_afrr_activation_revenue_eur', 0.0):.2f}")
-    print(f"  - total_da_cost_eur: {outputs.summary.get('total_da_cost_eur', 0.0):.2f}")
-    print(f"  - total_degradation_cost_eur: {outputs.summary.get('total_degradation_cost_eur', 0.0):.2f}")
-    print(f"  - total_transaction_cost_eur: {outputs.summary.get('total_transaction_cost_eur', 0.0):.2f}")
-    print(f"  - total_penalty_cost_eur: {outputs.summary.get('total_penalty_cost_eur', 0.0):.2f}")
-    print(f"  - realized_pnl_from_components_eur: {outputs.summary.get('realized_pnl_from_components_eur', 0.0):.2f}")
-    print(f"  - realized_pnl_balance_error_eur: {outputs.summary.get('realized_pnl_balance_error_eur', 0.0):.6f}")
-    print(f"  - realized_pnl_balance_ok: {bool(outputs.summary.get('realized_pnl_balance_ok', 0.0))}")
-    print("- operational_kpis:")
-    print(f"  - total_equivalent_full_cycles: {outputs.summary.get('total_equivalent_full_cycles', float('nan')):.4f}")
-    print(f"  - afrr_capacity_award_rate: {outputs.summary.get('afrr_capacity_award_rate', float('nan')):.4f}")
-    print(f"  - total_missed_activation_mwh: {outputs.summary.get('total_missed_activation_mwh', 0.0):.4f}")
-    print(f"  - roi_on_max_capital: {outputs.summary.get('roi_on_max_capital', float('nan')):.4f}")
-    print(f"- oracle_total_pnl_eur: {outputs.summary['oracle_total_pnl_eur']:.2f}")
-    if "oracle_pnl_from_components_eur" in outputs.summary:
-        print(f"- oracle_pnl_from_components_eur: {outputs.summary['oracle_pnl_from_components_eur']:.2f}")
-        print(f"- oracle_pnl_balance_error_eur: {outputs.summary.get('oracle_pnl_balance_error_eur', 0.0):.6f}")
-        print(f"- oracle_pnl_balance_ok: {bool(outputs.summary.get('oracle_pnl_balance_ok', 0.0))}")
-    print(f"- predicted_total_pnl_eur: {outputs.summary['predicted_total_pnl_eur']:.2f}")
-    if "oracle_upper_bound_ok" in outputs.summary:
-        print(f"- oracle_upper_bound_ok: {bool(outputs.summary['oracle_upper_bound_ok'])}")
-    print(f"- naive_total_pnl_eur: {outputs.summary['naive_total_pnl_eur']:.2f}")
-    print(f"- cost_of_forecast_error_total_eur: {outputs.summary['cost_of_forecast_error_total_eur']:.2f}")
-    print(f"- pnl_gap_total_eur: {outputs.summary['pnl_gap_total_eur']:.2f}")
-    print(f"- economic_opportunity_gap_ratio: {outputs.summary['economic_opportunity_gap_ratio']:.4f}")
-    print(f"- max_capital_required_eur: {outputs.summary['max_capital_required_eur']:.2f}")
-    print(
-        "- final_soc: "
-        f"{outputs.summary['final_real_soc_mwh']:.2f} MWh "
-        f"(min target {outputs.summary['final_soc_min_target_mwh']:.2f}, "
-        f"ok={bool(outputs.summary['final_soc_constraint_satisfied'])})"
-    )
-    print(f"- hourly: {hourly_path}")
-    print(f"- planned_ledger: {planned_ledger_path}")
-    print(f"- executed_ledger: {executed_ledger_path}")
-    print(f"- realized_ledger: {realized_ledger_path}")
-    print(f"- plan_history: {plan_history_path}")
-    print(f"- plan_history_global: {global_plan_history_path}")
-    print(f"- decision_volatility: {volatility_path}")
-    print(f"- monthly: {monthly_path}")
-    print(f"- yearly: {yearly_path}")
-    print(f"- summary: {summary_path}")
-    print(f"- state_machine_audit: {state_machine_audit_path}")
-    print(f"- diagnostics: {diagnostics_path}")
-    print(f"- diagnostics_txt: {diagnostics_txt_path}")
-    print(f"- pnl_contribution_plot: {pnl_plot_path}")
+        print(f"[OK] Battery backtest completed for scenario={scenario_name}.")
+        print(f"- realized_total_pnl_eur: {outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f}")
+        print(f"- output_dir: {scenario_out_dir}")
+
+        row: dict[str, object] = {
+            "scenario": scenario_name,
+            "da_quantile_role": args.da_quantile_role,
+            "realized_total_pnl_eur": outputs.summary.get("realized_total_pnl_eur"),
+            "predicted_total_pnl_eur": outputs.summary.get("predicted_total_pnl_eur"),
+            "naive_total_pnl_eur": outputs.summary.get("naive_total_pnl_eur"),
+            "oracle_total_pnl_eur": outputs.summary.get("oracle_total_pnl_eur"),
+            "cost_of_forecast_error_total_eur": outputs.summary.get("cost_of_forecast_error_total_eur"),
+            "pnl_gap_total_eur": outputs.summary.get("pnl_gap_total_eur"),
+            "economic_opportunity_gap_ratio": outputs.summary.get("economic_opportunity_gap_ratio"),
+            "roi_on_max_capital": outputs.summary.get("roi_on_max_capital"),
+            "output_dir": str(scenario_out_dir),
+        }
+        if scenario_name != "default":
+            q_lo, q_hi = scenario_name.split("_", 1)
+            row["quantile_low"] = q_lo
+            row["quantile_high"] = q_hi
+        sweep_rows.append(row)
+
+    global_plan_history_path = Path("artifacts/backtest_plan_history.parquet")
+    global_plan_history_path.parent.mkdir(parents=True, exist_ok=True)
+    if scenarios:
+        # Keep previous behavior for downstream consumers: export last scenario plan history globally.
+        outputs.plan_history.to_parquet(global_plan_history_path, index=False)
+
+    if quantile_pairs and sweep_rows:
+        sweep_df = pd.DataFrame(sweep_rows)
+        sweep_csv = out_dir / "quantile_sweep_summary.csv"
+        sweep_json = out_dir / "quantile_sweep_summary.json"
+        sweep_df.to_csv(sweep_csv, index=False)
+        sweep_json.write_text(sweep_df.to_json(orient="records", indent=2), encoding="utf-8")
+        print(f"[OK] Quantile sweep summary: {sweep_csv}")
 
 
 if __name__ == "__main__":

@@ -35,14 +35,25 @@ def tensorboard_target_log_dir(
 
 
 def create_summary_writer(log_dir: Path):
-    """Create torch SummaryWriter if available; else return None."""
+    """Create SummaryWriter if available; else return None.
+
+    Preference order:
+    1) torch.utils.tensorboard.SummaryWriter
+    2) tensorboardX.SummaryWriter
+    """
     try:
         from torch.utils.tensorboard import SummaryWriter  # type: ignore
 
         log_dir.mkdir(parents=True, exist_ok=True)
         return SummaryWriter(log_dir=str(log_dir))
     except Exception:
-        return None
+        try:
+            from tensorboardX import SummaryWriter  # type: ignore
+
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return SummaryWriter(logdir=str(log_dir))
+        except Exception:
+            return None
 
 
 def log_numeric_scalars(
@@ -70,4 +81,3 @@ def log_numeric_scalars(
             logged += 1
             continue
     return logged
-

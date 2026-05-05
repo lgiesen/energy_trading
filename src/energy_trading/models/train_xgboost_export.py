@@ -52,7 +52,7 @@ from energy_trading.evaluation.conformal_calibration import (
     calculate_conformal_shifts,
 )
 
-QUANTILES: list[float] = [0.01, 0.05, 0.10, 0.50, 0.90, 0.95, 0.99]
+QUANTILES: list[float] = [0.01, 0.05, 0.10, 0.30, 0.50, 0.70, 0.90, 0.95, 0.99]
 LOGGER = logging.getLogger(__name__)
 _ACTIVATION_RATE_TARGETS = {
     "target_afrr_activation_rate_pos",
@@ -679,7 +679,11 @@ def train_and_evaluate(
     n_estimators: int = 1000,
     max_depth: int = 8,
     learning_rate: float = 0.05,
+    subsample: float = 0.9,
     colsample_bytree: float = 0.8,
+    min_child_weight: float = 1.0,
+    reg_alpha: float = 0.0,
+    reg_lambda: float = 1.0,
     early_stopping_rounds: int = 50,
     run_cv: bool = False,
     cv_n_splits: int = 3,
@@ -728,12 +732,12 @@ def train_and_evaluate(
 
     base_xgb_params: dict[str, float] = {
         "max_depth": float(max_depth),
-        "min_child_weight": 1.0,
+        "min_child_weight": float(min_child_weight),
         "learning_rate": float(learning_rate),
-        "subsample": 0.9,
+        "subsample": float(subsample),
         "colsample_bytree": float(colsample_bytree),
-        "reg_alpha": 0.0,
-        "reg_lambda": 1.0,
+        "reg_alpha": float(reg_alpha),
+        "reg_lambda": float(reg_lambda),
         "early_stopping_rounds": float(max(0, int(early_stopping_rounds))),
     }
     primary_policy = resolve_xgb_params_for_target(primary_target, base_xgb_params)
@@ -1398,7 +1402,11 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--n-estimators", type=int, default=1000)
     p.add_argument("--max-depth", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=0.05)
+    p.add_argument("--subsample", type=float, default=0.9)
     p.add_argument("--colsample-bytree", type=float, default=0.8)
+    p.add_argument("--min-child-weight", type=float, default=1.0)
+    p.add_argument("--reg-alpha", type=float, default=0.0)
+    p.add_argument("--reg-lambda", type=float, default=1.0)
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument(
         "--run-cv",
@@ -1470,7 +1478,11 @@ def main() -> None:
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         learning_rate=args.learning_rate,
+        subsample=args.subsample,
         colsample_bytree=args.colsample_bytree,
+        min_child_weight=args.min_child_weight,
+        reg_alpha=args.reg_alpha,
+        reg_lambda=args.reg_lambda,
         early_stopping_rounds=args.early_stopping_rounds,
         run_cv=args.run_cv,
         cv_n_splits=args.cv_n_splits,

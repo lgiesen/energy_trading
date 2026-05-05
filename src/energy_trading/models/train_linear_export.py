@@ -44,7 +44,7 @@ from energy_trading.models.prepare_ml_bundles import load_processed_data  # noqa
 
 BundleName = Literal["da", "afrr"]
 LOGGER = logging.getLogger(__name__)
-QUANTILES: tuple[float, ...] = (0.01, 0.05, 0.10, 0.50, 0.90, 0.95, 0.99)
+QUANTILES: tuple[float, ...] = (0.01, 0.05, 0.10, 0.30, 0.50, 0.70, 0.90, 0.95, 0.99)
 
 
 AFRR_TARGETS = [
@@ -135,7 +135,15 @@ def _qcol(q: float) -> str:
     return f"p{int(round(q * 100)):02d}"
 
 
-def _build_linear_pipeline(alpha: float, quantile: float) -> Pipeline:
+def _build_linear_pipeline(
+    alpha: float,
+    quantile: float,
+    *,
+    l1_ratio: float,
+    learning_rate: str,
+    eta0: float,
+    seed: int,
+) -> Pipeline:
     # Fast linear quantile baseline using SGD quantile loss.
     try:
         model = SGDRegressor(
@@ -143,13 +151,13 @@ def _build_linear_pipeline(alpha: float, quantile: float) -> Pipeline:
             quantile=float(quantile),
             alpha=float(alpha),
             penalty="elasticnet",
-            l1_ratio=0.15,
+            l1_ratio=float(l1_ratio),
             max_iter=3000,
             tol=1e-4,
-            learning_rate="invscaling",
-            eta0=0.01,
+            learning_rate=str(learning_rate),
+            eta0=float(eta0),
             power_t=0.25,
-            random_state=42,
+            random_state=int(seed),
         )
     except TypeError:
         # sklearn versions without SGD quantile support.
@@ -221,6 +229,10 @@ def _train_target(
     bundle: BundleName,
     target_col: str,
     alpha: float,
+    l1_ratio: float,
+    learning_rate: str,
+    eta0: float,
+    seed: int,
     model_name: str,
     forecast_horizon_hours: int,
 ) -> tuple[dict[int, dict[str, Pipeline]], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
@@ -317,7 +329,14 @@ def _train_target(
         fit_t0 = time.perf_counter()
         for q in QUANTILES:
             qcol = _qcol(q)
-            pipe = _build_linear_pipeline(alpha=alpha, quantile=q)
+            pipe = _build_linear_pipeline(
+                alpha=alpha,
+                quantile=q,
+                l1_ratio=l1_ratio,
+                learning_rate=learning_rate,
+                eta0=eta0,
+                seed=seed,
+            )
             pipe.fit(X_tr, y_tr)
             q_models[qcol] = pipe
             preds_va[qcol] = pipe.predict(X_va)
@@ -541,6 +560,9 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--run-dir", default="", help="Run directory under artifacts/model_runs.")
     p.add_argument("--model-name", default="linear_ridge_v1")
     p.add_argument("--alpha", type=float, default=1.0)
+    p.add_argument("--l1-ratio", type=float, default=0.15)
+    p.add_argument("--learning-rate", default="invscaling")
+    p.add_argument("--eta0", type=float, default=0.01)
     p.add_argument("--forecast-horizon-hours", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--metrics-json-out", default="")
@@ -579,6 +601,10 @@ def main() -> None:
         bundle=args.bundle,
         target_col=tgt,
         alpha=float(args.alpha),
+        l1_ratio=float(args.l1_ratio),
+        learning_rate=str(args.learning_rate),
+        eta0=float(args.eta0),
+        seed=int(args.seed),
         model_name=args.model_name,
         forecast_horizon_hours=max(1, int(args.forecast_horizon_hours)),
     )

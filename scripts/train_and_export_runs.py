@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import shlex
 import subprocess
@@ -511,11 +512,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-estimators", type=int, default=1000)
     p.add_argument("--max-depth", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=0.05)
+    p.add_argument("--subsample", type=float, default=0.9)
     p.add_argument("--colsample-bytree", type=float, default=0.8)
+    p.add_argument("--min-child-weight", type=float, default=1.0)
+    p.add_argument("--reg-alpha", type=float, default=0.0)
+    p.add_argument("--reg-lambda", type=float, default=1.0)
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument("--forecast-horizon-hours", type=int, default=48)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--linear-alpha", type=float, default=1.0)
+    p.add_argument("--linear-l1-ratio", type=float, default=0.15)
+    p.add_argument("--linear-learning-rate", default="invscaling")
+    p.add_argument("--linear-eta0", type=float, default=0.01)
     p.add_argument(
         "--cleanup-lightning-checkpoints",
         action="store_true",
@@ -551,6 +560,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    IS_SMOKE_TEST = os.environ.get("IS_SMOKE_TEST", "0") == "1"
+    if IS_SMOKE_TEST:
+        print("⚠️ SMOKE TEST MODE AKTIVIERT - Reduziere Rechenlast!")
+        args.n_estimators = 5
+        if int(args.forecast_horizon_hours) > 24:
+            args.forecast_horizon_hours = 24
+        # Cross-script compatibility with smoke-test contract.
+        args.n_trials = 2
+        args.epochs = 1
     if args.model_type == "tft" and args.enable_da_stacking_afrr:
         raise ValueError("--enable-da-stacking-afrr is only supported for model-type=xgboost.")
     if args.model_type == "linear" and args.enable_da_stacking_afrr:
@@ -609,8 +627,16 @@ def main() -> None:
             str(args.max_depth),
             "--learning-rate",
             str(args.learning_rate),
+            "--subsample",
+            str(args.subsample),
             "--colsample-bytree",
             str(args.colsample_bytree),
+            "--min-child-weight",
+            str(args.min_child_weight),
+            "--reg-alpha",
+            str(args.reg_alpha),
+            "--reg-lambda",
+            str(args.reg_lambda),
             "--early-stopping-rounds",
             str(args.early_stopping_rounds),
             "--run-dir",
@@ -658,7 +684,13 @@ def main() -> None:
             "--run-dir",
             str(run_dir),
             "--alpha",
-            "1.0",
+            str(args.linear_alpha),
+            "--l1-ratio",
+            str(args.linear_l1_ratio),
+            "--learning-rate",
+            str(args.linear_learning_rate),
+            "--eta0",
+            str(args.linear_eta0),
             "--forecast-horizon-hours",
             str(args.forecast_horizon_hours),
             "--seed",

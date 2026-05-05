@@ -69,7 +69,7 @@ VOLATILE_VOLUME_FEATURES = {
 }
 TFT_CLIP_MIN = -5.0
 TFT_CLIP_MAX = 5.0
-QUANTILES: list[float] = [0.01, 0.05, 0.1, 0.5, 0.9, 0.95, 0.99]
+QUANTILES: list[float] = [0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99]
 LOGGER = logging.getLogger(__name__)
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -112,6 +113,12 @@ def _build_cli() -> argparse.ArgumentParser:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = _build_cli().parse_args()
+    IS_SMOKE_TEST = os.environ.get("IS_SMOKE_TEST", "0") == "1"
+    if IS_SMOKE_TEST:
+        print("⚠️ SMOKE TEST MODE AKTIVIERT - Reduziere Rechenlast!")
+        args.n_trials = 2
+        args.n_estimators = 5
+        args.epochs = 1
 
     try:
         import optuna
@@ -143,6 +150,11 @@ def main() -> None:
     X_va = _add_dynamics_features(X_val_df.loc[va_mask].copy(), prune_midterm_lags=True)
     y_tr = y_tr.loc[tr_mask].copy()
     y_va = y_va.loc[va_mask].copy()
+    if IS_SMOKE_TEST:
+        X_tr = X_tr.tail(min(len(X_tr), 3000)).copy()
+        y_tr = y_tr.tail(min(len(y_tr), 3000)).copy()
+        X_va = X_va.tail(min(len(X_va), 1000)).copy()
+        y_va = y_va.tail(min(len(y_va), 1000)).copy()
 
     tr_w, ql, qh = _build_tail_weights(
         y_tr, q_low=float(args.q_low), q_high=float(args.q_high), tail_weight=float(args.tail_weight)

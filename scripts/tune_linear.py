@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -116,6 +117,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    IS_SMOKE_TEST = os.environ.get("IS_SMOKE_TEST", "0") == "1"
+    if IS_SMOKE_TEST:
+        print("⚠️ SMOKE TEST MODE AKTIVIERT - Reduziere Rechenlast!")
+        args.n_trials = 2
+        args.n_estimators = 5
+        args.epochs = 1
     np.random.seed(args.seed)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +140,11 @@ def main() -> None:
     X_va = X_va_df.loc[va_mask].copy()
     y_tr = y_tr.loc[tr_mask].to_numpy(dtype=float)
     y_va = y_va.loc[va_mask].to_numpy(dtype=float)
+    if IS_SMOKE_TEST:
+        X_tr = X_tr.tail(min(len(X_tr), 3000)).copy()
+        X_va = X_va.tail(min(len(X_va), 1000)).copy()
+        y_tr = y_tr[-min(len(y_tr), 3000) :]
+        y_va = y_va[-min(len(y_va), 1000) :]
 
     alpha_grid = [float(x) for x in args.alpha_grid.split(",") if x.strip()]
     l1_grid = [float(x) for x in args.l1_ratio_grid.split(",") if x.strip()]
