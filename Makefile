@@ -82,14 +82,7 @@ help: ## Show available commands
 
 doctor: ## Preflight checks for data and python dependencies
 	@test -d data/model_input || (echo "Missing data/model_input" && exit 1)
-	@python3 - <<-'PY'
-	import importlib
-	mods = ["pandas", "numpy", "xgboost", "optuna", "lightning", "torch"]
-	missing = [m for m in mods if importlib.util.find_spec(m) is None]
-	if missing:
-	    raise SystemExit(f"Missing python deps: {missing}")
-	print("[OK] Python deps available.")
-	PY
+	@python3 -c "import importlib; mods=['pandas','numpy','xgboost','optuna','lightning','torch']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; (_ for _ in ()).throw(SystemExit(f'Missing python deps: {missing}')) if missing else print('[OK] Python deps available.')"
 
 all-xgb: audit-xgb ## Full XGBoost DAG
 all-linear: audit-linear ## Full Linear DAG
@@ -102,27 +95,7 @@ smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
 
 $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
 	@mkdir -p $(dir $(DATA_HASH_FILE))
-	@python3 - <<-'PY'
-	from pathlib import Path
-	import hashlib
-
-	root = Path("data/model_input")
-	files = sorted(root.rglob("*.parquet"))
-	if not files:
-	    raise SystemExit("No parquet files found under data/model_input")
-
-	lines = []
-	for p in files:
-	    h = hashlib.md5()
-	    with p.open("rb") as f:
-	        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-	            h.update(chunk)
-	    lines.append(f"{h.hexdigest()}  {p.as_posix()}")
-
-	out = Path("artifacts/hpo/data_model_input.md5")
-	out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-	print(f"[OK] wrote {out} with {len(lines)} entries")
-	PY
+	@python3 scripts/make_data_hash.py
 
 data_hash: $(DATA_HASH_FILE) ## Alias for provenance hash generation
 
@@ -252,19 +225,7 @@ $($(1)_AUDIT_ZIP): $$($(1)_SIM_DONE)
 	@git rev-parse HEAD > "artifacts/model_runs/$(3)/metadata/git_commit.txt" || true
 	@date -u +"%Y-%m-%dT%H:%M:%SZ" > "artifacts/model_runs/$(3)/metadata/timestamp_utc.txt"
 	@printf "SEED=%s\nFORECAST_HOURS=%s\nDEVICE=%s\nSIM_QUANTILE_PAIRS=%s\nDA_QUANTILE_ROLE=%s\n" "$(SEED)" "$(FORECAST_HOURS)" "$(DEVICE)" "$(SIM_QUANTILE_PAIRS)" "$(DA_QUANTILE_ROLE)" > "artifacts/model_runs/$(3)/metadata/run_parameters.txt"
-	@python3 - <<-'PY'
-	from pathlib import Path
-	import zipfile
-
-	run_id = "$(3)"
-	run_dir = Path("artifacts/model_runs") / run_id
-	zip_path = Path("artifacts/model_runs") / f"{run_id}_deliverable.zip"
-	with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-	    for p in sorted(run_dir.rglob("*")):
-	        if p.is_file():
-	            zf.write(p, p.relative_to(run_dir.parent))
-	print(f"[OK] wrote {zip_path}")
-	PY
+	@python3 scripts/make_run_zip.py --run-id "$(3)"
 endef
 
 $(eval $(call AUDIT_RULE,XGB,xgboost,$(RUN_ID_XGB)))
