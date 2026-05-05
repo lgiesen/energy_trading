@@ -526,6 +526,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--linear-learning-rate", default="invscaling")
     p.add_argument("--linear-eta0", type=float, default=0.01)
     p.add_argument(
+        "--hpo-artifact",
+        type=str,
+        default=None,
+        help="Path to Optuna/tuning JSON artifact",
+    )
+    p.add_argument(
         "--cleanup-lightning-checkpoints",
         action="store_true",
         help="For TFT runs: delete intermediate Lightning checkpoint files under ./checkpoints after training.",
@@ -573,6 +579,36 @@ def main() -> None:
         raise ValueError("--enable-da-stacking-afrr is only supported for model-type=xgboost.")
     if args.model_type == "linear" and args.enable_da_stacking_afrr:
         raise ValueError("--enable-da-stacking-afrr is only supported for model-type=xgboost.")
+
+    # Direct artifact consumption: load best_params from tuning JSON and
+    # override model arguments in-memory (no fragile shell extraction needed).
+    if args.hpo_artifact:
+        hpo_path = Path(args.hpo_artifact)
+        if not hpo_path.exists():
+            raise FileNotFoundError(f"HPO artifact not found: {hpo_path}")
+        payload = json.loads(hpo_path.read_text(encoding="utf-8"))
+        best_params = payload.get("best_params", {})
+        if not isinstance(best_params, dict):
+            raise RuntimeError(f"Invalid HPO artifact format in {hpo_path}: missing dict 'best_params'")
+
+        def _set_if_present(obj: argparse.Namespace, attr: str, key: str) -> None:
+            if key in best_params and best_params[key] is not None:
+                setattr(obj, attr, best_params[key])
+
+        if args.model_type == "xgboost":
+            _set_if_present(args, "max_depth", "max_depth")
+            _set_if_present(args, "learning_rate", "learning_rate")
+            _set_if_present(args, "subsample", "subsample")
+            _set_if_present(args, "colsample_bytree", "colsample_bytree")
+            _set_if_present(args, "min_child_weight", "min_child_weight")
+            _set_if_present(args, "reg_alpha", "reg_alpha")
+            _set_if_present(args, "reg_lambda", "reg_lambda")
+        elif args.model_type == "linear":
+            _set_if_present(args, "linear_alpha", "alpha")
+            _set_if_present(args, "linear_l1_ratio", "l1_ratio")
+            _set_if_present(args, "linear_learning_rate", "learning_rate")
+            _set_if_present(args, "linear_eta0", "eta0")
+
     run_id = args.run_id.strip() or _run_id_now()
     run_dir = Path(args.run_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)

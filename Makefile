@@ -95,28 +95,7 @@ smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
 
 $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
 	@mkdir -p $(dir $(DATA_HASH_FILE))
-	@python3 - <<-'PY'
-	from pathlib import Path
-	import hashlib
-
-	root = Path("data/model_input")
-	files = sorted(root.rglob("*.parquet"))
-	if not files:
-	    raise RuntimeError("No parquet files found under data/model_input")
-
-	lines = []
-	for p in files:
-	    h = hashlib.md5()
-	    with p.open("rb") as f:
-	        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-	            h.update(chunk)
-	    lines.append(f"{h.hexdigest()}  {p.as_posix()}")
-
-	out = Path("artifacts/hpo/data_model_input.md5")
-	out.parent.mkdir(parents=True, exist_ok=True)
-	out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-	print(f"[OK] wrote {out} with {len(lines)} entries")
-	PY
+	@python3 scripts/make_data_hash.py
 
 data_hash: $(DATA_HASH_FILE) ## Alias for provenance hash generation
 
@@ -146,45 +125,25 @@ $(LINEAR_TUNE_JSON): $(DATA_HASH_FILE)
 tune-linear: $(LINEAR_TUNE_JSON) ## Tune Linear model (depends on data_hash)
 
 $(XGB_MANIFEST): $(XGB_TUNE_JSON)
-	@MAX_DEPTH=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['max_depth'])"); \
-	LEARNING_RATE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['learning_rate'])"); \
-	SUBSAMPLE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['subsample'])"); \
-	COLSAMPLE=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['colsample_bytree'])"); \
-	MIN_CHILD=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['min_child_weight'])"); \
-	REG_ALPHA=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['reg_alpha'])"); \
-	REG_LAMBDA=$$(python3 -c "import json;print(json.load(open('$(XGB_TUNE_JSON)'))['best_params']['reg_lambda'])"); \
 	python3 scripts/train_and_export_runs.py \
 	  --model-type xgboost \
 	  --run-id "$(RUN_ID_XGB)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
 	  --seed $(SEED) \
+	  --hpo-artifact "$(XGB_TUNE_JSON)" \
 	  --n-estimators 400 \
-	  --max-depth $$MAX_DEPTH \
-	  --learning-rate $$LEARNING_RATE \
-	  --subsample $$SUBSAMPLE \
-	  --colsample-bytree $$COLSAMPLE \
-	  --min-child-weight $$MIN_CHILD \
-	  --reg-alpha $$REG_ALPHA \
-	  --reg-lambda $$REG_LAMBDA \
 	  --early-stopping-rounds 50 \
 	  --allow-cpu
 
 train-xgb: $(XGB_MANIFEST) ## Train+evaluate XGBoost (depends on tune-xgb output)
 
 $(LINEAR_MANIFEST): $(LINEAR_TUNE_JSON)
-	@LINEAR_ALPHA=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['alpha'])"); \
-	LINEAR_L1_RATIO=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['l1_ratio'])"); \
-	LINEAR_LR_MODE=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['learning_rate'])"); \
-	LINEAR_ETA0=$$(python3 -c "import json;print(json.load(open('$(LINEAR_TUNE_JSON)'))['best_params']['eta0'])"); \
 	python3 scripts/train_and_export_runs.py \
 	  --model-type linear \
 	  --run-id "$(RUN_ID_LINEAR)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
 	  --seed $(SEED) \
-	  --linear-alpha $$LINEAR_ALPHA \
-	  --linear-l1-ratio $$LINEAR_L1_RATIO \
-	  --linear-learning-rate $$LINEAR_LR_MODE \
-	  --linear-eta0 $$LINEAR_ETA0
+	  --hpo-artifact "$(LINEAR_TUNE_JSON)"
 
 train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on tune-linear output)
 
@@ -246,22 +205,7 @@ $($(1)_AUDIT_ZIP): $$($(1)_SIM_DONE)
 	@git rev-parse HEAD > "artifacts/model_runs/$(3)/metadata/git_commit.txt" || true
 	@date -u +"%Y-%m-%dT%H:%M:%SZ" > "artifacts/model_runs/$(3)/metadata/timestamp_utc.txt"
 	@printf "SEED=%s\nFORECAST_HOURS=%s\nDEVICE=%s\nSIM_QUANTILE_PAIRS=%s\nDA_QUANTILE_ROLE=%s\n" "$(SEED)" "$(FORECAST_HOURS)" "$(DEVICE)" "$(SIM_QUANTILE_PAIRS)" "$(DA_QUANTILE_ROLE)" > "artifacts/model_runs/$(3)/metadata/run_parameters.txt"
-	@python3 - <<-'PY'
-	from pathlib import Path
-	import zipfile
-
-	run_id = "$(3)"
-	run_dir = Path("artifacts/model_runs") / run_id
-	if not run_dir.exists():
-	    raise RuntimeError(f"Run directory not found: {run_dir}")
-
-	zip_path = Path("artifacts/model_runs") / f"{run_id}_deliverable.zip"
-	with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-	    for p in sorted(run_dir.rglob("*")):
-	        if p.is_file():
-	            zf.write(p, p.relative_to(run_dir.parent))
-	print(f"[OK] wrote {zip_path}")
-	PY
+	@python3 scripts/package_audit.py "$(3)"
 endef
 
 $(eval $(call AUDIT_RULE,XGB,xgboost,$(RUN_ID_XGB)))
