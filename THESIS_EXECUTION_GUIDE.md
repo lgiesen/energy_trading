@@ -40,6 +40,14 @@ These commands execute the full reproducible DAG for each model family and enfor
 - Fixed random seed behavior.
 - Strictly single-threaded BLAS/OMP settings (from Makefile exports) to maximize exact mathematical reproducibility.
 
+### HPO Artifact Consumption (Implementation Note)
+The pipeline uses direct artifact consumption for tuned hyperparameters:
+- `make all-xgb` passes `artifacts/hpo/xgb_optuna_da_target_da_price.json` to training.
+- `make all-linear` passes `artifacts/hpo/linear_sgd_tuning_da_target_da_price.json` to training.
+
+`scripts/train_and_export_runs.py` reads these files via `--hpo-artifact`, extracts `best_params`, and applies them directly in Python.  
+This replaces fragile shell-level JSON parsing and ensures deterministic, auditable parameter handoff from tuning to training.
+
 ## 4. Quantile Sweep Simulation & Reporting
 Run the full quantile sweep simulation:
 

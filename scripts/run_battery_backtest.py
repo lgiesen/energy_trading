@@ -49,8 +49,6 @@ from energy_trading.simulation.battery_backtest import (
     load_prediction_warehouse_long,
 )
 
-REQUIRED_QUANTILES_P01_P99 = [f"p{i:02d}" for i in range(1, 100)]
-
 
 def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> None:
     if hourly.empty:
@@ -383,6 +381,7 @@ def _preflight_manifest_and_quantiles(
     split: str,
     model_key: str,
     manifest_dir: Path,
+    expected_quantiles: set[str],
 ) -> None:
     if not manifest_path.exists():
         raise RuntimeError(f"Manifest not found: {manifest_path}")
@@ -403,18 +402,22 @@ def _preflight_manifest_and_quantiles(
         split=split,
         model_key=model_key,
     )
-    expected = set(REQUIRED_QUANTILES_P01_P99)
+    expected = {str(q).lower() for q in expected_quantiles}
+    if not expected:
+        expected = {"p50"}
     failures: list[str] = []
     for pred_col, file_path in sorted(resolved.items()):
         cols = set(_read_parquet_columns(Path(file_path)))
         missing = sorted(expected - cols)
         if missing:
             failures.append(
-                f"{pred_col}: missing {len(missing)} quantile columns (first 12: {missing[:12]}) in {file_path}"
+                f"{pred_col}: missing {len(missing)} required quantile columns "
+                f"(first 12: {missing[:12]}) in {file_path}"
             )
     if failures:
         msg = (
-            "Preflight failed: required quantile grid P01..P99 is not fully available.\n"
+            "Preflight failed: required quantiles derived from --quantile-pairs are not fully available.\n"
+            f"Expected quantiles: {sorted(expected)}\n"
             + "\n".join(failures)
         )
         raise RuntimeError(msg)
@@ -660,6 +663,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     run_id: str | None = args.run_id.strip() or None
+    quantile_pairs = _parse_quantile_pairs(args.quantile_pairs)
+    required_quantiles: set[str] = {"p50"}
+    for q_lo, q_hi in quantile_pairs:
+        required_quantiles.add(q_lo.lower())
+        required_quantiles.add(q_hi.lower())
 
     predictions_path = args.predictions.strip()
     ground_truth_path = args.ground_truth.strip()
@@ -694,6 +702,7 @@ def main() -> None:
             split=args.split,
             model_key=args.model_key.strip(),
             manifest_dir=manifest_dir,
+            expected_quantiles=required_quantiles,
         )
     else:
         manifest_dir = Path.cwd()
@@ -790,7 +799,6 @@ def main() -> None:
     if df.empty:
         raise ValueError("No rows after timestamp filtering.")
 
-    quantile_pairs = _parse_quantile_pairs(args.quantile_pairs)
     scenarios: list[tuple[str, dict[str, pd.DataFrame] | None]] = [("default", forecast_warehouse)]
     if quantile_pairs:
         if forecast_warehouse is None:
