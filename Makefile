@@ -1,4 +1,6 @@
 SHELL := /bin/bash
+.ONESHELL:
+.SHELLFLAGS := -eu -o pipefail -c
 
 # Global reproducibility / stability settings
 export PYTHONUNBUFFERED := 1
