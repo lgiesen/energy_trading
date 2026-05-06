@@ -335,19 +335,19 @@ class BatteryBacktester:
         p_da = self._finite_numeric_series(
             df,
             colmap.pred_da_price,
-            fallback_cols=[colmap.true_da_price],
+            fallback_cols=[],
             default=0.0,
         ).to_numpy(dtype=float)
         p_cap_pos = self._finite_numeric_series(
             df,
             colmap.pred_afrr_capacity_price_pos,
-            fallback_cols=[colmap.pred_afrr_capacity_price_neg, colmap.true_afrr_capacity_price_pos],
+            fallback_cols=[colmap.pred_afrr_capacity_price_neg],
             default=0.0,
         ).to_numpy(dtype=float)
         p_cap_neg = self._finite_numeric_series(
             df,
             colmap.pred_afrr_capacity_price_neg,
-            fallback_cols=[colmap.pred_afrr_capacity_price_pos, colmap.true_afrr_capacity_price_neg],
+            fallback_cols=[colmap.pred_afrr_capacity_price_pos],
             default=0.0,
         ).to_numpy(dtype=float)
         # Fallback acceptance-rate priors (used when no quantile-derived p_acc bins are available).
@@ -355,7 +355,7 @@ class BatteryBacktester:
             self._finite_numeric_series(
                 df,
                 colmap.pred_afrr_activation_rate_pos,
-                fallback_cols=[colmap.pred_afrr_activation_rate_neg, colmap.true_afrr_activation_rate_pos],
+                fallback_cols=[colmap.pred_afrr_activation_rate_neg],
                 default=0.0,
             ).to_numpy(dtype=float)
         )
@@ -363,7 +363,7 @@ class BatteryBacktester:
             self._finite_numeric_series(
                 df,
                 colmap.pred_afrr_activation_rate_neg,
-                fallback_cols=[colmap.pred_afrr_activation_rate_pos, colmap.true_afrr_activation_rate_neg],
+                fallback_cols=[colmap.pred_afrr_activation_rate_pos],
                 default=0.0,
             ).to_numpy(dtype=float)
         )
@@ -376,7 +376,6 @@ class BatteryBacktester:
                     colmap.pred_afrr_activation_rate_pos,
                     f"{colmap.pred_afrr_activation_rate_neg}_p90",
                     colmap.pred_afrr_activation_rate_neg,
-                    colmap.true_afrr_activation_rate_pos,
                 ],
                 default=0.0,
             ).to_numpy(dtype=float)
@@ -389,7 +388,6 @@ class BatteryBacktester:
                     colmap.pred_afrr_activation_rate_neg,
                     f"{colmap.pred_afrr_activation_rate_pos}_p90",
                     colmap.pred_afrr_activation_rate_pos,
-                    colmap.true_afrr_activation_rate_neg,
                 ],
                 default=0.0,
             ).to_numpy(dtype=float)
@@ -397,13 +395,13 @@ class BatteryBacktester:
         act_price_pos = self._finite_numeric_series(
             df,
             colmap.pred_afrr_activation_price_pos,
-            fallback_cols=[colmap.true_afrr_activation_price_pos],
+            fallback_cols=[],
             default=0.0,
         ).to_numpy(dtype=float)
         act_price_neg = self._finite_numeric_series(
             df,
             colmap.pred_afrr_activation_price_neg,
-            fallback_cols=[colmap.true_afrr_activation_price_neg],
+            fallback_cols=[],
             default=0.0,
         ).to_numpy(dtype=float)
 
@@ -1483,32 +1481,26 @@ class BatteryBacktester:
                                 window[f"{base}_{qc}"] = pd.to_numeric(filled_q, errors="coerce").to_numpy(dtype=float)
 
                 # Ensure required prediction columns are finite even if some long files are absent.
-                # Ordered fallbacks: paired prediction column -> truth-side column.
+                # Causality guard: prediction-side optimization must never fall back to truth-side columns.
                 pred_fallbacks: dict[str, list[str]] = {
-                    colmap.pred_da_price: [colmap.true_da_price],
+                    colmap.pred_da_price: [],
                     colmap.pred_afrr_capacity_price_pos: [
                         colmap.pred_afrr_capacity_price_neg,
-                        colmap.true_afrr_capacity_price_pos,
                     ],
                     colmap.pred_afrr_capacity_price_neg: [
                         colmap.pred_afrr_capacity_price_pos,
-                        colmap.true_afrr_capacity_price_neg,
                     ],
                     colmap.pred_afrr_activation_price_pos: [
                         colmap.pred_afrr_activation_price_neg,
-                        colmap.true_afrr_activation_price_pos,
                     ],
                     colmap.pred_afrr_activation_price_neg: [
                         colmap.pred_afrr_activation_price_pos,
-                        colmap.true_afrr_activation_price_neg,
                     ],
                     colmap.pred_afrr_activation_rate_pos: [
                         colmap.pred_afrr_activation_rate_neg,
-                        colmap.true_afrr_activation_rate_pos,
                     ],
                     colmap.pred_afrr_activation_rate_neg: [
                         colmap.pred_afrr_activation_rate_pos,
-                        colmap.true_afrr_activation_rate_neg,
                     ],
                 }
                 for pred_col, fallbacks in pred_fallbacks.items():
