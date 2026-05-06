@@ -1627,7 +1627,7 @@ class BatteryBacktester:
                 self._finite_numeric_series(
                     window,
                     colmap.pred_da_price,
-                    fallback_cols=[colmap.true_da_price],
+                    fallback_cols=[],
                     default=0.0,
                 ).to_numpy(dtype=float),
                 index=pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce"),
