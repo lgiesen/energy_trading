@@ -43,6 +43,7 @@ from energy_trading.evaluation.metrics import (
     compute_gate_closure_metrics,
     gate_hour_for_target,
 )
+from energy_trading.evaluation.lead_weighting import weighted_metric_from_decay
 from energy_trading.evaluation.tensorboard_utils import (
     create_summary_writer,
     tensorboard_target_log_dir,
@@ -1389,6 +1390,9 @@ def _build_cli() -> argparse.ArgumentParser:
         default=48,
         help="Forecast horizon for long-format prediction warehouse.",
     )
+    p.add_argument("--lead-weight-start", type=int, default=16)
+    p.add_argument("--lead-weight-end", type=int, default=48)
+    p.add_argument("--lead-weight-max", type=float, default=2.0)
     p.add_argument(
         "--metrics-json-out",
         default="",
@@ -1500,6 +1504,7 @@ def main() -> None:
 
     prediction_paths: dict[str, Path] = {}
     prediction_long_paths: dict[str, dict[str, Path]] = {}
+    leadtime_weighted_by_split: dict[str, dict[str, dict[str, float]]] = {}
     prediction_export_seconds_by_split: dict[str, float] = {}
     long_export_seconds_by_split: dict[str, float] = {}
     gate_closure_metrics_by_split: dict[str, dict[str, dict[str, object]]] = {}
@@ -1588,6 +1593,18 @@ def main() -> None:
                     decay = decay_by_col[pred_col]
                     decay_path = report_dir / f"{file_tag}_{split}_{pred_col}_forecast_decay.csv"
                     decay.to_csv(decay_path, index=False)
+                    leadtime_weighted_by_split.setdefault(split, {})[pred_col] = {
+                        "mae_weighted": float(
+                            weighted_metric_from_decay(
+                                decay,
+                                value_col="mae",
+                                count_col="n",
+                                start_lead=int(args.lead_weight_start),
+                                end_lead=int(args.lead_weight_end),
+                                max_weight=float(args.lead_weight_max),
+                            )
+                        )
+                    }
                     mae_plot_path = report_dir / f"{file_tag}_{split}_{pred_col}_mae_lead_1_24_48.png"
                     _plot_leadtime_mae_points(decay, mae_plot_path)
 
@@ -1625,6 +1642,19 @@ def main() -> None:
     metrics["timing_export_seconds"] = float(export_elapsed)
     metrics["timing_export_prediction_seconds_by_split"] = prediction_export_seconds_by_split
     metrics["timing_export_long_seconds_by_split"] = long_export_seconds_by_split
+    metrics["leadtime_weighting"] = {
+        "start_lead_h": int(args.lead_weight_start),
+        "end_lead_h": int(args.lead_weight_end),
+        "max_weight": float(args.lead_weight_max),
+    }
+    metrics["leadtime_weighted_by_split"] = leadtime_weighted_by_split
+    primary_pred_col = _pred_column_names_for_target(str(metrics.get("target_col", "")))[0]
+    metrics["leadtime_mae_val_weighted"] = (
+        leadtime_weighted_by_split.get("val", {}).get(primary_pred_col, {}).get("mae_weighted")
+    )
+    metrics["leadtime_mae_test_weighted"] = (
+        leadtime_weighted_by_split.get("test", {}).get(primary_pred_col, {}).get("mae_weighted")
+    )
     metrics["gate_closure_metrics_by_split"] = gate_closure_metrics_by_split
     metrics["timing_total_seconds"] = float(total_elapsed)
     # Export early-stopping diagnostics per target/lead/quantile for QA.

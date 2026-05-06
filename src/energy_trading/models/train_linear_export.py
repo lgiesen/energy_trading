@@ -31,6 +31,7 @@ from energy_trading.evaluation.metrics import (  # noqa: E402
     compute_gate_closure_metrics,
     gate_hour_for_target,
 )
+from energy_trading.evaluation.lead_weighting import weighted_metric_from_decay  # noqa: E402
 from energy_trading.evaluation.tensorboard_utils import (  # noqa: E402
     create_summary_writer,
     log_numeric_scalars,
@@ -235,6 +236,9 @@ def _train_target(
     seed: int,
     model_name: str,
     forecast_horizon_hours: int,
+    lead_weight_start: int,
+    lead_weight_end: int,
+    lead_weight_max: float,
 ) -> tuple[dict[int, dict[str, Pipeline]], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     cfg = json.loads((base_dir / "feature_config.json").read_text(encoding="utf-8"))
     bcfg = cfg["bundles"][bundle]
@@ -507,6 +511,22 @@ def _train_target(
     lead_mae_test_h1 = float(lead_df.loc[lead_df["lead_time_h"] == 1.0, "mae_test"].iloc[0]) if (lead_df["lead_time_h"] == 1.0).any() else np.nan
     lead_mae_val_last = float(lead_df.loc[lead_df["lead_time_h"] == float(last_h), "mae_val"].iloc[0]) if not lead_df.empty else np.nan
     lead_mae_test_last = float(lead_df.loc[lead_df["lead_time_h"] == float(last_h), "mae_test"].iloc[0]) if not lead_df.empty else np.nan
+    lead_mae_val_weighted = weighted_metric_from_decay(
+        lead_df.rename(columns={"mae_val": "mae", "n_val": "n"}),
+        value_col="mae",
+        count_col="n",
+        start_lead=lead_weight_start,
+        end_lead=lead_weight_end,
+        max_weight=lead_weight_max,
+    )
+    lead_mae_test_weighted = weighted_metric_from_decay(
+        lead_df.rename(columns={"mae_test": "mae", "n_test": "n"}),
+        value_col="mae",
+        count_col="n",
+        start_lead=lead_weight_start,
+        end_lead=lead_weight_end,
+        max_weight=lead_weight_max,
+    )
 
     metrics: dict[str, object] = {
         "target_col": target_col,
@@ -525,6 +545,13 @@ def _train_target(
         f"leadtime_mae_test_h{last_h}": lead_mae_test_last,
         "leadtime_mae_val_h_last": lead_mae_val_last,
         "leadtime_mae_test_h_last": lead_mae_test_last,
+        "leadtime_mae_val_weighted": lead_mae_val_weighted,
+        "leadtime_mae_test_weighted": lead_mae_test_weighted,
+        "leadtime_weighting": {
+            "start_lead_h": int(lead_weight_start),
+            "end_lead_h": int(lead_weight_end),
+            "max_weight": float(lead_weight_max),
+        },
         "leadtime_metrics": lead_df.to_dict(orient="records"),
         "metric_suite_val": val_metric_suite,
         "metric_suite_test": test_metric_suite,
@@ -564,6 +591,9 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--learning-rate", default="invscaling")
     p.add_argument("--eta0", type=float, default=0.01)
     p.add_argument("--forecast-horizon-hours", type=int, default=1)
+    p.add_argument("--lead-weight-start", type=int, default=16)
+    p.add_argument("--lead-weight-end", type=int, default=48)
+    p.add_argument("--lead-weight-max", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--metrics-json-out", default="")
     p.add_argument("--metrics-csv-out", default="")
@@ -607,6 +637,9 @@ def main() -> None:
         seed=int(args.seed),
         model_name=args.model_name,
         forecast_horizon_hours=max(1, int(args.forecast_horizon_hours)),
+        lead_weight_start=int(args.lead_weight_start),
+        lead_weight_end=int(args.lead_weight_end),
+        lead_weight_max=float(args.lead_weight_max),
     )
 
     file_tag = f"linear_{args.bundle}_{tgt.replace('target_', '')}"

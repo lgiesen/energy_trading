@@ -14,6 +14,9 @@ SEED ?= 42
 FORECAST_HOURS ?= 48
 export IS_SMOKE_TEST ?= 0
 DEVICE ?= cuda
+LEAD_WEIGHT_START ?= 16
+LEAD_WEIGHT_END ?= 48
+LEAD_WEIGHT_MAX ?= 2.0
 SIM_QUANTILE_PAIRS ?=
 DA_QUANTILE_ROLE ?= mid
 SIM_QUANTILE_SWEEP_DEFAULT ?= p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90
@@ -54,6 +57,9 @@ TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 	train-xgb train-linear train-tft \
 	sim-xgb sim-linear sim-tft \
 	sim-all-quantiles \
+	build-hybrid sim-hybrid \
+	residual-report \
+	strategy-diagnostics \
 	audit-xgb audit-linear audit-tft \
 	thesis-report \
 	all-xgb all-linear all-tft \
@@ -74,11 +80,17 @@ help: ## Show available commands
 	@echo "Global:"
 	@echo "  make smoke-test   # runs all-xgb, all-linear, all-tft with IS_SMOKE_TEST=1"
 	@echo "  make sim-all-quantiles  # run xgb/linear/tft simulation with standard thesis quantile sweep"
+	@echo "  make build-hybrid       # build champion-by-target (hybrid/ensemble) prediction table"
+	@echo "  make sim-hybrid         # run backtest on hybrid table (requires HYBRID_GROUND_TRUTH)"
 	@echo "  make thesis-report      # aggregate quantile sweep outputs into one benchmark report"
+	@echo "  make residual-report RUN_DIR=artifacts/model_runs/<run_id> SPLIT=test"
+	@echo "  make strategy-diagnostics [SIM_ROOT=artifacts/simulation_runs] [OUT_DIR=artifacts/analysis/strategy_diagnostics]"
 	@echo ""
 	@echo "Optional overrides:"
 	@echo "  RUN_ID_XGB=... RUN_ID_LINEAR=... RUN_ID_TFT=... SEED=42 FORECAST_HOURS=48 DEVICE=cuda|cpu"
 	@echo "  SIM_QUANTILE_PAIRS='p50-p50,p30-p70,p10-p90' DA_QUANTILE_ROLE=mid|low|high"
+	@echo "  LEAD_WEIGHT_START=16 LEAD_WEIGHT_END=48 LEAD_WEIGHT_MAX=2.0"
+	@echo "  HYBRID_RECO_CSV=... HYBRID_OUT=... HYBRID_GROUND_TRUTH=... HYBRID_SPLIT=test"
 
 doctor: ## Preflight checks for data and python dependencies
 	@test -d data/model_input || (echo "Missing data/model_input" && exit 1)
@@ -129,6 +141,9 @@ $(XGB_MANIFEST): $(XGB_TUNE_JSON)
 	  --model-type xgboost \
 	  --run-id "$(RUN_ID_XGB)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
+	  --lead-weight-start $(LEAD_WEIGHT_START) \
+	  --lead-weight-end $(LEAD_WEIGHT_END) \
+	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
 	  --hpo-artifact "$(XGB_TUNE_JSON)" \
 	  --n-estimators 400 \
@@ -142,6 +157,9 @@ $(LINEAR_MANIFEST): $(LINEAR_TUNE_JSON)
 	  --model-type linear \
 	  --run-id "$(RUN_ID_LINEAR)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
+	  --lead-weight-start $(LEAD_WEIGHT_START) \
+	  --lead-weight-end $(LEAD_WEIGHT_END) \
+	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
 	  --hpo-artifact "$(LINEAR_TUNE_JSON)"
 
@@ -162,6 +180,9 @@ $(TFT_MANIFEST): $(DATA_HASH_FILE)
 	  --model-type tft \
 	  --run-id "$(RUN_ID_TFT)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
+	  --lead-weight-start $(LEAD_WEIGHT_START) \
+	  --lead-weight-end $(LEAD_WEIGHT_END) \
+	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
 	  --device $$DEVICE_USE \
 	  --num-workers 0
@@ -204,7 +225,7 @@ $($(1)_AUDIT_ZIP): $$($(1)_SIM_DONE)
 	@pip freeze > "artifacts/model_runs/$(3)/metadata/pip_freeze.txt"
 	@git rev-parse HEAD > "artifacts/model_runs/$(3)/metadata/git_commit.txt" || true
 	@date -u +"%Y-%m-%dT%H:%M:%SZ" > "artifacts/model_runs/$(3)/metadata/timestamp_utc.txt"
-	@printf "SEED=%s\nFORECAST_HOURS=%s\nDEVICE=%s\nSIM_QUANTILE_PAIRS=%s\nDA_QUANTILE_ROLE=%s\n" "$(SEED)" "$(FORECAST_HOURS)" "$(DEVICE)" "$(SIM_QUANTILE_PAIRS)" "$(DA_QUANTILE_ROLE)" > "artifacts/model_runs/$(3)/metadata/run_parameters.txt"
+	@printf "SEED=%s\nFORECAST_HOURS=%s\nDEVICE=%s\nLEAD_WEIGHT_START=%s\nLEAD_WEIGHT_END=%s\nLEAD_WEIGHT_MAX=%s\nSIM_QUANTILE_PAIRS=%s\nDA_QUANTILE_ROLE=%s\n" "$(SEED)" "$(FORECAST_HOURS)" "$(DEVICE)" "$(LEAD_WEIGHT_START)" "$(LEAD_WEIGHT_END)" "$(LEAD_WEIGHT_MAX)" "$(SIM_QUANTILE_PAIRS)" "$(DA_QUANTILE_ROLE)" > "artifacts/model_runs/$(3)/metadata/run_parameters.txt"
 	@python3 scripts/package_audit.py "$(3)"
 endef
 
@@ -217,6 +238,42 @@ audit-linear: $(LINEAR_AUDIT_ZIP) ## Audit+package Linear run
 audit-tft: $(TFT_AUDIT_ZIP) ## Audit+package TFT run
 thesis-report: ## Merge quantile sweep summaries into artifacts/thesis_benchmark_report.csv
 	python3 scripts/generate_thesis_report.py
+
+residual-report: ## Export reproducible residual artifacts for one run (set RUN_DIR and optional SPLIT)
+	@test -n "$(RUN_DIR)" || (echo "Set RUN_DIR, e.g. make residual-report RUN_DIR=artifacts/model_runs/xgb_YYYYmmdd_HHMMSS" && exit 1)
+	@SPLIT_USE="$(or $(SPLIT),test)"; \
+	OUT_DIR_USE="$(or $(OUT_DIR),artifacts/residual_reports/$$(basename "$(RUN_DIR)")_$${SPLIT_USE})"; \
+	python3 scripts/export_residual_analysis.py \
+	  --run-dir "$(RUN_DIR)" \
+	  --split "$${SPLIT_USE}" \
+	  --out-dir "$${OUT_DIR_USE}"
+
+strategy-diagnostics: ## Analyze mapping/failure-modes/constraints/calibration-link/comparative diagnosis
+	@SIM_ROOT_USE="$(or $(SIM_ROOT),artifacts/simulation_runs)"; \
+	OUT_DIR_USE="$(or $(OUT_DIR),artifacts/analysis/strategy_diagnostics)"; \
+	python3 scripts/generate_strategy_diagnostics.py \
+	  --simulation-root "$${SIM_ROOT_USE}" \
+	  --out-dir "$${OUT_DIR_USE}"
+
+build-hybrid: ## Build champion-by-target hybrid (ensemble) prediction table
+	@RECO_USE="$(or $(HYBRID_RECO_CSV),artifacts/benchmarks/final_report/recommendation_per_target_test.csv)"; \
+	OUT_USE="$(or $(HYBRID_OUT),artifacts/simulation_runs/hybrid/test/backtest_table_test.parquet)"; \
+	SPLIT_USE="$(or $(HYBRID_SPLIT),test)"; \
+	python3 scripts/build_hybrid_predictions.py \
+	  --recommendation-csv "$${RECO_USE}" \
+	  --split "$${SPLIT_USE}" \
+	  --out "$${OUT_USE}"
+
+sim-hybrid: build-hybrid ## Simulate champion-by-target hybrid table
+	@test -n "$(HYBRID_GROUND_TRUTH)" || (echo "Set HYBRID_GROUND_TRUTH (required), e.g. make sim-hybrid HYBRID_GROUND_TRUTH=data/model_input/backtest_truth_test.parquet" && exit 1)
+	@OUT_USE="$(or $(HYBRID_OUT),artifacts/simulation_runs/hybrid/test/backtest_table_test.parquet)"; \
+	SPLIT_USE="$(or $(HYBRID_SPLIT),test)"; \
+	python3 scripts/run_battery_backtest.py \
+	  --predictions "$${OUT_USE}" \
+	  --ground-truth "$(HYBRID_GROUND_TRUTH)" \
+	  --split "$${SPLIT_USE}" \
+	  --model-key hybrid \
+	  --out-dir "artifacts/simulation_runs/hybrid/$${SPLIT_USE}"
 
 clean-markers: ## Remove simulation markers only (forces re-sim)
 	rm -f $(XGB_SIM_DONE) $(LINEAR_SIM_DONE) $(TFT_SIM_DONE)

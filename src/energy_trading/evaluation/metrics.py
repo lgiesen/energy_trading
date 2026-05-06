@@ -95,6 +95,141 @@ def _pinball_loss(y_true: np.ndarray, y_q: np.ndarray, q: float) -> float | None
     return float(np.mean(loss))
 
 
+def pinball_loss_by_quantile(
+    y_true: pd.Series | np.ndarray,
+    quantile_preds: dict[float, pd.Series | np.ndarray],
+) -> dict[float, float | None]:
+    """Return mean pinball loss for each quantile tau.
+
+    Parameters
+    ----------
+    y_true:
+        Ground truth vector.
+    quantile_preds:
+        Mapping {tau: predicted quantile vector}.
+    """
+    yt = np.asarray(pd.to_numeric(pd.Series(y_true), errors="coerce"), dtype=float)
+    out: dict[float, float | None] = {}
+    for tau, pred in sorted(quantile_preds.items(), key=lambda kv: kv[0]):
+        yp = np.asarray(pd.to_numeric(pd.Series(pred), errors="coerce"), dtype=float)
+        out[float(tau)] = _pinball_loss(yt, yp, float(tau))
+    return out
+
+
+def winkler_score(
+    y_true: pd.Series | np.ndarray,
+    y_lower: pd.Series | np.ndarray,
+    y_upper: pd.Series | np.ndarray,
+    *,
+    alpha: float,
+) -> float | None:
+    """Mean Winkler score for prediction interval [L, U].
+
+    alpha = 1 - interval_level (e.g., alpha=0.2 for an 80% interval).
+    Lower score is better.
+    """
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0, 1).")
+    yt = np.asarray(pd.to_numeric(pd.Series(y_true), errors="coerce"), dtype=float)
+    lo = np.asarray(pd.to_numeric(pd.Series(y_lower), errors="coerce"), dtype=float)
+    hi = np.asarray(pd.to_numeric(pd.Series(y_upper), errors="coerce"), dtype=float)
+    m = np.isfinite(yt) & np.isfinite(lo) & np.isfinite(hi)
+    if not m.any():
+        return None
+    yt = yt[m]
+    lo = lo[m]
+    hi = hi[m]
+    width = hi - lo
+    score = width.copy()
+    below = yt < lo
+    above = yt > hi
+    score[below] = width[below] + (2.0 / alpha) * (lo[below] - yt[below])
+    score[above] = width[above] + (2.0 / alpha) * (yt[above] - hi[above])
+    return float(np.mean(score))
+
+
+def prediction_interval_coverage_probability(
+    y_true: pd.Series | np.ndarray,
+    y_lower: pd.Series | np.ndarray,
+    y_upper: pd.Series | np.ndarray,
+) -> float | None:
+    """PICP: fraction of observations inside [L, U]."""
+    yt = np.asarray(pd.to_numeric(pd.Series(y_true), errors="coerce"), dtype=float)
+    lo = np.asarray(pd.to_numeric(pd.Series(y_lower), errors="coerce"), dtype=float)
+    hi = np.asarray(pd.to_numeric(pd.Series(y_upper), errors="coerce"), dtype=float)
+    m = np.isfinite(yt) & np.isfinite(lo) & np.isfinite(hi)
+    if not m.any():
+        return None
+    yt = yt[m]
+    lo = lo[m]
+    hi = hi[m]
+    return float(np.mean((yt >= lo) & (yt <= hi)))
+
+
+def prediction_interval_normalized_average_width(
+    y_true: pd.Series | np.ndarray,
+    y_lower: pd.Series | np.ndarray,
+    y_upper: pd.Series | np.ndarray,
+) -> float | None:
+    """PINAW: mean interval width normalized by target range."""
+    yt = np.asarray(pd.to_numeric(pd.Series(y_true), errors="coerce"), dtype=float)
+    lo = np.asarray(pd.to_numeric(pd.Series(y_lower), errors="coerce"), dtype=float)
+    hi = np.asarray(pd.to_numeric(pd.Series(y_upper), errors="coerce"), dtype=float)
+    m = np.isfinite(yt) & np.isfinite(lo) & np.isfinite(hi)
+    if not m.any():
+        return None
+    yt = yt[m]
+    lo = lo[m]
+    hi = hi[m]
+    y_range = float(np.nanmax(yt) - np.nanmin(yt))
+    if y_range <= 1e-12:
+        return None
+    return float(np.mean(hi - lo) / y_range)
+
+
+def summarize_probabilistic_interval_metrics(
+    df: pd.DataFrame,
+    *,
+    y_true_col: str,
+    quantile_col_map: dict[float, str],
+    lower_q: float,
+    upper_q: float,
+) -> dict[str, Any]:
+    """Aggregate probabilistic metrics for a selected interval [q_low, q_high].
+
+    Returns Pinball loss for all provided quantiles plus interval metrics:
+    Winkler, PICP, PINAW.
+    """
+    if y_true_col not in df.columns:
+        raise KeyError(f"Missing y_true column: {y_true_col}")
+    if lower_q not in quantile_col_map or upper_q not in quantile_col_map:
+        raise KeyError(f"quantile_col_map must contain {lower_q} and {upper_q}")
+
+    y_true = _to_float_series(df[y_true_col])
+    q_preds: dict[float, pd.Series] = {}
+    for q, c in quantile_col_map.items():
+        if c not in df.columns:
+            raise KeyError(f"Missing quantile column for q={q}: {c}")
+        q_preds[float(q)] = _to_float_series(df[c])
+
+    alpha = 1.0 - float(upper_q - lower_q)
+    y_lo = q_preds[float(lower_q)]
+    y_hi = q_preds[float(upper_q)]
+
+    pinball = pinball_loss_by_quantile(y_true, q_preds)
+    out: dict[str, Any] = {
+        "interval_lower_q": float(lower_q),
+        "interval_upper_q": float(upper_q),
+        "interval_level": float(upper_q - lower_q),
+        "alpha": float(alpha),
+        "pinball_by_quantile": {f"p{int(round(q*100)):02d}": v for q, v in pinball.items()},
+        "winkler_score": winkler_score(y_true, y_lo, y_hi, alpha=alpha),
+        "picp": prediction_interval_coverage_probability(y_true, y_lo, y_hi),
+        "pinaw": prediction_interval_normalized_average_width(y_true, y_lo, y_hi),
+    }
+    return out
+
+
 def _extract_quantile_columns(df: pd.DataFrame, explicit: dict[float, str] | None) -> dict[float, str]:
     out: dict[float, str] = {}
     if explicit:

@@ -519,6 +519,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reg-lambda", type=float, default=1.0)
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument("--forecast-horizon-hours", type=int, default=48)
+    p.add_argument("--lead-weight-start", type=int, default=16)
+    p.add_argument("--lead-weight-end", type=int, default=48)
+    p.add_argument("--lead-weight-max", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--linear-alpha", type=float, default=1.0)
@@ -681,6 +684,12 @@ def main() -> None:
             "val,test",
             "--forecast-horizon-hours",
             str(args.forecast_horizon_hours),
+            "--lead-weight-start",
+            str(args.lead_weight_start),
+            "--lead-weight-end",
+            str(args.lead_weight_end),
+            "--lead-weight-max",
+            str(args.lead_weight_max),
             "--seed",
             str(args.seed),
         ]
@@ -702,6 +711,12 @@ def main() -> None:
             "168",
             "--max-prediction-length",
             str(args.forecast_horizon_hours),
+            "--lead-weight-start",
+            str(args.lead_weight_start),
+            "--lead-weight-end",
+            str(args.lead_weight_end),
+            "--lead-weight-max",
+            str(args.lead_weight_max),
             "--seed",
             str(args.seed),
             "--num-workers",
@@ -729,6 +744,12 @@ def main() -> None:
             str(args.linear_eta0),
             "--forecast-horizon-hours",
             str(args.forecast_horizon_hours),
+            "--lead-weight-start",
+            str(args.lead_weight_start),
+            "--lead-weight-end",
+            str(args.lead_weight_end),
+            "--lead-weight-max",
+            str(args.lead_weight_max),
             "--seed",
             str(args.seed),
         ]

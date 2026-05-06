@@ -38,6 +38,7 @@ from energy_trading.evaluation.metrics import (
     compute_gate_closure_metrics,
     gate_hour_for_target,
 )
+from energy_trading.evaluation.lead_weighting import weighted_metric_from_decay
 from energy_trading.evaluation.tensorboard_utils import (
     tensorboard_log_root,
     tensorboard_target_version,
@@ -599,6 +600,9 @@ def _train_tft(
     cleanup_lightning_checkpoints: bool = False,
     learning_rate: float = 1e-3,
     gradient_clip_val: float = 0.05,
+    lead_weight_start: int = 16,
+    lead_weight_end: int = 48,
+    lead_weight_max: float = 2.0,
 ) -> dict[str, object]:
     total_start = time.perf_counter()
     try:
@@ -1110,6 +1114,38 @@ def _train_tft(
     rmse_val_h_last = _rmse_for_lead(decay_val, h_last)
     rmse_test_h1 = _rmse_for_lead(decay_test, 1)
     rmse_test_h_last = _rmse_for_lead(decay_test, h_last)
+    mae_val_weighted = weighted_metric_from_decay(
+        decay_val,
+        value_col="mae",
+        count_col="n",
+        start_lead=int(lead_weight_start),
+        end_lead=int(lead_weight_end),
+        max_weight=float(lead_weight_max),
+    )
+    mae_test_weighted = weighted_metric_from_decay(
+        decay_test,
+        value_col="mae",
+        count_col="n",
+        start_lead=int(lead_weight_start),
+        end_lead=int(lead_weight_end),
+        max_weight=float(lead_weight_max),
+    )
+    rmse_val_weighted = weighted_metric_from_decay(
+        decay_val,
+        value_col="rmse",
+        count_col="n",
+        start_lead=int(lead_weight_start),
+        end_lead=int(lead_weight_end),
+        max_weight=float(lead_weight_max),
+    )
+    rmse_test_weighted = weighted_metric_from_decay(
+        decay_test,
+        value_col="rmse",
+        count_col="n",
+        start_lead=int(lead_weight_start),
+        end_lead=int(lead_weight_end),
+        max_weight=float(lead_weight_max),
+    )
 
     metrics = {
         "bundle": bundle,
@@ -1132,6 +1168,15 @@ def _train_tft(
         "leadtime_rmse_test_h1": rmse_test_h1,
         "leadtime_rmse_val_h_last": rmse_val_h_last,
         "leadtime_rmse_test_h_last": rmse_test_h_last,
+        "leadtime_mae_val_weighted": mae_val_weighted,
+        "leadtime_mae_test_weighted": mae_test_weighted,
+        "leadtime_rmse_val_weighted": rmse_val_weighted,
+        "leadtime_rmse_test_weighted": rmse_test_weighted,
+        "leadtime_weighting": {
+            "start_lead_h": int(lead_weight_start),
+            "end_lead_h": int(lead_weight_end),
+            "max_weight": float(lead_weight_max),
+        },
         f"leadtime_mae_val_h{h_last}": mae_val_h_last,
         f"leadtime_mae_test_h{h_last}": mae_test_h_last,
         f"leadtime_rmse_val_h{h_last}": rmse_val_h_last,
@@ -1219,6 +1264,9 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--gradient-clip-val", type=float, default=0.05)
+    p.add_argument("--lead-weight-start", type=int, default=16)
+    p.add_argument("--lead-weight-end", type=int, default=48)
+    p.add_argument("--lead-weight-max", type=float, default=2.0)
     p.add_argument(
         "--cleanup-lightning-checkpoints",
         action="store_true",
@@ -1249,6 +1297,9 @@ def main() -> None:
         cleanup_lightning_checkpoints=args.cleanup_lightning_checkpoints,
         learning_rate=float(args.learning_rate),
         gradient_clip_val=float(args.gradient_clip_val),
+        lead_weight_start=int(args.lead_weight_start),
+        lead_weight_end=int(args.lead_weight_end),
+        lead_weight_max=float(args.lead_weight_max),
     )
 
     # Keep metrics path unique per bundle+target to avoid overwrite in target-wise

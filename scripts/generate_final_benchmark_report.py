@@ -38,6 +38,8 @@ RECOMMENDED_METRICS = [
     "gate_dplus1_mbe",
     "gate_dplus1_directional_accuracy",
     "spread_directional_error",
+    "leadtime_mae_test_weighted",
+    "leadtime_mae_val_weighted",
 ]
 
 TARGET_FAMILY_ORDER = [
@@ -72,9 +74,13 @@ def _safe_float(v: Any) -> float:
 def _score_row(row: pd.Series) -> float:
     # Trading-relevant composite score:
     # gate-aware error (or MAE fallback) + direction + spike + skill.
+    lead_weighted_mae = _safe_float(row.get("leadtime_mae_test_weighted"))
     gate_mae = _safe_float(row.get("gate_mae"))
     mae = _safe_float(row.get("mae_mean"))
-    err = gate_mae if np.isfinite(gate_mae) else mae
+    if np.isfinite(lead_weighted_mae):
+        err = lead_weighted_mae
+    else:
+        err = gate_mae if np.isfinite(gate_mae) else mae
     err_score = 1.0 / (1.0 + max(0.0, err)) if np.isfinite(err) else 0.0
 
     direction = _safe_float(row.get("directional_accuracy"))
