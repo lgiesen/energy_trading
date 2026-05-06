@@ -34,6 +34,8 @@ XGB_TUNE_JSON := artifacts/hpo/xgb_optuna_da_target_da_price.json
 XGB_TUNE_CSV := artifacts/hpo/xgb_optuna_da_target_da_price_trials.csv
 LINEAR_TUNE_JSON := artifacts/hpo/linear_sgd_tuning_da_target_da_price.json
 LINEAR_TUNE_CSV := artifacts/hpo/linear_sgd_tuning_da_target_da_price_trials.csv
+TFT_TUNE_JSON := artifacts/hpo/tft_optuna_da_target_da_price.json
+TFT_TUNE_CSV := artifacts/hpo/tft_optuna_da_target_da_price_trials.csv
 
 # Train outputs
 XGB_MANIFEST := artifacts/model_runs/$(RUN_ID_XGB)/manifest.json
@@ -53,7 +55,7 @@ TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 .PHONY: help \
 	doctor \
 	data_hash \
-	tune-xgb tune-linear \
+	tune-xgb tune-linear tune-tft \
 	train-xgb train-linear train-tft \
 	sim-xgb sim-linear sim-tft \
 	sim-all-quantiles \
@@ -69,10 +71,10 @@ help: ## Show available commands
 	@echo "Model pipelines:"
 	@echo "  make all-xgb      # tune -> train -> sim -> audit (XGBoost)"
 	@echo "  make all-linear   # tune -> train -> sim -> audit (Linear)"
-	@echo "  make all-tft      # train -> sim -> audit (TFT, no tune)"
+	@echo "  make all-tft      # tune -> train -> sim -> audit (TFT)"
 	@echo ""
 	@echo "Actions per model:"
-	@echo "  tune-xgb | tune-linear"
+	@echo "  tune-xgb | tune-linear | tune-tft"
 	@echo "  train-xgb | train-linear | train-tft"
 	@echo "  sim-xgb | sim-linear | sim-tft"
 	@echo "  audit-xgb | audit-linear | audit-tft"
@@ -136,6 +138,19 @@ $(LINEAR_TUNE_JSON): $(DATA_HASH_FILE)
 
 tune-linear: $(LINEAR_TUNE_JSON) ## Tune Linear model (depends on data_hash)
 
+$(TFT_TUNE_JSON): $(DATA_HASH_FILE)
+	@mkdir -p artifacts/hpo
+	python3 scripts/tune_tft.py \
+	  --bundle da \
+	  --target-col target_da_price \
+	  --selection-metric leadtime_pinball_p90_val_weighted \
+	  --fallback-metric leadtime_mae_val_weighted \
+	  --n-trials 24 \
+	  --device $(DEVICE) \
+	  --seed $(SEED)
+
+tune-tft: $(TFT_TUNE_JSON) ## Tune TFT model (depends on data_hash)
+
 $(XGB_MANIFEST): $(XGB_TUNE_JSON)
 	python3 scripts/train_and_export_runs.py \
 	  --model-type xgboost \
@@ -165,7 +180,7 @@ $(LINEAR_MANIFEST): $(LINEAR_TUNE_JSON)
 
 train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on tune-linear output)
 
-$(TFT_MANIFEST): $(DATA_HASH_FILE)
+$(TFT_MANIFEST): $(TFT_TUNE_JSON)
 	@DEVICE_USE="$(DEVICE)"; \
 	if [ "$(IS_SMOKE_TEST)" = "1" ]; then DEVICE_USE="cpu"; fi; \
 	if [ "$(IS_SMOKE_TEST)" != "1" ] && [ "$$DEVICE_USE" != "cuda" ]; then \
@@ -184,10 +199,11 @@ $(TFT_MANIFEST): $(DATA_HASH_FILE)
 	  --lead-weight-end $(LEAD_WEIGHT_END) \
 	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
+	  --hpo-artifact "$(TFT_TUNE_JSON)" \
 	  --device $$DEVICE_USE \
 	  --num-workers 0
 
-train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends only on data_hash; no tune)
+train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on tune-tft output)
 
 define SIM_RULE
 $($(1)_SIM_DONE): $$($(1)_MANIFEST)

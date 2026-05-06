@@ -11,6 +11,16 @@ import pandas as pd
 _QCOL_RE = re.compile(r"(?:^|_)p(?P<q>\d{1,2})$", re.IGNORECASE)
 _DA_TARGET_RE = re.compile(r"target_da_price", re.IGNORECASE)
 _AFRR_CAP_TARGET_RE = re.compile(r"target_afrr_capacity_price_(?:pos|neg)", re.IGNORECASE)
+_STRATEGIC_INTERVAL_PAIRS: tuple[tuple[float, float], ...] = (
+    (0.10, 0.90),
+    (0.30, 0.70),
+    (0.10, 0.30),
+    (0.30, 0.50),
+    (0.50, 0.70),
+    (0.70, 0.90),
+    (0.05, 0.95),
+    (0.01, 0.99),
+)
 
 
 def _to_float_series(s: pd.Series) -> pd.Series:
@@ -309,18 +319,47 @@ def compute_forecast_metrics(
             q=float(q),
         )
 
-    q10 = qmap.get(0.10)
-    q90 = qmap.get(0.90)
-    out["picp_80"] = None
-    if q10 is not None and q90 is not None:
-        y10 = _to_float_series(df[q10])
-        y90 = _to_float_series(df[q90])
-        m = yt_s.notna() & y10.notna() & y90.notna()
+    interval_metrics_by_pair: dict[str, dict[str, float | None]] = {}
+    for q_lo, q_hi in _STRATEGIC_INTERVAL_PAIRS:
+        c_lo = qmap.get(float(q_lo))
+        c_hi = qmap.get(float(q_hi))
+        pair_key = f"p{int(round(q_lo * 100)):02d}_p{int(round(q_hi * 100)):02d}"
+        pair_payload = {
+            "picp": None,
+            "winkler_score": None,
+            "pinaw": None,
+            "interval_level": float(q_hi - q_lo),
+            "alpha": float(1.0 - (q_hi - q_lo)),
+        }
+        if c_lo is None or c_hi is None:
+            interval_metrics_by_pair[pair_key] = pair_payload
+            continue
+        y_lo = _to_float_series(df[c_lo])
+        y_hi = _to_float_series(df[c_hi])
+        m = yt_s.notna() & y_lo.notna() & y_hi.notna()
         if bool(m.any()):
             yt_m = yt_s.loc[m].to_numpy(dtype=float)
-            lo = y10.loc[m].to_numpy(dtype=float)
-            hi = y90.loc[m].to_numpy(dtype=float)
-            out["picp_80"] = float(np.mean((yt_m > lo) & (yt_m < hi)))
+            lo = y_lo.loc[m].to_numpy(dtype=float)
+            hi = y_hi.loc[m].to_numpy(dtype=float)
+            alpha = float(1.0 - (q_hi - q_lo))
+            pair_payload["picp"] = float(np.mean((yt_m > lo) & (yt_m < hi)))
+            pair_payload["winkler_score"] = winkler_score(yt_m, lo, hi, alpha=alpha)
+            pair_payload["pinaw"] = prediction_interval_normalized_average_width(yt_m, lo, hi)
+        interval_metrics_by_pair[pair_key] = pair_payload
+        out[f"picp_{pair_key}"] = pair_payload["picp"]
+        out[f"winkler_score_{pair_key}"] = pair_payload["winkler_score"]
+        out[f"pinaw_{pair_key}"] = pair_payload["pinaw"]
+
+    out["interval_metrics_by_pair"] = interval_metrics_by_pair
+    # Backward-compatible aliases.
+    p10_p90 = interval_metrics_by_pair.get("p10_p90", {})
+    out["picp_80"] = p10_p90.get("picp")
+    out["winkler_score_80"] = p10_p90.get("winkler_score")
+    out["pinaw_80"] = p10_p90.get("pinaw")
+    p05_p95 = interval_metrics_by_pair.get("p05_p95", {})
+    out["picp_90"] = p05_p95.get("picp")
+    out["winkler_score_90"] = p05_p95.get("winkler_score")
+    out["pinaw_90"] = p05_p95.get("pinaw")
 
     return out
 

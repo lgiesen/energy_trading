@@ -343,6 +343,15 @@ def _leadtime_mae(
     base = pd.to_numeric(true_h1, errors="coerce").reset_index(drop=True)
     truth_by_lead = {h: base.shift(-(h - 1)) for h in range(1, horizon_hours + 1)}
     pred_col = "p50" if "p50" in pred_long.columns else "predicted_value"
+    pinball_qs: list[tuple[str, float]] = []
+    for c in pred_long.columns:
+        m = re.fullmatch(r"p(\d{2})", str(c))
+        if not m:
+            continue
+        q_int = int(m.group(1))
+        if 0 < q_int < 100:
+            pinball_qs.append((str(c), q_int / 100.0))
+    pinball_qs.sort(key=lambda kv: kv[1])
 
     rows: list[dict[str, float]] = []
     for lead in range(1, horizon_hours + 1):
@@ -352,7 +361,20 @@ def _leadtime_mae(
         n = int(m.sum())
         mae = float(mean_absolute_error(t[m], p[m])) if n > 0 else np.nan
         rmse = float(np.sqrt(mean_squared_error(t[m], p[m]))) if n > 0 else np.nan
-        rows.append({"lead_time_h": float(lead), "n": float(n), "mae": mae, "rmse": rmse})
+        row: dict[str, float] = {"lead_time_h": float(lead), "n": float(n), "mae": mae, "rmse": rmse}
+        for q_col, tau in pinball_qs:
+            q_pred = pd.to_numeric(
+                pred_long.loc[pred_long["lead_time_h"] == lead, q_col],
+                errors="coerce",
+            ).reset_index(drop=True)
+            qm = q_pred.notna() & t.notna()
+            if int(qm.sum()) > 0:
+                e = t[qm].to_numpy(dtype=float) - q_pred[qm].to_numpy(dtype=float)
+                loss = np.maximum(float(tau) * e, (float(tau) - 1.0) * e)
+                row[f"pinball_{q_col}"] = float(np.mean(loss))
+            else:
+                row[f"pinball_{q_col}"] = float("nan")
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -603,6 +625,11 @@ def _train_tft(
     lead_weight_start: int = 16,
     lead_weight_end: int = 48,
     lead_weight_max: float = 2.0,
+    hidden_size_override: int | None = None,
+    attention_head_size_override: int | None = None,
+    dropout_override: float | None = None,
+    max_epochs_override: int | None = None,
+    early_stopping_patience_override: int | None = None,
 ) -> dict[str, object]:
     total_start = time.perf_counter()
     try:
@@ -817,6 +844,12 @@ def _train_tft(
         "max_epochs": 100.0,
     }
     target_tft_params = resolve_tft_params_for_target(tgt, base_tft_params)
+    if dropout_override is not None:
+        target_tft_params["dropout"] = float(dropout_override)
+    if max_epochs_override is not None:
+        target_tft_params["max_epochs"] = float(max_epochs_override)
+    if early_stopping_patience_override is not None:
+        target_tft_params["early_stopping_patience"] = float(early_stopping_patience_override)
     max_epochs = int(target_tft_params["max_epochs"])
     early_stopping_patience = int(target_tft_params["early_stopping_patience"])
     dropout = float(target_tft_params["dropout"])
@@ -831,8 +864,11 @@ def _train_tft(
         early_stopping_patience = min(4, max(3, early_stopping_patience))
     else:
         hidden_size = 96
-        effective_dropout = 0.10
+        effective_dropout = float(dropout)
         early_stopping_patience = min(10, max(8, early_stopping_patience))
+    if hidden_size_override is not None:
+        hidden_size = int(hidden_size_override)
+    attention_head_size = int(attention_head_size_override) if attention_head_size_override is not None else 8
     tb_root = tensorboard_log_root()
     tb_version = tensorboard_target_version(
         model_family="tft",
@@ -873,7 +909,7 @@ def _train_tft(
         training,
         learning_rate=float(learning_rate),
         hidden_size=hidden_size,
-        attention_head_size=8,
+        attention_head_size=attention_head_size,
         dropout=effective_dropout,
         hidden_continuous_size=16,
         loss=QuantileLoss(quantiles=QUANTILES),
@@ -1146,6 +1182,31 @@ def _train_tft(
         end_lead=int(lead_weight_end),
         max_weight=float(lead_weight_max),
     )
+    lead_pinball_weighted: dict[str, float] = {}
+    pinball_cols_val = [c for c in decay_val.columns if c.startswith("pinball_p")]
+    pinball_cols_test = [c for c in decay_test.columns if c.startswith("pinball_p")]
+    for dcol in pinball_cols_val:
+        qcol = dcol.removeprefix("pinball_")
+        if dcol in decay_val.columns:
+            lead_pinball_weighted[f"leadtime_pinball_{qcol}_val_weighted"] = weighted_metric_from_decay(
+                decay_val,
+                value_col=dcol,
+                count_col="n",
+                start_lead=int(lead_weight_start),
+                end_lead=int(lead_weight_end),
+                max_weight=float(lead_weight_max),
+            )
+    for dcol in pinball_cols_test:
+        qcol = dcol.removeprefix("pinball_")
+        if dcol in decay_test.columns:
+            lead_pinball_weighted[f"leadtime_pinball_{qcol}_test_weighted"] = weighted_metric_from_decay(
+                decay_test,
+                value_col=dcol,
+                count_col="n",
+                start_lead=int(lead_weight_start),
+                end_lead=int(lead_weight_end),
+                max_weight=float(lead_weight_max),
+            )
 
     metrics = {
         "bundle": bundle,
@@ -1226,7 +1287,7 @@ def _train_tft(
             "is_afrr_target": bool(is_afrr_target),
         },
         "hidden_size": hidden_size,
-        "attention_head_size": 8,
+        "attention_head_size": attention_head_size,
         "dropout": effective_dropout,
         "tensorboard_log_dir": str(Path(tb_logger.log_dir).resolve()),
         "learning_rate": float(learning_rate),
@@ -1247,6 +1308,14 @@ def _train_tft(
         "timing_export_seconds": float(export_seconds),
         "timing_total_seconds": float(total_seconds),
     }
+    # Export all probabilistic metrics present in H1 suites (all available quantiles + intervals).
+    for k, v in val_metric_suite_h1.items():
+        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+            metrics[f"{k}_val_h1"] = v
+    for k, v in test_metric_suite_h1.items():
+        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+            metrics[f"{k}_test_h1"] = v
+    metrics.update(lead_pinball_weighted)
     return metrics
 
 
@@ -1264,6 +1333,11 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--gradient-clip-val", type=float, default=0.05)
+    p.add_argument("--hidden-size", type=int, default=None)
+    p.add_argument("--attention-head-size", type=int, default=None)
+    p.add_argument("--dropout", type=float, default=None)
+    p.add_argument("--max-epochs", type=int, default=None)
+    p.add_argument("--early-stopping-patience", type=int, default=None)
     p.add_argument("--lead-weight-start", type=int, default=16)
     p.add_argument("--lead-weight-end", type=int, default=48)
     p.add_argument("--lead-weight-max", type=float, default=2.0)
@@ -1300,6 +1374,11 @@ def main() -> None:
         lead_weight_start=int(args.lead_weight_start),
         lead_weight_end=int(args.lead_weight_end),
         lead_weight_max=float(args.lead_weight_max),
+        hidden_size_override=args.hidden_size,
+        attention_head_size_override=args.attention_head_size,
+        dropout_override=args.dropout,
+        max_epochs_override=args.max_epochs,
+        early_stopping_patience_override=args.early_stopping_patience,
     )
 
     # Keep metrics path unique per bundle+target to avoid overwrite in target-wise

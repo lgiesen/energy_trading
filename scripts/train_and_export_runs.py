@@ -528,6 +528,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--linear-l1-ratio", type=float, default=0.15)
     p.add_argument("--linear-learning-rate", default="invscaling")
     p.add_argument("--linear-eta0", type=float, default=0.01)
+    p.add_argument("--tft-hidden-size", type=int, default=None)
+    p.add_argument("--tft-attention-head-size", type=int, default=None)
+    p.add_argument("--tft-dropout", type=float, default=None)
+    p.add_argument("--tft-learning-rate", type=float, default=None)
+    p.add_argument("--tft-gradient-clip-val", type=float, default=None)
+    p.add_argument("--tft-max-encoder-length", type=int, default=None)
+    p.add_argument("--tft-max-epochs", type=int, default=None)
+    p.add_argument("--tft-early-stopping-patience", type=int, default=None)
     p.add_argument(
         "--hpo-artifact",
         type=str,
@@ -611,6 +619,15 @@ def main() -> None:
             _set_if_present(args, "linear_l1_ratio", "l1_ratio")
             _set_if_present(args, "linear_learning_rate", "learning_rate")
             _set_if_present(args, "linear_eta0", "eta0")
+        elif args.model_type == "tft":
+            _set_if_present(args, "tft_hidden_size", "hidden_size")
+            _set_if_present(args, "tft_attention_head_size", "attention_head_size")
+            _set_if_present(args, "tft_dropout", "dropout")
+            _set_if_present(args, "tft_learning_rate", "learning_rate")
+            _set_if_present(args, "tft_gradient_clip_val", "gradient_clip_val")
+            _set_if_present(args, "tft_max_encoder_length", "max_encoder_length")
+            _set_if_present(args, "tft_max_epochs", "max_epochs")
+            _set_if_present(args, "tft_early_stopping_patience", "early_stopping_patience")
 
     run_id = args.run_id.strip() or _run_id_now()
     run_dir = Path(args.run_root) / run_id
@@ -697,6 +714,7 @@ def main() -> None:
             base_cmd.append("--allow-cpu")
     elif args.model_type == "tft":
         model_name = args.model_name.strip() or "tft_v1"
+        tft_max_encoder_length = int(args.tft_max_encoder_length) if args.tft_max_encoder_length is not None else 168
         base_cmd = [
             sys.executable,
             "-m",
@@ -708,7 +726,7 @@ def main() -> None:
             "--run-dir",
             str(run_dir),
             "--max-encoder-length",
-            "168",
+            str(tft_max_encoder_length),
             "--max-prediction-length",
             str(args.forecast_horizon_hours),
             "--lead-weight-start",
@@ -722,6 +740,20 @@ def main() -> None:
             "--num-workers",
             str(args.num_workers),
         ]
+        if args.tft_learning_rate is not None:
+            base_cmd += ["--learning-rate", str(args.tft_learning_rate)]
+        if args.tft_gradient_clip_val is not None:
+            base_cmd += ["--gradient-clip-val", str(args.tft_gradient_clip_val)]
+        if args.tft_hidden_size is not None:
+            base_cmd += ["--hidden-size", str(args.tft_hidden_size)]
+        if args.tft_attention_head_size is not None:
+            base_cmd += ["--attention-head-size", str(args.tft_attention_head_size)]
+        if args.tft_dropout is not None:
+            base_cmd += ["--dropout", str(args.tft_dropout)]
+        if args.tft_max_epochs is not None:
+            base_cmd += ["--max-epochs", str(args.tft_max_epochs)]
+        if args.tft_early_stopping_patience is not None:
+            base_cmd += ["--early-stopping-patience", str(args.tft_early_stopping_patience)]
         if args.cleanup_lightning_checkpoints:
             base_cmd.append("--cleanup-lightning-checkpoints")
     else:

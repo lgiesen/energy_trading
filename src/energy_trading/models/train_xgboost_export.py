@@ -209,7 +209,7 @@ def calculate_forecast_decay(
     true_h1: pd.Series,
     horizon_hours: int,
 ) -> pd.DataFrame:
-    """Calculate MAE by lead-time for a long-format prediction warehouse table."""
+    """Calculate lead-time decay metrics (MAE + optional pinball by quantile)."""
     if pred_long.empty:
         return pd.DataFrame(columns=["lead_time_h", "n", "mae"])
 
@@ -221,6 +221,16 @@ def calculate_forecast_decay(
     pred_col = "p50" if "p50" in pred_long.columns else "predicted_value"
     pred = pd.to_numeric(pred_long[pred_col], errors="coerce")
     lead = pd.to_numeric(pred_long["lead_time_h"], errors="coerce").astype("Int64")
+
+    pinball_qs: list[tuple[str, float]] = []
+    for c in pred_long.columns:
+        m = re.fullmatch(r"p(\d{2})", str(c))
+        if not m:
+            continue
+        q_int = int(m.group(1))
+        if 0 < q_int < 100:
+            pinball_qs.append((str(c), q_int / 100.0))
+    pinball_qs.sort(key=lambda kv: kv[1])
 
     rows: list[dict[str, float]] = []
     for l in sorted(set(int(v) for v in lead.dropna().unique())):
@@ -235,7 +245,18 @@ def calculate_forecast_decay(
         mask = aligned_truth.notna() & pred_part.notna()
         n = int(mask.sum())
         mae = float(mean_absolute_error(aligned_truth[mask], pred_part[mask])) if n > 0 else np.nan
-        rows.append({"lead_time_h": float(l), "n": float(n), "mae": mae})
+        row: dict[str, float] = {"lead_time_h": float(l), "n": float(n), "mae": mae}
+        yt = pd.to_numeric(aligned_truth, errors="coerce")
+        for q_col, tau in pinball_qs:
+            q_pred = pd.to_numeric(pred_long.loc[idx, q_col], errors="coerce").reset_index(drop=True)
+            q_mask = yt.notna() & q_pred.notna()
+            if int(q_mask.sum()) > 0:
+                e = yt.loc[q_mask].to_numpy(dtype=float) - q_pred.loc[q_mask].to_numpy(dtype=float)
+                loss = np.maximum(float(tau) * e, (float(tau) - 1.0) * e)
+                row[f"pinball_{q_col}"] = float(np.mean(loss))
+            else:
+                row[f"pinball_{q_col}"] = float("nan")
+        rows.append(row)
     return pd.DataFrame(rows).sort_values("lead_time_h").reset_index(drop=True)
 
 
@@ -1108,6 +1129,10 @@ def train_and_evaluate(
         "tensorboard_log_dirs_by_target": per_target_tb_log_dir,
         "xgb_best_iteration_by_target_lead_quantile": xgb_best_iteration_rows,
     }
+    # Export all probabilistic metrics available on primary target H1 suite.
+    for k, v in primary_metric_suite_h1.items():
+        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+            metrics[f"{k}_h1"] = v
     metrics.update(cv_metrics)
     return metrics, models_by_target, target_cols
 
@@ -1605,6 +1630,21 @@ def main() -> None:
                             )
                         )
                     }
+                    pinball_cols = [c for c in decay.columns if c.startswith("pinball_p")]
+                    for dcol in pinball_cols:
+                        qcol = dcol.removeprefix("pinball_")
+                        leadtime_weighted_by_split.setdefault(split, {}).setdefault(pred_col, {})[
+                            f"pinball_{qcol}_weighted"
+                        ] = float(
+                            weighted_metric_from_decay(
+                                decay,
+                                value_col=dcol,
+                                count_col="n",
+                                start_lead=int(args.lead_weight_start),
+                                end_lead=int(args.lead_weight_end),
+                                max_weight=float(args.lead_weight_max),
+                            )
+                        )
                     mae_plot_path = report_dir / f"{file_tag}_{split}_{pred_col}_mae_lead_1_24_48.png"
                     _plot_leadtime_mae_points(decay, mae_plot_path)
 
@@ -1655,6 +1695,16 @@ def main() -> None:
     metrics["leadtime_mae_test_weighted"] = (
         leadtime_weighted_by_split.get("test", {}).get(primary_pred_col, {}).get("mae_weighted")
     )
+    val_weighted = leadtime_weighted_by_split.get("val", {}).get(primary_pred_col, {})
+    test_weighted = leadtime_weighted_by_split.get("test", {}).get(primary_pred_col, {})
+    for key, value in val_weighted.items():
+        if key.startswith("pinball_p") and key.endswith("_weighted"):
+            qcol = key.removeprefix("pinball_").removesuffix("_weighted")
+            metrics[f"leadtime_pinball_{qcol}_val_weighted"] = value
+    for key, value in test_weighted.items():
+        if key.startswith("pinball_p") and key.endswith("_weighted"):
+            qcol = key.removeprefix("pinball_").removesuffix("_weighted")
+            metrics[f"leadtime_pinball_{qcol}_test_weighted"] = value
     metrics["gate_closure_metrics_by_split"] = gate_closure_metrics_by_split
     metrics["timing_total_seconds"] = float(total_elapsed)
     # Export early-stopping diagnostics per target/lead/quantile for QA.

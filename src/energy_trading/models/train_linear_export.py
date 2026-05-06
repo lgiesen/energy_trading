@@ -378,16 +378,19 @@ def _train_target(
             )
         )
 
-        val_metric_suite_h = compute_forecast_metrics(
-            pd.DataFrame({"y_true": y_va.to_numpy(dtype=float), "y_pred": pred_va}),
-            y_true_col="y_true",
-            y_pred_col="y_pred",
-        )
-        test_metric_suite_h = compute_forecast_metrics(
-            pd.DataFrame({"y_true": y_te.to_numpy(dtype=float), "y_pred": pred_te}),
-            y_true_col="y_true",
-            y_pred_col="y_pred",
-        )
+        val_metric_df_h = pd.DataFrame({"y_true": y_va.to_numpy(dtype=float), "y_pred": pred_va})
+        test_metric_df_h = pd.DataFrame({"y_true": y_te.to_numpy(dtype=float), "y_pred": pred_te})
+        for qcol in q_cols:
+            val_metric_df_h[f"y_pred_{qcol}"] = pd.to_numeric(
+                pd.Series(preds_va.get(qcol, np.nan)),
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            test_metric_df_h[f"y_pred_{qcol}"] = pd.to_numeric(
+                pd.Series(preds_te.get(qcol, np.nan)),
+                errors="coerce",
+            ).to_numpy(dtype=float)
+        val_metric_suite_h = compute_forecast_metrics(val_metric_df_h, y_true_col="y_true", y_pred_col="y_pred")
+        test_metric_suite_h = compute_forecast_metrics(test_metric_df_h, y_true_col="y_true", y_pred_col="y_pred")
         lead_metric_rows.append(
             {
                 "lead_time_h": float(lead_h),
@@ -397,6 +400,14 @@ def _train_target(
                 "mae_test": float(test_metric_suite_h.get("mae", np.nan)),
                 "rmse_val": float(val_metric_suite_h.get("rmse", np.nan)),
                 "rmse_test": float(test_metric_suite_h.get("rmse", np.nan)),
+                "pinball_p10_val": float(val_metric_suite_h.get("pinball_loss_p10", np.nan)),
+                "pinball_p50_val": float(val_metric_suite_h.get("pinball_loss_p50", np.nan)),
+                "pinball_p90_val": float(val_metric_suite_h.get("pinball_loss_p90", np.nan)),
+                "pinball_p95_val": float(val_metric_suite_h.get("pinball_loss_p95", np.nan)),
+                "pinball_p10_test": float(test_metric_suite_h.get("pinball_loss_p10", np.nan)),
+                "pinball_p50_test": float(test_metric_suite_h.get("pinball_loss_p50", np.nan)),
+                "pinball_p90_test": float(test_metric_suite_h.get("pinball_loss_p90", np.nan)),
+                "pinball_p95_test": float(test_metric_suite_h.get("pinball_loss_p95", np.nan)),
             }
         )
 
@@ -527,6 +538,31 @@ def _train_target(
         end_lead=lead_weight_end,
         max_weight=lead_weight_max,
     )
+    lead_pinball_weighted: dict[str, float] = {}
+    pinball_val_cols = [c for c in lead_df.columns if c.startswith("pinball_p") and c.endswith("_val")]
+    pinball_test_cols = [c for c in lead_df.columns if c.startswith("pinball_p") and c.endswith("_test")]
+    for vcol in pinball_val_cols:
+        q = vcol.removeprefix("pinball_").removesuffix("_val")
+        if vcol in lead_df.columns:
+            lead_pinball_weighted[f"leadtime_pinball_{q}_val_weighted"] = weighted_metric_from_decay(
+                lead_df.rename(columns={vcol: "pinball", "n_val": "n"}),
+                value_col="pinball",
+                count_col="n",
+                start_lead=lead_weight_start,
+                end_lead=lead_weight_end,
+                max_weight=lead_weight_max,
+            )
+    for tcol in pinball_test_cols:
+        q = tcol.removeprefix("pinball_").removesuffix("_test")
+        if tcol in lead_df.columns:
+            lead_pinball_weighted[f"leadtime_pinball_{q}_test_weighted"] = weighted_metric_from_decay(
+                lead_df.rename(columns={tcol: "pinball", "n_test": "n"}),
+                value_col="pinball",
+                count_col="n",
+                start_lead=lead_weight_start,
+                end_lead=lead_weight_end,
+                max_weight=lead_weight_max,
+            )
 
     metrics: dict[str, object] = {
         "target_col": target_col,
@@ -576,6 +612,14 @@ def _train_target(
         "timing_fit_seconds_total": fit_seconds_total,
         "trained_leads": sorted(int(k) for k in lead_models.keys()),
     }
+    # Export all probabilistic metrics available in H1 suites (all quantiles + interval pairs).
+    for k, v in val_metric_suite.items():
+        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+            metrics[f"{k}_val_h1"] = v
+    for k, v in test_metric_suite.items():
+        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+            metrics[f"{k}_test_h1"] = v
+    metrics.update(lead_pinball_weighted)
     return lead_models, metrics, pred_frames, long_frames
 
 
