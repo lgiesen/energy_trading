@@ -1005,12 +1005,38 @@ def main() -> None:
 
     if not args.skip_latest_pointer:
         latest_path = Path(args.run_root) / "latest.json"
+        now_iso = datetime.now(timezone.utc).isoformat()
         latest_payload = {
             "run_id": run_id,
             "manifest_path": str(manifest_path.resolve()),
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "updated_at_utc": now_iso,
+            "model_type": args.model_type,
+        }
+        # Backward-compatible global pointer + per-model pointers in one file.
+        if latest_path.exists():
+            try:
+                existing = json.loads(latest_path.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    models_block = existing.get("models")
+                    if isinstance(models_block, dict):
+                        latest_payload["models"] = models_block
+            except Exception:
+                pass
+        if "models" not in latest_payload:
+            latest_payload["models"] = {}
+        latest_payload["models"][str(args.model_type)] = {
+            "run_id": run_id,
+            "manifest_path": str(manifest_path.resolve()),
+            "updated_at_utc": now_iso,
+            "model_type": args.model_type,
         }
         latest_path.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
+        # Convenience model-specific pointer file.
+        latest_model_path = Path(args.run_root) / f"latest_{args.model_type}.json"
+        latest_model_path.write_text(
+            json.dumps(latest_payload["models"][str(args.model_type)], indent=2),
+            encoding="utf-8",
+        )
 
     print("[OK] Run export complete.")
     print(f"- run_id: {run_id}")
@@ -1019,6 +1045,7 @@ def main() -> None:
     print(f"- manifest: {manifest_path}")
     if not args.skip_latest_pointer:
         print(f"- latest: {Path(args.run_root) / 'latest.json'}")
+        print(f"- latest_model: {Path(args.run_root) / f'latest_{args.model_type}.json'}")
 
 
 if __name__ == "__main__":
