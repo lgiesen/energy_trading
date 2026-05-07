@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import random
@@ -788,6 +789,13 @@ def _train_tft(
         # Keep all rolling windows in test for full forecast-vintage export.
         predict=False,
     )
+    # Build compact lookup once, then release large intermediate tables.
+    idx_to_ts = {
+        int(i): pd.Timestamp(ts)
+        for i, ts in zip(full_sc["time_idx"], pd.to_datetime(full_sc["timestamp_utc"], utc=True, errors="coerce"))
+    }
+    del full_sc, tr_sc, va_sc, te_sc, train_df
+    gc.collect()
 
     torch_device, accelerator = _resolve_torch_device(requested_device)
     if torch_device == "cuda":
@@ -948,10 +956,6 @@ def _train_tft(
             LOGGER.info("Removed %s Lightning checkpoint file(s) from %s.", removed, ckpt_dir)
 
     # Predict val/test in long format with model_name.
-    idx_to_ts = {
-        int(i): pd.Timestamp(ts)
-        for i, ts in zip(full_sc["time_idx"], pd.to_datetime(full_sc["timestamp_utc"], utc=True, errors="coerce"))
-    }
 
     def _predict(ds: TimeSeriesDataSet) -> pd.DataFrame:
         dl = ds.to_dataloader(train=False, batch_size=batch_size, num_workers=num_workers, pin_memory=False)
@@ -989,6 +993,9 @@ def _train_tft(
     pred_test_start = time.perf_counter()
     pred_test_long = _predict(testing)
     pred_test_seconds = time.perf_counter() - pred_test_start
+    # Training datasets/loaders no longer needed after forecast export.
+    del training, validation, testing, train_loader, val_loader
+    gc.collect()
 
     if tgt in {"target_afrr_activation_rate_pos", "target_afrr_activation_rate_neg"}:
         pred_val_long = _clip_activation_rate_predictions(pred_val_long)
