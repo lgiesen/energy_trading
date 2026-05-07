@@ -105,7 +105,7 @@ all-tft: audit-tft ## Full TFT DAG
 smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
 	$(MAKE) IS_SMOKE_TEST=1 all-xgb
 	$(MAKE) IS_SMOKE_TEST=1 all-linear
-	$(MAKE) IS_SMOKE_TEST=1 DEVICE=cpu all-tft
+	$(MAKE) IS_SMOKE_TEST=1 DEVICE=$(DEVICE) all-tft
 
 $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
 	@mkdir -p $(dir $(DATA_HASH_FILE))
@@ -182,7 +182,6 @@ train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on tune-linea
 
 $(TFT_MANIFEST): $(TFT_TUNE_JSON)
 	@DEVICE_USE="$(DEVICE)"; \
-	if [ "$(IS_SMOKE_TEST)" = "1" ]; then DEVICE_USE="cpu"; fi; \
 	if [ "$(IS_SMOKE_TEST)" != "1" ] && [ "$$DEVICE_USE" != "cuda" ]; then \
 	  echo "TFT final runs must use CUDA. Got DEVICE=$$DEVICE_USE"; \
 	  exit 1; \
