@@ -77,8 +77,11 @@ def main() -> None:
     fallback_metric = str(args.fallback_metric)
 
     def _objective(trial: "optuna.Trial") -> float:
-        hidden_size = trial.suggest_categorical("hidden_size", [32, 48, 64, 96])
-        attention_head_size = trial.suggest_categorical("attention_head_size", [2, 4, 8])
+        # Memory-aware capacity ladder:
+        # try smaller configurations first and only scale up if they improve the
+        # selected validation objective.
+        hidden_size = trial.suggest_categorical("hidden_size", [32, 48, 64])
+        attention_head_size = trial.suggest_categorical("attention_head_size", [2, 4])
         dropout = trial.suggest_float("dropout", 0.05, 0.35)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
         gradient_clip_val = trial.suggest_float("gradient_clip_val", 0.01, 0.30, log=True)
@@ -222,4 +225,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

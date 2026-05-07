@@ -863,7 +863,7 @@ def _train_tft(
     dropout = float(target_tft_params["dropout"])
 
     # Asymmetric regularization by target family:
-    # - DA targets: higher capacity, light regularization.
+    # - DA targets: medium capacity (memory-aware), light regularization.
     # - aFRR targets: constrained capacity, stronger regularization.
     is_afrr_target = "afrr" in tgt.lower()
     if is_afrr_target:
@@ -871,12 +871,12 @@ def _train_tft(
         effective_dropout = min(0.30, max(0.25, dropout))
         early_stopping_patience = min(4, max(3, early_stopping_patience))
     else:
-        hidden_size = 96
+        hidden_size = 64
         effective_dropout = float(dropout)
         early_stopping_patience = min(10, max(8, early_stopping_patience))
     if hidden_size_override is not None:
         hidden_size = int(hidden_size_override)
-    attention_head_size = int(attention_head_size_override) if attention_head_size_override is not None else 8
+    attention_head_size = int(attention_head_size_override) if attention_head_size_override is not None else 4
     tb_root = tensorboard_log_root()
     tb_version = tensorboard_target_version(
         model_family="tft",
