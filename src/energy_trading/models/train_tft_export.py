@@ -631,6 +631,7 @@ def _train_tft(
     dropout_override: float | None = None,
     max_epochs_override: int | None = None,
     early_stopping_patience_override: int | None = None,
+    precision_mode: str = "auto",
 ) -> dict[str, object]:
     total_start = time.perf_counter()
     try:
@@ -803,6 +804,15 @@ def _train_tft(
             torch.set_float32_matmul_precision("high")
         except Exception:  # pragma: no cover - older torch variants
             pass
+    resolved_precision = str(precision_mode).strip().lower()
+    if resolved_precision == "auto":
+        resolved_precision = "16-mixed" if torch_device == "cuda" else "32-true"
+    allowed_precisions = {"32-true", "16-mixed", "bf16-mixed"}
+    if resolved_precision not in allowed_precisions:
+        raise ValueError(
+            f"Unsupported precision mode '{precision_mode}'. "
+            f"Use one of: {sorted(allowed_precisions)} or 'auto'."
+        )
     batch_size = 64
     train_loader = training.to_dataloader(
         train=True,
@@ -907,6 +917,7 @@ def _train_tft(
         max_epochs=max_epochs,
         accelerator=accelerator,
         devices=1,
+        precision=resolved_precision,
         gradient_clip_val=float(gradient_clip_val),
         enable_checkpointing=True,
         callbacks=[_EpochEtaCallback(max_epochs=max_epochs), checkpoint_cb, early_stopping_cb],
@@ -1299,6 +1310,7 @@ def _train_tft(
         "tensorboard_log_dir": str(Path(tb_logger.log_dir).resolve()),
         "learning_rate": float(learning_rate),
         "gradient_clip_val": float(gradient_clip_val),
+        "precision_mode": resolved_precision,
         "attention_plot_path": interpretation_artifacts.get("attention_plot_path"),
         "attention_history_plot_path": interpretation_artifacts.get("attention_history_plot_path"),
         "feature_importance_plot_path": interpretation_artifacts.get("feature_importance_plot_path"),
@@ -1343,6 +1355,12 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--hidden-size", type=int, default=None)
     p.add_argument("--attention-head-size", type=int, default=None)
     p.add_argument("--dropout", type=float, default=None)
+    p.add_argument(
+        "--precision",
+        choices=["auto", "32-true", "16-mixed", "bf16-mixed"],
+        default="auto",
+        help="Training precision. 'auto' uses 16-mixed on CUDA and 32-true otherwise.",
+    )
     p.add_argument("--max-epochs", type=int, default=None)
     p.add_argument("--early-stopping-patience", type=int, default=None)
     p.add_argument("--lead-weight-start", type=int, default=16)
@@ -1386,6 +1404,7 @@ def main() -> None:
         dropout_override=args.dropout,
         max_epochs_override=args.max_epochs,
         early_stopping_patience_override=args.early_stopping_patience,
+        precision_mode=args.precision,
     )
 
     # Keep metrics path unique per bundle+target to avoid overwrite in target-wise
