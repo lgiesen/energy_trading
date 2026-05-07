@@ -30,6 +30,12 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--bundle", choices=["da", "afrr"], default="da")
     p.add_argument("--target-col", default="target_da_price")
     p.add_argument("--device", choices=["cuda", "cpu", "mps"], default="cuda")
+    p.add_argument(
+        "--precision",
+        choices=["auto", "32-true", "16-mixed", "bf16-mixed"],
+        default="auto",
+        help="Forwarded to train_tft_export. Use bf16-mixed or 32-true if 16-mixed overflows.",
+    )
     p.add_argument("--n-trials", type=int, default=24)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--timeout-seconds", type=int, default=0, help="0 disables timeout.")
@@ -109,6 +115,8 @@ def main() -> None:
             "tft_hpo",
             "--device",
             str(args.device),
+            "--precision",
+            str(args.precision),
             "--seed",
             str(args.seed),
             "--max-encoder-length",

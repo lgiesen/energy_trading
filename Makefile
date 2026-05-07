@@ -14,6 +14,7 @@ SEED ?= 42
 FORECAST_HOURS ?= 48
 export IS_SMOKE_TEST ?= 0
 DEVICE ?= cuda
+TFT_PRECISION ?= bf16-mixed
 LEAD_WEIGHT_START ?= 16
 LEAD_WEIGHT_END ?= 48
 LEAD_WEIGHT_MAX ?= 2.0
@@ -147,12 +148,13 @@ $(TFT_TUNE_JSON): $(DATA_HASH_FILE)
 	  --fallback-metric leadtime_mae_val_weighted \
 	  --n-trials 24 \
 	  --device $(DEVICE) \
+	  --precision $(TFT_PRECISION) \
 	  --seed $(SEED)
 
 tune-tft: $(TFT_TUNE_JSON) ## Tune TFT model (depends on data_hash)
 
 $(XGB_MANIFEST): $(XGB_TUNE_JSON)
-	python3 scripts/train_and_export_runs.py \
+		python3 scripts/train_and_export_runs.py \
 	  --model-type xgboost \
 	  --run-id "$(RUN_ID_XGB)" \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
@@ -198,9 +200,10 @@ $(TFT_MANIFEST): $(TFT_TUNE_JSON)
 	  --lead-weight-end $(LEAD_WEIGHT_END) \
 	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
-	  --hpo-artifact "$(TFT_TUNE_JSON)" \
-	  --device $$DEVICE_USE \
-	  --num-workers 0
+		  --hpo-artifact "$(TFT_TUNE_JSON)" \
+		  --device $$DEVICE_USE \
+		  --tft-precision $(TFT_PRECISION) \
+		  --num-workers 0
 
 train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on tune-tft output)
 

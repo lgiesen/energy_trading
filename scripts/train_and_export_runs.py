@@ -537,6 +537,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tft-max-epochs", type=int, default=None)
     p.add_argument("--tft-early-stopping-patience", type=int, default=None)
     p.add_argument(
+        "--tft-precision",
+        choices=["auto", "32-true", "16-mixed", "bf16-mixed"],
+        default="auto",
+    )
+    p.add_argument(
         "--hpo-artifact",
         type=str,
         default=None,
@@ -739,6 +744,8 @@ def main() -> None:
             str(args.seed),
             "--num-workers",
             str(args.num_workers),
+            "--precision",
+            str(args.tft_precision),
         ]
         if args.tft_learning_rate is not None:
             base_cmd += ["--learning-rate", str(args.tft_learning_rate)]
