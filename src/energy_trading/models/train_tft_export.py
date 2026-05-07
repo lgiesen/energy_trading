@@ -1004,10 +1004,6 @@ def _train_tft(
     pred_test_start = time.perf_counter()
     pred_test_long = _predict(testing)
     pred_test_seconds = time.perf_counter() - pred_test_start
-    # Training datasets/loaders no longer needed after forecast export.
-    del training, validation, testing, train_loader, val_loader
-    gc.collect()
-
     if tgt in {"target_afrr_activation_rate_pos", "target_afrr_activation_rate_neg"}:
         pred_val_long = _clip_activation_rate_predictions(pred_val_long)
         pred_test_long = _clip_activation_rate_predictions(pred_test_long)
@@ -1049,6 +1045,9 @@ def _train_tft(
         num_workers=num_workers,
         max_encoder_length=max_encoder_length,
     )
+    # Training datasets/loaders are no longer needed after interpretation export.
+    del training, validation, testing, train_loader, val_loader
+    gc.collect()
     pred_col = _pred_column_names_for_target(tgt)[0]
     val_long_path = pred_dir / f"{bundle}_{tgt}_{pred_col}_long.parquet"
     test_long_path = pred_dir / f"{bundle}_{tgt}_{pred_col}_long_test.parquet"
