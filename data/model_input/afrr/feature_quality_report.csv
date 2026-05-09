@@ -1,10 +1,10 @@
 feature,train_nan_pct,action
-wind_total_error_da_lag_12h,0.007479,keep
-wind_total_error_da_lag_1h,0.007479,keep
-wind_total_error_da_lag_24h,0.007479,keep
-wind_total_error_da_lag_2h,0.007479,keep
-wind_total_error_da_lag_3h,0.007479,keep
-wind_total_error_da_lag_6h,0.007479,keep
+wind_total_error_da_lag_12h,0.005638,keep
+wind_total_error_da_lag_1h,0.005638,keep
+wind_total_error_da_lag_24h,0.005638,keep
+wind_total_error_da_lag_2h,0.005638,keep
+wind_total_error_da_lag_3h,0.005638,keep
+wind_total_error_da_lag_6h,0.005638,keep
 NRV_balance_lag_12h,0.0,keep
 NRV_balance_lag_24h,0.0,keep
 NRV_balance_lag_2h,0.0,keep

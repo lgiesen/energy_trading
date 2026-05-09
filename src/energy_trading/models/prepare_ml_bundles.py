@@ -220,9 +220,9 @@ class MLDataFactory:
     @staticmethod
     def _default_bounds() -> SplitBounds:
         return SplitBounds(
-            train_end_exclusive=pd.Timestamp("2024-01-01T00:00:00Z"),
-            val_end_exclusive=pd.Timestamp("2024-07-01T00:00:00Z"),
-            test_end_inclusive=pd.Timestamp(datetime.now(timezone.utc)),
+            train_end_exclusive=pd.Timestamp("2024-07-01T00:00:00Z"),
+            val_end_exclusive=pd.Timestamp("2025-01-01T00:00:00Z"),
+            test_end_inclusive=pd.Timestamp("2026-03-01T01:00:00Z"),
         )
 
     @staticmethod

@@ -1,6 +1,6 @@
 {
   "artifact_path": "data/features/all_data_features.parquet",
-  "generated_at_utc": "2026-04-26T11:19:30.212784+00:00",
+  "generated_at_utc": "2026-05-09T08:36:32.048856+00:00",
   "options": {
     "use_forecast_pca": false,
     "forecast_pca_var_threshold": 0.95,
@@ -9,9 +9,9 @@
     "forecast_pca_drop_raw": false
   },
   "splits": {
-    "train_end_exclusive": "2024-01-01T00:00:00+00:00",
-    "val_end_exclusive": "2024-07-01T00:00:00+00:00",
-    "test_end_inclusive": "2026-04-26T11:19:30.210939+00:00",
+    "train_end_exclusive": "2024-07-01T00:00:00+00:00",
+    "val_end_exclusive": "2025-01-01T00:00:00+00:00",
+    "test_end_inclusive": "2026-03-01T01:00:00+00:00",
     "purge_gap_rows": 72
   },
   "bundles": {

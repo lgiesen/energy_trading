@@ -1,5 +1,5 @@
 feature,train_nan_pct,action
-wind_total_error_da_lag_24h,0.007479,keep
+wind_total_error_da_lag_24h,0.005638,keep
 NRV_balance_lag_24h,0.0,keep
 NRV_balance_lag_4h,0.0,keep
 co2_price,0.0,keep
