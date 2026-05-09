@@ -209,14 +209,15 @@ train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on tune-tft output)
 
 define SIM_RULE
 $($(1)_SIM_DONE): $$($(1)_MANIFEST)
+	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
 	python3 scripts/run_battery_backtest.py \
 	  --run-manifest "$$($(1)_MANIFEST)" \
 	  --split test \
 	  --model-key $(2) \
 	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
 	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
-	  --start 2024-01-01T00:00:00Z \
-	  --end 2024-03-31T23:00:00Z
+	  --start "$$$$SIM_START" \
+	  --end "$$$$SIM_END"
 	@touch $$($(1)_SIM_DONE)
 endef
 
