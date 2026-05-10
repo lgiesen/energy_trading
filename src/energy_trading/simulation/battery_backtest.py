@@ -1946,6 +1946,10 @@ class BatteryBacktester:
                     "discharge_mw",
                     "reserve_pos_mw",
                     "reserve_neg_mw",
+                    "id_charge_mw",
+                    "id_discharge_mw",
+                    "pending_id_charge_mw",
+                    "pending_id_discharge_mw",
                     "is_charging",
                     "soc_lp_mwh",
                     "planned_soc_mwh",
@@ -2076,6 +2080,24 @@ class BatteryBacktester:
         ]
         dispatch_cols = dispatch_cols + [c for c in dispatch_meta_cols if c in dispatch.columns]
         dispatch_cols = dispatch_cols + [c for c in dispatch_clearing_cols if c in dispatch.columns]
+
+        # Backward compatibility: fallback/legacy dispatch paths may not include
+        # all expected execution columns; synthesize safe defaults.
+        required_dispatch_defaults: dict[str, float] = {
+            colmap.timestamp: np.nan,
+            "charge_mw": 0.0,
+            "discharge_mw": 0.0,
+            "reserve_pos_mw": 0.0,
+            "reserve_neg_mw": 0.0,
+            "id_charge_mw": 0.0,
+            "id_discharge_mw": 0.0,
+            "pending_id_charge_mw": 0.0,
+            "pending_id_discharge_mw": 0.0,
+        }
+        for c, default_val in required_dispatch_defaults.items():
+            if c not in dispatch.columns:
+                dispatch[c] = default_val
+
         if predicted_settlement and all(c in dispatch.columns for c in [da_col, cap_pos_col, cap_neg_col, act_pos_col, act_neg_col, rate_pos_col, rate_neg_col]):
             merged = dispatch[
                 dispatch_cols + [da_col, cap_pos_col, cap_neg_col, act_pos_col, act_neg_col, rate_pos_col, rate_neg_col]
