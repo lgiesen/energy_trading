@@ -1610,17 +1610,40 @@ class BatteryBacktester:
                     # Graceful fallback for the final rolling window: if the
                     # terminal SoC floor makes the MILP infeasible (e.g. due to
                     # fixed DA bids), re-optimize without terminal floor.
-                    plan = self.optimize_dispatch(
-                        window,
-                        colmap,
-                        soc_start=soc,
-                        soc_end_target=enforce_end,
-                        soc_end_min_target=None,
-                        fixed_da_dispatch=da_lockbook,
-                        deterministic_reserve_settlement=deterministic_reserve_settlement,
-                        allowed_markets=allowed_markets,
-                    )
-                    optimization_fallback = "relaxed_final_soc_min"
+                    try:
+                        plan = self.optimize_dispatch(
+                            window,
+                            colmap,
+                            soc_start=soc,
+                            soc_end_target=enforce_end,
+                            soc_end_min_target=None,
+                            fixed_da_dispatch=da_lockbook,
+                            deterministic_reserve_settlement=deterministic_reserve_settlement,
+                            allowed_markets=allowed_markets,
+                        )
+                        optimization_fallback = "relaxed_final_soc_min"
+                    except RuntimeError as exc_relaxed:
+                        if "infeasible" not in str(exc_relaxed).lower():
+                            raise
+                        # If even the relaxed-final-SoC solve is infeasible, keep
+                        # simulation robust by falling back to hold plan.
+                        ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+                        hold = pd.DataFrame(
+                            {
+                                colmap.timestamp: ts_vals,
+                                "charge_mw": np.zeros(len(window), dtype=float),
+                                "discharge_mw": np.zeros(len(window), dtype=float),
+                                "reserve_pos_mw": np.zeros(len(window), dtype=float),
+                                "reserve_neg_mw": np.zeros(len(window), dtype=float),
+                                "soc_lp_mwh": np.full(len(window), float(soc), dtype=float),
+                            },
+                            index=window.index,
+                        )
+                        for b in range(len(self.afrr_bid_prices_eur_mwh)):
+                            hold[f"reserve_pos_bin_{b}_mw"] = 0.0
+                            hold[f"reserve_neg_bin_{b}_mw"] = 0.0
+                        plan = hold
+                        optimization_fallback = "safe_hold_plan_after_relaxed_failure"
                 else:
                     # Last-resort fallback: if rolling MILP is infeasible even
                     # without terminal floor, degrade to a physically safe hold
