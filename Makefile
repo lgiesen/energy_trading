@@ -59,6 +59,7 @@ TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 	tune-xgb tune-linear tune-tft \
 	train-xgb train-linear train-tft \
 	sim-xgb sim-linear sim-tft \
+	sim-latest-xgb sim-latest-linear sim-latest-tft \
 	sim-all-quantiles \
 	build-hybrid sim-hybrid \
 	residual-report \
@@ -78,6 +79,7 @@ help: ## Show available commands
 	@echo "  tune-xgb | tune-linear | tune-tft"
 	@echo "  train-xgb | train-linear | train-tft"
 	@echo "  sim-xgb | sim-linear | sim-tft"
+	@echo "  sim-latest-xgb | sim-latest-linear | sim-latest-tft   # standalone simulation (no retrain)"
 	@echo "  audit-xgb | audit-linear | audit-tft"
 	@echo ""
 	@echo "Global:"
@@ -228,6 +230,51 @@ $(eval $(call SIM_RULE,TFT,tft))
 sim-xgb: $(XGB_SIM_DONE) ## Run XGBoost simulation
 sim-linear: $(LINEAR_SIM_DONE) ## Run Linear simulation
 sim-tft: $(TFT_SIM_DONE) ## Run TFT simulation
+sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboost.json (fallback latest.json)
+	@LATEST_JSON="artifacts/model_runs/latest_xgboost.json"; \
+	if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
+	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
+	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
+	echo "[INFO] sim-latest-xgb using $$LATEST_JSON"; \
+	python3 scripts/run_battery_backtest.py \
+	  --run-manifest "$$MANIFEST_PATH" \
+	  --split test \
+	  --model-key xgboost \
+	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
+	  --start "$$SIM_START" \
+	  --end "$$SIM_END"
+sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_linear.json (fallback latest.json)
+	@LATEST_JSON="artifacts/model_runs/latest_linear.json"; \
+	if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
+	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
+	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
+	echo "[INFO] sim-latest-linear using $$LATEST_JSON"; \
+	python3 scripts/run_battery_backtest.py \
+	  --run-manifest "$$MANIFEST_PATH" \
+	  --split test \
+	  --model-key linear \
+	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
+	  --start "$$SIM_START" \
+	  --end "$$SIM_END"
+sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.json (fallback latest.json)
+	@LATEST_JSON="artifacts/model_runs/latest_tft.json"; \
+	if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
+	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
+	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
+	echo "[INFO] sim-latest-tft using $$LATEST_JSON"; \
+	python3 scripts/run_battery_backtest.py \
+	  --run-manifest "$$MANIFEST_PATH" \
+	  --split test \
+	  --model-key tft \
+	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
+	  --start "$$SIM_START" \
+	  --end "$$SIM_END"
 sim-all-quantiles: clean-markers ## Run quantile sweep simulation for xgb, linear, tft
 	$(MAKE) sim-xgb SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
 	$(MAKE) sim-linear SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
