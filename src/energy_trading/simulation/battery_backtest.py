@@ -273,6 +273,20 @@ class BatteryBacktester:
             return 0.0, q(min(self.p_max_mw, net))
         return q(min(self.p_max_mw, -net)), 0.0
 
+    @staticmethod
+    def _assert_valid_time_index(df: pd.DataFrame, timestamp_col: str) -> pd.Series:
+        """Validate timestamp column for optimization/backtesting invariants."""
+        if timestamp_col not in df.columns:
+            raise KeyError(f"Missing required timestamp column: {timestamp_col}")
+        ts = pd.to_datetime(df[timestamp_col], utc=True, errors="coerce")
+        if ts.isna().any():
+            raise ValueError(f"Timestamp column '{timestamp_col}' contains invalid/NaT values.")
+        if not ts.is_monotonic_increasing:
+            raise ValueError(f"Timestamp column '{timestamp_col}' must be sorted ascending.")
+        if ts.duplicated().any():
+            raise ValueError(f"Timestamp column '{timestamp_col}' contains duplicates.")
+        return ts
+
     def _variable_slices(self, n: int, n_bins: int) -> dict[str, slice]:
         # Hourly decisions:
         # - charge/discharge,
@@ -324,10 +338,17 @@ class BatteryBacktester:
         - p_acc_cap[j,t]: probability that capacity bid in bin j clears.
         - r_act[t]: expected activation-rate conditional on awarded capacity.
         """
+        if df.empty:
+            raise ValueError("optimize_dispatch received empty dataframe.")
+        self._assert_valid_time_index(df, colmap.timestamp)
         n = len(df)
         n_bins = int(len(self.afrr_bid_prices_eur_mwh))
+        if n_bins <= 0:
+            raise ValueError("afrr_bid_prices_eur_mwh must contain at least one bid bin.")
         sl = self._variable_slices(n, n_bins=n_bins)
         n_vars = int(sl["slack_neg"].stop)
+        if sl["ch"].start != 0 or sl["slack_neg"].stop <= 0:
+            raise ValueError("Invalid variable slice definition for MILP.")
         allowed = {str(m).strip().lower() for m in allowed_markets}
         da_enabled = "da" in allowed
         afrr_enabled = "afrr" in allowed
@@ -634,26 +655,30 @@ class BatteryBacktester:
             a_ub.append(row)
             b_ub.append(-float(soc_end_min_target))
 
-        lb = []
-        ub = []
+        lb = np.zeros(n_vars, dtype=float)
+        ub = np.full(n_vars, np.inf, dtype=float)
         da_units_max = int(np.floor(self.p_max_mw / da_step + 1e-9)) if da_enabled else 0
         afrr_units_max = int(np.floor(self.reserve_max_mw / afrr_step + 1e-9)) if afrr_enabled else 0
-        lb.extend([0.0] * n)  # charge units
-        ub.extend([da_units_max] * n)
-        lb.extend([0.0] * n)  # discharge units
-        ub.extend([da_units_max] * n)
-        lb.extend([0.0] * (n * n_bins))  # reserve pos bin units
-        ub.extend([afrr_units_max] * (n * n_bins))
-        lb.extend([0.0] * (n * n_bins))  # reserve neg bin units
-        ub.extend([afrr_units_max] * (n * n_bins))
-        lb.extend([0.0] * n)  # is_charging
-        ub.extend([1.0] * n)
-        lb.extend([self.soc_min] * (n + 1))  # soc
-        ub.extend([self.soc_max] * (n + 1))
-        lb.extend([0.0] * n)  # slack_pos (continuous)
-        ub.extend([np.inf] * n)
-        lb.extend([0.0] * n)  # slack_neg (continuous)
-        ub.extend([np.inf] * n)
+
+        # Integer decision blocks.
+        ub[sl["ch"]] = da_units_max
+        ub[sl["dis"]] = da_units_max
+        ub[sl["rpos_bin"]] = afrr_units_max
+        ub[sl["rneg_bin"]] = afrr_units_max
+        ub[sl["u"]] = 1.0
+
+        # State and slack blocks.
+        lb[sl["soc"]] = self.soc_min
+        ub[sl["soc"]] = self.soc_max
+        lb[sl["slack_pos"]] = 0.0
+        lb[sl["slack_neg"]] = 0.0
+
+        # Defensive check: prevent MILP vector-shape mismatches.
+        if not (len(c) == len(lb) == len(ub) == n_vars):
+            raise ValueError(
+                "MILP shape mismatch: "
+                f"len(c)={len(c)} len(lb)={len(lb)} len(ub)={len(ub)} n_vars={n_vars}"
+            )
 
         constraints = []
         if a_ub:
@@ -677,10 +702,17 @@ class BatteryBacktester:
             c=c,
             constraints=constraints,
             integrality=integrality,
-            bounds=Bounds(np.array(lb), np.array(ub)),
+            bounds=Bounds(lb, ub),
         )
         if not sol.success:
             raise RuntimeError(f"MIP optimization failed: {sol.message}")
+        if sol.x is None or len(sol.x) != n_vars:
+            raise RuntimeError(
+                "MILP solver returned invalid solution vector shape: "
+                f"got={0 if sol.x is None else len(sol.x)} expected={n_vars}"
+            )
+        if not np.isfinite(sol.x).all():
+            raise RuntimeError("MILP solver returned non-finite decision values.")
 
         x = sol.x
         rpos_bin = x[sl["rpos_bin"]].reshape(n_bins, n).T
@@ -1339,6 +1371,7 @@ class BatteryBacktester:
             raise ValueError("horizon_hours and reopt_step_hours must be > 0")
         if soc_feedback_mode not in {"realized", "predicted"}:
             raise ValueError("soc_feedback_mode must be one of {'realized', 'predicted'}")
+        self._assert_valid_time_index(df, colmap.timestamp)
         allowed = {str(m).strip().lower() for m in allowed_markets}
         da_enabled = "da" in allowed
         afrr_enabled = "afrr" in allowed
@@ -1616,6 +1649,8 @@ class BatteryBacktester:
             snapshot_plan = plan.copy()
             snapshot_plan["snapshot_time_utc"] = snapshot_ts if forecast_warehouse else pd.to_datetime(window.iloc[0][colmap.timestamp], utc=True, errors="coerce")
             snapshot_plan["target_time_utc"] = pd.to_datetime(snapshot_plan[colmap.timestamp], utc=True, errors="coerce")
+            if snapshot_plan["target_time_utc"].isna().any():
+                raise ValueError("Rolling plan contains invalid target timestamps.")
             snapshot_plan["lead_time_h"] = (
                 (snapshot_plan["target_time_utc"] - snapshot_plan["snapshot_time_utc"]).dt.total_seconds() // 3600
             ).astype("Int64")
@@ -2249,6 +2284,9 @@ class BatteryBacktester:
         enforce_final_soc_min: bool = True,
     ) -> BacktestOutputs:
         """Run optimization + predicted settlement + realized settlement."""
+        if horizon_hours <= 0 or reopt_step_hours <= 0:
+            raise ValueError("horizon_hours and reopt_step_hours must be > 0")
+        self._assert_valid_time_index(df, colmap.timestamp)
         def _run_isolated_path(
             *,
             path_df: pd.DataFrame,
