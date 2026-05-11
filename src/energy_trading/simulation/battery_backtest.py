@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Iterable
 
 import numpy as np
@@ -1430,7 +1431,36 @@ class BatteryBacktester:
         pending_id_discharge_mw = 0.0
         reopt_restart_done: set[pd.Timestamp] = set()
         i = 0
+        progress_start = time.monotonic()
+        progress_last_log = progress_start
+        progress_last_i = -1
+        progress_log_interval_s = 30.0
+
+        def _log_progress(*, force: bool = False, note: str = "") -> None:
+            nonlocal progress_last_log, progress_last_i
+            now = time.monotonic()
+            if not force and (now - progress_last_log) < progress_log_interval_s:
+                return
+            elapsed = max(0.0, now - progress_start)
+            done = max(0, int(i))
+            total = max(1, int(n))
+            pct = 100.0 * (done / total)
+            if done > 0:
+                avg_s_per_step = elapsed / done
+                eta_s = max(0.0, (total - done) * avg_s_per_step)
+            else:
+                eta_s = float("inf")
+            eta_txt = f"{eta_s/60.0:.1f} min" if np.isfinite(eta_s) else "n/a"
+            suffix = f" | {note}" if note else ""
+            print(
+                f"[PROGRESS] backtest rolling step {done}/{total} ({pct:.1f}%) "
+                f"| elapsed={elapsed/60.0:.1f} min | eta={eta_txt}{suffix}"
+            )
+            progress_last_log = now
+            progress_last_i = done
         while i < n:
+            if i == progress_last_i:
+                _log_progress(note="re-optimizing current snapshot")
             if forecast_warehouse:
                 if i >= n - 1:
                     break
@@ -1720,6 +1750,7 @@ class BatteryBacktester:
                 # Event-driven hard restart: invalidate current MILP plan and
                 # re-optimize immediately from the same snapshot state (no chunk hack).
                 reopt_restart_done.add(this_snapshot_ts)
+                _log_progress(note="capacity-gate event restart")
                 continue
 
             # Lock-in DA bids at gate closure for next UTC day (24 hours).
@@ -1923,6 +1954,7 @@ class BatteryBacktester:
                     pending_id_discharge_mw = 0.0
                 soc = float(executed_s)
                 i += 1
+                _log_progress()
                 if i >= n:
                     break
 
@@ -1983,6 +2015,7 @@ class BatteryBacktester:
                 ]
             )
             return empty_dispatch, empty_plan
+        _log_progress(force=True, note="completed")
         out = pd.concat(decisions, ignore_index=True)
         out = out.sort_values(colmap.timestamp).reset_index(drop=True)
         plan_out = pd.concat(plan_history, ignore_index=True) if plan_history else pd.DataFrame()
@@ -2557,13 +2590,18 @@ class BatteryBacktester:
             is_oracle_local=True,
         )
 
-        hourly = (
-            dispatch
-            .merge(pred, on=colmap.timestamp, how="left")
-            .merge(real, on=colmap.timestamp, how="left")
-            .merge(naive_real, on=colmap.timestamp, how="left")
-            .merge(oracle_real, on=colmap.timestamp, how="left")
-        )
+        def _merge_unique(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+            """Merge while dropping overlapping non-key columns from right."""
+            right_cols = [colmap.timestamp] + [
+                c for c in right.columns if c != colmap.timestamp and c not in left.columns
+            ]
+            return left.merge(right[right_cols], on=colmap.timestamp, how="left")
+
+        hourly = dispatch.copy()
+        hourly = _merge_unique(hourly, pred)
+        hourly = _merge_unique(hourly, real)
+        hourly = _merge_unique(hourly, naive_real)
+        hourly = _merge_unique(hourly, oracle_real)
         hourly = hourly.sort_values(colmap.timestamp).reset_index(drop=True)
 
         if "real_net_cashflow_eur" in hourly.columns:
