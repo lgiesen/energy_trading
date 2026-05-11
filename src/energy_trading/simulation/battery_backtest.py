@@ -1299,41 +1299,23 @@ class BatteryBacktester:
                     lock_neg[pd.to_datetime(ts, utc=True)] = 0.0
                 continue
 
-            ts_idx = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce")
-            sblk = source.reindex(ts_idx).copy()
-            pred_cap_pos = float(pd.to_numeric(sblk.get(colmap.pred_afrr_capacity_price_pos), errors="coerce").mean())
-            pred_cap_neg = float(pd.to_numeric(sblk.get(colmap.pred_afrr_capacity_price_neg), errors="coerce").mean())
-            pred_act_pos = float(pd.to_numeric(sblk.get(colmap.pred_afrr_activation_price_pos), errors="coerce").mean())
-            pred_act_neg = float(pd.to_numeric(sblk.get(colmap.pred_afrr_activation_price_neg), errors="coerce").mean())
-            true_cap_pos = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_pos), errors="coerce").mean())
-            true_cap_neg = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_neg), errors="coerce").mean())
-            if not np.isfinite(pred_cap_pos):
-                pred_cap_pos = 0.0
-            if not np.isfinite(pred_cap_neg):
-                pred_cap_neg = 0.0
-            if not np.isfinite(pred_act_pos):
-                pred_act_pos = 0.0
-            if not np.isfinite(pred_act_neg):
-                pred_act_neg = 0.0
-            if not np.isfinite(true_cap_pos):
-                true_cap_pos = 0.0
-            if not np.isfinite(true_cap_neg):
-                true_cap_neg = 0.0
-
-            cap_bids = self.bid_builder.build_afrr_capacity_bids(
-                ts=ts_idx.iloc[0] if len(ts_idx) else snapshot_ts,
-                reserve_pos_mw=offered_pos,
-                reserve_neg_mw=offered_neg,
-                pred_cap_pos=pred_cap_pos,
-                pred_cap_neg=pred_cap_neg,
-                pred_act_pos=pred_act_pos,
-                pred_act_neg=pred_act_neg,
+            # Stage 1 (forecast-only): formulate submitted capacity bids.
+            cap_bids, ts_idx = self._formulate_afrr_capacity_block_bids(
+                blk=blk,
+                source=source,
+                colmap=colmap,
+                snapshot_ts=snapshot_ts,
+                offered_pos=offered_pos,
+                offered_neg=offered_neg,
                 is_oracle=is_oracle,
             )
-            cap_res = self.market_clearing_engine.clear_afrr_capacity(
-                cap_bids,
-                true_cap_pos=true_cap_pos,
-                true_cap_neg=true_cap_neg,
+            # Stage 2 (isolated market clearing): compare submitted bid prices
+            # to realized clearing prices to determine awarded capacity.
+            cap_res = self._clear_afrr_capacity_block_against_truth(
+                cap_bids=cap_bids,
+                ts_idx=ts_idx,
+                source=source,
+                colmap=colmap,
             )
             e_pos = 0.0
             e_neg = 0.0
@@ -1351,6 +1333,70 @@ class BatteryBacktester:
             rejected_total += max(0.0, offered_pos - float(cap_res.awarded_pos_mw))
             rejected_total += max(0.0, offered_neg - float(cap_res.awarded_neg_mw))
         return {"triggered": float(rejected_total > 1e-9), "rejected_mw_total": float(rejected_total)}
+
+    def _formulate_afrr_capacity_block_bids(
+        self,
+        *,
+        blk: pd.DataFrame,
+        source: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        snapshot_ts: pd.Timestamp,
+        offered_pos: float,
+        offered_neg: float,
+        is_oracle: bool = False,
+    ) -> tuple[list[AFRRCapacityBid], pd.Series]:
+        """Build submitted aFRR capacity bids using forecast-side information only."""
+        ts_idx = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce")
+        sblk = source.reindex(ts_idx).copy()
+
+        # Forecast-side pricing inputs only (no realized capacity clearing prices).
+        pred_cap_pos = float(pd.to_numeric(sblk.get(colmap.pred_afrr_capacity_price_pos), errors="coerce").mean())
+        pred_cap_neg = float(pd.to_numeric(sblk.get(colmap.pred_afrr_capacity_price_neg), errors="coerce").mean())
+        pred_act_pos = float(pd.to_numeric(sblk.get(colmap.pred_afrr_activation_price_pos), errors="coerce").mean())
+        pred_act_neg = float(pd.to_numeric(sblk.get(colmap.pred_afrr_activation_price_neg), errors="coerce").mean())
+
+        if not np.isfinite(pred_cap_pos):
+            pred_cap_pos = 0.0
+        if not np.isfinite(pred_cap_neg):
+            pred_cap_neg = 0.0
+        if not np.isfinite(pred_act_pos):
+            pred_act_pos = 0.0
+        if not np.isfinite(pred_act_neg):
+            pred_act_neg = 0.0
+
+        cap_bids = self.bid_builder.build_afrr_capacity_bids(
+            ts=ts_idx.iloc[0] if len(ts_idx) else snapshot_ts,
+            reserve_pos_mw=offered_pos,
+            reserve_neg_mw=offered_neg,
+            pred_cap_pos=pred_cap_pos,
+            pred_cap_neg=pred_cap_neg,
+            pred_act_pos=pred_act_pos,
+            pred_act_neg=pred_act_neg,
+            is_oracle=is_oracle,
+        )
+        return cap_bids, ts_idx
+
+    def _clear_afrr_capacity_block_against_truth(
+        self,
+        *,
+        cap_bids: list[AFRRCapacityBid],
+        ts_idx: pd.Series,
+        source: pd.DataFrame,
+        colmap: BacktestColumnMap,
+    ):
+        """Isolated aFRR capacity auction: submitted bids vs realized clearing prices."""
+        sblk = source.reindex(ts_idx).copy()
+        true_cap_pos = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_pos), errors="coerce").mean())
+        true_cap_neg = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_neg), errors="coerce").mean())
+        if not np.isfinite(true_cap_pos):
+            true_cap_pos = 0.0
+        if not np.isfinite(true_cap_neg):
+            true_cap_neg = 0.0
+        return self.market_clearing_engine.clear_afrr_capacity(
+            cap_bids,
+            true_cap_pos=true_cap_pos,
+            true_cap_neg=true_cap_neg,
+        )
 
     def optimize_dispatch_rolling(
         self,
