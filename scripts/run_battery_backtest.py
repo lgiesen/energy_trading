@@ -26,10 +26,15 @@ Usage (manual files):
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
+import os
 import re
 from pathlib import Path
+import signal
 import sys
+import threading
+import time
 from typing import Iterable
 
 import matplotlib.pyplot as plt
@@ -45,9 +50,51 @@ if str(SRC_DIR) not in sys.path:
 from energy_trading.simulation.battery_backtest import (
     BacktestColumnMap,
     BatteryBacktester,
+    PhaseTimeoutError,
     load_and_align_market_data,
     load_prediction_warehouse_long,
 )
+
+
+def _phase_timeout_seconds(phase: str) -> float:
+    key = "BACKTEST_PHASE_TIMEOUT_" + "".join(ch if ch.isalnum() else "_" for ch in phase.upper()) + "_S"
+    if key in os.environ:
+        return float(os.environ[key])
+    return float(os.environ.get("BACKTEST_PHASE_TIMEOUT_S", "0"))
+
+
+@contextmanager
+def _phase_watchdog(phase: str):
+    timeout_s = _phase_timeout_seconds(phase)
+    t0 = time.monotonic()
+    print(f"[PHASE] START {phase}")
+
+    use_signal = (
+        timeout_s > 0
+        and threading.current_thread() is threading.main_thread()
+        and hasattr(signal, "SIGALRM")
+        and hasattr(signal, "setitimer")
+    )
+    old_handler = None
+    old_timer = None
+    if use_signal:
+        def _alarm_handler(_signum: int, _frame: object) -> None:
+            raise PhaseTimeoutError(f"Phase timeout in '{phase}' after {timeout_s:.1f}s.")
+
+        old_handler = signal.getsignal(signal.SIGALRM)
+        old_timer = signal.setitimer(signal.ITIMER_REAL, timeout_s)
+        signal.signal(signal.SIGALRM, _alarm_handler)
+    try:
+        yield
+    finally:
+        if use_signal:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            if old_timer is not None:
+                signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
+            if old_handler is not None:
+                signal.signal(signal.SIGALRM, old_handler)
+        dt = time.monotonic() - t0
+        print(f"[PHASE] END {phase} | elapsed={dt:.2f}s")
 
 
 def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> None:
@@ -820,17 +867,18 @@ def main() -> None:
         scenario_out_dir = out_dir if scenario_name == "default" and not quantile_pairs else out_dir / scenario_name
         scenario_out_dir.mkdir(parents=True, exist_ok=True)
 
-        outputs = backtester.run(
-            df,
-            colmap,
-            use_rolling_horizon=not args.disable_rolling_horizon,
-            horizon_hours=args.horizon_hours,
-            reopt_step_hours=args.reopt_step_hours,
-            forecast_warehouse=scenario_warehouse,
-            da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
-            soc_feedback_mode=args.soc_feedback_mode,
-            enforce_final_soc_min=args.enforce_final_soc_min,
-        )
+        with _phase_watchdog("backtester_run"):
+            outputs = backtester.run(
+                df,
+                colmap,
+                use_rolling_horizon=not args.disable_rolling_horizon,
+                horizon_hours=args.horizon_hours,
+                reopt_step_hours=args.reopt_step_hours,
+                forecast_warehouse=scenario_warehouse,
+                da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
+                soc_feedback_mode=args.soc_feedback_mode,
+                enforce_final_soc_min=args.enforce_final_soc_min,
+            )
 
         hourly_path = scenario_out_dir / "backtest_hourly.parquet"
         planned_ledger_path = scenario_out_dir / "planned_ledger.parquet"
@@ -846,14 +894,16 @@ def main() -> None:
         diagnostics_txt_path = scenario_out_dir / "backtest_diagnostics.txt"
         pnl_plot_path = scenario_out_dir / "backtest_cumulative_pnl.png"
 
-        outputs.hourly.to_parquet(hourly_path, index=False)
+        with _phase_watchdog("write_hourly"):
+            outputs.hourly.to_parquet(hourly_path, index=False)
         planned_cols = [c for c in [
             colmap.timestamp, "charge_mw", "discharge_mw", "reserve_pos_mw", "reserve_neg_mw", "soc_lp_mwh",
             "planned_soc_mwh", "aFRR_Capacity_Won_Pos_MW", "aFRR_Capacity_Won_Neg_MW", "aFRR_Capacity_Won_MW",
             "aFRR_Energy_Price_EUR_MWh_Pos", "aFRR_Energy_Price_EUR_MWh_Neg", "event_reopt_triggered",
             "event_reopt_rejected_mw_total", "predicted_objective_eur"
         ] if c in outputs.hourly.columns]
-        outputs.hourly[planned_cols].to_parquet(planned_ledger_path, index=False)
+        with _phase_watchdog("write_planned_ledger"):
+            outputs.hourly[planned_cols].to_parquet(planned_ledger_path, index=False)
 
         executed_cols = [colmap.timestamp]
         executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_planned_")])
@@ -866,7 +916,8 @@ def main() -> None:
             "real_aFRR_Energy_Gate_Closure_Min", "shock_source", "soc_before_mwh", "soc_after_planned_mwh",
             "soc_after_executed_mwh", "soc_shock_mwh"
         ] if c in outputs.hourly.columns])
-        outputs.hourly[[*dict.fromkeys(executed_cols)]].to_parquet(executed_ledger_path, index=False)
+        with _phase_watchdog("write_executed_ledger"):
+            outputs.hourly[[*dict.fromkeys(executed_cols)]].to_parquet(executed_ledger_path, index=False)
 
         realized_cols = [colmap.timestamp]
         realized_cols.extend([
@@ -879,27 +930,36 @@ def main() -> None:
                 "real_delivered_activation_revenue_eur", "real_missed_activation_revenue_eur", "real_soc_mwh",
             }
         ])
-        outputs.hourly[[*dict.fromkeys(realized_cols)]].to_parquet(realized_ledger_path, index=False)
+        with _phase_watchdog("write_realized_ledger"):
+            outputs.hourly[[*dict.fromkeys(realized_cols)]].to_parquet(realized_ledger_path, index=False)
 
-        outputs.plan_history.to_parquet(plan_history_path, index=False)
-        outputs.volatility.to_csv(volatility_path, index=False)
-        outputs.monthly.to_csv(monthly_path, index=False)
-        outputs.yearly.to_csv(yearly_path, index=False)
-        summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
-        state_machine_audit_path.write_text(json.dumps(_build_state_machine_audit(outputs.hourly), indent=2), encoding="utf-8")
-        diagnostics = _build_backtest_diagnostics(outputs.hourly, outputs.summary)
-        diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
-        diagnostics_txt_path.write_text(
-            "\n".join([
-                "Backtest Diagnostics",
-                f"rows_hourly={diagnostics['rows_hourly']}",
-                f"numeric_nan_total={diagnostics['numeric_nan_total']}",
-                f"numeric_nonfinite_total={diagnostics['numeric_nonfinite_total']}",
-                f"final_soc_constraint_satisfied={diagnostics['infeasibility_flags']['final_soc_constraint_satisfied']}",
-            ]) + "\n",
-            encoding="utf-8",
-        )
-        _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
+        with _phase_watchdog("write_plan_history"):
+            outputs.plan_history.to_parquet(plan_history_path, index=False)
+        with _phase_watchdog("write_volatility"):
+            outputs.volatility.to_csv(volatility_path, index=False)
+        with _phase_watchdog("write_monthly"):
+            outputs.monthly.to_csv(monthly_path, index=False)
+        with _phase_watchdog("write_yearly"):
+            outputs.yearly.to_csv(yearly_path, index=False)
+        with _phase_watchdog("write_summary_json"):
+            summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+        with _phase_watchdog("write_state_machine_audit"):
+            state_machine_audit_path.write_text(json.dumps(_build_state_machine_audit(outputs.hourly), indent=2), encoding="utf-8")
+        with _phase_watchdog("build_and_write_diagnostics"):
+            diagnostics = _build_backtest_diagnostics(outputs.hourly, outputs.summary)
+            diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+            diagnostics_txt_path.write_text(
+                "\n".join([
+                    "Backtest Diagnostics",
+                    f"rows_hourly={diagnostics['rows_hourly']}",
+                    f"numeric_nan_total={diagnostics['numeric_nan_total']}",
+                    f"numeric_nonfinite_total={diagnostics['numeric_nonfinite_total']}",
+                    f"final_soc_constraint_satisfied={diagnostics['infeasibility_flags']['final_soc_constraint_satisfied']}",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+        with _phase_watchdog("plot_cumulative_pnl"):
+            _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
 
         print(f"[OK] Battery backtest completed for scenario={scenario_name}.")
         print(f"- realized_total_pnl_eur: {outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f}")

@@ -28,8 +28,11 @@ Programmatic usage:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 import os
+import signal
+import threading
 import time
 from typing import Iterable
 
@@ -88,6 +91,51 @@ CANONICAL_PREDICTION_COLUMNS = [
     "pred_afrr_activation_rate_neg",
 ]
 QUANTILE_COLUMNS = [f"p{q:02d}" for q in range(10, 100, 10)]
+
+
+class PhaseTimeoutError(RuntimeError):
+    """Raised when a timed backtest phase exceeds configured timeout."""
+
+
+def _phase_timeout_seconds(phase: str) -> float:
+    key = "BACKTEST_PHASE_TIMEOUT_" + "".join(ch if ch.isalnum() else "_" for ch in phase.upper()) + "_S"
+    if key in os.environ:
+        return float(os.environ[key])
+    return float(os.environ.get("BACKTEST_PHASE_TIMEOUT_S", "0"))
+
+
+@contextmanager
+def _phase_watchdog(phase: str):
+    timeout_s = _phase_timeout_seconds(phase)
+    t0 = time.monotonic()
+    print(f"[PHASE] START {phase}")
+
+    use_signal = (
+        timeout_s > 0
+        and threading.current_thread() is threading.main_thread()
+        and hasattr(signal, "SIGALRM")
+        and hasattr(signal, "setitimer")
+    )
+    old_handler = None
+    old_timer = None
+    if use_signal:
+        def _alarm_handler(_signum: int, _frame: object) -> None:
+            raise PhaseTimeoutError(f"Phase timeout in '{phase}' after {timeout_s:.1f}s.")
+
+        old_handler = signal.getsignal(signal.SIGALRM)
+        old_timer = signal.setitimer(signal.ITIMER_REAL, timeout_s)
+        signal.signal(signal.SIGALRM, _alarm_handler)
+    try:
+        yield
+    finally:
+        if use_signal:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            if old_timer is not None:
+                signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
+            if old_handler is not None:
+                signal.signal(signal.SIGALRM, old_handler)
+        dt = time.monotonic() - t0
+        print(f"[PHASE] END {phase} | elapsed={dt:.2f}s")
 
 
 def _coalesce_column(df: pd.DataFrame, candidates: Iterable[str], required: bool = True) -> str | None:
@@ -2536,15 +2584,17 @@ class BatteryBacktester:
                 deterministic_reserve_settlement=False,
                 allowed_markets=("DA", "aFRR"),
             )
-        pred = self.settle_dispatch(df, dispatch, colmap, predicted_settlement=True)
-        real = self.settle_dispatch(
-            df,
-            dispatch,
-            colmap,
-            predicted_settlement=False,
-            apply_market_clearing=True,
-            oracle_mode=False,
-        )
+        with _phase_watchdog("settlement_predicted"):
+            pred = self.settle_dispatch(df, dispatch, colmap, predicted_settlement=True)
+        with _phase_watchdog("settlement_realized"):
+            real = self.settle_dispatch(
+                df,
+                dispatch,
+                colmap,
+                predicted_settlement=False,
+                apply_market_clearing=True,
+                oracle_mode=False,
+            )
 
         # Naive-24h benchmark run: y_t_hat := y_{t-24} for predicted market columns.
         naive_df = df.copy()
@@ -2585,14 +2635,15 @@ class BatteryBacktester:
                 deterministic_reserve_settlement=False,
                 allowed_markets=("DA", "aFRR"),
             )
-        naive_real = self.settle_dispatch(
-            df,
-            naive_dispatch,
-            colmap,
-            predicted_settlement=False,
-            apply_market_clearing=True,
-            oracle_mode=False,
-        )
+        with _phase_watchdog("settlement_naive_realized"):
+            naive_real = self.settle_dispatch(
+                df,
+                naive_dispatch,
+                colmap,
+                predicted_settlement=False,
+                apply_market_clearing=True,
+                oracle_mode=False,
+            )
         naive_real = naive_real.rename(
             columns={
                 c: c.replace("real_", "naive_", 1)
@@ -2635,14 +2686,15 @@ class BatteryBacktester:
                 deterministic_reserve_settlement=True,
                 allowed_markets=("DA", "aFRR"),
             )
-        oracle_real = self.settle_dispatch(
-            oracle_df,
-            oracle_dispatch,
-            colmap,
-            predicted_settlement=False,
-            apply_market_clearing=True,
-            oracle_mode=True,
-        )
+        with _phase_watchdog("settlement_oracle_realized"):
+            oracle_real = self.settle_dispatch(
+                oracle_df,
+                oracle_dispatch,
+                colmap,
+                predicted_settlement=False,
+                apply_market_clearing=True,
+                oracle_mode=True,
+            )
         oracle_real = oracle_real.rename(
             columns={
                 c: c.replace("real_", "oracle_", 1)
