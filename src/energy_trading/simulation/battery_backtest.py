@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import time
 from typing import Iterable
 
@@ -214,6 +215,14 @@ class BatteryBacktester:
         self.market_clearing_engine = MarketClearingEngine(
             da_mode_default=self.da_execution_mode,
         )
+        # MILP runtime controls:
+        # - default execution is bounded and robust for rolling simulation
+        # - diagnostic mode can be enabled to inspect HiGHS solver behavior
+        #   (presolve, branching, degeneracy / collinearity indicators).
+        self.milp_diagnostic_mode = os.environ.get("BACKTEST_MILP_DIAG", "0") == "1"
+        self.milp_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_TIME_LIMIT_S", "10.0"))
+        self.milp_rel_gap = float(os.environ.get("BACKTEST_MILP_REL_GAP", "1e-4"))
+        self.milp_diag_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_DIAG_TIME_LIMIT_S", "60.0"))
 
     @staticmethod
     def _clip_rate(x: np.ndarray) -> np.ndarray:
@@ -307,6 +316,29 @@ class BatteryBacktester:
             "slack_pos": slice(base + n + (n + 1), base + n + (n + 1) + n),
             "slack_neg": slice(base + n + (n + 1) + n, base + n + (n + 1) + 2 * n),
         }
+
+    def _milp_options(self) -> dict[str, float | bool]:
+        """Build SciPy/HiGHS MILP options for stable rolling optimization."""
+        if self.milp_diagnostic_mode:
+            # Verbose diagnostics with longer cap for bottleneck analysis.
+            return {
+                "disp": True,
+                "time_limit": max(1e-3, float(self.milp_diag_time_limit_seconds)),
+                "mip_rel_gap": max(0.0, float(self.milp_rel_gap)),
+            }
+        return {
+            "disp": False,
+            "time_limit": max(1e-3, float(self.milp_time_limit_seconds)),
+            "mip_rel_gap": max(0.0, float(self.milp_rel_gap)),
+        }
+
+    @staticmethod
+    def _is_timeout_result(sol: object) -> bool:
+        """Detect MILP timeout status across SciPy result formats/messages."""
+        status = getattr(sol, "status", None)
+        msg = str(getattr(sol, "message", "")).lower()
+        # SciPy/HiGHS commonly uses status=1 for iteration/time limit.
+        return status == 1 or ("time limit" in msg) or ("timelimit" in msg)
 
     @staticmethod
     def _quantile_map_from_row(row: pd.Series) -> dict[float, float]:
@@ -699,13 +731,17 @@ class BatteryBacktester:
         integrality[sl["rneg_bin"]] = 1
         integrality[sl["u"]] = 1
 
+        milp_options = self._milp_options()
         sol = milp(
             c=c,
             constraints=constraints,
             integrality=integrality,
             bounds=Bounds(lb, ub),
+            options=milp_options,
         )
-        if not sol.success:
+        # Graceful timeout handling: continue with best incumbent feasible solution.
+        timeout_with_incumbent = self._is_timeout_result(sol) and (sol.x is not None)
+        if (not sol.success) and (not timeout_with_incumbent):
             raise RuntimeError(f"MIP optimization failed: {sol.message}")
         if sol.x is None or len(sol.x) != n_vars:
             raise RuntimeError(
@@ -714,6 +750,11 @@ class BatteryBacktester:
             )
         if not np.isfinite(sol.x).all():
             raise RuntimeError("MILP solver returned non-finite decision values.")
+        if timeout_with_incumbent:
+            print(
+                "[WARN] MILP hit time limit; proceeding with incumbent feasible solution "
+                f"(status={getattr(sol, 'status', 'n/a')}, msg='{getattr(sol, 'message', '')}')."
+            )
 
         x = sol.x
         rpos_bin = x[sl["rpos_bin"]].reshape(n_bins, n).T
