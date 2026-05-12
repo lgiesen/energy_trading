@@ -231,6 +231,7 @@ class BatteryBacktester:
 
         self.bid_power_max_mw = float(MARKET_SPECS.get("bid_power_max_mw", self.p_max_mw))
         self.reserve_max_mw = min(self.p_max_mw, self.bid_power_max_mw)
+        self.reserve_product_duration_h = float(MODEL_SPECS.get("reserve_product_duration_h", 4.0))
         self.da_bid_granularity_mw = float(MARKET_SPECS.get("da_bid_granularity", 0.1))
         self.afrr_bid_granularity_mw = float(MARKET_SPECS.get("afrr_bid_granularity", 1.0))
         if self.da_bid_granularity_mw <= 0 or self.afrr_bid_granularity_mw <= 0:
@@ -263,6 +264,10 @@ class BatteryBacktester:
         self.market_clearing_engine = MarketClearingEngine(
             da_mode_default=self.da_execution_mode,
         )
+        # Keep settlement penalty coefficients centralized so optimizer and
+        # settlement can use consistent economics.
+        self.capacity_penalty_multiplier = 2.0
+        self.capacity_penalty_price_floor_eur_mw_h = 10.0
         # MILP runtime controls:
         # - default execution is bounded and robust for rolling simulation
         # - diagnostic mode can be enabled to inspect HiGHS solver behavior
@@ -409,6 +414,7 @@ class BatteryBacktester:
         soc_end_target: float | None = None,
         soc_end_min_target: float | None = None,
         fixed_da_dispatch: dict[pd.Timestamp, tuple[float, float]] | None = None,
+        fixed_reserve_obligation: dict[pd.Timestamp, tuple[float, float]] | None = None,
         deterministic_reserve_settlement: bool = False,
         allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
     ) -> pd.DataFrame:
@@ -575,13 +581,13 @@ class BatteryBacktester:
             else:
                 rpos_coef = (
                     p_acc_cap_pos[:, b] * p_cap_pos
-                    + exp_act_pos * bid_price * self.eta_out
+                    + exp_act_pos * act_price_pos * self.eta_out
                     - self.trans_eur_mwh * exp_act_pos * self.eta_out
                     - self.deg_eur_mwh * exp_act_pos
                 )
                 rneg_coef = (
                     p_acc_cap_neg[:, b] * p_cap_neg
-                    + exp_act_neg * bid_price / self.eta_in
+                    + exp_act_neg * act_price_neg / self.eta_in
                     - self.trans_eur_mwh * exp_act_neg / self.eta_in
                     - self.deg_eur_mwh * exp_act_neg
                 )
@@ -589,9 +595,31 @@ class BatteryBacktester:
             s_neg = sl["rneg_bin"].start + b * n
             c[s_pos : s_pos + n] = -(rpos_coef * afrr_step)
             c[s_neg : s_neg + n] = -(rneg_coef * afrr_step)
-        # Soft chance-constraint penalties (continuous non-delivery slack, €/MWh).
-        c[sl["slack_pos"]] = self.imbalance_penalty_eur_mwh * self.dt_h
-        c[sl["slack_neg"]] = self.imbalance_penalty_eur_mwh * self.dt_h
+        # Soft chance-constraint penalties (continuous non-delivery slack).
+        # Make slack prohibitively expensive relative to capacity revenues so
+        # solver prioritizes physical feasibility over speculative awards.
+        cap_price_scale = float(
+            max(
+                1.0,
+                float(np.nanmax(p_cap_pos)) if len(p_cap_pos) else 1.0,
+                float(np.nanmax(p_cap_neg)) if len(p_cap_neg) else 1.0,
+                float(np.nanmax(self.afrr_bid_prices_eur_mwh)) if len(self.afrr_bid_prices_eur_mwh) else 1.0,
+            )
+        )
+        strict_slack_lambda = max(
+            self.imbalance_penalty_eur_mwh * self.dt_h,
+            (cap_price_scale + 1.0) ** 2 * self.dt_h,
+        )
+        cap_penalty_pos = self.capacity_penalty_multiplier * np.maximum(
+            self.capacity_penalty_price_floor_eur_mw_h,
+            p_cap_pos,
+        ) * self.dt_h
+        cap_penalty_neg = self.capacity_penalty_multiplier * np.maximum(
+            self.capacity_penalty_price_floor_eur_mw_h,
+            p_cap_neg,
+        ) * self.dt_h
+        c[sl["slack_pos"]] = np.maximum(strict_slack_lambda, cap_penalty_pos)
+        c[sl["slack_neg"]] = np.maximum(strict_slack_lambda, cap_penalty_neg)
         # Terminal SoC opportunity value (anti end-of-horizon dumping):
         # Reward terminal inventory using a trailing DA reference with non-negative
         # floor and export efficiency scaling to approximate realizable grid value.
@@ -697,6 +725,29 @@ class BatteryBacktester:
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
+            # Hard physical deliverability bounds for awarded reserve.
+            # Use reserve product duration padding (e.g. 4h) to enforce robust
+            # SoC availability across the full reserve commitment horizon.
+            # pos reserve needs footroom above soc_min (discharge capability).
+            row = np.zeros(n_vars, dtype=float)
+            row[sl["soc"].start + t] = -1.0
+            for b in range(n_bins):
+                row[sl["rpos_bin"].start + b * n + t] = (
+                    self.reserve_product_duration_h / max(self.eta_out, 1e-12)
+                ) * afrr_step
+            a_ub.append(row)
+            b_ub.append(-self.soc_min)
+
+            # neg reserve needs headroom below soc_max (charge capability).
+            row = np.zeros(n_vars, dtype=float)
+            row[sl["soc"].start + t] = 1.0
+            for b in range(n_bins):
+                row[sl["rneg_bin"].start + b * n + t] = (
+                    self.reserve_product_duration_h * self.eta_in
+                ) * afrr_step
+            a_ub.append(row)
+            b_ub.append(self.soc_max)
+
             # Mixed-integer exclusivity (Big-M):
             # charge[t] <= is_charging[t] * Pmax
             row = np.zeros(n_vars, dtype=float)
@@ -728,6 +779,31 @@ class BatteryBacktester:
                     row[sl["dis"].start + t] = da_step
                     a_eq.append(row)
                     b_eq.append(float(dis_fix))
+            # Reserve lockbook obligation: when capacity has already been
+            # awarded, force optimization to carry that commitment explicitly.
+            if fixed_reserve_obligation and afrr_enabled:
+                ts = ts_index.iloc[t]
+                if pd.notna(ts) and ts in fixed_reserve_obligation:
+                    ob_pos, ob_neg = fixed_reserve_obligation[ts]
+                    ob_pos_q = self.bid_builder._qfloor(
+                        max(0.0, float(ob_pos)),
+                        self.afrr_bid_granularity_mw,
+                    )
+                    ob_neg_q = self.bid_builder._qfloor(
+                        max(0.0, float(ob_neg)),
+                        self.afrr_bid_granularity_mw,
+                    )
+                    row = np.zeros(n_vars, dtype=float)
+                    for b in range(n_bins):
+                        row[sl["rpos_bin"].start + b * n + t] = afrr_step
+                    a_eq.append(row)
+                    b_eq.append(float(ob_pos_q))
+
+                    row = np.zeros(n_vars, dtype=float)
+                    for b in range(n_bins):
+                        row[sl["rneg_bin"].start + b * n + t] = afrr_step
+                    a_eq.append(row)
+                    b_eq.append(float(ob_neg_q))
 
         # Final SoC floor constraint: SoC_T >= soc_end_min_target
         if soc_end_min_target is not None:
@@ -984,12 +1060,18 @@ class BatteryBacktester:
         # Stylized Proxy Penalty: Approximates the incentive-based settlement of
         # regelleistung.net. Uses a fixed multiplier of 2.0 and a 10 EUR/MW floor
         # as a conservative economic proxy for non-delivery exposure.
-        cap_penalty_price_floor_eur_mw_h = 10.0
+        cap_penalty_price_floor_eur_mw_h = float(self.capacity_penalty_price_floor_eur_mw_h)
         penalty_capacity_pos_eur = (
-            2.0 * missed_capacity_pos_mw * max(cap_penalty_price_floor_eur_mw_h, float(cap_pos)) * self.dt_h
+            float(self.capacity_penalty_multiplier)
+            * missed_capacity_pos_mw
+            * max(cap_penalty_price_floor_eur_mw_h, float(cap_pos))
+            * self.dt_h
         )
         penalty_capacity_neg_eur = (
-            2.0 * missed_capacity_neg_mw * max(cap_penalty_price_floor_eur_mw_h, float(cap_neg)) * self.dt_h
+            float(self.capacity_penalty_multiplier)
+            * missed_capacity_neg_mw
+            * max(cap_penalty_price_floor_eur_mw_h, float(cap_neg))
+            * self.dt_h
         )
         penalty_capacity_eur = penalty_capacity_pos_eur + penalty_capacity_neg_eur
         penalty_eur = penalty_activation_eur + penalty_capacity_eur
@@ -1755,6 +1837,16 @@ class BatteryBacktester:
                 enforce_end_min = None
             optimization_fallback = "none"
             optimization_error = ""
+            fixed_reserve_obligation: dict[pd.Timestamp, tuple[float, float]] = {}
+            if afrr_enabled:
+                w_ts = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+                for tsw in w_ts:
+                    if pd.isna(tsw):
+                        continue
+                    ob_pos = float(afrr_cap_pos_lockbook.get(tsw, 0.0))
+                    ob_neg = float(afrr_cap_neg_lockbook.get(tsw, 0.0))
+                    if ob_pos > 0.0 or ob_neg > 0.0:
+                        fixed_reserve_obligation[tsw] = (ob_pos, ob_neg)
             try:
                 plan = self.optimize_dispatch(
                     window,
@@ -1763,6 +1855,7 @@ class BatteryBacktester:
                     soc_end_target=enforce_end,
                     soc_end_min_target=enforce_end_min,
                     fixed_da_dispatch=da_lockbook,
+                    fixed_reserve_obligation=fixed_reserve_obligation,
                     deterministic_reserve_settlement=deterministic_reserve_settlement,
                     allowed_markets=allowed_markets,
                 )
@@ -1783,6 +1876,7 @@ class BatteryBacktester:
                             soc_end_target=enforce_end,
                             soc_end_min_target=None,
                             fixed_da_dispatch=da_lockbook,
+                            fixed_reserve_obligation=fixed_reserve_obligation,
                             deterministic_reserve_settlement=deterministic_reserve_settlement,
                             allowed_markets=allowed_markets,
                         )

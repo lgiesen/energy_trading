@@ -565,15 +565,21 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
         true_afrr_activation_price_pos=pick(
             truth,
             colmap.true_afrr_activation_price_pos,
-            ["target_afrr_activation_price_vwap_pos", "afrr_activation_price_vwap"],
+            [
+                "target_afrr_activation_price_vwap_pos_raw",
+                "target_afrr_activation_price_vwap_pos",
+                "afrr_activation_price_vwap",
+            ],
         ),
         true_afrr_activation_price_neg=pick(
             truth,
             colmap.true_afrr_activation_price_neg,
             [
+                "target_afrr_activation_price_vwap_neg_raw",
                 "target_afrr_activation_price_vwap_neg",
                 "afrr_activation_price_vwap",
                 "afrr_activation_price_vwap_pos",
+                "target_afrr_activation_price_vwap_pos_raw",
                 "target_afrr_activation_price_vwap_pos",
             ],
         ),

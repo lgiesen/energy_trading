@@ -59,7 +59,55 @@ _ACTIVATION_RATE_TARGETS = {
     "target_afrr_activation_rate_pos",
     "target_afrr_activation_rate_neg",
 }
+_ACTIVATION_PRICE_TARGETS = {
+    "target_afrr_activation_price_vwap_pos",
+    "target_afrr_activation_price_vwap_neg",
+}
 TAIL_WEIGHT_MULTIPLIER = 3.0
+
+
+class TargetTransform:
+    """Robust target transform for heavy-tailed regression targets."""
+
+    def __init__(self, kind: str, q_low: float, q_high: float, symlog_scale: float) -> None:
+        self.kind = str(kind)
+        self.q_low = float(q_low)
+        self.q_high = float(q_high)
+        self.symlog_scale = float(max(1e-9, symlog_scale))
+
+    @staticmethod
+    def fit(y: pd.Series, *, kind: str = "symlog_clip", clip_low_q: float = 0.01, clip_high_q: float = 0.99) -> "TargetTransform":
+        ys = pd.to_numeric(y, errors="coerce")
+        finite = ys[np.isfinite(ys.to_numpy(dtype=float))]
+        if finite.empty:
+            return TargetTransform(kind=kind, q_low=0.0, q_high=0.0, symlog_scale=1.0)
+        q_low = float(finite.quantile(clip_low_q))
+        q_high = float(finite.quantile(clip_high_q))
+        med = float(finite.median())
+        mad = float(np.median(np.abs(finite.to_numpy(dtype=float) - med)))
+        scale = max(1.0, 1.4826 * mad)
+        return TargetTransform(kind=kind, q_low=q_low, q_high=q_high, symlog_scale=scale)
+
+    def transform_series(self, y: pd.Series) -> pd.Series:
+        ys = pd.to_numeric(y, errors="coerce")
+        clipped = ys.clip(lower=self.q_low, upper=self.q_high)
+        if self.kind == "symlog_clip":
+            return np.sign(clipped) * np.log1p(np.abs(clipped) / self.symlog_scale)
+        return clipped
+
+    def inverse_array(self, x: np.ndarray) -> np.ndarray:
+        xv = np.asarray(x, dtype=float)
+        if self.kind == "symlog_clip":
+            return np.sign(xv) * (np.expm1(np.abs(xv)) * self.symlog_scale)
+        return xv
+
+    def to_dict(self) -> dict[str, float | str]:
+        return {
+            "kind": self.kind,
+            "clip_low": self.q_low,
+            "clip_high": self.q_high,
+            "symlog_scale": self.symlog_scale,
+        }
 
 
 def _qcol(q: float) -> str:
@@ -715,6 +763,7 @@ def train_and_evaluate(
     require_cuda: bool = True,
     horizon_hours: int = 48,
     seed: int = 42,
+    activation_price_transform: str = "symlog_clip",
 ) -> tuple[dict[str, float], dict[str, dict[int, dict[str, object]]], list[str]]:
     try:
         from xgboost import XGBRegressor
@@ -794,6 +843,7 @@ def train_and_evaluate(
     per_target_metrics: dict[str, dict[str, float]] = {}
     per_target_policy: dict[str, dict[str, object]] = {}
     per_target_training_seconds: dict[str, float] = {}
+    target_transform_by_target: dict[str, dict[str, float | str]] = {}
     per_target_tb_log_dir: dict[str, str] = {}
     xgb_best_iteration_rows: list[dict[str, object]] = []
     total_fit_seconds = 0.0
@@ -819,6 +869,10 @@ def train_and_evaluate(
         target_train_start = time.perf_counter()
         y_tr_base = pd.to_numeric(y_train_m[tgt], errors="coerce")
         y_va_base = pd.to_numeric(y_val_m[tgt], errors="coerce")
+        target_transform: TargetTransform | None = None
+        if tgt in _ACTIVATION_PRICE_TARGETS and activation_price_transform != "none":
+            target_transform = TargetTransform.fit(y_tr_base, kind=activation_price_transform)
+            target_transform_by_target[tgt] = target_transform.to_dict()
         Y_tr = _build_horizon_matrix(y_tr_base, horizon_hours=horizon_hours)
         Y_va = _build_horizon_matrix(y_va_base, horizon_hours=horizon_hours)
 
@@ -842,6 +896,8 @@ def train_and_evaluate(
             X_va_h = X_val_t.loc[va_mask].copy()
             y_tr_h = y_tr_lead.loc[tr_mask].copy()
             y_va_h = y_va_lead.loc[va_mask].copy()
+            y_tr_model = target_transform.transform_series(y_tr_h) if target_transform is not None else y_tr_h
+            y_va_model = target_transform.transform_series(y_va_h) if target_transform is not None else y_va_h
 
             if X_tr_h.empty or X_va_h.empty:
                 raise ValueError(
@@ -887,9 +943,9 @@ def train_and_evaluate(
                 )
                 model.fit(
                     X_tr_h,
-                    y_tr_h,
-                    sample_weight=_tail_sample_weights(y_tr_h),
-                    eval_set=[(X_tr_h, y_tr_h), (X_va_h, y_va_h)],
+                    y_tr_model,
+                    sample_weight=_tail_sample_weights(y_tr_model),
+                    eval_set=[(X_tr_h, y_tr_model), (X_va_h, y_va_model)],
                     verbose=False,
                 )
 
@@ -951,6 +1007,8 @@ def train_and_evaluate(
                         )
 
                 pred = _predict_with_device_alignment(model, X_va_h, resolved_device=resolved_device)
+                if target_transform is not None:
+                    pred = target_transform.inverse_array(pred)
                 quantile_models_for_lead[qcol] = model
                 lead_pred_by_q[qcol] = pred
 
@@ -1062,6 +1120,7 @@ def train_and_evaluate(
                 "reg_lambda": float(target_policy["reg_lambda"]),
                 "early_stopping_rounds": int(target_policy["early_stopping_rounds"]),
             },
+            "target_transform": target_transform.to_dict() if target_transform is not None else {"kind": "none"},
         }
         models_by_target[tgt] = lead_models
         target_elapsed = time.perf_counter() - target_train_start
@@ -1126,6 +1185,7 @@ def train_and_evaluate(
         "resolved_device": resolved_device,
         "timing_training_seconds": float(total_fit_seconds),
         "timing_training_seconds_by_target": per_target_training_seconds,
+        "target_transform_by_target": target_transform_by_target,
         "tensorboard_log_dirs_by_target": per_target_tb_log_dir,
         "xgb_best_iteration_by_target_lead_quantile": xgb_best_iteration_rows,
     }
@@ -1204,6 +1264,7 @@ def _predict_split_frame(
     split: str,
     models_by_target: dict[str, dict[int, dict[str, object]]],
     target_cols: list[str],
+    target_transform_by_target: dict[str, dict[str, float | str]] | None = None,
     resolved_device: str = "cpu",
 ) -> pd.DataFrame:
     split_df, bcfg = _load_bundle_split_df(base_dir=base_dir, bundle=bundle, split=split)
@@ -1228,6 +1289,15 @@ def _predict_split_frame(
     for tgt in target_cols:
         model_q = models_by_target[tgt][1]["p50"]
         pred_h = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
+        tf_cfg = (target_transform_by_target or {}).get(tgt, {})
+        if str(tf_cfg.get("kind", "none")) != "none":
+            tf = TargetTransform(
+                kind=str(tf_cfg.get("kind", "none")),
+                q_low=float(tf_cfg.get("clip_low", 0.0)),
+                q_high=float(tf_cfg.get("clip_high", 0.0)),
+                symlog_scale=float(tf_cfg.get("symlog_scale", 1.0)),
+            )
+            pred_h = tf.inverse_array(pred_h)
         pred = pd.to_numeric(pd.Series(pred_h, index=split_df.index), errors="coerce")
         if tgt in _ACTIVATION_RATE_TARGETS:
             pred = pred.clip(lower=0.0, upper=1.0)
@@ -1243,6 +1313,7 @@ def _predict_split_long_multistep(
     split: str,
     models_by_target: dict[str, dict[int, dict[str, object]]],
     target_cols: list[str],
+    target_transform_by_target: dict[str, dict[str, float | str]] | None,
     horizon_hours: int,
     model_name: str,
     resolved_device: str = "cpu",
@@ -1283,6 +1354,15 @@ def _predict_split_long_multistep(
                 model_q = lead_models[c]
                 lead_pred_q[c] = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
             lead_stack = np.column_stack([lead_pred_q[c] for c in q_cols])
+            tf_cfg = (target_transform_by_target or {}).get(tgt, {})
+            if str(tf_cfg.get("kind", "none")) != "none":
+                tf = TargetTransform(
+                    kind=str(tf_cfg.get("kind", "none")),
+                    q_low=float(tf_cfg.get("clip_low", 0.0)),
+                    q_high=float(tf_cfg.get("clip_high", 0.0)),
+                    symlog_scale=float(tf_cfg.get("symlog_scale", 1.0)),
+                )
+                lead_stack = tf.inverse_array(lead_stack)
             lead_stack = np.sort(lead_stack, axis=1)
             if tgt in _ACTIVATION_RATE_TARGETS:
                 # Activation rate predictions are bounded probabilities/fractions.
@@ -1446,6 +1526,12 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--cv-test-size", type=int, default=24 * 28, help="Validation rows per fold (hourly rows).")
     p.add_argument("--cv-gap-hours", type=int, default=72)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--activation-price-transform",
+        choices=["none", "symlog_clip"],
+        default="symlog_clip",
+        help="Robust target transform for aFRR activation-price targets.",
+    )
     return p
 
 
@@ -1521,6 +1607,7 @@ def main() -> None:
         require_cuda=not args.allow_cpu,
         horizon_hours=args.forecast_horizon_hours,
         seed=args.seed,
+        activation_price_transform=args.activation_price_transform,
     )
     train_eval_elapsed = time.perf_counter() - train_eval_start
 
@@ -1536,6 +1623,9 @@ def main() -> None:
     splits = [s.strip() for s in args.prediction_splits.split(",") if s.strip()]
     if args.export_predictions:
         resolved_pred_device = str(metrics.get("resolved_device", args.device))
+        target_transform_by_target = {
+            str(k): v for k, v in (metrics.get("target_transform_by_target", {}) or {}).items()
+        }
         calib_long_by_col: dict[str, pd.DataFrame] = {}
         calib_truth_by_target: dict[str, pd.DataFrame] = {}
         for split in splits:
@@ -1546,6 +1636,7 @@ def main() -> None:
                 split=split,
                 models_by_target=models_by_target,
                 target_cols=target_cols,
+                target_transform_by_target=target_transform_by_target,
                 resolved_device=resolved_pred_device,
             )
             out_path = pred_dir / f"{file_tag}_{split}.parquet"
@@ -1562,6 +1653,7 @@ def main() -> None:
                     split=split,
                     models_by_target=models_by_target,
                     target_cols=target_cols,
+                    target_transform_by_target=target_transform_by_target,
                     horizon_hours=args.forecast_horizon_hours,
                     model_name=args.model_name,
                     resolved_device=resolved_pred_device,

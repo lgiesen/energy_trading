@@ -486,6 +486,52 @@ def add_explicit_targets(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("__target_source_afrr_capacity_price_pos").shift(-1).alias("target_afrr_capacity_price_pos"),
         pl.col("__target_source_afrr_capacity_price_neg").shift(-1).alias("target_afrr_capacity_price_neg"),
     ])
+
+    # Preserve raw (non-imputed) activation-price targets for settlement/forensics.
+    out = out.with_columns([
+        pl.col("target_afrr_activation_price_vwap_pos").alias("target_afrr_activation_price_vwap_pos_raw"),
+        pl.col("target_afrr_activation_price_vwap_neg").alias("target_afrr_activation_price_vwap_neg_raw"),
+    ])
+
+    # Strict no-activation semantics: price is undefined when rate is zero.
+    out = out.with_columns([
+        pl.when(pl.col("target_afrr_activation_rate_pos").cast(pl.Float64).fill_null(0.0).abs() <= 1e-12)
+        .then(pl.lit(None, dtype=pl.Float64))
+        .otherwise(pl.col("target_afrr_activation_price_vwap_pos").cast(pl.Float64))
+        .alias("target_afrr_activation_price_vwap_pos"),
+        pl.when(pl.col("target_afrr_activation_rate_neg").cast(pl.Float64).fill_null(0.0).abs() <= 1e-12)
+        .then(pl.lit(None, dtype=pl.Float64))
+        .otherwise(pl.col("target_afrr_activation_price_vwap_neg").cast(pl.Float64))
+        .alias("target_afrr_activation_price_vwap_neg"),
+    ])
+
+    # ML-only fallback imputation: use DA proxy (opportunity-cost anchor).
+    da_proxy = pl.coalesce([
+        pl.col("target_da_price").cast(pl.Float64),
+        pl.col("__target_source_da_price").cast(pl.Float64),
+    ])
+    out = out.with_columns([
+        pl.when(pl.col("target_afrr_activation_price_vwap_pos").is_null())
+        .then(da_proxy * 1.1)
+        .otherwise(pl.col("target_afrr_activation_price_vwap_pos").cast(pl.Float64))
+        .alias("target_afrr_activation_price_vwap_pos"),
+        pl.when(pl.col("target_afrr_activation_price_vwap_neg").is_null())
+        .then(da_proxy * 0.9)
+        .otherwise(pl.col("target_afrr_activation_price_vwap_neg").cast(pl.Float64))
+        .alias("target_afrr_activation_price_vwap_neg"),
+    ])
+
+    # Guarantee finite ML labels by local directional fallback if DA is unavailable.
+    out = out.with_columns([
+        pl.col("target_afrr_activation_price_vwap_pos")
+        .fill_null(strategy="forward")
+        .fill_null(strategy="backward")
+        .alias("target_afrr_activation_price_vwap_pos"),
+        pl.col("target_afrr_activation_price_vwap_neg")
+        .fill_null(strategy="forward")
+        .fill_null(strategy="backward")
+        .alias("target_afrr_activation_price_vwap_neg"),
+    ])
     return out.drop([c for c in required if c in out.columns])
 
 

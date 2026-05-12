@@ -128,6 +128,20 @@ class BidBuilder:
         q_pos = self._qfloor(float(reserve_pos_mw), self.afrr_step_mw)
         q_neg = self._qfloor(float(reserve_neg_mw), self.afrr_step_mw)
         if q_pos > 0.0:
+            cap_bid_pos = (
+                float(pred_cap_pos)
+                if is_oracle
+                else self.pricing.capacity_price(pred=float(pred_cap_pos))
+            )
+            # Avoid structurally loss-making reserve participation.
+            unit_margin_pos = (
+                cap_bid_pos
+                + max(0.0, float(pred_act_pos)) * self.eta_out
+                - self.mc_pos * self.eta_out
+            )
+            if unit_margin_pos <= 0.0:
+                q_pos = 0.0
+        if q_pos > 0.0:
             bids.append(
                 AFRRCapacityBid(
                     ts=ts,
@@ -136,11 +150,7 @@ class BidBuilder:
                     # Capacity is settled pay-as-bid: in oracle mode (pred=true),
                     # bid at forecast/true capacity price to both clear and keep
                     # economically consistent remuneration.
-                    capacity_price_eur_mw=(
-                        float(pred_cap_pos)
-                        if is_oracle
-                        else self.pricing.capacity_price(pred=float(pred_cap_pos))
-                    ),
+                    capacity_price_eur_mw=cap_bid_pos,
                     energy_price_eur_mwh=self.pricing.energy_price(
                         side="pos",
                         pred=float(pred_act_pos),
@@ -150,16 +160,25 @@ class BidBuilder:
                 )
             )
         if q_neg > 0.0:
+            cap_bid_neg = (
+                float(pred_cap_neg)
+                if is_oracle
+                else self.pricing.capacity_price(pred=float(pred_cap_neg))
+            )
+            unit_margin_neg = (
+                cap_bid_neg
+                + min(0.0, float(pred_act_neg)) / max(self.eta_in, 1e-12)
+                - self.mc_neg / max(self.eta_in, 1e-12)
+            )
+            if unit_margin_neg <= 0.0:
+                q_neg = 0.0
+        if q_neg > 0.0:
             bids.append(
                 AFRRCapacityBid(
                     ts=ts,
                     side="neg",
                     quantity_mw=q_neg,
-                    capacity_price_eur_mw=(
-                        float(pred_cap_neg)
-                        if is_oracle
-                        else self.pricing.capacity_price(pred=float(pred_cap_neg))
-                    ),
+                    capacity_price_eur_mw=cap_bid_neg,
                     energy_price_eur_mwh=self.pricing.energy_price(
                         side="neg",
                         pred=float(pred_act_neg),
@@ -203,7 +222,10 @@ class BidBuilder:
                 return -9999.0
 
         if is_oracle and true_act_price is not None and math.isfinite(float(true_act_price)):
-            return float(true_act_price)
+            # Oracle still avoids knowingly uneconomic activation prices.
+            if side == "pos":
+                return max(float(self.mc_pos), float(true_act_price))
+            return min(float(true_act_price), -float(self.mc_neg))
 
         strategy = str(self.afrr_energy_bid_strategy).lower().strip()
         if strategy == "forecast":
@@ -251,6 +273,11 @@ class BidBuilder:
         bids: list[DABid] = []
         if plan_buy_mw > 0.0:
             buy_is_hedge = self.link_da_to_awarded_afrr and float(obligation_pos_mw) > 0.0
+            # Non-hedging DA buy requires clearly favorable entry price.
+            if (not buy_is_hedge) and (float(pred_da_price) > -float(self.mc_pos)):
+                plan_buy_mw = 0.0
+        if plan_buy_mw > 0.0:
+            buy_is_hedge = self.link_da_to_awarded_afrr and float(obligation_pos_mw) > 0.0
             buy_mode = "price_taker" if (is_oracle or buy_is_hedge) else self.da_arb_mode
             buy_price = (
                 self.pricing.da_buy_limit_price_eur_mwh if buy_mode == "price_taker" else float(pred_da_price)
@@ -265,6 +292,11 @@ class BidBuilder:
                     reason="afrr_hedge" if buy_is_hedge else "da_arbitrage",
                 )
             )
+        if plan_sell_mw > 0.0:
+            sell_is_hedge = self.link_da_to_awarded_afrr and float(obligation_neg_mw) > 0.0
+            sell_unit_margin = float(pred_da_price) * self.eta_out - float(self.mc_neg) * self.eta_out
+            if (not sell_is_hedge) and (sell_unit_margin <= 0.0):
+                plan_sell_mw = 0.0
         if plan_sell_mw > 0.0:
             sell_is_hedge = self.link_da_to_awarded_afrr and float(obligation_neg_mw) > 0.0
             sell_mode = "price_taker" if (is_oracle or sell_is_hedge) else self.da_arb_mode

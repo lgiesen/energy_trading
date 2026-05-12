@@ -60,6 +60,7 @@ CPP_FILES_BASE_URL = "https://www.regelleistung.net/apps/cpp-publisher/api/v2/te
 # Collect full 15-minute activation price streams while parsing yearly files.
 ALL_15MIN_PRICE_DATA: list[pd.DataFrame] = []
 PICASSO_START_UTC = pd.Timestamp(PICASSO_RELEASE_UTC)
+MICRO_VOLUME_FILTER_MW = 1.0
 
 
 def _log_dst_drop(label: str, ts_series: pd.Series, date_series: pd.Series) -> None:
@@ -989,27 +990,38 @@ def _aggregate_hourly_with_vwap(df_15m: pd.DataFrame) -> pd.DataFrame:
             )
 
     if {price_pos, vol_pos}.issubset(df_15m.columns):
-        df_15m["weighted_cost_pos"] = df_15m[price_pos] * df_15m[vol_pos].abs()
+        vol_pos_abs = df_15m[vol_pos].abs().astype(float)
+        # Micro-volume guard: tiny activations should not dominate hourly VWAP.
+        vol_pos_vwap = vol_pos_abs.where(vol_pos_abs >= MICRO_VOLUME_FILTER_MW, 0.0)
+        df_15m["weighted_cost_pos"] = (df_15m[price_pos].astype(float) * vol_pos_vwap).astype(float)
+        df_15m["vwap_vol_pos"] = vol_pos_vwap.astype(float)
     if {price_neg, vol_neg}.issubset(df_15m.columns):
-        df_15m["weighted_cost_neg"] = df_15m[price_neg] * df_15m[vol_neg].abs()
+        vol_neg_abs = df_15m[vol_neg].abs().astype(float)
+        # Micro-volume guard: tiny activations should not dominate hourly VWAP.
+        vol_neg_vwap = vol_neg_abs.where(vol_neg_abs >= MICRO_VOLUME_FILTER_MW, 0.0)
+        df_15m["weighted_cost_neg"] = (df_15m[price_neg].astype(float) * vol_neg_vwap).astype(float)
+        df_15m["vwap_vol_neg"] = vol_neg_vwap.astype(float)
 
     hourly = df_15m.resample("1h").mean(numeric_only=True)
 
-    if {"weighted_cost_pos", vol_pos, price_pos}.issubset(df_15m.columns):
+    if {"weighted_cost_pos", "vwap_vol_pos"}.issubset(df_15m.columns):
         sum_weighted_pos = df_15m["weighted_cost_pos"].resample("1h").sum(min_count=1)
-        sum_vol_pos = df_15m[vol_pos].abs().resample("1h").sum(min_count=1)
-        mean_price_pos = df_15m[price_pos].resample("1h").mean()
-        vwap_pos = np.where(sum_vol_pos != 0, sum_weighted_pos / sum_vol_pos, mean_price_pos)
+        sum_vol_pos = df_15m["vwap_vol_pos"].resample("1h").sum(min_count=1)
+        # Strict semantics: no activated volume => undefined price (NaN).
+        vwap_pos = np.where(sum_vol_pos > 0, sum_weighted_pos / sum_vol_pos, np.nan)
         hourly["afrr_activation_price_vwap_pos"] = vwap_pos
 
-    if {"weighted_cost_neg", vol_neg, price_neg}.issubset(df_15m.columns):
+    if {"weighted_cost_neg", "vwap_vol_neg"}.issubset(df_15m.columns):
         sum_weighted_neg = df_15m["weighted_cost_neg"].resample("1h").sum(min_count=1)
-        sum_vol_neg = df_15m[vol_neg].abs().resample("1h").sum(min_count=1)
-        mean_price_neg = df_15m[price_neg].resample("1h").mean()
-        vwap_neg = np.where(sum_vol_neg != 0, sum_weighted_neg / sum_vol_neg, mean_price_neg)
+        sum_vol_neg = df_15m["vwap_vol_neg"].resample("1h").sum(min_count=1)
+        # Strict semantics: no activated volume => undefined price (NaN).
+        vwap_neg = np.where(sum_vol_neg > 0, sum_weighted_neg / sum_vol_neg, np.nan)
         hourly["afrr_activation_price_vwap_neg"] = vwap_neg
 
-    return hourly.drop(columns=[c for c in ["weighted_cost_pos", "weighted_cost_neg"] if c in hourly.columns], errors="ignore")
+    return hourly.drop(
+        columns=[c for c in ["weighted_cost_pos", "weighted_cost_neg", "vwap_vol_pos", "vwap_vol_neg"] if c in hourly.columns],
+        errors="ignore",
+    )
 
 
 def _export_afrr_15min_price_volume(
