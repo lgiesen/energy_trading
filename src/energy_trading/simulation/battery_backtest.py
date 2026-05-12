@@ -228,6 +228,20 @@ class BatteryBacktester:
         # Penalty used for non-delivery / imbalance settlement when awarded aFRR
         # cannot be physically delivered due to SoC constraints.
         self.imbalance_penalty_eur_mwh = float(FINANCIAL_PARAMS.get("imbalance_penalty_eur_mwh", 500.0))
+        self.afrr_penalty_aufschlag_eur_mwh = float(FINANCIAL_PARAMS.get("afrr_penalty_aufschlag_eur_mwh", 30.0))
+        self.afrr_penalty_aufschlag_eur_mw_h = float(FINANCIAL_PARAMS.get("afrr_penalty_aufschlag_eur_mw_h", 3.0))
+        self.afrr_penalty_default_marginal_energy_price_eur_mwh = float(
+            FINANCIAL_PARAMS.get("afrr_penalty_default_marginal_energy_price_eur_mwh", 150.0)
+        )
+        self.afrr_penalty_default_avg_capacity_price_product_eur_mw_h = float(
+            FINANCIAL_PARAMS.get("afrr_penalty_default_avg_capacity_price_product_eur_mw_h", 12.5)
+        )
+        self.afrr_penalty_default_idaep_eur_mwh = float(
+            FINANCIAL_PARAMS.get("afrr_penalty_default_idaep_eur_mwh", 100.0)
+        )
+        self.afrr_capacity_penalty_only_on_repeated_violation = bool(
+            FINANCIAL_PARAMS.get("afrr_capacity_penalty_only_on_repeated_violation", True)
+        )
 
         self.bid_power_max_mw = float(MARKET_SPECS.get("bid_power_max_mw", self.p_max_mw))
         self.reserve_max_mw = min(self.p_max_mw, self.bid_power_max_mw)
@@ -239,7 +253,10 @@ class BatteryBacktester:
         self.da_min_bid_size_mw = float(MARKET_SPECS.get("da_min_bid_size", self.da_bid_granularity_mw))
         self.afrr_min_bid_size_mw = float(MARKET_SPECS.get("afrr_min_bid_size", self.afrr_bid_granularity_mw))
         # aFRR bid-price bins for expected-value reserve optimization.
-        self.afrr_bid_prices_eur_mwh = np.arange(50.0, 501.0, 50.0, dtype=float)
+        afrr_bid_min = float(MARKET_SPECS.get("afrr_bid_price_min_eur_mwh", 50.0))
+        afrr_bid_max = float(MARKET_SPECS.get("afrr_bid_price_max_eur_mwh", 500.0))
+        afrr_bid_step = float(MARKET_SPECS.get("afrr_bid_price_step_eur_mwh", 50.0))
+        self.afrr_bid_prices_eur_mwh = np.arange(afrr_bid_min, afrr_bid_max + 0.5 * afrr_bid_step, afrr_bid_step, dtype=float)
         self.da_execution_mode = str(MARKET_SPECS.get("da_execution_mode", "price_taker"))
         self.da_link_to_awarded_afrr = bool(MARKET_SPECS.get("da_link_to_awarded_afrr", True))
         self.bid_pricing_policy = BidPricingPolicy(
@@ -268,8 +285,11 @@ class BatteryBacktester:
         )
         # Keep settlement penalty coefficients centralized so optimizer and
         # settlement can use consistent economics.
-        self.capacity_penalty_multiplier = 2.0
-        self.capacity_penalty_price_floor_eur_mw_h = 10.0
+        self.capacity_penalty_multiplier = float(MARKET_SPECS.get("capacity_penalty_multiplier", 2.0))
+        self.capacity_penalty_price_floor_eur_mw_h = float(MARKET_SPECS.get("capacity_penalty_price_floor_eur_mw_h", 10.0))
+        self.id_rescue_spread_eur_mwh = float(MARKET_SPECS.get("id_rescue_spread_eur_mwh", 30.0))
+        self.id_buy_price_cap_eur_mwh = float(MARKET_SPECS.get("id_buy_price_cap_eur_mwh", 3000.0))
+        self.id_sell_price_floor_eur_mwh = float(MARKET_SPECS.get("id_sell_price_floor_eur_mwh", -500.0))
         # MILP runtime controls:
         # - default execution is bounded and robust for rolling simulation
         # - diagnostic mode can be enabled to inspect HiGHS solver behavior
@@ -964,6 +984,14 @@ class BatteryBacktester:
         da_discharge_mw: float | None = None,
         id_charge_mw: float = 0.0,
         id_discharge_mw: float = 0.0,
+        marginal_energy_price_pos_eur_mwh: float | None = None,
+        marginal_energy_price_neg_eur_mwh: float | None = None,
+        average_capacity_price_product_eur_mw_h: float | None = None,
+        idaep_pos_eur_mwh: float | None = None,
+        idaep_neg_eur_mwh: float | None = None,
+        aufschlag_eur_mwh: float | None = None,
+        aufschlag_eur_mw_h: float | None = None,
+        repeated_violation_flag: bool = False,
     ) -> tuple[float, dict[str, float]]:
         """
         3-Layer ID Rescue settlement:
@@ -1038,12 +1066,12 @@ class BatteryBacktester:
         rev_da = da_sell_grid * da_price
         cost_da = da_buy_grid * da_price
         # Synthetic ID rescue prices with EPEX technical caps.
-        id_buy_price_eur_mwh = min(3000.0, float(da_price) + 30.0)
-        id_sell_price_eur_mwh = max(-500.0, float(da_price) - 30.0)
+        id_buy_price_eur_mwh = min(self.id_buy_price_cap_eur_mwh, float(da_price) + self.id_rescue_spread_eur_mwh)
+        id_sell_price_eur_mwh = max(self.id_sell_price_floor_eur_mwh, float(da_price) - self.id_rescue_spread_eur_mwh)
         cost_id_eur = id_buy_mwh * id_buy_price_eur_mwh
         revenue_id_eur = id_sell_mwh * id_sell_price_eur_mwh
         id_trade_mwh = id_buy_mwh + id_sell_mwh
-        id_slippage_cost_eur = id_trade_mwh * 30.0
+        id_slippage_cost_eur = id_trade_mwh * self.id_rescue_spread_eur_mwh
 
         # Capacity non-delivery check on post-rescue SoC (ID already applied).
         soc_for_capacity = soc + self.eta_in * id_ch_internal - id_dis_internal / self.eta_out
@@ -1100,27 +1128,69 @@ class BatteryBacktester:
             da_ch_internal + da_dis_internal + id_ch_internal + id_dis_internal + act_pos_internal + act_neg_internal
         )
 
+        # aFRR-Penalty gemäß regelleistung.net:
+        # Nichtlieferung -> P_unavailable * max(P_product_slice, IDAEP + Aufschlag)
+        # Wiederholung -> zusätzliche/verstärkte Kapazitätsstrafe.
+        # Quelle: https://www.regelleistung.net/de-de/Anbieter-werden/Abrechnung/automatic-Frequency-Restoration-Reserve
         missed_activation_pos_mwh = max(0.0, act_pos_grid_req - act_pos_grid)
         missed_activation_neg_mwh = max(0.0, act_neg_grid_req - act_neg_grid)
-        penalty_activation_pos_eur = missed_activation_pos_mwh * self.imbalance_penalty_eur_mwh
-        penalty_activation_neg_eur = missed_activation_neg_mwh * self.imbalance_penalty_eur_mwh
+
+        marginal_pos = float(
+            self.afrr_penalty_default_marginal_energy_price_eur_mwh
+            if marginal_energy_price_pos_eur_mwh is None or not np.isfinite(marginal_energy_price_pos_eur_mwh)
+            else marginal_energy_price_pos_eur_mwh
+        )
+        marginal_neg = float(
+            self.afrr_penalty_default_marginal_energy_price_eur_mwh
+            if marginal_energy_price_neg_eur_mwh is None or not np.isfinite(marginal_energy_price_neg_eur_mwh)
+            else marginal_energy_price_neg_eur_mwh
+        )
+        # Fallback to realized activation prices if caller does not provide explicit marginal prices.
+        if marginal_energy_price_pos_eur_mwh is None or not np.isfinite(marginal_energy_price_pos_eur_mwh):
+            if np.isfinite(act_pos_price):
+                marginal_pos = float(abs(act_pos_price))
+        if marginal_energy_price_neg_eur_mwh is None or not np.isfinite(marginal_energy_price_neg_eur_mwh):
+            if np.isfinite(act_neg_price):
+                marginal_neg = float(abs(act_neg_price))
+
+        idaep_pos = float(
+            self.afrr_penalty_default_idaep_eur_mwh
+            if idaep_pos_eur_mwh is None or not np.isfinite(idaep_pos_eur_mwh)
+            else idaep_pos_eur_mwh
+        )
+        idaep_neg = float(
+            self.afrr_penalty_default_idaep_eur_mwh
+            if idaep_neg_eur_mwh is None or not np.isfinite(idaep_neg_eur_mwh)
+            else idaep_neg_eur_mwh
+        )
+        auf_mwh = float(self.afrr_penalty_aufschlag_eur_mwh if aufschlag_eur_mwh is None else aufschlag_eur_mwh)
+        auf_mw_h = float(self.afrr_penalty_aufschlag_eur_mw_h if aufschlag_eur_mw_h is None else aufschlag_eur_mw_h)
+        avg_cap_prod = float(
+            self.afrr_penalty_default_avg_capacity_price_product_eur_mw_h
+            if average_capacity_price_product_eur_mw_h is None or not np.isfinite(average_capacity_price_product_eur_mw_h)
+            else average_capacity_price_product_eur_mw_h
+        )
+
+        penalty_activation_basis_pos_eur_mwh = max(float(abs(marginal_pos)), float(abs(idaep_pos + auf_mwh)))
+        penalty_activation_basis_neg_eur_mwh = max(float(abs(marginal_neg)), float(abs(idaep_neg + auf_mwh)))
+        penalty_activation_pos_eur = missed_activation_pos_mwh * penalty_activation_basis_pos_eur_mwh
+        penalty_activation_neg_eur = missed_activation_neg_mwh * penalty_activation_basis_neg_eur_mwh
         penalty_activation_eur = penalty_activation_pos_eur + penalty_activation_neg_eur
-        # Stylized Proxy Penalty: Approximates the incentive-based settlement of
-        # regelleistung.net. Uses a fixed multiplier of 2.0 and a 10 EUR/MW floor
-        # as a conservative economic proxy for non-delivery exposure.
-        cap_penalty_price_floor_eur_mw_h = float(self.capacity_penalty_price_floor_eur_mw_h)
-        penalty_capacity_pos_eur = (
-            float(self.capacity_penalty_multiplier)
-            * missed_capacity_pos_mw
-            * max(cap_penalty_price_floor_eur_mw_h, float(cap_pos))
-            * self.dt_h
-        )
-        penalty_capacity_neg_eur = (
-            float(self.capacity_penalty_multiplier)
-            * missed_capacity_neg_mw
-            * max(cap_penalty_price_floor_eur_mw_h, float(cap_neg))
-            * self.dt_h
-        )
+
+        apply_capacity_penalty = bool(repeated_violation_flag)
+        if self.afrr_capacity_penalty_only_on_repeated_violation:
+            apply_capacity_penalty = bool(repeated_violation_flag)
+        if apply_capacity_penalty:
+            # As requested: hourly proxy in EUR/MW/h using IDAEP/1000 + markup.
+            penalty_capacity_basis_pos_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_pos)) / 1000.0 + auf_mw_h)
+            penalty_capacity_basis_neg_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_neg)) / 1000.0 + auf_mw_h)
+            penalty_capacity_pos_eur = missed_capacity_pos_mw * penalty_capacity_basis_pos_eur_mw_h * self.dt_h
+            penalty_capacity_neg_eur = missed_capacity_neg_mw * penalty_capacity_basis_neg_eur_mw_h * self.dt_h
+        else:
+            penalty_capacity_basis_pos_eur_mw_h = 0.0
+            penalty_capacity_basis_neg_eur_mw_h = 0.0
+            penalty_capacity_pos_eur = 0.0
+            penalty_capacity_neg_eur = 0.0
         penalty_capacity_eur = penalty_capacity_pos_eur + penalty_capacity_neg_eur
         penalty_eur = penalty_activation_eur + penalty_capacity_eur
 
@@ -1160,9 +1230,14 @@ class BatteryBacktester:
             "penalty_activation_pos_eur": penalty_activation_pos_eur,
             "penalty_activation_neg_eur": penalty_activation_neg_eur,
             "penalty_activation_eur": penalty_activation_eur,
+            "penalty_activation_basis_pos_eur_mwh": penalty_activation_basis_pos_eur_mwh,
+            "penalty_activation_basis_neg_eur_mwh": penalty_activation_basis_neg_eur_mwh,
             "penalty_capacity_pos_eur": penalty_capacity_pos_eur,
             "penalty_capacity_neg_eur": penalty_capacity_neg_eur,
             "penalty_capacity_eur": penalty_capacity_eur,
+            "penalty_capacity_basis_pos_eur_mw_h": penalty_capacity_basis_pos_eur_mw_h,
+            "penalty_capacity_basis_neg_eur_mw_h": penalty_capacity_basis_neg_eur_mw_h,
+            "repeated_violation_flag": float(bool(repeated_violation_flag)),
             "penalty_eur": penalty_eur,
             "net_cashflow_eur": net_cashflow_eur,
             "pnl_eur": pnl,

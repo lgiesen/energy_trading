@@ -25,7 +25,7 @@ BATTERY_SPECS = {
 
     # Costs
     "degradation_cost": 25.0,  # EUR/MWh internal throughput
-    "aux_power_mw": 0.2,  # AC-side house load (cooling/BMS/etc.)
+    "aux_power_mw": 0.07,  # AC-side house load (cooling/BMS/etc.)
 }
 BATTERY_SPECS["efficiency_rt"] = BATTERY_SPECS["efficiency_in"] * BATTERY_SPECS["efficiency_out"]
 
@@ -40,6 +40,13 @@ FINANCIAL_PARAMS = {
     "transaction_cost_eur_per_mwh": 1.0,  # C_trans in thesis
     "risk_margin_eur_per_mwh": 0.0,  # Optional conservative margin for thresholds
     "imbalance_penalty_eur_mwh": 500.0,  # Non-delivery/imbalance penalty proxy
+    # aFRR penalty calibration (regelleistung-style proxy inputs/fallbacks)
+    "afrr_penalty_aufschlag_eur_mwh": 30.0,
+    "afrr_penalty_aufschlag_eur_mw_h": 3.0,
+    "afrr_penalty_default_marginal_energy_price_eur_mwh": 150.0,
+    "afrr_penalty_default_avg_capacity_price_product_eur_mw_h": 12.5,
+    "afrr_penalty_default_idaep_eur_mwh": 100.0,
+    "afrr_capacity_penalty_only_on_repeated_violation": True,
 }
 
 # --- MARKET CONSTRAINTS ---
@@ -54,8 +61,19 @@ MARKET_SPECS = {
     "afrr_capacity_bid_risk_lambda": 0.2,
     "afrr_activation_bid_risk_lambda": 0.2,
     "afrr_energy_bid_strategy": "forecast",  # "forecast" | "marginal_cost" | "hybrid"
+    # aFRR reserve bid-price bins used in optimization objective (EUR/MWh)
+    "afrr_bid_price_min_eur_mwh": 50.0,
+    "afrr_bid_price_max_eur_mwh": 500.0,
+    "afrr_bid_price_step_eur_mwh": 50.0,
     "da_buy_limit_price_eur_mwh": 3000.0,
     "da_sell_limit_price_eur_mwh": -500.0,
+    # Synthetic ID rescue pricing around DA with market caps/floors
+    "id_rescue_spread_eur_mwh": 30.0,
+    "id_buy_price_cap_eur_mwh": 3000.0,
+    "id_sell_price_floor_eur_mwh": -500.0,
+    # Optimizer slack-penalty calibration (legacy proxy for non-delivery exposure)
+    "capacity_penalty_multiplier": 2.0,
+    "capacity_penalty_price_floor_eur_mw_h": 10.0,
     # Keep separate from optimization step on purpose:
     # optimization uses 60 min, settlement/input granularity is 15 min.
     "settlement_period_min": 15,  # Settlement/input granularity for imbalance/SRL
@@ -103,6 +121,10 @@ def _validate_config() -> None:
 
     if MARKET_SPECS["afrr_bid_granularity"] <= 0:
         raise ValueError("afrr_bid_granularity must be > 0.")
+    if MARKET_SPECS["afrr_bid_price_step_eur_mwh"] <= 0:
+        raise ValueError("afrr_bid_price_step_eur_mwh must be > 0.")
+    if MARKET_SPECS["afrr_bid_price_max_eur_mwh"] < MARKET_SPECS["afrr_bid_price_min_eur_mwh"]:
+        raise ValueError("afrr_bid_price_max_eur_mwh must be >= afrr_bid_price_min_eur_mwh.")
     if MARKET_SPECS["da_execution_mode"] not in {"price_taker", "limit"}:
         raise ValueError("da_execution_mode must be one of {'price_taker', 'limit'}.")
     if MARKET_SPECS["da_arbitrage_mode"] not in {"price_taker", "limit"}:
@@ -115,6 +137,10 @@ def _validate_config() -> None:
         raise ValueError("afrr_activation_bid_risk_lambda must be >= 0.")
     if MARKET_SPECS["afrr_min_bid_size"] < 0:
         raise ValueError("afrr_min_bid_size must be >= 0.")
+    if MARKET_SPECS["capacity_penalty_multiplier"] < 0:
+        raise ValueError("capacity_penalty_multiplier must be >= 0.")
+    if MARKET_SPECS["capacity_penalty_price_floor_eur_mw_h"] < 0:
+        raise ValueError("capacity_penalty_price_floor_eur_mw_h must be >= 0.")
     if MARKET_SPECS["settlement_period_min"] <= 0:
         raise ValueError("settlement_period_min must be > 0.")
     if MARKET_SPECS["bid_power_max_mw"] <= 0:
