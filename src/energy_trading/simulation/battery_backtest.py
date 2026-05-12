@@ -754,21 +754,9 @@ class BatteryBacktester:
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
-            # Mixed-integer exclusivity (Big-M):
-            # charge[t] <= is_charging[t] * Pmax
-            row = np.zeros(n_vars, dtype=float)
-            row[sl["ch"].start + t] = da_step
-            row[sl["u"].start + t] = -self.p_max_mw
-            a_ub.append(row)
-            b_ub.append(0.0)
-
-            # discharge[t] <= (1 - is_charging[t]) * Pmax
-            # <=> discharge[t] + is_charging[t] * Pmax <= Pmax
-            row = np.zeros(n_vars, dtype=float)
-            row[sl["dis"].start + t] = da_step
-            row[sl["u"].start + t] = self.p_max_mw
-            a_ub.append(row)
-            b_ub.append(self.p_max_mw)
+            # Note: DA charge/discharge mutual exclusivity has been relaxed by request.
+            # Simultaneous charge/discharge is therefore allowed as long as all
+            # other physical/power constraints remain satisfied.
 
             # DA gate-closure lock: fixed day-ahead charge/discharge bids.
             if fixed_da_dispatch and da_enabled:
@@ -854,12 +842,10 @@ class BatteryBacktester:
             b_eq_arr = np.array(b_eq)
             constraints.append(LinearConstraint(a_eq_arr, b_eq_arr, b_eq_arr))
 
+        # LP relaxation by design: all dispatch/reserve/auxiliary variables continuous.
+        # This avoids NP-hard branch-and-bound behavior from integer decisions and
+        # improves solve robustness for oracle benchmarking.
         integrality = np.zeros(n_vars, dtype=int)
-        integrality[sl["ch"]] = 1
-        integrality[sl["dis"]] = 1
-        integrality[sl["rpos_bin"]] = 1
-        integrality[sl["rneg_bin"]] = 1
-        integrality[sl["u"]] = 1
 
         milp_options = self._milp_options()
         sol = milp(
@@ -920,7 +906,7 @@ class BatteryBacktester:
             + ev_terminal_soc_credit_eur
         )
         extra_cols: dict[str, np.ndarray] = {
-            "is_charging": x[sl["u"]],
+            "is_charging": (charge_mw > 1e-9).astype(float),
             "soc_lp_mwh": soc_lp,
             "slack_pos_mw": slack_pos,
             "slack_neg_mw": slack_neg,
@@ -2673,7 +2659,10 @@ class BatteryBacktester:
             allowed_markets_local: tuple[str, ...],
             deterministic_local: bool,
             is_oracle_local: bool,
-        ) -> tuple[float, bool]:
+        ) -> tuple[float, bool, dict[str, float]]:
+            allowed_local = {str(m).strip().lower() for m in allowed_markets_local}
+            is_da_only = allowed_local == {"da"}
+            is_afrr_only = allowed_local == {"afrr"}
             try:
                 if use_rolling_horizon:
                     path_dispatch, _ = self.optimize_dispatch_rolling(
@@ -2702,7 +2691,14 @@ class BatteryBacktester:
                 # Isolated market ablation can be infeasible under strict physics;
                 # keep full backtest robust and report feasibility in summary.
                 if "infeasible" in str(exc).lower():
-                    return 0.0, False
+                    return 0.0, False, {
+                        "da_net_eur": 0.0,
+                        "afrr_net_eur": 0.0,
+                        "id_net_eur": 0.0,
+                        "common_costs_eur": 0.0,
+                        "terminal_value_eur": 0.0,
+                        "pnl_excl_terminal_eur": 0.0,
+                    }
                 raise
             path_real = self.settle_dispatch(
                 path_df,
@@ -2712,10 +2708,36 @@ class BatteryBacktester:
                 apply_market_clearing=True,
                 oracle_mode=is_oracle_local,
             )
-            pnl_excl = float(path_real["real_pnl_eur"].sum()) if not path_real.empty else 0.0
+            # Strategy-explicit component accounting to prevent cross-market
+            # leakage in isolated ablation reports.
+            da_net = float(
+                path_real.get("real_revenue_da_eur", 0.0).sum()
+                - path_real.get("real_cost_da_eur", 0.0).sum()
+            ) if not path_real.empty else 0.0
+            afrr_net = float(
+                path_real.get("real_revenue_capacity_eur", 0.0).sum()
+                + path_real.get("real_revenue_activation_eur", 0.0).sum()
+            ) if not path_real.empty else 0.0
+            id_net = float(
+                path_real.get("real_revenue_id_eur", 0.0).sum()
+                - path_real.get("real_cost_id_eur", 0.0).sum()
+            ) if not path_real.empty else 0.0
+            common_costs = float(
+                -path_real.get("real_transaction_cost_eur", 0.0).sum()
+                - path_real.get("real_degradation_cost_eur", 0.0).sum()
+                - path_real.get("real_penalty_eur", 0.0).sum()
+            ) if not path_real.empty else 0.0
+            if path_real.empty:
+                pnl_excl = 0.0
+            elif is_da_only:
+                pnl_excl = da_net + id_net + common_costs
+            elif is_afrr_only:
+                pnl_excl = afrr_net + id_net + common_costs
+            else:
+                pnl_excl = float(path_real["real_pnl_eur"].sum())
             final_soc = float(path_real["real_soc_mwh"].iloc[-1]) if (not path_real.empty and "real_soc_mwh" in path_real.columns) else float(self.soc_init)
             da_true_last_local = self._finite_numeric_series(
-                df,
+                path_df,
                 colmap.true_da_price,
                 fallback_cols=[colmap.pred_da_price],
                 default=0.0,
@@ -2725,7 +2747,14 @@ class BatteryBacktester:
                 float(da_true_last_local.iloc[-1]) if len(da_true_last_local) else 0.0,
             )
             terminal_value_local = max(0.0, final_soc - self.soc_min) * self.eta_out * terminal_price_local
-            return float(pnl_excl + terminal_value_local), True
+            return float(pnl_excl + terminal_value_local), True, {
+                "da_net_eur": float(da_net),
+                "afrr_net_eur": float(afrr_net),
+                "id_net_eur": float(id_net),
+                "common_costs_eur": float(common_costs),
+                "terminal_value_eur": float(terminal_value_local),
+                "pnl_excl_terminal_eur": float(pnl_excl),
+            }
 
         plan_history = pd.DataFrame()
         if use_rolling_horizon:
@@ -2830,29 +2859,39 @@ class BatteryBacktester:
         oracle_df[colmap.pred_afrr_activation_price_neg] = oracle_df[colmap.true_afrr_activation_price_neg]
         oracle_df[colmap.pred_afrr_activation_rate_pos] = oracle_df[colmap.true_afrr_activation_rate_pos]
         oracle_df[colmap.pred_afrr_activation_rate_neg] = oracle_df[colmap.true_afrr_activation_rate_neg]
-        if use_rolling_horizon:
-            oracle_dispatch, _ = self.optimize_dispatch_rolling(
-                oracle_df,
-                colmap,
-                horizon_hours=horizon_hours,
-                reopt_step_hours=reopt_step_hours,
-                da_gate_hour_cet=da_gate_hour_cet,
-                soc_feedback_mode=soc_feedback_mode,
-                enforce_final_soc_min=enforce_final_soc_min,
-                deterministic_reserve_settlement=True,
-                is_oracle=True,
-                allowed_markets=("DA", "aFRR"),
-            )
-        else:
-            oracle_dispatch = self.optimize_dispatch(
-                oracle_df,
-                colmap,
-                soc_start=self.soc_init,
-                soc_end_target=None,
-                soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
-                deterministic_reserve_settlement=True,
-                allowed_markets=("DA", "aFRR"),
-            )
+        # Oracle benchmark should be as close as possible to global optimum.
+        # Apply stricter/longer solver settings locally for this branch.
+        _orig_tl = float(self.milp_time_limit_seconds)
+        _orig_gap = float(self.milp_rel_gap)
+        self.milp_time_limit_seconds = max(_orig_tl, 300.0)
+        self.milp_rel_gap = min(_orig_gap, 1e-4)
+        try:
+            if use_rolling_horizon:
+                oracle_dispatch, _ = self.optimize_dispatch_rolling(
+                    oracle_df,
+                    colmap,
+                    horizon_hours=horizon_hours,
+                    reopt_step_hours=reopt_step_hours,
+                    da_gate_hour_cet=da_gate_hour_cet,
+                    soc_feedback_mode=soc_feedback_mode,
+                    enforce_final_soc_min=enforce_final_soc_min,
+                    deterministic_reserve_settlement=True,
+                    is_oracle=True,
+                    allowed_markets=("DA", "aFRR"),
+                )
+            else:
+                oracle_dispatch = self.optimize_dispatch(
+                    oracle_df,
+                    colmap,
+                    soc_start=self.soc_init,
+                    soc_end_target=None,
+                    soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
+                    deterministic_reserve_settlement=True,
+                    allowed_markets=("DA", "aFRR"),
+                )
+        finally:
+            self.milp_time_limit_seconds = _orig_tl
+            self.milp_rel_gap = _orig_gap
         with _phase_watchdog("settlement_oracle_realized"):
             oracle_real = self.settle_dispatch(
                 oracle_df,
@@ -2871,25 +2910,25 @@ class BatteryBacktester:
         )
 
         # Isolated market ablation paths (value of stacking).
-        realized_da_only_total, realized_da_only_feasible = _run_isolated_path(
+        realized_da_only_total, realized_da_only_feasible, realized_da_only_diag = _run_isolated_path(
             path_df=df,
             allowed_markets_local=("DA",),
             deterministic_local=False,
             is_oracle_local=False,
         )
-        oracle_da_only_total, oracle_da_only_feasible = _run_isolated_path(
+        oracle_da_only_total, oracle_da_only_feasible, oracle_da_only_diag = _run_isolated_path(
             path_df=oracle_df,
             allowed_markets_local=("DA",),
             deterministic_local=True,
             is_oracle_local=True,
         )
-        realized_afrr_only_total, realized_afrr_only_feasible = _run_isolated_path(
+        realized_afrr_only_total, realized_afrr_only_feasible, realized_afrr_only_diag = _run_isolated_path(
             path_df=df,
             allowed_markets_local=("aFRR",),
             deterministic_local=False,
             is_oracle_local=False,
         )
-        oracle_afrr_only_total, oracle_afrr_only_feasible = _run_isolated_path(
+        oracle_afrr_only_total, oracle_afrr_only_feasible, oracle_afrr_only_diag = _run_isolated_path(
             path_df=oracle_df,
             allowed_markets_local=("aFRR",),
             deterministic_local=True,
@@ -3058,6 +3097,28 @@ class BatteryBacktester:
                 summary["oracle_da_only_total_pnl_eur"]
                 + summary["oracle_afrr_only_total_pnl_eur"]
             )
+        )
+        for prefix, diag in (
+            ("realized_da_only", realized_da_only_diag),
+            ("oracle_da_only", oracle_da_only_diag),
+            ("realized_afrr_only", realized_afrr_only_diag),
+            ("oracle_afrr_only", oracle_afrr_only_diag),
+        ):
+            for k, v in diag.items():
+                summary[f"{prefix}_{k}"] = float(v)
+        def _safe_ratio(num: float, den: float) -> float:
+            return float(num / den) if abs(float(den)) > 1e-12 else float("nan")
+        summary["realized_vs_oracle_ratio_da_only"] = _safe_ratio(
+            float(summary["realized_da_only_total_pnl_eur"]),
+            float(summary["oracle_da_only_total_pnl_eur"]),
+        )
+        summary["realized_vs_oracle_ratio_afrr_only"] = _safe_ratio(
+            float(summary["realized_afrr_only_total_pnl_eur"]),
+            float(summary["oracle_afrr_only_total_pnl_eur"]),
+        )
+        summary["realized_vs_oracle_ratio_multi_market"] = _safe_ratio(
+            float(summary["realized_total_pnl_eur"]),
+            float(summary["oracle_total_pnl_eur"]),
         )
         # Economic building blocks for thesis-grade PnL decomposition.
         summary["total_da_revenue_eur"] = float(hourly["real_revenue_da_eur"].sum())

@@ -900,6 +900,7 @@ def main() -> None:
         state_machine_audit_path = scenario_out_dir / "state_machine_audit.json"
         diagnostics_path = scenario_out_dir / "backtest_diagnostics.json"
         diagnostics_txt_path = scenario_out_dir / "backtest_diagnostics.txt"
+        oracle_paradox_path = scenario_out_dir / "oracle_paradox_hours.csv"
         pnl_plot_path = scenario_out_dir / "backtest_cumulative_pnl.png"
 
         with _phase_watchdog("write_hourly"):
@@ -1014,10 +1015,28 @@ def main() -> None:
                 except Exception:
                     return str(v)
                 return f"{fv:.2f}" if pd.notna(fv) else "nan"
+            ts_col = colmap.timestamp if colmap.timestamp in outputs.hourly.columns else None
+            if ts_col is not None and not outputs.hourly.empty:
+                _ts = pd.to_datetime(outputs.hourly[ts_col], utc=True, errors="coerce").dropna()
+            else:
+                _ts = pd.Series(dtype="datetime64[ns, UTC]")
+            if len(_ts) > 0:
+                timeframe_start = _ts.min()
+                timeframe_end = _ts.max()
+                num_days_total = float((timeframe_end - timeframe_start).total_seconds() / 86400.0) + (1.0 / 24.0)
+                timeframe_start_txt = timeframe_start.isoformat()
+                timeframe_end_txt = timeframe_end.isoformat()
+            else:
+                num_days_total = float("nan")
+                timeframe_start_txt = "n/a"
+                timeframe_end_txt = "n/a"
             diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
             diagnostics_txt_path.write_text(
                 "\n".join([
                     "Backtest Diagnostics",
+                    f"timeframe_start_utc={timeframe_start_txt}",
+                    f"timeframe_end_utc={timeframe_end_txt}",
+                    f"timeframe_total_days={num_days_total:.4f}" if pd.notna(num_days_total) else "timeframe_total_days=nan",
                     f"rows_hourly={diagnostics['rows_hourly']}",
                     f"numeric_nan_total={diagnostics['numeric_nan_total']}",
                     f"numeric_nonfinite_total={diagnostics['numeric_nonfinite_total']}",
@@ -1033,10 +1052,70 @@ def main() -> None:
                 ]) + "\n",
                 encoding="utf-8",
             )
+        with _phase_watchdog("write_oracle_paradox_report"):
+            hp = outputs.hourly.copy()
+            if {"oracle_pnl_eur", "real_pnl_eur"}.issubset(hp.columns):
+                hp = hp[hp["oracle_pnl_eur"] < hp["real_pnl_eur"]].copy()
+            else:
+                hp = hp.iloc[0:0].copy()
+            pos_share_cols = sorted([c for c in hp.columns if c.startswith("ev_expected_act_share_pos_bin_")])
+            neg_share_cols = sorted([c for c in hp.columns if c.startswith("ev_expected_act_share_neg_bin_")])
+            pos_res_cols = sorted([c for c in hp.columns if c.startswith("reserve_pos_bin_") and c.endswith("_mw")])
+            neg_res_cols = sorted([c for c in hp.columns if c.startswith("reserve_neg_bin_") and c.endswith("_mw")])
+            n_pos = min(len(pos_share_cols), len(pos_res_cols))
+            n_neg = min(len(neg_share_cols), len(neg_res_cols))
+            if not hp.empty and n_pos > 0:
+                exp_pos = np.zeros(len(hp), dtype=float)
+                for i in range(n_pos):
+                    exp_pos += pd.to_numeric(hp[pos_share_cols[i]], errors="coerce").fillna(0.0).to_numpy(dtype=float) * pd.to_numeric(hp[pos_res_cols[i]], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                hp["expected_act_pos_mwh_from_objective"] = exp_pos
+            else:
+                hp["expected_act_pos_mwh_from_objective"] = 0.0
+            if not hp.empty and n_neg > 0:
+                exp_neg = np.zeros(len(hp), dtype=float)
+                for i in range(n_neg):
+                    exp_neg += pd.to_numeric(hp[neg_share_cols[i]], errors="coerce").fillna(0.0).to_numpy(dtype=float) * pd.to_numeric(hp[neg_res_cols[i]], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                hp["expected_act_neg_mwh_from_objective"] = exp_neg
+            else:
+                hp["expected_act_neg_mwh_from_objective"] = 0.0
+            hp["expected_act_total_mwh_from_objective"] = hp["expected_act_pos_mwh_from_objective"] + hp["expected_act_neg_mwh_from_objective"]
+            hp["realized_act_total_mwh"] = pd.to_numeric(hp.get("real_act_pos_mwh", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(hp.get("real_act_neg_mwh", 0.0), errors="coerce").fillna(0.0)
+            hp["oracle_act_total_mwh"] = pd.to_numeric(hp.get("oracle_act_pos_mwh", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(hp.get("oracle_act_neg_mwh", 0.0), errors="coerce").fillna(0.0)
+            keep = [
+                colmap.timestamp,
+                "real_pnl_eur",
+                "oracle_pnl_eur",
+                "real_penalty_eur",
+                "oracle_penalty_eur",
+                "reserve_pos_mw",
+                "reserve_neg_mw",
+                "expected_act_pos_mwh_from_objective",
+                "expected_act_neg_mwh_from_objective",
+                "expected_act_total_mwh_from_objective",
+                "realized_act_total_mwh",
+                "oracle_act_total_mwh",
+                "real_act_pos_mwh",
+                "real_act_neg_mwh",
+                "oracle_act_pos_mwh",
+                "oracle_act_neg_mwh",
+            ]
+            keep = [c for c in keep if c in hp.columns]
+            hp[keep].to_csv(oracle_paradox_path, index=False)
         with _phase_watchdog("plot_cumulative_pnl"):
             _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
 
         print(f"[OK] Battery backtest completed for scenario={scenario_name}.")
+        ts_col = colmap.timestamp if colmap.timestamp in outputs.hourly.columns else None
+        if ts_col is not None and not outputs.hourly.empty:
+            _ts = pd.to_datetime(outputs.hourly[ts_col], utc=True, errors="coerce").dropna()
+        else:
+            _ts = pd.Series(dtype="datetime64[ns, UTC]")
+        if len(_ts) > 0:
+            timeframe_start = _ts.min()
+            timeframe_end = _ts.max()
+            num_days_total = float((timeframe_end - timeframe_start).total_seconds() / 86400.0) + (1.0 / 24.0)
+            print(f"- timeframe_utc: {timeframe_start.isoformat()} -> {timeframe_end.isoformat()}")
+            print(f"- timeframe_total_days: {num_days_total:.4f}")
         print(f"- realized_total_pnl_eur: {outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f}")
         print(f"- oracle_total_pnl_eur: {outputs.summary.get('oracle_total_pnl_eur', float('nan')):.2f}")
         print(
@@ -1053,6 +1132,15 @@ def main() -> None:
             "- Multi-market pnl (realized/oracle): "
             f"{outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f} / "
             f"{outputs.summary.get('oracle_total_pnl_eur', float('nan')):.2f}"
+        )
+        r_da = outputs.summary.get("realized_vs_oracle_ratio_da_only", float("nan"))
+        r_afrr = outputs.summary.get("realized_vs_oracle_ratio_afrr_only", float("nan"))
+        r_multi = outputs.summary.get("realized_vs_oracle_ratio_multi_market", float("nan"))
+        print(
+            "- realized/oracle ratio % (DA-only | aFRR-only | Multi): "
+            f"{(100.0 * float(r_da)) if pd.notna(r_da) else float('nan'):.2f}% | "
+            f"{(100.0 * float(r_afrr)) if pd.notna(r_afrr) else float('nan'):.2f}% | "
+            f"{(100.0 * float(r_multi)) if pd.notna(r_multi) else float('nan'):.2f}%"
         )
         print(f"- output_dir: {scenario_out_dir}")
 
