@@ -252,6 +252,8 @@ class BatteryBacktester:
             pricing_policy=self.bid_pricing_policy,
             da_step_mw=self.da_bid_granularity_mw,
             afrr_step_mw=self.afrr_bid_granularity_mw,
+            da_min_bid_size_mw=self.da_min_bid_size_mw,
+            afrr_min_bid_size_mw=self.afrr_min_bid_size_mw,
             eta_in=self.eta_in,
             eta_out=self.eta_out,
             degradation_cost_eur_mwh=self.deg_eur_mwh,
@@ -559,6 +561,8 @@ class BatteryBacktester:
         dis_coef = (p_da * self.eta_out) - self.trans_eur_mwh * self.eta_out - self.deg_eur_mwh
         c[sl["ch"]] = -(ch_coef * da_step)
         c[sl["dis"]] = -(dis_coef * da_step)
+        rpos_coef_by_bin = np.zeros((n, n_bins), dtype=float)
+        rneg_coef_by_bin = np.zeros((n, n_bins), dtype=float)
         for b, bid_price in enumerate(self.afrr_bid_prices_eur_mwh):
             # Expected activated-share (conditional on both capacity clearing and
             # activation-rate forecast).
@@ -593,6 +597,8 @@ class BatteryBacktester:
                 )
             s_pos = sl["rpos_bin"].start + b * n
             s_neg = sl["rneg_bin"].start + b * n
+            rpos_coef_by_bin[:, b] = rpos_coef
+            rneg_coef_by_bin[:, b] = rneg_coef
             c[s_pos : s_pos + n] = -(rpos_coef * afrr_step)
             c[s_neg : s_neg + n] = -(rneg_coef * afrr_step)
         # Soft chance-constraint penalties (continuous non-delivery slack).
@@ -888,10 +894,66 @@ class BatteryBacktester:
         out["discharge_mw"] = x[sl["dis"]] * da_step
         out["reserve_pos_mw"] = rpos_bin.sum(axis=1) * afrr_step
         out["reserve_neg_mw"] = rneg_bin.sum(axis=1) * afrr_step
-        out["is_charging"] = x[sl["u"]]
-        out["soc_lp_mwh"] = x[sl["soc"].start + 1 : sl["soc"].start + n + 1]
-        out["slack_pos_mw"] = x[sl["slack_pos"]]
-        out["slack_neg_mw"] = x[sl["slack_neg"]]
+        reserve_pos_bin_mw = rpos_bin * afrr_step
+        reserve_neg_bin_mw = rneg_bin * afrr_step
+        charge_mw = out["charge_mw"].to_numpy(dtype=float)
+        discharge_mw = out["discharge_mw"].to_numpy(dtype=float)
+        soc_lp = x[sl["soc"].start + 1 : sl["soc"].start + n + 1]
+        slack_pos = x[sl["slack_pos"]]
+        slack_neg = x[sl["slack_neg"]]
+        ev_da_charge_eur = ch_coef * charge_mw
+        ev_da_discharge_eur = dis_coef * discharge_mw
+        ev_afrr_pos_eur = (rpos_coef_by_bin * reserve_pos_bin_mw).sum(axis=1)
+        ev_afrr_neg_eur = (rneg_coef_by_bin * reserve_neg_bin_mw).sum(axis=1)
+        ev_slack_penalty_pos_eur = c[sl["slack_pos"]] * slack_pos
+        ev_slack_penalty_neg_eur = c[sl["slack_neg"]] * slack_neg
+        ev_terminal_soc_credit_eur = np.zeros(n, dtype=float)
+        if n > 0:
+            ev_terminal_soc_credit_eur[-1] = terminal_soc_value_eur_per_mwh * float(soc_lp[-1])
+        ev_objective_rebuild_eur = (
+            ev_da_charge_eur
+            + ev_da_discharge_eur
+            + ev_afrr_pos_eur
+            + ev_afrr_neg_eur
+            - ev_slack_penalty_pos_eur
+            - ev_slack_penalty_neg_eur
+            + ev_terminal_soc_credit_eur
+        )
+        extra_cols: dict[str, np.ndarray] = {
+            "is_charging": x[sl["u"]],
+            "soc_lp_mwh": soc_lp,
+            "slack_pos_mw": slack_pos,
+            "slack_neg_mw": slack_neg,
+            "ev_pred_da_price_eur_mwh": p_da,
+            "ev_pred_cap_pos_eur_mw": p_cap_pos,
+            "ev_pred_cap_neg_eur_mw": p_cap_neg,
+            "ev_pred_act_price_pos_eur_mwh": act_price_pos,
+            "ev_pred_act_price_neg_eur_mwh": act_price_neg,
+            "ev_pred_act_rate_pos": r_act_pos_base,
+            "ev_pred_act_rate_neg": r_act_neg_base,
+            "ev_pred_act_rate_pos_p90": r_act_pos_p90,
+            "ev_pred_act_rate_neg_p90": r_act_neg_p90,
+            "ev_da_charge_coef_eur_per_mw": ch_coef,
+            "ev_da_discharge_coef_eur_per_mw": dis_coef,
+            "ev_da_charge_eur": ev_da_charge_eur,
+            "ev_da_discharge_eur": ev_da_discharge_eur,
+            "ev_afrr_pos_eur": ev_afrr_pos_eur,
+            "ev_afrr_neg_eur": ev_afrr_neg_eur,
+            "ev_slack_penalty_pos_eur": ev_slack_penalty_pos_eur,
+            "ev_slack_penalty_neg_eur": ev_slack_penalty_neg_eur,
+            "ev_terminal_soc_credit_eur": ev_terminal_soc_credit_eur,
+            "ev_objective_rebuild_eur": ev_objective_rebuild_eur,
+        }
+        for b in range(n_bins):
+            extra_cols[f"reserve_pos_bin_{b}_mw"] = reserve_pos_bin_mw[:, b]
+            extra_cols[f"reserve_neg_bin_{b}_mw"] = reserve_neg_bin_mw[:, b]
+            extra_cols[f"ev_pacc_pos_bin_{b}"] = p_acc_cap_pos[:, b]
+            extra_cols[f"ev_pacc_neg_bin_{b}"] = p_acc_cap_neg[:, b]
+            extra_cols[f"ev_expected_act_share_pos_bin_{b}"] = p_acc_cap_pos[:, b] * r_act_pos_base
+            extra_cols[f"ev_expected_act_share_neg_bin_{b}"] = p_acc_cap_neg[:, b] * r_act_neg_base
+            extra_cols[f"ev_rpos_coef_bin_{b}_eur_per_mw"] = rpos_coef_by_bin[:, b]
+            extra_cols[f"ev_rneg_coef_bin_{b}_eur_per_mw"] = rneg_coef_by_bin[:, b]
+        out = pd.concat([out, pd.DataFrame(extra_cols, index=out.index)], axis=1, copy=False)
         out["predicted_objective_eur"] = -sol.fun
         return out
 
@@ -1953,6 +2015,17 @@ class BatteryBacktester:
             snapshot_plan["da_bid_locked"] = snapshot_plan["target_time_utc"].isin(set(da_lockbook.keys()))
             snapshot_plan["optimization_fallback"] = optimization_fallback
             snapshot_plan["optimization_error"] = optimization_error
+            snapshot_ts_current = pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True, errors="coerce")
+            is_afrr_gate_now = bool(afrr_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, 9))
+            is_da_gate_now = bool(da_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, da_gate_hour_cet))
+            if is_afrr_gate_now and is_da_gate_now:
+                snapshot_plan["milp_event_type"] = "afrr_capacity_gate+da_gate"
+            elif is_afrr_gate_now:
+                snapshot_plan["milp_event_type"] = "afrr_capacity_gate"
+            elif is_da_gate_now:
+                snapshot_plan["milp_event_type"] = "da_gate"
+            else:
+                snapshot_plan["milp_event_type"] = "none"
             plan_history.append(snapshot_plan)
 
             # Phase 1 (D-1 09:00 CET): clear aFRR capacity in 4h blocks and

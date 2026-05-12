@@ -891,6 +891,8 @@ def main() -> None:
         executed_ledger_path = scenario_out_dir / "executed_ledger.parquet"
         realized_ledger_path = scenario_out_dir / "realized_ledger.parquet"
         plan_history_path = scenario_out_dir / "backtest_plan_history.parquet"
+        milp_event_log_path = scenario_out_dir / "backtest_milp_event_log.parquet"
+        milp_event_summary_path = scenario_out_dir / "backtest_milp_event_summary.csv"
         volatility_path = scenario_out_dir / "backtest_decision_volatility.csv"
         monthly_path = scenario_out_dir / "backtest_monthly.csv"
         yearly_path = scenario_out_dir / "backtest_yearly.csv"
@@ -941,6 +943,58 @@ def main() -> None:
 
         with _phase_watchdog("write_plan_history"):
             outputs.plan_history.to_parquet(plan_history_path, index=False)
+        with _phase_watchdog("write_milp_event_log"):
+            if "milp_event_type" in outputs.plan_history.columns:
+                ev_cols = [c for c in outputs.plan_history.columns if c.startswith("ev_")]
+                reserve_bin_cols = [c for c in outputs.plan_history.columns if c.startswith("reserve_pos_bin_") or c.startswith("reserve_neg_bin_")]
+                keep_cols = [
+                    "snapshot_time_utc",
+                    "target_time_utc",
+                    "lead_time_h",
+                    "milp_event_type",
+                    "charge_mw",
+                    "discharge_mw",
+                    "reserve_pos_mw",
+                    "reserve_neg_mw",
+                    "slack_pos_mw",
+                    "slack_neg_mw",
+                    "predicted_objective_eur",
+                    "ev_objective_rebuild_eur",
+                    *reserve_bin_cols,
+                    *ev_cols,
+                ]
+                keep_cols = list(dict.fromkeys(c for c in keep_cols if c in outputs.plan_history.columns))
+                event_log = outputs.plan_history.loc[
+                    outputs.plan_history["milp_event_type"].astype(str).ne("none"),
+                    keep_cols,
+                ].copy()
+                if not event_log.empty:
+                    event_log["snapshot_time_utc"] = pd.to_datetime(event_log["snapshot_time_utc"], utc=True, errors="coerce")
+                    event_log["snapshot_date_utc"] = event_log["snapshot_time_utc"].dt.date.astype(str)
+                    event_log.to_parquet(milp_event_log_path, index=False)
+                    summary = (
+                        event_log.groupby(["snapshot_time_utc", "snapshot_date_utc", "milp_event_type"], dropna=False)
+                        .agg(
+                            hours_covered=("target_time_utc", "count"),
+                            ev_da_charge_eur=("ev_da_charge_eur", "sum"),
+                            ev_da_discharge_eur=("ev_da_discharge_eur", "sum"),
+                            ev_afrr_pos_eur=("ev_afrr_pos_eur", "sum"),
+                            ev_afrr_neg_eur=("ev_afrr_neg_eur", "sum"),
+                            ev_slack_penalty_pos_eur=("ev_slack_penalty_pos_eur", "sum"),
+                            ev_slack_penalty_neg_eur=("ev_slack_penalty_neg_eur", "sum"),
+                            ev_terminal_soc_credit_eur=("ev_terminal_soc_credit_eur", "sum"),
+                            ev_objective_rebuild_eur=("ev_objective_rebuild_eur", "sum"),
+                            predicted_objective_eur=("predicted_objective_eur", "mean"),
+                            avg_pred_da_price_eur_mwh=("ev_pred_da_price_eur_mwh", "mean"),
+                            avg_pred_act_rate_pos=("ev_pred_act_rate_pos", "mean"),
+                            avg_pred_act_rate_neg=("ev_pred_act_rate_neg", "mean"),
+                            avg_pred_cap_pos_eur_mw=("ev_pred_cap_pos_eur_mw", "mean"),
+                            avg_pred_cap_neg_eur_mw=("ev_pred_cap_neg_eur_mw", "mean"),
+                        )
+                        .reset_index()
+                        .sort_values(["snapshot_time_utc", "milp_event_type"])
+                    )
+                    summary.to_csv(milp_event_summary_path, index=False)
         with _phase_watchdog("write_volatility"):
             outputs.volatility.to_csv(volatility_path, index=False)
         with _phase_watchdog("write_monthly"):
@@ -953,6 +1007,13 @@ def main() -> None:
             state_machine_audit_path.write_text(json.dumps(_build_state_machine_audit(outputs.hourly), indent=2), encoding="utf-8")
         with _phase_watchdog("build_and_write_diagnostics"):
             diagnostics = _build_backtest_diagnostics(outputs.hourly, outputs.summary)
+            def _fmt_summary_val(key: str) -> str:
+                v = outputs.summary.get(key, float("nan"))
+                try:
+                    fv = float(v)
+                except Exception:
+                    return str(v)
+                return f"{fv:.2f}" if pd.notna(fv) else "nan"
             diagnostics_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
             diagnostics_txt_path.write_text(
                 "\n".join([
@@ -961,6 +1022,14 @@ def main() -> None:
                     f"numeric_nan_total={diagnostics['numeric_nan_total']}",
                     f"numeric_nonfinite_total={diagnostics['numeric_nonfinite_total']}",
                     f"final_soc_constraint_satisfied={diagnostics['infeasibility_flags']['final_soc_constraint_satisfied']}",
+                    "",
+                    "PnL Summary",
+                    f"realized_total_pnl_eur={_fmt_summary_val('realized_total_pnl_eur')}",
+                    f"oracle_total_pnl_eur={_fmt_summary_val('oracle_total_pnl_eur')}",
+                    f"realized_da_only_total_pnl_eur={_fmt_summary_val('realized_da_only_total_pnl_eur')}",
+                    f"oracle_da_only_total_pnl_eur={_fmt_summary_val('oracle_da_only_total_pnl_eur')}",
+                    f"realized_afrr_only_total_pnl_eur={_fmt_summary_val('realized_afrr_only_total_pnl_eur')}",
+                    f"oracle_afrr_only_total_pnl_eur={_fmt_summary_val('oracle_afrr_only_total_pnl_eur')}",
                 ]) + "\n",
                 encoding="utf-8",
             )
@@ -969,6 +1038,22 @@ def main() -> None:
 
         print(f"[OK] Battery backtest completed for scenario={scenario_name}.")
         print(f"- realized_total_pnl_eur: {outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f}")
+        print(f"- oracle_total_pnl_eur: {outputs.summary.get('oracle_total_pnl_eur', float('nan')):.2f}")
+        print(
+            "- DA-only pnl (realized/oracle): "
+            f"{outputs.summary.get('realized_da_only_total_pnl_eur', float('nan')):.2f} / "
+            f"{outputs.summary.get('oracle_da_only_total_pnl_eur', float('nan')):.2f}"
+        )
+        print(
+            "- aFRR-only pnl (realized/oracle): "
+            f"{outputs.summary.get('realized_afrr_only_total_pnl_eur', float('nan')):.2f} / "
+            f"{outputs.summary.get('oracle_afrr_only_total_pnl_eur', float('nan')):.2f}"
+        )
+        print(
+            "- Multi-market pnl (realized/oracle): "
+            f"{outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f} / "
+            f"{outputs.summary.get('oracle_total_pnl_eur', float('nan')):.2f}"
+        )
         print(f"- output_dir: {scenario_out_dir}")
 
         row: dict[str, object] = {

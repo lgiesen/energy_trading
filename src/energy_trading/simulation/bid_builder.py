@@ -85,6 +85,8 @@ class BidBuilder:
         pricing_policy: BidPricingPolicy,
         da_step_mw: float,
         afrr_step_mw: float,
+        da_min_bid_size_mw: float | None = None,
+        afrr_min_bid_size_mw: float | None = None,
         eta_in: float,
         eta_out: float,
         degradation_cost_eur_mwh: float,
@@ -97,6 +99,8 @@ class BidBuilder:
         self.pricing = pricing_policy
         self.da_step_mw = float(da_step_mw)
         self.afrr_step_mw = float(afrr_step_mw)
+        self.da_min_bid_size_mw = float(da_min_bid_size_mw) if da_min_bid_size_mw is not None else float(da_step_mw)
+        self.afrr_min_bid_size_mw = float(afrr_min_bid_size_mw) if afrr_min_bid_size_mw is not None else float(afrr_step_mw)
         self.eta_in = float(eta_in)
         self.eta_out = float(eta_out)
         self.mc_pos = float(degradation_cost_eur_mwh) + float(transaction_cost_eur_mwh)
@@ -127,6 +131,10 @@ class BidBuilder:
         bids: list[AFRRCapacityBid] = []
         q_pos = self._qfloor(float(reserve_pos_mw), self.afrr_step_mw)
         q_neg = self._qfloor(float(reserve_neg_mw), self.afrr_step_mw)
+        if 0.0 < q_pos < self.afrr_min_bid_size_mw:
+            q_pos = 0.0
+        if 0.0 < q_neg < self.afrr_min_bid_size_mw:
+            q_neg = 0.0
         if q_pos > 0.0:
             cap_bid_pos = (
                 float(pred_cap_pos)
@@ -269,6 +277,10 @@ class BidBuilder:
         # BidBuilder only sets execution mode/price policy.
         plan_buy_mw = self._qfloor(max(0.0, float(planned_charge_mw)), self.da_step_mw)
         plan_sell_mw = self._qfloor(max(0.0, float(planned_discharge_mw)), self.da_step_mw)
+        if 0.0 < plan_buy_mw < self.da_min_bid_size_mw:
+            plan_buy_mw = 0.0
+        if 0.0 < plan_sell_mw < self.da_min_bid_size_mw:
+            plan_sell_mw = 0.0
 
         bids: list[DABid] = []
         if plan_buy_mw > 0.0:
