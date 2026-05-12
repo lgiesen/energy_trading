@@ -1116,8 +1116,6 @@ def main() -> None:
             num_days_total = float((timeframe_end - timeframe_start).total_seconds() / 86400.0) + (1.0 / 24.0)
             print(f"- timeframe_utc: {timeframe_start.isoformat()} -> {timeframe_end.isoformat()}")
             print(f"- timeframe_total_days: {num_days_total:.4f}")
-        print(f"- realized_total_pnl_eur: {outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f}")
-        print(f"- oracle_total_pnl_eur: {outputs.summary.get('oracle_total_pnl_eur', float('nan')):.2f}")
         print(
             "- DA-only pnl (realized/oracle): "
             f"{outputs.summary.get('realized_da_only_total_pnl_eur', float('nan')):.2f} / "
