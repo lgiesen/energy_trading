@@ -5,6 +5,7 @@ MODEL_SPECS = {
     "time_step_hours": 1.0,  # Optimization time step (Delta t): 1h
     "reserve_product_duration_h": 4.0,  # Duration used for activation-energy bounds
     "market_scope": "DE_LU",  # Sign/settlement convention scope
+    "terminal_soc_value_discount": 0.8,  # Discount for terminal SoC value in objective
 }
 MODEL_SPECS["optimization_step_min"] = int(MODEL_SPECS["time_step_hours"] * 60)
 
@@ -25,7 +26,7 @@ BATTERY_SPECS = {
 
     # Costs
     "degradation_cost": 25.0,  # EUR/MWh internal throughput
-    "aux_power_mw": 0.07,  # AC-side house load (cooling/BMS/etc.)
+    "aux_power_mw": 0.00,  # AC-side house load (cooling/BMS/etc.)
 }
 BATTERY_SPECS["efficiency_rt"] = BATTERY_SPECS["efficiency_in"] * BATTERY_SPECS["efficiency_out"]
 
@@ -67,13 +68,14 @@ MARKET_SPECS = {
     "afrr_bid_price_step_eur_mwh": 50.0,
     "da_buy_limit_price_eur_mwh": 3000.0,
     "da_sell_limit_price_eur_mwh": -500.0,
+    # Limit-order aggressiveness around expected DA price (EUR/MWh)
+    # buy_limit = pred + buy_offset, sell_limit = pred - sell_offset
+    "da_buy_limit_offset_eur_mwh": 0.0,
+    "da_sell_limit_offset_eur_mwh": 2.0,
     # Synthetic ID rescue pricing around DA with market caps/floors
     "id_rescue_spread_eur_mwh": 30.0,
     "id_buy_price_cap_eur_mwh": 3000.0,
     "id_sell_price_floor_eur_mwh": -500.0,
-    # Optimizer slack-penalty calibration (legacy proxy for non-delivery exposure)
-    "capacity_penalty_multiplier": 2.0,
-    "capacity_penalty_price_floor_eur_mw_h": 10.0,
     # Keep separate from optimization step on purpose:
     # optimization uses 60 min, settlement/input granularity is 15 min.
     "settlement_period_min": 15,  # Settlement/input granularity for imbalance/SRL
@@ -137,10 +139,6 @@ def _validate_config() -> None:
         raise ValueError("afrr_activation_bid_risk_lambda must be >= 0.")
     if MARKET_SPECS["afrr_min_bid_size"] < 0:
         raise ValueError("afrr_min_bid_size must be >= 0.")
-    if MARKET_SPECS["capacity_penalty_multiplier"] < 0:
-        raise ValueError("capacity_penalty_multiplier must be >= 0.")
-    if MARKET_SPECS["capacity_penalty_price_floor_eur_mw_h"] < 0:
-        raise ValueError("capacity_penalty_price_floor_eur_mw_h must be >= 0.")
     if MARKET_SPECS["settlement_period_min"] <= 0:
         raise ValueError("settlement_period_min must be > 0.")
     if MARKET_SPECS["bid_power_max_mw"] <= 0:

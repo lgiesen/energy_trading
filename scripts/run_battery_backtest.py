@@ -851,6 +851,14 @@ def main() -> None:
         df = df[df[colmap.timestamp] <= pd.to_datetime(args.end, utc=True)].copy()
     if df.empty:
         raise ValueError("No rows after timestamp filtering.")
+    # Quick data-health diagnostic for potential "death zone" windows.
+    true_da_std = pd.to_numeric(df.get(colmap.true_da_price), errors="coerce").std()
+    true_act_pos_std = pd.to_numeric(df.get(colmap.true_afrr_activation_price_pos), errors="coerce").std()
+    print(
+        "[DIAG] input_stddev "
+        f"{colmap.true_da_price}={float(true_da_std) if pd.notna(true_da_std) else float('nan'):.6f}, "
+        f"{colmap.true_afrr_activation_price_pos}={float(true_act_pos_std) if pd.notna(true_act_pos_std) else float('nan'):.6f}"
+    )
 
     scenarios: list[tuple[str, dict[str, pd.DataFrame] | None]] = [("default", forecast_warehouse)]
     if quantile_pairs:

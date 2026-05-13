@@ -93,6 +93,8 @@ class BidBuilder:
         transaction_cost_eur_mwh: float,
         da_mode: str = "price_taker",
         da_arb_mode: str = "limit",
+        da_buy_limit_offset_eur_mwh: float = 0.0,
+        da_sell_limit_offset_eur_mwh: float = 0.0,
         afrr_energy_bid_strategy: str = "forecast",
         link_da_to_awarded_afrr: bool = True,
     ) -> None:
@@ -107,6 +109,8 @@ class BidBuilder:
         self.mc_neg = float(degradation_cost_eur_mwh) + float(transaction_cost_eur_mwh)
         self.da_mode = da_mode
         self.da_arb_mode = da_arb_mode
+        self.da_buy_limit_offset_eur_mwh = float(da_buy_limit_offset_eur_mwh)
+        self.da_sell_limit_offset_eur_mwh = float(da_sell_limit_offset_eur_mwh)
         self.afrr_energy_bid_strategy = afrr_energy_bid_strategy
         self.link_da_to_awarded_afrr = bool(link_da_to_awarded_afrr)
 
@@ -285,14 +289,11 @@ class BidBuilder:
         bids: list[DABid] = []
         if plan_buy_mw > 0.0:
             buy_is_hedge = self.link_da_to_awarded_afrr and float(obligation_pos_mw) > 0.0
-            # Non-hedging DA buy requires clearly favorable entry price.
-            if (not buy_is_hedge) and (float(pred_da_price) > -float(self.mc_pos)):
-                plan_buy_mw = 0.0
-        if plan_buy_mw > 0.0:
-            buy_is_hedge = self.link_da_to_awarded_afrr and float(obligation_pos_mw) > 0.0
             buy_mode = "price_taker" if (is_oracle or buy_is_hedge) else self.da_arb_mode
             buy_price = (
-                self.pricing.da_buy_limit_price_eur_mwh if buy_mode == "price_taker" else float(pred_da_price)
+                self.pricing.da_buy_limit_price_eur_mwh
+                if buy_mode == "price_taker"
+                else float(pred_da_price) + self.da_buy_limit_offset_eur_mwh
             )
             bids.append(
                 DABid(
@@ -311,9 +312,13 @@ class BidBuilder:
                 plan_sell_mw = 0.0
         if plan_sell_mw > 0.0:
             sell_is_hedge = self.link_da_to_awarded_afrr and float(obligation_neg_mw) > 0.0
-            sell_mode = "price_taker" if (is_oracle or sell_is_hedge) else self.da_arb_mode
+            # Non-hedging DA sell is forced to price-taker by default to avoid
+            # "black hole" limit rejections after margin already passed.
+            sell_mode = "price_taker" if (is_oracle or (not sell_is_hedge)) else self.da_arb_mode
             sell_price = (
-                self.pricing.da_sell_limit_price_eur_mwh if sell_mode == "price_taker" else float(pred_da_price)
+                self.pricing.da_sell_limit_price_eur_mwh
+                if sell_mode == "price_taker"
+                else float(pred_da_price) - self.da_sell_limit_offset_eur_mwh
             )
             bids.append(
                 DABid(
