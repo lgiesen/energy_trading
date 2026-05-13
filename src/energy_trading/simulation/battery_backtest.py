@@ -78,6 +78,7 @@ class BacktestOutputs:
     plan_history: pd.DataFrame
     volatility: pd.DataFrame
     summary: dict[str, float]
+    isolated_hourly: dict[str, pd.DataFrame] | None = None
 
 
 CANONICAL_PREDICTION_COLUMNS = [
@@ -253,7 +254,10 @@ class BatteryBacktester:
         )
         # Replacement for hard end-SoC floor: soft shortfall penalty in objective.
         self.final_soc_shortfall_penalty_eur_per_mwh = float(
-            FINANCIAL_PARAMS.get("final_soc_shortfall_penalty_eur_per_mwh", 10000.0)
+            os.environ.get(
+                "BACKTEST_FINAL_SOC_SHORTFALL_PENALTY_EUR_PER_MWH",
+                FINANCIAL_PARAMS.get("final_soc_shortfall_penalty_eur_per_mwh", 100000.0),
+            )
         )
 
         self.bid_power_max_mw = float(MARKET_SPECS.get("bid_power_max_mw", self.p_max_mw))
@@ -587,10 +591,13 @@ class BatteryBacktester:
             default=0.0,
         ).to_numpy(dtype=float)
         mid_bin = self.afrr_quantile_bins.index("p50") if "p50" in self.afrr_quantile_bins else n_bins // 2
+        pacc_pos_fallback_used = np.zeros(n, dtype=float)
+        pacc_neg_fallback_used = np.zeros(n, dtype=float)
         for t in range(n):
             have_pos = np.isfinite(cap_price_pos_by_bin[t, :]).any()
             have_neg = np.isfinite(cap_price_neg_by_bin[t, :]).any()
             if not have_pos:
+                pacc_pos_fallback_used[t] = 1.0
                 cap_price_pos_by_bin[t, :] = mid_pos[t]
                 for b in range(n_bins):
                     p_acc_cap_pos[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
@@ -598,6 +605,7 @@ class BatteryBacktester:
                 miss = ~np.isfinite(cap_price_pos_by_bin[t, :])
                 cap_price_pos_by_bin[t, miss] = mid_pos[t]
             if not have_neg:
+                pacc_neg_fallback_used[t] = 1.0
                 cap_price_neg_by_bin[t, :] = mid_neg[t]
                 for b in range(n_bins):
                     p_acc_cap_neg[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
@@ -986,7 +994,27 @@ class BatteryBacktester:
             "ev_terminal_soc_credit_eur": ev_terminal_soc_credit_eur,
             "ev_objective_rebuild_eur": ev_objective_rebuild_eur,
             "final_soc_shortfall_mwh": np.full(n, final_soc_shortfall_mwh, dtype=float),
+            "ev_pacc_pos_fallback_used": pacc_pos_fallback_used,
+            "ev_pacc_neg_fallback_used": pacc_neg_fallback_used,
         }
+        if "optimizer_required_input_imputed_count" in df.columns:
+            extra_cols["optimizer_required_input_imputed_count"] = pd.to_numeric(
+                df["optimizer_required_input_imputed_count"], errors="coerce"
+            ).fillna(0.0).to_numpy(dtype=float)
+        else:
+            extra_cols["optimizer_required_input_imputed_count"] = np.zeros(n, dtype=float)
+        if "optimizer_required_input_imputed_any" in df.columns:
+            extra_cols["optimizer_required_input_imputed_any"] = pd.to_numeric(
+                df["optimizer_required_input_imputed_any"], errors="coerce"
+            ).fillna(0.0).to_numpy(dtype=float)
+        else:
+            extra_cols["optimizer_required_input_imputed_any"] = np.zeros(n, dtype=float)
+        if "optimizer_fallback_used" in df.columns:
+            extra_cols["optimizer_fallback_used"] = pd.to_numeric(
+                df["optimizer_fallback_used"], errors="coerce"
+            ).fillna(0.0).to_numpy(dtype=float)
+        else:
+            extra_cols["optimizer_fallback_used"] = np.zeros(n, dtype=float)
         for b in range(n_bins):
             extra_cols[f"reserve_pos_bin_{b}_mw"] = reserve_pos_bin_mw[:, b]
             extra_cols[f"reserve_neg_bin_{b}_mw"] = reserve_neg_bin_mw[:, b]
@@ -1566,8 +1594,8 @@ class BatteryBacktester:
             "afrr_act_pos_accepted": float(act_pos_accepted),
             "afrr_act_neg_accepted": float(act_neg_accepted),
             "da_price_taker_mode": float(self.da_execution_mode == "price_taker"),
-            "da_buy_reason": 1.0 if da_res.reason_buy == "price_taker" else 2.0 if da_res.reason_buy == "limit_cleared" else 0.0,
-            "da_sell_reason": 1.0 if da_res.reason_sell == "price_taker" else 2.0 if da_res.reason_sell == "limit_cleared" else 0.0,
+            "da_buy_reason": str(da_res.reason_buy) if da_res.reason_buy else "none",
+            "da_sell_reason": str(da_res.reason_sell) if da_res.reason_sell else "none",
             "aFRR_Capacity_Won_MW": float(max(ob_pos, ob_neg, res_pos_exec, res_neg_exec)),
             "DA_Energy_Sold_MW": float(dis_exec),
             "aFRR_Energy_Price_EUR_MWh": mean_energy_price,
@@ -1847,6 +1875,65 @@ class BatteryBacktester:
                     break
                 snapshot_ts = pd.to_datetime(df.iloc[i][colmap.timestamp], utc=True, errors="coerce")
                 target_times = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+                left_targets = pd.DataFrame(
+                    {
+                        "_ord": np.arange(len(window), dtype=int),
+                        "target_time_utc": pd.to_datetime(target_times, utc=True, errors="coerce"),
+                        "snapshot_time_utc": pd.to_datetime(
+                            pd.Series([snapshot_ts] * len(window), index=window.index),
+                            utc=True,
+                            errors="coerce",
+                        ).to_numpy(),
+                    }
+                )
+                left_targets["target_time_ns"] = left_targets["target_time_utc"].astype("int64")
+                left_targets["snapshot_time_ns"] = left_targets["snapshot_time_utc"].astype("int64")
+
+                def _asof_fill_from_long(src_df: pd.DataFrame, value_col: str) -> pd.Series:
+                    """For each target, pick latest snapshot <= decision snapshot via asof-merge."""
+                    def _to_ns_utc(s: pd.Series) -> pd.Series:
+                        ts = pd.to_datetime(s, utc=True, errors="coerce")
+                        # Force a common nanosecond representation independent of
+                        # source parquet timestamp resolution (us/ns).
+                        ts = ts.dt.tz_convert("UTC").dt.tz_localize(None).astype("datetime64[ns]")
+                        return ts.astype("int64")
+                    if value_col not in src_df.columns:
+                        return pd.Series(np.nan, index=window.index, dtype="float64")
+                    right = src_df.loc[:, ["target_time_utc", "snapshot_time_utc", value_col]].copy()
+                    right["target_time_utc"] = pd.to_datetime(right["target_time_utc"], utc=True, errors="coerce")
+                    right["snapshot_time_utc"] = pd.to_datetime(right["snapshot_time_utc"], utc=True, errors="coerce")
+                    right["target_time_ns"] = _to_ns_utc(right["target_time_utc"])
+                    right["snapshot_time_ns"] = _to_ns_utc(right["snapshot_time_utc"])
+                    right = right.dropna(subset=["target_time_utc", "snapshot_time_utc"]).sort_values(
+                        ["target_time_utc", "snapshot_time_utc"]
+                    )
+                    if right.empty:
+                        return pd.Series(np.nan, index=window.index, dtype="float64")
+                    left = left_targets.copy()
+                    left["target_time_utc"] = pd.to_datetime(left["target_time_utc"], utc=True, errors="coerce")
+                    left["snapshot_time_utc"] = pd.to_datetime(left["snapshot_time_utc"], utc=True, errors="coerce")
+                    left["target_time_ns"] = _to_ns_utc(left["target_time_utc"])
+                    left["snapshot_time_ns"] = _to_ns_utc(left["snapshot_time_utc"])
+                    out_vals = pd.Series(np.nan, index=left.index, dtype="float64")
+                    # Robust per-target asof merge avoids fragile global sort constraints
+                    # when matching by target and snapshot simultaneously.
+                    for tns in left["target_time_ns"].dropna().unique():
+                        lsub = left[left["target_time_ns"] == tns][["_ord", "snapshot_time_ns"]].sort_values("snapshot_time_ns")
+                        rsub = right[right["target_time_ns"] == tns][["snapshot_time_ns", value_col]].sort_values("snapshot_time_ns")
+                        if lsub.empty or rsub.empty:
+                            continue
+                        msub = pd.merge_asof(
+                            lsub,
+                            rsub,
+                            on="snapshot_time_ns",
+                            direction="backward",
+                            allow_exact_matches=True,
+                        )
+                        out_vals.iloc[msub["_ord"].to_numpy(dtype=int)] = pd.to_numeric(
+                            msub[value_col], errors="coerce"
+                        ).to_numpy(dtype=float)
+                    out_vals.index = window.index
+                    return out_vals
 
                 for pred_col in CANONICAL_PREDICTION_COLUMNS:
                     if pred_col not in window.columns:
@@ -1854,23 +1941,8 @@ class BatteryBacktester:
                     if pred_col not in forecast_warehouse:
                         continue
                     src_df = forecast_warehouse[pred_col]
-                    sub = src_df[src_df["snapshot_time_utc"] == snapshot_ts]
-                    if sub.empty:
-                        # Use latest available forecast snapshot up to decision time.
-                        sub = src_df[src_df["snapshot_time_utc"] <= snapshot_ts]
-                        if not sub.empty:
-                            sub = (
-                                sub.sort_values(["snapshot_time_utc", "target_time_utc"])
-                                .drop_duplicates(subset=["target_time_utc"], keep="last")
-                            )
-                    if sub.empty:
-                        continue
-                    pred_map = (
-                        sub.drop_duplicates(subset=["target_time_utc"])
-                        .set_index("target_time_utc")["predicted_value"]
-                    )
-                    filled = target_times.map(pred_map)
-                    window[pred_col] = pd.to_numeric(filled, errors="coerce").to_numpy(dtype=float)
+                    filled = _asof_fill_from_long(src_df, "predicted_value")
+                    window[pred_col] = filled.to_numpy(dtype=float)
 
                     # Fallback to wide per-target timestamp predictions when warehouse has gaps.
                     if pred_col in source.columns:
@@ -1880,17 +1952,16 @@ class BatteryBacktester:
                             fb_vals = pd.to_numeric(window.loc[miss, colmap.timestamp].map(source[pred_col]), errors="coerce")
                             window.loc[miss, pred_col] = fb_vals.to_numpy()
 
-                    # Build quantile->CDF acceptance bridge for aFRR CAPACITY prices.
-                    # Dynamic quantile bidding uses the strict mapping:
-                    # p_acc(q) = 1 - q, where q is the quantile level.
+                    # Propagate capacity-price quantiles into window columns used
+                    # by optimize_dispatch(), e.g. pred_afrr_capacity_price_pos_p01.
+                    # Without this mapping, downstream logic falls back to median
+                    # placeholders and creates artificial symmetric coefficients.
                     if pred_col in {colmap.pred_afrr_capacity_price_pos, colmap.pred_afrr_capacity_price_neg}:
-                        q_cols = [c for c in QUANTILE_COLUMNS if c in sub.columns]
+                        q_cols = [c for c in QUANTILE_COLUMNS if c in src_df.columns]
                         if q_cols:
-                            sub_u = (
-                                sub.drop_duplicates(subset=["target_time_utc"])
-                                .set_index("target_time_utc")
-                                .sort_index()
-                            )
+                            for qc in q_cols:
+                                filled_q = _asof_fill_from_long(src_df, qc)
+                                window[f"{pred_col}_{qc}"] = filled_q.to_numpy(dtype=float)
                             for b, qcol in enumerate(self.afrr_quantile_bins):
                                 q_level = float(qcol.replace("p", "")) / 100.0
                                 pacc = max(0.0, min(1.0, 1.0 - q_level))
@@ -1900,18 +1971,12 @@ class BatteryBacktester:
                     # Propagate activation-rate quantiles into window columns
                     # for p90 chance constraints in optimize_dispatch().
                     if pred_col in {colmap.pred_afrr_activation_rate_pos, colmap.pred_afrr_activation_rate_neg}:
-                        q_cols = [c for c in QUANTILE_COLUMNS if c in sub.columns]
+                        q_cols = [c for c in QUANTILE_COLUMNS if c in src_df.columns]
                         if q_cols:
-                            sub_u = (
-                                sub.drop_duplicates(subset=["target_time_utc"])
-                                .set_index("target_time_utc")
-                                .sort_index()
-                            )
                             base = colmap.pred_afrr_activation_rate_pos if pred_col == colmap.pred_afrr_activation_rate_pos else colmap.pred_afrr_activation_rate_neg
                             for qc in q_cols:
-                                q_map = sub_u[qc]
-                                filled_q = target_times.map(q_map)
-                                window[f"{base}_{qc}"] = pd.to_numeric(filled_q, errors="coerce").to_numpy(dtype=float)
+                                filled_q = _asof_fill_from_long(src_df, qc)
+                                window[f"{base}_{qc}"] = filled_q.to_numpy(dtype=float)
 
                 # Ensure required prediction columns are finite even if some long files are absent.
                 # Causality guard: prediction-side optimization must never fall back to truth-side columns.
@@ -1936,9 +2001,49 @@ class BatteryBacktester:
                         colmap.pred_afrr_activation_rate_pos,
                     ],
                 }
+                # Fail-fast coverage check:
+                # If forecast warehouse mapping leaves missing required optimizer
+                # inputs in the current window, abort immediately with context.
+                # This avoids silently biasing economics via default imputations.
+                missing_msgs: list[str] = []
                 for pred_col, fallbacks in pred_fallbacks.items():
                     if pred_col not in window.columns:
                         window[pred_col] = np.nan
+                    raw_vals = pd.to_numeric(window[pred_col], errors="coerce")
+                    miss_mask = raw_vals.isna()
+                    if bool(miss_mask.any()):
+                        miss_n = int(miss_mask.sum())
+                        miss_ts = (
+                            pd.to_datetime(window.loc[miss_mask, colmap.timestamp], utc=True, errors="coerce")
+                            .dropna()
+                            .astype(str)
+                            .head(3)
+                            .tolist()
+                        )
+                        missing_msgs.append(
+                            f"{pred_col}: missing={miss_n}/{len(window)} sample_targets={miss_ts}"
+                        )
+                if missing_msgs:
+                    snap_txt = str(pd.to_datetime(snapshot_ts, utc=True, errors="coerce")) if forecast_warehouse else "n/a"
+                    raise RuntimeError(
+                        "Forecast coverage check failed before optimizer input imputation. "
+                        f"snapshot={snap_txt}; details=" + " | ".join(missing_msgs)
+                    )
+
+                # Input-quality diagnostics for optimizer-side forecast/prices/rates.
+                # Count how many required optimizer inputs are missing before robust fill.
+                req_cols = list(pred_fallbacks.keys())
+                req_missing_count = np.zeros(len(window), dtype=int)
+                req_missing_any = np.zeros(len(window), dtype=int)
+                for pred_col in req_cols:
+                    raw = pd.to_numeric(window[pred_col], errors="coerce")
+                    miss = raw.isna().to_numpy(dtype=bool)
+                    req_missing_count += miss.astype(int)
+                    req_missing_any = np.maximum(req_missing_any, miss.astype(int))
+                window["optimizer_required_input_imputed_count"] = req_missing_count.astype(float)
+                window["optimizer_required_input_imputed_any"] = req_missing_any.astype(float)
+
+                for pred_col, fallbacks in pred_fallbacks.items():
                     window[pred_col] = self._finite_numeric_series(
                         window,
                         pred_col,
@@ -1983,6 +2088,57 @@ class BatteryBacktester:
             else:
                 w_end = min(n, i + horizon_hours)
                 window = df.iloc[i:w_end].copy()
+
+            def _fill_zero_ev(plan_df: pd.DataFrame) -> pd.DataFrame:
+                """Populate fallback plans with EV columns to avoid NaN diagnostics."""
+                out = plan_df.copy()
+                scalar_zero_cols = [
+                    "predicted_objective_eur",
+                    "ev_objective_rebuild_eur",
+                    "ev_da_charge_coef_eur_per_mw",
+                    "ev_da_discharge_coef_eur_per_mw",
+                    "ev_da_charge_eur",
+                    "ev_da_discharge_eur",
+                    "ev_afrr_pos_eur",
+                    "ev_afrr_neg_eur",
+                    "ev_slack_penalty_pos_eur",
+                    "ev_slack_penalty_neg_eur",
+                    "ev_terminal_soc_credit_eur",
+                    "ev_pred_da_price_eur_mwh",
+                    "ev_pred_cap_pos_eur_mw",
+                    "ev_pred_cap_neg_eur_mw",
+                    "ev_pred_act_price_pos_eur_mwh",
+                    "ev_pred_act_price_neg_eur_mwh",
+                    "ev_pred_act_rate_pos",
+                    "ev_pred_act_rate_neg",
+                    "ev_pred_act_rate_pos_p90",
+                    "ev_pred_act_rate_neg_p90",
+                    "slack_pos_mw",
+                    "slack_neg_mw",
+                    "final_soc_shortfall_mwh",
+                    "optimizer_required_input_imputed_count",
+                    "optimizer_required_input_imputed_any",
+                    "ev_pacc_pos_fallback_used",
+                    "ev_pacc_neg_fallback_used",
+                    "optimizer_fallback_used",
+                ]
+                for c in scalar_zero_cols:
+                    if c not in out.columns:
+                        out[c] = 0.0
+                for b in range(len(self.afrr_quantile_bins)):
+                    for c in (
+                        f"reserve_pos_bin_{b}_mw",
+                        f"reserve_neg_bin_{b}_mw",
+                        f"ev_pacc_pos_bin_{b}",
+                        f"ev_pacc_neg_bin_{b}",
+                        f"ev_expected_act_share_pos_bin_{b}",
+                        f"ev_expected_act_share_neg_bin_{b}",
+                        f"ev_rpos_coef_bin_{b}_eur_per_mw",
+                        f"ev_rneg_coef_bin_{b}_eur_per_mw",
+                    ):
+                        if c not in out.columns:
+                            out[c] = 0.0
+                return out
 
             # Terminal SoC floor policy:
             # - Intermediate rolling windows: only enforce physical minimum SoC.
@@ -2042,7 +2198,8 @@ class BatteryBacktester:
                     for b in range(len(self.afrr_quantile_bins)):
                         hold[f"reserve_pos_bin_{b}_mw"] = 0.0
                         hold[f"reserve_neg_bin_{b}_mw"] = 0.0
-                    plan = hold
+                    plan = _fill_zero_ev(hold)
+                    plan["optimizer_fallback_used"] = 1.0
                     optimization_fallback = "safe_hold_plan_under_infeasible_soft_final_soc"
                 else:
                     # Last-resort fallback: if rolling MILP is infeasible even
@@ -2066,7 +2223,8 @@ class BatteryBacktester:
                     for b in range(len(self.afrr_quantile_bins)):
                         hold[f"reserve_pos_bin_{b}_mw"] = 0.0
                         hold[f"reserve_neg_bin_{b}_mw"] = 0.0
-                    plan = hold
+                    plan = _fill_zero_ev(hold)
+                    plan["optimizer_fallback_used"] = 1.0
                     optimization_fallback = "safe_hold_plan"
 
             snapshot_plan = plan.copy()
@@ -2093,6 +2251,7 @@ class BatteryBacktester:
             snapshot_plan["predicted_price"] = snapshot_plan["target_time_utc"].map(window_price_map)
             snapshot_plan["da_bid_locked"] = snapshot_plan["target_time_utc"].isin(set(da_lockbook.keys()))
             snapshot_plan["optimization_fallback"] = optimization_fallback
+            snapshot_plan["optimizer_fallback_used"] = float(optimization_fallback != "none")
             snapshot_plan["optimization_error"] = optimization_error
             snapshot_ts_current = pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True, errors="coerce")
             is_afrr_gate_now = bool(afrr_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, 9))
@@ -2175,6 +2334,15 @@ class BatteryBacktester:
             take["aFRR_Energy_Price_EUR_MWh_Neg"] = tsu_take.map(lambda ts: float(afrr_energy_neg_lockbook.get(ts, np.nan)))
             take["event_reopt_triggered"] = float(cap_gate_triggered)
             take["event_reopt_rejected_mw_total"] = float(cap_gate_stats.get("rejected_mw_total", 0.0))
+            take["optimization_error_code"] = str(optimization_fallback) if str(optimization_fallback) != "none" else "ok"
+            take["is_fallback_hour"] = float(str(optimization_fallback) != "none")
+            if "optimizer_required_input_imputed_any" in take.columns:
+                take["is_strict_optimized_hour"] = (
+                    pd.to_numeric(take["is_fallback_hour"], errors="coerce").fillna(0.0).eq(0.0)
+                    & pd.to_numeric(take["optimizer_required_input_imputed_any"], errors="coerce").fillna(0.0).eq(0.0)
+                ).astype(float)
+            else:
+                take["is_strict_optimized_hour"] = pd.to_numeric(take["is_fallback_hour"], errors="coerce").fillna(0.0).eq(0.0).astype(float)
             decisions.append(take)
 
             # Propagate both planned and executed SoC. Re-planning state always
@@ -2581,7 +2749,13 @@ class BatteryBacktester:
                     id_discharge = _g("id_discharge_mw", _g("pending_id_discharge_mw", id_discharge))
                     for c in dispatch_clearing_cols:
                         if c in merged.columns:
-                            clearing_rec[c] = _g(c, 0.0)
+                            if c in {"da_buy_reason", "da_sell_reason"}:
+                                try:
+                                    clearing_rec[c] = str(getattr(r, c))
+                                except Exception:
+                                    clearing_rec[c] = "none"
+                            else:
+                                clearing_rec[c] = _g(c, 0.0)
                 else:
                     cleared = self._apply_market_clearing(
                         target_time_utc=pd.to_datetime(ts, utc=True, errors="coerce"),
@@ -2752,7 +2926,7 @@ class BatteryBacktester:
             allowed_markets_local: tuple[str, ...],
             deterministic_local: bool,
             is_oracle_local: bool,
-        ) -> tuple[float, bool, dict[str, float]]:
+        ) -> tuple[float, bool, dict[str, float], pd.DataFrame]:
             allowed_local = {str(m).strip().lower() for m in allowed_markets_local}
             is_da_only = allowed_local == {"da"}
             is_afrr_only = allowed_local == {"afrr"}
@@ -2791,7 +2965,7 @@ class BatteryBacktester:
                         "common_costs_eur": 0.0,
                         "terminal_value_eur": 0.0,
                         "pnl_excl_terminal_eur": 0.0,
-                    }
+                    }, pd.DataFrame()
                 raise
             path_real = self.settle_dispatch(
                 path_df,
@@ -2801,25 +2975,27 @@ class BatteryBacktester:
                 apply_market_clearing=True,
                 oracle_mode=is_oracle_local,
             )
+            def _sum_any(frame: pd.DataFrame, *cands: str) -> float:
+                for c in cands:
+                    if c in frame.columns:
+                        return float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).sum())
+                return 0.0
             # Strategy-explicit component accounting to prevent cross-market
             # leakage in isolated ablation reports.
-            da_net = float(
-                path_real.get("real_revenue_da_eur", 0.0).sum()
-                - path_real.get("real_cost_da_eur", 0.0).sum()
-            ) if not path_real.empty else 0.0
-            afrr_net = float(
-                path_real.get("real_revenue_capacity_eur", 0.0).sum()
-                + path_real.get("real_revenue_activation_eur", 0.0).sum()
-            ) if not path_real.empty else 0.0
-            id_net = float(
-                path_real.get("real_revenue_id_eur", 0.0).sum()
-                - path_real.get("real_cost_id_eur", 0.0).sum()
-            ) if not path_real.empty else 0.0
-            common_costs = float(
-                -path_real.get("real_transaction_cost_eur", 0.0).sum()
-                - path_real.get("real_degradation_cost_eur", 0.0).sum()
-                - path_real.get("real_penalty_eur", 0.0).sum()
-            ) if not path_real.empty else 0.0
+            if path_real.empty:
+                da_net = 0.0
+                afrr_net = 0.0
+                id_net = 0.0
+                common_costs = 0.0
+            else:
+                da_net = _sum_any(path_real, "revenue_da_eur", "real_revenue_da_eur") - _sum_any(path_real, "cost_da_eur", "real_cost_da_eur")
+                afrr_net = _sum_any(path_real, "revenue_capacity_eur", "real_revenue_capacity_eur") + _sum_any(path_real, "revenue_activation_eur", "real_revenue_activation_eur")
+                id_net = _sum_any(path_real, "revenue_id_eur", "real_revenue_id_eur") - _sum_any(path_real, "cost_id_eur", "real_cost_id_eur")
+                common_costs = (
+                    -_sum_any(path_real, "transaction_cost_eur", "real_transaction_cost_eur")
+                    - _sum_any(path_real, "degradation_cost_eur", "real_degradation_cost_eur")
+                    - _sum_any(path_real, "penalty_eur", "real_penalty_eur")
+                )
             if path_real.empty:
                 pnl_excl = 0.0
             elif is_da_only:
@@ -2827,8 +3003,10 @@ class BatteryBacktester:
             elif is_afrr_only:
                 pnl_excl = afrr_net + id_net + common_costs
             else:
-                pnl_excl = float(path_real["real_pnl_eur"].sum())
-            final_soc = float(path_real["real_soc_mwh"].iloc[-1]) if (not path_real.empty and "real_soc_mwh" in path_real.columns) else float(self.soc_init)
+                pnl_excl = _sum_any(path_real, "pnl_eur", "real_pnl_eur")
+            final_soc = float(path_real["soc_mwh"].iloc[-1]) if (not path_real.empty and "soc_mwh" in path_real.columns) else (
+                float(path_real["real_soc_mwh"].iloc[-1]) if (not path_real.empty and "real_soc_mwh" in path_real.columns) else float(self.soc_init)
+            )
             da_true_last_local = self._finite_numeric_series(
                 path_df,
                 colmap.true_da_price,
@@ -2840,14 +3018,19 @@ class BatteryBacktester:
                 float(da_true_last_local.iloc[-1]) if len(da_true_last_local) else 0.0,
             )
             terminal_value_local = max(0.0, final_soc - self.soc_min) * self.eta_out * terminal_price_local
-            return float(pnl_excl + terminal_value_local), True, {
+            # Keep isolated-path reporting strictly market-separated:
+            # *_only_total_pnl_eur is reported excluding terminal carry value.
+            # Terminal is exposed separately in diagnostics to avoid masking DA/aFRR
+            # contribution differences when both paths end with similar SoC.
+            return float(pnl_excl), True, {
                 "da_net_eur": float(da_net),
                 "afrr_net_eur": float(afrr_net),
                 "id_net_eur": float(id_net),
                 "common_costs_eur": float(common_costs),
                 "terminal_value_eur": float(terminal_value_local),
                 "pnl_excl_terminal_eur": float(pnl_excl),
-            }
+                "pnl_incl_terminal_eur": float(pnl_excl + terminal_value_local),
+            }, path_real
 
         plan_history = pd.DataFrame()
         if use_rolling_horizon:
@@ -3003,25 +3186,25 @@ class BatteryBacktester:
         )
 
         # Isolated market ablation paths (value of stacking).
-        realized_da_only_total, realized_da_only_feasible, realized_da_only_diag = _run_isolated_path(
+        realized_da_only_total, realized_da_only_feasible, realized_da_only_diag, realized_da_only_hourly = _run_isolated_path(
             path_df=df,
             allowed_markets_local=("DA",),
             deterministic_local=False,
             is_oracle_local=False,
         )
-        oracle_da_only_total, oracle_da_only_feasible, oracle_da_only_diag = _run_isolated_path(
+        oracle_da_only_total, oracle_da_only_feasible, oracle_da_only_diag, oracle_da_only_hourly = _run_isolated_path(
             path_df=oracle_df,
             allowed_markets_local=("DA",),
             deterministic_local=True,
             is_oracle_local=True,
         )
-        realized_afrr_only_total, realized_afrr_only_feasible, realized_afrr_only_diag = _run_isolated_path(
+        realized_afrr_only_total, realized_afrr_only_feasible, realized_afrr_only_diag, realized_afrr_only_hourly = _run_isolated_path(
             path_df=df,
             allowed_markets_local=("aFRR",),
             deterministic_local=False,
             is_oracle_local=False,
         )
-        oracle_afrr_only_total, oracle_afrr_only_feasible, oracle_afrr_only_diag = _run_isolated_path(
+        oracle_afrr_only_total, oracle_afrr_only_feasible, oracle_afrr_only_diag, oracle_afrr_only_hourly = _run_isolated_path(
             path_df=oracle_df,
             allowed_markets_local=("aFRR",),
             deterministic_local=True,
@@ -3177,6 +3360,48 @@ class BatteryBacktester:
             "realized_afrr_only_feasible": float(realized_afrr_only_feasible),
             "oracle_afrr_only_feasible": float(oracle_afrr_only_feasible),
         }
+        # Optimizer data-quality and fallback diagnostics.
+        if "optimizer_fallback_used" in hourly.columns:
+            fb = pd.to_numeric(hourly["optimizer_fallback_used"], errors="coerce").fillna(0.0)
+            summary["optimizer_fallback_hours"] = float((fb > 0.0).sum())
+            summary["optimizer_fallback_share_pct"] = float(100.0 * (fb > 0.0).mean())
+        else:
+            summary["optimizer_fallback_hours"] = 0.0
+            summary["optimizer_fallback_share_pct"] = 0.0
+        if "optimizer_required_input_imputed_any" in hourly.columns:
+            imp_any = pd.to_numeric(hourly["optimizer_required_input_imputed_any"], errors="coerce").fillna(0.0)
+            summary["optimizer_input_imputed_hours"] = float((imp_any > 0.0).sum())
+            summary["optimizer_input_imputed_share_pct"] = float(100.0 * (imp_any > 0.0).mean())
+        else:
+            summary["optimizer_input_imputed_hours"] = 0.0
+            summary["optimizer_input_imputed_share_pct"] = 0.0
+        if "optimizer_required_input_imputed_count" in hourly.columns:
+            imp_cnt = pd.to_numeric(hourly["optimizer_required_input_imputed_count"], errors="coerce").fillna(0.0)
+            summary["optimizer_input_imputed_total_count"] = float(imp_cnt.sum())
+            summary["optimizer_input_imputed_avg_count_per_hour"] = float(imp_cnt.mean())
+        else:
+            summary["optimizer_input_imputed_total_count"] = 0.0
+            summary["optimizer_input_imputed_avg_count_per_hour"] = 0.0
+        if "ev_pacc_pos_fallback_used" in hourly.columns:
+            summary["pacc_pos_fallback_share_pct"] = float(
+                100.0
+                * pd.to_numeric(hourly["ev_pacc_pos_fallback_used"], errors="coerce")
+                .fillna(0.0)
+                .clip(0.0, 1.0)
+                .mean()
+            )
+        else:
+            summary["pacc_pos_fallback_share_pct"] = 0.0
+        if "ev_pacc_neg_fallback_used" in hourly.columns:
+            summary["pacc_neg_fallback_share_pct"] = float(
+                100.0
+                * pd.to_numeric(hourly["ev_pacc_neg_fallback_used"], errors="coerce")
+                .fillna(0.0)
+                .clip(0.0, 1.0)
+                .mean()
+            )
+        else:
+            summary["pacc_neg_fallback_share_pct"] = 0.0
         summary["stacking_value_realized_eur"] = float(
             summary["realized_total_pnl_eur"]
             - (
@@ -3213,6 +3438,25 @@ class BatteryBacktester:
             float(summary["realized_total_pnl_eur"]),
             float(summary["oracle_total_pnl_eur"]),
         )
+        # EV sanity on "optimized-only" hours (exclude fallback and imputed-input hours).
+        optimized_mask = pd.Series(True, index=hourly.index)
+        if "optimizer_fallback_used" in hourly.columns:
+            optimized_mask &= pd.to_numeric(hourly["optimizer_fallback_used"], errors="coerce").fillna(0.0).eq(0.0)
+        if "optimizer_required_input_imputed_any" in hourly.columns:
+            optimized_mask &= pd.to_numeric(hourly["optimizer_required_input_imputed_any"], errors="coerce").fillna(0.0).eq(0.0)
+        summary["optimized_hours_only_rows"] = float(int(optimized_mask.sum()))
+        for ev_col in (
+            "ev_da_charge_eur",
+            "ev_da_discharge_eur",
+            "ev_afrr_pos_eur",
+            "ev_afrr_neg_eur",
+            "ev_objective_rebuild_eur",
+        ):
+            if ev_col in hourly.columns and int(optimized_mask.sum()) > 0:
+                vals = pd.to_numeric(hourly.loc[optimized_mask, ev_col], errors="coerce")
+                summary[f"optimized_hours_only_{ev_col}_mean"] = float(vals.mean())
+            elif ev_col in hourly.columns:
+                summary[f"optimized_hours_only_{ev_col}_mean"] = float("nan")
         # Economic building blocks for thesis-grade PnL decomposition.
         summary["total_da_revenue_eur"] = float(hourly["real_revenue_da_eur"].sum())
         summary["total_da_cost_eur"] = float(hourly["real_cost_da_eur"].sum())
@@ -3332,10 +3576,12 @@ class BatteryBacktester:
         summary["final_real_soc_mwh"] = final_real_soc_mwh
         summary["final_soc_min_target_mwh"] = float(self.soc_target_end)
         summary["final_soc_constraint_satisfied"] = float(final_real_soc_mwh >= float(self.soc_target_end) - 1e-9)
+        derived_final_shortfall = float(max(0.0, float(self.soc_target_end) - float(final_real_soc_mwh)))
         if "final_soc_shortfall_mwh" in hourly.columns:
-            summary["final_soc_shortfall_mwh"] = float(pd.to_numeric(hourly["final_soc_shortfall_mwh"], errors="coerce").fillna(0.0).iloc[-1])
+            reported_shortfall = float(pd.to_numeric(hourly["final_soc_shortfall_mwh"], errors="coerce").fillna(0.0).iloc[-1])
+            summary["final_soc_shortfall_mwh"] = float(max(derived_final_shortfall, reported_shortfall))
         else:
-            summary["final_soc_shortfall_mwh"] = float(max(0.0, float(self.soc_target_end) - float(final_real_soc_mwh)))
+            summary["final_soc_shortfall_mwh"] = derived_final_shortfall
         if not volatility.empty:
             summary["decision_volatility_total_flips"] = float(volatility["action_flips"].sum())
             summary["decision_volatility_mean_flips_per_target"] = float(volatility["action_flips"].mean())
@@ -3359,6 +3605,12 @@ class BatteryBacktester:
             plan_history=plan_history,
             volatility=volatility,
             summary=summary,
+            isolated_hourly={
+                "realized_da_only": realized_da_only_hourly,
+                "realized_afrr_only": realized_afrr_only_hourly,
+                "oracle_da_only": oracle_da_only_hourly,
+                "oracle_afrr_only": oracle_afrr_only_hourly,
+            },
         )
 
 

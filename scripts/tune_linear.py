@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -152,12 +153,19 @@ def main() -> None:
     eta0_grid = [float(x) for x in args.eta0_grid.split(",") if x.strip()]
     rows: list[dict[str, float | str]] = []
 
+    total_trials = len(alpha_grid) * len(l1_grid) * len(lr_grid) * len(eta0_grid)
+    done_trials = 0
+    t0 = time.perf_counter()
+    heartbeat_every_s = 20.0
+    last_heartbeat = t0
+
     best_obj = float("inf")
     best_cfg: dict[str, float | str] | None = None
     for alpha in alpha_grid:
         for l1_ratio in l1_grid:
             for learning_rate in lr_grid:
                 for eta0 in eta0_grid:
+                    trial_t0 = time.perf_counter()
                     model = _build_model(
                         alpha=alpha,
                         l1_ratio=l1_ratio,
@@ -199,6 +207,26 @@ def main() -> None:
                             "learning_rate": learning_rate,
                             "eta0": eta0,
                         }
+                        print(
+                            f"[BEST] trial={done_trials + 1}/{total_trials} "
+                            f"objective={best_obj:.6f} params={best_cfg}"
+                        )
+
+                    done_trials += 1
+                    now = time.perf_counter()
+                    if (now - last_heartbeat) >= heartbeat_every_s or done_trials == total_trials:
+                        elapsed = now - t0
+                        avg_s = elapsed / max(done_trials, 1)
+                        remaining = max(total_trials - done_trials, 0)
+                        eta_s = remaining * avg_s
+                        pct = 100.0 * done_trials / max(total_trials, 1)
+                        best_obj_str = f"{best_obj:.6f}" if np.isfinite(best_obj) else "nan"
+                        print(
+                            f"[HEARTBEAT] progress={done_trials}/{total_trials} ({pct:.1f}%) "
+                            f"elapsed={elapsed:.1f}s eta={eta_s:.1f}s "
+                            f"last_trial={now - trial_t0:.2f}s best_obj={best_obj_str}"
+                        )
+                        last_heartbeat = now
 
     trials = pd.DataFrame(rows).sort_values("objective")
     out_json = out_dir / f"linear_sgd_tuning_{bundle}_{target}.json"

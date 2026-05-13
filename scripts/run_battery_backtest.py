@@ -898,6 +898,10 @@ def main() -> None:
         planned_ledger_path = scenario_out_dir / "planned_ledger.parquet"
         executed_ledger_path = scenario_out_dir / "executed_ledger.parquet"
         realized_ledger_path = scenario_out_dir / "realized_ledger.parquet"
+        realized_da_only_hourly_path = scenario_out_dir / "hourly_realized_da_only.parquet"
+        realized_afrr_only_hourly_path = scenario_out_dir / "hourly_realized_afrr_only.parquet"
+        oracle_da_only_hourly_path = scenario_out_dir / "hourly_oracle_da_only.parquet"
+        oracle_afrr_only_hourly_path = scenario_out_dir / "hourly_oracle_afrr_only.parquet"
         plan_history_path = scenario_out_dir / "backtest_plan_history.parquet"
         milp_event_log_path = scenario_out_dir / "backtest_milp_event_log.parquet"
         milp_event_summary_path = scenario_out_dir / "backtest_milp_event_summary.csv"
@@ -949,6 +953,16 @@ def main() -> None:
         ])
         with _phase_watchdog("write_realized_ledger"):
             outputs.hourly[[*dict.fromkeys(realized_cols)]].to_parquet(realized_ledger_path, index=False)
+        with _phase_watchdog("write_isolated_hourly"):
+            iso = outputs.isolated_hourly or {}
+            if isinstance(iso.get("realized_da_only"), pd.DataFrame):
+                iso["realized_da_only"].to_parquet(realized_da_only_hourly_path, index=False)
+            if isinstance(iso.get("realized_afrr_only"), pd.DataFrame):
+                iso["realized_afrr_only"].to_parquet(realized_afrr_only_hourly_path, index=False)
+            if isinstance(iso.get("oracle_da_only"), pd.DataFrame):
+                iso["oracle_da_only"].to_parquet(oracle_da_only_hourly_path, index=False)
+            if isinstance(iso.get("oracle_afrr_only"), pd.DataFrame):
+                iso["oracle_afrr_only"].to_parquet(oracle_afrr_only_hourly_path, index=False)
 
         with _phase_watchdog("write_plan_history"):
             outputs.plan_history.to_parquet(plan_history_path, index=False)
@@ -1109,6 +1123,42 @@ def main() -> None:
             ]
             keep = [c for c in keep if c in hp.columns]
             hp[keep].to_csv(oracle_paradox_path, index=False)
+        with _phase_watchdog("write_ev_summary"):
+            ev_terms = [
+                "ev_da_charge_eur",
+                "ev_da_discharge_eur",
+                "ev_afrr_pos_eur",
+                "ev_afrr_neg_eur",
+                "ev_slack_penalty_pos_eur",
+                "ev_slack_penalty_neg_eur",
+                "ev_terminal_soc_credit_eur",
+                "ev_objective_rebuild_eur",
+                "ev_da_charge_coef_eur_per_mw",
+                "ev_da_discharge_coef_eur_per_mw",
+            ]
+            ev_terms = [c for c in ev_terms if c in outputs.hourly.columns]
+            if ev_terms:
+                h = outputs.hourly.copy()
+                strict_mask = pd.Series(True, index=h.index)
+                if "is_strict_optimized_hour" in h.columns:
+                    strict_mask &= pd.to_numeric(h["is_strict_optimized_hour"], errors="coerce").fillna(0.0).eq(1.0)
+                rows = []
+                for scope, mask in [("all_hours", pd.Series(True, index=h.index)), ("strict_optimized_hours", strict_mask)]:
+                    hs = h.loc[mask]
+                    for c in ev_terms:
+                        s = pd.to_numeric(hs[c], errors="coerce")
+                        rows.append(
+                            {
+                                "scope": scope,
+                                "ev_term": c,
+                                "count": int(s.notna().sum()),
+                                "mean": float(s.mean()) if len(s) else float("nan"),
+                                "pct_zero": float((s.fillna(0.0) == 0.0).mean() * 100.0) if len(s) else float("nan"),
+                                "pct_negative": float((s < 0.0).mean() * 100.0) if len(s) else float("nan"),
+                                "pct_positive": float((s > 0.0).mean() * 100.0) if len(s) else float("nan"),
+                            }
+                        )
+                pd.DataFrame(rows).to_csv(scenario_out_dir / "ev_summary.csv", index=False)
         with _phase_watchdog("plot_cumulative_pnl"):
             _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
 
@@ -1148,6 +1198,21 @@ def main() -> None:
             f"{(100.0 * float(r_afrr)) if pd.notna(r_afrr) else float('nan'):.2f}% | "
             f"{(100.0 * float(r_multi)) if pd.notna(r_multi) else float('nan'):.2f}%"
         )
+        final_soc = outputs.summary.get("final_real_soc_mwh", float("nan"))
+        final_soc_target = outputs.summary.get("final_soc_min_target_mwh", float("nan"))
+        final_soc_ok = bool(outputs.summary.get("final_soc_constraint_satisfied", False))
+        final_soc_shortfall = outputs.summary.get("final_soc_shortfall_mwh", float("nan"))
+        if final_soc_ok:
+            print(
+                "- final_soc_check: OK "
+                f"(actual/target={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh)"
+            )
+        else:
+            print(
+                "[WARN] final_soc_check: NOT MET "
+                f"(actual/target={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh, "
+                f"shortfall={float(final_soc_shortfall):.4f} MWh)"
+            )
         print(f"- output_dir: {scenario_out_dir}")
 
         row: dict[str, object] = {

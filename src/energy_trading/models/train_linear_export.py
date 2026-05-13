@@ -298,7 +298,12 @@ def _train_target(
     pred_va_h1: np.ndarray | None = None
     pred_te_h1: np.ndarray | None = None
 
+    total_leads = int(forecast_horizon_hours)
+    leads_done = 0
+    train_t0 = time.perf_counter()
+
     for lead_h in range(1, int(forecast_horizon_hours) + 1):
+        lead_t0 = time.perf_counter()
         shift_n = int(lead_h - 1)
         y_tr_shift = y_train_all.shift(-shift_n)
         y_va_shift = y_val_all.shift(-shift_n)
@@ -325,7 +330,19 @@ def _train_target(
                 len(X_tr),
                 len(X_va),
             )
+            leads_done += 1
             continue
+
+        LOGGER.info(
+            "[TRAIN] target=%s lead=%s/%s rows(train=%s,val=%s,test=%s) quantiles=%s",
+            target_col,
+            lead_h,
+            total_leads,
+            len(X_tr),
+            len(X_va),
+            len(X_te),
+            len(QUANTILES),
+        )
 
         q_models: dict[str, Pipeline] = {}
         preds_va: dict[str, np.ndarray] = {}
@@ -420,6 +437,21 @@ def _train_target(
                 "val": _make_prediction_frame(bundle=bundle, timestamp=ts_va, pred_col=pred_col, y_pred=pred_va),
                 "test": _make_prediction_frame(bundle=bundle, timestamp=ts_te, pred_col=pred_col, y_pred=pred_te),
             }
+
+        leads_done += 1
+        now = time.perf_counter()
+        elapsed = now - train_t0
+        avg_lead_s = elapsed / max(leads_done, 1)
+        eta_s = max(total_leads - leads_done, 0) * avg_lead_s
+        LOGGER.info(
+            "[HEARTBEAT] target=%s progress=%s/%s elapsed=%.1fs eta=%.1fs lead_runtime=%.2fs",
+            target_col,
+            leads_done,
+            total_leads,
+            elapsed,
+            eta_s,
+            now - lead_t0,
+        )
 
     if not lead_models:
         raise ValueError(f"No linear lead models trained for target '{target_col}'.")

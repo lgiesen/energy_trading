@@ -145,14 +145,6 @@ class BidBuilder:
                 if is_oracle
                 else self.pricing.capacity_price(pred=float(pred_cap_pos))
             )
-            # Avoid structurally loss-making reserve participation.
-            unit_margin_pos = (
-                cap_bid_pos
-                + max(0.0, float(pred_act_pos)) * self.eta_out
-                - self.mc_pos * self.eta_out
-            )
-            if unit_margin_pos <= 0.0:
-                q_pos = 0.0
         if q_pos > 0.0:
             bids.append(
                 AFRRCapacityBid(
@@ -177,13 +169,6 @@ class BidBuilder:
                 if is_oracle
                 else self.pricing.capacity_price(pred=float(pred_cap_neg))
             )
-            unit_margin_neg = (
-                cap_bid_neg
-                + min(0.0, float(pred_act_neg)) / max(self.eta_in, 1e-12)
-                - self.mc_neg / max(self.eta_in, 1e-12)
-            )
-            if unit_margin_neg <= 0.0:
-                q_neg = 0.0
         if q_neg > 0.0:
             bids.append(
                 AFRRCapacityBid(
