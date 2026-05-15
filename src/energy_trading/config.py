@@ -81,6 +81,10 @@ MARKET_SPECS = {
     # buy uses conservative upper tail (e.g. p90/p95), sell lower tail (e.g. p10/p05).
     "da_buy_limit_quantile": "p90",
     "da_sell_limit_quantile": "p10",
+    # Debug guard for DA limit bids:
+    # if enabled, fail hard when configured DA quantile inputs are missing/invalid
+    # instead of silently falling back to weaker pricing logic.
+    "da_bid_fail_fast_debug": False,
     # Synthetic ID rescue pricing around DA with market caps/floors
     "id_rescue_spread_eur_mwh": 30.0,
     "id_buy_price_cap_eur_mwh": 3000.0,
@@ -156,6 +160,8 @@ def _validate_config() -> None:
         raise ValueError("da_buy_limit_quantile must be one of {'p05','p10','p90','p95'}.")
     if str(MARKET_SPECS.get("da_sell_limit_quantile", "p10")).lower() not in {"p05", "p10", "p90", "p95"}:
         raise ValueError("da_sell_limit_quantile must be one of {'p05','p10','p90','p95'}.")
+    if not isinstance(MARKET_SPECS.get("da_bid_fail_fast_debug", False), bool):
+        raise ValueError("da_bid_fail_fast_debug must be boolean.")
     if MARKET_SPECS["afrr_energy_bid_strategy"] not in {"forecast", "marginal_cost", "hybrid"}:
         raise ValueError("afrr_energy_bid_strategy must be one of {'forecast', 'marginal_cost', 'hybrid'}.")
     if MARKET_SPECS["afrr_capacity_bid_risk_lambda"] < 0:

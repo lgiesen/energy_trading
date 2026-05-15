@@ -857,15 +857,6 @@ def main() -> None:
         df = df[df[colmap.timestamp] <= pd.to_datetime(args.end, utc=True)].copy()
     if df.empty:
         raise ValueError("No rows after timestamp filtering.")
-    # Quick data-health diagnostic for potential "death zone" windows.
-    true_da_std = pd.to_numeric(df.get(colmap.true_da_price), errors="coerce").std()
-    true_act_pos_std = pd.to_numeric(df.get(colmap.true_afrr_activation_price_pos), errors="coerce").std()
-    print(
-        "[DIAG] input_stddev "
-        f"{colmap.true_da_price}={float(true_da_std) if pd.notna(true_da_std) else float('nan'):.6f}, "
-        f"{colmap.true_afrr_activation_price_pos}={float(true_act_pos_std) if pd.notna(true_act_pos_std) else float('nan'):.6f}"
-    )
-
     scenarios: list[tuple[str, dict[str, pd.DataFrame] | None]] = [("default", forecast_warehouse)]
     if quantile_pairs:
         if forecast_warehouse is None:
@@ -1180,7 +1171,7 @@ def main() -> None:
             print(f"- timeframe_total_days: {num_days_total:.4f}")
         print(f"- trading_strategy: {args.trading_strategy}")
         print(
-            "- Multi-market pnl (realized/oracle): "
+            "- realized/oracle: "
             f"{outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f} / "
             f"{outputs.summary.get('oracle_total_pnl_eur', float('nan')):.2f}"
         )
@@ -1213,11 +1204,31 @@ def main() -> None:
                 f"(actual/target={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh, "
                 f"shortfall={float(final_soc_shortfall):.4f} MWh)"
             )
+        missed_cap_pos = pd.to_numeric(
+            pd.Series([outputs.summary.get("total_missed_capacity_pos_mw", 0.0)]),
+            errors="coerce",
+        ).iloc[0]
+        missed_cap_neg = pd.to_numeric(
+            pd.Series([outputs.summary.get("total_missed_capacity_neg_mw", 0.0)]),
+            errors="coerce",
+        ).iloc[0]
+        if (pd.notna(missed_cap_pos) and float(missed_cap_pos) > 0.0) or (
+            pd.notna(missed_cap_neg) and float(missed_cap_neg) > 0.0
+        ):
+            print(
+                "[WARN] missed_capacity_afrr: "
+                f"pos={float(missed_cap_pos):.4f} MW, "
+                f"neg={float(missed_cap_neg):.4f} MW"
+            )
         print(f"- output_dir: {scenario_out_dir}")
 
         row: dict[str, object] = {
             "scenario": scenario_name,
             "trading_strategy": args.trading_strategy,
+            "split": args.split,
+            "model_key": args.model_key,
+            "start": args.start,
+            "end": args.end,
             "da_quantile_role": args.da_quantile_role,
             "realized_total_pnl_eur": outputs.summary.get("realized_total_pnl_eur"),
             "predicted_total_pnl_eur": outputs.summary.get("predicted_total_pnl_eur"),
@@ -1248,6 +1259,45 @@ def main() -> None:
         sweep_df.to_csv(sweep_csv, index=False)
         sweep_json.write_text(sweep_df.to_json(orient="records", indent=2), encoding="utf-8")
         print(f"[OK] Quantile sweep summary: {sweep_csv}")
+
+    # Strategy overview across separate runs (multi / da_only / afrr_only).
+    if sweep_rows:
+        overview_row = pd.DataFrame(sweep_rows)
+        overview_csv = out_dir / "strategy_overview.csv"
+        overview_json = out_dir / "strategy_overview.json"
+        if overview_csv.exists():
+            prev = pd.read_csv(overview_csv)
+            overview = pd.concat([prev, overview_row], ignore_index=True, sort=False)
+        else:
+            overview = overview_row
+        # Keep exactly one row per scenario+strategy in the overview.
+        # Re-running smoke tests should overwrite previous entries.
+        dedup_keys = [k for k in ["scenario", "trading_strategy"] if k in overview.columns]
+        if dedup_keys:
+            overview = overview.drop_duplicates(subset=dedup_keys, keep="last")
+        if {"realized_total_pnl_eur", "oracle_total_pnl_eur"}.issubset(overview.columns):
+            r = pd.to_numeric(overview["realized_total_pnl_eur"], errors="coerce")
+            o = pd.to_numeric(overview["oracle_total_pnl_eur"], errors="coerce")
+            overview["realized_vs_oracle_pct"] = np.where(
+                o.abs() > 1e-12,
+                (r / o) * 100.0,
+                np.nan,
+            )
+        overview = overview.sort_values([c for c in ["scenario", "trading_strategy"] if c in overview.columns]).reset_index(drop=True)
+        overview.to_csv(overview_csv, index=False)
+        overview_json.write_text(overview.to_json(orient="records", indent=2), encoding="utf-8")
+        print("[OK] Strategy overview:")
+        print(f"- output_dir: {out_dir}")
+        show_cols = [c for c in ["scenario", "trading_strategy", "realized_total_pnl_eur", "oracle_total_pnl_eur", "realized_vs_oracle_pct"] if c in overview.columns]
+        if show_cols:
+            display_df = overview[show_cols].copy()
+            for c in ["realized_total_pnl_eur", "oracle_total_pnl_eur", "realized_vs_oracle_pct"]:
+                if c in display_df.columns:
+                    display_df[c] = pd.to_numeric(display_df[c], errors="coerce").map(
+                        lambda x: f"{float(x):.2f}" if pd.notna(x) else "nan"
+                    )
+            print(display_df.to_string(index=False))
+        print(f"[OK] Strategy overview files: {overview_csv} | {overview_json}")
 
 
 if __name__ == "__main__":

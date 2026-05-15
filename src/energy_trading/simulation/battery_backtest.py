@@ -291,6 +291,7 @@ class BatteryBacktester:
         self.afrr_quantile_bins = list(AFRR_QUANTILE_BINS)
         self.afrr_quantile_prob = {q: 1.0 - float(q.replace("p", "")) / 100.0 for q in self.afrr_quantile_bins}
         self.da_execution_mode = str(MARKET_SPECS.get("da_execution_mode", "price_taker"))
+        self.da_bid_fail_fast_debug = bool(MARKET_SPECS.get("da_bid_fail_fast_debug", False))
         self.da_link_to_awarded_afrr = bool(MARKET_SPECS.get("da_link_to_awarded_afrr", True))
         self.bid_pricing_policy = BidPricingPolicy(
             cap_risk_lambda=float(MARKET_SPECS.get("afrr_capacity_bid_risk_lambda", 0.2)),
@@ -361,7 +362,66 @@ class BatteryBacktester:
 
     @staticmethod
     def _clip_rate(x: np.ndarray) -> np.ndarray:
-        return np.clip(np.nan_to_num(x, nan=0.0), 0.0, 1.0)
+        arr = np.asarray(x, dtype=float)
+        if np.isnan(arr).any():
+            raise ValueError("NaN detected in activation-rate input. Fail-fast is enabled; fix upstream data mapping.")
+        return np.clip(arr, 0.0, 1.0)
+
+    def _validate_critical_data(
+        self,
+        frame: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        *,
+        require_da_quantiles: bool = False,
+        require_pacc_bins: bool = False,
+    ) -> None:
+        """Fail-fast gate for critical financial inputs before clearing/optimization."""
+        critical_cols = [
+            colmap.pred_da_price,
+            colmap.true_da_price,
+            colmap.pred_afrr_capacity_price_pos,
+            colmap.pred_afrr_capacity_price_neg,
+            colmap.true_afrr_capacity_price_pos,
+            colmap.true_afrr_capacity_price_neg,
+            colmap.pred_afrr_activation_price_pos,
+            colmap.pred_afrr_activation_price_neg,
+            colmap.true_afrr_activation_price_pos,
+            colmap.true_afrr_activation_price_neg,
+            colmap.pred_afrr_activation_rate_pos,
+            colmap.pred_afrr_activation_rate_neg,
+            colmap.true_afrr_activation_rate_pos,
+            colmap.true_afrr_activation_rate_neg,
+        ]
+        if require_da_quantiles:
+            critical_cols.extend(
+                [
+                    f"{colmap.pred_da_price}_p05",
+                    f"{colmap.pred_da_price}_p10",
+                    f"{colmap.pred_da_price}_p90",
+                    f"{colmap.pred_da_price}_p95",
+                ]
+            )
+        # p_acc bins are critical once created for optimization.
+        if require_pacc_bins:
+            for b in range(len(self.afrr_quantile_bins)):
+                critical_cols.append(f"pacc_pos_bin_{b}")
+                critical_cols.append(f"pacc_neg_bin_{b}")
+
+        missing_cols = [c for c in critical_cols if c not in frame.columns]
+        if missing_cols:
+            raise ValueError(
+                "Critical data gate failed: missing required columns: " + ", ".join(missing_cols[:20])
+            )
+
+        bad_msgs: list[str] = []
+        for c in critical_cols:
+            s = pd.to_numeric(frame[c], errors="coerce")
+            bad = s.isna() | ~np.isfinite(s.to_numpy(dtype=float))
+            if bool(bad.any()):
+                idx = frame.index[bad].tolist()[:5]
+                bad_msgs.append(f"{c}: bad={int(bad.sum())}/{len(s)} sample_index={idx}")
+        if bad_msgs:
+            raise ValueError("Critical data gate failed due to null/non-finite values. " + " | ".join(bad_msgs[:20]))
 
     @staticmethod
     def _finite_numeric_series(
@@ -1411,6 +1471,7 @@ class BatteryBacktester:
             id_discharge_mw=id_discharge,
         )
         aux_mwh = aux_power_mw * self.dt_h
+        aux_cost_eur = aux_mwh * float(da_price)
 
         # Keep SoC feasible by scaling in/out streams if needed.
         delta = self.eta_in * in_internal - out_internal / self.eta_out - aux_mwh
@@ -1606,8 +1667,19 @@ class BatteryBacktester:
             "id_slippage_cost_eur": id_slippage_cost_eur,
             "aux_power_mw": aux_power_mw,
             "aux_energy_mwh": aux_mwh,
+            "aux_cost_eur": aux_cost_eur,
             "aux_state": aux_state,
             "soc_for_capacity_mwh": soc_for_capacity,
+            "requested_activation_pos_mwh": act_pos_grid_req,
+            "requested_activation_neg_mwh": act_neg_grid_req,
+            "awarded_capacity_pos_mw": reserve_pos,
+            "awarded_capacity_neg_mw": reserve_neg,
+            "physically_deliverable_capacity_pos_mw": max_pos_capacity_supported_mw,
+            "physically_deliverable_capacity_neg_mw": max_neg_capacity_supported_mw,
+            "delivered_capacity_pos_mw": delivered_capacity_pos_mw,
+            "delivered_capacity_neg_mw": delivered_capacity_neg_mw,
+            "delivered_activation_pos_mwh": act_pos_grid,
+            "delivered_activation_neg_mwh": act_neg_grid,
             "penalty_activation_pos_eur": penalty_activation_pos_eur,
             "penalty_activation_neg_eur": penalty_activation_neg_eur,
             "penalty_activation_eur": penalty_activation_eur,
@@ -1705,6 +1777,42 @@ class BatteryBacktester:
         ob_neg = max(0.0, float(obligation_neg_mw))
         soc_ref = float(self.soc_init if soc_now is None else soc_now)
         n_bins = int(len(self.afrr_quantile_bins))
+
+        if self.da_bid_fail_fast_debug:
+            # Debug-mode hard guard: DA limit bids must not be built from missing or
+            # degenerate quantile inputs.
+            buy_q_name = str(getattr(self.bid_builder, "da_buy_limit_quantile", "p90")).lower()
+            sell_q_name = str(getattr(self.bid_builder, "da_sell_limit_quantile", "p10")).lower()
+            da_q_map = {
+                "p05": pred_da_price_p05,
+                "p10": pred_da_price_p10,
+                "p90": pred_da_price_p90,
+                "p95": pred_da_price_p95,
+            }
+            if ch_plan > 0.0:
+                buy_q_val = da_q_map.get(buy_q_name)
+                if buy_q_val is None or not np.isfinite(float(buy_q_val)):
+                    raise RuntimeError(
+                        f"DA fail-fast: missing/invalid buy quantile '{buy_q_name}' at {ts}; "
+                        f"planned_charge_mw={ch_plan:.4f}, pred_da_price={float(pred_da_price):.6f}"
+                    )
+                if abs(float(buy_q_val)) <= 1e-12:
+                    raise RuntimeError(
+                        f"DA fail-fast: zero buy quantile '{buy_q_name}' at {ts}; "
+                        f"planned_charge_mw={ch_plan:.4f}, pred_da_price={float(pred_da_price):.6f}"
+                    )
+            if dis_plan > 0.0:
+                sell_q_val = da_q_map.get(sell_q_name)
+                if sell_q_val is None or not np.isfinite(float(sell_q_val)):
+                    raise RuntimeError(
+                        f"DA fail-fast: missing/invalid sell quantile '{sell_q_name}' at {ts}; "
+                        f"planned_discharge_mw={dis_plan:.4f}, pred_da_price={float(pred_da_price):.6f}"
+                    )
+                if abs(float(sell_q_val)) <= 1e-12:
+                    raise RuntimeError(
+                        f"DA fail-fast: zero sell quantile '{sell_q_name}' at {ts}; "
+                        f"planned_discharge_mw={dis_plan:.4f}, pred_da_price={float(pred_da_price):.6f}"
+                    )
 
         def _qlevel(q: str) -> float:
             try:
@@ -2242,6 +2350,30 @@ class BatteryBacktester:
             )
             return empty_dispatch, empty_plan
 
+        # Pre-simulation gate is only safe without forecast warehouse.
+        # With long-format warehouse mode, critical prediction columns are
+        # populated per-window later and validated there.
+        if forecast_warehouse is None:
+            # Apply global gate only when a full prediction surface is present on df.
+            # Naive/oracle helper runs may intentionally build prediction columns
+            # differently (e.g., lagged construction) and are validated downstream.
+            pred_surface_cols = [
+                colmap.pred_da_price,
+                colmap.pred_afrr_capacity_price_pos,
+                colmap.pred_afrr_capacity_price_neg,
+                colmap.pred_afrr_activation_price_pos,
+                colmap.pred_afrr_activation_price_neg,
+                colmap.pred_afrr_activation_rate_pos,
+                colmap.pred_afrr_activation_rate_neg,
+            ]
+            if all(c in df.columns for c in pred_surface_cols):
+                self._validate_critical_data(
+                    df,
+                    colmap,
+                    require_da_quantiles=False,
+                    require_pacc_bins=False,
+                )
+
         decisions: list[pd.DataFrame] = []
         plan_history: list[pd.DataFrame] = []
         soc = float(self.soc_init)
@@ -2398,6 +2530,13 @@ class BatteryBacktester:
                             for qc in q_cols:
                                 filled_q = _asof_fill_from_long(src_df, qc)
                                 window[f"{base}_{qc}"] = filled_q.to_numpy(dtype=float)
+                    # Propagate DA quantile columns used by DA limit bid pricing.
+                    if pred_col == colmap.pred_da_price:
+                        q_cols = [c for c in QUANTILE_COLUMNS if c in src_df.columns]
+                        if q_cols:
+                            for qc in q_cols:
+                                filled_q = _asof_fill_from_long(src_df, qc)
+                                window[f"{pred_col}_{qc}"] = filled_q.to_numpy(dtype=float)
 
                 # Ensure required prediction columns are finite even if some long files are absent.
                 # Causality guard: prediction-side optimization must never fall back to truth-side columns.
@@ -2508,6 +2647,15 @@ class BatteryBacktester:
                             .fillna(pd.Series(fb_neg, index=window.index))
                             .to_numpy(dtype=float)
                         )
+                # Final strict gate: critical optimizer inputs must be fully valid.
+                self._validate_critical_data(
+                    window,
+                    colmap,
+                    # DA quantiles are only strictly required in explicit debug mode.
+                    # In normal mode, DA bid pricing can still fall back to point-forecast logic.
+                    require_da_quantiles=bool(self.da_bid_fail_fast_debug),
+                    require_pacc_bins=True,
+                )
             else:
                 w_end = min(n, i + horizon_hours)
                 window = df.iloc[i:w_end].copy()
@@ -2744,6 +2892,19 @@ class BatteryBacktester:
             k = min(reopt_step_hours, len(plan))
             take = plan.iloc[:k].copy()
             pred_cols = [c for c in CANONICAL_PREDICTION_COLUMNS if c in window.columns]
+            # Include DA quantile columns needed later for quantile-backed
+            # settlement/bid validation in fail-fast mode.
+            da_quant_cols = [
+                c
+                for c in (
+                    f"{colmap.pred_da_price}_p05",
+                    f"{colmap.pred_da_price}_p10",
+                    f"{colmap.pred_da_price}_p90",
+                    f"{colmap.pred_da_price}_p95",
+                )
+                if c in window.columns
+            ]
+            pred_cols = pred_cols + [c for c in da_quant_cols if c not in pred_cols]
             if pred_cols:
                 pred_take = window[[colmap.timestamp, *pred_cols]].iloc[:k].copy()
                 # Defensive normalization: ensure same tz-aware dtype on merge key.
@@ -2787,7 +2948,7 @@ class BatteryBacktester:
                 soc_before_vals.append(float(executed_s))
                 ts = getattr(r, colmap.timestamp)
                 src = window_src.loc[ts] if ts in window_src.index else source.loc[ts]
-                def _sf(series: pd.Series, key: str, default: float = 0.0) -> float:
+                def _sf(series: pd.Series, key: str, default: float = np.nan) -> float:
                     try:
                         v = pd.to_numeric(pd.Series([series.get(key, default)]), errors="coerce").iloc[0]
                         return float(default if pd.isna(v) else v)
@@ -2836,6 +2997,37 @@ class BatteryBacktester:
                 )
                 planned_soc_vals.append(float(planned_s))
 
+                critical_inputs = {
+                    "pred_da_price": float(da_price_plan),
+                    "true_da_price": _sf(src, colmap.true_da_price, np.nan),
+                    "pred_cap_pos": _sf(src, colmap.pred_afrr_capacity_price_pos, np.nan),
+                    "true_cap_pos": _sf(src, colmap.true_afrr_capacity_price_pos, np.nan),
+                    "pred_cap_neg": _sf(src, colmap.pred_afrr_capacity_price_neg, np.nan),
+                    "true_cap_neg": _sf(src, colmap.true_afrr_capacity_price_neg, np.nan),
+                    "pred_act_pos": _sf(src, colmap.pred_afrr_activation_price_pos, np.nan),
+                    "true_act_pos": _sf(src, colmap.true_afrr_activation_price_pos, np.nan),
+                    "pred_act_neg": _sf(src, colmap.pred_afrr_activation_price_neg, np.nan),
+                    "true_act_neg": _sf(src, colmap.true_afrr_activation_price_neg, np.nan),
+                    "pred_rate_pos": _sf(src, colmap.pred_afrr_activation_rate_pos, np.nan),
+                    "pred_rate_neg": _sf(src, colmap.pred_afrr_activation_rate_neg, np.nan),
+                    "true_rate_pos": _sf(src, colmap.true_afrr_activation_rate_pos, np.nan),
+                    "true_rate_neg": _sf(src, colmap.true_afrr_activation_rate_neg, np.nan),
+                }
+                require_da_quantiles_here = bool(self.da_bid_fail_fast_debug) or (
+                    abs(charge_plan) > 1e-9 or abs(discharge_plan) > 1e-9
+                )
+                if require_da_quantiles_here:
+                    critical_inputs["pred_da_price_p05"] = _sf(src, f"{colmap.pred_da_price}_p05", np.nan)
+                    critical_inputs["pred_da_price_p10"] = _sf(src, f"{colmap.pred_da_price}_p10", np.nan)
+                    critical_inputs["pred_da_price_p90"] = _sf(src, f"{colmap.pred_da_price}_p90", np.nan)
+                    critical_inputs["pred_da_price_p95"] = _sf(src, f"{colmap.pred_da_price}_p95", np.nan)
+                bad = [k for k, v in critical_inputs.items() if not np.isfinite(float(v))]
+                if bad:
+                    raise ValueError(
+                        f"Critical clearing input missing/non-finite at {pd.to_datetime(ts, utc=True)}: "
+                        + ", ".join(bad)
+                    )
+
                 cleared = self._apply_market_clearing(
                     target_time_utc=pd.to_datetime(ts, utc=True, errors="coerce"),
                     is_oracle=is_oracle,
@@ -2843,24 +3035,26 @@ class BatteryBacktester:
                     planned_discharge_mw=discharge_plan,
                     planned_reserve_pos_mw=reserve_pos_plan,
                     planned_reserve_neg_mw=reserve_neg_plan,
-                    pred_da_price=_sf(src, colmap.pred_da_price, 0.0),
-                    pred_da_price_p05=_sf(src, f"{colmap.pred_da_price}_p05", np.nan),
-                    pred_da_price_p10=_sf(src, f"{colmap.pred_da_price}_p10", np.nan),
-                    pred_da_price_p90=_sf(src, f"{colmap.pred_da_price}_p90", np.nan),
-                    pred_da_price_p95=_sf(src, f"{colmap.pred_da_price}_p95", np.nan),
-                    true_da_price=_sf(src, colmap.true_da_price, 0.0),
-                    pred_cap_pos=_sf(src, colmap.pred_afrr_capacity_price_pos, 0.0),
-                    true_cap_pos=_sf(src, colmap.true_afrr_capacity_price_pos, 0.0),
-                    pred_cap_neg=_sf(src, colmap.pred_afrr_capacity_price_neg, 0.0),
-                    true_cap_neg=_sf(src, colmap.true_afrr_capacity_price_neg, 0.0),
-                    pred_act_pos=_sf(src, colmap.pred_afrr_activation_price_pos, 0.0),
-                    true_act_pos=_sf(src, colmap.true_afrr_activation_price_pos, 0.0),
-                    pred_act_neg=_sf(src, colmap.pred_afrr_activation_price_neg, 0.0),
-                    true_act_neg=_sf(src, colmap.true_afrr_activation_price_neg, 0.0),
-                    true_rate_pos=_sf(src, colmap.true_afrr_activation_rate_pos, 0.0),
-                    true_rate_neg=_sf(src, colmap.true_afrr_activation_rate_neg, 0.0),
-                    pred_rate_pos=_sf(src, colmap.pred_afrr_activation_rate_pos, 0.0),
-                    pred_rate_neg=_sf(src, colmap.pred_afrr_activation_rate_neg, 0.0),
+                    # Never default DA prediction to 0.0 for bid pricing.
+                    # Use the already-selected planning-side DA forecast instead.
+                    pred_da_price=float(da_price_plan),
+                    pred_da_price_p05=critical_inputs.get("pred_da_price_p05", np.nan),
+                    pred_da_price_p10=critical_inputs.get("pred_da_price_p10", np.nan),
+                    pred_da_price_p90=critical_inputs.get("pred_da_price_p90", np.nan),
+                    pred_da_price_p95=critical_inputs.get("pred_da_price_p95", np.nan),
+                    true_da_price=critical_inputs["true_da_price"],
+                    pred_cap_pos=critical_inputs["pred_cap_pos"],
+                    true_cap_pos=critical_inputs["true_cap_pos"],
+                    pred_cap_neg=critical_inputs["pred_cap_neg"],
+                    true_cap_neg=critical_inputs["true_cap_neg"],
+                    pred_act_pos=critical_inputs["pred_act_pos"],
+                    true_act_pos=critical_inputs["true_act_pos"],
+                    pred_act_neg=critical_inputs["pred_act_neg"],
+                    true_act_neg=critical_inputs["true_act_neg"],
+                    true_rate_pos=critical_inputs["true_rate_pos"],
+                    true_rate_neg=critical_inputs["true_rate_neg"],
+                    pred_rate_pos=critical_inputs["pred_rate_pos"],
+                    pred_rate_neg=critical_inputs["pred_rate_neg"],
                     soc_now=float(executed_s),
                     pred_act_pos_q10=_sf(src, "pred_afrr_activation_price_pos_p10", np.nan),
                     pred_act_pos_q50=_sf(src, "pred_afrr_activation_price_pos_p50", np.nan),
@@ -3123,6 +3317,23 @@ class BatteryBacktester:
         )
         dispatch_cols = dispatch_cols + [c for c in dispatch_meta_cols if c in dispatch.columns]
         dispatch_cols = dispatch_cols + [c for c in dispatch_clearing_cols if c in dispatch.columns]
+        # Preserve prediction handoff into settlement:
+        # when base input df is truth-only (manifest mode), settlement still needs
+        # prediction-side columns for quantile-backed DA/aFRR bidding checks.
+        pred_handoff_cols = [
+            colmap.pred_da_price,
+            f"{colmap.pred_da_price}_p05",
+            f"{colmap.pred_da_price}_p10",
+            f"{colmap.pred_da_price}_p90",
+            f"{colmap.pred_da_price}_p95",
+            colmap.pred_afrr_capacity_price_pos,
+            colmap.pred_afrr_capacity_price_neg,
+            colmap.pred_afrr_activation_price_pos,
+            colmap.pred_afrr_activation_price_neg,
+            colmap.pred_afrr_activation_rate_pos,
+            colmap.pred_afrr_activation_rate_neg,
+        ]
+        dispatch_cols = dispatch_cols + [c for c in pred_handoff_cols if c in dispatch.columns]
 
         # Backward compatibility: fallback/legacy dispatch paths may not include
         # all expected execution columns; synthesize safe defaults.
@@ -3171,21 +3382,46 @@ class BatteryBacktester:
                 base_cols.extend(
                     [
                         colmap.pred_da_price,
+                        f"{colmap.pred_da_price}_p05",
+                        f"{colmap.pred_da_price}_p10",
+                        f"{colmap.pred_da_price}_p90",
+                        f"{colmap.pred_da_price}_p95",
                         colmap.pred_afrr_capacity_price_pos,
                         colmap.pred_afrr_capacity_price_neg,
                         colmap.pred_afrr_activation_price_pos,
                         colmap.pred_afrr_activation_price_neg,
+                        colmap.pred_afrr_activation_rate_pos,
+                        colmap.pred_afrr_activation_rate_neg,
                     ]
                 )
             base_cols = [c for c in dict.fromkeys(base_cols) if c in df.columns]
             merged = df[base_cols].copy()
-            merged = merged.merge(dispatch[dispatch_cols], on=colmap.timestamp, how="inner")
+            disp_take = dispatch[dispatch_cols].copy()
+            # Robust timezone/key alignment for settlement handoff.
+            merged[colmap.timestamp] = pd.to_datetime(merged[colmap.timestamp], utc=True, errors="coerce")
+            disp_take[colmap.timestamp] = pd.to_datetime(disp_take[colmap.timestamp], utc=True, errors="coerce")
+            merged = merged.dropna(subset=[colmap.timestamp])
+            disp_take = disp_take.dropna(subset=[colmap.timestamp])
+            merged["_merge_ts_key"] = merged[colmap.timestamp].astype("int64")
+            disp_take["_merge_ts_key"] = disp_take[colmap.timestamp].astype("int64")
+            disp_take = disp_take.drop(columns=[colmap.timestamp], errors="ignore")
+            merged = merged.merge(disp_take, on="_merge_ts_key", how="inner").drop(columns=["_merge_ts_key"], errors="ignore")
+
+        da_quant_cols_required = [
+            f"{colmap.pred_da_price}_p05",
+            f"{colmap.pred_da_price}_p10",
+            f"{colmap.pred_da_price}_p90",
+            f"{colmap.pred_da_price}_p95",
+        ]
+        require_da_quantiles_here = bool(self.da_bid_fail_fast_debug) or any(
+            c in merged.columns for c in da_quant_cols_required
+        )
 
         soc = self.soc_init
         rows: list[dict[str, float | pd.Timestamp]] = []
         for r in merged.itertuples(index=False):
             ts = getattr(r, colmap.timestamp)
-            def _g(name: str, default: float = 0.0) -> float:
+            def _g(name: str, default: float = np.nan) -> float:
                 try:
                     return float(getattr(r, name))
                 except Exception:
@@ -3228,6 +3464,37 @@ class BatteryBacktester:
                             else:
                                 clearing_rec[c] = _g(c, 0.0)
                 else:
+                    critical_inputs = {
+                        "pred_da_price": _g(
+                            colmap.pred_da_price,
+                            _g("ev_pred_da_price_eur_mwh", _g("predicted_price", np.nan)),
+                        ),
+                        "true_da_price": _g(colmap.true_da_price, np.nan),
+                        "pred_cap_pos": _g(colmap.pred_afrr_capacity_price_pos, np.nan),
+                        "true_cap_pos": _g(colmap.true_afrr_capacity_price_pos, np.nan),
+                        "pred_cap_neg": _g(colmap.pred_afrr_capacity_price_neg, np.nan),
+                        "true_cap_neg": _g(colmap.true_afrr_capacity_price_neg, np.nan),
+                        "pred_act_pos": _g(colmap.pred_afrr_activation_price_pos, np.nan),
+                        "true_act_pos": _g(colmap.true_afrr_activation_price_pos, np.nan),
+                        "pred_act_neg": _g(colmap.pred_afrr_activation_price_neg, np.nan),
+                        "true_act_neg": _g(colmap.true_afrr_activation_price_neg, np.nan),
+                        "pred_rate_pos": _g(colmap.pred_afrr_activation_rate_pos, np.nan),
+                        "pred_rate_neg": _g(colmap.pred_afrr_activation_rate_neg, np.nan),
+                        "true_rate_pos": _g(colmap.true_afrr_activation_rate_pos, np.nan),
+                        "true_rate_neg": _g(colmap.true_afrr_activation_rate_neg, np.nan),
+                    }
+                    if require_da_quantiles_here:
+                        critical_inputs["pred_da_price_p05"] = _g(f"{colmap.pred_da_price}_p05", np.nan)
+                        critical_inputs["pred_da_price_p10"] = _g(f"{colmap.pred_da_price}_p10", np.nan)
+                        critical_inputs["pred_da_price_p90"] = _g(f"{colmap.pred_da_price}_p90", np.nan)
+                        critical_inputs["pred_da_price_p95"] = _g(f"{colmap.pred_da_price}_p95", np.nan)
+                    bad = [k for k, v in critical_inputs.items() if not np.isfinite(float(v))]
+                    if bad:
+                        raise ValueError(
+                            f"Critical clearing input missing/non-finite at {pd.to_datetime(ts, utc=True)}: "
+                            + ", ".join(bad)
+                        )
+
                     cleared = self._apply_market_clearing(
                         target_time_utc=pd.to_datetime(ts, utc=True, errors="coerce"),
                         is_oracle=oracle_mode,
@@ -3235,24 +3502,26 @@ class BatteryBacktester:
                         planned_discharge_mw=discharge,
                         planned_reserve_pos_mw=reserve_pos,
                         planned_reserve_neg_mw=reserve_neg,
-                        pred_da_price=_g(colmap.pred_da_price, 0.0),
-                        pred_da_price_p05=_g(f"{colmap.pred_da_price}_p05", np.nan),
-                        pred_da_price_p10=_g(f"{colmap.pred_da_price}_p10", np.nan),
-                        pred_da_price_p90=_g(f"{colmap.pred_da_price}_p90", np.nan),
-                        pred_da_price_p95=_g(f"{colmap.pred_da_price}_p95", np.nan),
-                        true_da_price=_g(colmap.true_da_price, 0.0),
-                        pred_cap_pos=_g(colmap.pred_afrr_capacity_price_pos, 0.0),
-                        true_cap_pos=_g(colmap.true_afrr_capacity_price_pos, 0.0),
-                        pred_cap_neg=_g(colmap.pred_afrr_capacity_price_neg, 0.0),
-                        true_cap_neg=_g(colmap.true_afrr_capacity_price_neg, 0.0),
-                        pred_act_pos=_g(colmap.pred_afrr_activation_price_pos, 0.0),
-                        true_act_pos=_g(colmap.true_afrr_activation_price_pos, 0.0),
-                        pred_act_neg=_g(colmap.pred_afrr_activation_price_neg, 0.0),
-                        true_act_neg=_g(colmap.true_afrr_activation_price_neg, 0.0),
-                        true_rate_pos=_g(colmap.true_afrr_activation_rate_pos, 0.0),
-                        true_rate_neg=_g(colmap.true_afrr_activation_rate_neg, 0.0),
-                        pred_rate_pos=_g(colmap.pred_afrr_activation_rate_pos, 0.0),
-                        pred_rate_neg=_g(colmap.pred_afrr_activation_rate_neg, 0.0),
+                        # Do not silently coerce missing DA forecast to 0.0.
+                        # Prefer explicit DA prediction columns available in this row.
+                        pred_da_price=critical_inputs["pred_da_price"],
+                        pred_da_price_p05=critical_inputs.get("pred_da_price_p05", np.nan),
+                        pred_da_price_p10=critical_inputs.get("pred_da_price_p10", np.nan),
+                        pred_da_price_p90=critical_inputs.get("pred_da_price_p90", np.nan),
+                        pred_da_price_p95=critical_inputs.get("pred_da_price_p95", np.nan),
+                        true_da_price=critical_inputs["true_da_price"],
+                        pred_cap_pos=critical_inputs["pred_cap_pos"],
+                        true_cap_pos=critical_inputs["true_cap_pos"],
+                        pred_cap_neg=critical_inputs["pred_cap_neg"],
+                        true_cap_neg=critical_inputs["true_cap_neg"],
+                        pred_act_pos=critical_inputs["pred_act_pos"],
+                        true_act_pos=critical_inputs["true_act_pos"],
+                        pred_act_neg=critical_inputs["pred_act_neg"],
+                        true_act_neg=critical_inputs["true_act_neg"],
+                        true_rate_pos=critical_inputs["true_rate_pos"],
+                        true_rate_neg=critical_inputs["true_rate_neg"],
+                        pred_rate_pos=critical_inputs["pred_rate_pos"],
+                        pred_rate_neg=critical_inputs["pred_rate_neg"],
                         soc_now=float(soc),
                         pred_act_pos_q10=_g("pred_afrr_activation_price_pos_p10", np.nan),
                         pred_act_pos_q50=_g("pred_afrr_activation_price_pos_p50", np.nan),
@@ -3368,12 +3637,23 @@ class BatteryBacktester:
             "revenue_activation_eur": f"{kind}_revenue_activation_eur",
             "transaction_cost_eur": f"{kind}_transaction_cost_eur",
             "degradation_cost_eur": f"{kind}_degradation_cost_eur",
+            "aux_cost_eur": f"{kind}_aux_cost_eur",
             "missed_activation_mwh": f"{kind}_missed_activation_mwh",
             "missed_activation_pos_mwh": f"{kind}_missed_activation_pos_mwh",
             "missed_activation_neg_mwh": f"{kind}_missed_activation_neg_mwh",
+            "requested_activation_pos_mwh": f"{kind}_requested_activation_pos_mwh",
+            "requested_activation_neg_mwh": f"{kind}_requested_activation_neg_mwh",
+            "delivered_activation_pos_mwh": f"{kind}_delivered_activation_pos_mwh",
+            "delivered_activation_neg_mwh": f"{kind}_delivered_activation_neg_mwh",
             "missed_capacity_mw": f"{kind}_missed_capacity_mw",
             "missed_capacity_pos_mw": f"{kind}_missed_capacity_pos_mw",
             "missed_capacity_neg_mw": f"{kind}_missed_capacity_neg_mw",
+            "awarded_capacity_pos_mw": f"{kind}_awarded_capacity_pos_mw",
+            "awarded_capacity_neg_mw": f"{kind}_awarded_capacity_neg_mw",
+            "physically_deliverable_capacity_pos_mw": f"{kind}_physically_deliverable_capacity_pos_mw",
+            "physically_deliverable_capacity_neg_mw": f"{kind}_physically_deliverable_capacity_neg_mw",
+            "delivered_capacity_pos_mw": f"{kind}_delivered_capacity_pos_mw",
+            "delivered_capacity_neg_mw": f"{kind}_delivered_capacity_neg_mw",
             "requested_activation_revenue_eur": f"{kind}_requested_activation_revenue_eur",
             "delivered_activation_revenue_eur": f"{kind}_delivered_activation_revenue_eur",
             "missed_activation_revenue_eur": f"{kind}_missed_activation_revenue_eur",
@@ -3574,7 +3854,12 @@ class BatteryBacktester:
         for pred_col, true_col in naive_pairs:
             if true_col in naive_df.columns:
                 lagged = pd.to_numeric(naive_df[true_col], errors="coerce").shift(24)
-                fallback = pd.to_numeric(naive_df[pred_col], errors="coerce") if pred_col in naive_df.columns else np.nan
+                # If prediction column is absent (truth-only input mode), use true
+                # series as finite fallback to avoid propagating all-NaN naive preds.
+                if pred_col in naive_df.columns:
+                    fallback = pd.to_numeric(naive_df[pred_col], errors="coerce")
+                else:
+                    fallback = pd.to_numeric(naive_df[true_col], errors="coerce")
                 naive_df[pred_col] = lagged.fillna(fallback)
         if use_rolling_horizon:
             naive_dispatch, naive_plan_history = self.optimize_dispatch_rolling(
@@ -3735,6 +4020,21 @@ class BatteryBacktester:
         hourly["oracle_cum_pnl_eur"] = hourly["oracle_pnl_eur"].cumsum()
         hourly["pnl_gap_eur"] = hourly["real_pnl_eur"] - hourly["pred_pnl_eur"]
         hourly["cost_of_forecast_error_eur"] = hourly["oracle_pnl_eur"] - hourly["real_pnl_eur"]
+        # Per-market opportunity-cost proxy (EV-space):
+        # Compare DA-only EV vs aFRR-only EV each hour and quantify the gap to the
+        # best single-market alternative (non-negative baseline).
+        if all(c in hourly.columns for c in ["ev_da_charge_eur", "ev_da_discharge_eur", "ev_afrr_pos_eur", "ev_afrr_neg_eur"]):
+            ev_da_total = pd.to_numeric(hourly["ev_da_charge_eur"], errors="coerce").fillna(0.0) + pd.to_numeric(
+                hourly["ev_da_discharge_eur"], errors="coerce"
+            ).fillna(0.0)
+            ev_afrr_total = pd.to_numeric(hourly["ev_afrr_pos_eur"], errors="coerce").fillna(0.0) + pd.to_numeric(
+                hourly["ev_afrr_neg_eur"], errors="coerce"
+            ).fillna(0.0)
+            hourly["ev_da_total_eur"] = ev_da_total
+            hourly["ev_afrr_total_eur"] = ev_afrr_total
+            hourly["ev_best_single_market_eur"] = np.maximum(np.maximum(ev_da_total, ev_afrr_total), 0.0)
+            hourly["ev_opportunity_cost_da_eur"] = hourly["ev_best_single_market_eur"] - ev_da_total
+            hourly["ev_opportunity_cost_afrr_eur"] = hourly["ev_best_single_market_eur"] - ev_afrr_total
 
         min_cash = float(hourly["real_cum_cash_eur"].min()) if not hourly.empty else self.initial_cash
         capital_required = max(0.0, -min_cash)
