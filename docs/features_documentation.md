@@ -1,35 +1,63 @@
-# Feature-Dokumentation und Datenwörterbuch
+# Feature Documentation and Data Dictionary
 
-## Einleitung
+## Table of Contents
 
-Dieses Dokument beschreibt den finalen, kausal abgesicherten Merkmalsraum für die aFRR-Prognose.
+- [1. Scope and Snapshot](#1-scope-and-snapshot)
+  - [1.1 Introduction](#11-introduction)
+  - [1.2 Reproducibility Block](#12-reproducibility-block)
+- [2. Feature Space](#2-feature-space)
+  - [2.1 Current Feature Concept](#21-current-feature-concept)
+  - [2.2 Considered and Removed Features](#22-considered-and-removed-features)
+  <!-- - [2.3 Metadata and Excluded Columns](#23-metadata-and-excluded-columns) -->
+- [3. Design Decisions](#3-design-decisions)
+  - [3.1 Runtime Dynamics Features During Training](#31-runtime-dynamics-features-during-training)
+  - [3.2 No-PCA Default Despite Collinearity](#32-no-pca-default-despite-collinearity)
+  - [3.3 No Global Scaling for Tree Models](#33-no-global-scaling-for-tree-models)
+  - [3.4 Cyclical Encoding of Time Features](#34-cyclical-encoding-of-time-features)
+  - [3.5 Model Separation (DA vs aFRR)](#35-model-separation-da-vs-afrr)
+- [4. Data Quality and Causality Controls](#4-data-quality-and-causality-controls)
+  - [4.1 Publication-Latency Rules (PiT)](#41-publication-latency-rules-pit)
+  - [4.2 Data Imputation (Methodological Rationale)](#42-data-imputation-methodological-rationale)
+  - [4.3 Observed Imputations (Latest Bundle Run)](#43-observed-imputations-latest-bundle-run)
+- [5. Specific Feature Logic and Rationale](#specific-feature-logic-and-rationale)
+  - [5.1 Targeted Additional Intraday Lags (Update)](#targeted-additional-intraday-lags-update)
+- [6. Compact Data Dictionary (Feature Families)](#compact-data-dictionary-feature-families)
+- [7. Causality Check for Lag Naming](#causality-check-for-lag-naming)
+- [8. Validation Methodology](#validierungsmethodik)
+- [9. Methodological Governance and Evidence](#methodische-governance-und-evidenz)
+- [10. Primary-Source Gaps and April-2025 Forensics](#primary-source-gaps-and-april-2025-forensics)
+- [11. Empirical Validity](#empirical-validity)
+- [12. Parameter Rationale](#parameter-rationale)
 
-- Finale Artefaktdatei: `data/features/all_data_features.parquet`
-- Aktueller Stand (Snapshot 2026-03-31): **356 Spalten** im Feature-Artefakt.
-- **Primär-Target:** `target_afrr_activation_price_vwap_pos`.  
-  **Rationale:** Beschreibt den volumengewichteten durchschnittlichen
-  Aktivierungspreis der Stunde _t+1_. Durch den 1h-Versatz wird sichergestellt,
-  dass das Modell zum Prognosezeitpunkt _t_ keine Information über die
-  tatsächliche Preisbildung der Zielstunde verwendet.
-- Trainingsmerkmale `X` werden **modellspezifisch** gebildet:
-  - **DA-Bundle:** reduzierte, auktionskausale Feature-Menge (fundamental getrieben).
-  - **aFRR-Bundle:** erweiterte Feature-Menge mit Stress-/Spread-Signalen (kurzfristig getrieben).
-- `timestamp_utc` ist ein **Metadatum/Zeitindex** und wird nicht als Trainingsmerkmal gezählt.
+## 1. Scope and Snapshot
 
-## Reproduzierbarkeits-Block
+### 1.1 Introduction
 
-| Element                           | Wert                                      |
+This document describes the final, causally safe feature space used for aFRR and DA forecasting.
+
+- Final artifact file: `data/features/all_data_features.parquet`
+- Current snapshot (2026-05-14): **364 columns** in the feature artifact.
+- Training features `X` are built **model-specifically**:
+  - **DA bundle:** reduced, auction-causal set (fundamental signals), see [DA train bundle](../data/model_input/da/train.parquet)
+  - **aFRR bundle:** extended set with stress/spread signals (short-term signals), see [aFRR train bundle](../data/model_input/afrr/train.parquet)
+- `timestamp_utc` is **metadata/time index** and not counted as a training feature.
+
+### 1.2 Reproducibility Block
+
+| Element                           | Value                                     |
 | --------------------------------- | ----------------------------------------- |
-| **Snapshot-Datum**                | 2026-03-31                                |
-| **Feature-Artefakt**              | `data/features/all_data_features.parquet` |
-| **Artefaktgröße (Snapshot)**      | `45,985` Zeilen, `356` Spalten            |
-| **Bundle-Konfiguration**          | `data/model_input/feature_config.json`    |
-| **DA-Featureanzahl (Snapshot)**   | `136`                                     |
-| **aFRR-Featureanzahl (Snapshot)** | `347`                                     |
-| **Regime-Cut**                    | `2022-06-22 22:00:00+00:00`               |
-| **DA-Gate**                       | `D-1 13:00 UTC` (`da_price_pit`)          |
+| **Snapshot date**                 | 2026-05-14                                |
+| **Feature artifact**              | `data/features/all_data_features.parquet` |
+| **Artifact shape (snapshot)**     | `46,009` rows, `364` columns              |
+| **Bundle configuration**          | `data/model_input/feature_config.json`    |
+| **DA feature count (snapshot)**   | `121`                                     |
+| **aFRR feature count (snapshot)** | `342`                                     |
+| **Training data end (UTC)**       | `2024-06-30T23:00:00+00:00`               |
+| **Regime cut**                    | `2022-06-22 22:00:00+00:00`               |
+| **DA gate**                       | `D-1 13:00 UTC` (`da_price_pit`)          |
+| **Finalized at (UTC)**            | `2026-05-14T09:42:51+00:00`               |
 
-**Rebuild-Kommandos (kanonischer Ablauf):**
+**Canonical rebuild commands:**
 
 ```bash
 ./.venv/bin/python -m energy_trading.ingestion.merge_data \
@@ -38,7 +66,7 @@ Dieses Dokument beschreibt den finalen, kausal abgesicherten Merkmalsraum für d
   --clip-start 2020-11-30T23:00:00Z \
   --clip-end 2026-03-25T23:00:00Z
 
-./.venv/bin/python scripts/post_collection_pipeline.py \
+./.venv/bin/python -m scripts.post_collection_pipeline \
   --input data/processed/all_data.parquet
 
 ./.venv/bin/python -m src.energy_trading.models.prepare_ml_bundles \
@@ -46,349 +74,305 @@ Dieses Dokument beschreibt den finalen, kausal abgesicherten Merkmalsraum für d
   --output-dir data/model_input
 ```
 
-Hinweis: Die Snapshot-Zahlen sind **run-abhängig** und können sich bei neuem
-Datenstand oder geänderter Feature-Logik ändern.
+Shape-lineage note:
 
-Shape-Lineage-Hinweis:
-- Die vollständige Entwicklung von `rows x cols` über alle Pipeline-Stufen
-  (raw -> processed -> features -> bundles) wird operativ im Runbook geführt:
-  `docs/pipeline_runbook.md` (Abschnitt "Shape lineage across all major artifacts").
-- Empfohlenes Laufartefakt: `data/reports/pipeline_shape_lineage.csv`.
+- End-to-end `rows x cols` lineage (raw -> processed -> features -> bundles) is tracked in `docs/pipeline_runbook.md`.
+- Recommended run artifact: `data/reports/pipeline_shape_lineage.csv`.
 
-## Strategische Design-Entscheidungen
+## 2. Feature Space
 
-### Runtime-Dynamics-Features im Training (Direct Multi-Output)
+### 2.1 Current Feature Concept
 
-Zusätzlich zu den statischen Bundle-Features aus
-`data/model_input/feature_config.json` werden im Training
-(`src/energy_trading/models/train_xgboost_export.py`) dynamische
-Kurzfristfeatures on-the-fly erzeugt:
+- The feature system is split by decision context (DA vs aFRR).
+- The DA bundle focuses on ex-ante fundamental signals available at D-1 gate.
+- The aFRR bundle extends the DA base with short-horizon balancing and stress context.
+- Static bundle definitions live in `data/model_input/feature_config.json`.
+- Additional training-time transformations can be applied later in model scripts.
+- `data/model_input/feature_config.json` defines **static** bundle selection.
+- Additional runtime transformations (dynamics features and mid-term-lag pruning) happen later in training.
 
-| Feature | Formel / Aufbau | Einheit | Zweck |
-| --- | --- | --- | --- |
-| `nrv_velocity_1h` | `NRV_balance_lag_2h - NRV_balance_lag_3h` | MW | Kurzfristige Imbalance-Momentum-Approximation (Steigen/Fallen des NRV). |
-| `load_ramp_signed_1h` | bevorzugt `load_forecast_da_entsoe_h1 - load_forecast_da_entsoe` (Fallback: `h2-h1`) | MW | Erfasst Richtung und Stärke der Last-Rampe zwischen benachbarten Forecast-Punkten. |
-| `load_ramp_abs_1h` | `abs(load_ramp_signed_1h)` | MW | Rampenintensität unabhängig von Vorzeichen zur Stressmodellierung. |
-| `res_load_ramp_signed_1h` | bevorzugt `residual_load_forecast_h1 - residual_load_forecast` (Fallback: `h2-h1`) | MW | Kurzfristige Änderung der prognostizierten Residuallast als Flexibilitätsdruck-Signal. |
-| `res_load_ramp_x_wind_total_error_da_lag_2h` | `res_load_ramp_signed_1h * wind_total_error_da_lag_2h` | MW² | Interaktion aus Rampenstress und jüngstem Windfehler als Fragilitätsmerkmal. |
+### 2.2 Considered and Removed Features
 
-Hinweise:
-- Diese Spalten sind **modellspezifische Runtime-Features** und erscheinen
-  deshalb nicht notwendigerweise als physische Spalten in den statischen
-  Bundle-Parquet-Dateien.
-- Wenn Dynamics-Features aktiv sind, werden redundante Mid-Term-Lags
-  (`*_lag_4h`, `*_lag_6h`) im Training optional entfernt, um Dimensionalität
-  zu reduzieren.
+| Status                        | Scope         | Feature / Pattern                                                                                                                                                      | Rule source                                                           | Rationale                                                                                |
+| ----------------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **Removed**                   | DA bundle     | `afrr_*`, `mfrr_*`, `nrv_*`, `rz_saldo_*`, `picasso_*`, `mari_*`, `is_activated_*`, `system_stress_*`, `grid_stress_*`, `scarcity_*`, `nrv_zscore_*`, `nrv_quantile_*` | `prepare_ml_bundles.py:get_da_optimized_features`                     | D-1 auction causality: near-real-time balancing/stress signals are not ex-ante DA-valid. |
+| **Removed**                   | DA bundle     | short lags `*_lag_(1,2,3,6,12)h`                                                                                                                                       | `prepare_ml_bundles.py:get_da_optimized_features`                     | Avoid near-term non-causal information in DA path.                                       |
+| **Removed**                   | DA bundle     | `da_spread_*` without lag and `da_spread_*_lag_<24h`                                                                                                                   | `prepare_ml_bundles.py:get_da_optimized_features`                     | Bilateral spreads in DA path are allowed only as day-seasonal memory (`>=24h`).          |
+| **Removed**                   | DA bundle     | `total_wind_solar_id_error*`                                                                                                                                           | `prepare_ml_bundles.py:get_da_optimized_features`                     | Intraday error indicators are excluded from DA feature set.                              |
+| **Removed (runtime)**         | Training      | `*_lag_4h`, `*_lag_6h` (when dynamics active)                                                                                                                          | `train_xgboost_export.py:_add_dynamics_features`                      | Reduce redundant mid-term lags when 1h momentum/ramp terms exist.                        |
+| **Removed (legacy)**          | Feature layer | columns containing `reconstructed` or `grid_share` (if present)                                                                                                        | project cleanup/audit tooling                                         | Remove deprecated feature families if they appear in upstream datasets.                  |
+| **Optional (off by default)** | Bundle build  | PCA on forecast families, optional raw-drop                                                                                                                            | `prepare_ml_bundles.py` (`use_forecast_pca`, `forecast_pca_drop_raw`) | Available but disabled by default until robust CV/PnL gains are proven.                  |
+| **Ablation only**             | aFRR modeling | groups like `cross_border`, `hydro_pumped`, `load_error`, `picasso_flow`, `orderbook_depth`                                                                            | `scripts/run_feature_ablation.py`                                     | Group removal tested empirically; not enforced globally by default.                      |
 
-### Erwogene und entfernte Features (aktueller Stand)
+<!-- ### 2.3 Metadata and Excluded Columns
 
-Die folgende Übersicht dokumentiert explizit, welche Featurefamilien im
-Projektverlauf geprüft und anschließend (je nach Modellpfad) entfernt bzw.
-beibehalten wurden.
+| Type                                       | Columns                                                                                                                                                                                                                                       |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Metadata/index                             | `timestamp_utc`                                                                                                                                                                                                                               |
+| Technical metadata (excluded from `X`)     | `data_is_lagged`, `is_local_reconstruction_only`, `pit_lagged_column_count`                                                                                                                                                                   |
+| Target/outcome columns (excluded from `X`) | `target_afrr_activation_price_vwap_pos`, `target_afrr_activation_price_vwap_neg`, `target_afrr_activation_rate_pos`, `target_afrr_activation_rate_neg`, `target_afrr_capacity_price_pos`, `target_afrr_capacity_price_neg`, `target_da_price` |
 
-| Status | Scope | Feature/Pattern | Regelquelle | Begründung |
-| --- | --- | --- | --- | --- |
-| **Entfernt** | DA-Bundle | `afrr_*`, `mfrr_*`, `nrv_*`, `rz_saldo_*`, `picasso_*`, `mari_*`, `is_activated_*`, `system_stress_*`, `grid_stress_*`, `scarcity_*`, `nrv_zscore_*`, `nrv_quantile_*` | `prepare_ml_bundles.py:get_da_optimized_features` | D-1-Auktionskausalität: kurzfristige Balancing-/Stresssignale sind ex ante für DA nicht zulässig. |
-| **Entfernt** | DA-Bundle | Kurzfrist-Lags `*_lag_(1|2|3|6|12)h` | `prepare_ml_bundles.py:get_da_optimized_features` | Vermeidung nicht kausaler Nahzeit-Information im DA-Pfad. |
-| **Entfernt** | DA-Bundle | `da_spread_*` ohne Lag sowie `da_spread_*_lag_<24h` | `prepare_ml_bundles.py:get_da_optimized_features` | Bilaterale Spreads im DA-Pfad nur als day-seasonal Memory (>=24h) zugelassen. |
-| **Entfernt** | DA-Bundle | `total_wind_solar_id_error*` | `prepare_ml_bundles.py:get_da_optimized_features` | Intraday-Fehlerindikatoren werden aus dem DA-Feature-Set ausgeschlossen. |
-| **Entfernt (runtime)** | Training (DA+aFRR Export-Training) | `*_lag_4h`, `*_lag_6h` (wenn Dynamics aktiv) | `train_xgboost_export.py:_add_dynamics_features` | Reduktion redundanter Mid-Term-Lags bei vorhandenen 1h-Momentum/Rampenmerkmalen. |
-| **Entfernt (Legacy)** | Transformed-Feature-Layer | Spalten mit `reconstructed` oder `grid_share` | `scripts/check_removed_features.py` | Bereinigung veralteter Featurefamilien; aktueller Audit zeigt `legacy_bad_count=0`. |
-| **Erwogen (optional, standardmäßig aus)** | Bundle-Build | PCA auf Forecast-Familien inkl. optionalem Drop der Rohspalten | `prepare_ml_bundles.py` (`use_forecast_pca`, `forecast_pca_drop_raw`) | Redundanzreduktion wurde implementiert, aber standardmäßig deaktiviert, bis robuste CV/PnL-Verbesserung vorliegt. |
-| **Erwogen (Ablation), aktuell nicht global entfernt** | aFRR-Modellierung | `cross_border`, `hydro_pumped`, `load_error`, `picasso_flow`, `orderbook_depth` | `scripts/run_feature_ablation.py`, `data/reports/feature_ablation_report.csv` | Gruppenweise Removal wird evidenzbasiert geprüft; Entscheidungen werden nicht pauschal in den Bundle-Bau erzwungen. |
+Note: `target_afrr_capacity_price_pos` and `target_afrr_capacity_price_neg` are strictly label columns (`y`) and are excluded from `X`. -->
 
-Interpretationshinweis:
-- `data/model_input/feature_config.json` beschreibt die **statische**
-  Bundle-Selektion.
-- Zusätzliche Runtime-Transformationen (z. B. Dynamics-Features und Mid-Term-
-  Lag-Pruning) passieren erst im Training und erscheinen daher nicht zwingend
-  als physische Spalten im Bundle-Parquet.
+## 3. Design Decisions
 
-### Verzicht auf PCA trotz Multikollinearität
+### 3.1 Runtime Dynamics Features During Training
 
-- Referenz: `notebooks/13_forecast_collinearity_pca_audit.ipynb`.
-- Ergebnis des Audits: innerhalb der Forecast-Familien (insb. Solar) liegen hohe
-  Kollinearitäten vor (u. a. **VIF > 16**).
-- **Design-Entscheidung:** bewusster Verzicht auf PCA im finalen Standard-Training.
-- **Begründung:**
-  1. **XGBoost** ist gegenüber multikollinearen Eingängen robust.
-  2. Die **physikalische Interpretierbarkeit** der Rohfeatures bleibt erhalten
-     (zentrale Anforderung für die wissenschaftliche Nachvollziehbarkeit der
-     Masterarbeit).
+In addition to static bundle features from `data/model_input/feature_config.json`, the training pipeline (`src/energy_trading/models/train_xgboost_export.py`) creates short-term runtime features on-the-fly:
 
-### Verzicht auf Skalierung (modellseitig)
+| Feature                                      | Formula / Construction                                                               | Unit | Purpose                                                    |
+| -------------------------------------------- | ------------------------------------------------------------------------------------ | ---- | ---------------------------------------------------------- |
+| `nrv_velocity_1h`                            | `NRV_balance_lag_2h - NRV_balance_lag_3h`                                            | MW   | Short-term imbalance momentum approximation.               |
+| `load_ramp_signed_1h`                        | preferred `load_forecast_da_entsoe_h1 - load_forecast_da_entsoe` (fallback: `h2-h1`) | MW   | Direction and strength of load ramp.                       |
+| `load_ramp_abs_1h`                           | `abs(load_ramp_signed_1h)`                                                           | MW   | Ramp intensity independent of direction.                   |
+| `res_load_ramp_signed_1h`                    | preferred `residual_load_forecast_h1 - residual_load_forecast` (fallback: `h2-h1`)   | MW   | Short-term residual-load pressure signal.                  |
+| `res_load_ramp_x_wind_total_error_da_lag_2h` | `res_load_ramp_signed_1h * wind_total_error_da_lag_2h`                               | MW²  | Interaction feature for ramp stress and recent wind error. |
 
-- **Design-Entscheidung:** Im finalen XGBoost-Training wird bewusst auf eine
-  globale Feature-Skalierung verzichtet.
-- **Rationale:** XGBoost ist gegenüber monotonen Skalentransformationen
-  weitgehend **invariant**; eine explizite Standardisierung ist für die
-  Baum-Split-Logik nicht erforderlich.
-- **Methodischer Nutzen:** Der Erhalt physischer Einheiten (z. B. **MW**,
-  **EUR/MWh**) verbessert die ökonomische Interpretierbarkeit von
-  Feature-Importances und SHAP-Effekten.
+Notes:
 
-### Zyklische Enkodierung zeitlicher Merkmale
+- These are **runtime model features** and do not necessarily appear as physical columns in static bundle parquet files.
+- If dynamics features are active, redundant mid-term lags (`*_lag_4h`, `*_lag_6h`) can be dropped during training.
+
+### 3.2 No-PCA Default Despite Collinearity
+
+- Reference: `notebooks/13_forecast_collinearity_pca_audit.ipynb`.
+- Audit result: high within-family collinearity (especially solar; e.g., high VIF values).
+- **Decision:** no PCA in the default final training path.
+- **Why:**
+  1. XGBoost is relatively robust to collinear inputs.
+  2. Physical interpretability of raw features is preserved.
+
+### 3.3 No Global Scaling for Tree Models
+
+- **Decision:** no global feature scaling in final XGBoost training.
+- **Why:** tree split logic is mostly invariant to monotonic scaling.
+- **Benefit:** better interpretability in physical units (`MW`, `EUR/MWh`).
+
+### 3.4 Cyclical Encoding of Time Features
 
 - **Features:** `hour_sin/cos`, `dayofweek_sin/cos`, `month_sin/cos`.
-- **Rationale:** Abbildung periodischer Zeitachsen auf den Einheitskreis zur
-  Wahrung **zirkulärer Kontinuität**.
-- **Methodischer Nutzen:** Numerische Nachbarschaft zwischen Periodenenden
-  (z. B. Stunde 23 und 00) wird korrekt modellierbar, ohne künstliche
-  Diskontinuitäten.
+- **Why:** preserves circular continuity.
+- **Benefit:** avoids artificial discontinuity at period boundaries (e.g., hour 23 -> 00).
 
-### Modell-Trennung (DA vs. aFRR)
+### 3.5 Model Separation (DA vs aFRR)
 
-- **DA-Set:** Strikt auf den D-1-Auktionszeitpunkt limitiert; enthält nur
-  fundamentale, ex ante verfügbare Merit-Order-Treiber (z. B.
-  Commodity-Preise, Forecasts, Kalender- und saisonale Signale).
-  **Intraday-/Balancing-Informationen werden ausgeschlossen**, um
-  Information-Leakage in die DA-Prognose zu verhindern.
-- **aFRR-Set:** Als **Add-on-Modell** auf der fundamentalen DA-Basis
-  konzipiert und um transiente Stress-Signale erweitert (z. B.
-  `load_error_da_lag_2h`, `NRV_balance_lag_2h`, Spread-/Flow-Signale).
-- Zweck der Trennung: höhere **kausale Konsistenz** je Entscheidungszeitpunkt
-  und bessere **ökonomische Modelladäquanz**.
+- **DA set:** strict D-1 auction-causal features only (fundamental ex-ante drivers).
+- **aFRR set:** DA base plus high-frequency stress/flow/spread signals.
+- **Purpose:** stronger causal consistency per decision time and better market-specific fit.
 
-| Feature-Set                    | Inhalt                                                                                   | Ausschlüsse / Zusatz                                               |
-| ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| **DA-Modell-Set**              | Fundamentale Forecasts, Commodity-Preise, Kalender-/Saisonalitätsmerkmale                | Ausschluss von Balancing- und Stress-Signalen gemäß D-1-Kausalität |
-| **aFRR-Modell-Set (Full Set)** | DA-Set plus hochfrequente Stress-/Flow-/Spread-Signale (z. B. NRV, Lags, Spreads, Flows) | Ziel: Modellierung der kurzfristigen Abweichung vom DA-Preis       |
+| Feature set               | Content                                                                | Exclusions / Additions                               |
+| ------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------- |
+| **DA model set**          | Fundamental forecasts, commodity prices, calendar/seasonality features | Excludes balancing/stress signals by D-1 causality   |
+| **aFRR model set (full)** | DA set plus high-frequency stress/flow/spread signals                  | Designed to model short-term deviation from DA price |
 
-## Regeln zur Publikationslatenz (PiT)
+## 4. Data Quality and Causality Controls
 
-| Datengruppe                                                           | Kausalregel                                                     |
-| --------------------------------------------------------------------- | --------------------------------------------------------------- |
-| ENTSO-E-Actuals (Erzeugung/Last/Outages/NRV)                          | mindestens `lag_2h`                                             |
-| aFRR/mFRR-Aktivierung und Aktivierungspreise                          | mindestens `lag_1h`                                             |
-| Netz-Statistiken Stress (`system_stress_signal`, `grid_stress_index`) | explizit nur `lag_2h`, `lag_3h`, `lag_6h`, `lag_12h`, `lag_24h` |
-| Day-Ahead-Preis                                                       | `da_price_pit` mit D-1 13:00-UTC-Freigabelogik                  |
-| DA-Forecast-Horizonte (`*_h1..h24`)                                  | publikationsgegated (D-1 13:00 UTC), sonst kausaler Fallback `shift(24)` |
-| Forecast-Signale (allgemein)                                          | ex ante nutzbar; keine nicht-kausale Zukunftsauffüllung          |
+### 4.1 Publication-Latency Rules (PiT)
 
-## Daten-Imputation (methodische Begründung)
+| Data group                                                      | Causal rule                                                         |
+| --------------------------------------------------------------- | ------------------------------------------------------------------- |
+| ENTSO-E actuals (generation/load/outages/NRV)                   | at least `lag_2h`                                                   |
+| aFRR/mFRR activation and activation prices                      | at least `lag_1h`                                                   |
+| Grid stress stats (`system_stress_signal`, `grid_stress_index`) | only `lag_2h`, `lag_3h`, `lag_6h`, `lag_12h`, `lag_24h`             |
+| Day-ahead price                                                 | `da_price_pit` with D-1 13:00 UTC release gating                    |
+| DA forecast horizons (`*_h1..h24`)                              | publication-gated (D-1 13:00 UTC), else causal fallback `shift(24)` |
+| Forecast signals (general)                                      | ex-ante usable; no non-causal future fill                           |
 
-- Zur Vermeidung künstlicher Datenknappheit werden installierte Kapazitäten
-  (`*_capacity`) im Feature-Bau rückwärts aufgefüllt (`backfill`).
-- Der erste verfügbare Meldewert (typisch ab Ende 2023) wird rückwirkend für
-  frühere Zeitstempel bis mindestens zum PICASSO-Start
-  (`2022-06-22 22:00:00+00:00`) als konstante Strukturgröße verwendet.
-- Diese Imputation ist wissenschaftlich vertretbar, da installierte Kapazitäten
-  sich nur langsam ändern und die stündliche Marktdynamik über Ist- und
-  Aktivierungsdaten modelliert wird.
-- Für `generation_baseload_total` gilt:
+### 4.2 Data Imputation (Methodological Rationale)
+
+- To avoid artificial sparsity, installed capacities (`*_capacity`) are backfilled in feature construction.
+- First available reported capacity values (typically from late 2023) are propagated backwards at least to PICASSO start (`2022-06-22 22:00:00+00:00`).
+- This is methodologically acceptable because installed capacities change slowly and hourly market dynamics are modeled via actual and activation series.
+- For `generation_baseload_total`:
   `generation_baseload_total = biomass_actual_entsoe + generation_nuclear_mw`
-  (fehlende Werte in `generation_nuclear_mw` werden als `0` gesetzt).
-- Interpretation: Seit dem deutschen Atomausstieg (letzte Abschaltungen am 15. April 2023; im Stundenraster ab den Folgestunden) ist der Nuclear-Anteil
-  faktisch `0`. Das Merkmal wirkt in der jüngeren Periode daher als
-  biomass-dominierter Baseload-Proxie.
+  (missing `generation_nuclear_mw` values set to `0`).
+- Since German nuclear phase-out, the feature is effectively biomass-dominated in recent periods.
 
-### Beobachtete Imputationen (letzter Bundle-Run)
+### 4.3 Observed Imputations (Latest Bundle Run)
 
-Die operative Imputation in `prepare_ml_bundles.py` erfolgt auf `X` je Split
-mit `ffill(limit=12)` und anschließendem train-fitted Median-Fallback. Bereits
-in `handle_missing_values.py` gelten folgende Spezialfälle:
-- Commodity-Preise (`co2_price`, `gas_price`, `coal_price`): `ffill()` ohne Limit
-  plus `bfill()` nur für verbleibende führende Startlücken
-- Strukturkapazitäten (`*_capacity`): `ffill()` ohne Limit
-- `da_price_BE`: Fallback auf exakt gleichen UTC-Stundenwert des Vortags (`t-24h`)
-Die folgenden Spalten wurden im letzten Lauf tatsächlich betroffen geloggt:
+`prepare_ml_bundles.py` imputes `X` per split via `ffill(limit=12)` and then train-fitted median fallback.
+Additional upstream special cases in `handle_missing_values.py`:
 
-| Bundle / Split | Betroffene Spalten (Auszug)                                                                                                                                                                                                                                                                                                                                                                                                                                          | Methode                                                            |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| DA / test      | `da_price_BE`, `gas_price`, `co2_price`                                                                                                                                                                                                                                                                                                                                                                                                                              | `ffill(limit=12)`; Rest per Train-Median                           |
-| DA / test      | `wind_onshore_capacity`, `wind_offshore_capacity`, `solar_capacity`, `gas_capacity`, `hard_coal_capacity`, `lignite_capacity`, `pumped_storage_capacity`                                                                                                                                                                                                                                                                                                             | primär `ffill(limit=12)` (lange Blöcke), kein/kaum Median-Fallback |
-| aFRR / train   | `wind_total_error_da_lag_2h`                                                                                                                                                                                                                                                                                                                                                                                                                                         | geringes `ffill`, kein Median-Fallback                             |
-| aFRR / test    | wie DA-Commodity/Capacity plus `afrr_activated_mw_pos_lag_1h`, `afrr_activated_mw_neg_lag_1h`, `mfrr_activated_mw_pos_lag_1h`, `mfrr_activated_mw_neg_lag_1h`, `mfrr_mari_net_mw_lag_1h`, `afrr_capacity_offered_mw_pos_lag_1h`, `afrr_capacity_offered_mw_neg_lag_1h`, `afrr_capacity_awarded_mw_pos_lag_1h`, `afrr_capacity_awarded_mw_neg_lag_1h`, `afrr_activation_offered_mw_pos_lag_1h`, `afrr_activation_offered_mw_neg_lag_1h`, `wind_total_error_da_lag_2h` | überwiegend kleines `ffill`, i. d. R. ohne Median-Fallback         |
+- Commodity prices (`co2_price`, `gas_price`, `coal_price`): unlimited `ffill()` plus `bfill()` for leading gaps.
+- Structural capacities (`*_capacity`): unlimited `ffill()`.
+- `da_price_BE`: fallback to previous-day same UTC hour (`t-24h`).
 
-Hinweis: Die exakten Imputations-Counts sind run-abhängig und werden pro Lauf
-in den Reports dokumentiert:
+Affected columns in the table below are **illustrative from a recent run pattern** and may differ in your next run:
+
+| Bundle / Split | Affected columns (excerpt)                                                                                                                               | Method                                               |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| DA / test      | `da_price_BE`, `gas_price`, `co2_price`                                                                                                                  | `ffill(limit=12)` + train median fallback            |
+| DA / test      | `wind_onshore_capacity`, `wind_offshore_capacity`, `solar_capacity`, `gas_capacity`, `hard_coal_capacity`, `lignite_capacity`, `pumped_storage_capacity` | mostly `ffill(limit=12)`, little/no median fallback  |
+| aFRR / train   | `wind_total_error_da_lag_2h`                                                                                                                             | minor `ffill`, no median fallback                    |
+| aFRR / test    | DA commodity/capacity columns plus activation/capacity lag features                                                                                      | mostly short-gap `ffill`, usually no median fallback |
+
+The **authoritative, up-to-date** imputation evidence is always the current report files:
 
 - `data/model_input/da/feature_quality_report.csv`
 - `data/model_input/afrr/feature_quality_report.csv`
 - `data/reports/feature_quality_report_all.csv`
 
-## Metadaten und ausgeschlossene Spalten
+---
 
-| Typ                                                    | Spalten                                                                                                                                                           |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Metadatum/Index                                        | `timestamp_utc`                                                                                                                                                   |
-| Technische Metadaten (aus `X` ausgeschlossen)          | `data_is_lagged`, `is_local_reconstruction_only`, `pit_lagged_column_count`                                                                                       |
-| Zielvariablen/Outcome-Spalten (aus `X` ausgeschlossen) | `target_afrr_activation_price_vwap_pos`, `target_afrr_activation_price_vwap_neg`, `target_afrr_activation_rate_pos`, `target_afrr_activation_rate_neg`, `target_afrr_capacity_price_pos`, `target_afrr_capacity_price_neg`, `target_da_price` |
+## Specific Feature Logic and Rationale
 
-Hinweis: `target_afrr_capacity_price_pos` und
-`target_afrr_capacity_price_neg` sind reine **Label-Spalten** (`y`) und
-werden strikt aus dem Feature-Set (`X`) ausgeschlossen.
+| **Feature Class**                                                             | **Rationale**                                                                                                                          | **Purpose**                                                                                                                  |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **Symmetric Log Transformation** (`da_price_slog1p`)                           | Compression of extreme price spikes while preserving the sign.                                                                           | Stabilizes XGBoost gradient behavior and reduces outlier noise.                                    |
+| **Pumped-Hydro Isolation** (`generation_hydro_pumped_storage_mw_lag_2h`)      | Separates price-reactive flexibility (pumped storage) from inflexible run-of-river/aggregate hydro components to avoid signal dilution. | Detects tactical flexibility activation; high output signals boundary-capacity usage and increased aFRR volatility. |
+| **Renewable-Share-Forecast** (`renewable_share_forecast`)                      | Measures the relative displacement of conventional flexibility in the merit order; more informative than absolute single-MW values.              | Robust indicator for merit-order shifts and flexibility demand.                                                 |
+| **EWMA Derivatives** (`*_ewma24`)                                                 | Heavier weighting of recent price information relative to older observations.                                                       | Faster response to market momentum and regime shifts in intraday conditions.                                                |
+| **DA Forecast Curve Features** (`*_h1,_h2,_h3,_h6,_h12,_h24`)                  | Explicit representation of the expected forecast trajectory for the next day instead of only point-based ex-ante values.                     | Improves multi-horizon forecasts by exposing trajectories, ramps, and daily profiles within the forecast window.            |
+| **Compressed Forecast Curves** (`*_next24_*`)                                | Compresses the 24h trajectory into level/dispersion/ramp statistics (`mean/min/max/std`, `ramp`) to reduce dimensionality.     | Robust capture of trend and volatility patterns with controlled model complexity (especially for tree models).        |
+| **Load-Error-Feature** (`load_error_da_lag_2h`)                                | Unexpected load fluctuations are primary drivers of short-term system imbalances.                                          | Direct predictor for balancing-energy activation (aFRR).                                                            |
+| **Cross-Border-Spreads** (`da_spread_de_at/de_fr/de_nl`, incl. Lags)           | Represents import/export pressure and coupling intensity of neighboring day-ahead markets.                                                     | Additional explanatory power for price and spread regimes via cross-border arbitrage/congestion signals.             |
+| **PICASSO Regime Flag** (`is_picasso_active`)                                  | Represents the active PICASSO market phase (`since July 2024`) as a structural regime anchor.                                               | Allows the model to distinguish pre-PICASSO from PICASSO-coupled European pricing logic.          |
+| **PiT latency rule for ENTSO-E actuals** (`*_lag_2h`)                           | Physical actual values are not stably published immediately at decision time.                                                     | Avoids information leakage through consistent causal lagging.                                                  |
+| **DA gate logic** (`da_price_pit`)                                             | Day-ahead auction results are only available after the D-1 gate (`13:00 UTC`).                                                      | Causally correct representation of information availability for DA and aFRR-related features.                                    |
+| **Stress signals without `lag_1h`** (`system_stress_signal`, `grid_stress_index`) | These indicators are based on actual-/NRV-near sources with additional publication latency.                                           | Robust PiT integrity by starting at `lag_2h` (instead of short-term leakage-prone `lag_1h`).                           |
+| **Strict Target Policy** (`target_*`)                                          | Unshifted outcome series would enforce nowcasting instead of forecasting.                                                            | Separation of `X` and `y` along the time axis; the forecast target remains strictly `t+1`.                                          |
 
-## Spezifische Feature-Logik & Rationale
+### Targeted Additional Intraday Lags (Update)
 
-| **Feature-Klasse**                                                                           | **Rationale**                                                                                                                              | **Zweck**                                                                                                                  |
-| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| **Symmetric Log Transformation** (`da_price_slog1p`)                                         | Kompression extremer Preisspikes bei Erhalt des Vorzeichens.                                                                               | Stabilisierung der Gradienten-Berechnung in XGBoost und Reduktion von Outlier-Rauschen.                                    |
-| **Pumped-Hydro-Isolierung** (`generation_hydro_pumped_storage_mw_lag_2h`)                    | Trennung preisreaktiver Flexibilität (Pumpspeicher) von unflexiblen Laufwasser-/Aggregatanteilen, um Signal-Verwässerung zu vermeiden.     | Erkennung taktischer Flex-Aktivierung; hohe Einspeisung signalisiert Grenz-Kapazitätsnutzung und erhöhte aFRR-Volatilität. |
-| **Renewable-Share-Forecast** (`renewable_share_forecast`)                                    | Maß der relativen Verdrängung konventioneller Flexibilität in der Merit-Order; informativer als absolute Einzel-MW-Werte.                  | Robuster Indikator für Merit-Order-Verschiebungen und Flexibilitätsbedarf.                                                 |
-| **EWMA-Derivate** (`*_ewma24`)                                                               | Stärkere Gewichtung rezenter Preisinformationen gegenüber älteren Beobachtungen.                                                           | Schnellere Reaktion auf Marktmomentum und Regimewechsel im Intraday-Umfeld.                                                |
-| **DA-Forecast-Kurvenfeatures** (`*_h1,_h2,_h3,_h6,_h12,_h24`)                               | Explizite Abbildung der erwarteten Forecast-Trajektorie für den nächsten Tag statt rein punktueller Ex-ante-Werte.                         | Verbessert Multi-Horizon-Prognosen durch Sichtbarkeit von Verlauf, Rampen und Tagesprofilen im Prognosefenster.             |
-| **Komprimierte Forecast-Kurven** (`*_next24_*`)                                              | Verdichtung der 24h-Trajektorie in Lage-/Streuungs- und Rampenmaße (`mean/min/max/std`, `ramp`) zur Reduktion von Dimensionalität.        | Robuste Erfassung von Trend- und Volatilitätsmustern bei kontrollierter Modellkomplexität (insb. für Tree-Modelle).         |
-| **Load-Error-Feature** (`load_error_da_lag_2h`)                                              | Unvorhergesehene Lastschwankungen sind primäre Treiber kurzfristiger System-Ungleichgewichte.                                              | Direkter Prädiktor für die Aktivierung von Regelenergie (aFRR).                                                            |
-| **Cross-Border-Spreads** (`da_spread_de_at/de_fr/de_nl`, inkl. Lags)                         | Abbildung von Import-/Exportdruck und Kopplungsgrad benachbarter Day-Ahead-Märkte.                                                         | Zusätzliche Erklärungskraft für Preis- und Spread-Regime durch grenzüberschreitende Arbitrage-/Engpasssignale.             |
-| **PICASSO-Regime-Flag** (`is_picasso_active`) | Abbildung der aktiven PICASSO-Marktphase (`ab Juli 2024`) als struktureller Regimeanker. | Ermöglicht dem Modell die Trennung zwischen Vor-PICASSO- und PICASSO-gekoppelter europäischer Preissetzungslogik.          |
-| **PiT-Latenzregel für ENTSO-E-Actuals** (`*_lag_2h`)                                          | Physische Istwerte sind zum Entscheidungszeitpunkt nicht sofort stabil publiziert.                                                          | Vermeidung von Information-Leakage durch konsistente kausale Verzögerung.                                                   |
-| **DA-Gate-Logik** (`da_price_pit`)                                                            | Day-Ahead-Auktionsergebnisse sind erst nach dem D-1-Gate (`13:00 UTC`) verfügbar.                                                          | Kausal korrekte Abbildung der Informationsverfügbarkeit für DA- und aFRR-nahe Features.                                    |
-| **Stress-Signale ohne `lag_1h`** (`system_stress_signal`, `grid_stress_index`)               | Diese Kennzahlen basieren auf Actual-/NRV-nahen Quellen mit zusätzlicher Publikationslatenz.                                               | Robuste PiT-Integrität durch Start bei `lag_2h` (statt kurzfristig leakage-anfälligem `lag_1h`).                           |
-| **Strict Target Policy** (`target_*`)                                                         | Unverschobene Outcome-Reihen würden Nowcasting statt Forecasting erzwingen.                                                                  | Trennung von `X` und `y` entlang der Zeitachse; Prognoseziel bleibt strikt `t+1`.                                          |
+| Family / Columns                                                                                         | New or extended lags  | Rationale (short)                                                                                  |
+| --------------------------------------------------------------------------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------- |
+| `NRV_balance`, `nrv_zscore_24h`, `nrv_quantile_5`                                                         | `2h, 3h, 4h, 6h, 12h, 24h` | Short-term stress dynamics (ramps/decay) are captured better; no `1h` due to PiT latency.     |
+| `afrr_activation_rate_pos`, `afrr_activation_rate_neg`, `is_activated`, `mfrr_active_lag`                 | `1h, 2h, 3h, 6h, 12h, 24h` | Activation intensity shows pronounced intraday momentum clusters, separated by direction for POS/NEG. |
+| `afrr_activated_mw_pos/neg`, `mfrr_activated_mw_pos/neg`, `mfrr_mari_net_mw`, `afrr_activation_offered_*` | `1h, 2h, 3h, 6h, 12h, 24h` | Volume and flow trajectories are short-term persistent and relevant for aFRR price/rate forecasts. |
+| `afrr_capacity_awarded_*`, `afrr_capacity_offered_*`, `afrr_capacity_price_*`                             | `1h, 2h, 3h, 6h, 12h, 24h` | Auction outcomes and capacity-market tightness typically persist for multiple hours.     |
+| `wind_forecast_update`, `wind_onshore_forecast_update`, `solar_forecast_update`, `*_error_da`             | `1h, 2h, 3h, 6h, 12h, 24h` | Forecast “news” signals affect not only the current hour but also the following day.     |
 
-### Gezielte zusätzliche Intraday-Lags (Update)
+## Compact Data Dictionary (Feature Families)
 
-| Familie / Spalten                                                                                          | Neue bzw. erweiterte Lags          | Begründung (kurz)                                                                                 |
-| ---------------------------------------------------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `NRV_balance`, `nrv_zscore_24h`, `nrv_quantile_5`                                                          | `2h, 3h, 4h, 6h, 12h, 24h`         | Kurzfristige Stressdynamik (Rampen/Abklingen) wird besser erfasst; kein `1h` wegen PiT-Latenz. |
-| `afrr_activation_rate_pos`, `afrr_activation_rate_neg`, `is_activated`, `mfrr_active_lag`                | `1h, 2h, 3h, 6h, 12h, 24h`         | Aktivierungsintensität zeigt ausgeprägte Intraday-Momentum-Cluster, richtungsgetrennt für POS/NEG. |
-| `afrr_activated_mw_pos/neg`, `mfrr_activated_mw_pos/neg`, `mfrr_mari_net_mw`, `afrr_activation_offered_*` | `1h, 2h, 3h, 6h, 12h, 24h`         | Mengen- und Flussverläufe sind kurzfristig persistent und für aFRR-Preis-/Rate-Prognosen relevant. |
-| `afrr_capacity_awarded_*`, `afrr_capacity_offered_*`, `afrr_capacity_price_*`                              | `1h, 2h, 3h, 6h, 12h, 24h`         | Auktionsergebnisse und Capacity-Marktspannung wirken typischerweise über mehrere Stunden nach.   |
-| `wind_forecast_update`, `wind_onshore_forecast_update`, `solar_forecast_update`, `*_error_da`             | `1h, 2h, 3h, 6h, 12h, 24h`         | Forecast-„News“-Signale entfalten ihren Effekt nicht nur instantan, sondern über den Folgetag.   |
+Completeness note: The feature families below cover the full final artifact scope of **356 columns** (including target columns, metadata/governance variables, and model-relevant feature groups). The presentation is intentionally grouped, not listed row-by-row per single column.
 
-## Komprimiertes Datenwörterbuch (Merkmalsfamilien)
+| Feature (available lags)                                                                                                                                                                                                                                                                   | Unit      | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `afrr_activation_price_vwap_pos` (1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                                                                                                                                      | EUR/MWh      | Positive aFRR activation price (VWAP) as a core signal for short-term price regimes and weekly patterns.                                                                                                                                                                                                                                                                                                                                                                                            |
+| `afrr_activation_price_vwap_neg` (1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                                                                                                                                      | EUR/MWh      | Negative aFRR activation price (VWAP); captures asymmetric balancing costs vs POS prices.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `afrr_da_price_spread` (1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                                                                                                                                                | EUR/MWh      | Difference between aFRR activation price and day-ahead price as a direct opportunity-cost indicator.                                                                                                                                                                                                                                                                                                                                                                                              |
+| `da_price_pit` (no lag, 1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                                                                                                                                              | EUR/MWh      | PiT-gated day-ahead price that is only model-available after publication time.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `da_price` (24h, 48h, 168h)                                                                                                                                                                                                                                                                 | EUR/MWh      | Historical Day-Ahead-Preisniveaus zur Erfassung stabiler Tages- und Wochenzyklen.                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `gas_price`, `coal_price`, `co2_price` (no lag)                                                                                                                                                                                                                                           | EUR/MWh      | Brennstoff- und Emissionskosten als exogene Kostentreiber der Merit-Order und Strompreisdynamik.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `da_price_slog1p`, `da_price_diff1`, `da_price_diff24`, `da_price_ewma24` (no lag)                                                                                                                                                                                                        | EUR/MWh      | Transformed price levels and changes for robust representation of jumps and short-term trends.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `da_price_mean_24h`, `da_price_std_24h`, `da_price_mean_168h`, `da_price_std_168h`, `da_price_volatility_30d` (no lag)                                                                                                                                                                    | EUR/MWh      | Rolling mean/volatility measures to quantify market regime shifts and uncertainty.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `system_stress_signal` (2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                                                                               | Index        | Compressed stress signal from system imbalances; usable only with 2h+ latency per PiT rule.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `grid_stress_index` (2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                                                                                  | Index        | Composite grid-stress index combining multiple stress components into a robust control indicator.                                                                                                                                                                                                                                                                                                                                                                                         |
+| `nrv_zscore_24h` (2h, 3h, 4h, 6h, 12h, 24h)                                                                                                                                                                                                                                                 | Index        | Standardized NRV deviation vs the 24h path to identify unusual balance states.                                                                                                                                                                                                                                                                                                                                                                                       |
+| `nrv_zscore_24h_lag_2h`                                                                                                                                                                                                                                                                     | Index        | PiT-compliant short-term indicator for acute grid stress and next-hour balancing probability.                                                                                                                                                                                                                                                                                                                                                                                         |
+| `nrv_quantile_5` (2h, 3h, 4h, 6h, 12h, 24h)                                                                                                                                                                                                                                                 | Index        | Quantized NRV state (5 classes) for robust regime coding even with outliers.                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `NRV_balance` (2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                                                                                        | MW           | Net balancing-area saldo as a core physical signal for system surplus or deficit.                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `neighbor_spread_avg`, `relative_price_competitiveness`, `price_volatility_short_term`, `scarcity_price_premium` (each 2h)                                                                                                                                                                    | EUR/MWh      | Derived competitiveness, scarcity, and volatility indicators explaining short-term price premiums.                                                                                                                                                                                                                                                                                                                                                                                         |
+| `load_error_da_lag_2h`                                                                                                                                                                                                                                                                      | MW           | Load error (actual minus forecast) with PiT-compliant lag as a direct driver of short-term system imbalances.                                                                                                                                                                                                                                                                                                                                                                               |
+| `da_spread_de_at_lag_2h/24h/48h/168h`, `da_spread_de_fr_lag_2h/24h/48h/168h`, `da_spread_de_nl_lag_2h/24h/48h/168h`                                                                                                                                                                         | EUR/MWh      | Bilateral DE-neighbor spreads as a proxy for cross-border import/export pressure and arbitrage tension; **no `lag_1h`** due to D-1 auction causality.                                                                                                                                                                                                                                                                                                                              |
+| `afrr_activated_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                                                                      | MW           | Actually activated aFRR volume as a direct measure of real balancing-energy demand.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `afrr_activated_mw_pos_lag_1h`                                                                                                                                                                                                                                                              | MW           | Short-term activation impulse as a momentum signal for positive reserve demand.                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `afrr_capacity_awarded_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                                                               | MW           | Awarded aFRR capacity volumes as information on expected balancing requirements.                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `afrr_activation_offered_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                                                             | MW           | Offered activation volumes as liquidity/tightness indicators of balancing markets.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `afrr_activation_rate_pos`, `afrr_activation_rate_neg` (je 1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                                        | Share (0-1) | Direction-specific activation rates (POS/NEG) as activated-to-reserved ratio; core intensity signals for short-term balancing usage.                                                                                                                                                                                                                                                                                                                      |
+| `is_activated` (1h)                                                                                                                                                                                                                                                                         | Flag (0/1)   | Binary activation status to distinguish activated vs non-activated hours.                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `mfrr_activated_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h), `mfrr_mari_net_mw` (1h, 2h, 3h, 6h, 12h, 24h), `mfrr_active_lag` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                                         | MW / Index   | mFRR activation and MARI flows as complementary balancing signals for system-wide reserve tightness.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `residual_load_actual`, `residual_load_calc` (each 2h)                                                                                                                                                                                                                                        | MW           | Residual load (real load minus renewables) as a core driver of conventional dispatch.                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `generation_fossil_total_mw_lag_2h`, `generation_hydro_pumped_storage_mw_lag_2h`, `generation_hydro_actual_total_lag_2h`, `generation_baseload_total_lag_2h`                                                                                                                                | MW / Share  | Aggregated generation blocks represent supply structure; `generation_hydro_pumped_storage_mw_lag_2h` is kept **explicitly separate** because pumped storage is short-term controllable flexibility (charge/discharge) and is more informative for aFRR regimes than pure run-of-river/total-hydro signals. `generation_baseload_total_lag_2h` is defined as biomass + nuclear (`nuclear` missing -> `0`) and is effectively biomass-dominated since the April 2023 nuclear phase-out. |
+| `wind_onshore_actual_entsoe` (2h, 24h, 48h, 168h)                                                                                                                                                                                                                                           | MW           | Actual onshore wind generation with short-to-weekly history for modeling weather-driven regimes.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `wind_offshore_actual_entsoe`, `solar_actual_entsoe` (each 2h)                                                                                                                                                                                                                                | MW           | Actual offshore wind and solar output as direct determinants of residual load.                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `wind_onshore_error_da/id`, `wind_offshore_error_da/id`, `solar_error_da/id`, `wind_total_error_da`, `total_wind_solar_id_error` (each 2h)                                                                                                                                                    | MW           | Forecast errors versus actuals as a proxy for forecast uncertainty and subsequent balancing-energy needs.                                                                                                                                                                                                                                                                                                                                                                                                |
+| `wind_onshore_actual_entsoe_mean_24h/std_24h/mean_168h/std_168h` (each 2h)                                                                                                                                                                                                                    | MW           | Rolling level and dispersion measures of onshore feed-in to stabilize wind-regime detection.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `unplanned_outages_mw` (2h), `planned_outages_mw` (no lag)                                                                                                                                                                                                                                | MW           | Unplanned and planned plant outages as supply-constraint signals in short-term dispatch.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `wind_onshore_forecast_id_entsoe`, `wind_offshore_forecast_id_entsoe`, `solar_forecast_id_entsoe` (no lag, 24h, 48h, 168h)                                                                                                                                                                | MW           | Ex-ante renewable feed-in forecasts for early representation of expected volatility.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `renewable_share_forecast`, `residual_load_forecast` (no lag, 24h, 48h, 168h)                                                                                                                                                                                                             | Share / MW  | Forecast renewable share and expected residual load as key variables for day-ahead and balancing conditions.                                                                                                                                                                                                                                                                                                                                                                                           |
+| `load_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `wind_onshore_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `wind_offshore_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `solar_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `residual_load_forecast_da_h1/.../h24`, `renewable_share_forecast_h1/.../h24` | MW / Share  | Sparse DA-Forecast-Horizonte (1..24h) als kausal gegatete Trajektorienpunkte zur expliziten Multi-Horizon-Signalgebung.                                                                                                                                                                                                                                                                                                                                                                                |
+| `*_next24_mean/min/max/std`, `*_next24_ramp` (for DA forecast-based core series)                                                                                                                                                                                                            | MW / Share  | Compressed curve description of expected 24h evolution; reduces feature explosion while preserving shape information (level, dispersion, ramps).                                                                                                                                                                                                                                                                                                                                                       |
+| `wind_forecast_update`, `wind_onshore_forecast_update`, `solar_forecast_update` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                                                                                  | Index        | Forecast change metrics as early indicators for new weather information and repricing risk.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `wind_onshore_capacity`, `wind_offshore_capacity`, `solar_capacity`, `gas_capacity`, `hard_coal_capacity`, `lignite_capacity`, `pumped_storage_capacity` (no lag)                                                                                                                         | MW           | Available capacities as structural upper bounds of generation and flexibility potential.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `picasso_flow_rate` (lag_1h, lag_24h)                                                                                                                                                                                                                                                       | Share (0-1) | Share of cross-border PICASSO activation as an indicator for European coupling effects.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `TE_hour_regime_activation` (1h)                                                                                                                                                                                                                                                            | Index        | Time-regime activation coding for explicit separation of typical hourly patterns.                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `hour_sin`, `hour_cos`, `dayofweek_sin`, `dayofweek_cos`, `weekday_sin`, `weekday_cos`, `month_sin`, `month_cos` (no lag)                                                                                                                                                                 | Index        | Cyclical time encodings with circular continuity (especially 23:00 -> 00:00) for robust modeling of periodic patterns.                                                                                                                                                                                                                                                                                                                                                                             |
+| `is_weekend`, `is_afternoon`, `is_evening`, `is_morning`, `is_night`, `is_bridge_day`, `is_payday_period`, `is_christmas_break`, `is_picasso_active` (no lag)                                                                                                                             | Flag (0/1)   | Binary regime indicators for calendar- and market-structure-driven demand patterns and activation probabilities.                                                                                                                                                                                                                                                                                                                                                                                 |
+| `holiday_severity` (no lag)                                                                                                                                                                                                                                                               | Index        | Compressed calendar index for robust separation of unusual days and operating phases.                                                                                                                                                                                                                                                                                                                                                                                                            |
 
-Hinweis zur Vollständigkeit: Die nachfolgenden Merkmalsfamilien decken den
-finalen Artefaktumfang von **356 Spalten** vollständig ab (inklusive
-Target-Spalten, Metadaten-/Governance-Variablen und modellrelevanter
-Feature-Gruppen). Die Darstellung ist bewusst gruppiert, nicht zeilenweise je
-Einzelspalte.
+## Feature Taxonomy (Information Sources)
 
-| Merkmal (verfügbare Lags)                                                                                                                                                            | Einheit      | Beschreibung                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `afrr_activation_price_vwap_pos` (1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                               | EUR/MWh      | Positiver aFRR-Aktivierungspreis (VWAP) als zentrales Signal für kurzfristige Preisregime und Wochenmuster.                                                                                                                                                                                                                                                                                                                                                                                            |
-| `afrr_activation_price_vwap_neg` (1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                               | EUR/MWh      | Negativer aFRR-Aktivierungspreis (VWAP); bildet asymmetrische Balancing-Kosten gegenüber POS-Preisen ab.                                                                                                                                                                                                                                                                                                                                                                                               |
-| `afrr_da_price_spread` (1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                                         | EUR/MWh      | Differenz zwischen aFRR-Aktivierungspreis und Day-Ahead-Preis als direkter Opportunitätskosten-Indikator.                                                                                                                                                                                                                                                                                                                                                                                              |
-| `da_price_pit` (ohne Lag, 1h, 2h, 3h, 6h, 12h, 24h, 48h, 168h)                                                                                                                       | EUR/MWh      | PiT-gegatterter Day-Ahead-Preis, der nur nach Veröffentlichungszeitpunkt modellseitig verfügbar ist.                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `da_price` (24h, 48h, 168h)                                                                                                                                                          | EUR/MWh      | Historische Day-Ahead-Preisniveaus zur Erfassung stabiler Tages- und Wochenzyklen.                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `gas_price`, `coal_price`, `co2_price` (ohne Lag)                                                                                                                                    | EUR/MWh      | Brennstoff- und Emissionskosten als exogene Kostentreiber der Merit-Order und Strompreisdynamik.                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `da_price_slog1p`, `da_price_diff1`, `da_price_diff24`, `da_price_ewma24` (ohne Lag)                                                                                                 | EUR/MWh      | Transformierte Preisniveaus und Preisänderungen zur robusteren Abbildung von Sprüngen und Kurzfristtrends.                                                                                                                                                                                                                                                                                                                                                                                             |
-| `da_price_mean_24h`, `da_price_std_24h`, `da_price_mean_168h`, `da_price_std_168h`, `da_price_volatility_30d` (ohne Lag)                                                             | EUR/MWh      | Rollierende Mittel-/Volatilitätsmaße zur Quantifizierung von Marktregimewechseln und Unsicherheit.                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `system_stress_signal` (2h, 3h, 6h, 12h, 24h)                                                                                                                                        | Index        | Verdichtetes Stresssignal aus Systemungleichgewichten; nur mit 2h+ Latenz gemäß PiT-Regel nutzbar.                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `grid_stress_index` (2h, 3h, 6h, 12h, 24h)                                                                                                                                           | Index        | Kompositindex für Netzanspannung, der mehrere Belastungskomponenten in einen robusten Steuerindikator bündelt.                                                                                                                                                                                                                                                                                                                                                                                         |
-| `nrv_zscore_24h` (2h, 3h, 4h, 6h, 12h, 24h)                                                                                                                                          | Index        | Standardisierte Abweichung des NRV gegenüber dem 24h-Verlauf zur Identifikation ungewöhnlicher Balance-Zustände.                                                                                                                                                                                                                                                                                                                                                                                       |
-| `nrv_zscore_24h_lag_2h`                                                                                                                                                              | Index        | PiT-konformer Kurzfristindikator für akute Netzanspannung und Balancing-Wahrscheinlichkeit in der Folgestunde.                                                                                                                                                                                                                                                                                                                                                                                         |
-| `nrv_quantile_5` (2h, 3h, 4h, 6h, 12h, 24h)                                                                                                                                          | Index        | Quantilisierte NRV-Lage (5 Klassen) zur robusten Regimekodierung auch bei Ausreißern.                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `NRV_balance` (2h, 3h, 6h, 12h, 24h)                                                                                                                                                 | MW           | Netto-Regelverbundsaldo als physikalisches Kernsignal für Systemüberschuss oder -defizit.                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `neighbor_spread_avg`, `relative_price_competitiveness`, `price_volatility_short_term`, `scarcity_price_premium` (je 2h)                                                             | EUR/MWh      | Abgeleitete Wettbewerbs-, Knappheits- und Volatilitätsindikatoren zur Erklärung kurzfristiger Preisaufschläge.                                                                                                                                                                                                                                                                                                                                                                                         |
-| `load_error_da_lag_2h`                                                                                                                                                               | MW           | Lastfehler (Ist minus Prognose) mit PiT-konformer Verzögerung als direkter Treiber kurzfristiger Systemungleichgewichte.                                                                                                                                                                                                                                                                                                                                                                               |
-| `da_spread_de_at_lag_2h/24h/48h/168h`, `da_spread_de_fr_lag_2h/24h/48h/168h`, `da_spread_de_nl_lag_2h/24h/48h/168h`                                                                  | EUR/MWh      | Bilaterale DE-Nachbarland-Spreads als Proxy für grenzüberschreitenden Import-/Exportdruck und Arbitragespannungen; **kein `lag_1h`** aufgrund der D-1-Auktionskausalität.                                                                                                                                                                                                                                                                                                                              |
-| `afrr_activated_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                               | MW           | Tatsächlich aktivierte aFRR-Leistung als direktes Maß für den realen Regelenergiebedarf im System.                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `afrr_activated_mw_pos_lag_1h`                                                                                                                                                       | MW           | Kurzfristiger Aktivierungsimpuls als Momentum-Signal für positive Regelleistungsnachfrage.                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `afrr_capacity_awarded_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                        | MW           | Bezuschlagte aFRR-Vorhaltemengen als Information über erwartete Balancing-Anforderungen.                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `afrr_activation_offered_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h)                                                                                                                      | MW           | Angebotsseitige Aktivierungsmengen als Liquiditäts- und Spannungsindikator der Balancing-Märkte.                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `afrr_activation_rate_pos`, `afrr_activation_rate_neg` (je 1h, 2h, 3h, 6h, 12h, 24h)                                                                                               | Anteil (0-1) | Richtungsgetrennte Aktivierungsraten (POS/NEG) als Verhältnis aktivierter zu vorgehaltener aFRR-Leistung; zentrale Intensitätssignale für kurzfristige Regelenergiebeanspruchung.                                                                                                                                                                                                                                                                                                                     |
-| `is_activated` (1h)                                                                                                                                                                  | Flag (0/1)   | Binärer Aktivierungsstatus zur Trennung von Aktivierungs- und Nicht-Aktivierungsstunden.                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `mfrr_activated_mw_pos/neg` (1h, 2h, 3h, 6h, 12h, 24h), `mfrr_mari_net_mw` (1h, 2h, 3h, 6h, 12h, 24h), `mfrr_active_lag` (1h, 2h, 3h, 6h, 12h, 24h) | MW / Index   | mFRR-Aktivierung und MARI-Flüsse als ergänzende Balancing-Signale für systemweite Reserveanspannung.                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `residual_load_actual`, `residual_load_calc` (je 2h)                                                                                                                                 | MW           | Reallast abzüglich erneuerbarer Einspeisung als zentraler Treiber konventioneller Fahrweise.                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `generation_fossil_total_mw_lag_2h`, `generation_hydro_pumped_storage_mw_lag_2h`, `generation_hydro_actual_total_lag_2h`, `generation_baseload_total_lag_2h`                         | MW / Anteil  | Aggregierte Erzeugungsblöcke zur Abbildung der Angebotsstruktur; `generation_hydro_pumped_storage_mw_lag_2h` wird **explizit separat** geführt, da Pumpspeicher kurzfristig steuerbare Flexibilität (Laden/Entladen) abbilden und damit für aFRR-Regime deutlich informativer sind als reine Laufwasser-/Gesamthydro-Signale. `generation_baseload_total_lag_2h` ist definiert als Biomasse + Kernkraft (`nuclear`-Missing -> `0`) und seit dem Atomausstieg im April 2023 faktisch biomassedominiert. |
-| `wind_onshore_actual_entsoe` (2h, 24h, 48h, 168h)                                                                                                                                    | MW           | Tatsächliche Onshore-Winderzeugung mit Kurz- bis Wochenhistorie zur Modellierung wettergetriebener Regime.                                                                                                                                                                                                                                                                                                                                                                                             |
-| `wind_offshore_actual_entsoe`, `solar_actual_entsoe` (je 2h)                                                                                                                         | MW           | Tatsächliche Offshore-Wind- und Solarleistung als unmittelbare Determinanten der Residuallast.                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `wind_onshore_error_da/id`, `wind_offshore_error_da/id`, `solar_error_da/id`, `wind_total_error_da`, `total_wind_solar_id_error` (je 2h)                                             | MW           | Forecast-Fehler gegenüber Istwerten als Proxy für Prognoseunsicherheit und spätere Regelenergiebedarfe.                                                                                                                                                                                                                                                                                                                                                                                                |
-| `wind_onshore_actual_entsoe_mean_24h/std_24h/mean_168h/std_168h` (je 2h)                                                                                                             | MW           | Rollierende Lage- und Streuungsmaße der Onshore-Einspeisung zur Stabilisierung der Windregime-Erkennung.                                                                                                                                                                                                                                                                                                                                                                                               |
-| `unplanned_outages_mw` (2h), `planned_outages_mw` (ohne Lag)                                                                                                                         | MW           | Ungeplante und geplante Kraftwerksausfälle als Angebotsrestriktionssignal im kurzfristigen Dispatch.                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `wind_onshore_forecast_id_entsoe`, `wind_offshore_forecast_id_entsoe`, `solar_forecast_id_entsoe` (ohne Lag, 24h, 48h, 168h)                                                         | MW           | Ex-ante Einspeiseprognosen für erneuerbare Energien zur frühzeitigen Abbildung erwarteter Volatilität.                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `renewable_share_forecast`, `residual_load_forecast` (ohne Lag, 24h, 48h, 168h)                                                                                                      | Anteil / MW  | Prognostizierter EE-Anteil und erwartete Residuallast als Schlüsselgrößen für Day-Ahead- und Balancing-Lage.                                                                                                                                                                                                                                                                                                                                                                                           |
-| `load_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `wind_onshore_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `wind_offshore_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `solar_forecast_da_entsoe_h1/h2/h3/h6/h12/h24`, `residual_load_forecast_da_h1/.../h24`, `renewable_share_forecast_h1/.../h24` | MW / Anteil  | Sparse DA-Forecast-Horizonte (1..24h) als kausal gegatete Trajektorienpunkte zur expliziten Multi-Horizon-Signalgebung.                                                                                                                                                                                                                                                                                                                                                                                |
-| `*_next24_mean/min/max/std`, `*_next24_ramp` (für DA-forecastbasierte Kernreihen)                                                                                | MW / Anteil  | Komprimierte Kurvenbeschreibung der erwarteten 24h-Entwicklung; reduziert Feature-Flut bei Erhalt der Forminformation (Level, Streuung, Rampen).                                                                                                                                                                                                                                                                                                                                                       |
-| `wind_forecast_update`, `wind_onshore_forecast_update`, `solar_forecast_update` (1h, 2h, 3h, 6h, 12h, 24h)                                                                          | Index        | Änderungsmaße der Forecasts als Frühindikator für neue Wetterinformationen und Repricing-Risiken.                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `wind_onshore_capacity`, `wind_offshore_capacity`, `solar_capacity`, `gas_capacity`, `hard_coal_capacity`, `lignite_capacity`, `pumped_storage_capacity` (ohne Lag)                  | MW           | Verfügbare Kapazitäten als strukturelle Obergrenzen des Erzeugungs- und Flexibilitätspotenzials.                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `picasso_flow_rate` (lag_1h, lag_24h)                                                                                                                                                | Anteil (0-1) | Anteil grenzüberschreitender PICASSO-Aktivierung als Indikator für europäische Kopplungseffekte.                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `TE_hour_regime_activation` (1h)                                                                                                                                                     | Index        | Zeitregime-basierte Aktivierungskodierung zur expliziten Trennung typischer Stundenmuster.                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `hour_sin`, `hour_cos`, `dayofweek_sin`, `dayofweek_cos`, `weekday_sin`, `weekday_cos`, `month_sin`, `month_cos` (ohne Lag)                                                          | Index        | Zyklische Zeitkodierungen mit zirkulärer Kontinuität (insb. 23:00 -> 00:00) zur robusten Modellierung periodischer Muster.                                                                                                                                                                                                                                                                                                                                                                             |
-| `is_weekend`, `is_afternoon`, `is_evening`, `is_morning`, `is_night`, `is_bridge_day`, `is_payday_period`, `is_christmas_break`, `is_picasso_active` (ohne Lag) | Flag (0/1)   | Binäre Regimeindikatoren für kalender- und marktstrukturbedingte Nachfragemuster und Aktivierungswahrscheinlichkeiten.                                                                                                                                                                                                                                                                                                                                                                                 |
-| `holiday_severity` (ohne Lag)                                                                                                                                                        | Index        | Verdichteter Kalenderindex zur robusten Trennung außergewöhnlicher Tage und Betriebsphasen.                                                                                                                                                                                                                                                                                                                                                                                                             |
-
-## Feature-Taxonomie (Informationsquellen)
-
-| Kategorie           | Typische Merkmale                                       | Informationsfunktion                                                      |
+| Category           | Typical features                                       | Information function                                                      |
 | ------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------- |
-| **Fundamental**     | Last, Erneuerbare, Outages, Commodity-Preise            | Physikalische und kostengetriebene Basiskräfte der Merit-Order.           |
-| **Markt-Sentiment** | DA-Preise (historisch/PiT), Spreads, Volatilitäten      | Preisregime, relative Bewertung und Erwartungsdynamik im Markt.           |
+| **Fundamental**     | Load, renewables, outages, commodity prices            | Physical and cost-driven base forces of the merit order.           |
+| **Market sentiment** | DA prices (historical/PiT), spreads, volatilities      | Price regimes, relative valuation, and expectation dynamics in the market.           |
 | **Echtzeit-Stress** | NRV, Aktivierungsraten, Netz-Statistiken, PICASSO-Flows | Kurzfristige Systemanspannung und Balancing-Bedarf.                       |
-| **Kalendarium**     | Feiertage, Brückentage, zyklische Zeitgeber             | Strukturierte saisonale und verhaltensbedingte Nachfrage-/Angebotsmuster. |
+| **Calendar**     | Holidays, bridge days, cyclical time markers             | Structured seasonal and behavior-driven demand/supply patterns. |
 
-## Feature-Taxonomie der Modell-Bundles
+## Feature Taxonomy of Model Bundles
 
-| Bundle          | Taxonomie                 | Inhaltlicher Fokus                                                                                                                      |
+| Bundle          | Taxonomy                 | Content focus                                                                                                                      |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| **DA-Bundle**   | **Fundamental & Ex-Ante** | Last- und EE-Forecasts, Commodity-Preise, Kalender-/Saisonalitätsmerkmale; keine Balancing-/Stress-Signale gemäß D-1-Kausalität.        |
-| **aFRR-Bundle** | **Stress & Momentum**     | DA-Basis plus kurzfristige Stress-/Momentum-Signale (NRV, Aktivierungs-Lags, Spreads, Flows) zur Prognose der Abweichung vom DA-Niveau. |
+| **DA-Bundle**   | **Fundamental & Ex-Ante** | Load and renewable forecasts, commodity prices, calendar/seasonality features; no balancing/stress signals per D-1 causality.        |
+| **aFRR-Bundle** | **Stress & Momentum**     | DA base plus short-term stress/momentum signals (NRV, activation lags, spreads, flows) to forecast deviations from the DA level. |
 
-## Kausalitäts-Check zur Lag-Benennung
+## Causality Check for Lag Naming
 
-- Alle Lag-Spalten folgen dem Schema `*_lag_Xh`.
-- `X` beschreibt die absolute Verzögerung zur Echtzeit.
-- Für `system_stress_signal` und `grid_stress_index` existiert **kein** `lag_1h`.
+- All lag columns follow the `*_lag_Xh` pattern.
+- `X` denotes the absolute delay relative to real time.
+- For `system_stress_signal` and `grid_stress_index`, there is **no** `lag_1h`.
 
-## Validierungsmethodik
+## Validation Methodology
 
-| Methode                        | Konfiguration                                                       | Zweck                                                                                                                      |
+| Method                        | Configuration                                                       | Purpose                                                                                                                      |
 | ------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| **Purged Cross-Validation**    | `72h` Gap zwischen Train- und Validierungsfenster                   | Ausschluss zeitlicher Leakage-Pfade durch Autokorrelation in Wetter-, Last- und Preissignalen.                             |
-| **Ablation-Tests**             | Gruppenweise Feature-Entfernung/Beibehaltung auf identischen Splits | Quantifizierung des inkrementellen Nutzens einzelner Feature-Klassen.                                                      |
-| **PnL-Proxy (Spread-Capture)** | Fold-weise Logging im CV-Loop                                       | Prüfung, ob ein Feature nicht nur Fehlermaße verbessert, sondern auch ökonomisch verwertbare Richtungsinformation liefert. |
+| **Purged Cross-Validation**    | `72h` Gap zwischen Train- und Validierungsfenster                   | Excludes temporal leakage paths caused by autocorrelation in weather, load, and price signals.                             |
+| **Ablation-Tests**             | Group-wise feature removal/retention on identical splits | Quantifizierung des inkrementellen Nutzens einzelner Feature-Klassen.                                                      |
+| **PnL-Proxy (Spread-Capture)** | Fold-weise Logging im CV-Loop                                       | Checks whether a feature improves not only error metrics but also economically usable directional information. |
 
-## Methodische Governance und Evidenz
+## Methodological Governance and Evidence
 
-| Thema                             | Umgesetzte Regel                                                                                                                 | Nutzen für Nachvollziehbarkeit                                                  |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **Regime-Cut (Post-PICASSO)**     | Trainings-Bundles werden ab `2022-06-22 22:00:00+00:00` gefiltert.                                                               | Verhindert Regime-Mischung zwischen historischer und aktueller Marktdynamik.    |
-| **Strict Target Policy**          | Für Training sind ausschließlich `target_*` als Zielvariablen zulässig; unshifted Ziel-nahe Reihen dienen nur Audit/`y_true`. | Stellt sicher, dass Forecasting (h+1) nicht in Nowcasting kippt.                |
-| **DA-vs-aFRR Feature Governance** | DA-Bundle wird um Balancing-/Stress-Signale bereinigt; aFRR-Bundle behält diese Signale als zentrale Treiber.                    | Klare kausale Trennung nach Entscheidungszeitpunkt und Modellzweck.             |
-| **Cross-Border-DA-Spreads (PiT)** | `da_spread_de_at/de_fr/de_nl` basieren auf PIT-gegatterten DA-Preisen (`D-1 13:00 UTC`), nicht auf Rohpreisen.                   | Vermeidet versteckte Leakage-Pfade in grenzüberschreitenden Preisrelationen.    |
-| **Imputation Governance**         | Bundle-seitig: `ffill(limit=12)` auf `X` plus train-fitted Median-Fallback; Logging je Spalte mit Imputation-Counts.             | Transparente, reproduzierbare Behandlung kleiner Quelllücken ohne Ziel-Leakage. |
-| **Ablation-Prozess**              | Feature-Gruppen werden nur übernommen, wenn sie in Purged-CV und Holdout robusten Mehrwert liefern.                              | Datengetriebene Feature-Auswahl statt heuristischer Überfrachtung.              |
+| Topic                             | Implemented rule                                                                                                              | Traceability benefit                                                  |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **Regime-Cut (Post-PICASSO)**     | Training bundles are filtered from `2022-06-22 22:00:00+00:00` onward.                                                            | Prevents regime mixing between historical and current market dynamics.    |
+| **Strict Target Policy**          | For training, only `target_*` columns are allowed as targets; unshifted target-near series are for audit/`y_true` only. | Ensures forecasting (h+1) does not collapse into nowcasting.                |
+| **DA-vs-aFRR Feature Governance** | The DA bundle is stripped of balancing/stress signals; the aFRR bundle retains these signals as core drivers.                 | Clear causal separation by decision time and model purpose.             |
+| **Cross-Border-DA-Spreads (PiT)** | `da_spread_de_at/de_fr/de_nl` basieren auf PIT-gegatterten DA-Preisen (`D-1 13:00 UTC`), nicht auf Rohpreisen.                | Avoids hidden leakage paths in cross-border price relationships.    |
+| **Imputation Governance**         | Bundle-seitig: `ffill(limit=12)` auf `X` plus train-fitted Median-Fallback; Logging je Spalte mit Imputation-Counts.          | Transparent, reproducible handling of small source gaps without target leakage. |
+| **Ablation-Prozess**              | Feature groups are adopted only when they deliver robust value in Purged CV and holdout.                           | Data-driven feature selection instead of heuristic overloading.              |
 
-## Primärquellen-Lücken und April-2025-Forensik
+## Primary-Source Gaps and April 2025 Forensics
 
-- Zentrale Missingness-Dokumentation: `docs/api_missingness_report.md` und
+- Central missingness documentation: `docs/api_missingness_report.md` und
   `data/reports/api_missingness_audit.csv`.
-- Für **2025-04-01 00:00 bis 2025-04-02 23:00 UTC** wurde ein gezielter
-  Re-Fetch durchgeführt (`data/reports/april_refetch_comparison.csv`).
-- Befund: `wind_onshore_forecast_id_entsoe` blieb mit **22 fehlenden Werten**
-  unverändert; Klassifikation als **Hard Source Gap** (Primärquellenlimit),
-  nicht als Ingestionsfehler.
-- Nachweis der Lag-Propagation: `data/reports/april_hard_gap_propagation.csv`.
+- For **2025-04-01 00:00 to 2025-04-02 23:00 UTC**, a targeted re-fetch was performed (`data/reports/april_refetch_comparison.csv`).
+- Finding: `wind_onshore_forecast_id_entsoe` remained unchanged with **22 missing values**; classified as a **Hard Source Gap** (primary-source limit), not an ingestion error.
+- Lag propagation evidence: `data/reports/april_hard_gap_propagation.csv`.
 
-## Empirische Validität
+## Empirical Validity
 
-Zur empirischen Begründung der finalen Trainingsmerkmale werden nach dem
-XGBoost-Training zwei komplementäre Wichtigkeitsmaße exportiert:
+To empirically justify the final training features, two complementary importance measures are exported after XGBoost training:
 
-- **XGBoost Gain**: Informationsgewinn je Feature im Baumwachstum.
+- **XGBoost Gain**: information gain per feature during tree growth.
 - **SHAP (mean absolute values)**: durchschnittlicher marginaler Beitrag je
-  Feature zur Vorhersage.
+  feature contribution to prediction.
 
 Erzeugte Artefakte:
 
 - `data/reports/model_training/importance_report.csv`
-- `data/reports/model_training/shap_summary.png`
+- `data/reports/model_training/xgboost_da_top20_feature_importance.png`
 
-Diese Nachweise dienen als prüfbare Evidenz im Methodik-/Ergebnis-Kapitel,
-dass die verwendeten `X`-Merkmale (inkl. Lag-Struktur) nicht nur formal
-kausal definiert, sondern auch modellseitig substanziell wirksam sind.
+These artifacts provide verifiable evidence in the methods/results section that the used `X` features (including lag structure) are not only formally causal but also materially effective in the model.
 
-## Parameter-Rationale
+Note: These artifacts and filenames are snapshot-specific and may vary by training run/export configuration.
 
-| Parameter / Feature-Logik          | Konfiguration                                                    | Methodische Begründung                                                                                                                                                  |
+## Parameter Rationale
+
+| Parameter / Feature logic          | Configuration                                                    | Methodological rationale                                                                                                                                                  |
 | ---------------------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Tages-/Wochen-Saisonalität         | Fenster `24h` und `168h` (z. B. Mittelwert/Std/Lags)             | Strom- und Regelenergiemärkte zeigen stabile Intraday- und Wochenrhythmen (Lastprofile, Wochenend-Effekt). Die Fenster bilden diese wiederkehrenden Muster explizit ab. |
-| PiT-Latenz für Actuals             | `lag_2h` für ENTSO-E-Istwerte/abgeleitete Actual-Features        | Vermeidung von Look-ahead-Bias durch Publikationslatenz: Istwerte gelten erst mit Verzögerung als beobachtbar.                                                          |
-| PiT-Latenz für aFRR/Marktreaktion  | `lag_1h` für aFRR-Aktivierungs-/preisnahe und Kapazitäts-Signale | Marktsignale werden erst nach Ablauf/Publikation der Stunde als sicher verfügbar behandelt.                                                                             |
-| DA-Informationsgate                | `da_price_pit` mit D-1 `13:00 UTC` Freigabelogik                 | Strikte Abbildung der realen Informationsverfügbarkeit vor Lieferstunde; verhindert Vorwissen aus noch nicht publizierten DA-Auktionswerten.                            |
-| DA-Forecast-Trajektorien           | Sparse Horizonte `h1,h2,h3,h6,h12,h24` plus `next24`-Kompression | Vereint Kurvenform (Rampen/Volatilität) und Dimensionalitätskontrolle für Multi-Horizon-Modelle ohne Bruch der PiT-Kausalität.                                           |
-| DA-Derivate (Diff/EWMA/Stats/Slog) | Berechnung auf `da_price_pit` statt Roh-`da_price`               | Konsistente PiT-Kausalität für alle aus DA abgeleiteten Merkmale; verhindert indirekte Leakage-Pfade über Derivate.                                                     |
-| Load Error                         | `load_error_da_lag_2h`                                           | Direkter Ungleichgewichtsindikator aus Last-Ist vs. Last-Prognose; kausal verzögert zur Vermeidung von Leakage.                                                         |
-| Cross-Border-Spreads               | `da_spread_de_at/de_fr/de_nl` (inkl. Lags)                       | Erfasst Kopplungsdruck zwischen DE und Nachbarmärkten (Import/Export, Arbitrage, Engpässe).                                                                             |
-| Pumped-Hydro-Isolierung            | `generation_hydro_pumped_storage_mw_lag_2h`                      | Separates Flexibilitäts-Signal für taktische Speicherfahrweise; verhindert Signal-Verwässerung in aggregierten Hydro-Blöcken.                                           |
-| 30-Tage-Volatilität                | `da_price_volatility_30d` (rollierend, kausal verschoben)        | Erfasst mittelfristige Regimewechsel und Stressphasen, die kurzfristige Preis- und Aktivierungsdynamik beeinflussen.                                                    |
-| Signed-Log-Transformation          | `slog1p(x) = sign(x) * log1p(abs(x))`                            | Komprimiert Preisspitzen (positive und negative) ohne Vorzeichenverlust; stabilisiert numerische Gradienten und reduziert Dominanz extremer Ausreißer.                  |
+| Daily/weekly seasonality         | Windows `24h` and `168h` (e.g., mean/std/lags)             | Power and balancing markets show stable intraday and weekly rhythms (load profiles, weekend effects). These windows explicitly capture recurring patterns. |
+| PiT latency for actuals             | `lag_2h` for ENTSO-E actual values/derived actual features        | Avoids look-ahead bias due to publication latency: actual values are observable only with delay.                                                          |
+| PiT latency for aFRR/market reaction  | `lag_1h` for aFRR activation/price-near and capacity signals | Market signals are treated as reliably available only after the hour has elapsed/been published.                                                                             |
+| DA information gate                | `da_price_pit` with D-1 `13:00 UTC` release logic                 | Strict representation of real information availability before delivery hour; prevents foresight from not-yet-published DA auction values.                            |
+| DA forecast trajectories           | Sparse Horizonte `h1,h2,h3,h6,h12,h24` plus `next24`-Kompression | Combines curve shape (ramps/volatility) with dimensionality control for multi-horizon models without breaking PiT causality.                                          |
+| DA derivatives (Diff/EWMA/Stats/Slog) | Berechnung auf `da_price_pit` statt Roh-`da_price`               | Consistent PiT causality for all DA-derived features; prevents indirect leakage paths via derivatives.                                                     |
+| Load Error                         | `load_error_da_lag_2h`                                           | Direct imbalance indicator from load actual vs. load forecast; causally lagged to avoid leakage.                                                         |
+| Cross-Border-Spreads               | `da_spread_de_at/de_fr/de_nl` (incl. Lags)                       | Captures coupling pressure between DE and neighboring markets (import/export, arbitrage, congestion).                                                                             |
+| Pumped-hydro isolation            | `generation_hydro_pumped_storage_mw_lag_2h`                      | Separate flexibility signal for tactical storage operation; avoids signal dilution in aggregated hydro blocks.                                           |
+| 30-day volatility                | `da_price_volatility_30d` (rollierend, kausal verschoben)        | Captures medium-term regime shifts and stress phases that affect short-term price and activation dynamics.                                                    |
+| Signed-Log-Transformation          | `slog1p(x) = sign(x) * log1p(abs(x))`                            | Compresses price spikes (positive and negative) without losing sign; stabilizes numerical gradients and reduces dominance of extreme outliers.                  |
 
-Hinweis zur Modellierung:
+Modeling note:
 
-- Die in `notebooks/13_forecast_collinearity_pca_audit.ipynb` identifizierte
-  Kollinearität (insb. Solar-Forecast-Familie) wird für XGBoost bewusst
-  beibehalten, da Baumverfahren robust gegenüber kollinearen Eingängen sind
-  und Rohfeatures für die ökonomische Interpretation erhalten bleiben.
+- The collinearity identified in `notebooks/13_forecast_collinearity_pca_audit.ipynb` (especially in the solar forecast family) is intentionally retained for XGBoost, since tree models are robust to collinear inputs and raw features remain available for economic interpretation.

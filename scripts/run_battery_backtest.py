@@ -710,6 +710,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use a single full-horizon optimization instead of rolling horizon.",
     )
+    p.add_argument(
+        "--trading-strategy",
+        choices=["multi", "da_only", "afrr_only"],
+        default="multi",
+        help="Strategy isolation mode: multi (DA+aFRR), da_only (DA only), afrr_only (aFRR only).",
+    )
     return p.parse_args()
 
 
@@ -877,8 +883,16 @@ def main() -> None:
 
     backtester = BatteryBacktester()
     sweep_rows: list[dict[str, object]] = []
+    if args.trading_strategy == "da_only":
+        allowed_markets = ("DA",)
+    elif args.trading_strategy == "afrr_only":
+        allowed_markets = ("aFRR",)
+    else:
+        allowed_markets = ("DA", "aFRR")
+    strategy_root = out_dir / args.trading_strategy
+
     for scenario_name, scenario_warehouse in scenarios:
-        scenario_out_dir = out_dir if scenario_name == "default" and not quantile_pairs else out_dir / scenario_name
+        scenario_out_dir = strategy_root if scenario_name == "default" and not quantile_pairs else strategy_root / scenario_name
         scenario_out_dir.mkdir(parents=True, exist_ok=True)
 
         with _phase_watchdog("backtester_run"):
@@ -892,16 +906,13 @@ def main() -> None:
                 da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
                 soc_feedback_mode=args.soc_feedback_mode,
                 enforce_final_soc_min=args.enforce_final_soc_min,
+                allowed_markets=allowed_markets,
             )
 
         hourly_path = scenario_out_dir / "backtest_hourly.parquet"
         planned_ledger_path = scenario_out_dir / "planned_ledger.parquet"
         executed_ledger_path = scenario_out_dir / "executed_ledger.parquet"
         realized_ledger_path = scenario_out_dir / "realized_ledger.parquet"
-        realized_da_only_hourly_path = scenario_out_dir / "hourly_realized_da_only.parquet"
-        realized_afrr_only_hourly_path = scenario_out_dir / "hourly_realized_afrr_only.parquet"
-        oracle_da_only_hourly_path = scenario_out_dir / "hourly_oracle_da_only.parquet"
-        oracle_afrr_only_hourly_path = scenario_out_dir / "hourly_oracle_afrr_only.parquet"
         plan_history_path = scenario_out_dir / "backtest_plan_history.parquet"
         milp_event_log_path = scenario_out_dir / "backtest_milp_event_log.parquet"
         milp_event_summary_path = scenario_out_dir / "backtest_milp_event_summary.csv"
@@ -923,6 +934,9 @@ def main() -> None:
             "aFRR_Energy_Price_EUR_MWh_Pos", "aFRR_Energy_Price_EUR_MWh_Neg", "event_reopt_triggered",
             "event_reopt_rejected_mw_total", "predicted_objective_eur"
         ] if c in outputs.hourly.columns]
+        planned_cols.extend([c for c in outputs.hourly.columns if c.startswith("afrr_bin_")])
+        planned_cols.extend([c for c in outputs.hourly.columns if c.startswith("submitted_afrr_")])
+        planned_cols.extend([c for c in outputs.hourly.columns if c.startswith("executed_afrr_")])
         with _phase_watchdog("write_planned_ledger"):
             outputs.hourly[planned_cols].to_parquet(planned_ledger_path, index=False)
 
@@ -930,6 +944,7 @@ def main() -> None:
         executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_planned_")])
         executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_submitted_")])
         executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_executed_")])
+        executed_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_afrr_bin_")])
         executed_cols.extend([c for c in [
             "real_da_buy_accepted", "real_da_sell_accepted", "real_afrr_cap_pos_awarded", "real_afrr_cap_neg_awarded",
             "real_afrr_act_pos_accepted", "real_afrr_act_neg_accepted", "real_aFRR_Capacity_Won_MW",
@@ -941,6 +956,9 @@ def main() -> None:
             outputs.hourly[[*dict.fromkeys(executed_cols)]].to_parquet(executed_ledger_path, index=False)
 
         realized_cols = [colmap.timestamp]
+        realized_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_submitted_afrr_")])
+        realized_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_executed_afrr_")])
+        realized_cols.extend([c for c in outputs.hourly.columns if c.startswith("real_afrr_bin_")])
         realized_cols.extend([
             c for c in outputs.hourly.columns if c.startswith("real_") and c in {
                 "real_pnl_eur", "real_da_buy_mwh", "real_da_sell_mwh", "real_act_pos_mwh", "real_act_neg_mwh",
@@ -953,16 +971,6 @@ def main() -> None:
         ])
         with _phase_watchdog("write_realized_ledger"):
             outputs.hourly[[*dict.fromkeys(realized_cols)]].to_parquet(realized_ledger_path, index=False)
-        with _phase_watchdog("write_isolated_hourly"):
-            iso = outputs.isolated_hourly or {}
-            if isinstance(iso.get("realized_da_only"), pd.DataFrame):
-                iso["realized_da_only"].to_parquet(realized_da_only_hourly_path, index=False)
-            if isinstance(iso.get("realized_afrr_only"), pd.DataFrame):
-                iso["realized_afrr_only"].to_parquet(realized_afrr_only_hourly_path, index=False)
-            if isinstance(iso.get("oracle_da_only"), pd.DataFrame):
-                iso["oracle_da_only"].to_parquet(oracle_da_only_hourly_path, index=False)
-            if isinstance(iso.get("oracle_afrr_only"), pd.DataFrame):
-                iso["oracle_afrr_only"].to_parquet(oracle_afrr_only_hourly_path, index=False)
 
         with _phase_watchdog("write_plan_history"):
             outputs.plan_history.to_parquet(plan_history_path, index=False)
@@ -1067,10 +1075,6 @@ def main() -> None:
                     "PnL Summary",
                     f"realized_total_pnl_eur={_fmt_summary_val('realized_total_pnl_eur')}",
                     f"oracle_total_pnl_eur={_fmt_summary_val('oracle_total_pnl_eur')}",
-                    f"realized_da_only_total_pnl_eur={_fmt_summary_val('realized_da_only_total_pnl_eur')}",
-                    f"oracle_da_only_total_pnl_eur={_fmt_summary_val('oracle_da_only_total_pnl_eur')}",
-                    f"realized_afrr_only_total_pnl_eur={_fmt_summary_val('realized_afrr_only_total_pnl_eur')}",
-                    f"oracle_afrr_only_total_pnl_eur={_fmt_summary_val('oracle_afrr_only_total_pnl_eur')}",
                 ]) + "\n",
                 encoding="utf-8",
             )
@@ -1174,28 +1178,24 @@ def main() -> None:
             num_days_total = float((timeframe_end - timeframe_start).total_seconds() / 86400.0) + (1.0 / 24.0)
             print(f"- timeframe_utc: {timeframe_start.isoformat()} -> {timeframe_end.isoformat()}")
             print(f"- timeframe_total_days: {num_days_total:.4f}")
-        print(
-            "- DA-only pnl (realized/oracle): "
-            f"{outputs.summary.get('realized_da_only_total_pnl_eur', float('nan')):.2f} / "
-            f"{outputs.summary.get('oracle_da_only_total_pnl_eur', float('nan')):.2f}"
-        )
-        print(
-            "- aFRR-only pnl (realized/oracle): "
-            f"{outputs.summary.get('realized_afrr_only_total_pnl_eur', float('nan')):.2f} / "
-            f"{outputs.summary.get('oracle_afrr_only_total_pnl_eur', float('nan')):.2f}"
-        )
+        print(f"- trading_strategy: {args.trading_strategy}")
         print(
             "- Multi-market pnl (realized/oracle): "
             f"{outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f} / "
             f"{outputs.summary.get('oracle_total_pnl_eur', float('nan')):.2f}"
         )
-        r_da = outputs.summary.get("realized_vs_oracle_ratio_da_only", float("nan"))
-        r_afrr = outputs.summary.get("realized_vs_oracle_ratio_afrr_only", float("nan"))
+        # Warn on negative PnL in any reported optimization view.
+        pnl_warn_fields = [
+            ("Multi-market realized", "realized_total_pnl_eur"),
+            ("Multi-market oracle", "oracle_total_pnl_eur"),
+        ]
+        for label, key in pnl_warn_fields:
+            v = pd.to_numeric(pd.Series([outputs.summary.get(key, float("nan"))]), errors="coerce").iloc[0]
+            if pd.notna(v) and float(v) < 0.0:
+                print(f"[WARN] negative_pnl: {label}={float(v):.2f} EUR")
         r_multi = outputs.summary.get("realized_vs_oracle_ratio_multi_market", float("nan"))
         print(
-            "- realized/oracle ratio % (DA-only | aFRR-only | Multi): "
-            f"{(100.0 * float(r_da)) if pd.notna(r_da) else float('nan'):.2f}% | "
-            f"{(100.0 * float(r_afrr)) if pd.notna(r_afrr) else float('nan'):.2f}% | "
+            "- realized/oracle ratio % (Multi): "
             f"{(100.0 * float(r_multi)) if pd.notna(r_multi) else float('nan'):.2f}%"
         )
         final_soc = outputs.summary.get("final_real_soc_mwh", float("nan"))
@@ -1217,6 +1217,7 @@ def main() -> None:
 
         row: dict[str, object] = {
             "scenario": scenario_name,
+            "trading_strategy": args.trading_strategy,
             "da_quantile_role": args.da_quantile_role,
             "realized_total_pnl_eur": outputs.summary.get("realized_total_pnl_eur"),
             "predicted_total_pnl_eur": outputs.summary.get("predicted_total_pnl_eur"),

@@ -95,6 +95,8 @@ class BidBuilder:
         da_arb_mode: str = "limit",
         da_buy_limit_offset_eur_mwh: float = 0.0,
         da_sell_limit_offset_eur_mwh: float = 0.0,
+        da_buy_limit_quantile: str = "p90",
+        da_sell_limit_quantile: str = "p10",
         afrr_energy_bid_strategy: str = "forecast",
         link_da_to_awarded_afrr: bool = True,
     ) -> None:
@@ -111,6 +113,8 @@ class BidBuilder:
         self.da_arb_mode = da_arb_mode
         self.da_buy_limit_offset_eur_mwh = float(da_buy_limit_offset_eur_mwh)
         self.da_sell_limit_offset_eur_mwh = float(da_sell_limit_offset_eur_mwh)
+        self.da_buy_limit_quantile = str(da_buy_limit_quantile).lower()
+        self.da_sell_limit_quantile = str(da_sell_limit_quantile).lower()
         self.afrr_energy_bid_strategy = afrr_energy_bid_strategy
         self.link_da_to_awarded_afrr = bool(link_da_to_awarded_afrr)
 
@@ -260,6 +264,10 @@ class BidBuilder:
         obligation_pos_mw: float,
         obligation_neg_mw: float,
         pred_da_price: float,
+        pred_da_price_p05: float | None = None,
+        pred_da_price_p10: float | None = None,
+        pred_da_price_p90: float | None = None,
+        pred_da_price_p95: float | None = None,
         is_oracle: bool = False,
     ) -> list[DABid]:
         # Use MILP schedule volumes directly (endogenous physics/hedging).
@@ -272,14 +280,31 @@ class BidBuilder:
             plan_sell_mw = 0.0
 
         bids: list[DABid] = []
+        qmap = {
+            "p05": pred_da_price_p05,
+            "p10": pred_da_price_p10,
+            "p90": pred_da_price_p90,
+            "p95": pred_da_price_p95,
+        }
+        def _qval(name: str) -> float | None:
+            v = qmap.get(str(name).lower())
+            if v is None:
+                return None
+            if not math.isfinite(float(v)):
+                return None
+            return float(v)
+
         if plan_buy_mw > 0.0:
             buy_is_hedge = self.link_da_to_awarded_afrr and float(obligation_pos_mw) > 0.0
-            buy_mode = "price_taker" if (is_oracle or buy_is_hedge) else self.da_arb_mode
-            buy_price = (
-                self.pricing.da_buy_limit_price_eur_mwh
-                if buy_mode == "price_taker"
-                else float(pred_da_price) + self.da_buy_limit_offset_eur_mwh
-            )
+            # Quantile-backed DA limits: always use limit mode for standard DA actions.
+            buy_mode = "limit"
+            buy_q = _qval(self.da_buy_limit_quantile) or _qval("p90") or _qval("p95")
+            if buy_q is not None:
+                buy_price = float(buy_q)
+            elif math.isfinite(float(pred_da_price)):
+                buy_price = float(pred_da_price) + self.da_buy_limit_offset_eur_mwh
+            else:
+                buy_price = float(self.pricing.da_buy_limit_price_eur_mwh)
             bids.append(
                 DABid(
                     ts=ts,
@@ -297,14 +322,15 @@ class BidBuilder:
                 plan_sell_mw = 0.0
         if plan_sell_mw > 0.0:
             sell_is_hedge = self.link_da_to_awarded_afrr and float(obligation_neg_mw) > 0.0
-            # Non-hedging DA sell is forced to price-taker by default to avoid
-            # "black hole" limit rejections after margin already passed.
-            sell_mode = "price_taker" if (is_oracle or (not sell_is_hedge)) else self.da_arb_mode
-            sell_price = (
-                self.pricing.da_sell_limit_price_eur_mwh
-                if sell_mode == "price_taker"
-                else float(pred_da_price) - self.da_sell_limit_offset_eur_mwh
-            )
+            # Quantile-backed DA limits: conservative lower tail for sell.
+            sell_mode = "limit"
+            sell_q = _qval(self.da_sell_limit_quantile) or _qval("p10") or _qval("p05")
+            if sell_q is not None:
+                sell_price = float(sell_q)
+            elif math.isfinite(float(pred_da_price)):
+                sell_price = float(pred_da_price) - self.da_sell_limit_offset_eur_mwh
+            else:
+                sell_price = float(self.pricing.da_sell_limit_price_eur_mwh)
             bids.append(
                 DABid(
                     ts=ts,

@@ -224,16 +224,34 @@ class BatteryBacktester:
         self.soc_init = float(BATTERY_SPECS["initial_soc"]) * self.cap_mwh
         self.soc_target_end = float(BATTERY_SPECS["soc_target_end"]) * self.cap_mwh
 
-        self.aux_mwh = float(BATTERY_SPECS["aux_power_mw"]) * self.dt_h
+        self.aux_mode = str(BATTERY_SPECS.get("aux_power_mode", "state_dependent")).strip().lower()
+        self.aux_peak_mw = float(BATTERY_SPECS.get("aux_power_peak_mw", BATTERY_SPECS.get("aux_power_mw", 0.0)))
+        self.aux_off_mw = max(0.0, self.aux_peak_mw * float(BATTERY_SPECS.get("aux_power_off_duty", 0.0)))
+        self.aux_standby_mw = max(0.0, self.aux_peak_mw * float(BATTERY_SPECS.get("aux_power_standby_duty", 0.25)))
+        self.aux_trading_mw = max(0.0, self.aux_peak_mw * float(BATTERY_SPECS.get("aux_power_trading_duty", 0.75)))
+        self.aux_afrr_active_mw = max(
+            0.0, self.aux_peak_mw * float(BATTERY_SPECS.get("aux_power_afrr_active_duty", 1.0))
+        )
+        # Legacy constant auxiliary load energy-equivalent (used only in constant mode paths).
+        self.aux_mwh = float(BATTERY_SPECS.get("aux_power_mw", 0.0)) * self.dt_h
         aux_override = os.environ.get("BACKTEST_AUX_POWER_MW_OVERRIDE", "").strip()
         if aux_override:
             try:
-                self.aux_mwh = float(aux_override) * self.dt_h
+                aux_ovr = float(aux_override)
+                self.aux_peak_mw = aux_ovr
+                self.aux_off_mw = 0.0
+                self.aux_standby_mw = 0.25 * aux_ovr
+                self.aux_trading_mw = 0.75 * aux_ovr
+                self.aux_afrr_active_mw = aux_ovr
+                self.aux_mwh = aux_ovr * self.dt_h
                 print(f"[INFO] Using aux power override: {float(aux_override):.6f} MW")
             except ValueError:
                 pass
         self.deg_eur_mwh = float(BATTERY_SPECS["degradation_cost"])
         self.trans_eur_mwh = float(FINANCIAL_PARAMS["transaction_cost_eur_per_mwh"])
+        # Fixed offer/availability reserve cost (EUR per offered MW per hour).
+        # This is incurred when reserve is offered, independent of clearing.
+        self.afrr_offer_cost_eur_mw_h = float(FINANCIAL_PARAMS.get("afrr_offer_cost_eur_mw_h", 0.0))
         self.initial_cash = float(FINANCIAL_PARAMS["initial_cash"])
         # Penalty used for non-delivery / imbalance settlement when awarded aFRR
         # cannot be physically delivered due to SoC constraints.
@@ -249,9 +267,6 @@ class BatteryBacktester:
         self.afrr_penalty_default_idaep_eur_mwh = float(
             FINANCIAL_PARAMS.get("afrr_penalty_default_idaep_eur_mwh", 100.0)
         )
-        self.afrr_capacity_penalty_only_on_repeated_violation = bool(
-            FINANCIAL_PARAMS.get("afrr_capacity_penalty_only_on_repeated_violation", True)
-        )
         # Replacement for hard end-SoC floor: soft shortfall penalty in objective.
         self.final_soc_shortfall_penalty_eur_per_mwh = float(
             os.environ.get(
@@ -265,6 +280,8 @@ class BatteryBacktester:
         self.reserve_product_duration_h = float(MODEL_SPECS.get("reserve_product_duration_h", 4.0))
         self.da_bid_granularity_mw = float(MARKET_SPECS.get("da_bid_granularity", 0.1))
         self.afrr_bid_granularity_mw = float(MARKET_SPECS.get("afrr_bid_granularity", 1.0))
+        # Backward-compatible alias used by some helper paths.
+        self.afrr_step_mw = self.afrr_bid_granularity_mw
         if self.da_bid_granularity_mw <= 0 or self.afrr_bid_granularity_mw <= 0:
             raise ValueError("Bid granularities must be > 0.")
         self.da_min_bid_size_mw = float(MARKET_SPECS.get("da_min_bid_size", self.da_bid_granularity_mw))
@@ -295,6 +312,8 @@ class BatteryBacktester:
             da_arb_mode=str(MARKET_SPECS.get("da_arbitrage_mode", "limit")),
             da_buy_limit_offset_eur_mwh=float(MARKET_SPECS.get("da_buy_limit_offset_eur_mwh", 0.0)),
             da_sell_limit_offset_eur_mwh=float(MARKET_SPECS.get("da_sell_limit_offset_eur_mwh", 0.0)),
+            da_buy_limit_quantile=str(MARKET_SPECS.get("da_buy_limit_quantile", "p90")),
+            da_sell_limit_quantile=str(MARKET_SPECS.get("da_sell_limit_quantile", "p10")),
             afrr_energy_bid_strategy=str(MARKET_SPECS.get("afrr_energy_bid_strategy", "forecast")),
             link_da_to_awarded_afrr=self.da_link_to_awarded_afrr,
         )
@@ -313,6 +332,33 @@ class BatteryBacktester:
         self.milp_rel_gap = float(os.environ.get("BACKTEST_MILP_REL_GAP", "1e-4"))
         self.milp_diag_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_DIAG_TIME_LIMIT_S", "60.0"))
 
+    def _state_aux_power_mw(
+        self,
+        *,
+        charge_mw: float,
+        discharge_mw: float,
+        reserve_pos_mw: float,
+        reserve_neg_mw: float,
+        act_pos_rate: float,
+        act_neg_rate: float,
+        id_charge_mw: float = 0.0,
+        id_discharge_mw: float = 0.0,
+    ) -> tuple[float, str]:
+        """Return state-dependent auxiliary power and discrete operating mode."""
+        if self.aux_mode != "state_dependent":
+            return float(BATTERY_SPECS.get("aux_power_mw", 0.0)), "CONSTANT"
+        eps = 1e-9
+        reserve_committed = (reserve_pos_mw > eps) or (reserve_neg_mw > eps)
+        activated = ((reserve_pos_mw > eps) and (act_pos_rate > eps)) or ((reserve_neg_mw > eps) and (act_neg_rate > eps))
+        trading = (charge_mw > eps) or (discharge_mw > eps) or (id_charge_mw > eps) or (id_discharge_mw > eps)
+        if activated:
+            return self.aux_afrr_active_mw, "aFRR_ACTIVE"
+        if trading:
+            return self.aux_trading_mw, "TRADING"
+        if reserve_committed:
+            return self.aux_standby_mw, "STANDBY"
+        return self.aux_off_mw, "OFF"
+
     @staticmethod
     def _clip_rate(x: np.ndarray) -> np.ndarray:
         return np.clip(np.nan_to_num(x, nan=0.0), 0.0, 1.0)
@@ -324,6 +370,8 @@ class BatteryBacktester:
         *,
         fallback_cols: list[str] | None = None,
         default: float = 0.0,
+        allow_temporal_fill: bool = True,
+        strict_non_null: bool = False,
     ) -> pd.Series:
         """Return a finite numeric series using ordered fallbacks and safe fills."""
         if primary_col in frame.columns:
@@ -352,7 +400,16 @@ class BatteryBacktester:
                     fb = pd.Series([fb] * len(frame), index=frame.index)
                 vals = vals.fillna(fb.astype("float64"))
         vals = vals.replace([np.inf, -np.inf], np.nan)
-        vals = vals.ffill().bfill().fillna(float(default))
+        if allow_temporal_fill:
+            vals = vals.ffill().bfill().fillna(float(default))
+        elif not strict_non_null:
+            vals = vals.fillna(float(default))
+        if strict_non_null and vals.isna().any():
+            miss_n = int(vals.isna().sum())
+            raise ValueError(
+                f"NaN detected in critical optimizer input '{primary_col}' after fallback resolution "
+                f"(missing={miss_n}/{len(vals)}). Fix data pipeline."
+            )
         return vals
 
     def _normalize_da_bid(self, charge_mw: float, discharge_mw: float) -> tuple[float, float]:
@@ -395,18 +452,27 @@ class BatteryBacktester:
         # - soft-constraint slacks for reserve infeasibility,
         # - soft terminal SoC shortfall slack (replacement for hard final SoC floor).
         n_r = n * n_bins
-        base = 3 * n + 2 * n_r
-        return {
-            "ch": slice(0, n),
-            "dis": slice(n, 2 * n),
-            "rpos_bin": slice(2 * n, 2 * n + n_r),
-            "rneg_bin": slice(2 * n + n_r, 2 * n + 2 * n_r),
-            "u": slice(base, base + n),
-            "soc": slice(base + n, base + n + (n + 1)),
-            "slack_pos": slice(base + n + (n + 1), base + n + (n + 1) + n),
-            "slack_neg": slice(base + n + (n + 1) + n, base + n + (n + 1) + 2 * n),
-            "slack_final_soc": slice(base + n + (n + 1) + 2 * n, base + n + (n + 1) + 2 * n + 1),
-        }
+        s = 0
+        out: dict[str, slice] = {}
+        out["ch"] = slice(s, s + n); s += n
+        out["dis"] = slice(s, s + n); s += n
+        out["rpos_bin"] = slice(s, s + n_r); s += n_r
+        out["rneg_bin"] = slice(s, s + n_r); s += n_r
+        out["u"] = slice(s, s + n); s += n
+        out["soc"] = slice(s, s + (n + 1)); s += (n + 1)
+        out["slack_pos"] = slice(s, s + n); s += n
+        out["slack_neg"] = slice(s, s + n); s += n
+        out["slack_final_soc"] = slice(s, s + 1); s += 1
+        # Emergency physical SoC slacks (n+1 states, including terminal state).
+        out["slack_soc_min"] = slice(s, s + (n + 1)); s += (n + 1)
+        out["slack_soc_max"] = slice(s, s + (n + 1)); s += (n + 1)
+        # Deliverability slacks (softened 4h reserve-energy/headroom constraints).
+        out["slack_deliver_pos"] = slice(s, s + n); s += n
+        out["slack_deliver_neg"] = slice(s, s + n); s += n
+        # Obligation slacks (softened lockbook equality/feasibility constraints).
+        out["slack_obligation_pos"] = slice(s, s + n); s += n
+        out["slack_obligation_neg"] = slice(s, s + n); s += n
+        return out
 
     def _milp_options(self) -> dict[str, float | bool]:
         """Build SciPy/HiGHS MILP options for stable rolling optimization."""
@@ -430,6 +496,42 @@ class BatteryBacktester:
         msg = str(getattr(sol, "message", "")).lower()
         # SciPy/HiGHS commonly uses status=1 for iteration/time limit.
         return status == 1 or ("time limit" in msg) or ("timelimit" in msg)
+
+    def _write_infeasible_debug_dump(
+        self,
+        *,
+        df: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        c: np.ndarray,
+        a_ub: np.ndarray | None,
+        b_ub: np.ndarray | None,
+        a_eq: np.ndarray | None,
+        b_eq: np.ndarray | None,
+        lb: np.ndarray,
+        ub: np.ndarray,
+        message: str,
+    ) -> None:
+        """Persist MILP matrices for post-mortem infeasibility debugging."""
+        try:
+            out_dir = Path("artifacts/simulation_debug")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts0 = pd.to_datetime(df[colmap.timestamp].iloc[0], utc=True, errors="coerce")
+            tag = ts0.strftime("%Y%m%dT%H%M%SZ") if pd.notna(ts0) else "unknown_ts"
+            path = out_dir / f"infeasible_debug_{tag}.npz"
+            np.savez_compressed(
+                path,
+                c=c,
+                a_ub=(a_ub if a_ub is not None else np.empty((0, len(c)))),
+                b_ub=(b_ub if b_ub is not None else np.empty((0,))),
+                a_eq=(a_eq if a_eq is not None else np.empty((0, len(c)))),
+                b_eq=(b_eq if b_eq is not None else np.empty((0,))),
+                lb=lb,
+                ub=ub,
+                message=np.array([str(message)]),
+            )
+            print(f"[DIAG] wrote infeasible debug dump: {path}")
+        except Exception as exc:
+            print(f"[WARN] failed to write infeasible debug dump: {exc}")
 
     @staticmethod
     def _quantile_map_from_row(row: pd.Series) -> dict[float, float]:
@@ -455,6 +557,7 @@ class BatteryBacktester:
         fixed_reserve_obligation: dict[pd.Timestamp, tuple[float, float]] | None = None,
         deterministic_reserve_settlement: bool = False,
         allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
+        strict_input_validation: bool = False,
     ) -> pd.DataFrame:
         """Solve LP on predicted market signals to obtain hourly dispatch.
 
@@ -471,7 +574,7 @@ class BatteryBacktester:
         if n_bins <= 0:
             raise ValueError("afrr_quantile_bins must contain at least one bid bin.")
         sl = self._variable_slices(n, n_bins=n_bins)
-        n_vars = int(sl["slack_final_soc"].stop)
+        n_vars = int(sl["slack_obligation_neg"].stop)
         if sl["ch"].start != 0 or sl["slack_neg"].stop <= 0:
             raise ValueError("Invalid variable slice definition for MILP.")
         allowed = {str(m).strip().lower() for m in allowed_markets}
@@ -483,18 +586,24 @@ class BatteryBacktester:
             colmap.pred_da_price,
             fallback_cols=[],
             default=0.0,
+            allow_temporal_fill=not strict_input_validation,
+            strict_non_null=strict_input_validation,
         ).to_numpy(dtype=float)
         p_cap_pos = self._finite_numeric_series(
             df,
             colmap.pred_afrr_capacity_price_pos,
             fallback_cols=[colmap.pred_afrr_capacity_price_neg],
             default=0.0,
+            allow_temporal_fill=not strict_input_validation,
+            strict_non_null=strict_input_validation,
         ).to_numpy(dtype=float)
         p_cap_neg = self._finite_numeric_series(
             df,
             colmap.pred_afrr_capacity_price_neg,
             fallback_cols=[colmap.pred_afrr_capacity_price_pos],
             default=0.0,
+            allow_temporal_fill=not strict_input_validation,
+            strict_non_null=strict_input_validation,
         ).to_numpy(dtype=float)
         # Fallback acceptance-rate priors (used when no quantile-derived p_acc bins are available).
         r_act_pos_base = self._clip_rate(
@@ -503,6 +612,8 @@ class BatteryBacktester:
                 colmap.pred_afrr_activation_rate_pos,
                 fallback_cols=[colmap.pred_afrr_activation_rate_neg],
                 default=0.0,
+                allow_temporal_fill=not strict_input_validation,
+                strict_non_null=strict_input_validation,
             ).to_numpy(dtype=float)
         )
         r_act_neg_base = self._clip_rate(
@@ -511,6 +622,8 @@ class BatteryBacktester:
                 colmap.pred_afrr_activation_rate_neg,
                 fallback_cols=[colmap.pred_afrr_activation_rate_pos],
                 default=0.0,
+                allow_temporal_fill=not strict_input_validation,
+                strict_non_null=strict_input_validation,
             ).to_numpy(dtype=float)
         )
         # p90 activation-rate chance-constraint rates (fallback to point rates).
@@ -524,6 +637,8 @@ class BatteryBacktester:
                     colmap.pred_afrr_activation_rate_neg,
                 ],
                 default=0.0,
+                allow_temporal_fill=not strict_input_validation,
+                strict_non_null=strict_input_validation,
             ).to_numpy(dtype=float)
         )
         r_act_neg_p90 = self._clip_rate(
@@ -536,6 +651,8 @@ class BatteryBacktester:
                     colmap.pred_afrr_activation_rate_pos,
                 ],
                 default=0.0,
+                allow_temporal_fill=not strict_input_validation,
+                strict_non_null=strict_input_validation,
             ).to_numpy(dtype=float)
         )
         act_price_pos = self._finite_numeric_series(
@@ -543,13 +660,36 @@ class BatteryBacktester:
             colmap.pred_afrr_activation_price_pos,
             fallback_cols=[],
             default=0.0,
+            allow_temporal_fill=not strict_input_validation,
+            strict_non_null=strict_input_validation,
         ).to_numpy(dtype=float)
         act_price_neg = self._finite_numeric_series(
             df,
             colmap.pred_afrr_activation_price_neg,
             fallback_cols=[],
             default=0.0,
+            allow_temporal_fill=not strict_input_validation,
+            strict_non_null=strict_input_validation,
         ).to_numpy(dtype=float)
+
+        # Fail-fast critical-input validation before MILP formulation.
+        critical_inputs = {
+            "pred_da_price": p_da,
+            "pred_afrr_capacity_price_pos": p_cap_pos,
+            "pred_afrr_capacity_price_neg": p_cap_neg,
+            "pred_afrr_activation_price_pos": act_price_pos,
+            "pred_afrr_activation_price_neg": act_price_neg,
+            "pred_afrr_activation_rate_pos": r_act_pos_base,
+            "pred_afrr_activation_rate_neg": r_act_neg_base,
+            "pred_afrr_activation_rate_pos_p90": r_act_pos_p90,
+            "pred_afrr_activation_rate_neg_p90": r_act_neg_p90,
+        }
+        bad_inputs = [name for name, arr in critical_inputs.items() if not np.isfinite(arr).all()]
+        if strict_input_validation and bad_inputs:
+            raise ValueError(
+                "NaN/inf detected in critical optimizer inputs before MILP build. "
+                f"Fix data pipeline. bad_columns={bad_inputs}"
+            )
 
         # Dynamic quantile bidding:
         # - bin price = predicted capacity quantile value
@@ -562,6 +702,11 @@ class BatteryBacktester:
         cap_price_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         cap_price_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         fallback_decay = 0.7
+        pos_quant_cols = [f"{colmap.pred_afrr_capacity_price_pos}_{q}" for q in self.afrr_quantile_bins]
+        neg_quant_cols = [f"{colmap.pred_afrr_capacity_price_neg}_{q}" for q in self.afrr_quantile_bins]
+        pos_quant_struct_missing = any(c not in df.columns for c in pos_quant_cols)
+        neg_quant_struct_missing = any(c not in df.columns for c in neg_quant_cols)
+
         for b, qcol in enumerate(self.afrr_quantile_bins):
             q_level = float(qcol.replace("p", "")) / 100.0
             pacc_const = max(0.0, min(1.0, 1.0 - q_level))
@@ -594,24 +739,28 @@ class BatteryBacktester:
         pacc_pos_fallback_used = np.zeros(n, dtype=float)
         pacc_neg_fallback_used = np.zeros(n, dtype=float)
         for t in range(n):
-            have_pos = np.isfinite(cap_price_pos_by_bin[t, :]).any()
-            have_neg = np.isfinite(cap_price_neg_by_bin[t, :]).any()
-            if not have_pos:
+            have_pos = np.isfinite(cap_price_pos_by_bin[t, :]).all()
+            have_neg = np.isfinite(cap_price_neg_by_bin[t, :]).all()
+            if pos_quant_struct_missing:
                 pacc_pos_fallback_used[t] = 1.0
                 cap_price_pos_by_bin[t, :] = mid_pos[t]
                 for b in range(n_bins):
                     p_acc_cap_pos[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
-            else:
-                miss = ~np.isfinite(cap_price_pos_by_bin[t, :])
-                cap_price_pos_by_bin[t, miss] = mid_pos[t]
-            if not have_neg:
+            elif not have_pos:
+                raise ValueError(
+                    "NaN detected in aFRR positive quantile capacity prices although quantile columns "
+                    "exist. Fallback is only allowed for structurally missing quantile columns."
+                )
+            if neg_quant_struct_missing:
                 pacc_neg_fallback_used[t] = 1.0
                 cap_price_neg_by_bin[t, :] = mid_neg[t]
                 for b in range(n_bins):
                     p_acc_cap_neg[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
-            else:
-                miss = ~np.isfinite(cap_price_neg_by_bin[t, :])
-                cap_price_neg_by_bin[t, miss] = mid_neg[t]
+            elif not have_neg:
+                raise ValueError(
+                    "NaN detected in aFRR negative quantile capacity prices although quantile columns "
+                    "exist. Fallback is only allowed for structurally missing quantile columns."
+                )
 
         c = np.zeros(n_vars, dtype=float)
 
@@ -619,45 +768,97 @@ class BatteryBacktester:
         afrr_step = self.afrr_bid_granularity_mw
 
         # Objective (maximize predicted margin, scipy.milp minimizes => negate coefficients).
-        # Keep DA opportunity-cost structure intact.
-        ch_coef = -(p_da / self.eta_in) - self.trans_eur_mwh / self.eta_in - self.deg_eur_mwh
-        dis_coef = (p_da * self.eta_out) - self.trans_eur_mwh * self.eta_out - self.deg_eur_mwh
+        # Keep DA/aFRR coefficients as pure hourly marginal cashflows.
+        # Intertemporal energy value is represented via SoC state transition +
+        # terminal SoC credit (added separately below), not inside these marginals.
+        # DA auxiliary-energy cost per dispatched MW:
+        # Hours_trading_equiv = throughput_mwh / power_mw
+        # For 1 MW decision variable over dt_h: throughput_mwh = 1 * dt_h.
+        # => hours_equiv_per_mw = dt_h / P_max
+        # Energy_trading_per_mw = hours_equiv_per_mw * aux_peak_mw * duty_trading
+        # Cost_per_mw = Energy_trading_per_mw * DA_price
+        da_hours_trading_equiv_per_mw = self.dt_h / max(self.p_max_mw, 1e-12)
+        da_aux_energy_trading_per_mw_mwh = da_hours_trading_equiv_per_mw * self.aux_trading_mw
+        da_aux_eur_per_mw = da_aux_energy_trading_per_mw_mwh * p_da
+        # Financial DA cashflows are settled on grid-side volumes.
+        # Efficiency is therefore not applied to DA price/transaction terms here;
+        # it enters through SoC physics and internal-throughput degradation conversion.
+        ch_coef = (
+            -p_da
+            - self.trans_eur_mwh
+            - (self.deg_eur_mwh * self.eta_in)
+            - da_aux_eur_per_mw
+        )
+        dis_coef = (
+            p_da
+            - self.trans_eur_mwh
+            - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
+            - da_aux_eur_per_mw
+        )
         c[sl["ch"]] = -(ch_coef * da_step)
         c[sl["dis"]] = -(dis_coef * da_step)
         rpos_coef_by_bin = np.zeros((n, n_bins), dtype=float)
         rneg_coef_by_bin = np.zeros((n, n_bins), dtype=float)
         for b in range(n_bins):
-            # Expected activated-share (conditional on both capacity clearing and
-            # activation-rate forecast).
+            # Correct EV split:
+            # 1) offer-side fixed availability cost (no p_acc multiplier)
+            # 2) activation/throughput terms scaled by expected activated share
+            #    exp_act = p_acc * expected_activation_rate
             exp_act_pos = p_acc_cap_pos[:, b] * r_act_pos_base
             exp_act_neg = p_acc_cap_neg[:, b] * r_act_neg_base
-            if deterministic_reserve_settlement:
-                # Deterministic oracle EV equals settlement EV under perfect foresight.
-                rpos_coef = (
-                    p_acc_cap_pos[:, b] * cap_price_pos_by_bin[:, b]
-                    + exp_act_pos * act_price_pos * self.eta_out
-                    - self.trans_eur_mwh * exp_act_pos * self.eta_out
-                    - self.deg_eur_mwh * exp_act_pos
+            offer_cost = self.afrr_offer_cost_eur_mw_h * self.dt_h
+            # Expected aFRR auxiliary energy over reserve product window:
+            # hours_afrr_active = window_h * p_acc * activation_rate
+            # hours_afrr_standby = window_h * (p_acc - p_acc*activation_rate)
+            # reserve-MW scaling enters via per-MW equivalent hours:
+            # hours_equiv_per_mw = window_h / P_max
+            window_h = float(self.reserve_product_duration_h)
+            afrr_hours_equiv_per_mw = window_h / max(self.p_max_mw, 1e-12)
+            standby_pos = np.maximum(0.0, p_acc_cap_pos[:, b] - exp_act_pos)
+            standby_neg = np.maximum(0.0, p_acc_cap_neg[:, b] - exp_act_neg)
+            afrr_aux_cost_pos = (
+                afrr_hours_equiv_per_mw
+                * (
+                    exp_act_pos * self.aux_afrr_active_mw
+                    + standby_pos * self.aux_standby_mw
                 )
-                rneg_coef = (
-                    p_acc_cap_neg[:, b] * cap_price_neg_by_bin[:, b]
-                    + exp_act_neg * act_price_neg / self.eta_in
-                    - self.trans_eur_mwh * exp_act_neg / self.eta_in
-                    - self.deg_eur_mwh * exp_act_neg
+                * p_da
+            )
+            afrr_aux_cost_neg = (
+                afrr_hours_equiv_per_mw
+                * (
+                    exp_act_neg * self.aux_afrr_active_mw
+                    + standby_neg * self.aux_standby_mw
                 )
-            else:
-                rpos_coef = (
-                    p_acc_cap_pos[:, b] * cap_price_pos_by_bin[:, b]
-                    + exp_act_pos * act_price_pos * self.eta_out
-                    - self.trans_eur_mwh * exp_act_pos * self.eta_out
-                    - self.deg_eur_mwh * exp_act_pos
+                * p_da
+            )
+            # aFRR EV terms:
+            # - capacity remuneration is expected via p_acc
+            # - activation remuneration/cost is expected via p_acc * act_rate
+            # - market price terms remain grid-side (no eta scaling)
+            # - degradation is internal-throughput based (eta conversion kept)
+            rpos_coef = (
+                p_acc_cap_pos[:, b] * cap_price_pos_by_bin[:, b]
+                - offer_cost
+                + exp_act_pos
+                * (
+                    act_price_pos
+                    - self.trans_eur_mwh
+                    - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
                 )
-                rneg_coef = (
-                    p_acc_cap_neg[:, b] * cap_price_neg_by_bin[:, b]
-                    + exp_act_neg * act_price_neg / self.eta_in
-                    - self.trans_eur_mwh * exp_act_neg / self.eta_in
-                    - self.deg_eur_mwh * exp_act_neg
+                - afrr_aux_cost_pos
+            )
+            rneg_coef = (
+                p_acc_cap_neg[:, b] * cap_price_neg_by_bin[:, b]
+                - offer_cost
+                + exp_act_neg
+                * (
+                    act_price_neg
+                    - self.trans_eur_mwh
+                    - (self.deg_eur_mwh * self.eta_in)
                 )
+                - afrr_aux_cost_neg
+            )
             s_pos = sl["rpos_bin"].start + b * n
             s_neg = sl["rneg_bin"].start + b * n
             rpos_coef_by_bin[:, b] = rpos_coef
@@ -683,13 +884,28 @@ class BatteryBacktester:
         c[sl["slack_pos"]] = strict_slack_lambda
         c[sl["slack_neg"]] = strict_slack_lambda
         c[sl["slack_final_soc"]] = max(0.0, float(self.final_soc_shortfall_penalty_eur_per_mwh))
+        # Emergency physical SoC slacks: make violations possible but extremely expensive.
+        emergency_soc_slack_lambda = max(
+            10_000.0,
+            float(self.final_soc_shortfall_penalty_eur_per_mwh),
+            strict_slack_lambda * 10.0,
+        )
+        c[sl["slack_soc_min"]] = emergency_soc_slack_lambda
+        c[sl["slack_soc_max"]] = emergency_soc_slack_lambda
+        # Structural-infeasibility guards:
+        # - deliverability slacks soften 4h reserve-energy/headroom hard bounds
+        # - obligation slacks soften lockbook reserve obligations
+        penalty_deliverability = max(5_000.0, strict_slack_lambda)
+        penalty_obligation = max(10_000.0, strict_slack_lambda * 2.0)
+        c[sl["slack_deliver_pos"]] = penalty_deliverability
+        c[sl["slack_deliver_neg"]] = penalty_deliverability
+        c[sl["slack_obligation_pos"]] = penalty_obligation
+        c[sl["slack_obligation_neg"]] = penalty_obligation
         # Terminal SoC opportunity value (anti end-of-horizon dumping):
-        # Reward terminal inventory using a trailing DA reference with non-negative
-        # floor and export efficiency scaling to approximate realizable grid value.
+        # Reward terminal inventory with a forward-looking DA proxy from the
+        # current horizon (mean predicted DA price), scaled by export efficiency.
         # scipy.milp minimizes, so we add a negative coefficient on terminal SoC.
-        tail_k = max(1, min(6, n))
-        da_tail = pd.Series(p_da[-tail_k:], dtype="float64").dropna()
-        da_ref = da_tail if not da_tail.empty else pd.Series(p_da, dtype="float64").dropna()
+        da_ref = pd.Series(p_da, dtype="float64").dropna()
         ref_da_price = max(0.0, float(da_ref.mean()) if not da_ref.empty else 0.0)
         terminal_soc_discount = float(MODEL_SPECS.get("terminal_soc_value_discount", 0.8))
         terminal_soc_discount = max(0.0, min(1.0, terminal_soc_discount))
@@ -712,6 +928,7 @@ class BatteryBacktester:
             row[sl["soc"].start + t] = -1.0
             row[sl["ch"].start + t] = -self.eta_in * da_step
             row[sl["dis"].start + t] = (1.0 / self.eta_out) * da_step
+            row[sl["u"].start + t] = self.dt_h
             for b in range(n_bins):
                 # Base SoC drift on expected awarded-and-activated reserve.
                 exp_pos = p_acc_cap_pos[t, b] * r_act_pos_base[t]
@@ -719,7 +936,7 @@ class BatteryBacktester:
                 row[sl["rpos_bin"].start + b * n + t] = (exp_pos / self.eta_out) * afrr_step
                 row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * exp_neg * afrr_step
             a_eq.append(row)
-            b_eq.append(-self.aux_mwh)
+            b_eq.append(0.0)
 
         # Initial and terminal SoC.
         row_init = np.zeros(n_vars, dtype=float)
@@ -727,11 +944,14 @@ class BatteryBacktester:
         a_eq.append(row_init)
         b_eq.append(self.soc_init if soc_start is None else soc_start)
 
+        # Do not enforce hard terminal SoC equality; route any caller-provided
+        # terminal target into the soft minimum target to preserve feasibility.
         if soc_end_target is not None:
-            row_end = np.zeros(n_vars, dtype=float)
-            row_end[sl["soc"].start + n] = 1.0
-            a_eq.append(row_end)
-            b_eq.append(soc_end_target)
+            soc_end_min_target = (
+                float(soc_end_target)
+                if soc_end_min_target is None
+                else max(float(soc_end_min_target), float(soc_end_target))
+            )
 
         a_ub = []
         b_ub = []
@@ -762,6 +982,38 @@ class BatteryBacktester:
                 row[sl["rneg_bin"].start + b * n + t] = afrr_step
             a_ub.append(row)
             b_ub.append(self.reserve_max_mw)
+
+            # Aux lower-bound proxies by operating regime (LP-friendly, no binaries):
+            # u_t >= standby when reserve is committed (scaled by committed reserve fraction)
+            # u_t >= trading when DA dispatch is active (scaled by power fraction)
+            # u_t >= aFRR-active when expected activated reserve is high (scaled)
+            if self.aux_mode == "state_dependent":
+                reserve_scale = max(self.reserve_max_mw, 1e-9)
+                power_scale = max(self.p_max_mw, 1e-9)
+                row = np.zeros(n_vars, dtype=float)
+                row[sl["u"].start + t] = -1.0
+                for b in range(n_bins):
+                    row[sl["rpos_bin"].start + b * n + t] = (self.aux_standby_mw / reserve_scale) * afrr_step
+                    row[sl["rneg_bin"].start + b * n + t] = (self.aux_standby_mw / reserve_scale) * afrr_step
+                a_ub.append(row)
+                b_ub.append(0.0)
+
+                row = np.zeros(n_vars, dtype=float)
+                row[sl["u"].start + t] = -1.0
+                row[sl["ch"].start + t] = (self.aux_trading_mw / power_scale) * da_step
+                row[sl["dis"].start + t] = (self.aux_trading_mw / power_scale) * da_step
+                a_ub.append(row)
+                b_ub.append(0.0)
+
+                row = np.zeros(n_vars, dtype=float)
+                row[sl["u"].start + t] = -1.0
+                for b in range(n_bins):
+                    exp_pos = p_acc_cap_pos[t, b] * r_act_pos_base[t]
+                    exp_neg = p_acc_cap_neg[t, b] * r_act_neg_base[t]
+                    row[sl["rpos_bin"].start + b * n + t] = (self.aux_afrr_active_mw / power_scale) * exp_pos * afrr_step
+                    row[sl["rneg_bin"].start + b * n + t] = (self.aux_afrr_active_mw / power_scale) * exp_neg * afrr_step
+                a_ub.append(row)
+                b_ub.append(0.0)
 
             # p90 chance-constraint safety bounds:
             # enforce sufficient SoC footroom/headroom for p90 activation-rate
@@ -800,6 +1052,7 @@ class BatteryBacktester:
                 row[sl["rpos_bin"].start + b * n + t] = (
                     self.reserve_product_duration_h / max(self.eta_out, 1e-12)
                 ) * afrr_step
+            row[sl["slack_deliver_pos"].start + t] = -1.0
             a_ub.append(row)
             b_ub.append(-self.soc_min)
 
@@ -810,6 +1063,7 @@ class BatteryBacktester:
                 row[sl["rneg_bin"].start + b * n + t] = (
                     self.reserve_product_duration_h * self.eta_in
                 ) * afrr_step
+            row[sl["slack_deliver_neg"].start + t] = -1.0
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
@@ -846,17 +1100,40 @@ class BatteryBacktester:
                         max(0.0, float(ob_neg)),
                         self.afrr_bid_granularity_mw,
                     )
+                    # Soften lockbook obligations:
+                    # sum(reserve_pos_bins) + slack_obligation_pos >= obligated_pos
+                    # sum(reserve_neg_bins) + slack_obligation_neg >= obligated_neg
+                    # Convert to <= form:
+                    # -sum(reserve_*) - slack_obligation_* <= -obligated_*
                     row = np.zeros(n_vars, dtype=float)
                     for b in range(n_bins):
-                        row[sl["rpos_bin"].start + b * n + t] = afrr_step
-                    a_eq.append(row)
-                    b_eq.append(float(ob_pos_q))
+                        row[sl["rpos_bin"].start + b * n + t] = -afrr_step
+                    row[sl["slack_obligation_pos"].start + t] = -1.0
+                    a_ub.append(row)
+                    b_ub.append(-float(ob_pos_q))
 
                     row = np.zeros(n_vars, dtype=float)
                     for b in range(n_bins):
-                        row[sl["rneg_bin"].start + b * n + t] = afrr_step
-                    a_eq.append(row)
-                    b_eq.append(float(ob_neg_q))
+                        row[sl["rneg_bin"].start + b * n + t] = -afrr_step
+                    row[sl["slack_obligation_neg"].start + t] = -1.0
+                    a_ub.append(row)
+                    b_ub.append(-float(ob_neg_q))
+
+        # Soft physical SoC bounds (including terminal state):
+        # soc_t + slack_soc_min_t >= soc_min
+        # soc_t - slack_soc_max_t <= soc_max
+        for t in range(n + 1):
+            row = np.zeros(n_vars, dtype=float)
+            row[sl["soc"].start + t] = -1.0
+            row[sl["slack_soc_min"].start + t] = -1.0
+            a_ub.append(row)
+            b_ub.append(-self.soc_min)
+
+            row = np.zeros(n_vars, dtype=float)
+            row[sl["soc"].start + t] = 1.0
+            row[sl["slack_soc_max"].start + t] = -1.0
+            a_ub.append(row)
+            b_ub.append(self.soc_max)
 
         # Soft final SoC floor (replacement for hard constraint SoC_T >= target):
         # soc_T + slack_final_soc >= soc_end_min_target, slack_final_soc >= 0
@@ -878,14 +1155,28 @@ class BatteryBacktester:
         ub[sl["dis"]] = da_units_max
         ub[sl["rpos_bin"]] = afrr_units_max
         ub[sl["rneg_bin"]] = afrr_units_max
-        ub[sl["u"]] = 1.0
+        if self.aux_mode == "state_dependent":
+            lb[sl["u"]] = max(0.0, self.aux_off_mw)
+            ub[sl["u"]] = self.aux_peak_mw
+        else:
+            aux_const_mw = float(BATTERY_SPECS.get("aux_power_mw", 0.0))
+            lb[sl["u"]] = aux_const_mw
+            ub[sl["u"]] = aux_const_mw
 
         # State and slack blocks.
-        lb[sl["soc"]] = self.soc_min
-        ub[sl["soc"]] = self.soc_max
+        # Keep SoC unbounded in LP variable bounds; enforce soft physical limits via
+        # emergency slacks in explicit constraints below.
+        lb[sl["soc"]] = -np.inf
+        ub[sl["soc"]] = np.inf
         lb[sl["slack_pos"]] = 0.0
         lb[sl["slack_neg"]] = 0.0
         lb[sl["slack_final_soc"]] = 0.0
+        lb[sl["slack_soc_min"]] = 0.0
+        lb[sl["slack_soc_max"]] = 0.0
+        lb[sl["slack_deliver_pos"]] = 0.0
+        lb[sl["slack_deliver_neg"]] = 0.0
+        lb[sl["slack_obligation_pos"]] = 0.0
+        lb[sl["slack_obligation_neg"]] = 0.0
 
         # Defensive check: prevent MILP vector-shape mismatches.
         if not (len(c) == len(lb) == len(ub) == n_vars):
@@ -921,6 +1212,20 @@ class BatteryBacktester:
         # Graceful timeout handling: continue with best incumbent feasible solution.
         timeout_with_incumbent = self._is_timeout_result(sol) and (sol.x is not None)
         if (not sol.success) and (not timeout_with_incumbent):
+            msg = str(getattr(sol, "message", ""))
+            if "infeasible" in msg.lower():
+                self._write_infeasible_debug_dump(
+                    df=df,
+                    colmap=colmap,
+                    c=c,
+                    a_ub=(a_ub_arr if a_ub else None),
+                    b_ub=(np.array(b_ub) if a_ub else None),
+                    a_eq=(a_eq_arr if a_eq else None),
+                    b_eq=(b_eq_arr if a_eq else None),
+                    lb=lb,
+                    ub=ub,
+                    message=msg,
+                )
             raise RuntimeError(f"MIP optimization failed: {sol.message}")
         if sol.x is None or len(sol.x) != n_vars:
             raise RuntimeError(
@@ -943,6 +1248,7 @@ class BatteryBacktester:
         out["discharge_mw"] = x[sl["dis"]] * da_step
         out["reserve_pos_mw"] = rpos_bin.sum(axis=1) * afrr_step
         out["reserve_neg_mw"] = rneg_bin.sum(axis=1) * afrr_step
+        out["aux_power_mw"] = x[sl["u"]]
         reserve_pos_bin_mw = rpos_bin * afrr_step
         reserve_neg_bin_mw = rneg_bin * afrr_step
         charge_mw = out["charge_mw"].to_numpy(dtype=float)
@@ -951,6 +1257,8 @@ class BatteryBacktester:
         final_soc_shortfall_mwh = float(x[sl["slack_final_soc"].start]) if "slack_final_soc" in sl else 0.0
         slack_pos = x[sl["slack_pos"]]
         slack_neg = x[sl["slack_neg"]]
+        slack_soc_min = x[sl["slack_soc_min"]]
+        slack_soc_max = x[sl["slack_soc_max"]]
         ev_da_charge_eur = ch_coef * charge_mw
         ev_da_discharge_eur = dis_coef * discharge_mw
         ev_afrr_pos_eur = (rpos_coef_by_bin * reserve_pos_bin_mw).sum(axis=1)
@@ -974,6 +1282,8 @@ class BatteryBacktester:
             "soc_lp_mwh": soc_lp,
             "slack_pos_mw": slack_pos,
             "slack_neg_mw": slack_neg,
+            "slack_soc_min_mwh": slack_soc_min[1:],
+            "slack_soc_max_mwh": slack_soc_max[1:],
             "ev_pred_da_price_eur_mwh": p_da,
             "ev_pred_cap_pos_eur_mw": p_cap_pos,
             "ev_pred_cap_neg_eur_mw": p_cap_neg,
@@ -1056,7 +1366,6 @@ class BatteryBacktester:
         idaep_neg_eur_mwh: float | None = None,
         aufschlag_eur_mwh: float | None = None,
         aufschlag_eur_mw_h: float | None = None,
-        repeated_violation_flag: bool = False,
     ) -> tuple[float, dict[str, float]]:
         """
         3-Layer ID Rescue settlement:
@@ -1091,9 +1400,20 @@ class BatteryBacktester:
 
         in_internal = da_ch_internal + id_ch_internal + act_neg_internal
         out_internal = da_dis_internal + id_dis_internal + act_pos_internal
+        aux_power_mw, aux_state = self._state_aux_power_mw(
+            charge_mw=da_charge,
+            discharge_mw=da_discharge,
+            reserve_pos_mw=reserve_pos,
+            reserve_neg_mw=reserve_neg,
+            act_pos_rate=act_pos_rate,
+            act_neg_rate=act_neg_rate,
+            id_charge_mw=id_charge,
+            id_discharge_mw=id_discharge,
+        )
+        aux_mwh = aux_power_mw * self.dt_h
 
         # Keep SoC feasible by scaling in/out streams if needed.
-        delta = self.eta_in * in_internal - out_internal / self.eta_out - self.aux_mwh
+        delta = self.eta_in * in_internal - out_internal / self.eta_out - aux_mwh
         min_delta = self.soc_min - soc
         max_delta = self.soc_max - soc
 
@@ -1104,7 +1424,7 @@ class BatteryBacktester:
             da_dis_internal *= scale
             id_dis_internal *= scale
             act_pos_internal *= scale
-            delta = self.eta_in * in_internal - out_internal / self.eta_out - self.aux_mwh
+            delta = self.eta_in * in_internal - out_internal / self.eta_out - aux_mwh
         if delta > max_delta and in_internal > 0:
             excess = delta - max_delta
             scale = max(0.0, 1.0 - excess / max(self.eta_in * in_internal, 1e-12))
@@ -1112,7 +1432,7 @@ class BatteryBacktester:
             da_ch_internal *= scale
             id_ch_internal *= scale
             act_neg_internal *= scale
-            delta = self.eta_in * in_internal - out_internal / self.eta_out - self.aux_mwh
+            delta = self.eta_in * in_internal - out_internal / self.eta_out - aux_mwh
 
         soc_next = float(np.clip(soc + delta, self.soc_min, self.soc_max))
 
@@ -1166,9 +1486,11 @@ class BatteryBacktester:
         # awarded_MW * submitted_capacity_bid_price * dt_h.
         cap_pos_settlement = float(cap_pos if cap_bid_pos is None else cap_bid_pos)
         cap_neg_settlement = float(cap_neg if cap_bid_neg is None else cap_bid_neg)
+        # Capacity remuneration is paid for awarded capacity (market award),
+        # not for physically activated energy. Non-delivery is handled via penalties.
         rev_cap = (
-            delivered_capacity_pos_mw * cap_pos_settlement * self.dt_h
-            + delivered_capacity_neg_mw * cap_neg_settlement * self.dt_h
+            reserve_pos * cap_pos_settlement * self.dt_h
+            + reserve_neg * cap_neg_settlement * self.dt_h
         )
 
         # Activation revenue is paid on delivered activation energy. We still avoid
@@ -1195,7 +1517,7 @@ class BatteryBacktester:
 
         # aFRR-Penalty gemäß regelleistung.net:
         # Nichtlieferung -> P_unavailable * max(P_product_slice, IDAEP + Aufschlag)
-        # Wiederholung -> zusätzliche/verstärkte Kapazitätsstrafe.
+        # Kapazitätsstrafe wird bei Nichtlieferung direkt angewendet.
         # Quelle: https://www.regelleistung.net/de-de/Anbieter-werden/Abrechnung/automatic-Frequency-Restoration-Reserve
         missed_activation_pos_mwh = max(0.0, act_pos_grid_req - act_pos_grid)
         missed_activation_neg_mwh = max(0.0, act_neg_grid_req - act_neg_grid)
@@ -1242,20 +1564,11 @@ class BatteryBacktester:
         penalty_activation_neg_eur = missed_activation_neg_mwh * penalty_activation_basis_neg_eur_mwh
         penalty_activation_eur = penalty_activation_pos_eur + penalty_activation_neg_eur
 
-        apply_capacity_penalty = bool(repeated_violation_flag)
-        if self.afrr_capacity_penalty_only_on_repeated_violation:
-            apply_capacity_penalty = bool(repeated_violation_flag)
-        if apply_capacity_penalty:
-            # As requested: hourly proxy in EUR/MW/h using IDAEP/1000 + markup.
-            penalty_capacity_basis_pos_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_pos)) / 1000.0 + auf_mw_h)
-            penalty_capacity_basis_neg_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_neg)) / 1000.0 + auf_mw_h)
-            penalty_capacity_pos_eur = missed_capacity_pos_mw * penalty_capacity_basis_pos_eur_mw_h * self.dt_h
-            penalty_capacity_neg_eur = missed_capacity_neg_mw * penalty_capacity_basis_neg_eur_mw_h * self.dt_h
-        else:
-            penalty_capacity_basis_pos_eur_mw_h = 0.0
-            penalty_capacity_basis_neg_eur_mw_h = 0.0
-            penalty_capacity_pos_eur = 0.0
-            penalty_capacity_neg_eur = 0.0
+        # As requested: hourly proxy in EUR/MW/h using IDAEP/1000 + markup.
+        penalty_capacity_basis_pos_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_pos)) / 1000.0 + auf_mw_h)
+        penalty_capacity_basis_neg_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_neg)) / 1000.0 + auf_mw_h)
+        penalty_capacity_pos_eur = missed_capacity_pos_mw * penalty_capacity_basis_pos_eur_mw_h * self.dt_h
+        penalty_capacity_neg_eur = missed_capacity_neg_mw * penalty_capacity_basis_neg_eur_mw_h * self.dt_h
         penalty_capacity_eur = penalty_capacity_pos_eur + penalty_capacity_neg_eur
         penalty_eur = penalty_activation_eur + penalty_capacity_eur
 
@@ -1291,6 +1604,9 @@ class BatteryBacktester:
             "revenue_id_eur": revenue_id_eur,
             "cost_id_eur": cost_id_eur,
             "id_slippage_cost_eur": id_slippage_cost_eur,
+            "aux_power_mw": aux_power_mw,
+            "aux_energy_mwh": aux_mwh,
+            "aux_state": aux_state,
             "soc_for_capacity_mwh": soc_for_capacity,
             "penalty_activation_pos_eur": penalty_activation_pos_eur,
             "penalty_activation_neg_eur": penalty_activation_neg_eur,
@@ -1302,7 +1618,6 @@ class BatteryBacktester:
             "penalty_capacity_eur": penalty_capacity_eur,
             "penalty_capacity_basis_pos_eur_mw_h": penalty_capacity_basis_pos_eur_mw_h,
             "penalty_capacity_basis_neg_eur_mw_h": penalty_capacity_basis_neg_eur_mw_h,
-            "repeated_violation_flag": float(bool(repeated_violation_flag)),
             "penalty_eur": penalty_eur,
             "net_cashflow_eur": net_cashflow_eur,
             "pnl_eur": pnl,
@@ -1345,6 +1660,10 @@ class BatteryBacktester:
         planned_reserve_pos_mw: float,
         planned_reserve_neg_mw: float,
         pred_da_price: float,
+        pred_da_price_p05: float | None = None,
+        pred_da_price_p10: float | None = None,
+        pred_da_price_p90: float | None = None,
+        pred_da_price_p95: float | None = None,
         true_da_price: float,
         pred_cap_pos: float,
         true_cap_pos: float,
@@ -1369,7 +1688,11 @@ class BatteryBacktester:
         obligation_neg_mw: float = 0.0,
         obligation_energy_pos: float | None = None,
         obligation_energy_neg: float | None = None,
-    ) -> dict[str, float]:
+        planned_reserve_pos_bins_mw: list[float] | None = None,
+        planned_reserve_neg_bins_mw: list[float] | None = None,
+        pred_cap_pos_bins_eur_mw: list[float] | None = None,
+        pred_cap_neg_bins_eur_mw: list[float] | None = None,
+    ) -> dict[str, float | str]:
         """Sequential market clearing: aFRR capacity -> DA -> aFRR activation."""
         ch_plan, dis_plan = self._normalize_da_bid(planned_charge_mw, planned_discharge_mw)
         res_pos_plan = max(0.0, float(planned_reserve_pos_mw))
@@ -1381,6 +1704,32 @@ class BatteryBacktester:
         ob_pos = max(0.0, float(obligation_pos_mw))
         ob_neg = max(0.0, float(obligation_neg_mw))
         soc_ref = float(self.soc_init if soc_now is None else soc_now)
+        n_bins = int(len(self.afrr_quantile_bins))
+
+        def _qlevel(q: str) -> float:
+            try:
+                return float(q.replace("p", "")) / 100.0
+            except Exception:
+                return float("nan")
+
+        # Per-bin transparency payload (filled later with submitted/awarded/activated values).
+        bin_payload: dict[str, float | str] = {}
+        for b, q in enumerate(self.afrr_quantile_bins):
+            q_level = _qlevel(str(q))
+            bin_payload[f"afrr_bin_{b}_quantile"] = str(q)
+            bin_payload[f"afrr_bin_{b}_quantile_level"] = float(q_level)
+            bin_payload[f"submitted_afrr_pos_bin_{b}_mw"] = 0.0
+            bin_payload[f"submitted_afrr_neg_bin_{b}_mw"] = 0.0
+            bin_payload[f"submitted_afrr_pos_bin_{b}_price_eur_mw"] = 0.0
+            bin_payload[f"submitted_afrr_neg_bin_{b}_price_eur_mw"] = 0.0
+            bin_payload[f"executed_afrr_cap_pos_bin_{b}_mw"] = 0.0
+            bin_payload[f"executed_afrr_cap_neg_bin_{b}_mw"] = 0.0
+            bin_payload[f"executed_afrr_cap_pos_bin_{b}_price_eur_mw"] = 0.0
+            bin_payload[f"executed_afrr_cap_neg_bin_{b}_price_eur_mw"] = 0.0
+            bin_payload[f"executed_afrr_act_pos_bin_{b}_mw"] = 0.0
+            bin_payload[f"executed_afrr_act_neg_bin_{b}_mw"] = 0.0
+            bin_payload[f"executed_afrr_act_pos_bin_{b}_price_eur_mwh"] = 0.0
+            bin_payload[f"executed_afrr_act_neg_bin_{b}_price_eur_mwh"] = 0.0
         if ob_pos > 0.0 or ob_neg > 0.0:
             # Capacity already auctioned at D-1 09:00 CET: use mandatory obligation.
             cap_bids = []
@@ -1445,16 +1794,65 @@ class BatteryBacktester:
                 neg_awarded=ob_neg > 0.0,
             )
         else:
-            cap_bids = self.bid_builder.build_afrr_capacity_bids(
-                ts=ts,
-                reserve_pos_mw=res_pos_plan,
-                reserve_neg_mw=res_neg_plan,
-                pred_cap_pos=float(pred_cap_pos),
-                pred_cap_neg=float(pred_cap_neg),
-                pred_act_pos=float(pred_act_pos),
-                pred_act_neg=float(pred_act_neg),
-                is_oracle=is_oracle,
+            # Build per-bin bids when bin-level plan/prices are available.
+            cap_bids: list[AFRRCapacityBid] = []
+            has_bin_plan = (
+                isinstance(planned_reserve_pos_bins_mw, list)
+                and isinstance(planned_reserve_neg_bins_mw, list)
+                and len(planned_reserve_pos_bins_mw) == n_bins
+                and len(planned_reserve_neg_bins_mw) == n_bins
             )
+            has_bin_prices = (
+                isinstance(pred_cap_pos_bins_eur_mw, list)
+                and isinstance(pred_cap_neg_bins_eur_mw, list)
+                and len(pred_cap_pos_bins_eur_mw) == n_bins
+                and len(pred_cap_neg_bins_eur_mw) == n_bins
+            )
+            if has_bin_plan and has_bin_prices:
+                for b in range(n_bins):
+                    q_pos = self.bid_builder._qfloor(float(planned_reserve_pos_bins_mw[b]), self.afrr_step_mw)
+                    q_neg = self.bid_builder._qfloor(float(planned_reserve_neg_bins_mw[b]), self.afrr_step_mw)
+                    if 0.0 < q_pos < self.afrr_min_bid_size_mw:
+                        q_pos = 0.0
+                    if 0.0 < q_neg < self.afrr_min_bid_size_mw:
+                        q_neg = 0.0
+                    p_pos = float(pred_cap_pos_bins_eur_mw[b])
+                    p_neg = float(pred_cap_neg_bins_eur_mw[b])
+                    bin_payload[f"submitted_afrr_pos_bin_{b}_mw"] = float(q_pos)
+                    bin_payload[f"submitted_afrr_neg_bin_{b}_mw"] = float(q_neg)
+                    bin_payload[f"submitted_afrr_pos_bin_{b}_price_eur_mw"] = float(p_pos if q_pos > 0.0 else 0.0)
+                    bin_payload[f"submitted_afrr_neg_bin_{b}_price_eur_mw"] = float(p_neg if q_neg > 0.0 else 0.0)
+                    if q_pos > 0.0:
+                        cap_bids.append(
+                            AFRRCapacityBid(
+                                ts=ts,
+                                side="pos",
+                                quantity_mw=float(q_pos),
+                                capacity_price_eur_mw=float(p_pos),
+                                energy_price_eur_mwh=float(pred_act_pos),
+                            )
+                        )
+                    if q_neg > 0.0:
+                        cap_bids.append(
+                            AFRRCapacityBid(
+                                ts=ts,
+                                side="neg",
+                                quantity_mw=float(q_neg),
+                                capacity_price_eur_mw=float(p_neg),
+                                energy_price_eur_mwh=float(pred_act_neg),
+                            )
+                        )
+            else:
+                cap_bids = self.bid_builder.build_afrr_capacity_bids(
+                    ts=ts,
+                    reserve_pos_mw=res_pos_plan,
+                    reserve_neg_mw=res_neg_plan,
+                    pred_cap_pos=float(pred_cap_pos),
+                    pred_cap_neg=float(pred_cap_neg),
+                    pred_act_pos=float(pred_act_pos),
+                    pred_act_neg=float(pred_act_neg),
+                    is_oracle=is_oracle,
+                )
             cap_res = self.market_clearing_engine.clear_afrr_capacity(
                 cap_bids,
                 true_cap_pos=float(true_cap_pos),
@@ -1491,6 +1889,10 @@ class BatteryBacktester:
             obligation_pos_mw=ob_pos if ob_pos > 0.0 else cap_res.awarded_pos_mw,
             obligation_neg_mw=ob_neg if ob_neg > 0.0 else cap_res.awarded_neg_mw,
             pred_da_price=float(pred_da_price),
+            pred_da_price_p05=float(pred_da_price_p05) if pred_da_price_p05 is not None and np.isfinite(pred_da_price_p05) else None,
+            pred_da_price_p10=float(pred_da_price_p10) if pred_da_price_p10 is not None and np.isfinite(pred_da_price_p10) else None,
+            pred_da_price_p90=float(pred_da_price_p90) if pred_da_price_p90 is not None and np.isfinite(pred_da_price_p90) else None,
+            pred_da_price_p95=float(pred_da_price_p95) if pred_da_price_p95 is not None and np.isfinite(pred_da_price_p95) else None,
             is_oracle=is_oracle,
         )
         if ob_pos > 0.0 or ob_neg > 0.0:
@@ -1507,6 +1909,10 @@ class BatteryBacktester:
             da_bids,
             true_da_price=float(true_da_price),
         )
+        submitted_da_buy_prices = [float(b.price_eur_mwh) for b in da_bids if b.side == "buy" and float(b.quantity_mw) > 0.0]
+        submitted_da_sell_prices = [float(b.price_eur_mwh) for b in da_bids if b.side == "sell" and float(b.quantity_mw) > 0.0]
+        submitted_da_buy_price = float(np.mean(submitted_da_buy_prices)) if submitted_da_buy_prices else float("nan")
+        submitted_da_sell_price = float(np.mean(submitted_da_sell_prices)) if submitted_da_sell_prices else float("nan")
         act_res = self.market_clearing_engine.clear_afrr_activation(
             cap_bids,
             cap_res,
@@ -1545,18 +1951,30 @@ class BatteryBacktester:
         dis_exec = float(da_res.executed_sell_mw)
         res_pos_exec = float(cap_res.awarded_pos_mw)
         res_neg_exec = float(cap_res.awarded_neg_mw)
-        cap_bid_pos_settlement = _weighted_awarded_bid_price(
-            side="pos",
-            awarded_mw=res_pos_exec,
-            true_cap_price=float(true_cap_pos),
-        )
-        cap_bid_neg_settlement = _weighted_awarded_bid_price(
-            side="neg",
-            awarded_mw=res_neg_exec,
-            true_cap_price=float(true_cap_neg),
-        )
+        # Capacity settlement for realized accounting:
+        # use awarded MW with realized clearing price on that side.
+        cap_bid_pos_settlement = float(true_cap_pos) if res_pos_exec > 1e-12 else 0.0
+        cap_bid_neg_settlement = float(true_cap_neg) if res_neg_exec > 1e-12 else 0.0
         rate_pos_exec = float(act_res.executed_rate_pos)
         rate_neg_exec = float(act_res.executed_rate_neg)
+        # Fill per-bin executed settlement transparency (capacity + activated energy).
+        for b in range(n_bins):
+            s_pos = float(bin_payload.get(f"submitted_afrr_pos_bin_{b}_mw", 0.0))
+            s_neg = float(bin_payload.get(f"submitted_afrr_neg_bin_{b}_mw", 0.0))
+            p_pos = float(bin_payload.get(f"submitted_afrr_pos_bin_{b}_price_eur_mw", 0.0))
+            p_neg = float(bin_payload.get(f"submitted_afrr_neg_bin_{b}_price_eur_mw", 0.0))
+            aw_pos = s_pos if (s_pos > 0.0 and p_pos <= float(true_cap_pos) + 1e-12) else 0.0
+            aw_neg = s_neg if (s_neg > 0.0 and p_neg <= float(true_cap_neg) + 1e-12) else 0.0
+            bin_payload[f"executed_afrr_cap_pos_bin_{b}_mw"] = float(aw_pos)
+            bin_payload[f"executed_afrr_cap_neg_bin_{b}_mw"] = float(aw_neg)
+            bin_payload[f"executed_afrr_cap_pos_bin_{b}_price_eur_mw"] = float(p_pos if aw_pos > 0.0 else 0.0)
+            bin_payload[f"executed_afrr_cap_neg_bin_{b}_price_eur_mw"] = float(p_neg if aw_neg > 0.0 else 0.0)
+            act_mw_pos = float(aw_pos * rate_pos_exec if act_res.pos_accepted else 0.0)
+            act_mw_neg = float(aw_neg * rate_neg_exec if act_res.neg_accepted else 0.0)
+            bin_payload[f"executed_afrr_act_pos_bin_{b}_mw"] = float(act_mw_pos)
+            bin_payload[f"executed_afrr_act_neg_bin_{b}_mw"] = float(act_mw_neg)
+            bin_payload[f"executed_afrr_act_pos_bin_{b}_price_eur_mwh"] = float(true_act_pos if act_mw_pos > 0.0 else 0.0)
+            bin_payload[f"executed_afrr_act_neg_bin_{b}_price_eur_mwh"] = float(true_act_neg if act_mw_neg > 0.0 else 0.0)
         da_buy_accepted = bool(da_res.buy_accepted)
         da_sell_accepted = bool(da_res.sell_accepted)
         cap_pos_awarded = bool(cap_res.pos_awarded)
@@ -1577,6 +1995,8 @@ class BatteryBacktester:
             "planned_reserve_neg_mw": res_neg_plan,
             "submitted_da_buy_mw": float(da_res.submitted_buy_mw),
             "submitted_da_sell_mw": float(da_res.submitted_sell_mw),
+            "submitted_da_buy_price_eur_mwh": submitted_da_buy_price,
+            "submitted_da_sell_price_eur_mwh": submitted_da_sell_price,
             "submitted_afrr_pos_mw": float(cap_res.submitted_pos_mw),
             "submitted_afrr_neg_mw": float(cap_res.submitted_neg_mw),
             "executed_charge_mw": ch_exec,
@@ -1601,6 +2021,7 @@ class BatteryBacktester:
             "aFRR_Energy_Price_EUR_MWh": mean_energy_price,
             "Obligation_Fulfilled": float((ob_pos <= cap_res.submitted_pos_mw + 1e-9) and (ob_neg <= cap_res.submitted_neg_mw + 1e-9)),
             "aFRR_Energy_Gate_Closure_Min": 25.0,
+            **bin_payload,
         }
 
     @staticmethod
@@ -2049,6 +2470,8 @@ class BatteryBacktester:
                         pred_col,
                         fallback_cols=[c for c in fallbacks if c in window.columns],
                         default=0.0,
+                        allow_temporal_fill=False,
+                        strict_non_null=True,
                     ).to_numpy(dtype=float)
 
                 # Ensure every p_acc bin has a robust fallback.
@@ -2093,6 +2516,8 @@ class BatteryBacktester:
                 """Populate fallback plans with EV columns to avoid NaN diagnostics."""
                 out = plan_df.copy()
                 scalar_zero_cols = [
+                    "aux_power_mw",
+                    "is_charging",
                     "predicted_objective_eur",
                     "ev_objective_rebuild_eur",
                     "ev_da_charge_coef_eur_per_mw",
@@ -2115,6 +2540,8 @@ class BatteryBacktester:
                     "ev_pred_act_rate_neg_p90",
                     "slack_pos_mw",
                     "slack_neg_mw",
+                    "slack_soc_min_mwh",
+                    "slack_soc_max_mwh",
                     "final_soc_shortfall_mwh",
                     "optimizer_required_input_imputed_count",
                     "optimizer_required_input_imputed_any",
@@ -2172,6 +2599,7 @@ class BatteryBacktester:
                     fixed_reserve_obligation=fixed_reserve_obligation,
                     deterministic_reserve_settlement=deterministic_reserve_settlement,
                     allowed_markets=allowed_markets,
+                    strict_input_validation=bool(forecast_warehouse is not None),
                 )
             except RuntimeError as exc:
                 msg = str(exc)
@@ -2416,6 +2844,10 @@ class BatteryBacktester:
                     planned_reserve_pos_mw=reserve_pos_plan,
                     planned_reserve_neg_mw=reserve_neg_plan,
                     pred_da_price=_sf(src, colmap.pred_da_price, 0.0),
+                    pred_da_price_p05=_sf(src, f"{colmap.pred_da_price}_p05", np.nan),
+                    pred_da_price_p10=_sf(src, f"{colmap.pred_da_price}_p10", np.nan),
+                    pred_da_price_p90=_sf(src, f"{colmap.pred_da_price}_p90", np.nan),
+                    pred_da_price_p95=_sf(src, f"{colmap.pred_da_price}_p95", np.nan),
                     true_da_price=_sf(src, colmap.true_da_price, 0.0),
                     pred_cap_pos=_sf(src, colmap.pred_afrr_capacity_price_pos, 0.0),
                     true_cap_pos=_sf(src, colmap.true_afrr_capacity_price_pos, 0.0),
@@ -2440,6 +2872,20 @@ class BatteryBacktester:
                     obligation_neg_mw=float(afrr_cap_neg_lockbook.get(pd.to_datetime(ts, utc=True), 0.0)),
                     obligation_energy_pos=float(afrr_energy_pos_lockbook.get(pd.to_datetime(ts, utc=True), np.nan)),
                     obligation_energy_neg=float(afrr_energy_neg_lockbook.get(pd.to_datetime(ts, utc=True), np.nan)),
+                    planned_reserve_pos_bins_mw=[
+                        float(pd.to_numeric(pd.Series([getattr(r, f"reserve_pos_bin_{b}_mw", 0.0)]), errors="coerce").iloc[0])
+                        for b in range(len(self.afrr_quantile_bins))
+                    ],
+                    planned_reserve_neg_bins_mw=[
+                        float(pd.to_numeric(pd.Series([getattr(r, f"reserve_neg_bin_{b}_mw", 0.0)]), errors="coerce").iloc[0])
+                        for b in range(len(self.afrr_quantile_bins))
+                    ],
+                    pred_cap_pos_bins_eur_mw=[
+                        _sf(src, f"pred_afrr_capacity_price_pos_{q}", np.nan) for q in self.afrr_quantile_bins
+                    ],
+                    pred_cap_neg_bins_eur_mw=[
+                        _sf(src, f"pred_afrr_capacity_price_neg_{q}", np.nan) for q in self.afrr_quantile_bins
+                    ],
                 )
                 clearing_records.append(cleared)
                 executed_s, _ = self._settle_one_hour(
@@ -2516,8 +2962,12 @@ class BatteryBacktester:
             take["shock_source"] = pd.Series(shock_source_vals, index=take.index, dtype="string")
             if clearing_records:
                 clr_df = pd.DataFrame(clearing_records, index=take.index)
-                for c in clr_df.columns:
-                    take[c] = clr_df[c]
+                # Add clearing columns in one block to avoid DataFrame fragmentation
+                # from repeated per-column inserts.
+                overlap = [c for c in clr_df.columns if c in take.columns]
+                if overlap:
+                    take = take.drop(columns=overlap)
+                take = pd.concat([take, clr_df], axis=1)
 
         if not decisions:
             empty_dispatch = pd.DataFrame(
@@ -2631,6 +3081,8 @@ class BatteryBacktester:
             "planned_reserve_neg_mw",
             "submitted_da_buy_mw",
             "submitted_da_sell_mw",
+            "submitted_da_buy_price_eur_mwh",
+            "submitted_da_sell_price_eur_mwh",
             "submitted_afrr_pos_mw",
             "submitted_afrr_neg_mw",
             "executed_charge_mw",
@@ -2660,6 +3112,15 @@ class BatteryBacktester:
             "pending_id_charge_mw",
             "pending_id_discharge_mw",
         ]
+        dispatch_clearing_cols.extend(
+            [
+                c
+                for c in dispatch.columns
+                if c.startswith("submitted_afrr_")
+                or c.startswith("executed_afrr_")
+                or c.startswith("afrr_bin_")
+            ]
+        )
         dispatch_cols = dispatch_cols + [c for c in dispatch_meta_cols if c in dispatch.columns]
         dispatch_cols = dispatch_cols + [c for c in dispatch_clearing_cols if c in dispatch.columns]
 
@@ -2676,9 +3137,19 @@ class BatteryBacktester:
             "pending_id_charge_mw": 0.0,
             "pending_id_discharge_mw": 0.0,
         }
-        for c, default_val in required_dispatch_defaults.items():
-            if c not in dispatch.columns:
-                dispatch[c] = default_val
+        missing_defaults = {
+            c: default_val
+            for c, default_val in required_dispatch_defaults.items()
+            if c not in dispatch.columns
+        }
+        if missing_defaults:
+            # Add missing default columns in one block to avoid DataFrame
+            # fragmentation caused by repeated per-column inserts.
+            defaults_df = pd.DataFrame(
+                {c: np.full(len(dispatch), default_val) for c, default_val in missing_defaults.items()},
+                index=dispatch.index,
+            )
+            dispatch = pd.concat([dispatch, defaults_df], axis=1)
 
         if predicted_settlement and all(c in dispatch.columns for c in [da_col, cap_pos_col, cap_neg_col, act_pos_col, act_neg_col, rate_pos_col, rate_neg_col]):
             merged = dispatch[
@@ -2765,6 +3236,10 @@ class BatteryBacktester:
                         planned_reserve_pos_mw=reserve_pos,
                         planned_reserve_neg_mw=reserve_neg,
                         pred_da_price=_g(colmap.pred_da_price, 0.0),
+                        pred_da_price_p05=_g(f"{colmap.pred_da_price}_p05", np.nan),
+                        pred_da_price_p10=_g(f"{colmap.pred_da_price}_p10", np.nan),
+                        pred_da_price_p90=_g(f"{colmap.pred_da_price}_p90", np.nan),
+                        pred_da_price_p95=_g(f"{colmap.pred_da_price}_p95", np.nan),
                         true_da_price=_g(colmap.true_da_price, 0.0),
                         pred_cap_pos=_g(colmap.pred_afrr_capacity_price_pos, 0.0),
                         true_cap_pos=_g(colmap.true_afrr_capacity_price_pos, 0.0),
@@ -2837,6 +3312,8 @@ class BatteryBacktester:
             "planned_reserve_neg_mw",
             "submitted_da_buy_mw",
             "submitted_da_sell_mw",
+            "submitted_da_buy_price_eur_mwh",
+            "submitted_da_sell_price_eur_mwh",
             "submitted_afrr_pos_mw",
             "submitted_afrr_neg_mw",
             "executed_charge_mw",
@@ -2862,6 +3339,15 @@ class BatteryBacktester:
             "Obligation_Fulfilled",
             "aFRR_Energy_Gate_Closure_Min",
         ]
+        aux_clearing_cols.extend(
+            [
+                c
+                for c in out.columns
+                if c.startswith("submitted_afrr_")
+                or c.startswith("executed_afrr_")
+                or c.startswith("afrr_bin_")
+            ]
+        )
         out.rename(
             columns={c: f"{kind}_{c}" for c in aux_clearing_cols if c in out.columns},
             inplace=True,
@@ -2915,6 +3401,7 @@ class BatteryBacktester:
         da_gate_hour_cet: int = 12,
         soc_feedback_mode: str = "realized",
         enforce_final_soc_min: bool = True,
+        allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
     ) -> BacktestOutputs:
         """Run optimization + predicted settlement + realized settlement."""
         if horizon_hours <= 0 or reopt_step_hours <= 0:
@@ -3017,7 +3504,11 @@ class BatteryBacktester:
                 0.0,
                 float(da_true_last_local.iloc[-1]) if len(da_true_last_local) else 0.0,
             )
-            terminal_value_local = max(0.0, final_soc - self.soc_min) * self.eta_out * terminal_price_local
+            # Terminal valuation is based on delta energy versus start SoC:
+            # - above start SoC: positive value
+            # - below start SoC: negative value (inventory deficit)
+            terminal_delta_mwh_local = float(final_soc - self.soc_init)
+            terminal_value_local = terminal_delta_mwh_local * self.eta_out * terminal_price_local
             # Keep isolated-path reporting strictly market-separated:
             # *_only_total_pnl_eur is reported excluding terminal carry value.
             # Terminal is exposed separately in diagnostics to avoid masking DA/aFRR
@@ -3044,7 +3535,7 @@ class BatteryBacktester:
                 soc_feedback_mode=soc_feedback_mode,
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
-                allowed_markets=("DA", "aFRR"),
+                allowed_markets=allowed_markets,
             )
         else:
             dispatch = self.optimize_dispatch(
@@ -3054,7 +3545,7 @@ class BatteryBacktester:
                 soc_end_target=None,
                 soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
                 deterministic_reserve_settlement=False,
-                allowed_markets=("DA", "aFRR"),
+                allowed_markets=allowed_markets,
             )
         with _phase_watchdog("settlement_predicted"):
             pred = self.settle_dispatch(df, dispatch, colmap, predicted_settlement=True)
@@ -3095,7 +3586,7 @@ class BatteryBacktester:
                 soc_feedback_mode=soc_feedback_mode,
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
-                allowed_markets=("DA", "aFRR"),
+                allowed_markets=allowed_markets,
             )
         else:
             naive_dispatch = self.optimize_dispatch(
@@ -3105,7 +3596,7 @@ class BatteryBacktester:
                 soc_end_target=None,
                 soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
                 deterministic_reserve_settlement=False,
-                allowed_markets=("DA", "aFRR"),
+                allowed_markets=allowed_markets,
             )
         with _phase_watchdog("settlement_naive_realized"):
             naive_real = self.settle_dispatch(
@@ -3153,7 +3644,7 @@ class BatteryBacktester:
                     enforce_final_soc_min=enforce_final_soc_min,
                     deterministic_reserve_settlement=True,
                     is_oracle=True,
-                    allowed_markets=("DA", "aFRR"),
+                    allowed_markets=allowed_markets,
                 )
             else:
                 oracle_dispatch = self.optimize_dispatch(
@@ -3163,7 +3654,7 @@ class BatteryBacktester:
                     soc_end_target=None,
                     soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
                     deterministic_reserve_settlement=True,
-                    allowed_markets=("DA", "aFRR"),
+                    allowed_markets=allowed_markets,
                 )
         finally:
             self.milp_time_limit_seconds = _orig_tl
@@ -3185,31 +3676,23 @@ class BatteryBacktester:
             }
         )
 
-        # Isolated market ablation paths (value of stacking).
-        realized_da_only_total, realized_da_only_feasible, realized_da_only_diag, realized_da_only_hourly = _run_isolated_path(
-            path_df=df,
-            allowed_markets_local=("DA",),
-            deterministic_local=False,
-            is_oracle_local=False,
-        )
-        oracle_da_only_total, oracle_da_only_feasible, oracle_da_only_diag, oracle_da_only_hourly = _run_isolated_path(
-            path_df=oracle_df,
-            allowed_markets_local=("DA",),
-            deterministic_local=True,
-            is_oracle_local=True,
-        )
-        realized_afrr_only_total, realized_afrr_only_feasible, realized_afrr_only_diag, realized_afrr_only_hourly = _run_isolated_path(
-            path_df=df,
-            allowed_markets_local=("aFRR",),
-            deterministic_local=False,
-            is_oracle_local=False,
-        )
-        oracle_afrr_only_total, oracle_afrr_only_feasible, oracle_afrr_only_diag, oracle_afrr_only_hourly = _run_isolated_path(
-            path_df=oracle_df,
-            allowed_markets_local=("aFRR",),
-            deterministic_local=True,
-            is_oracle_local=True,
-        )
+        # Legacy isolated-market retrospective accounting removed.
+        realized_da_only_feasible = True
+        oracle_da_only_feasible = True
+        realized_afrr_only_feasible = True
+        oracle_afrr_only_feasible = True
+        realized_da_only_total = float("nan")
+        oracle_da_only_total = float("nan")
+        realized_afrr_only_total = float("nan")
+        oracle_afrr_only_total = float("nan")
+        realized_da_only_diag: dict[str, float] = {}
+        oracle_da_only_diag: dict[str, float] = {}
+        realized_afrr_only_diag: dict[str, float] = {}
+        oracle_afrr_only_diag: dict[str, float] = {}
+        realized_da_only_hourly = pd.DataFrame()
+        oracle_da_only_hourly = pd.DataFrame()
+        realized_afrr_only_hourly = pd.DataFrame()
+        oracle_afrr_only_hourly = pd.DataFrame()
 
         def _merge_unique(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
             """Merge while dropping overlapping non-key columns from right."""
@@ -3298,20 +3781,23 @@ class BatteryBacktester:
             float(da_true_last.iloc[-1]) if len(da_true_last) else 0.0,
         )
 
-        liquidatable_pred_mwh = max(0.0, final_pred_soc_mwh - self.soc_min) * self.eta_out
-        liquidatable_real_mwh = max(0.0, final_real_soc_mwh - self.soc_min) * self.eta_out
-        liquidatable_naive_mwh = max(0.0, final_naive_soc_mwh - self.soc_min) * self.eta_out
-        liquidatable_oracle_mwh = max(0.0, final_oracle_soc_mwh - self.soc_min) * self.eta_out
+        # Terminal valuation is delta-to-start inventory (not absolute inventory):
+        # only energy above start SoC adds value; missing energy is subtracted.
+        terminal_delta_pred_mwh = (final_pred_soc_mwh - self.soc_init) * self.eta_out
+        terminal_delta_real_mwh = (final_real_soc_mwh - self.soc_init) * self.eta_out
+        terminal_delta_naive_mwh = (final_naive_soc_mwh - self.soc_init) * self.eta_out
+        terminal_delta_oracle_mwh = (final_oracle_soc_mwh - self.soc_init) * self.eta_out
 
-        terminal_value_pred_eur = liquidatable_pred_mwh * terminal_price_pred_eur_mwh
-        terminal_value_real_eur = liquidatable_real_mwh * terminal_price_true_eur_mwh
-        terminal_value_naive_eur = liquidatable_naive_mwh * terminal_price_true_eur_mwh
-        terminal_value_oracle_eur = liquidatable_oracle_mwh * terminal_price_true_eur_mwh
+        terminal_value_pred_eur = terminal_delta_pred_mwh * terminal_price_pred_eur_mwh
+        terminal_value_real_eur = terminal_delta_real_mwh * terminal_price_true_eur_mwh
+        terminal_value_naive_eur = terminal_delta_naive_mwh * terminal_price_true_eur_mwh
+        terminal_value_oracle_eur = terminal_delta_oracle_mwh * terminal_price_true_eur_mwh
 
         pred_pnl_total = pred_pnl_raw + terminal_value_pred_eur
         real_pnl_total = real_pnl_raw + terminal_value_real_eur
         naive_pnl_total = naive_pnl_raw + terminal_value_naive_eur
         oracle_pnl_total = oracle_pnl_raw + terminal_value_oracle_eur
+
 
         if np.isfinite(oracle_pnl_total) and abs(oracle_pnl_total) > 1e-9:
             opportunity_gap_ratio = float((oracle_pnl_total - real_pnl_total) / oracle_pnl_total)
@@ -3332,10 +3818,10 @@ class BatteryBacktester:
             "terminal_value_realized_eur": float(terminal_value_real_eur),
             "terminal_value_naive_eur": float(terminal_value_naive_eur),
             "terminal_value_oracle_eur": float(terminal_value_oracle_eur),
-            "terminal_liquidatable_predicted_mwh": float(liquidatable_pred_mwh),
-            "terminal_liquidatable_realized_mwh": float(liquidatable_real_mwh),
-            "terminal_liquidatable_naive_mwh": float(liquidatable_naive_mwh),
-            "terminal_liquidatable_oracle_mwh": float(liquidatable_oracle_mwh),
+            "terminal_delta_predicted_mwh": float(terminal_delta_pred_mwh),
+            "terminal_delta_realized_mwh": float(terminal_delta_real_mwh),
+            "terminal_delta_naive_mwh": float(terminal_delta_naive_mwh),
+            "terminal_delta_oracle_mwh": float(terminal_delta_oracle_mwh),
             "terminal_price_predicted_eur_mwh": float(terminal_price_pred_eur_mwh),
             "terminal_price_realized_eur_mwh": float(terminal_price_true_eur_mwh),
             "realized_total_penalty_eur": float(hourly["real_penalty_eur"].sum()) if "real_penalty_eur" in hourly.columns else 0.0,
@@ -3351,10 +3837,6 @@ class BatteryBacktester:
             "avg_reserve_neg_mw": float(hourly["reserve_neg_mw"].mean()),
             "avg_charge_mw": float(hourly["charge_mw"].mean()),
             "avg_discharge_mw": float(hourly["discharge_mw"].mean()),
-            "realized_da_only_total_pnl_eur": float(realized_da_only_total),
-            "oracle_da_only_total_pnl_eur": float(oracle_da_only_total),
-            "realized_afrr_only_total_pnl_eur": float(realized_afrr_only_total),
-            "oracle_afrr_only_total_pnl_eur": float(oracle_afrr_only_total),
             "realized_da_only_feasible": float(realized_da_only_feasible),
             "oracle_da_only_feasible": float(oracle_da_only_feasible),
             "realized_afrr_only_feasible": float(realized_afrr_only_feasible),
@@ -3402,20 +3884,8 @@ class BatteryBacktester:
             )
         else:
             summary["pacc_neg_fallback_share_pct"] = 0.0
-        summary["stacking_value_realized_eur"] = float(
-            summary["realized_total_pnl_eur"]
-            - (
-                summary["realized_da_only_total_pnl_eur"]
-                + summary["realized_afrr_only_total_pnl_eur"]
-            )
-        )
-        summary["stacking_value_oracle_eur"] = float(
-            summary["oracle_total_pnl_eur"]
-            - (
-                summary["oracle_da_only_total_pnl_eur"]
-                + summary["oracle_afrr_only_total_pnl_eur"]
-            )
-        )
+        summary["stacking_value_realized_eur"] = float("nan")
+        summary["stacking_value_oracle_eur"] = float("nan")
         for prefix, diag in (
             ("realized_da_only", realized_da_only_diag),
             ("oracle_da_only", oracle_da_only_diag),
@@ -3426,14 +3896,6 @@ class BatteryBacktester:
                 summary[f"{prefix}_{k}"] = float(v)
         def _safe_ratio(num: float, den: float) -> float:
             return float(num / den) if abs(float(den)) > 1e-12 else float("nan")
-        summary["realized_vs_oracle_ratio_da_only"] = _safe_ratio(
-            float(summary["realized_da_only_total_pnl_eur"]),
-            float(summary["oracle_da_only_total_pnl_eur"]),
-        )
-        summary["realized_vs_oracle_ratio_afrr_only"] = _safe_ratio(
-            float(summary["realized_afrr_only_total_pnl_eur"]),
-            float(summary["oracle_afrr_only_total_pnl_eur"]),
-        )
         summary["realized_vs_oracle_ratio_multi_market"] = _safe_ratio(
             float(summary["realized_total_pnl_eur"]),
             float(summary["oracle_total_pnl_eur"]),
@@ -3481,6 +3943,8 @@ class BatteryBacktester:
         summary["total_slack_neg_mw"] = float(hourly["slack_neg_mw"].sum()) if "slack_neg_mw" in hourly.columns else 0.0
         summary["mean_slack_pos_mw"] = float(hourly["slack_pos_mw"].mean()) if "slack_pos_mw" in hourly.columns else 0.0
         summary["mean_slack_neg_mw"] = float(hourly["slack_neg_mw"].mean()) if "slack_neg_mw" in hourly.columns else 0.0
+        summary["total_slack_soc_min_mwh"] = float(hourly["slack_soc_min_mwh"].sum()) if "slack_soc_min_mwh" in hourly.columns else 0.0
+        summary["total_slack_soc_max_mwh"] = float(hourly["slack_soc_max_mwh"].sum()) if "slack_soc_max_mwh" in hourly.columns else 0.0
 
         # Backward-compatible aliases used by older reports/scripts.
         summary["total_da_energy_revenue_eur"] = summary["total_da_revenue_eur"]
