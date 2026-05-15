@@ -372,27 +372,24 @@ class BatteryBacktester:
         frame: pd.DataFrame,
         colmap: BacktestColumnMap,
         *,
-        require_da_quantiles: bool = False,
+        run_mode: str = "advanced_ml",
         require_pacc_bins: bool = False,
     ) -> None:
         """Fail-fast gate for critical financial inputs before clearing/optimization."""
-        critical_cols = [
-            colmap.pred_da_price,
-            colmap.true_da_price,
-            colmap.pred_afrr_capacity_price_pos,
-            colmap.pred_afrr_capacity_price_neg,
-            colmap.true_afrr_capacity_price_pos,
-            colmap.true_afrr_capacity_price_neg,
-            colmap.pred_afrr_activation_price_pos,
-            colmap.pred_afrr_activation_price_neg,
-            colmap.true_afrr_activation_price_pos,
-            colmap.true_afrr_activation_price_neg,
-            colmap.pred_afrr_activation_rate_pos,
-            colmap.pred_afrr_activation_rate_neg,
-            colmap.true_afrr_activation_rate_pos,
-            colmap.true_afrr_activation_rate_neg,
-        ]
-        if require_da_quantiles:
+        mode = str(run_mode).strip().lower()
+        if mode not in {"advanced_ml", "naive", "oracle"}:
+            raise ValueError(f"Unknown run_mode '{run_mode}'. Expected one of: advanced_ml, naive, oracle.")
+
+        if mode == "advanced_ml":
+            critical_cols = [
+                colmap.pred_da_price,
+                colmap.pred_afrr_capacity_price_pos,
+                colmap.pred_afrr_capacity_price_neg,
+                colmap.pred_afrr_activation_price_pos,
+                colmap.pred_afrr_activation_price_neg,
+                colmap.pred_afrr_activation_rate_pos,
+                colmap.pred_afrr_activation_rate_neg,
+            ]
             critical_cols.extend(
                 [
                     f"{colmap.pred_da_price}_p05",
@@ -401,6 +398,27 @@ class BatteryBacktester:
                     f"{colmap.pred_da_price}_p95",
                 ]
             )
+        elif mode == "naive":
+            critical_cols = [
+                colmap.pred_da_price,
+                colmap.pred_afrr_capacity_price_pos,
+                colmap.pred_afrr_capacity_price_neg,
+                colmap.pred_afrr_activation_price_pos,
+                colmap.pred_afrr_activation_price_neg,
+                colmap.pred_afrr_activation_rate_pos,
+                colmap.pred_afrr_activation_rate_neg,
+            ]
+        else:  # oracle
+            critical_cols = [
+                colmap.true_da_price,
+                colmap.true_afrr_capacity_price_pos,
+                colmap.true_afrr_capacity_price_neg,
+                colmap.true_afrr_activation_price_pos,
+                colmap.true_afrr_activation_price_neg,
+                colmap.true_afrr_activation_rate_pos,
+                colmap.true_afrr_activation_rate_neg,
+            ]
+
         # p_acc bins are critical once created for optimization.
         if require_pacc_bins:
             for b in range(len(self.afrr_quantile_bins)):
@@ -2300,6 +2318,7 @@ class BatteryBacktester:
         deterministic_reserve_settlement: bool = False,
         is_oracle: bool = False,
         allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
+        run_mode: str = "advanced_ml",
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Rolling-horizon LP (re-optimized repeatedly with SoC state carryover)."""
         if horizon_hours <= 0 or reopt_step_hours <= 0:
@@ -2367,12 +2386,7 @@ class BatteryBacktester:
                 colmap.pred_afrr_activation_rate_neg,
             ]
             if all(c in df.columns for c in pred_surface_cols):
-                self._validate_critical_data(
-                    df,
-                    colmap,
-                    require_da_quantiles=False,
-                    require_pacc_bins=False,
-                )
+                self._validate_critical_data(df, colmap, run_mode=run_mode, require_pacc_bins=False)
 
         decisions: list[pd.DataFrame] = []
         plan_history: list[pd.DataFrame] = []
@@ -2651,9 +2665,7 @@ class BatteryBacktester:
                 self._validate_critical_data(
                     window,
                     colmap,
-                    # DA quantiles are only strictly required in explicit debug mode.
-                    # In normal mode, DA bid pricing can still fall back to point-forecast logic.
-                    require_da_quantiles=bool(self.da_bid_fail_fast_debug),
+                    run_mode=run_mode,
                     require_pacc_bins=True,
                 )
             else:
@@ -3013,10 +3025,7 @@ class BatteryBacktester:
                     "true_rate_pos": _sf(src, colmap.true_afrr_activation_rate_pos, np.nan),
                     "true_rate_neg": _sf(src, colmap.true_afrr_activation_rate_neg, np.nan),
                 }
-                require_da_quantiles_here = bool(self.da_bid_fail_fast_debug) or (
-                    abs(charge_plan) > 1e-9 or abs(discharge_plan) > 1e-9
-                )
-                if require_da_quantiles_here:
+                if str(run_mode).strip().lower() == "advanced_ml":
                     critical_inputs["pred_da_price_p05"] = _sf(src, f"{colmap.pred_da_price}_p05", np.nan)
                     critical_inputs["pred_da_price_p10"] = _sf(src, f"{colmap.pred_da_price}_p10", np.nan)
                     critical_inputs["pred_da_price_p90"] = _sf(src, f"{colmap.pred_da_price}_p90", np.nan)
@@ -3397,6 +3406,12 @@ class BatteryBacktester:
             base_cols = [c for c in dict.fromkeys(base_cols) if c in df.columns]
             merged = df[base_cols].copy()
             disp_take = dispatch[dispatch_cols].copy()
+            # Keep canonical market inputs from `df` as single source of truth.
+            # If dispatch carries duplicate helper columns (e.g. pred_* handoff),
+            # avoid merge suffixing (_x/_y) by dropping overlapping non-key columns.
+            overlap = [c for c in disp_take.columns if c != colmap.timestamp and c in merged.columns]
+            if overlap:
+                disp_take = disp_take.drop(columns=overlap, errors="ignore")
             # Robust timezone/key alignment for settlement handoff.
             merged[colmap.timestamp] = pd.to_datetime(merged[colmap.timestamp], utc=True, errors="coerce")
             disp_take[colmap.timestamp] = pd.to_datetime(disp_take[colmap.timestamp], utc=True, errors="coerce")
@@ -3710,6 +3725,7 @@ class BatteryBacktester:
                         deterministic_reserve_settlement=deterministic_local,
                         is_oracle=is_oracle_local,
                         allowed_markets=allowed_markets_local,
+                        run_mode=("oracle" if is_oracle_local else "advanced_ml"),
                     )
                 else:
                     path_dispatch = self.optimize_dispatch(
@@ -3816,6 +3832,7 @@ class BatteryBacktester:
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
                 allowed_markets=allowed_markets,
+                run_mode="advanced_ml",
             )
         else:
             dispatch = self.optimize_dispatch(
@@ -3872,6 +3889,7 @@ class BatteryBacktester:
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
                 allowed_markets=allowed_markets,
+                run_mode="naive",
             )
         else:
             naive_dispatch = self.optimize_dispatch(
@@ -3930,6 +3948,7 @@ class BatteryBacktester:
                     deterministic_reserve_settlement=True,
                     is_oracle=True,
                     allowed_markets=allowed_markets,
+                    run_mode="oracle",
                 )
             else:
                 oracle_dispatch = self.optimize_dispatch(
