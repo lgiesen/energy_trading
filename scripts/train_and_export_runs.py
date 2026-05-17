@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -524,6 +525,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lead-weight-max", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument(
+        "--afrr-parallel-jobs",
+        type=int,
+        default=1,
+        help="Number of parallel aFRR target training jobs (useful for linear model runs).",
+    )
     p.add_argument("--linear-alpha", type=float, default=1.0)
     p.add_argument("--linear-l1-ratio", type=float, default=0.15)
     p.add_argument("--linear-learning-rate", default="invscaling")
@@ -805,6 +812,7 @@ def main() -> None:
     skipped = [t for t in AFRR_TARGETS if t not in afrr_targets]
     if skipped:
         print(f"[WARN] Skipping unavailable aFRR targets: {', '.join(skipped)}")
+    afrr_jobs: list[tuple[str, Path, list[str], str]] = []
     for tgt in afrr_targets:
         frag = run_dir / f"afrr_{tgt}_manifest_fragment.json"
         afrr_fragment_paths.append(frag)
@@ -819,13 +827,27 @@ def main() -> None:
             "--manifest-fragment-out",
             str(frag),
         ]
-        cmd_records.append(
-            _run_train_cmd(
-                cmd_afrr,
-                run_dir=run_dir,
-                log_stem=f"02_train_afrr_{args.model_type}_{tgt}",
-            )
-        )
+        afrr_jobs.append((tgt, frag, cmd_afrr, f"02_train_afrr_{args.model_type}_{tgt}"))
+
+    afrr_parallel_jobs = max(1, int(args.afrr_parallel_jobs))
+    # Keep conservative default behavior (sequential) unless explicitly requested.
+    if afrr_parallel_jobs == 1 or len(afrr_jobs) <= 1:
+        for _tgt, _frag, cmd_afrr, log_stem in afrr_jobs:
+            cmd_records.append(_run_train_cmd(cmd_afrr, run_dir=run_dir, log_stem=log_stem))
+    else:
+        print(f"[INFO] Running aFRR target training in parallel with jobs={afrr_parallel_jobs}.")
+        with ThreadPoolExecutor(max_workers=afrr_parallel_jobs) as pool:
+            fut_to_target = {
+                pool.submit(_run_train_cmd, cmd_afrr, run_dir=run_dir, log_stem=log_stem): tgt
+                for tgt, _frag, cmd_afrr, log_stem in afrr_jobs
+            }
+            for fut in as_completed(fut_to_target):
+                tgt = fut_to_target[fut]
+                try:
+                    rec = fut.result()
+                except Exception as exc:
+                    raise RuntimeError(f"aFRR training failed for target '{tgt}': {exc}") from exc
+                cmd_records.append(rec)
 
     da_meta = _load_fragment(da_fragment)
     afrr_meta_list = [_load_fragment(p) for p in afrr_fragment_paths if p.exists()]
