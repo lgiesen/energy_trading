@@ -22,6 +22,11 @@ LINEAR_AFRR_PARALLEL_JOBS ?= 4
 SIM_QUANTILE_PAIRS ?=
 DA_QUANTILE_ROLE ?= mid
 SIM_QUANTILE_SWEEP_DEFAULT ?= p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90
+GRID_DA_ROLES ?= low mid high
+GRID_STRATEGIES ?= multi da_only afrr_only
+GRID_QUANTILE_PAIRS ?= $(SIM_QUANTILE_SWEEP_DEFAULT)
+GRID_SMOKE_HOURS ?= 24
+SIM_GRID_STAMP ?= $(shell date +%Y%m%d_%H%M%S)
 
 # Run IDs (evaluated once per make invocation; command-line/env overrides still win)
 RUN_ID_XGB := $(or $(RUN_ID_XGB),xgb_$(shell date +%Y%m%d_%H%M%S))
@@ -62,6 +67,7 @@ TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 	sim-xgb sim-linear sim-tft \
 	sim-latest-xgb sim-latest-linear sim-latest-tft \
 	sim-all-quantiles \
+	sim-grid-full sim-grid-smoke \
 	build-hybrid sim-hybrid \
 	residual-report \
 	strategy-diagnostics \
@@ -86,6 +92,8 @@ help: ## Show available commands
 	@echo "Global:"
 	@echo "  make smoke-test   # runs all-xgb, all-linear, all-tft with IS_SMOKE_TEST=1"
 	@echo "  make sim-all-quantiles  # run xgb/linear/tft simulation with standard thesis quantile sweep"
+	@echo "  make sim-grid-full      # all models x all strategies x DA-role(low/mid/high) x quantile pairs (test horizon)"
+	@echo "  make sim-grid-smoke     # same grid as sim-grid-full, but only GRID_SMOKE_HOURS"
 	@echo "  make build-hybrid       # build champion-by-target (hybrid/ensemble) prediction table"
 	@echo "  make sim-hybrid         # run backtest on hybrid table (requires HYBRID_GROUND_TRUTH)"
 	@echo "  make thesis-report      # aggregate quantile sweep outputs into one benchmark report"
@@ -161,6 +169,7 @@ $(XGB_MANIFEST): $(XGB_TUNE_JSON)
 		python3 scripts/train_and_export_runs.py \
 	  --model-type xgboost \
 	  --run-id "$(RUN_ID_XGB)" \
+	  --device $(DEVICE) \
 	  --forecast-horizon-hours $(FORECAST_HOURS) \
 	  --lead-weight-start $(LEAD_WEIGHT_START) \
 	  --lead-weight-end $(LEAD_WEIGHT_END) \
@@ -282,6 +291,88 @@ sim-all-quantiles: clean-markers ## Run quantile sweep simulation for xgb, linea
 	$(MAKE) sim-xgb SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
 	$(MAKE) sim-linear SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
 	$(MAKE) sim-tft SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
+
+sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs on full test horizon
+	@read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
+	for MODEL in xgboost linear tft; do \
+	  case "$$MODEL" in \
+	    xgboost) RUN_ID="$(RUN_ID_XGB)" ;; \
+	    linear) RUN_ID="$(RUN_ID_LINEAR)" ;; \
+	    tft) RUN_ID="$(RUN_ID_TFT)" ;; \
+	  esac; \
+	  MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
+	  if [ ! -f "$$MANIFEST" ]; then \
+	    case "$$MODEL" in \
+	      xgboost) LATEST_JSON="artifacts/model_runs/latest_xgboost.json" ;; \
+	      linear) LATEST_JSON="artifacts/model_runs/latest_linear.json" ;; \
+	      tft) LATEST_JSON="artifacts/model_runs/latest_tft.json" ;; \
+	    esac; \
+	    if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	    RUN_ID_FROM_LATEST=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
+	    test -n "$$RUN_ID_FROM_LATEST" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
+	    RUN_ID="$$RUN_ID_FROM_LATEST"; \
+	    MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
+	  fi; \
+	  test -f "$$MANIFEST" || (echo "Missing manifest: $$MANIFEST" && exit 1); \
+	  for DA_ROLE in $(GRID_DA_ROLES); do \
+	    OUT_ROOT="artifacts/simulation_runs/quantile_grid_$${DA_ROLE}_$(SIM_GRID_STAMP)/$${MODEL}"; \
+	    for STRAT in $(GRID_STRATEGIES); do \
+	      echo "[GRID] model=$$MODEL strategy=$$STRAT da_role=$$DA_ROLE out=$$OUT_ROOT"; \
+	      BACKTEST_MILP_TIME_LIMIT_S=300 BACKTEST_MILP_REL_GAP=1e-4 \
+	      ./.venv/bin/python -u scripts/run_battery_backtest.py \
+	        --run-manifest "$$MANIFEST" \
+	        --split test \
+	        --model-key "$$MODEL" \
+	        --trading-strategy "$$STRAT" \
+	        --quantile-pairs "$(GRID_QUANTILE_PAIRS)" \
+	        --da-quantile-role "$$DA_ROLE" \
+	        --start "$$SIM_START" \
+	        --end "$$SIM_END" \
+	        --out-dir "$$OUT_ROOT"; \
+	    done; \
+	  done; \
+	done
+
+sim-grid-smoke: ## Smoke grid: all models x strategies x DA roles x quantile pairs on short window
+	@read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=sim_start+pd.Timedelta(hours=int('$(GRID_SMOKE_HOURS)'));print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
+	for MODEL in xgboost linear tft; do \
+	  case "$$MODEL" in \
+	    xgboost) RUN_ID="$(RUN_ID_XGB)" ;; \
+	    linear) RUN_ID="$(RUN_ID_LINEAR)" ;; \
+	    tft) RUN_ID="$(RUN_ID_TFT)" ;; \
+	  esac; \
+	  MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
+	  if [ ! -f "$$MANIFEST" ]; then \
+	    case "$$MODEL" in \
+	      xgboost) LATEST_JSON="artifacts/model_runs/latest_xgboost.json" ;; \
+	      linear) LATEST_JSON="artifacts/model_runs/latest_linear.json" ;; \
+	      tft) LATEST_JSON="artifacts/model_runs/latest_tft.json" ;; \
+	    esac; \
+	    if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	    RUN_ID_FROM_LATEST=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
+	    test -n "$$RUN_ID_FROM_LATEST" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
+	    RUN_ID="$$RUN_ID_FROM_LATEST"; \
+	    MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
+	  fi; \
+	  test -f "$$MANIFEST" || (echo "Missing manifest: $$MANIFEST" && exit 1); \
+	  for DA_ROLE in $(GRID_DA_ROLES); do \
+	    OUT_ROOT="artifacts/simulation_runs/quantile_grid_smoke_$${DA_ROLE}_$(SIM_GRID_STAMP)/$${MODEL}"; \
+	    for STRAT in $(GRID_STRATEGIES); do \
+	      echo "[GRID-SMOKE] model=$$MODEL strategy=$$STRAT da_role=$$DA_ROLE out=$$OUT_ROOT"; \
+	      BACKTEST_MILP_TIME_LIMIT_S=120 BACKTEST_MILP_REL_GAP=1e-4 \
+	      ./.venv/bin/python -u scripts/run_battery_backtest.py \
+	        --run-manifest "$$MANIFEST" \
+	        --split test \
+	        --model-key "$$MODEL" \
+	        --trading-strategy "$$STRAT" \
+	        --quantile-pairs "$(GRID_QUANTILE_PAIRS)" \
+	        --da-quantile-role "$$DA_ROLE" \
+	        --start "$$SIM_START" \
+	        --end "$$SIM_END" \
+	        --out-dir "$$OUT_ROOT"; \
+	    done; \
+	  done; \
+	done
 
 define AUDIT_RULE
 $($(1)_AUDIT_ZIP): $$($(1)_SIM_DONE)

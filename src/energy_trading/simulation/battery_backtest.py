@@ -3860,6 +3860,8 @@ class BatteryBacktester:
             "pnl_eur": f"{kind}_pnl_eur",
             "da_buy_mwh": f"{kind}_da_buy_mwh",
             "da_sell_mwh": f"{kind}_da_sell_mwh",
+            "id_charge_mw": f"{kind}_id_charge_mw",
+            "id_discharge_mw": f"{kind}_id_discharge_mw",
             "id_buy_mwh": f"{kind}_id_buy_mwh",
             "id_sell_mwh": f"{kind}_id_sell_mwh",
             "act_pos_mwh": f"{kind}_act_pos_mwh",

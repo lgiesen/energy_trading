@@ -73,6 +73,51 @@ make thesis-report
 This aggregates sweep outputs into:
 - `artifacts/thesis_benchmark_report.csv`
 
+### 4.1 Full Grid (All Models × All Strategies × All DA Roles × All Quantile Pairs)
+Best practice for large benchmark campaigns is to run a timestamped grid to avoid accidental overwrites.
+
+Run the complete grid on the full test horizon:
+
+```bash
+make sim-grid-full
+```
+
+This executes:
+- Models: `xgboost`, `linear`, `tft`
+- Strategies: `multi`, `da_only`, `afrr_only`
+- DA roles: `low`, `mid`, `high`
+- Quantile pairs: `p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90`
+
+Outputs are written to unique timestamped roots, e.g.:
+- `artifacts/simulation_runs/quantile_grid_mid_<stamp>/xgboost/...`
+- `artifacts/simulation_runs/quantile_grid_high_<stamp>/tft/...`
+
+So runs do not overwrite each other unless the same `SIM_GRID_STAMP` is reused.
+
+### 4.2 Smoke Grid (Fast End-to-End Validation)
+Run a short-window version of the same full grid:
+
+```bash
+make sim-grid-smoke
+```
+
+Default smoke horizon is 24 hours and can be changed:
+
+```bash
+make sim-grid-smoke GRID_SMOKE_HOURS=12
+```
+
+### 4.3 Useful Overrides
+You can customize the grid with Make variables:
+
+```bash
+make sim-grid-full \
+  GRID_DA_ROLES="low mid high" \
+  GRID_STRATEGIES="multi da_only afrr_only" \
+  GRID_QUANTILE_PAIRS="p50-p50,p30-p70,p10-p90" \
+  SIM_GRID_STAMP=$(date +%Y%m%d_%H%M%S)
+```
+
 ## 5. Audit & Output Artifacts
 For every successful run, the pipeline automatically produces an immutable deliverable archive:
 - `artifacts/model_runs/<run_id>_deliverable.zip`
