@@ -12,6 +12,7 @@ export NUMEXPR_NUM_THREADS := 1
 
 SEED ?= 42
 FORECAST_HOURS ?= 48
+SIM_HORIZON_HOURS ?= 48
 export IS_SMOKE_TEST ?= 0
 DEVICE ?= cuda
 TFT_PRECISION ?= bf16-mixed
@@ -28,10 +29,10 @@ GRID_QUANTILE_PAIRS ?= $(SIM_QUANTILE_SWEEP_DEFAULT)
 GRID_SMOKE_HOURS ?= 24
 SIM_GRID_STAMP ?= $(shell date +%Y%m%d_%H%M%S)
 
-# Run IDs (evaluated once per make invocation; command-line/env overrides still win)
-RUN_ID_XGB := $(or $(RUN_ID_XGB),xgb_$(shell date +%Y%m%d_%H%M%S))
-RUN_ID_LINEAR := $(or $(RUN_ID_LINEAR),linear_$(shell date +%Y%m%d_%H%M%S))
-RUN_ID_TFT := $(or $(RUN_ID_TFT),tft_$(shell date +%Y%m%d_%H%M%S))
+# Run IDs for training outputs (evaluated once per make invocation)
+RUN_ID_XGB := xgb_$(shell date +%Y%m%d_%H%M%S)
+RUN_ID_LINEAR := linear_$(shell date +%Y%m%d_%H%M%S)
+RUN_ID_TFT := tft_$(shell date +%Y%m%d_%H%M%S)
 
 # Common artifacts
 DATA_HASH_FILE := artifacts/hpo/data_model_input.md5
@@ -101,7 +102,7 @@ help: ## Show available commands
 	@echo "  make strategy-diagnostics [SIM_ROOT=artifacts/simulation_runs] [OUT_DIR=artifacts/analysis/strategy_diagnostics]"
 	@echo ""
 	@echo "Optional overrides:"
-	@echo "  RUN_ID_XGB=... RUN_ID_LINEAR=... RUN_ID_TFT=... SEED=42 FORECAST_HOURS=48 DEVICE=cuda|cpu"
+	@echo "  SEED=42 FORECAST_HOURS=48 DEVICE=cuda|cpu"
 	@echo "  LINEAR_AFRR_PARALLEL_JOBS=4   # parallel aFRR target jobs for linear training"
 	@echo "  SIM_QUANTILE_PAIRS='p50-p50,p30-p70,p10-p90' DA_QUANTILE_ROLE=mid|low|high"
 	@echo "  LEAD_WEIGHT_START=16 LEAD_WEIGHT_END=48 LEAD_WEIGHT_MAX=2.0"
@@ -116,9 +117,9 @@ all-linear: audit-linear ## Full Linear DAG
 all-tft: audit-tft ## Full TFT DAG
 
 smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
-	$(MAKE) IS_SMOKE_TEST=1 all-xgb
-	$(MAKE) IS_SMOKE_TEST=1 all-linear
-	$(MAKE) IS_SMOKE_TEST=1 DEVICE=$(DEVICE) all-tft
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-xgb
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-linear
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) all-tft
 
 $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
 	@mkdir -p $(dir $(DATA_HASH_FILE))
@@ -228,6 +229,7 @@ $($(1)_SIM_DONE): $$($(1)_MANIFEST)
 	  --run-manifest "$$($(1)_MANIFEST)" \
 	  --split test \
 	  --model-key $(2) \
+	  --horizon-hours $(SIM_HORIZON_HOURS) \
 	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
 	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
 	  --start "$$$$SIM_START" \
@@ -242,9 +244,9 @@ $(eval $(call SIM_RULE,TFT,tft))
 sim-xgb: $(XGB_SIM_DONE) ## Run XGBoost simulation
 sim-linear: $(LINEAR_SIM_DONE) ## Run Linear simulation
 sim-tft: $(TFT_SIM_DONE) ## Run TFT simulation
-sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboost.json (fallback latest.json)
+sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboost.json
 	@LATEST_JSON="artifacts/model_runs/latest_xgboost.json"; \
-	if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
@@ -257,9 +259,9 @@ sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboos
 	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
 	  --start "$$SIM_START" \
 	  --end "$$SIM_END"
-sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_linear.json (fallback latest.json)
+sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_linear.json
 	@LATEST_JSON="artifacts/model_runs/latest_linear.json"; \
-	if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
@@ -272,9 +274,9 @@ sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_lin
 	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
 	  --start "$$SIM_START" \
 	  --end "$$SIM_END"
-sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.json (fallback latest.json)
+sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.json
 	@LATEST_JSON="artifacts/model_runs/latest_tft.json"; \
-	if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
+	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
@@ -295,24 +297,11 @@ sim-all-quantiles: clean-markers ## Run quantile sweep simulation for xgb, linea
 sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs on full test horizon
 	@read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	for MODEL in xgboost linear tft; do \
-	  case "$$MODEL" in \
-	    xgboost) RUN_ID="$(RUN_ID_XGB)" ;; \
-	    linear) RUN_ID="$(RUN_ID_LINEAR)" ;; \
-	    tft) RUN_ID="$(RUN_ID_TFT)" ;; \
-	  esac; \
+	  LATEST_JSON="artifacts/model_runs/latest_$${MODEL}.json"; \
+	  test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
+	  RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
+	  test -n "$$RUN_ID" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
 	  MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
-	  if [ ! -f "$$MANIFEST" ]; then \
-	    case "$$MODEL" in \
-	      xgboost) LATEST_JSON="artifacts/model_runs/latest_xgboost.json" ;; \
-	      linear) LATEST_JSON="artifacts/model_runs/latest_linear.json" ;; \
-	      tft) LATEST_JSON="artifacts/model_runs/latest_tft.json" ;; \
-	    esac; \
-	    if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
-	    RUN_ID_FROM_LATEST=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
-	    test -n "$$RUN_ID_FROM_LATEST" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
-	    RUN_ID="$$RUN_ID_FROM_LATEST"; \
-	    MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
-	  fi; \
 	  test -f "$$MANIFEST" || (echo "Missing manifest: $$MANIFEST" && exit 1); \
 	  for DA_ROLE in $(GRID_DA_ROLES); do \
 	    OUT_ROOT="artifacts/simulation_runs/quantile_grid_$${DA_ROLE}_$(SIM_GRID_STAMP)/$${MODEL}"; \
@@ -336,24 +325,11 @@ sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs
 sim-grid-smoke: ## Smoke grid: all models x strategies x DA roles x quantile pairs on short window
 	@read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=sim_start+pd.Timedelta(hours=int('$(GRID_SMOKE_HOURS)'));print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	for MODEL in xgboost linear tft; do \
-	  case "$$MODEL" in \
-	    xgboost) RUN_ID="$(RUN_ID_XGB)" ;; \
-	    linear) RUN_ID="$(RUN_ID_LINEAR)" ;; \
-	    tft) RUN_ID="$(RUN_ID_TFT)" ;; \
-	  esac; \
+	  LATEST_JSON="artifacts/model_runs/latest_$${MODEL}.json"; \
+	  test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
+	  RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
+	  test -n "$$RUN_ID" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
 	  MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
-	  if [ ! -f "$$MANIFEST" ]; then \
-	    case "$$MODEL" in \
-	      xgboost) LATEST_JSON="artifacts/model_runs/latest_xgboost.json" ;; \
-	      linear) LATEST_JSON="artifacts/model_runs/latest_linear.json" ;; \
-	      tft) LATEST_JSON="artifacts/model_runs/latest_tft.json" ;; \
-	    esac; \
-	    if [ ! -f "$$LATEST_JSON" ]; then LATEST_JSON="artifacts/model_runs/latest.json"; fi; \
-	    RUN_ID_FROM_LATEST=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
-	    test -n "$$RUN_ID_FROM_LATEST" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
-	    RUN_ID="$$RUN_ID_FROM_LATEST"; \
-	    MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
-	  fi; \
 	  test -f "$$MANIFEST" || (echo "Missing manifest: $$MANIFEST" && exit 1); \
 	  for DA_ROLE in $(GRID_DA_ROLES); do \
 	    OUT_ROOT="artifacts/simulation_runs/quantile_grid_smoke_$${DA_ROLE}_$(SIM_GRID_STAMP)/$${MODEL}"; \

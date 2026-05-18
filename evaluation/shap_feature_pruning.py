@@ -432,15 +432,15 @@ def main() -> None:
             model_path = _select_model_path(Path(args.run_dir))
         else:
             # In auto mode with script existing but no SHAP values, we still need model path.
-            # Try latest pointer as convenience.
-            latest = Path("artifacts/model_runs/latest.json")
+            # Try model-specific latest pointer as convenience.
+            latest = Path("artifacts/model_runs/latest_xgboost.json")
             if latest.exists():
                 latest_payload = json.loads(latest.read_text(encoding="utf-8"))
                 rid = str(latest_payload.get("run_id", "")).strip()
                 if rid:
                     model_path = _select_model_path(Path("artifacts/model_runs") / rid)
                 else:
-                    raise ValueError("Could not resolve run_id from artifacts/model_runs/latest.json.")
+                    raise ValueError("Could not resolve run_id from artifacts/model_runs/latest_xgboost.json.")
             elif args.mode == "compute_only" or shap_scripts_exist:
                 raise ValueError("Model path not resolvable. Provide --run-dir or --model-path.")
             else:

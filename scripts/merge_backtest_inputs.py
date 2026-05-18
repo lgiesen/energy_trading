@@ -21,7 +21,8 @@ def _resolve_manifest(path: Path) -> tuple[dict, str | None]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Merge DA and aFRR prediction tables for simulation.")
-    p.add_argument("--run-manifest", default="artifacts/model_runs/latest.json")
+    p.add_argument("--model-key", choices=["xgboost", "linear", "tft"], default="xgboost")
+    p.add_argument("--run-manifest", default="")
     p.add_argument("--split", choices=["val", "test"], default="test")
     p.add_argument(
         "--out",
@@ -33,7 +34,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    manifest, run_id = _resolve_manifest(Path(args.run_manifest))
+    run_manifest = args.run_manifest.strip()
+    if not run_manifest:
+        run_manifest = f"artifacts/model_runs/latest_{args.model_key}.json"
+    manifest, run_id = _resolve_manifest(Path(run_manifest))
 
     da_pred = Path(manifest["bundles"]["da"]["predictions"][args.split])
     afrr_pred = Path(manifest["bundles"]["afrr"]["predictions"][args.split])

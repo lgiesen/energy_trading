@@ -11,7 +11,7 @@ Usage (manifest-autoload, recommended):
 
 Usage (explicit manifest path override):
     ./.venv/bin/python scripts/run_battery_backtest.py \
-      --run-manifest artifacts/model_runs/latest.json \
+      --run-manifest artifacts/model_runs/latest_xgboost.json \
       --split test
 
 Usage (manual files):

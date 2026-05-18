@@ -94,7 +94,7 @@ Notebook-Hinweis (Pfadstabilitaet):
 Purpose:
 - train DA and aFRR models into one versioned run artifact,
 - export predictions (`val`, `test`) in canonical simulation schema,
-- write `manifest.json` + `latest.json` for simulation autoload.
+- write `manifest.json` + `latest_<model>.json` for simulation autoload.
 
 ```bash
 ./.venv/bin/python scripts/train_and_export_runs.py \
@@ -108,7 +108,7 @@ Run outputs:
 - `artifacts/model_runs/<run_id>/models/*.joblib`
 - `artifacts/model_runs/<run_id>/metrics/*.json`
 - `artifacts/model_runs/<run_id>/predictions/*.parquet`
-- `artifacts/model_runs/latest.json`
+- `artifacts/model_runs/latest_<model>.json`
 
 Download challenger artifacts from server to local machine:
 
@@ -156,7 +156,7 @@ set -euo pipefail
 
 ./.venv/bin/python - <<'PY'
 import json, pathlib
-latest = json.loads(pathlib.Path("artifacts/model_runs/latest.json").read_text())
+latest = json.loads(pathlib.Path("artifacts/model_runs/latest_tft.json").read_text())
 run_id = latest["run_id"]
 pathlib.Path("artifacts/model_runs/latest_xgboost_run_id.txt").write_text(run_id + "\n")
 print("XGBoost run_id:", run_id)
@@ -174,7 +174,7 @@ PY
 
 ./.venv/bin/python - <<'PY'
 import json, pathlib
-latest = json.loads(pathlib.Path("artifacts/model_runs/latest.json").read_text())
+latest = json.loads(pathlib.Path("artifacts/model_runs/latest_xgboost.json").read_text())
 run_id = latest["run_id"]
 pathlib.Path("artifacts/model_runs/latest_tft_run_id.txt").write_text(run_id + "\n")
 print("TFT run_id:", run_id)
@@ -201,7 +201,7 @@ Purpose:
 
 ```bash
 ./.venv/bin/python scripts/run_battery_backtest.py \
-  --run-manifest artifacts/model_runs/latest.json \
+  --run-manifest artifacts/model_runs/latest_xgboost.json \
   --split test \
   --horizon-hours 48 \
   --reopt-step-hours 1 \
@@ -213,7 +213,7 @@ Optional explicit merge step (separate utility):
 
 ```bash
 ./.venv/bin/python scripts/merge_backtest_inputs.py \
-  --run-manifest artifacts/model_runs/latest.json \
+  --run-manifest artifacts/model_runs/latest_xgboost.json \
   --split test
 ```
 
