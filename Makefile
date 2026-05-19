@@ -76,7 +76,7 @@ TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 	audit-xgb audit-linear audit-tft \
 	thesis-report \
 	all-xgb all-linear all-tft \
-	smoke-test clean-markers
+	smoke-test smoke-xgb smoke-linear smoke-tft clean-markers
 
 help: ## Show available commands
 	@echo "Model pipelines:"
@@ -93,6 +93,9 @@ help: ## Show available commands
 	@echo ""
 	@echo "Global:"
 	@echo "  make smoke-test   # runs all-xgb, all-linear, all-tft with IS_SMOKE_TEST=1"
+	@echo "  make smoke-xgb    # smoke DAG only for XGBoost (24h/24h)"
+	@echo "  make smoke-linear # smoke DAG only for Linear (24h/24h)"
+	@echo "  make smoke-tft    # smoke DAG only for TFT (24h/24h)"
 	@echo "  make sim-all-quantiles  # run xgb/linear/tft simulation with standard thesis quantile sweep"
 	@echo "  make sim-grid-full      # all models x all strategies x DA-role(low/mid/high) x quantile pairs (test horizon)"
 	@echo "  make sim-grid-smoke     # same grid as sim-grid-full, but only GRID_SMOKE_HOURS"
@@ -121,6 +124,15 @@ all-tft: audit-tft ## Full TFT DAG
 smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-xgb
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-linear
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) all-tft
+
+smoke-xgb: ## Smoke pipeline for XGBoost only (24h train + 24h sim)
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-xgb
+
+smoke-linear: ## Smoke pipeline for Linear only (24h train + 24h sim)
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-linear
+
+smoke-tft: ## Smoke pipeline for TFT only (24h train + 24h sim)
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) all-tft
 
 $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
