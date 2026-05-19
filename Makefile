@@ -12,7 +12,7 @@ export NUMEXPR_NUM_THREADS := 1
 
 SEED ?= 42
 FORECAST_HOURS ?= 48
-SIM_HORIZON_HOURS ?= 48
+SIM_HORIZON_HOURS ?= auto
 export IS_SMOKE_TEST ?= 0
 SIM_SMOKE_DAYS ?= 7
 DEVICE ?= cuda
@@ -241,16 +241,27 @@ train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on tune-tft output)
 
 define SIM_RULE
 $($(1)_SIM_DONE): $$($(1)_MANIFEST)
-	case "$(SIM_HORIZON_HOURS)" in ''|*[!0-9]*) echo "SIM_HORIZON_HOURS must be an integer, got '$(SIM_HORIZON_HOURS)'"; exit 1;; esac
+	if [ "$(SIM_HORIZON_HOURS)" != "auto" ]; then \
+	  case "$(SIM_HORIZON_HOURS)" in ''|*[!0-9]*) echo "SIM_HORIZON_HOURS must be an integer or 'auto', got '$(SIM_HORIZON_HOURS)'"; exit 1;; esac; \
+	fi
+	SIM_HOURS=$(SIM_HORIZON_HOURS); \
+	if [ "$$$$SIM_HOURS" = "auto" ]; then \
+	  SIM_HOURS=$$$$(python3 -c "import json,sys;from pathlib import Path;m=Path('$$($(1)_MANIFEST)');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
+if ctx.exists(): \
+  cd=json.loads(ctx.read_text(encoding='utf-8')); \
+  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
+print(h if h else '48')"); \
+	fi; \
+	case "$$$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$$$SIM_HOURS' (manifest=$$($(1)_MANIFEST))"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=(sim_start+pd.Timedelta(days=int('$(SIM_SMOKE_DAYS)'))) if '$(IS_SMOKE_TEST)'=='1' else test_end;print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
 	for DA_ROLE in $(SIM_DA_ROLES); do \
 	  OUT_ROOT="artifacts/simulation_runs/default_$(2)_$(3)/$$$$DA_ROLE"; \
-	  echo "[SIM] model=$(2) da_role=$$$$DA_ROLE out=$$$$OUT_ROOT"; \
+	  echo "[SIM] model=$(2) run_id=$(3) manifest=$$($(1)_MANIFEST) horizon_hours=$$$$SIM_HOURS da_role=$$$$DA_ROLE start=$$$$SIM_START end=$$$$SIM_END out=$$$$OUT_ROOT"; \
 	  python3 scripts/run_battery_backtest.py \
 	    --run-manifest "$$($(1)_MANIFEST)" \
 	    --split test \
 	    --model-key $(2) \
-	    --horizon-hours $(SIM_HORIZON_HOURS) \
+	    --horizon-hours "$$$$SIM_HOURS" \
 	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
 	    --da-quantile-role "$$$$DA_ROLE" \
 	    --start "$$$$SIM_START" \
@@ -270,15 +281,29 @@ sim-tft: $(TFT_SIM_DONE) ## Run TFT simulation
 sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboost.json
 	@LATEST_JSON="artifacts/model_runs/latest_xgboost.json"; \
 	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
+	if [ "$(SIM_HORIZON_HOURS)" != "auto" ]; then \
+	  case "$(SIM_HORIZON_HOURS)" in ''|*[!0-9]*) echo "SIM_HORIZON_HOURS must be an integer or 'auto', got '$(SIM_HORIZON_HOURS)'"; exit 1;; esac; \
+	fi; \
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
+	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
+	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
+	if [ "$$SIM_HOURS" = "auto" ]; then \
+	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
+if ctx.exists(): \
+  cd=json.loads(ctx.read_text(encoding='utf-8')); \
+  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
+print(h if h else '48')"); \
+	fi; \
+	case "$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$SIM_HOURS' (manifest=$$MANIFEST_PATH)"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
-	echo "[INFO] sim-latest-xgb using $$LATEST_JSON"; \
+	echo "[INFO] sim-latest-xgb model=xgboost run_id=$$RUN_ID manifest=$$MANIFEST_PATH horizon_hours=$$SIM_HOURS using $$LATEST_JSON"; \
 	for DA_ROLE in $(SIM_DA_ROLES); do \
 	  python3 scripts/run_battery_backtest.py \
 	    --run-manifest "$$MANIFEST_PATH" \
 	    --split test \
 	    --model-key xgboost \
+	    --horizon-hours "$$SIM_HOURS" \
 	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
 	    --da-quantile-role "$$DA_ROLE" \
 	    --start "$$SIM_START" \
@@ -288,15 +313,29 @@ sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboos
 sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_linear.json
 	@LATEST_JSON="artifacts/model_runs/latest_linear.json"; \
 	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
+	if [ "$(SIM_HORIZON_HOURS)" != "auto" ]; then \
+	  case "$(SIM_HORIZON_HOURS)" in ''|*[!0-9]*) echo "SIM_HORIZON_HOURS must be an integer or 'auto', got '$(SIM_HORIZON_HOURS)'"; exit 1;; esac; \
+	fi; \
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
+	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
+	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
+	if [ "$$SIM_HOURS" = "auto" ]; then \
+	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
+if ctx.exists(): \
+  cd=json.loads(ctx.read_text(encoding='utf-8')); \
+  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
+print(h if h else '48')"); \
+	fi; \
+	case "$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$SIM_HOURS' (manifest=$$MANIFEST_PATH)"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
-	echo "[INFO] sim-latest-linear using $$LATEST_JSON"; \
+	echo "[INFO] sim-latest-linear model=linear run_id=$$RUN_ID manifest=$$MANIFEST_PATH horizon_hours=$$SIM_HOURS using $$LATEST_JSON"; \
 	for DA_ROLE in $(SIM_DA_ROLES); do \
 	  python3 scripts/run_battery_backtest.py \
 	    --run-manifest "$$MANIFEST_PATH" \
 	    --split test \
 	    --model-key linear \
+	    --horizon-hours "$$SIM_HOURS" \
 	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
 	    --da-quantile-role "$$DA_ROLE" \
 	    --start "$$SIM_START" \
@@ -306,15 +345,29 @@ sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_lin
 sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.json
 	@LATEST_JSON="artifacts/model_runs/latest_tft.json"; \
 	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
+	if [ "$(SIM_HORIZON_HOURS)" != "auto" ]; then \
+	  case "$(SIM_HORIZON_HOURS)" in ''|*[!0-9]*) echo "SIM_HORIZON_HOURS must be an integer or 'auto', got '$(SIM_HORIZON_HOURS)'"; exit 1;; esac; \
+	fi; \
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
+	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
+	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
+	if [ "$$SIM_HOURS" = "auto" ]; then \
+	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
+if ctx.exists(): \
+  cd=json.loads(ctx.read_text(encoding='utf-8')); \
+  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
+print(h if h else '48')"); \
+	fi; \
+	case "$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$SIM_HOURS' (manifest=$$MANIFEST_PATH)"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
-	echo "[INFO] sim-latest-tft using $$LATEST_JSON"; \
+	echo "[INFO] sim-latest-tft model=tft run_id=$$RUN_ID manifest=$$MANIFEST_PATH horizon_hours=$$SIM_HOURS using $$LATEST_JSON"; \
 	for DA_ROLE in $(SIM_DA_ROLES); do \
 	  python3 scripts/run_battery_backtest.py \
 	    --run-manifest "$$MANIFEST_PATH" \
 	    --split test \
 	    --model-key tft \
+	    --horizon-hours "$$SIM_HOURS" \
 	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
 	    --da-quantile-role "$$DA_ROLE" \
 	    --start "$$SIM_START" \
