@@ -246,11 +246,7 @@ $($(1)_SIM_DONE): $$($(1)_MANIFEST)
 	fi
 	SIM_HOURS=$(SIM_HORIZON_HOURS); \
 	if [ "$$$$SIM_HOURS" = "auto" ]; then \
-	  SIM_HOURS=$$$$(python3 -c "import json,sys;from pathlib import Path;m=Path('$$($(1)_MANIFEST)');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
-if ctx.exists(): \
-  cd=json.loads(ctx.read_text(encoding='utf-8')); \
-  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
-print(h if h else '48')"); \
+	  SIM_HOURS=$$$$(python3 -c "import json;from pathlib import Path;m=Path('$$($(1)_MANIFEST)');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
 	fi; \
 	case "$$$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$$$SIM_HOURS' (manifest=$$($(1)_MANIFEST))"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=(sim_start+pd.Timedelta(days=int('$(SIM_SMOKE_DAYS)'))) if '$(IS_SMOKE_TEST)'=='1' else test_end;print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
@@ -289,11 +285,7 @@ sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboos
 	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
 	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
 	if [ "$$SIM_HOURS" = "auto" ]; then \
-	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
-if ctx.exists(): \
-  cd=json.loads(ctx.read_text(encoding='utf-8')); \
-  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
-print(h if h else '48')"); \
+	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
 	fi; \
 	case "$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$SIM_HOURS' (manifest=$$MANIFEST_PATH)"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
@@ -321,11 +313,7 @@ sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_lin
 	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
 	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
 	if [ "$$SIM_HOURS" = "auto" ]; then \
-	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
-if ctx.exists(): \
-  cd=json.loads(ctx.read_text(encoding='utf-8')); \
-  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
-print(h if h else '48')"); \
+	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
 	fi; \
 	case "$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$SIM_HOURS' (manifest=$$MANIFEST_PATH)"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
@@ -353,11 +341,7 @@ sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.js
 	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
 	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
 	if [ "$$SIM_HOURS" = "auto" ]; then \
-	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=''; \
-if ctx.exists(): \
-  cd=json.loads(ctx.read_text(encoding='utf-8')); \
-  h=str(cd.get('cli_args',{}).get('forecast_horizon_hours','')).strip(); \
-print(h if h else '48')"); \
+	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
 	fi; \
 	case "$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$SIM_HOURS' (manifest=$$MANIFEST_PATH)"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
