@@ -1,0 +1,169 @@
+\chapter{Appendix}
+
+\section{Nomenclature}\label{sec:app-nomenclature}
+
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.20\textwidth} >{\raggedright\arraybackslash}p{0.62\textwidth} >{\raggedright\arraybackslash}p{0.12\textwidth}@{}}
+    \caption{Full nomenclature (all symbols used in the model and reporting).}\label{tab:app-nomenclature-full}                                      \\
+    \toprule
+    \textbf{Symbol}                           & \textbf{Description}                                                                 & \textbf{Unit} \\
+    \midrule
+    \endfirsthead
+    \multicolumn{3}{l}{\textit{Table \ref{tab:app-nomenclature-full} continued}}                                                                     \\
+    \toprule
+    \textbf{Symbol}                           & \textbf{Description}                                                                 & \textbf{Unit} \\
+    \midrule
+    \endhead
+    \midrule
+    \multicolumn{3}{r}{\textit{Continued on next page}}                                                                                              \\
+    \endfoot
+    \bottomrule
+    \endlastfoot
+    \multicolumn{3}{l}{\textit{Physical and operational symbols}}                                                                                    \\
+    $SoC_t$                                   & State of charge at time $t$ (end-of-interval after modeled trading/activation flows) & MWh           \\
+    $SoC_{\min}$                              & Minimum allowable state of charge                                                    & MWh           \\
+    $SoC_{\max}$                              & Maximum allowable state of charge                                                    & MWh           \\
+    $SoC_0$                                   & Initial state of charge                                                              & MWh           \\
+    $SoC_T$                                   & Terminal state of charge                                                             & MWh           \\
+    $E_{\text{cap}}$                          & Usable battery energy capacity                                                       & MWh           \\
+    $E_{\text{recv},t}$                       & DA/ID charging energy settled in the market                                          & MWh           \\
+    $E_{\text{sent},t}$                       & DA/ID discharging energy settled in the market                                       & MWh           \\
+    $E_{\text{recv},t}^{\text{plan}}$         & Planned charging energy in interval $t$ (ex-ante)                                    & MWh           \\
+    $E_{\text{sent},t}^{\text{plan}}$         & Planned discharging energy in interval $t$ (ex-ante)                                 & MWh           \\
+    $E_{\text{act},t}$                        & Activated reserve energy volume (signed)                                             & MWh           \\
+    $E_{\text{act},t}^{+}$                    & Positive activation component (upward/discharging)                                   & MWh           \\
+    $E_{\text{act},t}^{-}$                    & Negative activation component (downward/charging)                                    & MWh           \\
+    $E_{\text{recv},t}^{\text{SoC}}$          & Total charging energy used for SoC update (DA/ID + activation)                       & MWh           \\
+    $E_{\text{sent},t}^{\text{SoC}}$          & Total discharging energy used for SoC update (DA/ID + activation)                    & MWh           \\
+    $E_{\text{act},t}^{\uparrow}$             & Upward activated reserve energy volume (system level)                                & MWh           \\
+    $E_{\text{act},t}^{\downarrow}$           & Downward activated reserve energy volume (system level)                              & MWh           \\
+    $E_t$                                     & Discharging energy decision variable (rolling horizon section)                       & MWh           \\
+    $L_t$                                     & Charging energy decision variable (rolling horizon section)                          & MWh           \\
+    $P_{\text{max}}$                          & Rated charging/discharging converter power                                           & MW            \\
+    $P_{\text{bid},t}$                        & Bid capacity for reserve market                                                      & MW            \\
+    $P_{\text{bid},t}^{\uparrow}$             & Upward reserve bid component                                                         & MW            \\
+    $P_{\text{bid},t}^{\downarrow}$           & Downward reserve bid component                                                       & MW            \\
+    $P_{\text{bid,min}}$                      & Minimum admissible aFRR bid capacity                                                 & MW            \\
+    $P_{\text{bid,max}}$                      & Maximum admissible aFRR bid capacity                                                 & MW            \\
+    $\Delta P_{\text{bid}}$                   & aFRR bid granularity (step size)                                                     & MW            \\
+    $P_{\text{proc},t}^{\uparrow}$            & Procured upward aFRR capacity (system level)                                         & MW            \\
+    $P_{\text{proc},t}^{\downarrow}$          & Procured downward aFRR capacity (system level)                                       & MW            \\
+    $\Delta t$                                & Duration of one model interval                                                       & h             \\
+    $T$                                       & Number of intervals in the optimization horizon                                      & -             \\
+    $u_t$                                     & Binary operation state (1 charging, 0 discharging)                                   & -             \\
+    $u_{\text{bid},t}^{\uparrow}$             & Binary decision variable for submitting an upward reserve bid                        & -             \\
+    $u_{\text{bid},t}^{\downarrow}$           & Binary decision variable for submitting a downward reserve bid                       & -             \\
+    $y_t^{\text{en}}$                         & Binary market-mode variable for DA/ID energy trading                                 & -             \\
+    $y_t^{\text{res}}$                        & Binary market-mode variable for aFRR reserve participation                           & -             \\
+    $z_t^{\uparrow}$                          & Binary directional reserve switch for upward aFRR offering                           & -             \\
+    $z_t^{\downarrow}$                        & Binary directional reserve switch for downward aFRR offering                         & -             \\
+    $n_t$                                     & Integer bid-step variable                                                            & -             \\
+    $\eta_{\text{in}}$                        & Charging efficiency (meter-to-cell)                                                  & -             \\
+    $\eta_{\text{out}}$                       & Discharging efficiency (cell-to-meter)                                               & -             \\
+    $\eta_{\text{rt}}$                        & Round-trip efficiency (parameterization)                                             & -             \\
+    $\eta_1$                                  & Efficiency term used in rolling-horizon objective                                    & -             \\
+    $\eta$                                    & Generic efficiency parameter in optimization constraints                             & -             \\
+    \multicolumn{3}{l}{\textit{Economic, pricing, and settlement symbols}}                                                                           \\
+    $\lambda_{\text{mkt},t}$                  & Realized DA/ID market price                                                          & €/MWh         \\
+    $\hat{\lambda}_{\text{mkt},t}$            & Forecasted DA/ID market price                                                        & €/MWh         \\
+    $\lambda_{\text{clr},t}$                  & Realized aFRR activation clearing price                                              & €/MWh         \\
+    $\hat{\lambda}_{\text{clr},t}$            & Forecasted aFRR activation clearing price                                            & €/MWh         \\
+    $P_{DA,t}$                                & Day-Ahead energy price at time $t$                                                   & €/MWh         \\
+    $C_{\text{deg}}$                          & Degradation cost per internal throughput unit                                        & €/MWh         \\
+    $C_{\text{bid},t}$                        & Realized aFRR capacity price (pay-as-bid)                                            & €/MW/h        \\
+    $\hat{C}_{\text{bid},t}$                  & Forecasted aFRR capacity price                                                       & €/MW/h        \\
+    $C_{\text{pos},t}$                        & Non-energy activation cost for upward activation                                     & €             \\
+    $C_{\text{neg},t}$                        & Non-energy activation cost for downward activation                                   & €             \\
+    \multicolumn{3}{l}{\textit{Forecast and ML mapping symbols}}                                                                                     \\
+    $\mathbf{X}_t$                            & Feature vector at time $t$                                                           & -             \\
+    $g_{\text{bid}}(\cdot)$                   & Forecast mapping from features to capacity price                                     & -             \\
+    $g_{\text{clr}}(\cdot)$                   & Forecast mapping from features to activation clearing price                          & -             \\
+    $g_{\uparrow}(\cdot)$                     & Forecast mapping from features to upward activation probability                      & -             \\
+    $g_{\downarrow}(\cdot)$                   & Forecast mapping from features to downward activation probability                    & -             \\
+    $\mathcal{P}_{\text{act},t}^{\uparrow}$   & Predicted probability of upward activation                                           & -             \\
+    $\mathcal{P}_{\text{act},t}^{\downarrow}$ & Predicted probability of downward activation                                         & -             \\
+    $\alpha_{\text{sys},t}^{\uparrow}$        & Realized system-level upward activation rate                                         & -             \\
+    $\alpha_{\text{sys},t}^{\downarrow}$      & Realized system-level downward activation rate                                       & -             \\
+    $\alpha_{\text{sys},t}$                   & Generic system-level activation rate                                                 & -             \\
+    $\hat{\alpha}_{t}^{\uparrow}$             & Forecasted upward activation factor                                                  & -             \\
+    $\hat{\alpha}_{t}^{\downarrow}$           & Forecasted downward activation factor                                                & -             \\
+    $\hat{C}_{\text{marg},t}^{\uparrow}$      & Predicted marginal cost threshold for upward activation                              & €/MWh         \\
+    $\hat{C}_{\text{marg},t}^{\downarrow}$    & Predicted marginal cost threshold for downward activation                            & €/MWh         \\
+    $\hat{V}_{\text{SoC},t}$                  & Predicted value credit of stored energy after downward activation                    & €/MWh         \\
+    $M^{\uparrow}_t$                          & Expected upward activation margin component                                          & €/MWh         \\
+    $M^{\downarrow}_t$                        & Expected downward activation margin component                                        & €/MWh         \\
+    \multicolumn{3}{l}{\textit{Profit, objective, and operators}}                                                                                    \\
+    $\pi_t^{\text{chg}}$                      & Realized DA/ID charging-case cashflow                                                & €             \\
+    $\pi_t^{\text{dis}}$                      & Realized DA/ID discharging-case cashflow                                             & €             \\
+    $\pi_t^{\text{DA/ID}}$                    & Realized DA/ID net profit                                                            & €             \\
+    $\hat{\pi}_t^{\text{DA/ID}}$              & Expected DA/ID profit                                                                & €             \\
+    $\pi_t^{\text{cap}}$                      & Realized aFRR capacity profit                                                        & €             \\
+    $\pi_t^{\text{act}}$                      & Realized aFRR activation profit                                                      & €             \\
+    $\pi_t^{\text{aFRR}}$                     & Total realized aFRR profit                                                           & €             \\
+    $\hat{\pi}_t^{\text{aFRR}}$               & Expected aFRR profit                                                                 & €             \\
+    $\pi_t^{\text{spec,act}}$                 & Expected specific activation profit per reserved MW                                  & €/MW          \\
+    $\hat{\Pi}_{\text{tot}}$                  & Total expected profit over horizon                                                   & €             \\
+    $\Pi_{\text{real}}$                       & Total realized profit over evaluation horizon                                        & €             \\
+    $f$                                       & Rolling-horizon objective function value                                             & €             \\
+    $\mathbb{P}$                              & Probability operator                                                                 & -             \\
+\end{longtable}
+
+\section{AI Usage Declaration}\label{sec:app-ai-usage}
+Referenz/Declaration of AI usage (depth: kapitelspezifisch: in related work I used it for lit review - gemini was used to polish text) - 0,5 - 1 Seite
+
+--------
+
+every section:
+- re-/formulation of my bullet points
+
+introduction:
+- ergänzung der arguemnte für relevanz von Energy sector und meinem thesis thema auf basis meiner initialen brainstormings. Just to make sure I dont forget anything.
+
+theory
+- literature research: find relevant articles quicker
+-
+
+methodology
+-
+results
+-
+
+discussion
+-
+
+conclusion
+-
+
+coding
+- review of my code and challenge my ideas + brainstorming ideas on how to tackle issues, such as activation rate prediction (probabilistic approach)
+- generate code -> more specific
+- documentation of code
+
+
+------
+This section documents the use of artificial intelligence (AI) tools in accordance with good academic practice and transparency requirements. AI systems were used as auxiliary tools for language support and structured literature exploration; they were not used as autonomous scientific authors, and no AI-generated output was adopted without human verification.
+
+\textbf{Scope and depth of use (chapter-specific).}
+The use of AI was concentrated in the \textit{Related Work} part of the thesis process. Two distinct use cases were applied:
+\begin{itemize}
+    \item \textbf{Literature review support:} AI assistance was used to generate candidate keyword combinations, suggest potential thematic clusters, and propose initial structuring ideas for the state-of-research narrative.
+    \item \textbf{Language polishing (Gemini):} Gemini was used to improve wording quality, readability, and stylistic consistency of selected draft passages.
+\end{itemize}
+
+\textbf{What AI was not used for.}
+AI was not used to fabricate data, generate empirical results, run simulations, derive mathematical proofs, or make final methodological decisions. Model design, optimization formulation, parameterization, implementation logic, interpretation of findings, and all final scientific claims remain the sole responsibility of the author.
+
+\textbf{Quality assurance and validation procedure.}
+All AI-assisted content underwent manual verification before inclusion:
+\begin{itemize}
+    \item bibliographic candidates were checked against original sources;
+    \item theoretical statements were cross-checked with cited literature;
+    \item mathematical notation and equations were reviewed for consistency with the model implementation and nomenclature;
+    \item edited text was revised to preserve intended meaning and thesis-specific terminology.
+\end{itemize}
+Only content passing this review process was integrated into the manuscript.
+
+\textbf{Authorship and accountability.}
+The intellectual contribution, argumentation structure, critical assessment of prior work, and final written version were produced and approved by the author. AI tools served as assistive instruments comparable to advanced editorial support. Responsibility for accuracy, completeness, citation integrity, and compliance with university regulations lies fully with the author.
+
+\textbf{Summary declaration.}
+AI support was limited, transparent, and chapter-focused (primarily Related Work), with Gemini used for text polishing and AI-assisted prompts used for literature review scaffolding. The scientific substance, methodology, and conclusions are independent author contributions.

@@ -14,6 +14,7 @@ SEED ?= 42
 FORECAST_HOURS ?= 48
 SIM_HORIZON_HOURS ?= 48
 export IS_SMOKE_TEST ?= 0
+SIM_SMOKE_DAYS ?= 7
 DEVICE ?= cuda
 TFT_PRECISION ?= bf16-mixed
 LEAD_WEIGHT_START ?= 16
@@ -21,9 +22,10 @@ LEAD_WEIGHT_END ?= 48
 LEAD_WEIGHT_MAX ?= 2.0
 LINEAR_AFRR_PARALLEL_JOBS ?= 1
 LINEAR_LEAD_PARALLEL_JOBS ?= 4
-SIM_QUANTILE_PAIRS ?=
-DA_QUANTILE_ROLE ?= mid
 SIM_QUANTILE_SWEEP_DEFAULT ?= p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90
+SIM_QUANTILE_PAIRS ?= $(SIM_QUANTILE_SWEEP_DEFAULT)
+SIM_DA_ROLES ?= low mid high
+DA_QUANTILE_ROLE ?= mid
 GRID_DA_ROLES ?= low mid high
 GRID_STRATEGIES ?= multi da_only afrr_only
 GRID_QUANTILE_PAIRS ?= $(SIM_QUANTILE_SWEEP_DEFAULT)
@@ -93,9 +95,9 @@ help: ## Show available commands
 	@echo ""
 	@echo "Global:"
 	@echo "  make smoke-test   # runs all-xgb, all-linear, all-tft with IS_SMOKE_TEST=1"
-	@echo "  make smoke-xgb    # smoke DAG only for XGBoost (24h/24h)"
-	@echo "  make smoke-linear # smoke DAG only for Linear (24h/24h)"
-	@echo "  make smoke-tft    # smoke DAG only for TFT (24h/24h)"
+	@echo "  make smoke-xgb    # smoke DAG only for XGBoost (24h train + 7d sim, full quantile/DA-role sweep)"
+	@echo "  make smoke-linear # smoke DAG only for Linear (24h train + 7d sim, full quantile/DA-role sweep)"
+	@echo "  make smoke-tft    # smoke DAG only for TFT (24h train + 7d sim, full quantile/DA-role sweep)"
 	@echo "  make sim-all-quantiles  # run xgb/linear/tft simulation with standard thesis quantile sweep"
 	@echo "  make sim-grid-full      # all models x all strategies x DA-role(low/mid/high) x quantile pairs (test horizon)"
 	@echo "  make sim-grid-smoke     # same grid as sim-grid-full, but only GRID_SMOKE_HOURS"
@@ -109,7 +111,7 @@ help: ## Show available commands
 	@echo "  SEED=42 FORECAST_HOURS=48 DEVICE=cuda|cpu"
 	@echo "  LINEAR_AFRR_PARALLEL_JOBS=1   # parallel aFRR target jobs for linear training"
 	@echo "  LINEAR_LEAD_PARALLEL_JOBS=4   # parallel lead-time jobs inside each linear target"
-	@echo "  SIM_QUANTILE_PAIRS='p50-p50,p30-p70,p10-p90' DA_QUANTILE_ROLE=mid|low|high"
+	@echo "  SIM_QUANTILE_PAIRS='p50-p50,p30-p70,p10-p90' SIM_DA_ROLES='low mid high'"
 	@echo "  LEAD_WEIGHT_START=16 LEAD_WEIGHT_END=48 LEAD_WEIGHT_MAX=2.0"
 	@echo "  HYBRID_RECO_CSV=... HYBRID_OUT=... HYBRID_GROUND_TRUTH=... HYBRID_SPLIT=test"
 
@@ -126,13 +128,13 @@ smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-linear
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) all-tft
 
-smoke-xgb: ## Smoke pipeline for XGBoost only (24h train + 24h sim)
+smoke-xgb: ## Smoke pipeline for XGBoost only (24h train + 7d sim)
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-xgb
 
-smoke-linear: ## Smoke pipeline for Linear only (24h train + 24h sim)
+smoke-linear: ## Smoke pipeline for Linear only (24h train + 7d sim)
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-linear
 
-smoke-tft: ## Smoke pipeline for TFT only (24h train + 24h sim)
+smoke-tft: ## Smoke pipeline for TFT only (24h train + 7d sim)
 	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) all-tft
 
 $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
@@ -240,22 +242,27 @@ train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on tune-tft output)
 define SIM_RULE
 $($(1)_SIM_DONE): $$($(1)_MANIFEST)
 	case "$(SIM_HORIZON_HOURS)" in ''|*[!0-9]*) echo "SIM_HORIZON_HOURS must be an integer, got '$(SIM_HORIZON_HOURS)'"; exit 1;; esac
-	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
-	python3 scripts/run_battery_backtest.py \
-	  --run-manifest "$$($(1)_MANIFEST)" \
-	  --split test \
-	  --model-key $(2) \
-	  --horizon-hours $(SIM_HORIZON_HOURS) \
-	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
-	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
-	  --start "$$$$SIM_START" \
-	  --end "$$$$SIM_END"
+	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=(sim_start+pd.Timedelta(days=int('$(SIM_SMOKE_DAYS)'))) if '$(IS_SMOKE_TEST)'=='1' else test_end;print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
+	for DA_ROLE in $(SIM_DA_ROLES); do \
+	  OUT_ROOT="artifacts/simulation_runs/default_$(2)_$(3)/$$$$DA_ROLE"; \
+	  echo "[SIM] model=$(2) da_role=$$$$DA_ROLE out=$$$$OUT_ROOT"; \
+	  python3 scripts/run_battery_backtest.py \
+	    --run-manifest "$$($(1)_MANIFEST)" \
+	    --split test \
+	    --model-key $(2) \
+	    --horizon-hours $(SIM_HORIZON_HOURS) \
+	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	    --da-quantile-role "$$$$DA_ROLE" \
+	    --start "$$$$SIM_START" \
+	    --end "$$$$SIM_END" \
+	    --out-dir "$$$$OUT_ROOT"; \
+	done
 	@touch $$($(1)_SIM_DONE)
 endef
 
-$(eval $(call SIM_RULE,XGB,xgboost))
-$(eval $(call SIM_RULE,LINEAR,linear))
-$(eval $(call SIM_RULE,TFT,tft))
+$(eval $(call SIM_RULE,XGB,xgboost,$(RUN_ID_XGB)))
+$(eval $(call SIM_RULE,LINEAR,linear,$(RUN_ID_LINEAR)))
+$(eval $(call SIM_RULE,TFT,tft,$(RUN_ID_TFT)))
 
 sim-xgb: $(XGB_SIM_DONE) ## Run XGBoost simulation
 sim-linear: $(LINEAR_SIM_DONE) ## Run Linear simulation
@@ -267,14 +274,17 @@ sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboos
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	echo "[INFO] sim-latest-xgb using $$LATEST_JSON"; \
-	python3 scripts/run_battery_backtest.py \
-	  --run-manifest "$$MANIFEST_PATH" \
-	  --split test \
-	  --model-key xgboost \
-	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
-	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
-	  --start "$$SIM_START" \
-	  --end "$$SIM_END"
+	for DA_ROLE in $(SIM_DA_ROLES); do \
+	  python3 scripts/run_battery_backtest.py \
+	    --run-manifest "$$MANIFEST_PATH" \
+	    --split test \
+	    --model-key xgboost \
+	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	    --da-quantile-role "$$DA_ROLE" \
+	    --start "$$SIM_START" \
+	    --end "$$SIM_END" \
+	    --out-dir "artifacts/simulation_runs/latest_xgboost/$$DA_ROLE"; \
+	done
 sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_linear.json
 	@LATEST_JSON="artifacts/model_runs/latest_linear.json"; \
 	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
@@ -282,14 +292,17 @@ sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_lin
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	echo "[INFO] sim-latest-linear using $$LATEST_JSON"; \
-	python3 scripts/run_battery_backtest.py \
-	  --run-manifest "$$MANIFEST_PATH" \
-	  --split test \
-	  --model-key linear \
-	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
-	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
-	  --start "$$SIM_START" \
-	  --end "$$SIM_END"
+	for DA_ROLE in $(SIM_DA_ROLES); do \
+	  python3 scripts/run_battery_backtest.py \
+	    --run-manifest "$$MANIFEST_PATH" \
+	    --split test \
+	    --model-key linear \
+	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	    --da-quantile-role "$$DA_ROLE" \
+	    --start "$$SIM_START" \
+	    --end "$$SIM_END" \
+	    --out-dir "artifacts/simulation_runs/latest_linear/$$DA_ROLE"; \
+	done
 sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.json
 	@LATEST_JSON="artifacts/model_runs/latest_tft.json"; \
 	test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
@@ -297,18 +310,21 @@ sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.js
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	echo "[INFO] sim-latest-tft using $$LATEST_JSON"; \
-	python3 scripts/run_battery_backtest.py \
-	  --run-manifest "$$MANIFEST_PATH" \
-	  --split test \
-	  --model-key tft \
-	  --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
-	  --da-quantile-role "$(DA_QUANTILE_ROLE)" \
-	  --start "$$SIM_START" \
-	  --end "$$SIM_END"
+	for DA_ROLE in $(SIM_DA_ROLES); do \
+	  python3 scripts/run_battery_backtest.py \
+	    --run-manifest "$$MANIFEST_PATH" \
+	    --split test \
+	    --model-key tft \
+	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	    --da-quantile-role "$$DA_ROLE" \
+	    --start "$$SIM_START" \
+	    --end "$$SIM_END" \
+	    --out-dir "artifacts/simulation_runs/latest_tft/$$DA_ROLE"; \
+	done
 sim-all-quantiles: clean-markers ## Run quantile sweep simulation for xgb, linear, tft
-	$(MAKE) sim-xgb SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
-	$(MAKE) sim-linear SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
-	$(MAKE) sim-tft SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" DA_QUANTILE_ROLE=mid
+	$(MAKE) sim-xgb SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" SIM_DA_ROLES="low mid high"
+	$(MAKE) sim-linear SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" SIM_DA_ROLES="low mid high"
+	$(MAKE) sim-tft SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" SIM_DA_ROLES="low mid high"
 
 sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs on full test horizon
 	@read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
@@ -377,7 +393,7 @@ $($(1)_AUDIT_ZIP): $$($(1)_SIM_DONE)
 	@pip freeze > "artifacts/model_runs/$(3)/metadata/pip_freeze.txt"
 	@git rev-parse HEAD > "artifacts/model_runs/$(3)/metadata/git_commit.txt" || true
 	@date -u +"%Y-%m-%dT%H:%M:%SZ" > "artifacts/model_runs/$(3)/metadata/timestamp_utc.txt"
-	@printf "SEED=%s\nFORECAST_HOURS=%s\nDEVICE=%s\nLEAD_WEIGHT_START=%s\nLEAD_WEIGHT_END=%s\nLEAD_WEIGHT_MAX=%s\nSIM_QUANTILE_PAIRS=%s\nDA_QUANTILE_ROLE=%s\n" "$(SEED)" "$(FORECAST_HOURS)" "$(DEVICE)" "$(LEAD_WEIGHT_START)" "$(LEAD_WEIGHT_END)" "$(LEAD_WEIGHT_MAX)" "$(SIM_QUANTILE_PAIRS)" "$(DA_QUANTILE_ROLE)" > "artifacts/model_runs/$(3)/metadata/run_parameters.txt"
+	@printf "SEED=%s\nFORECAST_HOURS=%s\nDEVICE=%s\nLEAD_WEIGHT_START=%s\nLEAD_WEIGHT_END=%s\nLEAD_WEIGHT_MAX=%s\nSIM_QUANTILE_PAIRS=%s\nSIM_DA_ROLES=%s\nDA_QUANTILE_ROLE=%s\n" "$(SEED)" "$(FORECAST_HOURS)" "$(DEVICE)" "$(LEAD_WEIGHT_START)" "$(LEAD_WEIGHT_END)" "$(LEAD_WEIGHT_MAX)" "$(SIM_QUANTILE_PAIRS)" "$(SIM_DA_ROLES)" "$(DA_QUANTILE_ROLE)" > "artifacts/model_runs/$(3)/metadata/run_parameters.txt"
 	@python3 scripts/package_audit.py "$(3)"
 endef
 

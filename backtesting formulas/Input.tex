@@ -1,0 +1,759 @@
+
+TODO: extra energy in battery is added to the profit as if it was sold at market price at the end of the simulation: $terminal_delta_value = (SoC_end - SoC_start) * eta_out * terminal_price$
+
+\section{Decision and Economic Analysis}
+This section applies a quantitative, model-based techno-economic analysis aligned with the research question: whether probabilistic forecasting improves economically relevant \gls{bess} dispatch decisions under physical and market constraints. The analytical framework combines (i) continuous linear optimization for ex-ante decision support, (ii) rolling-horizon backtesting with ex-post settlement, and (iii) comparative performance diagnostics across forecast quantiles and benchmark strategies. Hence, the methodological focus is not interpretive text analysis, but statistical-economic evaluation of realized cashflows, penalties, and risk-adjusted operational outcomes.
+
+\subsection{Dispatch Optimization}
+\label{subsec:dispatch-optimization}
+The dispatch layer is formulated as a rolling continuous linear optimization problem that maximizes expected operating value subject to battery physics, inverter limits, and market participation constraints. In each optimization window, the decision vector includes \gls{da} charging/discharging setpoints, directional reserve commitments, auxiliary power variables, slack variables, and state trajectories.
+
+Let $t\in\{1,\dots,T\}$ index hourly time steps. The soft-penalty objective is:
+\begin{equation}\label{eq:milp-objective-soft}
+    \max \; \hat{\Pi}^{\mathrm{LP}}
+    =
+    \sum_{t=1}^{T}\left(\hat{\pi}_{t}^{\mathrm{DA/ID}}+\hat{\pi}_{t}^{\mathrm{aFRR}}\right)
+    - \lambda \sum_{t=1}^{T}\left(s_{t}^{+}+s_{t}^{-}\right),
+\end{equation}
+where $s_t^+\ge 0$ and $s_t^-\ge 0$ are slack variables for upward/downward \gls{soc} safety violations, and $\lambda>0$ is the severe imbalance-penalty coefficient. This term enforces risk awareness without rendering extreme forecast scenarios trivially infeasible.
+
+The quantile-based reserve-feasibility constraints are implemented as soft constraints:
+\begin{equation}\label{eq:soft-p90-pos}
+    SoC_t - \sum_{b\in\mathcal{B}}\Big(\hat{p}^{+}_{\mathrm{acc},b,t}\,\hat{r}^{+}_{\tau,t}\,P^{+}_{b,t}\,\Delta t/\eta_{\text{out}}\Big) + s_t^{+}
+    \ge SoC_{\min},
+\end{equation}
+\begin{equation}\label{eq:soft-p90-neg}
+    SoC_t + \sum_{b\in\mathcal{B}}\Big(\hat{p}^{-}_{\mathrm{acc},b,t}\,\hat{r}^{-}_{\tau,t}\,P^{-}_{b,t}\,\Delta t\,\eta_{\text{in}}\Big) - s_t^{-}
+    \le SoC_{\max}.
+\end{equation}
+Here, $\tau$ denotes the selected activation-rate forecast quantile used in the quantile sweep, for example $\tau \in \{0.50,\dots,0.99\}$.
+Thus, potential quantile-based headroom/footroom violations are explicitly priced in the objective rather than hidden in infeasibility artifacts.
+
+\subsection{Backtesting}
+Backtesting is performed in a causal rolling-horizon setting. At decision time $t$, forecasts available at $t$ are used to solve the continuous dispatch problem over horizon $H$ (here: 48 hours), but only the first control action is implemented:
+\begin{equation}\label{eq:rolling-policy}
+    \mathbf{u}^{*}_{t:t+H-1}
+    =
+    \arg\max_{\mathbf{u}} \hat{\Pi}_{t:t+H-1}(\mathbf{u}\mid\mathcal{F}_t),
+    \qquad
+    \mathbf{u}^{\mathrm{exec}}_{t}=\mathbf{u}^{*}_{t}.
+\end{equation}
+After market clearing and physical settlement, the state is updated and the optimization is repeated at $t+1$. This reproduces operational receding-horizon control and avoids look-ahead bias.
+
+Daily \gls{da} gate closure is represented by lock-in logic: previously committed \gls{da} schedules for already-closed delivery intervals are fixed in subsequent re-optimizations. Hence, only non-closed periods remain decision variables, while historical commitments are treated as binding constraints.
+
+Realized ex-post settlement is evaluated on true market outcomes:
+\begin{equation}\label{eq:realized-hourly-pnl}
+    \pi^{\mathrm{real}}_{t}
+    =
+    \pi^{\mathrm{DA/ID}}_{t}
+    +
+    \pi^{\mathrm{aFRR}}_{t}
+    -
+    C_{pen,t}
+    -
+    C_{tx,t}
+    -
+    C^{\mathrm{deg}}_{t}.
+\end{equation}
+The cumulative realized strategy value is
+\begin{equation}\label{eq:realized-total-pnl}
+    \Pi^{\mathrm{real}}=\sum_{t=1}^{T}\pi^{\mathrm{real}}_t + V_{\mathrm{term}}.
+\end{equation}
+
+For benchmarking, two reference policies are used:
+\begin{align}
+    \Pi^{\mathrm{naive}}  & : \text{forecast-driven benchmark without advanced probabilistic structure},          \\
+    \Pi^{\mathrm{oracle}} & : \text{perfect-foresight upper bound using realized prices/activations in planning}.
+\end{align}
+The oracle is interpreted as an informational upper bound, not as an implementable trading policy.
+
+
+This section is organized as follows: physical feasibility and \gls{soc} accounting first, then \gls{da}/\gls{id} and \gls{afrr} profit models (ex-post and ex-ante), followed by the master objective and assumptions.
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.34\textwidth} >{\raggedright\arraybackslash}p{0.46\textwidth} >{\raggedright\arraybackslash}p{0.14\textwidth}@{}}
+    \caption{Compact nomenclature (symbols used in Chapter~\ref{ch:analysis}).}\label{tab:nomenclature}                                                                                                                                                                                                                                                                                                                                                                                  \\
+    \toprule
+    \textbf{Symbol}                                                                                                                                                                                                                                                                                           & \textbf{Description}                                                                                                               & \textbf{Unit}                       \\
+    \midrule
+    \endfirsthead
+    \multicolumn{3}{l}{\textit{Table \ref{tab:nomenclature} continued}}                                                                                                                                                                                                                                                                                                                                                                                                                  \\
+    \toprule
+    \textbf{Symbol}                                                                                                                                                                                                                                                                                           & \textbf{Description}                                                                                                               & \textbf{Unit}                       \\
+    \midrule
+    \endhead
+    \midrule
+    \multicolumn{3}{r}{\textit{Continued on next page}}                                                                                                                                                                                                                                                                                                                                                                                                                                  \\
+    \endfoot
+    \bottomrule
+    \endlastfoot
+    \begin{tabular}[t]{@{}l@{}}$SoC_{0/t/T},\,SoC_{\min/\max}$\end{tabular}                                                                                                                                                                                                                                   & State of charge variable and lower/upper/initial/terminal bounds ($SoC_t$: end-of-interval after modeled trading/activation flows) & MWh                                 \\
+    $E_{\text{cap}},\,P_{\text{max}},\,\Delta t,\,T$                                                                                                                                                                                                                                                          & Battery energy/power ratings and horizon indexing                                                                                  & MWh, MW, h, -                       \\
+    \begin{tabular}[t]{@{}l@{}}$E_{\text{recv},t},\,E_{\text{sent},t}$\\$E_{\text{recv},t}^{\text{plan}},\,E_{\text{sent},t}^{\text{plan}}$\\$E^{DA/ID}_{\mathrm{recv},t},\,E^{DA/ID}_{\mathrm{sent},t}$\end{tabular}                                                                                         & DA/ID charging/discharging energies (settled ex-post and planned ex-ante)                                                          & MWh                                 \\
+    $E_{\text{act},t},\,E_{\text{act},t}^{+},\,E_{\text{act},t}^{-}$                                                                                                                                                                                                                                          & Signed and split activation energies (upward/downward components)                                                                  & MWh                                 \\
+    $E_{\text{recv},t}^{\text{SoC}},\,E_{\text{sent},t}^{\text{SoC}}$                                                                                                                                                                                                                                         & Total physical SoC-relevant charging/discharging energies                                                                          & MWh                                 \\
+    $\eta_{\text{in}},\,\eta_{\text{out}}$                                                                                                                                                                                                                                                                    & Charging/discharging efficiencies                                                                                                  & -                                   \\
+    $\lambda_{\text{mkt},t},\,\lambda_{\text{clr},t}$                                                                                                                                                                                                                                                         & Realized DA/ID market price and aFRR activation clearing price                                                                     & €/MWh                               \\
+    $\hat{\lambda}_{\text{mkt},t},\,\hat{\lambda}_{\text{clr},t}$                                                                                                                                                                                                                                             & Forecasted DA/ID market price and forecasted aFRR clearing price                                                                   & €/MWh                               \\
+    $C_{\text{deg}}$                                                                                                                                                                                                                                                                                          & Degradation cost parameter                                                                                                         & €/MWh                               \\
+    $\Delta P_{j}^{d}$                                                                                                                                                                                                                                                                                        & Relative bid spread interval $j$ for direction $d$                                                                                 & €/MWh                               \\
+    $J,\,j$                                                                                                                                                                                                                                                                                                   & Set of discrete bid spread intervals and index                                                                                     & -                                   \\
+    \begin{tabular}[t]{@{}l@{}}$P_{\text{charge},t},\,P_{\text{discharge},t}$\\$R_t^{+},\,R_t^{-},\,R_{\max}$\\$P_{\text{bid},t},\,P_{\text{bid},t}^{\uparrow},\,P_{\text{bid},t}^{\downarrow}$\\$P_{\text{bid,min/max}},\,\Delta P_{\text{bid}}$\end{tabular}                                                                  & Continuous charging/discharging, reserve, and bid-volume variables                                                                & MW                                  \\
+    $m_{j}^{d}$                                                                                                                                                                                                                                                                                               & Scalar midpoint of the spread interval $j$                                                                                         & €/MWh                               \\
+    $\hat{p}_{\text{acc}, j, t}^{d}$                                                                                                                                                                                                                                                                          & Forecasted probability of bid acceptance for interval $j$                                                                          & \%                                  \\
+    $\tau,\,\hat{r}_{\tau,t}^{+},\,\hat{r}_{\tau,t}^{-}$                                                                                                                                                                                                                                                      & Selected activation-rate quantile and directional activation-rate forecasts used in the quantile sweep                             & -, \%                               \\
+    $s_t^{+},\,s_t^{-},\,\lambda$                                                                                                                                                                                                                                                                             & Soft-constraint slack variables and penalty coefficient                                                                            & MWh, €/MWh                          \\
+    $\mathcal{B},\,b,\,P_{b,t}^{+},\,P_{b,t}^{-}$                                                                                                                                                                                                                                                             & Bid-spread interval set, interval index, and directional bid volumes in the soft reserve-feasibility constraints                   & -, -, MW                            \\
+    $V_{\text{bid}, t}^{d}$                                                                                                                                                                                                                                                                                   & Submitted bid volume for direction $d$                                                                                             & MW                                  \\
+    $C_{\text{bid},t},\,C_{\text{bid},t}^{\uparrow,\downarrow},\,\hat{C}_{\text{bid},t}$                                                                                                                                                                                                                      & Realized directional and forecasted aFRR capacity prices                                                                           & €/MW/h                              \\
+    $C_{\text{pos},t},\,C_{\text{neg},t}$                                                                                                                                                                                                                                                                     & Non-energy activation costs for upward/downward activation                                                                         & €                                   \\
+    $\pi_t^{\text{chg}},\,\pi_t^{\text{dis}},\,\pi_t^{\text{DA/ID}}$                                                                                                                                                                                                                                          & Realized DA/ID cashflow components and total                                                                                       & €                                   \\
+    $\pi_t^{\text{cap}},\,\pi_t^{\text{act}},\,\pi_t^{\text{aFRR}}$                                                                                                                                                                                                                                           & Realized aFRR capacity, activation, and total profit components                                                                    & €                                   \\
+    $\hat{\pi}_t^{\text{DA/ID}},\,\hat{\pi}_t^{\text{aFRR}}$                                                                                                                                                                                                                                                  & Expected DA/ID and aFRR profit terms                                                                                               & €                                   \\
+    $\mathbf{X}_t,\,g_{\text{bid}}(\cdot),\,g_{\text{clr}}(\cdot),\,g_{\uparrow}(\cdot),\,g_{\downarrow}(\cdot)$                                                                                                                                                                                              & Feature vector and forecast mappings                                                                                               & -                                   \\
+    $C_{\text{marg},t}^{\uparrow},\,C_{\text{marg},t}^{\downarrow}$                                                                                                                                                                                                                                           & Directional marginal activation thresholds                                                                                         & €/MWh                               \\
+    $P_{\text{proc},t}^{\uparrow,\downarrow},\,E_{\text{act},t}^{\uparrow,\downarrow}$                                                                                                                                                                                                                        & Procured and activated system-level reserve quantities                                                                             & MW, MWh                             \\
+    $\hat{\Pi}_{\text{tot}},\,\Pi^{\mathrm{real}}$                                                                                                                                                                                                                                                            & Total expected and realized objective values                                                                                       & €                                   \\
+    $C_{tx,t}$, $c_{tx}$, $C_{pen,t}$                                                                                                                                                                                                                                                                         & Transaction cost, specific transaction fee, and non-delivery penalties at time $t$                                                 & \texteuro, \texteuro/MWh, \texteuro \\
+    $C^{\mathrm{deg}}_t,\,C^{\mathrm{tx}},\,C^{\mathrm{pen}},\,C^{\mathrm{deg}}$                                                                                                                                                                                                                              & Period-specific degradation cost and aggregate transaction, penalty, and degradation costs over the backtest                       & \texteuro                           \\
+    $CF_{net,t}$                                                                                                                                                                                                                                                                                              & Net liquid cashflow at time $t$ (excluding non-cash degradation)                                                                   & \texteuro                           \\
+    $Cash_0$                                                                                                                                                                                                                                                                                                  & Initial cash balance                                                                                                               & \texteuro                           \\
+    $V_{\mathrm{term}}$                                                                                                                                                                                                                                                                                       & Terminal Mark-to-Market value of the remaining sellable inventory                                                                  & \texteuro                           \\
+    $\text{max\_cap\_req}$                                                                                                                                                                                                                                                                                    & Peak cumulative drawdown / maximum working capital required                                                                        & \texteuro                           \\
+    $\text{EFC}$                                                                                                                                                                                                                                                                                              & Equivalent Full Cycles (internal chemical throughput)                                                                              & -                                   \\
+    $ROI_{cap}$                                                                                                                                                                                                                                                                                               & Return on maximum capital requirement                                                                                              & \%                                  \\
+\end{longtable}
+
+The complete list of symbols is provided in Appendix~\ref{sec:app-nomenclature}.
+
+\subsubsection{Model Scope and Timeline}
+The optimization horizon is indexed by $t=1,\dots,T$ with fixed hourly granularity $\Delta t=1$ h.
+The formulation separates ex-post (realized) settlement accounting from ex-ante expected-value decision support.
+In the rolling 48-hour receding-horizon implementation, the optimization is solved again for each daily auction using the newest forecasts.
+Only the decisions for the next auction are executed, while the remaining 48-hour plan is overwritten on the following day; therefore, energy left in the battery is carried forward as realized \gls{soc} and valued through the terminal mark-to-market term instead of being forced to be sold at the horizon end.
+
+\subsubsection{Numerical Parameterization}
+Table~\ref{tab:parameterization} summarizes the baseline numerical setup used in the current implementation.
+
+\begin{table}[H]
+    \centering
+    \caption{Baseline model parameterization and open parameter definitions.}\label{tab:parameterization}
+    \begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.16\textwidth} >{\raggedright\arraybackslash}p{0.13\textwidth} >{\raggedright\arraybackslash}p{0.11\textwidth} >{\raggedright\arraybackslash}X@{}}
+        \toprule
+        \textbf{Symbol}             & \textbf{Value}             & \textbf{Unit} & \textbf{Rationale}                                                                                \\
+        \midrule
+        $E_{\text{cap}}$            & 20.0                       & MWh           & Matches commercial BESS projects, such as Mühlacker (10 MW / 20 MWh) and Marbach (15 MW / 22 MWh) \\
+        $P_{\text{max}}$            & 10.0                       & MW            & Matches commercial BESS projects, such as Mühlacker (10 MW / 20 MWh)                              \\
+        $\eta_{\text{rt}}$          & 0.90                       & -             & AC-to-AC round-trip efficiency                                                                    \\
+        $\eta_{\text{in}}$          & 0.9487                     & -             & One-way efficiency ($\sqrt{0.9}$)                                                                 \\
+        $\eta_{\text{out}}$         & 0.9487                     & -             & One-way efficiency ($\sqrt{0.9}$)                                                                 \\
+        $SoC_{\min}$                & 2.00                       & MWh           & Minimum SoC health bound (10\% of $E_{\text{cap}}$)                                               \\
+        $SoC_{\max}$                & 18.00                      & MWh           & Maximum SoC health bound (90\% of $E_{\text{cap}}$)                                               \\
+        $SoC_{0}=0.5E_{\text{cap}}$ & 10.00                      & MWh           & Start at neutral SoC (50\% of $E_{\text{cap}}$)                                                   \\
+        $C_{\text{deg}}$            & 25.0                       & €/MWh         & Conservative marginal throughput wear cost                                                        \\
+        $\Delta t$                  & 1.0                        & h             & Modeling choice; hourly optimization granularity                                                  \\
+        $P_{\text{bid,min}}$        & 1.0                        & MW            & German market specification                                                                       \\
+        $\Delta P_{\text{bid}}$     & 1.0                        & MW            & German market specification                                                                       \\
+        \midrule
+        Terminal boundary choice    & Lower-bounded terminal SoC & -             & Fixed as $SoC_0 = 0.5E_{\text{cap}}$ and $SoC_T \ge 0.5E_{\text{cap}}$                            \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+The baseline parameterization uses $P_{\text{max}} = 10\,\text{MW}$ and $E_{\text{cap}} = 20\,\text{MWh}$, which corresponds to typical commercial grid-scale \gls{bess} in Germany suitable for frequency regulation markets (incl. \gls{afrr}). This configuration is validated by real-world projects such as Stadtwerke Mühlacker (10 MW / 20 MWh) \citep{Butler2026}, EnBW Marbach (15 MW / 22 MWh) \citep{EnBW2024}, and Qair Fuchsstadt (20 MW / 44 MWh) \citep{Qair2025}. These projects represent the common 1--2 hour duration class for utility-scale \gls{bess} participating in German electricity markets. \gls{soc} bounds (10--90\%) and initial conditions follow standard battery health management practices.
+
+\subsubsection{Physical State and Feasibility Constraints}
+Convention: $E_{\text{recv}, t}$ and $E_{\text{sent}, t}$ are AC-side metered energies at the grid connection point; therefore, charging maps to cells via $\eta_{\text{in}}$ and discharging maps from cells via $\eta_{\text{out}}$.
+
+\begin{equation}\label{eq:act-split}
+    E_{\text{act}, t}=E_{\text{act}, t}^{+}-E_{\text{act}, t}^{-},
+    \qquad
+    E_{\text{act}, t}^{+}\ge 0,\;E_{\text{act}, t}^{-}\ge 0
+\end{equation}
+\begin{equation}\label{eq:act-split-calc}
+    E_{\text{act}, t}^{+}=
+    \begin{cases}
+        E_{\text{act}, t}, & \text{if } E_{\text{act}, t}>0 \\
+        0,                 & \text{otherwise}
+    \end{cases}
+    ,\qquad
+    E_{\text{act}, t}^{-}=
+    \begin{cases}
+        -E_{\text{act}, t}, & \text{if } E_{\text{act}, t}<0 \\
+        0,                  & \text{otherwise}
+    \end{cases}
+\end{equation}
+\begin{equation}\label{eq:soc-flow-map}
+    E_{\text{recv}, t}^{\text{SoC}}=E_{\text{recv}, t}+E_{\text{act}, t}^{-},
+    \qquad
+    E_{\text{sent}, t}^{\text{SoC}}=E_{\text{sent}, t}+E_{\text{act}, t}^{+}
+\end{equation}
+Formulas \ref{eq:act-split} and \ref{eq:act-split-calc} define how net signed activation is split into upward and downward components.
+Formula \ref{eq:soc-flow-map} then adds these directional components to the physical \gls{soc} charge/discharge flows.
+In the hourly net-mode model, activation is represented by net signed energy $E_{\text{act}, t}$; $E_{\text{act}, t}^{+}$ and $E_{\text{act}, t}^{-}$ are directional decomposition terms used for linear accounting.
+
+\begin{equation}\label{eq:soc-dynamics}
+    SoC_{t} =
+    \begin{cases}
+        SoC_{t-1} + (E_{\text{recv}, t}^{\text{SoC}} \cdot \eta_{\text{in}}),                 & \text{if charging } (E_{\text{recv}, t}^{\text{SoC}} > 0)    \\
+        SoC_{t-1} - \left( \frac{E_{\text{sent}, t}^{\text{SoC}}}{\eta_{\text{out}}} \right), & \text{if discharging } (E_{\text{sent}, t}^{\text{SoC}} > 0) \\
+        SoC_{t-1},                                                                            & \text{otherwise}
+    \end{cases}
+\end{equation}
+Charging uses $E_{\text{recv}, t}^{\text{SoC}}\cdot\eta_{\text{in}}$ in Formula \ref{eq:soc-dynamics} because only the efficiency-adjusted fraction of grid energy is stored in the cells.
+Discharging uses $E_{\text{sent}, t}^{\text{SoC}}/\eta_{\text{out}}$ in Formula \ref{eq:soc-dynamics} because exporting a given grid energy volume requires higher internal battery energy due to conversion losses.
+
+\begin{equation}\label{eq:soc-bounds}
+    SoC_{\min} \leq SoC_{t} \leq SoC_{\max}
+\end{equation}
+In Formula \ref{eq:soc-bounds}, this limit keeps the battery in a safe operating range and avoids harmful overcharging or deep discharging.
+
+\begin{equation}\label{eq:soc-cyclic}
+    SoC_{0} = 0.5 \cdot E_{\text{cap}},
+    \qquad
+    SoC_{T} \ge 0.5 \cdot E_{\text{cap}}
+\end{equation}
+In Formula \ref{eq:soc-cyclic}, the simulation starts at 50\% \gls{soc} and must not end below 50\%, so the optimizer cannot exploit horizon-end discharge while still allowing feasible reserve and dispatch decisions.
+
+\subsubsection{Operational Power and Market-Configuration Constraints}
+The implemented dispatch optimizer uses a continuous linear formulation. Charging and discharging powers are non-negative continuous variables and are bounded independently by the converter rating $P_{\text{max}}$. The formulation therefore does not introduce a binary charge/discharge mode switch.
+\begin{equation}\label{eq:charging_limit}
+    0 \le P_{\text{charge},t} \le P_{\max}
+\end{equation}
+\begin{equation}\label{eq:discharging_limit}
+    0 \le P_{\text{discharge},t} \le P_{\max}
+\end{equation}
+
+Reserve commitments are coupled to the same converter limit. Let $R_t^{+}$ denote upward reserve and $R_t^{-}$ downward reserve. Upward reserve requires discharge headroom, while downward reserve requires charge headroom:
+\begin{equation}\label{eq:reserve-power-coupling}
+    P_{\text{charge},t} + R^{-}_{t} \le P_{\max}
+\end{equation}
+\begin{equation}\label{eq:reserve-power-coupling-pos}
+    P_{\text{discharge},t} + R^{+}_{t} \le P_{\max}
+\end{equation}
+\begin{equation}\label{eq:reserve-total-limit}
+    R^{+}_{t}+R^{-}_{t}\le R_{\max}.
+\end{equation}
+These constraints limit total converter use but do not impose strict charge/discharge exclusivity.
+
+\begin{equation}\label{eq:bigm-charge-discharge}
+    \begin{aligned}
+        0 \leq E_{\text{recv}, t}^{\text{plan}} & \leq P_{\text{max}} \cdot \Delta t, \\
+        0 \leq E_{\text{sent}, t}^{\text{plan}} & \leq P_{\text{max}} \cdot \Delta t
+    \end{aligned}
+    \quad \forall t.
+\end{equation}
+Formula \ref{eq:bigm-charge-discharge} gives the equivalent planned-energy bounds without a binary mode variable.
+
+\begin{equation}\label{eq:market-mode}
+    \texttt{multi}: \quad
+    P_{\text{charge},t},\,P_{\text{discharge},t},\,R_t^{+},\,R_t^{-} \ge 0
+\end{equation}
+\begin{equation}\label{eq:market-mode-energy}
+    \texttt{da\_only}: \quad
+    R_t^{+}=R_t^{-}=0
+\end{equation}
+\begin{equation}\label{eq:market-mode-afrr}
+    \texttt{afrr\_only}: \quad
+    P_{\text{charge},t}=P_{\text{discharge},t}=0
+\end{equation}
+Formulas \ref{eq:market-mode}--\ref{eq:market-mode-afrr} describe run-configuration choices rather than hourly binary market-selection decisions. In \texttt{multi}, \gls{da} and \gls{afrr} variables are allowed simultaneously subject to converter and \gls{soc} constraints. In \texttt{da\_only}, reserve variables are clamped to zero. In \texttt{afrr\_only}, \gls{da} charge and discharge variables are clamped to zero.
+
+\begin{equation}\label{eq:energy-feasibility-up}
+    SoC_{t} - \frac{P_{\text{bid}, t}^{\uparrow} \cdot \Delta t}{\eta_{\text{out}}} \geq SoC_{\min}
+\end{equation}
+In Formula \ref{eq:energy-feasibility-up}, the battery must have enough energy to deliver the full upward reserve when called.
+
+\begin{equation}\label{eq:energy-feasibility-down}
+    SoC_{t} + P_{\text{bid}, t}^{\downarrow} \cdot \Delta t \cdot \eta_{\text{in}} \leq SoC_{\max}
+\end{equation}
+In Formula \ref{eq:energy-feasibility-down}, the battery must keep enough empty space to absorb the full downward reserve when called.
+In the stochastic rolling-horizon implementation, these deterministic bounds are replaced by the soft-penalty chance-constraints defined in Eq. \ref{eq:soft-p90-pos} and \ref{eq:soft-p90-neg} to ensure feasibility during extreme activation events.
+
+\begin{equation}\label{eq:activation-feasibility}
+    0 \leq E_{\text{act}, t}^{+} \leq P_{\text{bid}, t}^{\uparrow}\cdot\Delta t,
+    \qquad
+    0 \leq E_{\text{act}, t}^{-} \leq P_{\text{bid}, t}^{\downarrow}\cdot\Delta t
+\end{equation}
+Formula \ref{eq:activation-feasibility} limits upward and downward activated energy separately by the accepted directional reserve bids over the interval length.
+
+\begin{equation}\label{eq:bid-bigm}
+    \begin{aligned}
+        0 \leq P_{\text{bid}, t}^{\uparrow}   & \leq P_{\text{bid,max}},     \\
+        0 \leq P_{\text{bid}, t}^{\downarrow} & \leq P_{\text{bid,max}}.
+    \end{aligned}
+\end{equation}
+Formula \ref{eq:bid-bigm} bounds directional reserve bids as continuous variables.
+
+\begin{equation}\label{eq:bid-granularity}
+    0 \leq P_{\text{bid},t}^{d} \leq P_{\text{bid,max}} = P_{\text{max}},
+    \qquad d\in\{\uparrow,\downarrow\}.
+\end{equation}
+Formula \ref{eq:bid-granularity} states the continuous bid-volume bound used in the optimization; any reporting or market-facing rounding is handled outside the LP decision variables.
+
+\subsubsection{Day-Ahead \& Intraday Cashflow Model}
+To avoid pricing inconsistencies, \gls{da} and \gls{id} rescue trades are settled with distinct price processes. Let
+$E^{DA}_{\mathrm{recv},t},E^{DA}_{\mathrm{sent},t}$ denote \gls{da} charging/discharging grid energies, and
+$E^{ID}_{\mathrm{recv},t},E^{ID}_{\mathrm{sent},t}$ denote \gls{id} rescue charging/discharging grid energies.
+
+\begin{equation}\label{eq:pi-da}
+    \pi^{DA}_t
+    =
+    \underbrace{E^{DA}_{\mathrm{sent},t}\,\lambda_{\text{mkt},t}
+        -
+        E^{DA}_{\mathrm{recv},t}\,\lambda_{\text{mkt},t}}_{\text{DA energy cashflow}}
+\end{equation}
+
+\begin{equation}\label{eq:id-prices}
+    p^{ID}_{\mathrm{buy},t}=\min\!\left(3000,\lambda_{\text{mkt},t}+30\right),
+    \qquad
+    p^{ID}_{\mathrm{sell},t}=\max\!\left(-500,\lambda_{\text{mkt},t}-30\right)
+\end{equation}
+
+\begin{equation}\label{eq:pi-id}
+    \pi^{ID}_t
+    =
+    \underbrace{E^{ID}_{\mathrm{sent},t}\,p^{ID}_{\mathrm{sell},t}
+        -
+        E^{ID}_{\mathrm{recv},t}\,p^{ID}_{\mathrm{buy},t}}_{\text{ID rescue energy cashflow}}
+\end{equation}
+
+\begin{equation}\label{eq:pi-daid-realized-separated}
+    \pi^{\mathrm{DA/ID}}_t
+    =
+    \pi^{DA}_t+\pi^{ID}_t
+    -
+    \underbrace{C^{\mathrm{deg,DA/ID}}_t}_{\text{degradation on internal throughput}}
+\end{equation}
+
+with
+\begin{equation}\label{eq:cdeg-daid}
+    C^{\mathrm{deg,DA/ID}}_t
+    =
+    C_{\mathrm{deg}}
+    \left(
+    \eta_{\text{in}}\!\left(E^{DA}_{\mathrm{recv},t}+E^{ID}_{\mathrm{recv},t}\right)
+    +
+    \frac{E^{DA}_{\mathrm{sent},t}+E^{ID}_{\mathrm{sent},t}}{\eta_{\text{out}}}
+    \right).
+\end{equation}
+
+\subsubsection{aFRR Ex-Post Settlement Model}
+
+
+\subsubsection{Capacity Revenue ($\pi_{t}^{\text{cap}}$)}
+
+\begin{equation}\label{eq:pi-cap}
+    \pi_{t}^{\text{cap}} = P_{\text{bid}, t} \cdot C_{\text{bid}, t} \cdot \Delta t
+\end{equation}
+Formula \ref{eq:pi-cap} calculates the reserve-availability payment: reserved MW multiplied by the accepted capacity price and the length of the time interval.
+
+
+\subsubsection{Activation Revenue ($\pi_{t}^{\text{act}}$)}
+
+The model uses signed activation energy values ($E_{\text{act}, t}$). In the German \gls{afrr} settlement representation used here, $\lambda_{\text{clr}, t}$ is the signed clearing price paid by the \gls{tso} to the provider. Therefore, $E_{\text{act}, t}\cdot\lambda_{\text{clr}, t}$ captures both directions: upward activation ($E_{\text{act}, t}>0$) yields revenue, while downward activation ($E_{\text{act}, t}<0$) yields a cost unless $\lambda_{\text{clr}, t}<0$.
+
+Cost separation is defined to avoid double counting: ex-post activation cashflow includes settlement revenue and non-energy costs only ($C_{\text{pos}, t}$, $C_{\text{neg}, t}$), while energy replenishment effects are monetized later through realized \gls{da}/\gls{id} trades.
+
+\begin{equation}\label{eq:c-pos}
+    C_{\text{pos}, t} =
+    \underbrace{\left( \frac{E_{\text{act}, t}}{\eta_{\text{out}}} \cdot C_{\text{deg}} \right)}_{\text{Degradation (discharge)}}
+    \quad \text{for upward activation } (E_{\text{act}, t} > 0)
+\end{equation}
+
+\begin{equation}\label{eq:c-neg}
+    C_{\text{neg}, t} =
+    \underbrace{\left( \lvert E_{\text{act}, t}\rvert \cdot \eta_{\text{in}} \cdot C_{\text{deg}} \right)}_{\text{Degradation (charge)}}
+    \quad \text{for downward activation } (E_{\text{act}, t} < 0)
+\end{equation}
+Formulas \ref{eq:c-pos} and \ref{eq:c-neg} define non-energy activation costs as direction-specific degradation wear.
+
+\begin{equation}\label{eq:pi-act}
+    \pi_{t}^{\text{act}} =
+    \begin{cases}
+        (E_{\text{act}, t} \cdot \lambda_{\text{clr}, t}) - C_{\text{pos}, t}, & \text{if upward activation } (E_{\text{act}, t} > 0)   \\
+        (E_{\text{act}, t} \cdot \lambda_{\text{clr}, t}) - C_{\text{neg}, t}, & \text{if downward activation } (E_{\text{act}, t} < 0) \\
+        0,                                                                     & \text{otherwise}
+    \end{cases}
+\end{equation}
+Formula \ref{eq:pi-act} calculates activation profit from the signed activation payment and subtracts activation fees and degradation costs. Any later energy refill is reflected in the realized \gls{da}/\gls{id} cashflows.
+
+\subsubsection{Total aFRR Ex-Post Profit ($\pi_{t}^{\text{aFRR}}$)}
+
+
+\begin{equation}\label{eq:pi-afrr}
+    \pi_{t}^{\text{aFRR}} = \pi_{t}^{\text{cap}} + \pi_{t}^{\text{act}}
+\end{equation}
+Formula \ref{eq:pi-afrr} aggregates capacity and activation components into total realized \gls{afrr} profit.
+
+\subsubsection{aFRR Ex-Ante Expected Profit Model}
+
+\subsubsection{Forecast Mapping Definitions}
+\begin{equation}\label{eq:map-c-bid}
+    \hat{C}_{\text{bid}, t} = g_{\text{bid}}(\mathbf{X}_{t})
+\end{equation}
+Formula \ref{eq:map-c-bid} defines predicted capacity price as an \gls{ml} model output conditioned on feature vector $\mathbf{X}_{t}$.
+
+\begin{equation}\label{eq:map-lambda-clr}
+    \hat{\lambda}_{\text{clr}, t} = g_{\text{clr}}(\mathbf{X}_{t})
+\end{equation}
+Formula \ref{eq:map-lambda-clr} defines the forecasted \gls{afrr} activation clearing price from the same feature set.
+
+\begin{equation}\label{eq:map-p-act}
+    \hat{p}_{\text{acc}, j, t}^{d} = g_{d}\big(\mathbf{X}_{t}, m_{j}^{d}\big)
+\end{equation}
+Formula \ref{eq:map-p-act} means the classifier maps contemporaneous market features and the interval-specific spread midpoint to the probability that a bid in interval $j$ and direction $d$ is accepted.
+
+
+
+\subsubsection{Intraday Rebalancing and Reactive Rescue Mechanism}
+
+Because high-frequency continuous intraday order-book/tick data were not available, a synthetic and deterministic \gls{id} rescue mechanism was introduced to preserve physical feasibility and to reduce extreme \gls{afrr} non-delivery events. The mechanism is explicitly \emph{reactive} and not part of the optimization model. In particular, the rolling-horizon optimizer remains blind to \gls{id} execution and is calibrated with severe \gls{soc}-violation penalties (denoted by $\lambda$) in its chance-constraint penalty terms. This deliberate over-conservatism ensures methodological identification of forecasting value (including the quantile sweep) and prevents the optimizer from exploiting a synthetic \gls{id} layer for ex-ante speculative arbitrage (i.e., no ``free lunch'' channel is provided to the planning model).
+
+Causality is enforced with a one-hour execution lag. At hour $t$, the requirement for rebalancing is assessed from the post-clearing state and expected reserve obligations for hour $t+1$; the corresponding \gls{id} trade is then executed physically in hour $t+1$. Hence, no same-hour retroactive correction is permitted.
+\begin{equation}\label{eq:id-one-hour-lag}
+    E^{ID}_{\mathrm{exec},t+1} = f\left(SoC_t^{\mathrm{post}},\,E_{\text{act},t},\,P_{\text{bid},t+1}^{\uparrow},\,P_{\text{bid},t+1}^{\downarrow}\right)
+\end{equation}
+where $SoC_t^{\mathrm{post}}$ denotes the post-clearing/post-settlement state at the end of hour $t$, and $f(\cdot)$ maps this state and the next-hour reserve commitments to a feasible rescue energy decision subject to inverter and \gls{soc} limits. To emulate urgency and liquidity costs, \gls{id} rescue prices are linked to the day-ahead reference price $\lambda_{\text{mkt},t}$ via an asymmetric premium and capped by technical exchange bounds:
+\begin{align}
+    p^{ID}_{\mathrm{buy},t}  & = \min\!\left(3000,\; \lambda_{\text{mkt},t}+30\right), \\
+    p^{ID}_{\mathrm{sell},t} & = \max\!\left(-500,\; \lambda_{\text{mkt},t}-30\right).
+\end{align}
+These rules impose a structural slippage wedge and avoid mathematically invalid prices in stress periods.
+
+Physical realizability is enforced by inverter headroom after \gls{da} dispatch. Let $P_{\text{max}}$ denote converter power, and $P^{DA}_{\mathrm{ch},t},P^{DA}_{\mathrm{dis},t}$ the cleared \gls{da} charging/discharging powers. Then \gls{id} rescue power is bounded by
+\begin{equation}
+    P^{ID}_{\mathrm{ch},t} \le P_{\text{max}}-P^{DA}_{\mathrm{ch},t}, \qquad
+    P^{ID}_{\mathrm{dis},t} \le P_{\text{max}}-P^{DA}_{\mathrm{dis},t}.
+\end{equation}
+Thus, energy is not ``teleported'' across markets; all rescue flows must pass through the same hardware bottleneck.
+
+Degradation costs for \gls{id} rescue flows are aggregated with \gls{da} flows based on internal chemical throughput, as formalized in Equation~\ref{eq:cdeg-daid}.
+
+
+\subsubsection{Machine Learning Target: Probabilistic Acceptance}
+Instead of a continuous regression target for activated energy, the learning problem is framed as a probabilistic classification task. For each hour $t$ and direction $d\in\{\uparrow,\downarrow\}$, the model outputs the discrete probability vector $\big\{\hat{p}_{\text{acc}, j, t}^{d}\big\}_{j=1}^{J}$ over the set of spread intervals $j\in\{1,\dots,J\}$. This target aligns model predictions with the bid-acceptance mechanism of the \gls{afrr} merit order, allowing direct integration of data-driven acceptance likelihoods into the stochastic profit maximization.
+
+\subsubsection{Interval construction (Data Preprocessing)}
+The goal is to avoid guessing one exact bid price in a volatile market. Instead, the pricing landscape is sliced into discrete “zones” that are easier to reason about and optimize over. Each zone is defined by a bid spread, which represents how much higher or lower the bid is relative to the \gls{da} price. Using historical data, the continuous bid spread (historical bid minus historical \gls{da} price) is partitioned into $J$ uneven intervals $j\in\{1,\dots,J\}$. Quantile binning creates narrow intervals where the market is crowded (near the \gls{da} price) and wider intervals in the sparse tails, capturing the highly non-linear Residual Demand Curve \cite{aneiros2013functional} while preserving tractability for linear optimization \cite{abate2025bidding}. This turns a difficult continuous pricing problem into a manageable set of spread “zones” \cite{nolzen2022market}.
+
+\subsubsection{Probabilistic Prediction (Machine Learning)}
+Here the model behaves like a risk assessor rather than a single-point forecaster. For every hour $t$ and each spread interval $j$, it estimates the chance that the grid operator accepts the bid in a given direction $d\in\{\uparrow,\downarrow\}$. Concretely, the classifier outputs $\hat{p}_{\text{acc}, j, t}^{d}$, the predicted acceptance probability for zone $j$. This probability tells us how likely a bid at that price zone is to clear, given current market conditions \cite{koechlin2025strategic}. With a full probability vector across all zones, the optimizer can balance risk and reward rather than relying on a single brittle point forecast.
+
+\subsubsection{Expected Activation Profit Formulation}
+The battery’s energy is scarce: selling (upward activation) or buying (downward activation) in \gls{afrr} means forgoing the same transaction in the \gls{da} market. Profit must therefore be measured as an \emph{opportunity margin} relative to the \gls{da} price.
+
+\textbf{Directional intuition.}
+\begin{itemize}
+    \item Upward activation ($s^{\uparrow}=1$): the battery discharges and sells energy; it earns a premium over what it could have received in the \gls{da} market.
+    \item Downward activation ($s^{\downarrow}=-1$): the battery charges by buying energy; it gains a saving compared with what it would have paid in the \gls{da} market.
+    \item $C_{\text{marg}, t}^{d}$ captures marginal degradation and efficiency losses for that direction.
+\end{itemize}
+
+\textbf{Pricing step.}
+Let $m_{j}^{d}$ be the midpoint (€/MWh) of spread interval $j$ in direction $d$. The absolute bid price follows directly:
+\[
+    \hat{\lambda}_{\text{bid}, j, t}^{d} = \hat{\lambda}_{\text{mkt}, t} + m_{j}^{d}.
+\]
+
+\textbf{Opportunity margin and expected profit.}
+Using the directional sign $s^{d}$, the opportunity margin simplifies to $\big(s^{d}\cdot m_{j}^{d} - C_{\text{marg}, t}^{d}\big)$. The expected activation profit for interval $j$ is then
+\begin{equation}\label{eq:pi-act-prob}
+    \hat{\pi}_{t}^{\text{act},d}(j) = \hat{p}_{\text{acc}, j, t}^{d} \cdot \Big( s^{d} \cdot m_{j}^{d} - C_{\text{marg}, t}^{d} \Big) \cdot P_{\text{bid}, t}^{d} \cdot \Delta t
+\end{equation}
+with $P_{\text{bid}, t}^{d}$ the bid volume (MW).
+% EXPLANATION FOR WHY THIS IS A SMART CALCULATION 
+% \paragraph{Derivation of the Directional Profit Margin}
+% The formulation introduces a directional sign indicator $s^{d} \in \{-1, 1\}$ to consolidate the expected profit calculations for both upward and downward activations into a single equation. 
+
+% First, recall the definition of the spread midpoint $m_{j}^{d}$, which represents the price spread of the absolute bid price $\hat{\lambda}_{\text{bid}, j, t}^{d}$ relative to the forecasted Day-Ahead market price $\hat{\lambda}_{\text{mkt}, t}$:
+% \begin{equation}
+%     m_{j}^{d} = \hat{\lambda}_{\text{bid}, j, t}^{d} - \hat{\lambda}_{\text{mkt}, t}
+% \end{equation}
+
+% Because the aFRR market involves two opposite physical and financial actions, the opportunity margin must be evaluated directionally:
+
+% \begin{itemize}
+%     \item \textbf{Case 1: Upward Activation ($d = \uparrow$).} 
+%     The battery discharges, selling energy to the TSO instead of the Day-Ahead market. The profit margin is the premium earned over the Day-Ahead price:
+%     \begin{equation*}
+%         \text{Margin}^{\uparrow} = \hat{\lambda}_{\text{bid}, j, t}^{\uparrow} - \hat{\lambda}_{\text{mkt}, t} = m_{j}^{\uparrow}
+%     \end{equation*}
+%     By defining the upward sign indicator as $s^{\uparrow} = 1$, the term $s^{\uparrow} \cdot m_{j}^{\uparrow}$ evaluates exactly to $m_{j}^{\uparrow}$.
+
+%     \item \textbf{Case 2: Downward Activation ($d = \downarrow$).} 
+%     The battery charges, buying energy from the TSO instead of the Day-Ahead market. The profit margin in this case is the savings achieved compared to buying on the Day-Ahead market:
+%     \begin{equation*}
+%         \text{Margin}^{\downarrow} = \hat{\lambda}_{\text{mkt}, t} - \hat{\lambda}_{\text{bid}, j, t}^{\downarrow} = -\Big( \hat{\lambda}_{\text{bid}, j, t}^{\downarrow} - \hat{\lambda}_{\text{mkt}, t} \Big) = -m_{j}^{\downarrow}
+%     \end{equation*}
+%     By defining the downward sign indicator as $s^{\downarrow} = -1$, the term $s^{\downarrow} \cdot m_{j}^{\downarrow}$ evaluates exactly to $-m_{j}^{\downarrow}$.
+% \end{itemize}
+
+% Using this directional sign $s^{d}$, the gross opportunity margin seamlessly adapts to both directions as $s^{d} \cdot m_{j}^{d}$. Finally, subtracting the physical directional marginal cost $C_{\text{marg}, t}^{d}$ (accounting for degradation and efficiency losses) yields the consolidated net profit margin:
+% \begin{equation*}
+%     \Big( s^{d} \cdot m_{j}^{d} - C_{\text{marg}, t}^{d} \Big)
+% \end{equation*}
+% This algebraic substitution removes the need to define piecewise objective functions for charging and discharging.
+
+
+\textbf{Choosing the best zone.}
+Because the upward and downward books clear independently, the optimizer selects the best spread interval in each direction:
+\begin{equation}\label{eq:pi-act-max}
+    j^{*,d}(t) = \arg\max_{j\in\{1,\dots,J\}} \hat{\pi}_{t}^{\text{act},d}(j) \quad \forall d \in \{\uparrow, \downarrow\}
+\end{equation}
+yielding the interval that maximizes expected activation profit for that hour and direction.
+
+\subsubsection{Directional Marginal Costs ($C_{\text{marg}, t}^{\uparrow}, C_{\text{marg}, t}^{\downarrow}$)}
+
+The model uses direction-specific internal thresholds. Upward activation (discharging) and downward activation (charging) have different marginal costs because efficiency enters with opposite direction.
+
+
+\begin{equation}\label{eq:c-marg-up}
+    C_{\text{marg}, t}^{\uparrow} = \left( \frac{1}{\eta_{\text{out}}} \cdot C_{\text{deg}} \right)
+\end{equation}
+
+\begin{equation}\label{eq:c-marg-down}
+    C_{\text{marg}, t}^{\downarrow} = \left( \eta_{\text{in}} \cdot C_{\text{deg}} \right)
+\end{equation}
+These deterministic marginal cost thresholds define the minimum activation price levels at which activation is economically worthwhile for the battery (see Formulas \ref{eq:c-marg-up} and \ref{eq:c-marg-down}).
+
+
+\subsubsection{Total Expected aFRR Profit ($\hat{\pi}_{t}^{\text{aFRR}}$)}
+
+\begin{equation}\label{eq:e-pi-afrr}
+    \hat{\pi}_{t}^{\text{aFRR}} =
+    \underbrace{P_{\text{bid}, t} \cdot \hat{C}_{\text{bid}, t} \cdot \Delta t}_{\text{Expected Capacity Revenue}}
+    +
+    \underbrace{\hat{\pi}_{t}^{\text{act}}}_{\text{Expected Activation Revenue}}
+\end{equation}
+Formula \ref{eq:e-pi-afrr} combines expected capacity revenue and the optimized expected activation profit into the total ex-ante \gls{afrr} value.
+
+\subsubsection{Master Optimization Objective}
+
+\begin{equation}\label{eq:objective}
+    \max \ \hat{\Pi}_{\text{tot}} = \sum_{t=1}^{T} \left(\hat{\pi}_{t}^{\text{DA/ID}} + \hat{\pi}_{t}^{\text{aFRR}}\right)
+\end{equation}
+This keeps both terms in the optimization objective in Formula \ref{eq:objective} in ex-ante form and avoids mixing realized and expected quantities.
+
+\subsubsection{Ex-Post Total Realized Profit}
+\begin{equation}\label{eq:objective-realized}
+    \Pi^{\mathrm{real}} = \sum_{t=1}^{T}\left(\pi_{t}^{\text{DA/ID}} + \pi_{t}^{\text{aFRR}} - C_{pen,t} - C_{tx,t} - C^{\mathrm{deg}}_t\right) + V_{\mathrm{term}}
+\end{equation}
+In Formula \ref{eq:objective-realized} the total ex-post/realized profit is calculated.
+
+\subsubsection{Model Assumptions and Scope}
+The proposed formulation is a simplified representation of \gls{bess} trading behavior under operational and market constraints.
+
+\textbf{Scope and market convention (DE/LU).}
+The \gls{afrr} activation term is implemented with signed quantities, i.e., $E_{\text{act}, t}\cdot\lambda_{\text{clr}, t}$, according to the \gls{delu} market-rule representation used in this thesis.
+This is a scope and settlement-mapping choice for the selected market, not a free modeling assumption.
+
+\textbf{Assumption: electrochemical degradation proxy.}
+Degradation is modeled as a fixed cost per internal MWh that passes through the battery cells.
+This keeps the model simple and interpretable, but it does not capture detailed aging mechanisms such as temperature effects, calendar aging, or nonlinear state-of-health changes.
+Therefore, $C_{\text{deg}}$ should be read as an average wear cost for the selected battery technology and operating pattern.
+
+\textbf{Assumption: auxiliary and transaction costs.}
+Auxiliary consumption is neglected because, for the parameterization used here, it is not large enough to materially change the trading decisions or economic results.
+Transaction costs are retained as a linear accounting term $C_{tx,t}$ and can be set to zero in baseline runs or varied in sensitivity analyses.
+Accordingly, the model focuses on the dominant trading cashflows, penalty exposure, and degradation costs.
+
+\subsubsection{Methodological and Reporting Choices}
+\textbf{Temporal granularity and dispatch structure.}
+The model uses a fixed hourly resolution ($\Delta t = 1$ h).
+Although the \gls{da} market moved to quarter-hourly intervals on October 1, 2025, the dataset used here starts in 2022 and is predominantly hourly; therefore, a uniform hourly resolution is used for consistency across the full sample.
+This choice abstracts from sub-hourly activation dynamics, which can be relevant in balancing markets.
+The dispatch problem is solved as a continuous LP relaxation. This improves computational robustness, but it also means that charge/discharge exclusivity is not enforced by a binary mode switch.
+
+\textbf{Modeling of the intraday market interface.}
+
+\gls{id} rebalancing is modeled via the continuous reactive rescue mechanism formally defined in Subsection~\ref{subsec:dispatch-optimization} and in the dedicated subsection on intraday rebalancing above. In methodological terms, this interface acts as an ex-post feasibility safeguard under strict causality (with execution lag), not as an ex-ante optimization channel. Consequently, the LP planner remains blind to intraday rescue in order to prevent synthetic arbitrage and preserve identification of forecasting value in the \gls{da}/\gls{afrr} decision layer.
+
+\textbf{Ex-ante uncertainty modeling.}
+Expected activation profits are based on interval-level bid-acceptance probabilities $\hat{p}_{\text{acc}, j, t}^{d}$ and their associated spread midpoints $m_{j}^{d}$.
+This discretized, probabilistic formulation aligns model outputs with the \gls{afrr} merit-order acceptance process and avoids imposing deterministic full-hour activation assumptions.
+The predictive validity of the ex-ante objective depends on the calibration quality of the probabilistic classifier and on stable feature-to-market relationships across the spread bins.
+
+\textbf{Accounting convention and interpretation.}
+To avoid accounting overlap, the ex-post formulation includes non-energy activation costs only ($C_{\text{pos}, t}$, $C_{\text{neg}, t}$), while energy replenishment is valued through subsequent realized \gls{da}/\gls{id} trades.
+Results should be interpreted as conditional on these assumptions and modeling choices; robustness checks should include sensitivity analyses for $C_{\text{deg}}$, efficiency parameters, and the calibration of the interval-level acceptance probabilities.
+
+
+\subsubsection{Ex-Post Capacity Non-Delivery Penalties}
+Capacity non-delivery is evaluated on post-rescue feasibility and is jointly constrained by (i) available \gls{soc} energy headroom/footroom and (ii) residual inverter capacity after \gls{da} and \gls{id} execution.
+
+\begin{equation}\label{eq:rmax-pos}
+    R^{+}_{\max,t}
+    =
+    \min\!\left(
+    \frac{(SoC_t-SoC_{\min})\eta_{\text{out}}}{\Delta t},
+    \;
+    P_{\text{max}}-P^{DA}_{\mathrm{sent},t}-P^{ID}_{\mathrm{sent},t}
+    \right)
+\end{equation}
+
+\begin{equation}\label{eq:rmax-neg}
+    R^{-}_{\max,t}
+    =
+    \min\!\left(
+    \frac{SoC_{\max}-SoC_t}{\eta_{\text{in}}\Delta t},
+    \;
+    P_{\text{max}}-P^{DA}_{\mathrm{recv},t}-P^{ID}_{\mathrm{recv},t}
+    \right)
+\end{equation}
+
+Missed reserve capacity is
+\begin{equation}\label{eq:missed-cap}
+    M^{+}_{t}=\max\!\left(0, P_{\text{bid},t}^{\uparrow}-R^{+}_{\max,t}\right),
+    \qquad
+    M^{-}_{t}=\max\!\left(0, P_{\text{bid},t}^{\downarrow}-R^{-}_{\max,t}\right).
+\end{equation}
+
+Activation non-delivery is measured by comparing requested and physically delivered activation energy:
+\begin{equation}\label{eq:missed-activation}
+    E^{act,+}_{miss,t}=\max\!\left(0,\,E^{act,+}_{req,t}-E^{act,+}_{del,t}\right),
+    \qquad
+    E^{act,-}_{miss,t}=\max\!\left(0,\,E^{act,-}_{req,t}-E^{act,-}_{del,t}\right).
+\end{equation}
+Here, $E^{act,+}_{req,t}$ and $E^{act,-}_{req,t}$ denote requested upward and downward activation energy, while $E^{act,+}_{del,t}$ and $E^{act,-}_{del,t}$ denote delivered activation energy after physical and \gls{id} rescue constraints.
+
+At settlement level, the official incentive logic for non-delivery can be represented as \citep{Regelleistung.net2026}:
+\begin{equation}\label{eq:cpen-official}
+    C^{\mathrm{official}}_{\mathrm{pen},t}
+    =
+    M_t \cdot \max\!\left(\overline{C}_{\mathrm{cap, slice}},\, \lambda_{\mathrm{ID, AEP}} + \delta\right),
+\end{equation}
+where $M_t$ denotes the unavailable reserve capacity, $\overline{C}_{\mathrm{cap, slice}}$ is the average capacity price of the relevant product slice, $\lambda_{\mathrm{ID, AEP}}$ is the \gls{id} AEP reference, and $\delta$ is the regulatory surcharge.
+
+The simulation decomposes total non-delivery penalties into activation and capacity components:
+\begin{equation}\label{eq:cpen-total}
+    C^{pen}_t=C^{pen,act}_t+C^{pen,cap}_t.
+\end{equation}
+Activation penalties are calculated from missed activation energy and a direction-specific penalty basis:
+\begin{equation}\label{eq:cpen-act}
+    C^{pen,act}_t
+    =
+    E^{act,+}_{miss,t}\,B^{act,+}_t
+    +
+    E^{act,-}_{miss,t}\,B^{act,-}_t,
+\end{equation}
+\begin{equation}\label{eq:cpen-act-basis}
+    B^{act,+}_t=\max\!\left(|\lambda^{marg,+}_t|,\,|\lambda^{IDAEP,+}_t+\delta^{act}|\right),
+    \qquad
+    B^{act,-}_t=\max\!\left(|\lambda^{marg,-}_t|,\,|\lambda^{IDAEP,-}_t+\delta^{act}|\right).
+\end{equation}
+Capacity penalties are calculated from unavailable reserve capacity and a direction-specific capacity penalty basis:
+\begin{equation}\label{eq:cpen-cap}
+    C^{pen,cap}_t
+    =
+    M^{+}_{t}\,B^{cap,+}_t\,\Delta t
+    +
+    M^{-}_{t}\,B^{cap,-}_t\,\Delta t,
+\end{equation}
+\begin{equation}\label{eq:cpen-cap-basis}
+    B^{cap,+}_t=\max\!\left(\overline{C}_{\mathrm{cap, product}},\,\frac{|\lambda^{IDAEP,+}_t|}{1000}+\delta^{cap}\right),
+    \qquad
+    B^{cap,-}_t=\max\!\left(\overline{C}_{\mathrm{cap, product}},\,\frac{|\lambda^{IDAEP,-}_t|}{1000}+\delta^{cap}\right).
+\end{equation}
+The terms $B^{act,\pm}_t$ are expressed in \texteuro/MWh, while $B^{cap,\pm}_t$ are expressed in \texteuro/MW/h. If explicit marginal energy prices or \gls{id} AEP references are unavailable, the implementation uses configured fallback values to keep the backtest deterministic and reproducible.
+
+\subsubsection{Financial Settlement and Liquidity}
+Transaction costs are modeled proportional to the total grid-side energy throughput:
+\begin{equation}\label{eq:ctx}
+    C_{tx,t} = c_{tx} \cdot \left( E^{DA}_{\mathrm{recv},t} + E^{DA}_{\mathrm{sent},t} + E^{ID}_{\mathrm{recv},t} + E^{ID}_{\mathrm{sent},t} + |E_{\text{act},t}| \right)
+\end{equation}
+where $c_{tx}$ is the specific transaction fee in \texteuro/MWh.
+
+The net liquid cashflow isolates actual cash movements, strictly excluding non-cash depreciation such as battery degradation ($C^{\mathrm{deg}}_t$):
+\begin{equation}
+    CF_{net,t} = R_{DA,t} - C_{DA,t} + R_{cap,t} + R_{act,t} - C_{tx,t} - C_{pen,t}
+\end{equation}
+
+The maximum working capital requirement represents the peak cumulative drawdown:
+\begin{equation}
+    \text{max\_cap\_req} = \max\left(0,\,-\min_t \left(Cash_0 + \sum_{k=1}^{t} CF_{net,k} \right)\right)
+\end{equation}
+
+Assuming $\text{max\_cap\_req} > 0$, the return on capital is defined as:
+\begin{equation}
+    ROI_{cap} = \frac{\Pi^{\mathrm{real}}}{\text{max\_cap\_req}}
+\end{equation}
+
+\subsubsection{Terminal Valuation and Operational KPIs}
+To account for unsold energy at the end of the simulation horizon ($T$), the remaining inventory strictly above the minimal state of charge ($SoC_{\min}$) is marked-to-market at the final \gls{da}/\gls{id} reference price, discounting inverter losses ($\eta_{\text{out}}$):
+\begin{equation}
+    V_{\mathrm{term}} = \max(0, (SoC_T - SoC_{\min})) \cdot \eta_{\text{out}} \cdot \lambda_{\text{mkt},T}
+\end{equation}
+The total realized profit is thus $\Pi^{\mathrm{real}} = \sum_t \pi^{\mathrm{real}}_t + V_{\mathrm{term}}$.
+
+
+\subsection{Techno-Economic Assessment}
+\label{subsec:techno-economic-assessment}
+Techno-economic evaluation is performed on realized settlement outcomes and decomposed into value, risk, and operational stress indicators.
+
+\paragraph{Value of Forecasting (VoF).}
+For model $m$ and benchmark $b$, the incremental value of forecast quality is defined as:
+\begin{equation}\label{eq:vof}
+    VoF_{m\to b} = \Pi^{\mathrm{real}}_{m} - \Pi^{\mathrm{real}}_{b}.
+\end{equation}
+Relevant comparisons include probabilistic models against naive baselines and against deterministic alternatives. Positive \gls{vof} indicates economically beneficial forecast information under identical physical constraints.
+
+\paragraph{Capture and benchmark ratios.}
+To normalize across periods with different market scales, profit capture is evaluated relative to benchmark and oracle envelopes:
+\begin{equation}
+    CR^{\mathrm{bench}}_{m} = \frac{\Pi^{\mathrm{real}}_{m}}{\Pi^{\mathrm{real}}_{\mathrm{bench}}},
+    \qquad
+    CR^{\mathrm{oracle}}_{m} = \frac{\Pi^{\mathrm{real}}_{m}}{\Pi^{\mathrm{real}}_{\mathrm{oracle}}}.
+\end{equation}
+$CR^{\mathrm{oracle}}_{m}\in(-\infty,1]$ measures proximity to the informational upper bound.
+
+\paragraph{Profit-component decomposition.}
+Total realized value is reported as:
+\begin{equation}
+    \Pi^{\mathrm{real}} =
+    \underbrace{\Pi^{DA/ID}}_{\text{energy trading}}
+    +
+    \underbrace{\Pi^{cap}}_{\text{aFRR capacity}}
+    +
+    \underbrace{\Pi^{act}}_{\text{aFRR activation}}
+    -
+    \underbrace{C^{\mathrm{tx}}}_{\text{transaction}}
+    -
+    \underbrace{C^{\mathrm{pen}}}_{\text{non-delivery}}
+    -
+    \underbrace{C^{\mathrm{deg}}}_{\text{degradation}}
+    +
+    \underbrace{V_{\mathrm{term}}}_{\text{terminal inventory}}.
+\end{equation}
+This decomposition identifies whether gains stem from directional market timing, reserve monetization, or reduced penalty exposure.
+
+\paragraph{Operational intensity and stress.}
+Operational stress is reported via Equivalent Full Cycles (EFC), defined consistently with the discharge-based convention used in the settlement layer. Let total grid-side discharged energy be
+\[
+    E^{\mathrm{grid}}_{\mathrm{dis,tot}}
+    =
+    \sum_t \left(E^{DA}_{\mathrm{sent},t}+E^{ID}_{\mathrm{sent},t}\right)
+    +
+    \sum_t E^{+}_{\mathrm{act},t},
+\]
+then internal discharged throughput equals
+\[
+    E^{\mathrm{int}}_{\mathrm{dis,tot}}
+    =
+    \frac{E^{\mathrm{grid}}_{\mathrm{dis,tot}}}{\eta_{\text{out}}}.
+\]
+Hence,
+\begin{equation}\label{eq:efc-corrected}
+    \mathrm{EFC}
+    =
+    \frac{E^{\mathrm{int}}_{\mathrm{dis,tot}}}{E_{\text{cap}}}
+    =
+    \frac{\left(\sum_t \left(E^{DA}_{\mathrm{sent},t}+E^{ID}_{\mathrm{sent},t}\right)+\sum_t E^{+}_{\mathrm{act},t}\right)/\eta_{\text{out}}}{E_{\text{cap}}}.
+\end{equation}
+This avoids double counting from bidirectional throughput and keeps EFC fully aligned with the discharge-only cycle definition.
+
+\paragraph{Feasibility diagnostics.}
+To detect hidden infeasibility pressure in soft-constrained optimization, hourly slack utilizations are monitored:
+\begin{equation}
+    S^{+}=\sum_t s_t^{+},\qquad S^{-}=\sum_t s_t^{-}.
+\end{equation}
+Large $S^{+}$/$S^{-}$ indicate persistent quantile-based reserve-feasibility stress and are interpreted jointly with penalty payments and realized \gls{soc} trajectories.
