@@ -283,6 +283,11 @@ sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboos
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
+	if [ ! -f "$$MANIFEST_PATH" ] && [ -n "$$RUN_ID" ] && [ -f "artifacts/model_runs/$$RUN_ID/manifest.json" ]; then \
+	  MANIFEST_PATH="artifacts/model_runs/$$RUN_ID/manifest.json"; \
+	  echo "[INFO] manifest_path fallback to local run dir: $$MANIFEST_PATH"; \
+	fi; \
+	test -f "$$MANIFEST_PATH" || (echo "Manifest not found: $$MANIFEST_PATH (from $$LATEST_JSON)" && exit 1); \
 	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
 	if [ "$$SIM_HOURS" = "auto" ]; then \
 	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
@@ -311,6 +316,11 @@ sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_lin
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
+	if [ ! -f "$$MANIFEST_PATH" ] && [ -n "$$RUN_ID" ] && [ -f "artifacts/model_runs/$$RUN_ID/manifest.json" ]; then \
+	  MANIFEST_PATH="artifacts/model_runs/$$RUN_ID/manifest.json"; \
+	  echo "[INFO] manifest_path fallback to local run dir: $$MANIFEST_PATH"; \
+	fi; \
+	test -f "$$MANIFEST_PATH" || (echo "Manifest not found: $$MANIFEST_PATH (from $$LATEST_JSON)" && exit 1); \
 	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
 	if [ "$$SIM_HOURS" = "auto" ]; then \
 	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
@@ -339,6 +349,11 @@ sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.js
 	MANIFEST_PATH=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print(d.get('manifest_path','').strip())"); \
 	test -n "$$MANIFEST_PATH" || (echo "manifest_path missing in $$LATEST_JSON" && exit 1); \
 	RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())"); \
+	if [ ! -f "$$MANIFEST_PATH" ] && [ -n "$$RUN_ID" ] && [ -f "artifacts/model_runs/$$RUN_ID/manifest.json" ]; then \
+	  MANIFEST_PATH="artifacts/model_runs/$$RUN_ID/manifest.json"; \
+	  echo "[INFO] manifest_path fallback to local run dir: $$MANIFEST_PATH"; \
+	fi; \
+	test -f "$$MANIFEST_PATH" || (echo "Manifest not found: $$MANIFEST_PATH (from $$LATEST_JSON)" && exit 1); \
 	SIM_HOURS="$(SIM_HORIZON_HOURS)"; \
 	if [ "$$SIM_HOURS" = "auto" ]; then \
 	  SIM_HOURS=$$(python3 -c "import json;from pathlib import Path;m=Path('$$MANIFEST_PATH');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
