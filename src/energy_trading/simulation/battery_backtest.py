@@ -134,41 +134,15 @@ DISPATCH_DECISION_COLS = (
     "aFRR_Capacity_Won_MW",
     "aFRR_Energy_Price_EUR_MWh_Pos",
     "aFRR_Energy_Price_EUR_MWh_Neg",
-    "shock_source",
     "soc_before_mwh",
     "soc_after_planned_mwh",
     "soc_after_executed_mwh",
-    "plan_charge_mw",
-    "plan_discharge_mw",
-    "plan_reserve_pos_mw",
-    "plan_reserve_neg_mw",
-    "submitted_da_buy_mw",
-    "submitted_da_sell_mw",
-    "submitted_da_buy_price_eur_mwh",
-    "submitted_da_sell_price_eur_mwh",
-    "submitted_afrr_pos_mw",
-    "submitted_afrr_neg_mw",
-    "executed_charge_mw",
-    "executed_discharge_mw",
-    "executed_reserve_pos_mw",
-    "executed_reserve_neg_mw",
-    "settlement_cap_bid_price_pos_eur_mw",
-    "settlement_cap_bid_price_neg_eur_mw",
-    "executed_rate_pos",
-    "executed_rate_neg",
-    "da_buy_accepted",
-    "da_sell_accepted",
-    "afrr_cap_pos_awarded",
-    "afrr_cap_neg_awarded",
-    "afrr_act_pos_accepted",
-    "afrr_act_neg_accepted",
-    "da_price_taker_mode",
+)
+
+DISPATCH_METADATA_COLS = (
+    "shock_source",
     "da_buy_reason",
     "da_sell_reason",
-    "DA_Energy_Sold_MW",
-    "aFRR_Energy_Price_EUR_MWh",
-    "Obligation_Fulfilled",
-    "aFRR_Energy_Gate_Closure_Min",
 )
 
 SETTLEMENT_NUMERIC_COLS = (
@@ -212,6 +186,7 @@ SETTLEMENT_METADATA_COLS = (
 SETTLEMENT_CLEARING_COLS = SETTLEMENT_NUMERIC_COLS + SETTLEMENT_METADATA_COLS
 
 SETTLEMENT_RENAME_MAP_REAL = {
+    # Canonicalize realized execution primitives into stable physical names.
     "real_executed_charge_mw": "real_charge_mw",
     "real_executed_discharge_mw": "real_discharge_mw",
     "real_executed_reserve_pos_mw": "real_reserve_pos_mw",
@@ -3548,6 +3523,7 @@ class BatteryBacktester:
 
         dispatch_cols = [colmap.timestamp]
         dispatch_cols += [c for c in DISPATCH_DECISION_COLS if c in dispatch.columns]
+        dispatch_metadata_cols = [c for c in DISPATCH_METADATA_COLS if c in dispatch.columns]
         dispatch_clearing_cols = list(SETTLEMENT_CLEARING_COLS)
         dispatch_clearing_cols += [
             "id_charge_mw",
@@ -3564,7 +3540,7 @@ class BatteryBacktester:
                 or c.startswith("afrr_bin_")
             ]
         )
-        dispatch_cols = dispatch_cols + [c for c in dispatch_clearing_cols if c in dispatch.columns]
+        dispatch_cols = dispatch_cols + dispatch_metadata_cols + [c for c in dispatch_clearing_cols if c in dispatch.columns]
         # Deduplicate composed dispatch selection while preserving order.
         # This prevents left-side duplicate labels from slice requests like df[['A','A']].
         dispatch_cols = list(dict.fromkeys(dispatch_cols))
@@ -4168,6 +4144,62 @@ class BatteryBacktester:
         if pnl.isna().any():
             raise RuntimeError("Backtest audit failed: NaN/non-finite detected in realized_total_pnl components.")
 
+    @staticmethod
+    def _sum_abs_present(frame: pd.DataFrame, cols: list[str]) -> float:
+        total = 0.0
+        for c in cols:
+            if c in frame.columns:
+                total += float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).abs().sum())
+        return total
+
+    def _validate_strategy_isolation_outputs(
+        self,
+        *,
+        hourly: pd.DataFrame,
+        allowed_markets: list[str] | tuple[str, ...] | set[str],
+        tol: float = 1e-9,
+    ) -> None:
+        """Runtime assertions that final settled outputs respect strategy isolation."""
+        allowed = {str(m).strip().lower() for m in allowed_markets}
+        if allowed == {"da"}:
+            afrr_cols = [
+                "real_reserve_pos_mw",
+                "real_reserve_neg_mw",
+                "real_executed_reserve_pos_mw",
+                "real_executed_reserve_neg_mw",
+                "real_act_pos_mwh",
+                "real_act_neg_mwh",
+                "real_revenue_capacity_eur",
+                "real_revenue_activation_eur",
+                "real_submitted_afrr_pos_mw",
+                "real_submitted_afrr_neg_mw",
+            ]
+            afrr_mag = self._sum_abs_present(hourly, afrr_cols)
+            if afrr_mag > tol:
+                raise RuntimeError(
+                    "Strategy isolation check failed for da_only: non-zero aFRR activity detected "
+                    f"(abs-sum={afrr_mag:.6f})."
+                )
+        elif allowed == {"afrr"}:
+            da_cols = [
+                "real_charge_mw",
+                "real_discharge_mw",
+                "real_executed_charge_mw",
+                "real_executed_discharge_mw",
+                "real_da_buy_mwh",
+                "real_da_sell_mwh",
+                "real_revenue_da_eur",
+                "real_cost_da_eur",
+                "real_submitted_da_buy_mw",
+                "real_submitted_da_sell_mw",
+            ]
+            da_mag = self._sum_abs_present(hourly, da_cols)
+            if da_mag > tol:
+                raise RuntimeError(
+                    "Strategy isolation check failed for afrr_only: non-zero DA activity detected "
+                    f"(abs-sum={da_mag:.6f})."
+                )
+
     def run(
         self,
         df: pd.DataFrame,
@@ -4520,6 +4552,7 @@ class BatteryBacktester:
         hourly = _merge_unique(hourly, naive_real)
         hourly = _merge_unique(hourly, oracle_real)
         hourly = hourly.sort_values(colmap.timestamp).reset_index(drop=True)
+        self._validate_strategy_isolation_outputs(hourly=hourly, allowed_markets=allowed_markets)
 
         if "real_net_cashflow_eur" in hourly.columns:
             hourly["real_cashflow_eur"] = hourly["real_net_cashflow_eur"]
@@ -4633,6 +4666,22 @@ class BatteryBacktester:
         real_pnl_total = real_pnl_raw + terminal_value_real_eur
         naive_pnl_total = naive_pnl_raw + terminal_value_naive_eur
         oracle_pnl_total = oracle_pnl_raw + terminal_value_oracle_eur
+
+        # Hard oracle upper-bound assertion (final total only):
+        # real strategy must not outperform perfect-foresight oracle beyond
+        # small numeric tolerance.
+        oracle_upper_bound_eps = float(os.environ.get("BACKTEST_ORACLE_UPPER_BOUND_EPS", "1e-6"))
+        if (
+            np.isfinite(real_pnl_total)
+            and np.isfinite(oracle_pnl_total)
+            and (real_pnl_total - oracle_pnl_total) > oracle_upper_bound_eps
+        ):
+            raise RuntimeError(
+                "Oracle upper-bound violated: "
+                f"realized_total_pnl_eur={real_pnl_total:.6f} > "
+                f"oracle_total_pnl_eur={oracle_pnl_total:.6f} "
+                f"(eps={oracle_upper_bound_eps:.2e})."
+            )
 
 
         if np.isfinite(oracle_pnl_total) and abs(oracle_pnl_total) > 1e-9:

@@ -107,6 +107,7 @@ def _compute_scenario_metrics(scenarios: pd.DataFrame) -> pd.DataFrame:
         hp = Path(r["hourly_path"])
         summary = _load_json(sp)
         hourly = pd.read_parquet(hp)
+        trading_strategy = str(summary.get("trading_strategy", Path(r["output_dir"]).name)).strip().lower()
 
         row = dict(r)
         row.update(
@@ -116,8 +117,7 @@ def _compute_scenario_metrics(scenarios: pd.DataFrame) -> pd.DataFrame:
                 "naive_total_pnl_eur": _safe_float(summary.get("naive_total_pnl_eur")),
                 "oracle_total_pnl_eur": _safe_float(summary.get("oracle_total_pnl_eur")),
                 "stacking_value_realized_eur": _safe_float(summary.get("stacking_value_realized_eur")),
-                "realized_da_only_total_pnl_eur": _safe_float(summary.get("realized_da_only_total_pnl_eur")),
-                "realized_afrr_only_total_pnl_eur": _safe_float(summary.get("realized_afrr_only_total_pnl_eur")),
+                "trading_strategy": trading_strategy,
                 "total_penalty_cost_eur": _safe_float(summary.get("total_penalty_cost_eur", 0.0), 0.0),
                 "total_penalty_activation_eur": _safe_float(summary.get("total_penalty_activation_eur", 0.0), 0.0),
                 "total_penalty_capacity_eur": _safe_float(summary.get("total_penalty_capacity_eur", 0.0), 0.0),
@@ -238,13 +238,14 @@ def main() -> None:
     metrics.to_csv(out_dir / "scenario_diagnostics.csv", index=False)
 
     # Strategy behavior decomposition (you asked for this explicitly)
+    # Canonical architecture: each strategy has its own isolated run and writes
+    # realized_total_pnl_eur. Legacy retrospective *_only totals are removed.
     decomp_cols = [
         "model",
         "scenario",
+        "trading_strategy",
         "quantile_low",
         "quantile_high",
-        "realized_da_only_total_pnl_eur",
-        "realized_afrr_only_total_pnl_eur",
         "stacking_value_realized_eur",
         "realized_total_pnl_eur",
     ]
