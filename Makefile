@@ -19,7 +19,8 @@ TFT_PRECISION ?= bf16-mixed
 LEAD_WEIGHT_START ?= 16
 LEAD_WEIGHT_END ?= 48
 LEAD_WEIGHT_MAX ?= 2.0
-LINEAR_AFRR_PARALLEL_JOBS ?= 4
+LINEAR_AFRR_PARALLEL_JOBS ?= 1
+LINEAR_LEAD_PARALLEL_JOBS ?= 4
 SIM_QUANTILE_PAIRS ?=
 DA_QUANTILE_ROLE ?= mid
 SIM_QUANTILE_SWEEP_DEFAULT ?= p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90
@@ -103,7 +104,8 @@ help: ## Show available commands
 	@echo ""
 	@echo "Optional overrides:"
 	@echo "  SEED=42 FORECAST_HOURS=48 DEVICE=cuda|cpu"
-	@echo "  LINEAR_AFRR_PARALLEL_JOBS=4   # parallel aFRR target jobs for linear training"
+	@echo "  LINEAR_AFRR_PARALLEL_JOBS=1   # parallel aFRR target jobs for linear training"
+	@echo "  LINEAR_LEAD_PARALLEL_JOBS=4   # parallel lead-time jobs inside each linear target"
 	@echo "  SIM_QUANTILE_PAIRS='p50-p50,p30-p70,p10-p90' DA_QUANTILE_ROLE=mid|low|high"
 	@echo "  LEAD_WEIGHT_START=16 LEAD_WEIGHT_END=48 LEAD_WEIGHT_MAX=2.0"
 	@echo "  HYBRID_RECO_CSV=... HYBRID_OUT=... HYBRID_GROUND_TRUTH=... HYBRID_SPLIT=test"
@@ -193,6 +195,7 @@ $(LINEAR_MANIFEST): $(LINEAR_TUNE_JSON)
 	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
 	  --afrr-parallel-jobs $(LINEAR_AFRR_PARALLEL_JOBS) \
+	  --lead-parallel-jobs $(LINEAR_LEAD_PARALLEL_JOBS) \
 	  --hpo-artifact "$(LINEAR_TUNE_JSON)"
 
 train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on tune-linear output)

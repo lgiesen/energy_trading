@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import random
@@ -239,6 +240,7 @@ def _train_target(
     lead_weight_start: int,
     lead_weight_end: int,
     lead_weight_max: float,
+    lead_parallel_jobs: int = 1,
 ) -> tuple[dict[int, dict[str, Pipeline]], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     cfg = json.loads((base_dir / "feature_config.json").read_text(encoding="utf-8"))
     bcfg = cfg["bundles"][bundle]
@@ -302,7 +304,7 @@ def _train_target(
     leads_done = 0
     train_t0 = time.perf_counter()
 
-    for lead_h in range(1, int(forecast_horizon_hours) + 1):
+    def _fit_lead(lead_h: int) -> dict[str, Any] | None:
         lead_t0 = time.perf_counter()
         shift_n = int(lead_h - 1)
         y_tr_shift = y_train_all.shift(-shift_n)
@@ -330,8 +332,7 @@ def _train_target(
                 len(X_tr),
                 len(X_va),
             )
-            leads_done += 1
-            continue
+            return None
 
         LOGGER.info(
             "[TRAIN] target=%s lead=%s/%s rows(train=%s,val=%s,test=%s) quantiles=%s",
@@ -377,22 +378,17 @@ def _train_target(
         pred_va = preds_va["p50"]
         pred_te = preds_te["p50"]
 
-        lead_models[int(lead_h)] = q_models
-        lead_rows_val.append(
-            _make_long_rows(
-                h1_target_timestamp=ts_va,
-                lead_time_h=int(lead_h),
-                pred_by_q=preds_va,
-                model_name=model_name,
-            )
+        lead_row_val = _make_long_rows(
+            h1_target_timestamp=ts_va,
+            lead_time_h=int(lead_h),
+            pred_by_q=preds_va,
+            model_name=model_name,
         )
-        lead_rows_test.append(
-            _make_long_rows(
-                h1_target_timestamp=ts_te,
-                lead_time_h=int(lead_h),
-                pred_by_q=preds_te,
-                model_name=model_name,
-            )
+        lead_row_test = _make_long_rows(
+            h1_target_timestamp=ts_te,
+            lead_time_h=int(lead_h),
+            pred_by_q=preds_te,
+            model_name=model_name,
         )
 
         val_metric_df_h = pd.DataFrame({"y_true": y_va.to_numpy(dtype=float), "y_pred": pred_va})
@@ -408,50 +404,110 @@ def _train_target(
             ).to_numpy(dtype=float)
         val_metric_suite_h = compute_forecast_metrics(val_metric_df_h, y_true_col="y_true", y_pred_col="y_pred")
         test_metric_suite_h = compute_forecast_metrics(test_metric_df_h, y_true_col="y_true", y_pred_col="y_pred")
-        lead_metric_rows.append(
-            {
-                "lead_time_h": float(lead_h),
-                "n_val": float(len(y_va)),
-                "n_test": float(len(y_te)),
-                "mae_val": float(val_metric_suite_h.get("mae", np.nan)),
-                "mae_test": float(test_metric_suite_h.get("mae", np.nan)),
-                "rmse_val": float(val_metric_suite_h.get("rmse", np.nan)),
-                "rmse_test": float(test_metric_suite_h.get("rmse", np.nan)),
-                "pinball_p10_val": float(val_metric_suite_h.get("pinball_loss_p10", np.nan)),
-                "pinball_p50_val": float(val_metric_suite_h.get("pinball_loss_p50", np.nan)),
-                "pinball_p90_val": float(val_metric_suite_h.get("pinball_loss_p90", np.nan)),
-                "pinball_p95_val": float(val_metric_suite_h.get("pinball_loss_p95", np.nan)),
-                "pinball_p10_test": float(test_metric_suite_h.get("pinball_loss_p10", np.nan)),
-                "pinball_p50_test": float(test_metric_suite_h.get("pinball_loss_p50", np.nan)),
-                "pinball_p90_test": float(test_metric_suite_h.get("pinball_loss_p90", np.nan)),
-                "pinball_p95_test": float(test_metric_suite_h.get("pinball_loss_p95", np.nan)),
-            }
-        )
+        lead_metric_row = {
+            "lead_time_h": float(lead_h),
+            "n_val": float(len(y_va)),
+            "n_test": float(len(y_te)),
+            "mae_val": float(val_metric_suite_h.get("mae", np.nan)),
+            "mae_test": float(test_metric_suite_h.get("mae", np.nan)),
+            "rmse_val": float(val_metric_suite_h.get("rmse", np.nan)),
+            "rmse_test": float(test_metric_suite_h.get("rmse", np.nan)),
+            "pinball_p10_val": float(val_metric_suite_h.get("pinball_loss_p10", np.nan)),
+            "pinball_p50_val": float(val_metric_suite_h.get("pinball_loss_p50", np.nan)),
+            "pinball_p90_val": float(val_metric_suite_h.get("pinball_loss_p90", np.nan)),
+            "pinball_p95_val": float(val_metric_suite_h.get("pinball_loss_p95", np.nan)),
+            "pinball_p10_test": float(test_metric_suite_h.get("pinball_loss_p10", np.nan)),
+            "pinball_p50_test": float(test_metric_suite_h.get("pinball_loss_p50", np.nan)),
+            "pinball_p90_test": float(test_metric_suite_h.get("pinball_loss_p90", np.nan)),
+            "pinball_p95_test": float(test_metric_suite_h.get("pinball_loss_p95", np.nan)),
+        }
 
+        h1_payload = None
         if int(lead_h) == 1:
-            y_va_h1 = y_va
-            y_te_h1 = y_te
-            pred_va_h1 = pred_va
-            pred_te_h1 = pred_te
-            pred_frames = {
-                "val": _make_prediction_frame(bundle=bundle, timestamp=ts_va, pred_col=pred_col, y_pred=pred_va),
-                "test": _make_prediction_frame(bundle=bundle, timestamp=ts_te, pred_col=pred_col, y_pred=pred_te),
+            h1_payload = {
+                "y_va_h1": y_va,
+                "y_te_h1": y_te,
+                "pred_va_h1": pred_va,
+                "pred_te_h1": pred_te,
+                "pred_frames": {
+                    "val": _make_prediction_frame(bundle=bundle, timestamp=ts_va, pred_col=pred_col, y_pred=pred_va),
+                    "test": _make_prediction_frame(bundle=bundle, timestamp=ts_te, pred_col=pred_col, y_pred=pred_te),
+                },
             }
 
-        leads_done += 1
-        now = time.perf_counter()
-        elapsed = now - train_t0
-        avg_lead_s = elapsed / max(leads_done, 1)
-        eta_s = max(total_leads - leads_done, 0) * avg_lead_s
-        LOGGER.info(
-            "[HEARTBEAT] target=%s progress=%s/%s elapsed=%.1fs eta=%.1fs lead_runtime=%.2fs",
-            target_col,
-            leads_done,
-            total_leads,
-            elapsed,
-            eta_s,
-            now - lead_t0,
-        )
+        return {
+            "lead_h": int(lead_h),
+            "lead_runtime_s": float(time.perf_counter() - lead_t0),
+            "fit_seconds": float(time.perf_counter() - fit_t0),
+            "q_models": q_models,
+            "lead_row_val": lead_row_val,
+            "lead_row_test": lead_row_test,
+            "lead_metric_row": lead_metric_row,
+            "h1_payload": h1_payload,
+        }
+
+    lead_jobs = max(1, int(lead_parallel_jobs))
+    lead_indices = list(range(1, int(forecast_horizon_hours) + 1))
+    results_by_lead: dict[int, dict[str, Any]] = {}
+    if lead_jobs == 1:
+        for lead_h in lead_indices:
+            res = _fit_lead(lead_h)
+            leads_done += 1
+            if res is not None:
+                results_by_lead[int(lead_h)] = res
+            now = time.perf_counter()
+            elapsed = now - train_t0
+            avg_lead_s = elapsed / max(leads_done, 1)
+            eta_s = max(total_leads - leads_done, 0) * avg_lead_s
+            lead_runtime_s = float(res.get("lead_runtime_s", np.nan)) if res else float("nan")
+            LOGGER.info(
+                "[HEARTBEAT] target=%s progress=%s/%s elapsed=%.1fs eta=%.1fs lead_runtime=%.2fs",
+                target_col,
+                leads_done,
+                total_leads,
+                elapsed,
+                eta_s,
+                lead_runtime_s,
+            )
+    else:
+        LOGGER.info("[TRAIN] target=%s lead-parallel-jobs=%s", target_col, lead_jobs)
+        with ThreadPoolExecutor(max_workers=lead_jobs) as pool:
+            fut_to_lead = {pool.submit(_fit_lead, lead_h): lead_h for lead_h in lead_indices}
+            for fut in as_completed(fut_to_lead):
+                lead_h = fut_to_lead[fut]
+                res = fut.result()
+                leads_done += 1
+                if res is not None:
+                    results_by_lead[int(lead_h)] = res
+                now = time.perf_counter()
+                elapsed = now - train_t0
+                avg_lead_s = elapsed / max(leads_done, 1)
+                eta_s = max(total_leads - leads_done, 0) * avg_lead_s
+                lead_runtime_s = float(res.get("lead_runtime_s", np.nan)) if res else float("nan")
+                LOGGER.info(
+                    "[HEARTBEAT] target=%s progress=%s/%s elapsed=%.1fs eta=%.1fs lead_runtime=%.2fs",
+                    target_col,
+                    leads_done,
+                    total_leads,
+                    elapsed,
+                    eta_s,
+                    lead_runtime_s,
+                )
+
+    for lead_h in sorted(results_by_lead.keys()):
+        res = results_by_lead[lead_h]
+        fit_seconds_total += float(res["fit_seconds"])
+        lead_models[int(lead_h)] = res["q_models"]
+        lead_rows_val.append(res["lead_row_val"])
+        lead_rows_test.append(res["lead_row_test"])
+        lead_metric_rows.append(res["lead_metric_row"])
+        h1_payload = res.get("h1_payload")
+        if h1_payload:
+            y_va_h1 = h1_payload["y_va_h1"]
+            y_te_h1 = h1_payload["y_te_h1"]
+            pred_va_h1 = h1_payload["pred_va_h1"]
+            pred_te_h1 = h1_payload["pred_te_h1"]
+            pred_frames = h1_payload["pred_frames"]
 
     if not lead_models:
         raise ValueError(f"No linear lead models trained for target '{target_col}'.")
@@ -670,6 +726,7 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--lead-weight-start", type=int, default=16)
     p.add_argument("--lead-weight-end", type=int, default=48)
     p.add_argument("--lead-weight-max", type=float, default=2.0)
+    p.add_argument("--lead-parallel-jobs", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--metrics-json-out", default="")
     p.add_argument("--metrics-csv-out", default="")
@@ -716,6 +773,7 @@ def main() -> None:
         lead_weight_start=int(args.lead_weight_start),
         lead_weight_end=int(args.lead_weight_end),
         lead_weight_max=float(args.lead_weight_max),
+        lead_parallel_jobs=max(1, int(args.lead_parallel_jobs)),
     )
 
     file_tag = f"linear_{args.bundle}_{tgt.replace('target_', '')}"

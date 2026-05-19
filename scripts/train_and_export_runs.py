@@ -531,6 +531,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of parallel aFRR target training jobs (useful for linear model runs).",
     )
+    p.add_argument(
+        "--lead-parallel-jobs",
+        type=int,
+        default=1,
+        help="Number of parallel lead-time jobs inside one linear target training run.",
+    )
     p.add_argument("--linear-alpha", type=float, default=1.0)
     p.add_argument("--linear-l1-ratio", type=float, default=0.15)
     p.add_argument("--linear-learning-rate", default="invscaling")
@@ -719,6 +725,8 @@ def main() -> None:
             str(args.lead_weight_end),
             "--lead-weight-max",
             str(args.lead_weight_max),
+            "--lead-parallel-jobs",
+            str(max(1, int(args.lead_parallel_jobs))),
             "--seed",
             str(args.seed),
         ]
