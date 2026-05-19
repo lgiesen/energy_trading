@@ -43,6 +43,7 @@ from energy_trading.evaluation.conformal_calibration import (  # noqa: E402
     calculate_conformal_shifts,
 )
 from energy_trading.models.prepare_ml_bundles import load_processed_data  # noqa: E402
+from energy_trading.models.torch_linear_quantiles import TorchMultiQuantileLinearRegressor  # noqa: E402
 
 BundleName = Literal["da", "afrr"]
 LOGGER = logging.getLogger(__name__)
@@ -241,7 +242,8 @@ def _train_target(
     lead_weight_end: int,
     lead_weight_max: float,
     lead_parallel_jobs: int = 1,
-) -> tuple[dict[int, dict[str, Pipeline]], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    backend: str = "torch",
+) -> tuple[dict[int, dict[str, Any]], dict[str, object], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     cfg = json.loads((base_dir / "feature_config.json").read_text(encoding="utf-8"))
     bcfg = cfg["bundles"][bundle]
     train_ts = pd.to_datetime(
@@ -287,7 +289,7 @@ def _train_target(
     y_test_all = pd.to_numeric(y_test_df[target_col], errors="coerce")
 
     pred_col = _pred_column_names_for_target(target_col)[0]
-    lead_models: dict[int, dict[str, Pipeline]] = {}
+    lead_models: dict[int, dict[str, Any]] = {}
     lead_rows_val: list[pd.DataFrame] = []
     lead_rows_test: list[pd.DataFrame] = []
     lead_metric_rows: list[dict[str, float]] = []
@@ -345,24 +347,52 @@ def _train_target(
             len(QUANTILES),
         )
 
-        q_models: dict[str, Pipeline] = {}
+        q_models: dict[str, Any] = {}
         preds_va: dict[str, np.ndarray] = {}
         preds_te: dict[str, np.ndarray] = {}
         fit_t0 = time.perf_counter()
-        for q in QUANTILES:
-            qcol = _qcol(q)
-            pipe = _build_linear_pipeline(
-                alpha=alpha,
-                quantile=q,
-                l1_ratio=l1_ratio,
-                learning_rate=learning_rate,
-                eta0=eta0,
-                seed=seed,
+        if str(backend).lower() == "sklearn":
+            for q in QUANTILES:
+                qcol = _qcol(q)
+                pipe = _build_linear_pipeline(
+                    alpha=alpha,
+                    quantile=q,
+                    l1_ratio=l1_ratio,
+                    learning_rate=learning_rate,
+                    eta0=eta0,
+                    seed=seed,
+                )
+                pipe.fit(X_tr, y_tr)
+                q_models[qcol] = pipe
+                preds_va[qcol] = pipe.predict(X_va)
+                preds_te[qcol] = pipe.predict(X_te)
+        elif str(backend).lower() == "torch":
+            imputer = SimpleImputer(strategy="median")
+            scaler = RobustScaler(quantile_range=(10.0, 90.0))
+            xtr = scaler.fit_transform(imputer.fit_transform(X_tr))
+            xva = scaler.transform(imputer.transform(X_va))
+            xte = scaler.transform(imputer.transform(X_te))
+            torch_model = TorchMultiQuantileLinearRegressor(
+                quantiles=list(QUANTILES),
+                learning_rate=max(1e-5, float(eta0)),
+                epochs=1000,
+                batch_size=1024,
             )
-            pipe.fit(X_tr, y_tr)
-            q_models[qcol] = pipe
-            preds_va[qcol] = pipe.predict(X_va)
-            preds_te[qcol] = pipe.predict(X_te)
+            torch_model.fit(xtr, y_tr.to_numpy(dtype=float))
+            va_pred_all = torch_model.predict(xva)
+            te_pred_all = torch_model.predict(xte)
+            for i, q in enumerate(QUANTILES):
+                qcol = _qcol(q)
+                q_models[qcol] = {
+                    "imputer": imputer,
+                    "scaler": scaler,
+                    "model": torch_model,
+                    "quantile_index": int(i),
+                }
+                preds_va[qcol] = va_pred_all[:, i]
+                preds_te[qcol] = te_pred_all[:, i]
+        else:
+            raise ValueError(f"Unsupported backend '{backend}'. Expected 'sklearn' or 'torch'.")
         fit_seconds_total += float(time.perf_counter() - fit_t0)
 
         # Post-process to enforce monotone quantiles row-wise.
@@ -727,6 +757,7 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--lead-weight-end", type=int, default=48)
     p.add_argument("--lead-weight-max", type=float, default=2.0)
     p.add_argument("--lead-parallel-jobs", type=int, default=1)
+    p.add_argument("--backend", choices=["sklearn", "torch"], default="torch")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--metrics-json-out", default="")
     p.add_argument("--metrics-csv-out", default="")
@@ -774,6 +805,7 @@ def main() -> None:
         lead_weight_end=int(args.lead_weight_end),
         lead_weight_max=float(args.lead_weight_max),
         lead_parallel_jobs=max(1, int(args.lead_parallel_jobs)),
+        backend=str(args.backend),
     )
 
     file_tag = f"linear_{args.bundle}_{tgt.replace('target_', '')}"
