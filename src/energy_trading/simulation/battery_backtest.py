@@ -1377,11 +1377,13 @@ class BatteryBacktester:
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
-        # Hard final SoC floor: enforce SoC_T >= target when provided.
-        # This guarantees terminal energy feasibility for downstream operation.
+        # Soft final SoC floor (replacement for hard constraint SoC_T >= target):
+        # soc_T + slack_final_soc >= soc_end_min_target, slack_final_soc >= 0
+        # The objective penalizes slack_final_soc with a high EUR/MWh coefficient.
         if soc_end_min_target is not None:
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + n] = -1.0
+            row[sl["slack_final_soc"].start] = -1.0
             a_ub.append(row)
             b_ub.append(-float(soc_end_min_target))
 
@@ -2949,8 +2951,9 @@ class BatteryBacktester:
                     raise
                 optimization_error = msg
                 if enforce_end_min is not None:
-                    # Terminal SoC floor is hard-enforced. If infeasibility occurs,
-                    # fall back to a safe-hold plan for robustness.
+                    # Final SoC is now handled via soft shortfall slack inside the
+                    # optimizer objective. If infeasibility still occurs, fall back
+                    # to safe-hold for robustness.
                     ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
                     hold = pd.DataFrame(
                         {
@@ -2969,7 +2972,7 @@ class BatteryBacktester:
                         hold[f"reserve_neg_bin_{b}_mw"] = 0.0
                     plan = _fill_zero_ev(hold)
                     plan["optimizer_fallback_used"] = 1.0
-                    optimization_fallback = "safe_hold_plan_under_infeasible_hard_final_soc"
+                    optimization_fallback = "safe_hold_plan_under_infeasible_soft_final_soc"
                 else:
                     # Last-resort fallback: if rolling MILP is infeasible even
                     # without terminal floor, degrade to a physically safe hold

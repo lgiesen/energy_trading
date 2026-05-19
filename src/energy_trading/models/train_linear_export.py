@@ -393,8 +393,6 @@ def _train_target(
                 preds_te[qcol] = te_pred_all[:, i]
         else:
             raise ValueError(f"Unsupported backend '{backend}'. Expected 'sklearn' or 'torch'.")
-        fit_seconds_total += float(time.perf_counter() - fit_t0)
-
         # Post-process to enforce monotone quantiles row-wise.
         q_cols = [_qcol(q) for q in QUANTILES]
         va_stack = np.column_stack([pd.to_numeric(pd.Series(preds_va[c]), errors="coerce").to_numpy(dtype=float) for c in q_cols])
