@@ -25,6 +25,7 @@ LINEAR_LEAD_PARALLEL_JOBS ?= 4
 SIM_QUANTILE_SWEEP_DEFAULT ?= p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90
 SIM_QUANTILE_PAIRS ?= $(SIM_QUANTILE_SWEEP_DEFAULT)
 SIM_DA_ROLES ?= low mid high
+SIM_STRATEGIES ?= multi da_only afrr_only
 DA_QUANTILE_ROLE ?= mid
 GRID_DA_ROLES ?= low mid high
 GRID_STRATEGIES ?= multi da_only afrr_only
@@ -296,16 +297,19 @@ sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboos
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	echo "[INFO] sim-latest-xgb model=xgboost run_id=$$RUN_ID manifest=$$MANIFEST_PATH horizon_hours=$$SIM_HOURS using $$LATEST_JSON"; \
 	for DA_ROLE in $(SIM_DA_ROLES); do \
-	  python3 scripts/run_battery_backtest.py \
-	    --run-manifest "$$MANIFEST_PATH" \
-	    --split test \
-	    --model-key xgboost \
-	    --horizon-hours "$$SIM_HOURS" \
-	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
-	    --da-quantile-role "$$DA_ROLE" \
-	    --start "$$SIM_START" \
-	    --end "$$SIM_END" \
-	    --out-dir "artifacts/simulation_runs/latest_xgboost/$$DA_ROLE"; \
+	  for STRAT in $(SIM_STRATEGIES); do \
+	    python3 scripts/run_battery_backtest.py \
+	      --run-manifest "$$MANIFEST_PATH" \
+	      --split test \
+	      --model-key xgboost \
+	      --trading-strategy "$$STRAT" \
+	      --horizon-hours "$$SIM_HOURS" \
+	      --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	      --da-quantile-role "$$DA_ROLE" \
+	      --start "$$SIM_START" \
+	      --end "$$SIM_END" \
+	      --out-dir "artifacts/simulation_runs/latest_xgboost/$$DA_ROLE/$$STRAT"; \
+	  done; \
 	done
 sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_linear.json
 	@LATEST_JSON="artifacts/model_runs/latest_linear.json"; \
@@ -329,16 +333,19 @@ sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_lin
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	echo "[INFO] sim-latest-linear model=linear run_id=$$RUN_ID manifest=$$MANIFEST_PATH horizon_hours=$$SIM_HOURS using $$LATEST_JSON"; \
 	for DA_ROLE in $(SIM_DA_ROLES); do \
-	  python3 scripts/run_battery_backtest.py \
-	    --run-manifest "$$MANIFEST_PATH" \
-	    --split test \
-	    --model-key linear \
-	    --horizon-hours "$$SIM_HOURS" \
-	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
-	    --da-quantile-role "$$DA_ROLE" \
-	    --start "$$SIM_START" \
-	    --end "$$SIM_END" \
-	    --out-dir "artifacts/simulation_runs/latest_linear/$$DA_ROLE"; \
+	  for STRAT in $(SIM_STRATEGIES); do \
+	    python3 scripts/run_battery_backtest.py \
+	      --run-manifest "$$MANIFEST_PATH" \
+	      --split test \
+	      --model-key linear \
+	      --trading-strategy "$$STRAT" \
+	      --horizon-hours "$$SIM_HOURS" \
+	      --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	      --da-quantile-role "$$DA_ROLE" \
+	      --start "$$SIM_START" \
+	      --end "$$SIM_END" \
+	      --out-dir "artifacts/simulation_runs/latest_linear/$$DA_ROLE/$$STRAT"; \
+	  done; \
 	done
 sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.json
 	@LATEST_JSON="artifacts/model_runs/latest_tft.json"; \
@@ -362,16 +369,19 @@ sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.js
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	echo "[INFO] sim-latest-tft model=tft run_id=$$RUN_ID manifest=$$MANIFEST_PATH horizon_hours=$$SIM_HOURS using $$LATEST_JSON"; \
 	for DA_ROLE in $(SIM_DA_ROLES); do \
-	  python3 scripts/run_battery_backtest.py \
-	    --run-manifest "$$MANIFEST_PATH" \
-	    --split test \
-	    --model-key tft \
-	    --horizon-hours "$$SIM_HOURS" \
-	    --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
-	    --da-quantile-role "$$DA_ROLE" \
-	    --start "$$SIM_START" \
-	    --end "$$SIM_END" \
-	    --out-dir "artifacts/simulation_runs/latest_tft/$$DA_ROLE"; \
+	  for STRAT in $(SIM_STRATEGIES); do \
+	    python3 scripts/run_battery_backtest.py \
+	      --run-manifest "$$MANIFEST_PATH" \
+	      --split test \
+	      --model-key tft \
+	      --trading-strategy "$$STRAT" \
+	      --horizon-hours "$$SIM_HOURS" \
+	      --quantile-pairs "$(SIM_QUANTILE_PAIRS)" \
+	      --da-quantile-role "$$DA_ROLE" \
+	      --start "$$SIM_START" \
+	      --end "$$SIM_END" \
+	      --out-dir "artifacts/simulation_runs/latest_tft/$$DA_ROLE/$$STRAT"; \
+	  done; \
 	done
 sim-all-quantiles: clean-markers ## Run quantile sweep simulation for xgb, linear, tft
 	$(MAKE) sim-xgb SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" SIM_DA_ROLES="low mid high"

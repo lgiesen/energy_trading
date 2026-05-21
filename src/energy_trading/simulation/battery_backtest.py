@@ -1861,12 +1861,13 @@ class BatteryBacktester:
         penalty_activation_neg_eur = missed_activation_neg_mwh * penalty_activation_basis_neg_eur_mwh
         penalty_activation_eur = penalty_activation_pos_eur + penalty_activation_neg_eur
 
-        # As requested: hourly proxy in EUR/MW/h using IDAEP/1000 + markup.
-        penalty_capacity_basis_pos_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_pos)) / 1000.0 + auf_mw_h)
-        penalty_capacity_basis_neg_eur_mw_h = max(float(avg_cap_prod), float(abs(idaep_neg)) / 1000.0 + auf_mw_h)
-        penalty_capacity_pos_eur = missed_capacity_pos_mw * penalty_capacity_basis_pos_eur_mw_h * self.dt_h
-        penalty_capacity_neg_eur = missed_capacity_neg_mw * penalty_capacity_basis_neg_eur_mw_h * self.dt_h
-        penalty_capacity_eur = penalty_capacity_pos_eur + penalty_capacity_neg_eur
+        # Capacity non-delivery penalty removed by request.
+        # Keep missed-capacity diagnostics, but do not charge an economic penalty.
+        penalty_capacity_basis_pos_eur_mw_h = 0.0
+        penalty_capacity_basis_neg_eur_mw_h = 0.0
+        penalty_capacity_pos_eur = 0.0
+        penalty_capacity_neg_eur = 0.0
+        penalty_capacity_eur = 0.0
         penalty_eur = penalty_activation_eur + penalty_capacity_eur
 
         # Cashflow excludes non-cash degradation accounting.
@@ -2797,6 +2798,29 @@ class BatteryBacktester:
                 # If forecast warehouse mapping leaves missing required optimizer
                 # inputs in the current window, abort immediately with context.
                 # This avoids silently biasing economics via default imputations.
+                # End-of-coverage guard:
+                # If *all* required prediction columns are missing only in a trailing
+                # suffix of the rolling window (typical at split boundary), trim that
+                # suffix and continue with the feasible prefix. Internal holes remain
+                # hard failures (no silent interpolation across gaps).
+                req_pred_cols = list(pred_fallbacks.keys())
+                req_missing_frame = pd.DataFrame(
+                    {
+                        c: pd.to_numeric(window[c], errors="coerce").isna()
+                        for c in req_pred_cols
+                    },
+                    index=window.index,
+                )
+                all_req_missing = req_missing_frame.all(axis=1)
+                if bool(all_req_missing.any()):
+                    miss_pos = np.flatnonzero(all_req_missing.to_numpy(dtype=bool))
+                    first_miss = int(miss_pos[0])
+                    trailing_only = np.array_equal(miss_pos, np.arange(first_miss, len(window)))
+                    if trailing_only:
+                        window = window.iloc[:first_miss].copy()
+                        if window.empty:
+                            break
+
                 missing_msgs: list[str] = []
                 for pred_col, fallbacks in pred_fallbacks.items():
                     if pred_col not in window.columns:
@@ -2947,10 +2971,40 @@ class BatteryBacktester:
                 )
             except RuntimeError as exc:
                 msg = str(exc)
-                if "infeasible" not in msg.lower():
+                msg_l = msg.lower()
+                # Recoverable solver failures (e.g. transient HiGHS "Not Set")
+                # should not abort the entire backtest. Degrade this window to a
+                # physically safe hold plan and continue rolling.
+                recoverable_solver_failure = (
+                    "highs status 0: not set" in msg_l
+                    or "not set" in msg_l
+                    or "numerical" in msg_l
+                )
+                is_infeasible = "infeasible" in msg_l
+                if (not is_infeasible) and (not recoverable_solver_failure):
                     raise
                 optimization_error = msg
-                if enforce_end_min is not None:
+                if recoverable_solver_failure:
+                    ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+                    hold = pd.DataFrame(
+                        {
+                            colmap.timestamp: ts_vals,
+                            "charge_mw": np.zeros(len(window), dtype=float),
+                            "discharge_mw": np.zeros(len(window), dtype=float),
+                            "reserve_pos_mw": np.zeros(len(window), dtype=float),
+                            "reserve_neg_mw": np.zeros(len(window), dtype=float),
+                            "soc_lp_mwh": np.full(len(window), float(soc), dtype=float),
+                            "final_soc_shortfall_mwh": np.full(len(window), 0.0, dtype=float),
+                        },
+                        index=window.index,
+                    )
+                    for b in range(len(self.afrr_quantile_bins)):
+                        hold[f"reserve_pos_bin_{b}_mw"] = 0.0
+                        hold[f"reserve_neg_bin_{b}_mw"] = 0.0
+                    plan = _fill_zero_ev(hold)
+                    plan["optimizer_fallback_used"] = 1.0
+                    optimization_fallback = "safe_hold_plan_under_solver_not_set"
+                elif enforce_end_min is not None:
                     # Final SoC is now handled via soft shortfall slack inside the
                     # optimizer objective. If infeasibility still occurs, fall back
                     # to safe-hold for robustness.
