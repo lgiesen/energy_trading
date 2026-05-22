@@ -4,6 +4,9 @@
 MODEL_SPECS = {
     "time_step_hours": 1.0,  # Optimization time step (Delta t): 1h
     "reserve_product_duration_h": 4.0,  # Duration used for activation-energy bounds
+    # Minimum activation-energy headroom floor used inside p90 chance constraints.
+    # 0.25 means 15 minutes within a 1-hour optimization step.
+    "min_activation_headroom_fraction": 0.25,
     "market_scope": "DE_LU",  # Sign/settlement convention scope
     "terminal_soc_value_discount": 0.8,  # Discount for terminal SoC value in objective
 }
@@ -57,6 +60,9 @@ FINANCIAL_PARAMS = {
     "afrr_penalty_default_marginal_energy_price_eur_mwh": 150.0,
     "afrr_penalty_default_avg_capacity_price_product_eur_mw_h": 12.5,
     "afrr_penalty_default_idaep_eur_mwh": 100.0,
+    # Enforce final SoC >= soc_target_end effectively as hard in optimization:
+    # very large soft-shortfall cost (not a settlement cashflow component).
+    "final_soc_shortfall_penalty_eur_per_mwh": 1_000_000_000.0,
 }
 
 # --- MARKET CONSTRAINTS ---

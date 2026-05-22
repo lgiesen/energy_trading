@@ -725,8 +725,6 @@ def main() -> None:
             str(args.lead_weight_end),
             "--lead-weight-max",
             str(args.lead_weight_max),
-            "--lead-parallel-jobs",
-            str(max(1, int(args.lead_parallel_jobs))),
             "--seed",
             str(args.seed),
         ]

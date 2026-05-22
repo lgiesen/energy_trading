@@ -380,6 +380,10 @@ class BatteryBacktester:
         self.bid_power_max_mw = float(MARKET_SPECS.get("bid_power_max_mw", self.p_max_mw))
         self.reserve_max_mw = min(self.p_max_mw, self.bid_power_max_mw)
         self.reserve_product_duration_h = float(MODEL_SPECS.get("reserve_product_duration_h", 4.0))
+        self.min_activation_headroom_fraction = float(
+            MODEL_SPECS.get("min_activation_headroom_fraction", 0.25)
+        )
+        self.min_activation_headroom_fraction = max(0.0, min(1.0, self.min_activation_headroom_fraction))
         self.da_bid_granularity_mw = float(MARKET_SPECS.get("da_bid_granularity", 0.1))
         self.afrr_bid_granularity_mw = float(MARKET_SPECS.get("afrr_bid_granularity", 1.0))
         # Backward-compatible alias used by some helper paths.
@@ -1261,11 +1265,16 @@ class BatteryBacktester:
             # enforce sufficient SoC footroom/headroom for p90 activation-rate
             # on expected awarded reserve (capacity acceptance by bin).
             # pos reserve needs discharge energy from SoC:
-            # soc_t - sum_b(p_acc_cap_pos[t,b] * r_act_pos_p90[t] * reserve_bin[b,t] * dt / eta_out) >= soc_min
+            # enforce a minimum 15-min-equivalent activation headroom floor via
+            # max(r_act_p90, min_activation_headroom_fraction).
+            # soc_t - sum_b(p_acc_cap_pos[t,b] * max(r_act_pos_p90[t], r_floor) * reserve_bin[b,t] * dt / eta_out) >= soc_min
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = -1.0
             for b in range(n_bins):
-                chance_pos = p_acc_cap_pos[t, b] * r_act_pos_p90[t]
+                chance_pos = p_acc_cap_pos[t, b] * max(
+                    float(r_act_pos_p90[t]),
+                    float(self.min_activation_headroom_fraction),
+                )
                 row[sl["rpos_bin"].start + b * n + t] = (
                     chance_pos * self.dt_h / max(self.eta_out, 1e-12)
                 ) * afrr_step
@@ -1274,11 +1283,15 @@ class BatteryBacktester:
             b_ub.append(-self.soc_min)
 
             # neg reserve needs charging headroom in SoC:
-            # soc_t + sum_b(p_acc_cap_neg[t,b] * r_act_neg_p90[t] * reserve_bin[b,t] * dt * eta_in) <= soc_max
+            # same activation headroom floor as positive direction.
+            # soc_t + sum_b(p_acc_cap_neg[t,b] * max(r_act_neg_p90[t], r_floor) * reserve_bin[b,t] * dt * eta_in) <= soc_max
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = 1.0
             for b in range(n_bins):
-                chance_neg = p_acc_cap_neg[t, b] * r_act_neg_p90[t]
+                chance_neg = p_acc_cap_neg[t, b] * max(
+                    float(r_act_neg_p90[t]),
+                    float(self.min_activation_headroom_fraction),
+                )
                 row[sl["rneg_bin"].start + b * n + t] = (chance_neg * self.dt_h * self.eta_in) * afrr_step
             row[sl["slack_neg"].start + t] = -1.0
             a_ub.append(row)
