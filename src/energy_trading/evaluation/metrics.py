@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import Any
 
 import numpy as np
@@ -122,6 +123,10 @@ def _crps_from_quantile_losses(pinball_by_q: dict[float, float | None]) -> float
 
     Uses the identity CRPS = 2 * integral_0^1 pinball_tau d tau and
     trapezoidal integration over available quantiles.
+
+    Tail handling in this implementation is *truncation*: quantile regions
+    below min(q) and above max(q) are not extrapolated and therefore do not
+    contribute to the integral.
     """
     pairs: list[tuple[float, float]] = []
     for q, v in sorted(pinball_by_q.items(), key=lambda kv: kv[0]):
@@ -133,6 +138,13 @@ def _crps_from_quantile_losses(pinball_by_q: dict[float, float | None]) -> float
             pairs.append((qf, vf))
     if len(pairs) < 2:
         return None
+    if len(pairs) < 5:
+        warnings.warn(
+            "crps_quantile_approx uses fewer than 5 quantiles; "
+            "the approximation can be unstable on sparse quantile grids.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     qs = np.asarray([p[0] for p in pairs], dtype=float)
     losses = np.asarray([p[1] for p in pairs], dtype=float)
     area = float(np.trapz(losses, qs))
