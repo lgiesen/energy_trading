@@ -1328,10 +1328,26 @@ def _train_tft(
     }
     # Export all probabilistic metrics present in H1 suites (all available quantiles + intervals).
     for k, v in val_metric_suite_h1.items():
-        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+        if (
+            k.startswith("pinball_loss_p")
+            or k.startswith("picp_")
+            or k.startswith("winkler_score_")
+            or k.startswith("pinaw_")
+            or k.startswith("coverage_gap_")
+            or k.startswith("tradeoff_score_")
+            or k.startswith("crps_")
+        ):
             metrics[f"{k}_val_h1"] = v
     for k, v in test_metric_suite_h1.items():
-        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+        if (
+            k.startswith("pinball_loss_p")
+            or k.startswith("picp_")
+            or k.startswith("winkler_score_")
+            or k.startswith("pinaw_")
+            or k.startswith("coverage_gap_")
+            or k.startswith("tradeoff_score_")
+            or k.startswith("crps_")
+        ):
             metrics[f"{k}_test_h1"] = v
     metrics.update(lead_pinball_weighted)
     return metrics

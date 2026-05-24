@@ -23,6 +23,18 @@ _STRATEGIC_INTERVAL_PAIRS: tuple[tuple[float, float], ...] = (
 )
 
 
+def _interval_tradeoff_score(*, picp: float | None, pinaw: float | None, target_coverage: float) -> float | None:
+    """Combine calibration and sharpness into one interpretable score.
+
+    Lower is better. Perfect calibration and zero width gives 0.
+    """
+    if picp is None or pinaw is None:
+        return None
+    if not (np.isfinite(picp) and np.isfinite(pinaw) and np.isfinite(target_coverage)):
+        return None
+    return float(abs(float(picp) - float(target_coverage)) + float(pinaw))
+
+
 def _to_float_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").astype(float)
 
@@ -103,6 +115,28 @@ def _pinball_loss(y_true: np.ndarray, y_q: np.ndarray, q: float) -> float | None
     e = y_true[mask] - y_q[mask]
     loss = np.maximum(q * e, (q - 1.0) * e)
     return float(np.mean(loss))
+
+
+def _crps_from_quantile_losses(pinball_by_q: dict[float, float | None]) -> float | None:
+    """Approximate CRPS from quantile pinball losses.
+
+    Uses the identity CRPS = 2 * integral_0^1 pinball_tau d tau and
+    trapezoidal integration over available quantiles.
+    """
+    pairs: list[tuple[float, float]] = []
+    for q, v in sorted(pinball_by_q.items(), key=lambda kv: kv[0]):
+        if v is None:
+            continue
+        qf = float(q)
+        vf = float(v)
+        if np.isfinite(qf) and np.isfinite(vf):
+            pairs.append((qf, vf))
+    if len(pairs) < 2:
+        return None
+    qs = np.asarray([p[0] for p in pairs], dtype=float)
+    losses = np.asarray([p[1] for p in pairs], dtype=float)
+    area = float(np.trapz(losses, qs))
+    return float(2.0 * area)
 
 
 def pinball_loss_by_quantile(
@@ -310,14 +344,19 @@ def compute_forecast_metrics(
     qmap = _extract_quantile_columns(df, quantile_cols)
     out["available_quantiles"] = [float(q) for q in qmap.keys()]
 
+    pinball_by_q_float: dict[float, float | None] = {}
     for q, col in qmap.items():
         yq_s = _to_float_series(df[col])
         q_mask = yt_s.notna() & yq_s.notna()
-        out[f"pinball_loss_p{int(round(q * 100)):02d}"] = _pinball_loss(
+        pinball_q = _pinball_loss(
             yt_s.loc[q_mask].to_numpy(dtype=float),
             yq_s.loc[q_mask].to_numpy(dtype=float),
             q=float(q),
         )
+        pinball_by_q_float[float(q)] = pinball_q
+        out[f"pinball_loss_p{int(round(q * 100)):02d}"] = pinball_q
+
+    out["crps_quantile_approx"] = _crps_from_quantile_losses(pinball_by_q_float)
 
     interval_metrics_by_pair: dict[str, dict[str, float | None]] = {}
     for q_lo, q_hi in _STRATEGIC_INTERVAL_PAIRS:
@@ -328,6 +367,8 @@ def compute_forecast_metrics(
             "picp": None,
             "winkler_score": None,
             "pinaw": None,
+            "coverage_gap": None,
+            "tradeoff_score": None,
             "interval_level": float(q_hi - q_lo),
             "alpha": float(1.0 - (q_hi - q_lo)),
         }
@@ -345,10 +386,18 @@ def compute_forecast_metrics(
             pair_payload["picp"] = float(np.mean((yt_m > lo) & (yt_m < hi)))
             pair_payload["winkler_score"] = winkler_score(yt_m, lo, hi, alpha=alpha)
             pair_payload["pinaw"] = prediction_interval_normalized_average_width(yt_m, lo, hi)
+            pair_payload["coverage_gap"] = float(pair_payload["picp"] - (q_hi - q_lo))
+            pair_payload["tradeoff_score"] = _interval_tradeoff_score(
+                picp=pair_payload["picp"],
+                pinaw=pair_payload["pinaw"],
+                target_coverage=float(q_hi - q_lo),
+            )
         interval_metrics_by_pair[pair_key] = pair_payload
         out[f"picp_{pair_key}"] = pair_payload["picp"]
         out[f"winkler_score_{pair_key}"] = pair_payload["winkler_score"]
         out[f"pinaw_{pair_key}"] = pair_payload["pinaw"]
+        out[f"coverage_gap_{pair_key}"] = pair_payload["coverage_gap"]
+        out[f"tradeoff_score_{pair_key}"] = pair_payload["tradeoff_score"]
 
     out["interval_metrics_by_pair"] = interval_metrics_by_pair
     # Backward-compatible aliases.
@@ -356,10 +405,14 @@ def compute_forecast_metrics(
     out["picp_80"] = p10_p90.get("picp")
     out["winkler_score_80"] = p10_p90.get("winkler_score")
     out["pinaw_80"] = p10_p90.get("pinaw")
+    out["coverage_gap_80"] = p10_p90.get("coverage_gap")
+    out["tradeoff_score_80"] = p10_p90.get("tradeoff_score")
     p05_p95 = interval_metrics_by_pair.get("p05_p95", {})
     out["picp_90"] = p05_p95.get("picp")
     out["winkler_score_90"] = p05_p95.get("winkler_score")
     out["pinaw_90"] = p05_p95.get("pinaw")
+    out["coverage_gap_90"] = p05_p95.get("coverage_gap")
+    out["tradeoff_score_90"] = p05_p95.get("tradeoff_score")
 
     return out
 

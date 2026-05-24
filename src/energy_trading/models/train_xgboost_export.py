@@ -1191,7 +1191,15 @@ def train_and_evaluate(
     }
     # Export all probabilistic metrics available on primary target H1 suite.
     for k, v in primary_metric_suite_h1.items():
-        if k.startswith("pinball_loss_p") or k.startswith("picp_") or k.startswith("winkler_score_") or k.startswith("pinaw_"):
+        if (
+            k.startswith("pinball_loss_p")
+            or k.startswith("picp_")
+            or k.startswith("winkler_score_")
+            or k.startswith("pinaw_")
+            or k.startswith("coverage_gap_")
+            or k.startswith("tradeoff_score_")
+            or k.startswith("crps_")
+        ):
             metrics[f"{k}_h1"] = v
     metrics.update(cv_metrics)
     return metrics, models_by_target, target_cols
