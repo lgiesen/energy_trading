@@ -747,8 +747,27 @@ def main() -> None:
             )
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if "manifest_path" in payload:
+            pointer_path = manifest_path
             run_id = payload.get("run_id")
-            manifest_path = Path(payload["manifest_path"])
+            manifest_raw = Path(str(payload["manifest_path"]))
+            manifest_path = manifest_raw if manifest_raw.is_absolute() else (pointer_path.parent / manifest_raw)
+            if not manifest_path.exists():
+                candidates: list[Path] = []
+                if run_id:
+                    candidates.append(Path("artifacts/model_runs") / str(run_id) / "manifest.json")
+                    candidates.append(pointer_path.parent / str(run_id) / "manifest.json")
+                candidates.append(pointer_path.parent / "manifest.json")
+                fallback = next((c for c in candidates if c.exists()), None)
+                if fallback is None:
+                    raise FileNotFoundError(
+                        "Latest pointer resolves to missing manifest path and no local fallback was found. "
+                        f"pointer={pointer_path}, manifest_path={manifest_path}, run_id={run_id}"
+                    )
+                print(
+                    f"[WARN] Latest pointer manifest path not found: {manifest_path}. "
+                    f"Using local fallback: {fallback}"
+                )
+                manifest_path = fallback
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         run_id = run_id or payload.get("run_id") or (args.run_id.strip() or None)
         manifest_dir = manifest_path.parent

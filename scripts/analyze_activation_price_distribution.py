@@ -20,7 +20,8 @@ import pandas as pd
 def _resolve_manifest(path: Path) -> tuple[Path, dict]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if "manifest_path" in payload:
-        path = Path(str(payload["manifest_path"]))
+        raw = Path(str(payload["manifest_path"]))
+        path = raw if raw.is_absolute() else (path.parent / raw)
         payload = json.loads(path.read_text(encoding="utf-8"))
     return path, payload
 
@@ -114,4 +115,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

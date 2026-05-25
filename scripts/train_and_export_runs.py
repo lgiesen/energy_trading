@@ -32,6 +32,56 @@ def _run_id_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 
 
+def _normalize_json_paths_inplace(json_path: Path, *, repo_root: Path) -> bool:
+    """Rewrite absolute repo/server paths in one JSON file to relative paths."""
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    changed = False
+    base_dir = json_path.parent.resolve()
+    repo_root = repo_root.resolve()
+
+    def _to_rel(value: object) -> object:
+        nonlocal changed
+        if isinstance(value, dict):
+            return {k: _to_rel(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_to_rel(v) for v in value]
+        if not isinstance(value, str):
+            return value
+
+        s = value.strip()
+        if not s:
+            return value
+
+        local_abs: Path | None = None
+        p = Path(s)
+        if p.is_absolute():
+            local_abs = p
+        elif "/energy_trading/" in s:
+            suffix = s.split("/energy_trading/", 1)[1]
+            local_abs = repo_root / suffix
+        elif "/artifacts/model_runs/" in s:
+            suffix = s.split("/artifacts/model_runs/", 1)[1]
+            local_abs = repo_root / "artifacts" / "model_runs" / suffix
+
+        if local_abs is None:
+            return value
+        try:
+            rel = os.path.relpath(str(local_abs.resolve()), start=str(base_dir))
+            changed = True
+            return str(rel)
+        except Exception:
+            return value
+
+    normalized = _to_rel(payload)
+    if changed:
+        json_path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
+    return changed
+
+
 def _cmd_to_shell_string(cmd: list[str]) -> str:
     try:
         return shlex.join(cmd)
@@ -1040,14 +1090,29 @@ def main() -> None:
 
     if not args.skip_latest_pointer:
         now_iso = datetime.now(timezone.utc).isoformat()
+        latest_model_path = Path(args.run_root) / f"latest_{args.model_type}.json"
+        try:
+            # Prefer a portable relative pointer for multi-machine workflows.
+            manifest_pointer = str(manifest_path.resolve().relative_to(latest_model_path.parent.resolve()))
+        except ValueError:
+            # Fallback if paths are on different roots.
+            manifest_pointer = str(manifest_path.resolve())
         latest_payload = {
             "run_id": run_id,
-            "manifest_path": str(manifest_path.resolve()),
+            "manifest_path": manifest_pointer,
+            "manifest_path_abs": str(manifest_path.resolve()),
             "updated_at_utc": now_iso,
             "model_type": args.model_type,
         }
-        latest_model_path = Path(args.run_root) / f"latest_{args.model_type}.json"
         latest_model_path.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
+
+    # Normalize generated JSON artifacts to portable relative paths for
+    # cross-machine reproducibility.
+    repo_root = Path(__file__).resolve().parents[1]
+    for p in run_dir.rglob("*.json"):
+        _normalize_json_paths_inplace(p, repo_root=repo_root)
+    if not args.skip_latest_pointer:
+        _normalize_json_paths_inplace(latest_model_path, repo_root=repo_root)
 
     print("[OK] Run export complete.")
     print(f"- run_id: {run_id}")

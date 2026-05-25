@@ -34,7 +34,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _load_manifest(path: Path) -> dict[str, Any]:
     payload = _read_json(path)
     if "manifest_path" in payload:
-        p2 = Path(str(payload["manifest_path"]))
+        raw = Path(str(payload["manifest_path"]))
+        p2 = raw if raw.is_absolute() else (path.parent / raw)
         if p2.exists():
             payload = _read_json(p2)
     return payload

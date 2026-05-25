@@ -59,7 +59,6 @@ FINANCIAL_PARAMS = {
     "afrr_penalty_aufschlag_eur_mw_h": 3.0,
     "afrr_penalty_default_marginal_energy_price_eur_mwh": 150.0,
     "afrr_penalty_default_avg_capacity_price_product_eur_mw_h": 12.5,
-    "afrr_penalty_default_idaep_eur_mwh": 100.0,
     # Enforce final SoC >= soc_target_end effectively as hard in optimization:
     # very large soft-shortfall cost (not a settlement cashflow component).
     "final_soc_shortfall_penalty_eur_per_mwh": 1_000_000_000.0,

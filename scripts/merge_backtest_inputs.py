@@ -12,9 +12,11 @@ import pandas as pd
 def _resolve_manifest(path: Path) -> tuple[dict, str | None]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     run_id = payload.get("run_id")
+    manifest_path = path
     if "manifest_path" in payload:
-        path = Path(payload["manifest_path"])
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = Path(str(payload["manifest_path"]))
+        manifest_path = raw if raw.is_absolute() else (path.parent / raw)
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         run_id = run_id or payload.get("run_id")
     return payload, run_id
 
@@ -39,8 +41,21 @@ def main() -> None:
         run_manifest = f"artifacts/model_runs/latest_{args.model_key}.json"
     manifest, run_id = _resolve_manifest(Path(run_manifest))
 
+    run_manifest_path = Path(run_manifest)
+    payload = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    if "manifest_path" in payload:
+        raw = Path(str(payload["manifest_path"]))
+        manifest_file = raw if raw.is_absolute() else (run_manifest_path.parent / raw)
+    else:
+        manifest_file = run_manifest_path
+    manifest_dir = manifest_file.parent
+
     da_pred = Path(manifest["bundles"]["da"]["predictions"][args.split])
     afrr_pred = Path(manifest["bundles"]["afrr"]["predictions"][args.split])
+    if not da_pred.is_absolute():
+        da_pred = manifest_dir / da_pred
+    if not afrr_pred.is_absolute():
+        afrr_pred = manifest_dir / afrr_pred
 
     if args.out.strip():
         out = Path(args.out)

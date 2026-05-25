@@ -366,9 +366,6 @@ class BatteryBacktester:
         self.afrr_penalty_default_avg_capacity_price_product_eur_mw_h = float(
             FINANCIAL_PARAMS.get("afrr_penalty_default_avg_capacity_price_product_eur_mw_h", 12.5)
         )
-        self.afrr_penalty_default_idaep_eur_mwh = float(
-            FINANCIAL_PARAMS.get("afrr_penalty_default_idaep_eur_mwh", 100.0)
-        )
         # Replacement for hard end-SoC floor: soft shortfall penalty in objective.
         self.final_soc_shortfall_penalty_eur_per_mwh = float(
             os.environ.get(
@@ -428,6 +425,7 @@ class BatteryBacktester:
             da_mode_default=self.da_execution_mode,
         )
         self.id_rescue_spread_eur_mwh = float(MARKET_SPECS.get("id_rescue_spread_eur_mwh", 30.0))
+        self._neg_activation_sign_diagnostic_emitted = False
         self.id_buy_price_cap_eur_mwh = float(MARKET_SPECS.get("id_buy_price_cap_eur_mwh", 3000.0))
         self.id_sell_price_floor_eur_mwh = float(MARKET_SPECS.get("id_sell_price_floor_eur_mwh", -500.0))
         # MILP runtime controls:
@@ -1099,7 +1097,7 @@ class BatteryBacktester:
                 - offer_cost
                 + exp_act_neg
                 * (
-                    act_price_neg
+                    -act_price_neg
                     - self.trans_eur_mwh
                     - (self.deg_eur_mwh * self.eta_in)
                 )
@@ -1641,8 +1639,6 @@ class BatteryBacktester:
         marginal_energy_price_pos_eur_mwh: float | None = None,
         marginal_energy_price_neg_eur_mwh: float | None = None,
         average_capacity_price_product_eur_mw_h: float | None = None,
-        idaep_pos_eur_mwh: float | None = None,
-        idaep_neg_eur_mwh: float | None = None,
         aufschlag_eur_mwh: float | None = None,
         aufschlag_eur_mw_h: float | None = None,
     ) -> tuple[float, dict[str, float]]:
@@ -1806,10 +1802,29 @@ class BatteryBacktester:
         # Activation revenue is paid on delivered activation energy. We still avoid
         # double counting by not adding synthetic internal energy replacement costs
         # here; replenishment economics are reflected through subsequent DA/ID trades.
-        requested_activation_revenue_eur = act_pos_grid_req * act_pos_price + act_neg_grid_req * act_neg_price
-        delivered_activation_revenue_eur = act_pos_grid * act_pos_price + act_neg_grid * act_neg_price
+        # NEG (downward) price is stored with market-side sign. Provider-side
+        # settlement cashflow is therefore the negative of that signed price.
+        requested_activation_revenue_eur = act_pos_grid_req * act_pos_price - act_neg_grid_req * act_neg_price
+        delivered_activation_revenue_eur = act_pos_grid * act_pos_price - act_neg_grid * act_neg_price
         missed_activation_revenue_eur = max(0.0, requested_activation_revenue_eur - delivered_activation_revenue_eur)
         rev_act = float(delivered_activation_revenue_eur)
+        if not self._neg_activation_sign_diagnostic_emitted:
+            zero_volume_revenue = -0.0 * float(act_neg_price)
+            if abs(zero_volume_revenue) > 1e-12:
+                raise AssertionError(
+                    "NEG activation sign diagnostic failed: volume=0 must imply zero NEG activation revenue."
+                )
+            neg_cashflow = -float(act_neg_grid) * float(act_neg_price)
+            if float(act_neg_grid) > 1e-12 and float(act_neg_price) < 0.0 and neg_cashflow <= 0.0:
+                raise AssertionError(
+                    "NEG activation sign diagnostic failed: volume>0 with negative NEG price must yield positive revenue."
+                )
+            print(
+                "[DIAG] NEG activation sign check: "
+                f"volume_mwh={float(act_neg_grid):.6f}, price_eur_mwh={float(act_neg_price):.6f}, "
+                f"provider_cashflow_eur={neg_cashflow:.6f}"
+            )
+            self._neg_activation_sign_diagnostic_emitted = True
         missed_activation_mwh = max(0.0, act_pos_grid_req - act_pos_grid) + max(0.0, act_neg_grid_req - act_neg_grid)
         missed_capacity_mw = missed_capacity_pos_mw + missed_capacity_neg_mw
 
@@ -1825,51 +1840,12 @@ class BatteryBacktester:
             da_ch_internal + da_dis_internal + id_ch_internal + id_dis_internal + act_pos_internal + act_neg_internal
         )
 
-        # aFRR-Penalty gemäß regelleistung.net:
-        # Nichtlieferung -> P_unavailable * max(P_product_slice, IDAEP + Aufschlag)
-        # Kapazitätsstrafe wird bei Nichtlieferung direkt angewendet.
-        # Quelle: https://www.regelleistung.net/de-de/Anbieter-werden/Abrechnung/automatic-Frequency-Restoration-Reserve
+        # Activation non-delivery penalty:
+        # requested-minus-delivered activation volume settled at activation price.
         missed_activation_pos_mwh = max(0.0, act_pos_grid_req - act_pos_grid)
         missed_activation_neg_mwh = max(0.0, act_neg_grid_req - act_neg_grid)
-
-        marginal_pos = float(
-            self.afrr_penalty_default_marginal_energy_price_eur_mwh
-            if marginal_energy_price_pos_eur_mwh is None or not np.isfinite(marginal_energy_price_pos_eur_mwh)
-            else marginal_energy_price_pos_eur_mwh
-        )
-        marginal_neg = float(
-            self.afrr_penalty_default_marginal_energy_price_eur_mwh
-            if marginal_energy_price_neg_eur_mwh is None or not np.isfinite(marginal_energy_price_neg_eur_mwh)
-            else marginal_energy_price_neg_eur_mwh
-        )
-        # Fallback to realized activation prices if caller does not provide explicit marginal prices.
-        if marginal_energy_price_pos_eur_mwh is None or not np.isfinite(marginal_energy_price_pos_eur_mwh):
-            if np.isfinite(act_pos_price):
-                marginal_pos = float(abs(act_pos_price))
-        if marginal_energy_price_neg_eur_mwh is None or not np.isfinite(marginal_energy_price_neg_eur_mwh):
-            if np.isfinite(act_neg_price):
-                marginal_neg = float(abs(act_neg_price))
-
-        idaep_pos = float(
-            self.afrr_penalty_default_idaep_eur_mwh
-            if idaep_pos_eur_mwh is None or not np.isfinite(idaep_pos_eur_mwh)
-            else idaep_pos_eur_mwh
-        )
-        idaep_neg = float(
-            self.afrr_penalty_default_idaep_eur_mwh
-            if idaep_neg_eur_mwh is None or not np.isfinite(idaep_neg_eur_mwh)
-            else idaep_neg_eur_mwh
-        )
-        auf_mwh = float(self.afrr_penalty_aufschlag_eur_mwh if aufschlag_eur_mwh is None else aufschlag_eur_mwh)
-        auf_mw_h = float(self.afrr_penalty_aufschlag_eur_mw_h if aufschlag_eur_mw_h is None else aufschlag_eur_mw_h)
-        avg_cap_prod = float(
-            self.afrr_penalty_default_avg_capacity_price_product_eur_mw_h
-            if average_capacity_price_product_eur_mw_h is None or not np.isfinite(average_capacity_price_product_eur_mw_h)
-            else average_capacity_price_product_eur_mw_h
-        )
-
-        penalty_activation_basis_pos_eur_mwh = max(float(abs(marginal_pos)), float(abs(idaep_pos + auf_mwh)))
-        penalty_activation_basis_neg_eur_mwh = max(float(abs(marginal_neg)), float(abs(idaep_neg + auf_mwh)))
+        penalty_activation_basis_pos_eur_mwh = float(act_pos_price)
+        penalty_activation_basis_neg_eur_mwh = float(act_neg_price)
         penalty_activation_pos_eur = missed_activation_pos_mwh * penalty_activation_basis_pos_eur_mwh
         penalty_activation_neg_eur = missed_activation_neg_mwh * penalty_activation_basis_neg_eur_mwh
         penalty_activation_eur = penalty_activation_pos_eur + penalty_activation_neg_eur
