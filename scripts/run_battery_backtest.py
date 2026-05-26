@@ -684,8 +684,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--da-gate-hour-cet",
         type=int,
-        default=12,
-        help="Day-Ahead gate-closure hour in CET/CEST used for locking next-day DA bids (default: 12).",
+        default=11,
+        help="Day-Ahead gate-closure hour in CET/CEST used for locking next-day DA bids (default: 11).",
     )
     p.add_argument(
         "--da-gate-hour-utc",
