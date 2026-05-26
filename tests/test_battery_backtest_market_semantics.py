@@ -945,3 +945,195 @@ def test_headroom_audit_matches_constraint_timing() -> None:
     ) / bt.eta_out
     assert np.isclose(float(r["available_headroom_pos_mwh"]), expected_avail, atol=1e-9)
     assert np.isclose(float(r["required_headroom_pos_mwh"]), expected_req, atol=1e-9)
+
+
+def test_terminal_soc_pnl_reconciliation() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Encourage discharge so terminal repair/adjustment is active.
+    df[col.pred_da_price] = 120.0
+    df[col.true_da_price] = 120.0
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, allowed_markets=("DA",))
+    s = out.summary
+    rhs = float(s["realized_pnl_excl_terminal_eur"]) + float(s["terminal_soc_adjustment_eur"])
+    assert np.isclose(float(s["realized_total_pnl_eur"]), rhs, atol=1e-6)
+
+
+def test_summary_flags_invalid_runs() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Force fallback-driven infeasible stress with high reserve commitments.
+    df[col.pred_afrr_capacity_price_pos] = 1e3
+    df[col.true_afrr_capacity_price_pos] = 1e3
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=2, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    s = out.summary
+    for k in [
+        "simulation_valid",
+        "invalid_reason",
+        "final_soc_check_pass",
+        "missed_capacity_check_pass",
+        "pnl_reconciliation_check_pass",
+        "headroom_check_pass",
+    ]:
+        assert k in s
+
+
+def test_bcm_precommitment_reduces_infeasible_bid() -> None:
+    bt = _mk_backtester()
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")  # 08:00 CET/CEST gate for model path
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [10.0, 10.0, 10.0, 10.0],
+            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            # only ~2 MWh above soc_min -> infeasible for 10 MW @ 0.5h
+            "soc_start_lp_mwh": [bt.soc_min + 2.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [50.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    lock_pos: dict[pd.Timestamp, float] = {}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    lock_e_pos: dict[pd.Timestamp, float] = {}
+    lock_e_neg: dict[pd.Timestamp, float] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos=lock_e_pos,
+        lock_energy_neg=lock_e_neg,
+        is_oracle=False,
+    )
+    # 2 MWh headroom with 0.5h/eta_out implies <4 MW feasible.
+    assert len(lock_pos) == 4
+    assert max(lock_pos.values()) <= 4.0 + 1e-9
+
+
+def test_precommit_includes_aux_losses() -> None:
+    bt = _mk_backtester()
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    # Without aux this would be feasible for ~4 MW; with 0.2 MWh aux per hour it is reduced.
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [4.0, 4.0, 4.0, 4.0],
+            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "soc_start_lp_mwh": [bt.soc_min + 2.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.2] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [50.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    lock_pos: dict[pd.Timestamp, float] = {}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos={},
+        lock_energy_neg={},
+        is_oracle=False,
+    )
+    assert len(lock_pos) == 4
+    assert max(lock_pos.values()) < 4.0
+
+
+def test_precommit_includes_existing_lockbook_obligations() -> None:
+    bt = _mk_backtester()
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [4.0, 4.0, 4.0, 4.0],
+            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "soc_start_lp_mwh": [bt.soc_min + 3.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [50.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    lock_pos: dict[pd.Timestamp, float] = {ts: 3.0 for ts in target_hours}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos={},
+        lock_energy_neg={},
+        is_oracle=False,
+    )
+    # New offer should be clamped to leave room for already-locked 3 MW.
+    assert len(lock_pos) == 4
+    assert max(lock_pos.values()) <= 3.0 + 1e-9
+
+
+def test_final_report_excludes_invalid_runs() -> None:
+    df = pd.DataFrame(
+        {
+            "scenario": ["p50_p50", "p70_p90"],
+            "trading_strategy": ["multi", "multi"],
+            "simulation_valid": [0.0, 1.0],
+            "invalid_reason": ["missed_capacity", ""],
+        }
+    )
+    valid = df.loc[pd.to_numeric(df["simulation_valid"], errors="coerce").fillna(0.0) >= 0.5]
+    assert len(valid) == 1
+    assert valid.iloc[0]["scenario"] == "p70_p90"

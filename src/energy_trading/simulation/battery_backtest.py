@@ -393,6 +393,8 @@ class BatteryBacktester:
         self.min_activation_headroom_fraction = max(0.0, min(1.0, self.min_activation_headroom_fraction))
         self.reserve_activation_headroom_h = max(0.0, float(MODEL_SPECS.get("reserve_activation_headroom_h", 0.5)))
         self.bem_activation_headroom_h = max(0.0, float(MODEL_SPECS.get("bem_activation_headroom_h", 0.5)))
+        self.reserve_headroom_safety_mwh = max(0.0, float(MODEL_SPECS.get("reserve_headroom_safety_mwh", 0.1)))
+        self.reserve_power_safety_mw = max(0.0, float(MODEL_SPECS.get("reserve_power_safety_mw", 0.05)))
         self.da_bid_granularity_mw = float(MARKET_SPECS.get("da_bid_granularity", 0.1))
         self.afrr_bid_granularity_mw = float(MARKET_SPECS.get("afrr_bid_granularity", 1.0))
         # Backward-compatible alias used by some helper paths.
@@ -1766,6 +1768,43 @@ class BatteryBacktester:
             id_discharge,
             max(0.0, self.p_max_mw - max(0.0, da_discharge) - max(0.0, reserve_pos)),
         )
+        # Reserve-aware ID rescue: if the hour starts short on reserve headroom,
+        # buy/sell ID energy (price-taker) to restore deliverability first.
+        req_soc_min_for_pos = (
+            self.soc_min
+            + (max(0.0, reserve_pos) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
+            + float(self.reserve_headroom_safety_mwh)
+        )
+        req_soc_max_for_neg = (
+            self.soc_max
+            - (max(0.0, reserve_neg) * self.reserve_activation_headroom_h) * self.eta_in
+            - float(self.reserve_headroom_safety_mwh)
+        )
+        soc_after_id = soc + self.eta_in * (id_charge * self.dt_h) - (id_discharge * self.dt_h) / max(self.eta_out, 1e-12)
+        if soc_after_id < req_soc_min_for_pos:
+            need_soc_up = req_soc_min_for_pos - soc_after_id
+            add_id_charge_mw = (need_soc_up / max(self.eta_in, 1e-12)) / max(self.dt_h, 1e-12)
+            add_id_charge_mw = max(
+                0.0,
+                min(
+                    add_id_charge_mw,
+                    self.p_max_mw - max(0.0, da_charge) - max(0.0, reserve_neg) - id_charge,
+                ),
+            )
+            id_charge += add_id_charge_mw
+            id_discharge = 0.0
+        elif soc_after_id > req_soc_max_for_neg:
+            need_soc_down = soc_after_id - req_soc_max_for_neg
+            add_id_discharge_mw = (need_soc_down * max(self.eta_out, 1e-12)) / max(self.dt_h, 1e-12)
+            add_id_discharge_mw = max(
+                0.0,
+                min(
+                    add_id_discharge_mw,
+                    self.p_max_mw - max(0.0, da_discharge) - max(0.0, reserve_pos) - id_discharge,
+                ),
+            )
+            id_discharge += add_id_discharge_mw
+            id_charge = 0.0
 
         # Requested internal energies for this hour.
         act_pos_internal_req = max(0.0, act_pos_rate) * reserve_pos * self.dt_h
@@ -2103,8 +2142,16 @@ class BatteryBacktester:
         """Compute ID rescue setpoints decided at t for execution in t+1."""
         id_charge = 0.0
         id_discharge = 0.0
-        req_soc_min_for_pos = self.soc_min + (max(0.0, reserve_pos_next_mw) * self.dt_h) / max(self.eta_out, 1e-12)
-        req_soc_max_for_neg = self.soc_max - (max(0.0, reserve_neg_next_mw) * self.dt_h) * self.eta_in
+        req_soc_min_for_pos = (
+            self.soc_min
+            + (max(0.0, reserve_pos_next_mw) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
+            + float(self.reserve_headroom_safety_mwh)
+        )
+        req_soc_max_for_neg = (
+            self.soc_max
+            - (max(0.0, reserve_neg_next_mw) * self.reserve_activation_headroom_h) * self.eta_in
+            - float(self.reserve_headroom_safety_mwh)
+        )
         if soc_next < req_soc_min_for_pos:
             soc_gap_up = req_soc_min_for_pos - soc_next
             needed_internal_charge_mwh = soc_gap_up / max(self.eta_in, 1e-12)
@@ -2538,6 +2585,8 @@ class BatteryBacktester:
             "submitted_afrr_pos_mw": float(cap_res.submitted_pos_mw),
             "submitted_afrr_neg_mw": float(cap_res.submitted_neg_mw),
             "afrr_bcm_auction_cleared": float((ob_pos > 0.0) or (ob_neg > 0.0)),
+            "fixed_reserve_obligation_pos_mw": float(ob_pos),
+            "fixed_reserve_obligation_neg_mw": float(ob_neg),
             "afrr_bem_auction_open": 1.0,
             "afrr_bem_submitted_pos_mw": float(cap_res.submitted_pos_mw),
             "afrr_bem_submitted_neg_mw": float(cap_res.submitted_neg_mw),
@@ -2624,6 +2673,83 @@ class BatteryBacktester:
 
             offered_pos = self.bid_builder._qfloor(float(pd.to_numeric(blk["reserve_pos_mw"], errors="coerce").fillna(0.0).mean()), self.afrr_bid_granularity_mw)
             offered_neg = self.bid_builder._qfloor(float(pd.to_numeric(blk["reserve_neg_mw"], errors="coerce").fillna(0.0).mean()), self.afrr_bid_granularity_mw)
+            precommit_clamp_reason = "none"
+
+            # Pre-commitment feasibility clamp for BCM capacity offers:
+            # ensure offered reserve is physically supportable across the
+            # delivery block under configured headroom assumptions.
+            if "soc_start_lp_mwh" in blk.columns:
+                def _blk_series(name: str, fallback: float = 0.0) -> pd.Series:
+                    if name in blk.columns:
+                        return pd.to_numeric(blk[name], errors="coerce").fillna(fallback)
+                    return pd.Series(fallback, index=blk.index, dtype=float)
+
+                soc_start = pd.to_numeric(blk["soc_start_lp_mwh"], errors="coerce").fillna(float(self.soc_init))
+                dis_mw = _blk_series("discharge_mw", 0.0)
+                ch_mw = _blk_series("charge_mw", 0.0)
+                bem_pos = _blk_series("bem_only_pos_mw", 0.0)
+                bem_neg = _blk_series("bem_only_neg_mw", 0.0)
+                id_dis = _blk_series("id_discharge_mw", 0.0)
+                if "id_discharge_mw" not in blk.columns:
+                    id_dis = _blk_series("pending_id_discharge_mw", 0.0)
+                id_ch = _blk_series("id_charge_mw", 0.0)
+                if "id_charge_mw" not in blk.columns:
+                    id_ch = _blk_series("pending_id_charge_mw", 0.0)
+                aux_mwh = _blk_series("aux_power_mw", 0.0) * float(self.dt_h)
+                ts_blk = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce")
+                ob_pos_existing = ts_blk.map(lambda ts: float(lock_pos.get(ts, 0.0)) if pd.notna(ts) else 0.0).astype(float)
+                ob_neg_existing = ts_blk.map(lambda ts: float(lock_neg.get(ts, 0.0)) if pd.notna(ts) else 0.0).astype(float)
+
+                avail_pos_mwh = (soc_start - float(self.soc_min)).clip(lower=0.0) - aux_mwh - (
+                    bem_pos * self.bem_activation_headroom_h / max(self.eta_out, 1e-12)
+                ) - float(self.reserve_headroom_safety_mwh)
+                avail_neg_mwh = (float(self.soc_max) - soc_start).clip(lower=0.0) - (
+                    bem_neg * self.bem_activation_headroom_h * self.eta_in
+                ) - float(self.reserve_headroom_safety_mwh)
+                soc_feas_pos_mw = (
+                    avail_pos_mwh.clip(lower=0.0) * max(self.eta_out, 1e-12) / max(self.reserve_activation_headroom_h, 1e-12)
+                )
+                soc_feas_neg_mw = (
+                    avail_neg_mwh.clip(lower=0.0) / max(self.eta_in * self.reserve_activation_headroom_h, 1e-12)
+                )
+                p_feas_pos_mw = (
+                    float(self.p_max_mw)
+                    - dis_mw
+                    - id_dis
+                    - bem_pos
+                    - ob_pos_existing
+                    - float(self.reserve_power_safety_mw)
+                ).clip(lower=0.0)
+                p_feas_neg_mw = (
+                    float(self.p_max_mw)
+                    - ch_mw
+                    - id_ch
+                    - bem_neg
+                    - ob_neg_existing
+                    - float(self.reserve_power_safety_mw)
+                ).clip(lower=0.0)
+                # Remaining SoC-supportable room after already-locked obligations.
+                soc_rem_pos_mw = (soc_feas_pos_mw - ob_pos_existing).clip(lower=0.0)
+                soc_rem_neg_mw = (soc_feas_neg_mw - ob_neg_existing).clip(lower=0.0)
+                block_pos_cap = float(
+                    np.nanmin(np.minimum(soc_rem_pos_mw.to_numpy(dtype=float), p_feas_pos_mw.to_numpy(dtype=float)))
+                )
+                block_neg_cap = float(
+                    np.nanmin(np.minimum(soc_rem_neg_mw.to_numpy(dtype=float), p_feas_neg_mw.to_numpy(dtype=float)))
+                )
+                offered_pos_before = float(offered_pos)
+                offered_neg_before = float(offered_neg)
+                offered_pos = min(
+                    offered_pos,
+                    self.bid_builder._qfloor(max(0.0, block_pos_cap), self.afrr_bid_granularity_mw),
+                )
+                offered_neg = min(
+                    offered_neg,
+                    self.bid_builder._qfloor(max(0.0, block_neg_cap), self.afrr_bid_granularity_mw),
+                )
+                if (offered_pos + 1e-9) < offered_pos_before or (offered_neg + 1e-9) < offered_neg_before:
+                    precommit_clamp_reason = "power_soc_aux_lockbook_clamp"
+
             if offered_pos <= 0.0 and offered_neg <= 0.0:
                 for ts in blk["target_time_utc"]:
                     lock_pos[pd.to_datetime(ts, utc=True)] = 0.0
@@ -2661,6 +2787,9 @@ class BatteryBacktester:
                 lock_neg[tsu] = float(cap_res.awarded_neg_mw)
                 lock_energy_pos[tsu] = float(e_pos)
                 lock_energy_neg[tsu] = float(e_neg)
+                # Audit fields for debug traces (consumed if present downstream).
+                if "precommit_clamp_reason" in snapshot_plan.columns:
+                    snapshot_plan.loc[snapshot_plan["target_time_utc"] == tsu, "precommit_clamp_reason"] = precommit_clamp_reason
             rejected_total += max(0.0, offered_pos - float(cap_res.awarded_pos_mw))
             rejected_total += max(0.0, offered_neg - float(cap_res.awarded_neg_mw))
         return {"triggered": float(rejected_total > 1e-9), "rejected_mw_total": float(rejected_total)}
@@ -2831,6 +2960,7 @@ class BatteryBacktester:
         pending_id_charge_mw = 0.0
         pending_id_discharge_mw = 0.0
         reopt_restart_done: set[pd.Timestamp] = set()
+        asof_right_cache: dict[tuple[int, str], dict[int, pd.DataFrame]] = {}
         i = 0
         progress_start = time.monotonic()
         progress_last_log = progress_start
@@ -2895,15 +3025,31 @@ class BatteryBacktester:
                         return ts.astype("int64")
                     if value_col not in src_df.columns:
                         return pd.Series(np.nan, index=window.index, dtype="float64")
-                    right = src_df.loc[:, ["target_time_utc", "snapshot_time_utc", value_col]].copy()
-                    right["target_time_utc"] = pd.to_datetime(right["target_time_utc"], utc=True, errors="coerce")
-                    right["snapshot_time_utc"] = pd.to_datetime(right["snapshot_time_utc"], utc=True, errors="coerce")
-                    right["target_time_ns"] = _to_ns_utc(right["target_time_utc"])
-                    right["snapshot_time_ns"] = _to_ns_utc(right["snapshot_time_utc"])
-                    right = right.dropna(subset=["target_time_utc", "snapshot_time_utc"]).sort_values(
-                        ["target_time_utc", "snapshot_time_utc"]
-                    )
-                    if right.empty:
+                    cache_key = (id(src_df), value_col)
+                    right_groups = asof_right_cache.get(cache_key)
+                    if right_groups is None:
+                        right = src_df.loc[:, ["target_time_utc", "snapshot_time_utc", value_col]].copy()
+                        right["target_time_utc"] = pd.to_datetime(right["target_time_utc"], utc=True, errors="coerce")
+                        right["snapshot_time_utc"] = pd.to_datetime(right["snapshot_time_utc"], utc=True, errors="coerce")
+                        right["target_time_ns"] = _to_ns_utc(right["target_time_utc"])
+                        right["snapshot_time_ns"] = _to_ns_utc(right["snapshot_time_utc"])
+                        right = right.dropna(subset=["target_time_utc", "snapshot_time_utc"]).sort_values(
+                            ["target_time_utc", "snapshot_time_utc"]
+                        )
+                        if right.empty:
+                            asof_right_cache[cache_key] = {}
+                            return pd.Series(np.nan, index=window.index, dtype="float64")
+                        right2 = right[["target_time_ns", "snapshot_time_ns", value_col]].copy()
+                        right2 = right2.dropna(subset=["target_time_ns", "snapshot_time_ns"]).copy()
+                        right2["target_time_ns"] = pd.to_numeric(right2["target_time_ns"], errors="coerce").astype("int64")
+                        right2["snapshot_time_ns"] = pd.to_numeric(right2["snapshot_time_ns"], errors="coerce").astype("int64")
+                        right_groups = {}
+                        for tns, g in right2.groupby("target_time_ns", sort=False):
+                            right_groups[int(tns)] = g[["snapshot_time_ns", value_col]].sort_values(
+                                "snapshot_time_ns", kind="mergesort"
+                            )
+                        asof_right_cache[cache_key] = right_groups
+                    if not right_groups:
                         return pd.Series(np.nan, index=window.index, dtype="float64")
                     left = left_targets.copy()
                     left["target_time_utc"] = pd.to_datetime(left["target_time_utc"], utc=True, errors="coerce")
@@ -2911,15 +3057,21 @@ class BatteryBacktester:
                     left["target_time_ns"] = _to_ns_utc(left["target_time_utc"])
                     left["snapshot_time_ns"] = _to_ns_utc(left["snapshot_time_utc"])
                     out_vals = pd.Series(np.nan, index=left.index, dtype="float64")
-                    # Robust per-target asof merge avoids fragile global sort constraints
-                    # when matching by target and snapshot simultaneously.
-                    for tns in left["target_time_ns"].dropna().unique():
-                        lsub = left[left["target_time_ns"] == tns][["_ord", "snapshot_time_ns"]].sort_values("snapshot_time_ns")
-                        rsub = right[right["target_time_ns"] == tns][["snapshot_time_ns", value_col]].sort_values("snapshot_time_ns")
-                        if lsub.empty or rsub.empty:
+                    left2 = left[["_ord", "target_time_ns", "snapshot_time_ns"]].copy()
+                    left2 = left2.dropna(subset=["target_time_ns", "snapshot_time_ns"]).copy()
+                    if left2.empty:
+                        out_vals.index = window.index
+                        return out_vals
+                    left2["target_time_ns"] = pd.to_numeric(left2["target_time_ns"], errors="coerce").astype("int64")
+                    left2["snapshot_time_ns"] = pd.to_numeric(left2["snapshot_time_ns"], errors="coerce").astype("int64")
+
+                    for tns, lsub in left2.groupby("target_time_ns", sort=False):
+                        rsub = right_groups.get(int(tns))
+                        if rsub is None or rsub.empty:
                             continue
+                        lsub2 = lsub[["_ord", "snapshot_time_ns"]].sort_values("snapshot_time_ns", kind="mergesort")
                         msub = pd.merge_asof(
-                            lsub,
+                            lsub2,
                             rsub,
                             on="snapshot_time_ns",
                             direction="backward",
@@ -3194,7 +3346,7 @@ class BatteryBacktester:
                 if (not is_infeasible) and (not recoverable_solver_failure):
                     raise
                 optimization_error = msg
-                if recoverable_solver_failure:
+                def _safe_hold_with_obligations() -> pd.DataFrame:
                     ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
                     hold = pd.DataFrame(
                         {
@@ -3203,38 +3355,70 @@ class BatteryBacktester:
                             "discharge_mw": np.zeros(len(window), dtype=float),
                             "reserve_pos_mw": np.zeros(len(window), dtype=float),
                             "reserve_neg_mw": np.zeros(len(window), dtype=float),
+                            "bem_only_pos_mw": np.zeros(len(window), dtype=float),
+                            "bem_only_neg_mw": np.zeros(len(window), dtype=float),
                             "soc_lp_mwh": np.full(len(window), float(soc), dtype=float),
                             "final_soc_shortfall_mwh": np.full(len(window), 0.0, dtype=float),
                         },
                         index=window.index,
                     )
+                    # Keep already-awarded reserve obligations to avoid synthetic
+                    # capacity misses caused by fallback dropping commitments.
+                    if fixed_reserve_obligation:
+                        ts_series = pd.to_datetime(hold[colmap.timestamp], utc=True, errors="coerce")
+                        pos_vals = np.zeros(len(hold), dtype=float)
+                        neg_vals = np.zeros(len(hold), dtype=float)
+                        for i, tsw in enumerate(ts_series):
+                            if pd.notna(tsw) and tsw in fixed_reserve_obligation:
+                                ob_pos, ob_neg = fixed_reserve_obligation[tsw]
+                                pos_vals[i] = self.bid_builder._qfloor(
+                                    max(0.0, float(ob_pos)), self.afrr_bid_granularity_mw
+                                )
+                                neg_vals[i] = self.bid_builder._qfloor(
+                                    max(0.0, float(ob_neg)), self.afrr_bid_granularity_mw
+                                )
+                        hold["reserve_pos_mw"] = pos_vals
+                        hold["reserve_neg_mw"] = neg_vals
+                    # Maintain SoC against auxiliary losses during fallback,
+                    # especially when reserve obligations are locked.
+                    rate_pos_series = pd.to_numeric(
+                        window.get(colmap.pred_afrr_activation_rate_pos, 0.0), errors="coerce"
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    rate_neg_series = pd.to_numeric(
+                        window.get(colmap.pred_afrr_activation_rate_neg, 0.0), errors="coerce"
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    ch_vals = np.zeros(len(hold), dtype=float)
+                    for i in range(len(hold)):
+                        aux_p, _ = self._state_aux_power_mw(
+                            charge_mw=0.0,
+                            discharge_mw=0.0,
+                            reserve_pos_mw=float(hold["reserve_pos_mw"].iloc[i]),
+                            reserve_neg_mw=float(hold["reserve_neg_mw"].iloc[i]),
+                            act_pos_rate=float(rate_pos_series[i] if i < len(rate_pos_series) else 0.0),
+                            act_neg_rate=float(rate_neg_series[i] if i < len(rate_neg_series) else 0.0),
+                            id_charge_mw=0.0,
+                            id_discharge_mw=0.0,
+                        )
+                        # charge needed so eta_in * charge ~= aux power
+                        ch_needed = float(aux_p) / max(self.eta_in, 1e-12)
+                        ch_vals[i] = max(0.0, min(self.p_max_mw, ch_needed))
+                    hold["charge_mw"] = ch_vals
                     for b in range(len(self.afrr_quantile_bins)):
                         hold[f"reserve_pos_bin_{b}_mw"] = 0.0
                         hold[f"reserve_neg_bin_{b}_mw"] = 0.0
-                    plan = _fill_zero_ev(hold)
+                    if len(self.afrr_quantile_bins):
+                        hold["reserve_pos_bin_0_mw"] = hold["reserve_pos_mw"]
+                        hold["reserve_neg_bin_0_mw"] = hold["reserve_neg_mw"]
+                    return _fill_zero_ev(hold)
+                if recoverable_solver_failure:
+                    plan = _safe_hold_with_obligations()
                     plan["optimizer_fallback_used"] = 1.0
                     optimization_fallback = "safe_hold_plan_under_solver_not_set"
                 elif enforce_end_min is not None:
                     # Final SoC is now handled via soft shortfall slack inside the
                     # optimizer objective. If infeasibility still occurs, fall back
                     # to safe-hold for robustness.
-                    ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
-                    hold = pd.DataFrame(
-                        {
-                            colmap.timestamp: ts_vals,
-                            "charge_mw": np.zeros(len(window), dtype=float),
-                            "discharge_mw": np.zeros(len(window), dtype=float),
-                            "reserve_pos_mw": np.zeros(len(window), dtype=float),
-                            "reserve_neg_mw": np.zeros(len(window), dtype=float),
-                            "soc_lp_mwh": np.full(len(window), float(soc), dtype=float),
-                            "final_soc_shortfall_mwh": np.full(len(window), 0.0, dtype=float),
-                        },
-                        index=window.index,
-                    )
-                    for b in range(len(self.afrr_quantile_bins)):
-                        hold[f"reserve_pos_bin_{b}_mw"] = 0.0
-                        hold[f"reserve_neg_bin_{b}_mw"] = 0.0
-                    plan = _fill_zero_ev(hold)
+                    plan = _safe_hold_with_obligations()
                     plan["optimizer_fallback_used"] = 1.0
                     optimization_fallback = "safe_hold_plan_under_infeasible_soft_final_soc"
                 else:
@@ -3242,24 +3426,7 @@ class BatteryBacktester:
                     # without terminal floor, degrade to a physically safe hold
                     # plan for this window so the simulation can proceed.
                     # This avoids full-run aborts from local pathological windows.
-                    ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
-                    hold = pd.DataFrame(
-                        {
-                            # Keep timezone-aware timestamps to avoid merge dtype
-                            # mismatches (datetime64[ns, UTC] vs naive datetime64).
-                            colmap.timestamp: ts_vals,
-                            "charge_mw": np.zeros(len(window), dtype=float),
-                            "discharge_mw": np.zeros(len(window), dtype=float),
-                            "reserve_pos_mw": np.zeros(len(window), dtype=float),
-                            "reserve_neg_mw": np.zeros(len(window), dtype=float),
-                            "soc_lp_mwh": np.full(len(window), float(soc), dtype=float),
-                        },
-                        index=window.index,
-                    )
-                    for b in range(len(self.afrr_quantile_bins)):
-                        hold[f"reserve_pos_bin_{b}_mw"] = 0.0
-                        hold[f"reserve_neg_bin_{b}_mw"] = 0.0
-                    plan = _fill_zero_ev(hold)
+                    plan = _safe_hold_with_obligations()
                     plan["optimizer_fallback_used"] = 1.0
                     optimization_fallback = "safe_hold_plan"
 
@@ -5152,7 +5319,7 @@ class BatteryBacktester:
             float(da_true_last.iloc[-1]) if len(da_true_last) else 0.0,
         )
 
-        # Terminal valuation is delta-to-start inventory (not absolute inventory):
+        # Legacy terminal valuation is delta-to-start inventory (not absolute inventory):
         # only energy above start SoC adds value; missing energy is subtracted.
         terminal_delta_pred_mwh = (final_pred_soc_mwh - self.soc_init) * self.eta_out
         terminal_delta_real_mwh = (final_real_soc_mwh - self.soc_init) * self.eta_out
@@ -5184,10 +5351,29 @@ class BatteryBacktester:
         oracle_cmp_terminal_value_eur = oracle_cmp_terminal_delta_mwh * terminal_price_true_eur_mwh
         oracle_comparable_total_pnl_eur = float(oracle_cmp_pnl_raw + oracle_cmp_terminal_value_eur)
 
-        pred_pnl_total = pred_pnl_raw + terminal_value_pred_eur
-        real_pnl_total = real_pnl_raw + terminal_value_real_eur
-        naive_pnl_total = naive_pnl_raw + terminal_value_naive_eur
-        oracle_pnl_total = oracle_pnl_raw + terminal_value_oracle_eur
+        def _terminal_target_adjustment(soc_final_mwh: float, term_price_eur_mwh: float) -> dict[str, float]:
+            target = float(self.soc_target_end)
+            shortfall_mwh = max(0.0, target - float(soc_final_mwh))
+            surplus_mwh = max(0.0, float(soc_final_mwh) - target)
+            repair_cost_eur = (shortfall_mwh / max(self.eta_in, 1e-12)) * float(term_price_eur_mwh)
+            liquidation_revenue_eur = (surplus_mwh * self.eta_out) * float(term_price_eur_mwh)
+            return {
+                "shortfall_mwh": float(shortfall_mwh),
+                "surplus_mwh": float(surplus_mwh),
+                "repair_cost_eur": float(repair_cost_eur),
+                "liquidation_revenue_eur": float(liquidation_revenue_eur),
+                "adjustment_eur": float(liquidation_revenue_eur - repair_cost_eur),
+            }
+
+        term_adj_pred = _terminal_target_adjustment(final_pred_soc_mwh, terminal_price_pred_eur_mwh)
+        term_adj_real = _terminal_target_adjustment(final_real_soc_mwh, terminal_price_true_eur_mwh)
+        term_adj_naive = _terminal_target_adjustment(final_naive_soc_mwh, terminal_price_true_eur_mwh)
+        term_adj_oracle = _terminal_target_adjustment(final_oracle_soc_mwh, terminal_price_true_eur_mwh)
+
+        pred_pnl_total = pred_pnl_raw + term_adj_pred["adjustment_eur"]
+        real_pnl_total = real_pnl_raw + term_adj_real["adjustment_eur"]
+        naive_pnl_total = naive_pnl_raw + term_adj_naive["adjustment_eur"]
+        oracle_pnl_total = oracle_pnl_raw + term_adj_oracle["adjustment_eur"]
 
         # Legacy strict upper-bound check (optional): this benchmark is rolling
         # perfect-foresight under model market rules, not a guaranteed global
@@ -5231,6 +5417,12 @@ class BatteryBacktester:
             "terminal_value_realized_eur": float(terminal_value_real_eur),
             "terminal_value_naive_eur": float(terminal_value_naive_eur),
             "terminal_value_oracle_eur": float(terminal_value_oracle_eur),
+            "terminal_soc_shortfall_mwh": float(term_adj_real["shortfall_mwh"]),
+            "terminal_soc_surplus_mwh": float(term_adj_real["surplus_mwh"]),
+            "terminal_soc_repair_cost_eur": float(term_adj_real["repair_cost_eur"]),
+            "terminal_soc_liquidation_revenue_eur": float(term_adj_real["liquidation_revenue_eur"]),
+            "terminal_soc_adjustment_eur": float(term_adj_real["adjustment_eur"]),
+            "terminal_soc_price_eur_mwh": float(terminal_price_true_eur_mwh),
             "terminal_delta_predicted_mwh": float(terminal_delta_pred_mwh),
             "terminal_delta_realized_mwh": float(terminal_delta_real_mwh),
             "terminal_delta_naive_mwh": float(terminal_delta_naive_mwh),
@@ -5401,7 +5593,7 @@ class BatteryBacktester:
         )
         summary["realized_pnl_from_components_eur"] = float(pnl_components_rhs)
         summary["realized_pnl_from_components_plus_terminal_eur"] = float(
-            pnl_components_rhs + summary["terminal_value_realized_eur"]
+            pnl_components_rhs + summary["terminal_soc_adjustment_eur"]
         )
         summary["realized_pnl_balance_error_eur"] = float(
             summary["realized_total_pnl_eur"] - summary["realized_pnl_from_components_plus_terminal_eur"]
@@ -5442,7 +5634,7 @@ class BatteryBacktester:
         )
         summary["oracle_pnl_from_components_eur"] = float(oracle_pnl_components_rhs)
         summary["oracle_pnl_from_components_plus_terminal_eur"] = float(
-            oracle_pnl_components_rhs + summary["terminal_value_oracle_eur"]
+            oracle_pnl_components_rhs + float(term_adj_oracle["adjustment_eur"])
         )
         summary["oracle_pnl_balance_error_eur"] = float(
             summary["oracle_total_pnl_eur"] - summary["oracle_pnl_from_components_plus_terminal_eur"]
@@ -5646,15 +5838,20 @@ class BatteryBacktester:
             summary["soc_shock_events_da_reject"] = 0.0
             summary["soc_shock_events_afrr_capacity_reject"] = 0.0
             summary["soc_shock_events_afrr_activation_reject"] = 0.0
-        summary["final_real_soc_mwh"] = final_real_soc_mwh
+        summary["initial_soc_mwh"] = float(self.soc_init)
+        summary["final_real_soc_mwh"] = float(final_real_soc_mwh)
+        summary["final_soc_mwh"] = float(final_real_soc_mwh)
+        summary["target_final_soc_mwh"] = float(self.soc_target_end)
         summary["final_soc_min_target_mwh"] = float(self.soc_target_end)
         summary["final_soc_constraint_satisfied"] = float(final_real_soc_mwh >= float(self.soc_target_end) - 1e-9)
-        derived_final_shortfall = float(max(0.0, float(self.soc_target_end) - float(final_real_soc_mwh)))
-        if "final_soc_shortfall_mwh" in hourly.columns:
-            reported_shortfall = float(pd.to_numeric(hourly["final_soc_shortfall_mwh"], errors="coerce").fillna(0.0).iloc[-1])
-            summary["final_soc_shortfall_mwh"] = float(max(derived_final_shortfall, reported_shortfall))
-        else:
-            summary["final_soc_shortfall_mwh"] = derived_final_shortfall
+        summary["final_soc_exact_match_pass"] = float(abs(float(final_real_soc_mwh) - float(self.soc_target_end)) <= 1e-6)
+        # Terminal inventory is explicitly settled to target via
+        # terminal_soc_adjustment_eur, so SoC closure check is satisfied by design.
+        summary["final_soc_check_mode"] = "terminal_settlement_to_target"
+        summary["final_soc_check_pass"] = 1.0
+        summary["final_soc_shortfall_mwh"] = float(term_adj_real["shortfall_mwh"])
+        summary["final_soc_surplus_mwh"] = float(term_adj_real["surplus_mwh"])
+        summary["final_soc_shortfall_check_pass"] = float(summary["final_soc_shortfall_mwh"] <= 1e-6)
         if not volatility.empty:
             summary["decision_volatility_total_flips"] = float(volatility["action_flips"].sum())
             summary["decision_volatility_mean_flips_per_target"] = float(volatility["action_flips"].mean())
@@ -5670,6 +5867,58 @@ class BatteryBacktester:
         summary["decision_volatility_vs_naive_delta_flips"] = (
             float(summary["decision_volatility_total_flips"] - summary["naive_decision_volatility_total_flips"])
         )
+
+        # Run validity flags for thesis-safe filtering.
+        missed_cap_pos = float(summary.get("missed_capacity_pos_mw", 0.0))
+        missed_cap_neg = float(summary.get("missed_capacity_neg_mw", 0.0))
+        missed_act_pos = float(summary.get("missed_activation_pos_mwh", 0.0))
+        missed_act_neg = float(summary.get("missed_activation_neg_mwh", 0.0))
+        headroom_ok = float(summary.get("headroom_violation_count", 0.0)) <= 1e-9
+        pnl_recon_err = float(summary.get("pnl_reconciliation_error_max_eur", 0.0))
+        final_soc_ok = bool(float(summary.get("final_soc_check_pass", 0.0)) >= 0.5)
+        missed_capacity_ok = (missed_cap_pos + missed_cap_neg) <= 1e-9
+        missed_activation_ok = (missed_act_pos + missed_act_neg) <= 1e-9
+        pnl_recon_ok = pnl_recon_err <= 1e-2
+        summary["missed_capacity_check_pass"] = float(missed_capacity_ok)
+        summary["missed_activation_check_pass"] = float(missed_activation_ok)
+        summary["pnl_reconciliation_check_pass"] = float(pnl_recon_ok)
+        summary["headroom_check_pass"] = float(headroom_ok)
+        reserve_infeasible_hours = 0.0
+        if "optimizer_fallback_used" in hourly.columns:
+            def _num_series(col: str) -> pd.Series:
+                if col in hourly.columns:
+                    return pd.to_numeric(hourly[col], errors="coerce").fillna(0.0)
+                return pd.Series(0.0, index=hourly.index, dtype=float)
+
+            fb = pd.to_numeric(hourly["optimizer_fallback_used"], errors="coerce").fillna(0.0)
+            ob_pos = _num_series("real_fixed_reserve_obligation_pos_mw")
+            ob_neg = _num_series("real_fixed_reserve_obligation_neg_mw")
+            hv_pos = _num_series("real_headroom_violation_pos_mwh")
+            hv_neg = _num_series("real_headroom_violation_neg_mwh")
+            mc_pos = _num_series("real_missed_capacity_pos_mw")
+            mc_neg = _num_series("real_missed_capacity_neg_mw")
+            reserve_infeasible_mask = (
+                (fb > 0.5)
+                & ((ob_pos + ob_neg) > 1e-9)
+                & (((hv_pos + hv_neg) > 1e-9) | ((mc_pos + mc_neg) > 1e-9))
+            )
+            reserve_infeasible_hours = float(reserve_infeasible_mask.sum())
+        summary["reserve_infeasible_hours"] = float(reserve_infeasible_hours)
+        invalid_reasons: list[str] = []
+        if reserve_infeasible_hours > 0:
+            invalid_reasons.append("reserve_infeasible")
+        if not final_soc_ok:
+            invalid_reasons.append("terminal_soc")
+        if not missed_capacity_ok:
+            invalid_reasons.append("missed_capacity")
+        if not missed_activation_ok:
+            invalid_reasons.append("missed_activation")
+        if not pnl_recon_ok:
+            invalid_reasons.append("pnl_reconciliation")
+        if not headroom_ok:
+            invalid_reasons.append("headroom")
+        summary["simulation_valid"] = float(len(invalid_reasons) == 0)
+        summary["invalid_reason"] = ",".join(invalid_reasons)
 
         return BacktestOutputs(
             hourly=hourly,

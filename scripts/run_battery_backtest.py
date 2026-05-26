@@ -1272,6 +1272,8 @@ def main() -> None:
             "pnl_gap_total_eur": outputs.summary.get("pnl_gap_total_eur"),
             "economic_opportunity_gap_ratio": outputs.summary.get("economic_opportunity_gap_ratio"),
             "roi_on_max_capital": outputs.summary.get("roi_on_max_capital"),
+            "simulation_valid": outputs.summary.get("simulation_valid"),
+            "invalid_reason": outputs.summary.get("invalid_reason"),
             "output_dir": str(scenario_out_dir),
         }
         if scenario_name != "default":
@@ -1320,6 +1322,35 @@ def main() -> None:
         overview = overview.sort_values([c for c in ["scenario", "trading_strategy"] if c in overview.columns]).reset_index(drop=True)
         overview.to_csv(overview_csv, index=False)
         overview_json.write_text(overview.to_json(orient="records", indent=2), encoding="utf-8")
+        # Thesis-ready aggregate: valid runs only.
+        valid_only = overview.copy()
+        if "simulation_valid" in valid_only.columns:
+            sv = pd.to_numeric(valid_only["simulation_valid"], errors="coerce").fillna(0.0)
+            valid_only = valid_only.loc[sv >= 0.5].copy()
+        valid_csv = out_dir / "strategy_overview_valid_only.csv"
+        valid_json = out_dir / "strategy_overview_valid_only.json"
+        valid_only.to_csv(valid_csv, index=False)
+        valid_json.write_text(valid_only.to_json(orient="records", indent=2), encoding="utf-8")
+        total_scenarios = int(len(overview))
+        valid_scenarios = int(len(valid_only))
+        invalid_scenarios = int(total_scenarios - valid_scenarios)
+        invalid_rate_pct = float(100.0 * invalid_scenarios / total_scenarios) if total_scenarios > 0 else float("nan")
+        invalid_by_reason: dict[str, int] = {}
+        if "invalid_reason" in overview.columns and invalid_scenarios > 0:
+            invalid_rows = overview.loc[pd.to_numeric(overview.get("simulation_valid", 0.0), errors="coerce").fillna(0.0) < 0.5]
+            for txt in invalid_rows["invalid_reason"].fillna("").astype(str):
+                for reason in [r.strip() for r in txt.split(",") if r.strip()]:
+                    invalid_by_reason[reason] = invalid_by_reason.get(reason, 0) + 1
+        stats = {
+            "total_scenarios": total_scenarios,
+            "valid_scenarios": valid_scenarios,
+            "invalid_scenarios": invalid_scenarios,
+            "invalid_rate_pct": invalid_rate_pct,
+            "invalid_by_reason": invalid_by_reason,
+            "strategy_overview_all": str(overview_csv),
+            "strategy_overview_valid_only": str(valid_csv),
+        }
+        (out_dir / "strategy_overview_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
         print("[OK] Strategy overview:")
         print(f"- output_dir: {out_dir}")
         show_cols = [c for c in ["scenario", "trading_strategy", "realized_total_pnl_eur", "rolling_perfect_foresight_same_rules_total_pnl_eur", "realized_vs_rolling_perfect_foresight_same_rules_pct"] if c in overview.columns]
@@ -1332,6 +1363,11 @@ def main() -> None:
                     )
             print(display_df.to_string(index=False))
         print(f"[OK] Strategy overview files: {overview_csv} | {overview_json}")
+        print(f"[OK] Valid-only overview files: {valid_csv} | {valid_json}")
+        print(
+            f"[OK] Validity stats: total={total_scenarios}, valid={valid_scenarios}, "
+            f"invalid={invalid_scenarios}, invalid_rate={invalid_rate_pct:.2f}%"
+        )
 
 
 if __name__ == "__main__":

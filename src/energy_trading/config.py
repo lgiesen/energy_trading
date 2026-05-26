@@ -13,6 +13,8 @@ MODEL_SPECS = {
     # 0.5h means full awarded MW must be energetically deliverable for 30 minutes.
     "reserve_activation_headroom_h": 0.5,
     "bem_activation_headroom_h": 0.5,
+    "reserve_headroom_safety_mwh": 0.1,
+    "reserve_power_safety_mw": 0.05,
 }
 MODEL_SPECS["optimization_step_min"] = int(MODEL_SPECS["time_step_hours"] * 60)
 
@@ -58,14 +60,9 @@ FINANCIAL_PARAMS = {
     "afrr_offer_cost_eur_mw_h": 0.0,  # Fixed reserve availability cost per offered MW/h (independent of acceptance)
     "risk_margin_eur_per_mwh": 0.0,  # Optional conservative margin for thresholds
     "imbalance_penalty_eur_mwh": 500.0,  # Non-delivery/imbalance penalty proxy
-    # aFRR penalty calibration (regelleistung-style proxy inputs/fallbacks)
-    "afrr_penalty_aufschlag_eur_mwh": 30.0,
-    "afrr_penalty_aufschlag_eur_mw_h": 3.0,
-    "afrr_penalty_default_marginal_energy_price_eur_mwh": 150.0,
-    "afrr_penalty_default_avg_capacity_price_product_eur_mw_h": 12.5,
     # Enforce final SoC >= soc_target_end effectively as hard in optimization:
     # very large soft-shortfall cost (not a settlement cashflow component).
-    "final_soc_shortfall_penalty_eur_per_mwh": 1_000_000_000.0,
+    "final_soc_shortfall_penalty_eur_per_mwh": 1000000000.0,
 }
 
 # --- MARKET CONSTRAINTS ---
@@ -100,7 +97,6 @@ MARKET_SPECS = {
     "id_sell_price_floor_eur_mwh": -500.0,
     # Keep separate from optimization step on purpose:
     # optimization uses 60 min, settlement/input granularity is 15 min.
-    "settlement_period_min": 15,  # Settlement/input granularity for imbalance/SRL
 }
 MARKET_SPECS["bid_power_max_mw"] = BATTERY_SPECS["power_mw"]
 
@@ -179,7 +175,8 @@ def _validate_config() -> None:
         raise ValueError("afrr_activation_bid_risk_lambda must be >= 0.")
     if MARKET_SPECS["afrr_min_bid_size"] < 0:
         raise ValueError("afrr_min_bid_size must be >= 0.")
-    if MARKET_SPECS["settlement_period_min"] <= 0:
+    # Optional legacy key: keep validation backward-compatible when key is removed.
+    if float(MARKET_SPECS.get("settlement_period_min", 15)) <= 0:
         raise ValueError("settlement_period_min must be > 0.")
     if MARKET_SPECS["bid_power_max_mw"] <= 0:
         raise ValueError("bid_power_max_mw must be > 0.")
