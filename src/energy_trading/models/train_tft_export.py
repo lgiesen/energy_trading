@@ -82,6 +82,35 @@ def _qcol(q: float) -> str:
     return f"p{int(round(q * 100)):02d}"
 
 
+def _crossing_metrics_from_prediction(prediction: np.ndarray) -> dict[str, float]:
+    pred = np.asarray(prediction, dtype=float)
+    if pred.ndim == 2:
+        pred = pred[:, :, None]
+    if pred.ndim != 3 or pred.shape[2] < 2:
+        n_rows = float(pred.shape[0] * pred.shape[1]) if pred.ndim == 3 else 0.0
+        return {
+            "n_rows": n_rows,
+            "crossing_rate_before_repair": 0.0,
+            "max_crossing_violation_before_repair": 0.0,
+        }
+    flat = pred.reshape(-1, pred.shape[2])
+    finite_mask = np.all(np.isfinite(flat), axis=1)
+    flat_f = flat[finite_mask]
+    if flat_f.shape[0] == 0:
+        return {
+            "n_rows": 0.0,
+            "crossing_rate_before_repair": float("nan"),
+            "max_crossing_violation_before_repair": float("nan"),
+        }
+    violations = np.maximum(flat_f[:, :-1] - flat_f[:, 1:], 0.0)
+    row_cross = np.any(violations > 0.0, axis=1)
+    return {
+        "n_rows": float(flat_f.shape[0]),
+        "crossing_rate_before_repair": float(np.mean(row_cross)),
+        "max_crossing_violation_before_repair": float(np.max(violations)),
+    }
+
+
 def _run_id_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 
@@ -263,7 +292,7 @@ def _build_long_prediction_table(
     idx_to_ts: dict[int, pd.Timestamp],
     model_name: str,
     quantiles: list[float],
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict[str, float]]:
     rows: list[dict[str, object]] = []
     # prediction shape typically [batch, decoder, quantile] or [batch, decoder]
     pred = np.asarray(prediction, dtype=float)
@@ -280,6 +309,7 @@ def _build_long_prediction_table(
     if dti.ndim != 2 or dti.shape != pred[:, :, 0].shape:
         raise ValueError("decoder_time_idx shape mismatch against prediction tensor.")
 
+    crossing_metrics = _crossing_metrics_from_prediction(pred)
     # Enforce monotonic quantile ordering to avoid quantile crossing.
     pred_inv = np.sort(pred, axis=2)
     q_cols = [_qcol(q) for q in quantiles]
@@ -319,9 +349,9 @@ def _build_long_prediction_table(
                 *q_cols,
                 "predicted_value",
             ]
-        )
+        ), crossing_metrics
     out = out.sort_values(["snapshot_time_utc", "lead_time_h", "target_time_utc"]).reset_index(drop=True)
-    return out
+    return out, crossing_metrics
 
 
 def _clip_activation_rate_predictions(df: pd.DataFrame) -> pd.DataFrame:
@@ -1145,7 +1175,7 @@ def _train_tft(
 
     # Predict val/test in long format with model_name.
 
-    def _predict(ds: TimeSeriesDataSet) -> pd.DataFrame:
+    def _predict(ds: TimeSeriesDataSet) -> tuple[pd.DataFrame, dict[str, float]]:
         dl = ds.to_dataloader(train=False, batch_size=batch_size, num_workers=num_workers, pin_memory=False)
         pred_out = tft.predict(dl, mode="quantiles", return_x=True)
         # pytorch-forecasting returns a Prediction object in newer versions
@@ -1176,10 +1206,10 @@ def _train_tft(
         )
 
     pred_val_start = time.perf_counter()
-    pred_val_long = _predict(validation)
+    pred_val_long, pred_val_crossing = _predict(validation)
     pred_val_seconds = time.perf_counter() - pred_val_start
     pred_test_start = time.perf_counter()
-    pred_test_long = _predict(testing)
+    pred_test_long, pred_test_crossing = _predict(testing)
     pred_test_seconds = time.perf_counter() - pred_test_start
     if tgt in {"target_afrr_activation_rate_pos", "target_afrr_activation_rate_neg"}:
         pred_val_long = _clip_activation_rate_predictions(pred_val_long)
@@ -1495,6 +1525,14 @@ def _train_tft(
         "gate_closure_hour_local": gate_hour,
         "gate_closure_metrics_val": val_gate_metrics,
         "gate_closure_metrics_test": test_gate_metrics,
+        "crossing_rate_before_repair_val": pred_val_crossing.get("crossing_rate_before_repair"),
+        "max_crossing_violation_before_repair_val": pred_val_crossing.get(
+            "max_crossing_violation_before_repair"
+        ),
+        "crossing_rate_before_repair_test": pred_test_crossing.get("crossing_rate_before_repair"),
+        "max_crossing_violation_before_repair_test": pred_test_crossing.get(
+            "max_crossing_violation_before_repair"
+        ),
         "model_path": str(model_path.resolve()),
         "best_checkpoint_path": str(Path(best_model_path).resolve()) if best_model_path else str(model_path.resolve()),
         "stopped_epoch": int(trainer.current_epoch),

@@ -162,6 +162,31 @@ def _log_weight_audit(*, backend: str, target: str, lead: int, weights: np.ndarr
     )
 
 
+def _crossing_metrics_from_stack(q_stack: np.ndarray) -> dict[str, float]:
+    arr = np.asarray(q_stack, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return {
+            "n_rows": float(arr.shape[0]) if arr.ndim >= 1 else 0.0,
+            "crossing_rate_before_repair": 0.0,
+            "max_crossing_violation_before_repair": 0.0,
+        }
+    finite_mask = np.all(np.isfinite(arr), axis=1)
+    arr_f = arr[finite_mask]
+    if arr_f.shape[0] == 0:
+        return {
+            "n_rows": 0.0,
+            "crossing_rate_before_repair": float("nan"),
+            "max_crossing_violation_before_repair": float("nan"),
+        }
+    violations = np.maximum(arr_f[:, :-1] - arr_f[:, 1:], 0.0)
+    row_cross = np.any(violations > 0.0, axis=1)
+    return {
+        "n_rows": float(arr_f.shape[0]),
+        "crossing_rate_before_repair": float(np.mean(row_cross)),
+        "max_crossing_violation_before_repair": float(np.max(violations)),
+    }
+
+
 def _build_linear_pipeline(
     alpha: float,
     quantile: float,
@@ -317,6 +342,10 @@ def _train_target(
     lead_rows_val: list[pd.DataFrame] = []
     lead_rows_test: list[pd.DataFrame] = []
     lead_metric_rows: list[dict[str, float]] = []
+    crossing_acc = {
+        "val": {"n_rows": 0.0, "n_cross_rows": 0.0, "max_violation": 0.0},
+        "test": {"n_rows": 0.0, "n_cross_rows": 0.0, "max_violation": 0.0},
+    }
     fit_seconds_total = 0.0
 
     # Keep canonical wide-format prediction files as h1 for compatibility.
@@ -451,6 +480,17 @@ def _train_target(
         q_cols = [_qcol(q) for q in QUANTILES]
         va_stack = np.column_stack([pd.to_numeric(pd.Series(preds_va[c]), errors="coerce").to_numpy(dtype=float) for c in q_cols])
         te_stack = np.column_stack([pd.to_numeric(pd.Series(preds_te[c]), errors="coerce").to_numpy(dtype=float) for c in q_cols])
+        val_cross = _crossing_metrics_from_stack(va_stack)
+        test_cross = _crossing_metrics_from_stack(te_stack)
+        for split_name, split_cross in (("val", val_cross), ("test", test_cross)):
+            acc = crossing_acc[split_name]
+            if np.isfinite(split_cross["n_rows"]) and split_cross["n_rows"] > 0.0:
+                acc["n_rows"] += split_cross["n_rows"]
+                acc["n_cross_rows"] += split_cross["crossing_rate_before_repair"] * split_cross["n_rows"]
+                acc["max_violation"] = max(
+                    float(acc["max_violation"]),
+                    float(split_cross["max_crossing_violation_before_repair"]),
+                )
         va_stack = np.sort(va_stack, axis=1)
         te_stack = np.sort(te_stack, axis=1)
         for i, c in enumerate(q_cols):
@@ -799,6 +839,26 @@ def _train_target(
         "gate_closure_hour_local": gate_hour,
         "gate_closure_metrics_val": val_gate,
         "gate_closure_metrics_test": test_gate,
+        "crossing_rate_before_repair_val": (
+            float(crossing_acc["val"]["n_cross_rows"] / crossing_acc["val"]["n_rows"])
+            if crossing_acc["val"]["n_rows"] > 0.0
+            else float("nan")
+        ),
+        "max_crossing_violation_before_repair_val": (
+            float(crossing_acc["val"]["max_violation"])
+            if crossing_acc["val"]["n_rows"] > 0.0
+            else float("nan")
+        ),
+        "crossing_rate_before_repair_test": (
+            float(crossing_acc["test"]["n_cross_rows"] / crossing_acc["test"]["n_rows"])
+            if crossing_acc["test"]["n_rows"] > 0.0
+            else float("nan")
+        ),
+        "max_crossing_violation_before_repair_test": (
+            float(crossing_acc["test"]["max_violation"])
+            if crossing_acc["test"]["n_rows"] > 0.0
+            else float("nan")
+        ),
         "timing_fit_seconds_total": fit_seconds_total,
         "trained_leads": sorted(int(k) for k in lead_models.keys()),
     }

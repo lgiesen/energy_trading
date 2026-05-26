@@ -887,6 +887,7 @@ def train_and_evaluate(
     target_transform_by_target: dict[str, dict[str, float | str]] = {}
     per_target_tb_log_dir: dict[str, str] = {}
     xgb_best_iteration_rows: list[dict[str, object]] = []
+    per_target_crossing_acc: dict[str, dict[str, float]] = {}
     total_fit_seconds = 0.0
     primary_X_val_h = None
     primary_y_val_lead1 = None
@@ -1099,6 +1100,18 @@ def train_and_evaluate(
 
             # Monotonicity repair for this lead against quantile crossing.
             lead_stack = np.column_stack([lead_pred_by_q[c] for c in q_cols])
+            lead_cross = _crossing_metrics_from_stack(lead_stack)
+            acc = per_target_crossing_acc.setdefault(
+                tgt,
+                {"n_rows": 0.0, "n_cross_rows": 0.0, "max_violation": 0.0},
+            )
+            if np.isfinite(lead_cross["n_rows"]) and lead_cross["n_rows"] > 0.0:
+                acc["n_rows"] += lead_cross["n_rows"]
+                acc["n_cross_rows"] += lead_cross["crossing_rate_before_repair"] * lead_cross["n_rows"]
+                acc["max_violation"] = max(
+                    float(acc["max_violation"]),
+                    float(lead_cross["max_crossing_violation_before_repair"]),
+                )
             lead_stack = np.sort(lead_stack, axis=1)
             for qi, qcol in enumerate(q_cols):
                 lead_pred_series = pd.Series(np.nan, index=X_val.index, dtype=float)
@@ -1191,6 +1204,16 @@ def train_and_evaluate(
             "rows_val_horizon_max": float(max(rows_val_per_lead)),
             "best_iteration_by_lead": best_iteration_by_lead,
             "metric_suite_h1": h1_metric_suite,
+            "crossing_rate_before_repair": (
+                float(per_target_crossing_acc[tgt]["n_cross_rows"] / per_target_crossing_acc[tgt]["n_rows"])
+                if per_target_crossing_acc.get(tgt, {}).get("n_rows", 0.0) > 0.0
+                else float("nan")
+            ),
+            "max_crossing_violation_before_repair": (
+                float(per_target_crossing_acc[tgt]["max_violation"])
+                if per_target_crossing_acc.get(tgt, {}).get("n_rows", 0.0) > 0.0
+                else float("nan")
+            ),
         }
         per_target_policy[tgt] = {
             "feature_variant": target_variant,
@@ -1273,6 +1296,12 @@ def train_and_evaluate(
         "target_transform_by_target": target_transform_by_target,
         "tensorboard_log_dirs_by_target": per_target_tb_log_dir,
         "xgb_best_iteration_by_target_lead_quantile": xgb_best_iteration_rows,
+        "crossing_rate_before_repair": per_target_metrics.get(primary_target, {}).get(
+            "crossing_rate_before_repair"
+        ),
+        "max_crossing_violation_before_repair": per_target_metrics.get(primary_target, {}).get(
+            "max_crossing_violation_before_repair"
+        ),
     }
     # Export all probabilistic metrics available on primary target H1 suite.
     for k, v in primary_metric_suite_h1.items():
@@ -1410,7 +1439,7 @@ def _predict_split_long_multistep(
     horizon_hours: int,
     model_name: str,
     resolved_device: str = "cpu",
-) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, dict[str, float]]]:
     """Generate direct multi-output predictions and return long-format tables.
 
     Output per prediction column includes quantile surface:
@@ -1424,6 +1453,7 @@ def _predict_split_long_multistep(
     snapshots = pd.to_datetime(split_df["timestamp_utc"], utc=True, errors="coerce")
 
     pred_frames: dict[str, list[pd.DataFrame]] = {}
+    crossing_acc_by_pred_col: dict[str, dict[str, float]] = {}
 
     # Keep true h+1 series per target for decay metric.
     true_h1_by_target: dict[str, pd.Series] = {}
@@ -1447,6 +1477,7 @@ def _predict_split_long_multistep(
                 model_q = lead_models[c]
                 lead_pred_q[c] = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
             lead_stack = np.column_stack([lead_pred_q[c] for c in q_cols])
+            lead_cross = _crossing_metrics_from_stack(lead_stack)
             tf_cfg = (target_transform_by_target or {}).get(tgt, {})
             if str(tf_cfg.get("kind", "none")) != "none":
                 tf = TargetTransform(
@@ -1463,6 +1494,17 @@ def _predict_split_long_multistep(
 
             target_time = snapshots + pd.to_timedelta(lead, unit="h")
             for pred_col in _pred_column_names_for_target(tgt):
+                acc = crossing_acc_by_pred_col.setdefault(
+                    pred_col,
+                    {"n_rows": 0.0, "n_cross_rows": 0.0, "max_violation": 0.0},
+                )
+                if np.isfinite(lead_cross["n_rows"]) and lead_cross["n_rows"] > 0.0:
+                    acc["n_rows"] += lead_cross["n_rows"]
+                    acc["n_cross_rows"] += lead_cross["crossing_rate_before_repair"] * lead_cross["n_rows"]
+                    acc["max_violation"] = max(
+                        float(acc["max_violation"]),
+                        float(lead_cross["max_crossing_violation_before_repair"]),
+                    )
                 payload = {
                     "snapshot_time_utc": snapshots,
                     "target_time_utc": target_time,
@@ -1482,6 +1524,7 @@ def _predict_split_long_multistep(
 
     out_long: dict[str, pd.DataFrame] = {}
     out_decay: dict[str, pd.DataFrame] = {}
+    out_crossing: dict[str, dict[str, float]] = {}
     for pred_col, parts in pred_frames.items():
         long_df = pd.concat(parts, ignore_index=True)
         long_df = long_df.sort_values(["snapshot_time_utc", "lead_time_h"]).reset_index(drop=True)
@@ -1494,7 +1537,17 @@ def _predict_split_long_multistep(
             true_h1=true_h1,
             horizon_hours=horizon_hours,
         )
-    return out_long, out_decay
+        acc = crossing_acc_by_pred_col.get(pred_col, {})
+        n_rows = float(acc.get("n_rows", 0.0))
+        out_crossing[pred_col] = {
+            "crossing_rate_before_repair": (
+                float(acc["n_cross_rows"] / n_rows) if n_rows > 0.0 else float("nan")
+            ),
+            "max_crossing_violation_before_repair": (
+                float(acc["max_violation"]) if n_rows > 0.0 else float("nan")
+            ),
+        }
+    return out_long, out_decay, out_crossing
 
 
 def _write_bundle_manifest_fragment(
@@ -1740,7 +1793,7 @@ def main() -> None:
             if args.export_predictions_long:
                 long_split_start = time.perf_counter()
                 split_df, _ = _load_bundle_split_df(base_dir=base_dir, bundle=args.bundle, split=split)
-                long_by_col, decay_by_col = _predict_split_long_multistep(
+                long_by_col, decay_by_col, crossing_by_col = _predict_split_long_multistep(
                     base_dir=base_dir,
                     bundle=args.bundle,
                     split=split,
@@ -1834,6 +1887,13 @@ def main() -> None:
                     _plot_leadtime_mae_points(decay, mae_plot_path)
 
                     tgt_for_pred = _target_for_pred_column(pred_col)
+                    crossing_payload = crossing_by_col.get(pred_col, {})
+                    metrics[f"{split}_{pred_col}_crossing_rate_before_repair"] = crossing_payload.get(
+                        "crossing_rate_before_repair"
+                    )
+                    metrics[
+                        f"{split}_{pred_col}_max_crossing_violation_before_repair"
+                    ] = crossing_payload.get("max_crossing_violation_before_repair")
                     if tgt_for_pred:
                         gate_hour = gate_hour_for_target(tgt_for_pred)
                         if gate_hour is not None and tgt_for_pred in split_df.columns:
@@ -1897,6 +1957,18 @@ def main() -> None:
     )
     metrics["decision_weighted_mae_val"] = metrics.get("leadtime_mae_val_weighted")
     metrics["decision_weighted_mae_test"] = metrics.get("leadtime_mae_test_weighted")
+    metrics["crossing_rate_before_repair_val"] = metrics.get(
+        f"val_{primary_pred_col}_crossing_rate_before_repair"
+    )
+    metrics["max_crossing_violation_before_repair_val"] = metrics.get(
+        f"val_{primary_pred_col}_max_crossing_violation_before_repair"
+    )
+    metrics["crossing_rate_before_repair_test"] = metrics.get(
+        f"test_{primary_pred_col}_crossing_rate_before_repair"
+    )
+    metrics["max_crossing_violation_before_repair_test"] = metrics.get(
+        f"test_{primary_pred_col}_max_crossing_violation_before_repair"
+    )
     val_weighted = leadtime_weighted_by_split.get("val", {}).get(primary_pred_col, {})
     test_weighted = leadtime_weighted_by_split.get("test", {}).get(primary_pred_col, {})
     for key, value in val_weighted.items():
