@@ -1477,7 +1477,6 @@ def _predict_split_long_multistep(
                 model_q = lead_models[c]
                 lead_pred_q[c] = _predict_with_device_alignment(model_q, X, resolved_device=resolved_device)
             lead_stack = np.column_stack([lead_pred_q[c] for c in q_cols])
-            lead_cross = _crossing_metrics_from_stack(lead_stack)
             tf_cfg = (target_transform_by_target or {}).get(tgt, {})
             if str(tf_cfg.get("kind", "none")) != "none":
                 tf = TargetTransform(
@@ -1487,6 +1486,10 @@ def _predict_split_long_multistep(
                     symlog_scale=float(tf_cfg.get("symlog_scale", 1.0)),
                 )
                 lead_stack = tf.inverse_array(lead_stack)
+            # Measure crossing diagnostics on the exported target scale
+            # (e.g. EUR/MWh for transformed activation-price targets),
+            # but before monotonic repair.
+            lead_cross = _crossing_metrics_from_stack(lead_stack)
             lead_stack = np.sort(lead_stack, axis=1)
             if tgt in _ACTIVATION_RATE_TARGETS:
                 # Activation rate predictions are bounded probabilities/fractions.

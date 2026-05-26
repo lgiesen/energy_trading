@@ -27,6 +27,13 @@ AFRR_TARGETS = [
     "target_afrr_capacity_price_neg",
 ]
 
+# Canonical model names by family (used unless explicitly overridden).
+DEFAULT_MODEL_NAMES = {
+    "linear": "linear_torch_quantile",
+    "xgboost": "xgb_quantile",
+    "tft": "tft_quantile",
+}
+
 
 def _run_id_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -736,7 +743,7 @@ def main() -> None:
         afrr_base_dir = args.stacked_base_dir
 
     if args.model_type == "xgboost":
-        model_name = args.model_name.strip() or default_model_names["xgboost"]
+        model_name = args.model_name.strip() or DEFAULT_MODEL_NAMES["xgboost"]
         base_cmd = [
             sys.executable,
             "-m",
@@ -781,7 +788,7 @@ def main() -> None:
         if args.allow_cpu:
             base_cmd.append("--allow-cpu")
     elif args.model_type == "tft":
-        model_name = args.model_name.strip() or default_model_names["tft"]
+        model_name = args.model_name.strip() or DEFAULT_MODEL_NAMES["tft"]
         tft_max_encoder_length = int(args.tft_max_encoder_length) if args.tft_max_encoder_length is not None else 168
         base_cmd = [
             sys.executable,
@@ -827,7 +834,7 @@ def main() -> None:
         if args.cleanup_lightning_checkpoints:
             base_cmd.append("--cleanup-lightning-checkpoints")
     else:
-        model_name = args.model_name.strip() or default_model_names["linear"]
+        model_name = args.model_name.strip() or DEFAULT_MODEL_NAMES["linear"]
         base_cmd = [
             sys.executable,
             "-m",
@@ -1127,9 +1134,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # Canonical model names by family (used unless explicitly overridden).
-    default_model_names = {
-        "linear": "linear_torch_quantile",
-        "xgboost": "xgb_quantile",
-        "tft": "tft_quantile",
-    }
