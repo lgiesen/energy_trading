@@ -9,6 +9,10 @@ MODEL_SPECS = {
     "min_activation_headroom_fraction": 0.25,
     "market_scope": "DE_LU",  # Sign/settlement convention scope
     "terminal_soc_value_discount": 0.8,  # Discount for terminal SoC value in objective
+    # Hard headroom assumptions for reserve/activation deliverability (hours).
+    # 0.5h means full awarded MW must be energetically deliverable for 30 minutes.
+    "reserve_activation_headroom_h": 0.5,
+    "bem_activation_headroom_h": 0.5,
 }
 MODEL_SPECS["optimization_step_min"] = int(MODEL_SPECS["time_step_hours"] * 60)
 

@@ -684,3 +684,264 @@ def test_bem_only_forced_scenario_has_nonzero_revenue_and_benchmark_diagnostics(
     assert np.isfinite(real_cmp)
     assert np.isfinite(oracle_cmp)
     assert out.summary.get("comparable_benchmark_type") == "rolling_perfect_foresight_same_rules"
+
+
+def test_no_headroom_violations_in_clean_forced_bem_only() -> None:
+    bt = _mk_backtester()
+    n = 24
+    idx = pd.date_range("2025-05-01 00:00:00+00:00", periods=n, freq="h", tz="UTC")
+    col = BacktestColumnMap()
+    df = pd.DataFrame(
+        {
+            col.timestamp: idx,
+            col.pred_da_price: np.full(n, -20.0),
+            f"{col.pred_da_price}_p05": np.full(n, -25.0),
+            f"{col.pred_da_price}_p10": np.full(n, -23.0),
+            f"{col.pred_da_price}_p90": np.full(n, -17.0),
+            f"{col.pred_da_price}_p95": np.full(n, -15.0),
+            col.pred_afrr_capacity_price_pos: np.full(n, 0.5),
+            col.pred_afrr_capacity_price_neg: np.full(n, 0.5),
+            col.pred_afrr_activation_price_pos: np.full(n, 140.0),
+            col.pred_afrr_activation_price_neg: np.full(n, 10.0),
+            col.pred_afrr_activation_rate_pos: np.full(n, 0.95),
+            col.pred_afrr_activation_rate_neg: np.full(n, 0.05),
+            col.true_da_price: np.full(n, -18.0),
+            col.true_afrr_capacity_price_pos: np.full(n, 0.5),
+            col.true_afrr_capacity_price_neg: np.full(n, 0.5),
+            col.true_afrr_activation_price_pos: np.full(n, 150.0),
+            col.true_afrr_activation_price_neg: np.full(n, 20.0),
+            col.true_afrr_activation_rate_pos: np.full(n, 0.95),
+            col.true_afrr_activation_rate_neg: np.full(n, 0.05),
+        }
+    )
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=24, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    hv = float(out.summary.get("headroom_violation_count", 0.0))
+    hmax = float(out.summary.get("headroom_violation_max_mwh", 0.0))
+    assert hv <= 1e-9
+    assert hmax <= 1e-9
+
+
+def test_id_is_price_taker() -> None:
+    bt = _mk_backtester()
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_init,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=1.0,
+        id_discharge_mw=0.0,
+    )
+    assert float(m["id_buy_mwh"]) > 0.0
+    # ID cost follows modeled realized settlement price path directly.
+    assert float(m["cost_id_eur"]) > 0.0
+
+
+def test_bcm_positive_headroom_30min() -> None:
+    bt = _mk_backtester()
+    # Need >= reserve*0.5/eta_out above soc_min for 10 MW reserve.
+    req = 10.0 * bt.reserve_activation_headroom_h / bt.eta_out
+    soc_start = bt.soc_min + req - 0.2
+    df, col = _one_hour_pred_df(
+        da=0.0, cap_pos=300.0, cap_neg=0.0, act_pos=100.0, act_neg=0.0, rate_pos=1.0, rate_neg=0.0
+    )
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=soc_start,
+        allowed_markets=("aFRR",),
+    )
+    assert float(out["reserve_pos_mw"].iloc[0]) < 10.0
+
+
+def test_bem_only_headroom_fields_present() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=-100.0, cap_pos=0.0, cap_neg=0.0, act_pos=400.0, act_neg=-10.0, rate_pos=1.0, rate_neg=0.0
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("DA", "aFRR"))
+    for c in [
+        "required_headroom_pos_mwh",
+        "required_headroom_neg_mwh",
+        "available_headroom_pos_mwh",
+        "available_headroom_neg_mwh",
+        "headroom_margin_pos_mwh",
+        "headroom_margin_neg_mwh",
+        "power_stack_pos_mw",
+        "power_stack_neg_mw",
+    ]:
+        assert c in out.columns
+
+
+def test_bcm_negative_headroom_30min() -> None:
+    bt = _mk_backtester()
+    req = 10.0 * bt.reserve_activation_headroom_h * bt.eta_in
+    soc_start = bt.soc_max - req + 0.2
+    df, col = _one_hour_pred_df(
+        da=0.0, cap_pos=0.0, cap_neg=300.0, act_pos=0.0, act_neg=-100.0, rate_pos=0.0, rate_neg=1.0
+    )
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=soc_start,
+        allowed_markets=("aFRR",),
+    )
+    assert float(out["reserve_neg_mw"].iloc[0]) < 10.0
+
+
+def test_headroom_with_efficiency() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.9
+    bt.eta_out = 0.9
+    df, col = _one_hour_pred_df(
+        da=0.0, cap_pos=100.0, cap_neg=100.0, act_pos=100.0, act_neg=-100.0, rate_pos=1.0, rate_neg=1.0
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("aFRR",))
+    row = out.iloc[0]
+    pos_req_expected = (
+        float(row["reserve_pos_mw"]) * bt.reserve_activation_headroom_h
+        + float(row.get("bem_only_pos_mw", 0.0)) * bt.bem_activation_headroom_h
+    ) / bt.eta_out
+    neg_req_expected = (
+        float(row["reserve_neg_mw"]) * bt.reserve_activation_headroom_h
+        + float(row.get("bem_only_neg_mw", 0.0)) * bt.bem_activation_headroom_h
+    ) * bt.eta_in
+    assert np.isclose(float(row["required_headroom_pos_mwh"]), pos_req_expected, atol=1e-9)
+    assert np.isclose(float(row["required_headroom_neg_mwh"]), neg_req_expected, atol=1e-9)
+
+
+def test_bem_only_positive_headroom() -> None:
+    bt = _mk_backtester()
+    req = 10.0 * bt.bem_activation_headroom_h / bt.eta_out
+    soc_start = bt.soc_min + req - 0.2
+    df, col = _one_hour_pred_df(
+        da=-100.0, cap_pos=0.0, cap_neg=0.0, act_pos=500.0, act_neg=-10.0, rate_pos=1.0, rate_neg=0.0
+    )
+    out = bt.optimize_dispatch(df, col, soc_start=soc_start, allowed_markets=("DA", "aFRR"))
+    assert float(out["bem_only_pos_mw"].iloc[0]) < 10.0
+
+
+def test_bem_only_negative_headroom() -> None:
+    bt = _mk_backtester()
+    req = 10.0 * bt.bem_activation_headroom_h * bt.eta_in
+    soc_start = bt.soc_max - req + 0.2
+    df, col = _one_hour_pred_df(
+        da=100.0, cap_pos=0.0, cap_neg=0.0, act_pos=0.0, act_neg=-500.0, rate_pos=0.0, rate_neg=1.0
+    )
+    out = bt.optimize_dispatch(df, col, soc_start=soc_start, allowed_markets=("DA", "aFRR"))
+    assert float(out["bem_only_neg_mw"].iloc[0]) < 10.0
+
+
+def test_no_ex_post_missed_capacity_when_headroom_feasible() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=3)
+    df[col.pred_afrr_capacity_price_pos] = 200.0
+    df[col.pred_afrr_activation_price_pos] = 150.0
+    df[col.pred_afrr_activation_rate_pos] = 1.0
+    df[col.true_afrr_capacity_price_pos] = 200.0
+    df[col.true_afrr_activation_price_pos] = 150.0
+    df[col.true_afrr_activation_rate_pos] = 1.0
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=3, reopt_step_hours=1, allowed_markets=("aFRR",))
+    h = out.hourly
+    assert np.isclose(float(pd.to_numeric(h.get("real_missed_activation_pos_mwh", 0.0), errors="coerce").fillna(0.0).sum()), 0.0, atol=1e-9)
+    assert np.isclose(float(pd.to_numeric(h.get("real_missed_activation_neg_mwh", 0.0), errors="coerce").fillna(0.0).sum()), 0.0, atol=1e-9)
+
+
+def test_audit_fields_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=3)
+    df[col.pred_da_price] = 10.0
+    df[col.pred_afrr_capacity_price_pos] = 10.0
+    df[col.pred_afrr_capacity_price_neg] = 10.0
+    df[col.pred_afrr_activation_price_pos] = 20.0
+    df[col.pred_afrr_activation_price_neg] = -20.0
+    df[col.pred_afrr_activation_rate_pos] = 0.2
+    df[col.pred_afrr_activation_rate_neg] = 0.2
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=3, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    h = out.hourly
+    required = [
+        "required_headroom_pos_mwh",
+        "required_headroom_neg_mwh",
+        "power_stack_pos_mw",
+        "power_stack_neg_mw",
+        "real_revenue_capacity_eur",
+        "real_revenue_activation_eur",
+        "real_pnl_eur",
+        "afrr_cap_pos_awarded_mw",
+        "afrr_cap_neg_awarded_mw",
+        "delivered_activation_pos_mwh",
+        "delivered_activation_neg_mwh",
+        "real_afrr_cap_pos_awarded_mw",
+        "real_afrr_cap_neg_awarded_mw",
+        "real_delivered_activation_pos_mwh",
+        "real_delivered_activation_neg_mwh",
+        "real_required_headroom_pos_mwh",
+        "real_required_headroom_neg_mwh",
+    ]
+    for c in required:
+        assert c in h.columns
+    s = out.summary
+    for k in [
+        "id_price_taker",
+        "reserve_activation_headroom_h",
+        "bem_activation_headroom_h",
+        "headroom_violation_count",
+        "headroom_violation_max_mwh",
+    ]:
+        assert k in s
+
+
+def test_pnl_reconciliation() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=3)
+    df[col.pred_da_price] = 50.0
+    df[col.true_da_price] = 50.0
+    df[col.pred_afrr_capacity_price_pos] = 20.0
+    df[col.pred_afrr_capacity_price_neg] = 5.0
+    df[col.pred_afrr_activation_price_pos] = 30.0
+    df[col.pred_afrr_activation_price_neg] = -10.0
+    df[col.pred_afrr_activation_rate_pos] = 0.3
+    df[col.pred_afrr_activation_rate_neg] = 0.2
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=3, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    h = out.hourly
+    pnl = pd.to_numeric(h["real_pnl_eur"], errors="coerce").fillna(0.0)
+    rev_da = pd.to_numeric(h["real_revenue_da_eur"], errors="coerce").fillna(0.0)
+    rev_id = pd.to_numeric(h["real_revenue_id_eur"], errors="coerce").fillna(0.0)
+    rev_cap = pd.to_numeric(h["real_revenue_capacity_eur"], errors="coerce").fillna(0.0)
+    rev_act = pd.to_numeric(h["real_revenue_activation_eur"], errors="coerce").fillna(0.0)
+    cost_deg = pd.to_numeric(h["real_degradation_cost_eur"], errors="coerce").fillna(0.0)
+    cost_aux = pd.to_numeric(h["real_aux_cost_eur"], errors="coerce").fillna(0.0)
+    penalties = pd.to_numeric(h["real_penalty_eur"], errors="coerce").fillna(0.0)
+    recon = rev_da + rev_id + rev_cap + rev_act - cost_deg - cost_aux - penalties
+    assert np.isclose(float((pnl - recon).abs().max()), 0.0, atol=1e-6)
+    assert "real_pnl_reconciliation_error_eur" in h.columns
+    assert float(pd.to_numeric(h["real_pnl_reconciliation_error_eur"], errors="coerce").fillna(0.0).max()) <= 1e-6
+
+
+def test_headroom_audit_matches_constraint_timing() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=0.0,
+        cap_pos=250.0,
+        cap_neg=0.0,
+        act_pos=120.0,
+        act_neg=0.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(df, col, soc_start=bt.soc_min + 6.0, allowed_markets=("aFRR",))
+    r = out.iloc[0]
+    expected_avail = float(r["soc_start_lp_mwh"]) - bt.soc_min
+    expected_req = (
+        float(r["reserve_pos_mw"]) * bt.reserve_activation_headroom_h
+        + float(r.get("bem_only_pos_mw", 0.0)) * bt.bem_activation_headroom_h
+    ) / bt.eta_out
+    assert np.isclose(float(r["available_headroom_pos_mwh"]), expected_avail, atol=1e-9)
+    assert np.isclose(float(r["required_headroom_pos_mwh"]), expected_req, atol=1e-9)

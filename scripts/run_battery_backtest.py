@@ -54,6 +54,7 @@ from energy_trading.simulation.battery_backtest import (
     load_and_align_market_data,
     load_prediction_warehouse_long,
 )
+from energy_trading.config import MODEL_SPECS
 
 
 def _phase_timeout_seconds(phase: str) -> float:
@@ -716,6 +717,18 @@ def parse_args() -> argparse.Namespace:
         default="multi",
         help="Strategy isolation mode: multi (DA+aFRR), da_only (DA only), afrr_only (aFRR only).",
     )
+    p.add_argument(
+        "--reserve-activation-headroom-h",
+        type=float,
+        default=0.5,
+        help="Hard SoC headroom assumption (hours) for BCM reserve deliverability (default: 0.5h).",
+    )
+    p.add_argument(
+        "--bem-activation-headroom-h",
+        type=float,
+        default=0.5,
+        help="Hard SoC headroom assumption (hours) for BEM-only deliverability (default: 0.5h).",
+    )
     return p.parse_args()
 
 
@@ -891,6 +904,8 @@ def main() -> None:
             )
             scenarios.append((name, wh))
 
+    MODEL_SPECS["reserve_activation_headroom_h"] = float(args.reserve_activation_headroom_h)
+    MODEL_SPECS["bem_activation_headroom_h"] = float(args.bem_activation_headroom_h)
     backtester = BatteryBacktester()
     sweep_rows: list[dict[str, object]] = []
     if args.trading_strategy == "da_only":

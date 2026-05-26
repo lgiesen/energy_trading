@@ -391,6 +391,8 @@ class BatteryBacktester:
             MODEL_SPECS.get("min_activation_headroom_fraction", 0.25)
         )
         self.min_activation_headroom_fraction = max(0.0, min(1.0, self.min_activation_headroom_fraction))
+        self.reserve_activation_headroom_h = max(0.0, float(MODEL_SPECS.get("reserve_activation_headroom_h", 0.5)))
+        self.bem_activation_headroom_h = max(0.0, float(MODEL_SPECS.get("bem_activation_headroom_h", 0.5)))
         self.da_bid_granularity_mw = float(MARKET_SPECS.get("da_bid_granularity", 0.1))
         self.afrr_bid_granularity_mw = float(MARKET_SPECS.get("afrr_bid_granularity", 1.0))
         # Backward-compatible alias used by some helper paths.
@@ -1329,17 +1331,15 @@ class BatteryBacktester:
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
-            # Hard physical deliverability bounds for awarded reserve.
-            # Use reserve product duration padding (e.g. 4h) to enforce robust
-            # SoC availability across the full reserve commitment horizon.
+            # Hard physical deliverability bounds for awarded reserve under
+            # full-activation headroom assumption (configurable, default 0.5h).
             # pos reserve needs footroom above soc_min (discharge capability).
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = -1.0
             for b in range(n_bins):
                 row[sl["rpos_bin"].start + b * n + t] = (
-                    self.reserve_product_duration_h / max(self.eta_out, 1e-12)
+                    self.reserve_activation_headroom_h / max(self.eta_out, 1e-12)
                 ) * afrr_step
-            row[sl["slack_deliver_pos"].start + t] = -1.0
             a_ub.append(row)
             b_ub.append(-self.soc_min)
 
@@ -1348,9 +1348,24 @@ class BatteryBacktester:
             row[sl["soc"].start + t] = 1.0
             for b in range(n_bins):
                 row[sl["rneg_bin"].start + b * n + t] = (
-                    self.reserve_product_duration_h * self.eta_in
+                    self.reserve_activation_headroom_h * self.eta_in
                 ) * afrr_step
-            row[sl["slack_deliver_neg"].start + t] = -1.0
+            a_ub.append(row)
+            b_ub.append(self.soc_max)
+
+            # Hard physical deliverability bounds for explicit BEM-only bids
+            # under full-activation headroom assumption.
+            row = np.zeros(n_vars, dtype=float)
+            row[sl["soc"].start + t] = -1.0
+            row[sl["bem_pos"].start + t] = (
+                self.bem_activation_headroom_h / max(self.eta_out, 1e-12)
+            ) * afrr_step
+            a_ub.append(row)
+            b_ub.append(-self.soc_min)
+
+            row = np.zeros(n_vars, dtype=float)
+            row[sl["soc"].start + t] = 1.0
+            row[sl["bem_neg"].start + t] = (self.bem_activation_headroom_h * self.eta_in) * afrr_step
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
@@ -1387,22 +1402,20 @@ class BatteryBacktester:
                         max(0.0, float(ob_neg)),
                         self.afrr_bid_granularity_mw,
                     )
-                    # Soften lockbook obligations:
-                    # sum(reserve_pos_bins) + slack_obligation_pos >= obligated_pos
-                    # sum(reserve_neg_bins) + slack_obligation_neg >= obligated_neg
+                    # Hard lockbook obligations:
+                    # sum(reserve_pos_bins) >= obligated_pos
+                    # sum(reserve_neg_bins) >= obligated_neg
                     # Convert to <= form:
-                    # -sum(reserve_*) - slack_obligation_* <= -obligated_*
+                    # -sum(reserve_*) <= -obligated_*
                     row = np.zeros(n_vars, dtype=float)
                     for b in range(n_bins):
                         row[sl["rpos_bin"].start + b * n + t] = -afrr_step
-                    row[sl["slack_obligation_pos"].start + t] = -1.0
                     a_ub.append(row)
                     b_ub.append(-float(ob_pos_q))
 
                     row = np.zeros(n_vars, dtype=float)
                     for b in range(n_bins):
                         row[sl["rneg_bin"].start + b * n + t] = -afrr_step
-                    row[sl["slack_obligation_neg"].start + t] = -1.0
                     a_ub.append(row)
                     b_ub.append(-float(ob_neg_q))
 
@@ -1545,6 +1558,7 @@ class BatteryBacktester:
         charge_mw = out["charge_mw"].to_numpy(dtype=float)
         discharge_mw = out["discharge_mw"].to_numpy(dtype=float)
         soc_lp = x[sl["soc"].start + 1 : sl["soc"].start + n + 1]
+        soc_start_lp = x[sl["soc"].start : sl["soc"].start + n]
         final_soc_shortfall_mwh = float(x[sl["slack_final_soc"].start]) if "slack_final_soc" in sl else 0.0
         slack_pos = x[sl["slack_pos"]]
         slack_neg = x[sl["slack_neg"]]
@@ -1575,6 +1589,7 @@ class BatteryBacktester:
         extra_cols: dict[str, np.ndarray] = {
             "is_charging": (charge_mw > 1e-9).astype(float),
             "soc_lp_mwh": soc_lp,
+            "soc_start_lp_mwh": soc_start_lp,
             "slack_pos_mw": slack_pos,
             "slack_neg_mw": slack_neg,
             "slack_soc_min_mwh": slack_soc_min[1:],
@@ -1604,6 +1619,45 @@ class BatteryBacktester:
             "ev_pacc_pos_fallback_used": pacc_pos_fallback_used,
             "ev_pacc_neg_fallback_used": pacc_neg_fallback_used,
         }
+        # Audit-grade hard-headroom diagnostics (optimizer-side, per hour).
+        reserve_pos_mw = out["reserve_pos_mw"].to_numpy(dtype=float)
+        reserve_neg_mw = out["reserve_neg_mw"].to_numpy(dtype=float)
+        bem_pos_mw = out["bem_only_pos_mw"].to_numpy(dtype=float)
+        bem_neg_mw = out["bem_only_neg_mw"].to_numpy(dtype=float)
+        req_pos_mwh = (
+            (reserve_pos_mw * self.reserve_activation_headroom_h + bem_pos_mw * self.bem_activation_headroom_h)
+            / max(self.eta_out, 1e-12)
+        )
+        req_neg_mwh = (
+            (reserve_neg_mw * self.reserve_activation_headroom_h + bem_neg_mw * self.bem_activation_headroom_h)
+            * self.eta_in
+        )
+        avail_pos_mwh = np.maximum(0.0, soc_start_lp - self.soc_min)
+        avail_neg_mwh = np.maximum(0.0, self.soc_max - soc_start_lp)
+        headroom_margin_pos = avail_pos_mwh - req_pos_mwh
+        headroom_margin_neg = avail_neg_mwh - req_neg_mwh
+        power_stack_pos_mw = discharge_mw + reserve_pos_mw + bem_pos_mw
+        power_stack_neg_mw = charge_mw + reserve_neg_mw + bem_neg_mw
+        extra_cols.update(
+            {
+                "required_headroom_pos_mwh": req_pos_mwh,
+                "required_headroom_neg_mwh": req_neg_mwh,
+                "available_headroom_pos_mwh": avail_pos_mwh,
+                "available_headroom_neg_mwh": avail_neg_mwh,
+                "headroom_margin_pos_mwh": headroom_margin_pos,
+                "headroom_margin_neg_mwh": headroom_margin_neg,
+                "headroom_violation_pos_mwh": np.maximum(0.0, -headroom_margin_pos),
+                "headroom_violation_neg_mwh": np.maximum(0.0, -headroom_margin_neg),
+                "power_stack_pos_mw": power_stack_pos_mw,
+                "power_stack_neg_mw": power_stack_neg_mw,
+                "power_margin_pos_mw": self.p_max_mw - power_stack_pos_mw,
+                "power_margin_neg_mw": self.p_max_mw - power_stack_neg_mw,
+                "power_violation_pos_mw": np.maximum(0.0, power_stack_pos_mw - self.p_max_mw),
+                "power_violation_neg_mw": np.maximum(0.0, power_stack_neg_mw - self.p_max_mw),
+                "reserve_activation_headroom_h": np.full(n, self.reserve_activation_headroom_h, dtype=float),
+                "bem_activation_headroom_h": np.full(n, self.bem_activation_headroom_h, dtype=float),
+            }
+        )
         if "optimizer_required_input_imputed_count" in df.columns:
             extra_cols["optimizer_required_input_imputed_count"] = pd.to_numeric(
                 df["optimizer_required_input_imputed_count"], errors="coerce"
@@ -1704,8 +1758,14 @@ class BatteryBacktester:
         id_charge = max(0.0, float(id_charge_mw))
         id_discharge = max(0.0, float(id_discharge_mw))
         # Enforce instantaneous converter power constraints on combined DA+ID.
-        id_charge = min(id_charge, max(0.0, self.p_max_mw - max(0.0, da_charge)))
-        id_discharge = min(id_discharge, max(0.0, self.p_max_mw - max(0.0, da_discharge)))
+        id_charge = min(
+            id_charge,
+            max(0.0, self.p_max_mw - max(0.0, da_charge) - max(0.0, reserve_neg)),
+        )
+        id_discharge = min(
+            id_discharge,
+            max(0.0, self.p_max_mw - max(0.0, da_discharge) - max(0.0, reserve_pos)),
+        )
 
         # Requested internal energies for this hour.
         act_pos_internal_req = max(0.0, act_pos_rate) * reserve_pos * self.dt_h
@@ -1814,10 +1874,15 @@ class BatteryBacktester:
         # Inverter-aware capacity support: both SoC headroom/footroom and
         # residual converter power after DA+ID setpoints must allow reserve.
         soc_pos_limit_mw = max(
-            0.0, (soc_for_capacity - self.soc_min) * self.eta_out / max(self.dt_h, 1e-12)
+            0.0,
+            (soc_for_capacity - self.soc_min)
+            * self.eta_out
+            / max(self.reserve_activation_headroom_h, 1e-12),
         )
         soc_neg_limit_mw = max(
-            0.0, (self.soc_max - soc_for_capacity) / max(self.eta_in * self.dt_h, 1e-12)
+            0.0,
+            (self.soc_max - soc_for_capacity)
+            / max(self.eta_in * self.reserve_activation_headroom_h, 1e-12),
         )
         inverter_pos_limit_mw = max(
             0.0, self.p_max_mw - max(0.0, da_discharge) - max(0.0, id_discharge)
@@ -3988,6 +4053,7 @@ class BatteryBacktester:
                 if "settlement_cap_bid_price_neg_eur_mw" in clearing_rec
                 else None
             )
+            soc_start_hour = float(soc)
             soc, m = self._settle_one_hour(
                 soc=soc,
                 charge=charge,
@@ -4005,6 +4071,44 @@ class BatteryBacktester:
                 act_neg_rate=rate_neg,
                 cap_bid_pos=cap_bid_pos_settlement,
                 cap_bid_neg=cap_bid_neg_settlement,
+            )
+            # Realized headroom audit (aligned to settlement-time commitments).
+            committed_bem_pos_mw = float(clearing_rec.get("bem_only_submitted_pos_mw", 0.0))
+            committed_bem_neg_mw = float(clearing_rec.get("bem_only_submitted_neg_mw", 0.0))
+            req_pos_mwh = (
+                float(reserve_pos) * self.reserve_activation_headroom_h
+                + committed_bem_pos_mw * self.bem_activation_headroom_h
+            ) / max(self.eta_out, 1e-12)
+            req_neg_mwh = (
+                float(reserve_neg) * self.reserve_activation_headroom_h
+                + committed_bem_neg_mw * self.bem_activation_headroom_h
+            ) * self.eta_in
+            avail_pos_mwh = max(0.0, soc_start_hour - self.soc_min)
+            avail_neg_mwh = max(0.0, self.soc_max - soc_start_hour)
+            m.update(
+                {
+                    "soc_start_mwh": soc_start_hour,
+                    "soc_min_mwh": float(self.soc_min),
+                    "soc_max_mwh": float(self.soc_max),
+                    "required_headroom_pos_mwh": float(req_pos_mwh),
+                    "required_headroom_neg_mwh": float(req_neg_mwh),
+                    "available_headroom_pos_mwh": float(avail_pos_mwh),
+                    "available_headroom_neg_mwh": float(avail_neg_mwh),
+                    "headroom_margin_pos_mwh": float(avail_pos_mwh - req_pos_mwh),
+                    "headroom_margin_neg_mwh": float(avail_neg_mwh - req_neg_mwh),
+                    "headroom_violation_pos_mwh": float(max(0.0, req_pos_mwh - avail_pos_mwh)),
+                    "headroom_violation_neg_mwh": float(max(0.0, req_neg_mwh - avail_neg_mwh)),
+                    "power_stack_pos_mw": float(max(0.0, discharge) + max(0.0, id_discharge) + max(0.0, reserve_pos) + max(0.0, committed_bem_pos_mw)),
+                    "power_stack_neg_mw": float(max(0.0, charge) + max(0.0, id_charge) + max(0.0, reserve_neg) + max(0.0, committed_bem_neg_mw)),
+                    "power_margin_pos_mw": float(
+                        self.p_max_mw
+                        - (max(0.0, discharge) + max(0.0, id_discharge) + max(0.0, reserve_pos) + max(0.0, committed_bem_pos_mw))
+                    ),
+                    "power_margin_neg_mw": float(
+                        self.p_max_mw
+                        - (max(0.0, charge) + max(0.0, id_charge) + max(0.0, reserve_neg) + max(0.0, committed_bem_neg_mw))
+                    ),
+                }
             )
             # Row-level activation split: BCM-linked vs explicit BEM-only.
             bem_only_pos_mwh = float(clearing_rec.get("bem_only_executed_pos_mwh", 0.0))
@@ -4117,6 +4221,21 @@ class BatteryBacktester:
             "penalty_eur": f"{kind}_penalty_eur",
             "net_cashflow_eur": f"{kind}_net_cashflow_eur",
             "soc_mwh": f"{kind}_soc_mwh",
+            "soc_start_mwh": f"{kind}_soc_start_mwh",
+            "soc_min_mwh": f"{kind}_soc_min_mwh",
+            "soc_max_mwh": f"{kind}_soc_max_mwh",
+            "required_headroom_pos_mwh": f"{kind}_required_headroom_pos_mwh",
+            "required_headroom_neg_mwh": f"{kind}_required_headroom_neg_mwh",
+            "available_headroom_pos_mwh": f"{kind}_available_headroom_pos_mwh",
+            "available_headroom_neg_mwh": f"{kind}_available_headroom_neg_mwh",
+            "headroom_margin_pos_mwh": f"{kind}_headroom_margin_pos_mwh",
+            "headroom_margin_neg_mwh": f"{kind}_headroom_margin_neg_mwh",
+            "headroom_violation_pos_mwh": f"{kind}_headroom_violation_pos_mwh",
+            "headroom_violation_neg_mwh": f"{kind}_headroom_violation_neg_mwh",
+            "power_stack_pos_mw": f"{kind}_power_stack_pos_mw",
+            "power_stack_neg_mw": f"{kind}_power_stack_neg_mw",
+            "power_margin_pos_mw": f"{kind}_power_margin_pos_mw",
+            "power_margin_neg_mw": f"{kind}_power_margin_neg_mw",
         }, inplace=True)
         # Enforce strict realized namespace contract for settlement outcomes.
         if kind == "real":
@@ -4907,6 +5026,67 @@ class BatteryBacktester:
             missing_realized_pnl,
         )
 
+        # Audit aliases for awarded capacity and delivered activation.
+        if "real_afrr_cap_pos_awarded_mw" not in hourly.columns:
+            if "real_executed_reserve_pos_mw" in hourly.columns:
+                hourly["real_afrr_cap_pos_awarded_mw"] = pd.to_numeric(hourly["real_executed_reserve_pos_mw"], errors="coerce").fillna(0.0)
+            elif "real_awarded_capacity_pos_mw" in hourly.columns:
+                hourly["real_afrr_cap_pos_awarded_mw"] = pd.to_numeric(hourly["real_awarded_capacity_pos_mw"], errors="coerce").fillna(0.0)
+            else:
+                hourly["real_afrr_cap_pos_awarded_mw"] = 0.0
+        if "real_afrr_cap_neg_awarded_mw" not in hourly.columns:
+            if "real_executed_reserve_neg_mw" in hourly.columns:
+                hourly["real_afrr_cap_neg_awarded_mw"] = pd.to_numeric(hourly["real_executed_reserve_neg_mw"], errors="coerce").fillna(0.0)
+            elif "real_awarded_capacity_neg_mw" in hourly.columns:
+                hourly["real_afrr_cap_neg_awarded_mw"] = pd.to_numeric(hourly["real_awarded_capacity_neg_mw"], errors="coerce").fillna(0.0)
+            else:
+                hourly["real_afrr_cap_neg_awarded_mw"] = 0.0
+        if "real_delivered_activation_pos_mwh" not in hourly.columns and "real_act_pos_mwh" in hourly.columns:
+            hourly["real_delivered_activation_pos_mwh"] = pd.to_numeric(hourly["real_act_pos_mwh"], errors="coerce").fillna(0.0)
+        if "real_delivered_activation_neg_mwh" not in hourly.columns and "real_act_neg_mwh" in hourly.columns:
+            hourly["real_delivered_activation_neg_mwh"] = pd.to_numeric(hourly["real_act_neg_mwh"], errors="coerce").fillna(0.0)
+        for plain, pref in (
+            ("afrr_cap_pos_awarded_mw", "real_afrr_cap_pos_awarded_mw"),
+            ("afrr_cap_neg_awarded_mw", "real_afrr_cap_neg_awarded_mw"),
+            ("delivered_activation_pos_mwh", "real_delivered_activation_pos_mwh"),
+            ("delivered_activation_neg_mwh", "real_delivered_activation_neg_mwh"),
+        ):
+            if plain not in hourly.columns and pref in hourly.columns:
+                hourly[plain] = pd.to_numeric(hourly[pref], errors="coerce").fillna(0.0)
+
+        # Row-level realized PnL reconciliation (explicit components).
+        for c in (
+            "real_revenue_da_eur",
+            "real_cost_da_eur",
+            "real_revenue_id_eur",
+            "real_cost_id_eur",
+            "real_revenue_capacity_eur",
+            "real_revenue_activation_eur",
+            "real_transaction_cost_eur",
+            "real_degradation_cost_eur",
+            "real_aux_cost_eur",
+            "real_penalty_eur",
+            "real_pnl_eur",
+        ):
+            if c not in hourly.columns:
+                hourly[c] = 0.0
+            hourly[c] = pd.to_numeric(hourly[c], errors="coerce").fillna(0.0)
+        hourly["real_recomputed_pnl_eur"] = (
+            hourly["real_revenue_da_eur"]
+            - hourly["real_cost_da_eur"]
+            + hourly["real_revenue_id_eur"]
+            - hourly["real_cost_id_eur"]
+            + hourly["real_revenue_capacity_eur"]
+            + hourly["real_revenue_activation_eur"]
+            - hourly["real_transaction_cost_eur"]
+            - hourly["real_degradation_cost_eur"]
+            - hourly["real_aux_cost_eur"]
+            - hourly["real_penalty_eur"]
+        )
+        hourly["real_pnl_reconciliation_error_eur"] = (
+            hourly["real_pnl_eur"] - hourly["real_recomputed_pnl_eur"]
+        ).abs()
+
         min_cash = float(hourly["real_cum_cash_eur"].min()) if not hourly.empty else self.initial_cash
         capital_required = max(0.0, -min_cash)
 
@@ -5088,6 +5268,9 @@ class BatteryBacktester:
             "realized_afrr_only_feasible": float(realized_afrr_only_feasible),
             "oracle_afrr_only_feasible": float(oracle_afrr_only_feasible),
             "bem_only_mode": "approx_reuse_reserve_volume",
+            "id_price_taker": 1.0,
+            "reserve_activation_headroom_h": float(self.reserve_activation_headroom_h),
+            "bem_activation_headroom_h": float(self.bem_activation_headroom_h),
         }
         # Optimizer data-quality and fallback diagnostics.
         if "optimizer_fallback_used" in hourly.columns:
@@ -5224,6 +5407,9 @@ class BatteryBacktester:
             summary["realized_total_pnl_eur"] - summary["realized_pnl_from_components_plus_terminal_eur"]
         )
         summary["realized_pnl_balance_ok"] = float(abs(summary["realized_pnl_balance_error_eur"]) <= 1e-6)
+        summary["pnl_reconciliation_error_max_eur"] = float(
+            pd.to_numeric(hourly.get("real_pnl_reconciliation_error_eur", 0.0), errors="coerce").fillna(0.0).max()
+        )
 
         # Oracle component decomposition / balance check (same settlement accounting identity).
         summary["oracle_total_da_revenue_eur"] = float(hourly["oracle_revenue_da_eur"].sum())
@@ -5328,6 +5514,36 @@ class BatteryBacktester:
             awarded_afrr_mw += float(hourly["real_executed_reserve_neg_mw"].sum())
         summary["afrr_capacity_award_rate"] = float(awarded_afrr_mw / submitted_afrr_mw) if submitted_afrr_mw > 1e-12 else float("nan")
         summary["total_missed_activation_mwh"] = float(hourly["real_missed_activation_mwh"].sum()) if "real_missed_activation_mwh" in hourly.columns else 0.0
+        summary["missed_activation_pos_mwh"] = float(hourly["real_missed_activation_pos_mwh"].sum()) if "real_missed_activation_pos_mwh" in hourly.columns else 0.0
+        summary["missed_activation_neg_mwh"] = float(hourly["real_missed_activation_neg_mwh"].sum()) if "real_missed_activation_neg_mwh" in hourly.columns else 0.0
+        summary["missed_capacity_pos_mw"] = float(hourly["real_missed_capacity_pos_mw"].sum()) if "real_missed_capacity_pos_mw" in hourly.columns else 0.0
+        summary["missed_capacity_neg_mw"] = float(hourly["real_missed_capacity_neg_mw"].sum()) if "real_missed_capacity_neg_mw" in hourly.columns else 0.0
+        if (
+            "real_headroom_violation_pos_mwh" in hourly.columns
+            or "real_headroom_violation_neg_mwh" in hourly.columns
+            or "headroom_violation_pos_mwh" in hourly.columns
+            or "headroom_violation_neg_mwh" in hourly.columns
+        ):
+            hv_pos = pd.to_numeric(
+                hourly.get(
+                    "real_headroom_violation_pos_mwh",
+                    hourly.get("headroom_violation_pos_mwh", 0.0),
+                ),
+                errors="coerce",
+            ).fillna(0.0)
+            hv_neg = pd.to_numeric(
+                hourly.get(
+                    "real_headroom_violation_neg_mwh",
+                    hourly.get("headroom_violation_neg_mwh", 0.0),
+                ),
+                errors="coerce",
+            ).fillna(0.0)
+            hv = hv_pos + hv_neg
+            summary["headroom_violation_count"] = float((hv > 1e-9).sum())
+            summary["headroom_violation_max_mwh"] = float(hv.max() if len(hv) else 0.0)
+        else:
+            summary["headroom_violation_count"] = 0.0
+            summary["headroom_violation_max_mwh"] = 0.0
         summary["bem_only_mode"] = "explicit_optimizer"
         summary["bem_only_explicit_optimizer"] = 1.0
         bcm_col = "real_afrr_bcm_auction_cleared"
