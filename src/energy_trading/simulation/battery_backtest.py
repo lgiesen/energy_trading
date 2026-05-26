@@ -124,6 +124,8 @@ DISPATCH_DECISION_COLS = (
     "plan_discharge_mw",
     "plan_reserve_pos_mw",
     "plan_reserve_neg_mw",
+    "plan_bem_only_pos_mw",
+    "plan_bem_only_neg_mw",
     "id_charge_mw",
     "id_discharge_mw",
     "pending_id_charge_mw",
@@ -150,16 +152,24 @@ SETTLEMENT_NUMERIC_COLS = (
     "plan_discharge_mw",
     "plan_reserve_pos_mw",
     "plan_reserve_neg_mw",
+    "plan_bem_only_pos_mw",
+    "plan_bem_only_neg_mw",
     "submitted_da_buy_mw",
     "submitted_da_sell_mw",
     "submitted_da_buy_price_eur_mwh",
     "submitted_da_sell_price_eur_mwh",
     "submitted_afrr_pos_mw",
     "submitted_afrr_neg_mw",
+    "bem_only_submitted_pos_mw",
+    "bem_only_submitted_neg_mw",
     "executed_charge_mw",
     "executed_discharge_mw",
     "executed_reserve_pos_mw",
     "executed_reserve_neg_mw",
+    "bem_only_executed_pos_mw",
+    "bem_only_executed_neg_mw",
+    "bem_only_executed_pos_mwh",
+    "bem_only_executed_neg_mwh",
     "settlement_cap_bid_price_pos_eur_mw",
     "settlement_cap_bid_price_neg_eur_mw",
     "executed_rate_pos",
@@ -640,6 +650,8 @@ class BatteryBacktester:
         out["dis"] = slice(s, s + n); s += n
         out["rpos_bin"] = slice(s, s + n_r); s += n_r
         out["rneg_bin"] = slice(s, s + n_r); s += n_r
+        out["bem_pos"] = slice(s, s + n); s += n
+        out["bem_neg"] = slice(s, s + n); s += n
         out["u"] = slice(s, s + n); s += n
         out["soc"] = slice(s, s + (n + 1)); s += (n + 1)
         out["slack_pos"] = slice(s, s + n); s += n
@@ -1043,6 +1055,22 @@ class BatteryBacktester:
         c[sl["dis"]] = -(dis_coef * da_step)
         rpos_coef_by_bin = np.zeros((n, n_bins), dtype=float)
         rneg_coef_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_pos_coef = (
+            r_act_pos_base
+            * (
+                act_price_pos
+                - self.trans_eur_mwh
+                - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
+            )
+        )
+        bem_neg_coef = (
+            r_act_neg_base
+            * (
+                -act_price_neg
+                - self.trans_eur_mwh
+                - (self.deg_eur_mwh * self.eta_in)
+            )
+        )
         for b in range(n_bins):
             # Correct EV split:
             # 1) offer-side fixed availability cost (no p_acc multiplier)
@@ -1109,6 +1137,8 @@ class BatteryBacktester:
             rneg_coef_by_bin[:, b] = rneg_coef
             c[s_pos : s_pos + n] = -(rpos_coef * afrr_step)
             c[s_neg : s_neg + n] = -(rneg_coef * afrr_step)
+        c[sl["bem_pos"]] = -(bem_pos_coef * afrr_step)
+        c[sl["bem_neg"]] = -(bem_neg_coef * afrr_step)
         # Soft chance-constraint penalties (continuous non-delivery slack).
         # Make slack prohibitively expensive relative to capacity revenues so
         # solver prioritizes physical feasibility over speculative awards.
@@ -1179,6 +1209,8 @@ class BatteryBacktester:
                 exp_neg = p_acc_cap_neg[t, b] * r_act_neg_base[t]
                 row[sl["rpos_bin"].start + b * n + t] = (exp_pos / self.eta_out) * afrr_step
                 row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * exp_neg * afrr_step
+            row[sl["bem_pos"].start + t] = (r_act_pos_base[t] / self.eta_out) * afrr_step
+            row[sl["bem_neg"].start + t] = -self.eta_in * r_act_neg_base[t] * afrr_step
             a_eq.append(row)
             b_eq.append(0.0)
 
@@ -1208,6 +1240,7 @@ class BatteryBacktester:
             row[sl["ch"].start + t] = da_step
             for b in range(n_bins):
                 row[sl["rneg_bin"].start + b * n + t] = afrr_step
+            row[sl["bem_neg"].start + t] = afrr_step
             a_ub.append(row)
             b_ub.append(self.p_max_mw)
 
@@ -1216,6 +1249,7 @@ class BatteryBacktester:
             row[sl["dis"].start + t] = da_step
             for b in range(n_bins):
                 row[sl["rpos_bin"].start + b * n + t] = afrr_step
+            row[sl["bem_pos"].start + t] = afrr_step
             a_ub.append(row)
             b_ub.append(self.p_max_mw)
 
@@ -1408,6 +1442,8 @@ class BatteryBacktester:
         ub[sl["dis"]] = da_units_max
         ub[sl["rpos_bin"]] = afrr_units_max
         ub[sl["rneg_bin"]] = afrr_units_max
+        ub[sl["bem_pos"]] = afrr_units_max
+        ub[sl["bem_neg"]] = afrr_units_max
         if self.aux_mode == "state_dependent":
             lb[sl["u"]] = max(0.0, self.aux_off_mw)
             ub[sl["u"]] = self.aux_peak_mw
@@ -1501,6 +1537,8 @@ class BatteryBacktester:
         out["discharge_mw"] = x[sl["dis"]] * da_step
         out["reserve_pos_mw"] = rpos_bin.sum(axis=1) * afrr_step
         out["reserve_neg_mw"] = rneg_bin.sum(axis=1) * afrr_step
+        out["bem_only_pos_mw"] = x[sl["bem_pos"]] * afrr_step
+        out["bem_only_neg_mw"] = x[sl["bem_neg"]] * afrr_step
         out["aux_power_mw"] = x[sl["u"]]
         reserve_pos_bin_mw = rpos_bin * afrr_step
         reserve_neg_bin_mw = rneg_bin * afrr_step
@@ -1516,6 +1554,8 @@ class BatteryBacktester:
         ev_da_discharge_eur = dis_coef * discharge_mw
         ev_afrr_pos_eur = (rpos_coef_by_bin * reserve_pos_bin_mw).sum(axis=1)
         ev_afrr_neg_eur = (rneg_coef_by_bin * reserve_neg_bin_mw).sum(axis=1)
+        ev_bem_only_pos_eur = bem_pos_coef * out["bem_only_pos_mw"].to_numpy(dtype=float)
+        ev_bem_only_neg_eur = bem_neg_coef * out["bem_only_neg_mw"].to_numpy(dtype=float)
         ev_slack_penalty_pos_eur = c[sl["slack_pos"]] * slack_pos
         ev_slack_penalty_neg_eur = c[sl["slack_neg"]] * slack_neg
         ev_terminal_soc_credit_eur = np.zeros(n, dtype=float)
@@ -1526,6 +1566,8 @@ class BatteryBacktester:
             + ev_da_discharge_eur
             + ev_afrr_pos_eur
             + ev_afrr_neg_eur
+            + ev_bem_only_pos_eur
+            + ev_bem_only_neg_eur
             - ev_slack_penalty_pos_eur
             - ev_slack_penalty_neg_eur
             + ev_terminal_soc_credit_eur
@@ -1552,6 +1594,8 @@ class BatteryBacktester:
             "ev_da_discharge_eur": ev_da_discharge_eur,
             "ev_afrr_pos_eur": ev_afrr_pos_eur,
             "ev_afrr_neg_eur": ev_afrr_neg_eur,
+            "ev_bem_only_pos_eur": ev_bem_only_pos_eur,
+            "ev_bem_only_neg_eur": ev_bem_only_neg_eur,
             "ev_slack_penalty_pos_eur": ev_slack_penalty_pos_eur,
             "ev_slack_penalty_neg_eur": ev_slack_penalty_neg_eur,
             "ev_terminal_soc_credit_eur": ev_terminal_soc_credit_eur,
@@ -1978,6 +2022,8 @@ class BatteryBacktester:
         planned_discharge_mw: float,
         planned_reserve_pos_mw: float,
         planned_reserve_neg_mw: float,
+        planned_bem_only_pos_mw: float = 0.0,
+        planned_bem_only_neg_mw: float = 0.0,
         pred_da_price: float,
         pred_da_price_p05: float | None = None,
         pred_da_price_p10: float | None = None,
@@ -2016,6 +2062,8 @@ class BatteryBacktester:
         ch_plan, dis_plan = self._normalize_da_bid(planned_charge_mw, planned_discharge_mw)
         res_pos_plan = max(0.0, float(planned_reserve_pos_mw))
         res_neg_plan = max(0.0, float(planned_reserve_neg_mw))
+        bem_pos_plan = max(0.0, float(planned_bem_only_pos_mw))
+        bem_neg_plan = max(0.0, float(planned_bem_only_neg_mw))
         ts = pd.to_datetime(target_time_utc, utc=True, errors="coerce")
         if pd.isna(ts):
             ts = pd.Timestamp("1970-01-01T00:00:00Z")
@@ -2150,66 +2198,37 @@ class BatteryBacktester:
             )
         else:
             # No BCM obligation for this delivery hour.
-            # Keep submitted capacity bids for transparency only, but do not clear
-            # capacity intraday. Outside BCM gate, the strategy participates via
-            # aFRR BEM (activation price) for this hour.
+            # Explicit BEM-only participation uses independent planned BEM volumes.
             cap_bids: list[AFRRCapacityBid] = []
-            has_bin_plan = (
-                isinstance(planned_reserve_pos_bins_mw, list)
-                and isinstance(planned_reserve_neg_bins_mw, list)
-                and len(planned_reserve_pos_bins_mw) == n_bins
-                and len(planned_reserve_neg_bins_mw) == n_bins
-            )
-            has_bin_prices = (
-                isinstance(pred_cap_pos_bins_eur_mw, list)
-                and isinstance(pred_cap_neg_bins_eur_mw, list)
-                and len(pred_cap_pos_bins_eur_mw) == n_bins
-                and len(pred_cap_neg_bins_eur_mw) == n_bins
-            )
-            if has_bin_plan and has_bin_prices:
-                for b in range(n_bins):
-                    q_pos = self.bid_builder._qfloor(float(planned_reserve_pos_bins_mw[b]), self.afrr_step_mw)
-                    q_neg = self.bid_builder._qfloor(float(planned_reserve_neg_bins_mw[b]), self.afrr_step_mw)
-                    if 0.0 < q_pos < self.afrr_min_bid_size_mw:
-                        q_pos = 0.0
-                    if 0.0 < q_neg < self.afrr_min_bid_size_mw:
-                        q_neg = 0.0
-                    p_pos = float(pred_cap_pos_bins_eur_mw[b])
-                    p_neg = float(pred_cap_neg_bins_eur_mw[b])
-                    bin_payload[f"submitted_afrr_pos_bin_{b}_mw"] = float(q_pos)
-                    bin_payload[f"submitted_afrr_neg_bin_{b}_mw"] = float(q_neg)
-                    bin_payload[f"submitted_afrr_pos_bin_{b}_price_eur_mw"] = float(p_pos if q_pos > 0.0 else 0.0)
-                    bin_payload[f"submitted_afrr_neg_bin_{b}_price_eur_mw"] = float(p_neg if q_neg > 0.0 else 0.0)
-                    if q_pos > 0.0:
-                        cap_bids.append(
-                            AFRRCapacityBid(
-                                ts=ts,
-                                side="pos",
-                                quantity_mw=float(q_pos),
-                                capacity_price_eur_mw=float(p_pos),
-                                energy_price_eur_mwh=float(pred_act_pos),
-                            )
-                        )
-                    if q_neg > 0.0:
-                        cap_bids.append(
-                            AFRRCapacityBid(
-                                ts=ts,
-                                side="neg",
-                                quantity_mw=float(q_neg),
-                                capacity_price_eur_mw=float(p_neg),
-                                energy_price_eur_mwh=float(pred_act_neg),
-                            )
-                        )
-            else:
-                cap_bids = self.bid_builder.build_afrr_capacity_bids(
-                    ts=ts,
-                    reserve_pos_mw=res_pos_plan,
-                    reserve_neg_mw=res_neg_plan,
-                    pred_cap_pos=float(pred_cap_pos),
-                    pred_cap_neg=float(pred_cap_neg),
-                    pred_act_pos=float(pred_act_pos),
-                    pred_act_neg=float(pred_act_neg),
-                    is_oracle=is_oracle,
+            q_pos = self.bid_builder._qfloor(float(bem_pos_plan), self.afrr_step_mw)
+            q_neg = self.bid_builder._qfloor(float(bem_neg_plan), self.afrr_step_mw)
+            if 0.0 < q_pos < self.afrr_min_bid_size_mw:
+                q_pos = 0.0
+            if 0.0 < q_neg < self.afrr_min_bid_size_mw:
+                q_neg = 0.0
+            bin_payload["submitted_afrr_pos_bin_0_mw"] = float(q_pos)
+            bin_payload["submitted_afrr_neg_bin_0_mw"] = float(q_neg)
+            bin_payload["submitted_afrr_pos_bin_0_price_eur_mw"] = 0.0
+            bin_payload["submitted_afrr_neg_bin_0_price_eur_mw"] = 0.0
+            if q_pos > 0.0:
+                cap_bids.append(
+                    AFRRCapacityBid(
+                        ts=ts,
+                        side="pos",
+                        quantity_mw=float(q_pos),
+                        capacity_price_eur_mw=0.0,
+                        energy_price_eur_mwh=float(pred_act_pos),
+                    )
+                )
+            if q_neg > 0.0:
+                cap_bids.append(
+                    AFRRCapacityBid(
+                        ts=ts,
+                        side="neg",
+                        quantity_mw=float(q_neg),
+                        capacity_price_eur_mw=0.0,
+                        energy_price_eur_mwh=float(pred_act_neg),
+                    )
                 )
             submitted_pos = float(sum(float(b.quantity_mw) for b in cap_bids if b.side == "pos"))
             submitted_neg = float(sum(float(b.quantity_mw) for b in cap_bids if b.side == "neg"))
@@ -2639,6 +2658,8 @@ class BatteryBacktester:
                     "discharge_mw",
                     "reserve_pos_mw",
                     "reserve_neg_mw",
+                    "bem_only_pos_mw",
+                    "bem_only_neg_mw",
                     "soc_lp_mwh",
                     "planned_soc_mwh",
                     "executed_soc_mwh",
@@ -2659,6 +2680,8 @@ class BatteryBacktester:
                     "discharge_mw",
                     "reserve_pos_mw",
                     "reserve_neg_mw",
+                    "bem_only_pos_mw",
+                    "bem_only_neg_mw",
                     "planned_charge_mw",
                     "planned_discharge_mw",
                     "planned_reserve_mw",
@@ -3148,6 +3171,7 @@ class BatteryBacktester:
             snapshot_plan["planned_charge_mw"] = snapshot_plan["charge_mw"]
             snapshot_plan["planned_discharge_mw"] = snapshot_plan["discharge_mw"]
             snapshot_plan["planned_reserve_mw"] = snapshot_plan["reserve_pos_mw"] + snapshot_plan["reserve_neg_mw"]
+            snapshot_plan["planned_bem_only_mw"] = snapshot_plan.get("bem_only_pos_mw", 0.0) + snapshot_plan.get("bem_only_neg_mw", 0.0)
             window_price_map = pd.Series(
                 self._finite_numeric_series(
                     window,
@@ -3182,6 +3206,8 @@ class BatteryBacktester:
                 "discharge_mw": "plan_discharge_mw",
                 "reserve_pos_mw": "plan_reserve_pos_mw",
                 "reserve_neg_mw": "plan_reserve_neg_mw",
+                "bem_only_pos_mw": "plan_bem_only_pos_mw",
+                "bem_only_neg_mw": "plan_bem_only_neg_mw",
                 "aFRR_Capacity_Won_MW": "plan_aFRR_Capacity_Won_MW",
             }
             legacy_cols = [c for c in snapshot_for_history.columns if c.startswith("planned_")]
@@ -3336,6 +3362,8 @@ class BatteryBacktester:
                 discharge_plan = float(getattr(r, "discharge_mw"))
                 reserve_pos_plan = float(getattr(r, "reserve_pos_mw"))
                 reserve_neg_plan = float(getattr(r, "reserve_neg_mw"))
+                bem_only_pos_plan = float(getattr(r, "bem_only_pos_mw", 0.0))
+                bem_only_neg_plan = float(getattr(r, "bem_only_neg_mw", 0.0))
 
                 if soc_feedback_mode == "realized":
                     da_price_plan = float(src[colmap.true_da_price])
@@ -3409,6 +3437,8 @@ class BatteryBacktester:
                     planned_discharge_mw=discharge_plan,
                     planned_reserve_pos_mw=reserve_pos_plan,
                     planned_reserve_neg_mw=reserve_neg_plan,
+                    planned_bem_only_pos_mw=bem_only_pos_plan,
+                    planned_bem_only_neg_mw=bem_only_neg_plan,
                     # Never default DA prediction to 0.0 for bid pricing.
                     # Use the already-selected planning-side DA forecast instead.
                     pred_da_price=float(da_price_plan),
@@ -3544,6 +3574,8 @@ class BatteryBacktester:
                 "discharge_mw": "plan_discharge_mw",
                 "reserve_pos_mw": "plan_reserve_pos_mw",
                 "reserve_neg_mw": "plan_reserve_neg_mw",
+                "bem_only_pos_mw": "plan_bem_only_pos_mw",
+                "bem_only_neg_mw": "plan_bem_only_neg_mw",
                 "aFRR_Capacity_Won_MW": "plan_aFRR_Capacity_Won_MW",
             }
             existing_targets = [v for v in dispatch_rename_dict.values() if v in take_for_output.columns]
@@ -3888,6 +3920,8 @@ class BatteryBacktester:
                         discharge=discharge,
                         reserve_pos=reserve_pos,
                         reserve_neg=reserve_neg,
+                        bem_only_pos=float(getattr(r, "plan_bem_only_pos_mw")) if hasattr(r, "plan_bem_only_pos_mw") else 0.0,
+                        bem_only_neg=float(getattr(r, "plan_bem_only_neg_mw")) if hasattr(r, "plan_bem_only_neg_mw") else 0.0,
                         soc=float(soc),
                     )
                     charge = float(out["charge"])
@@ -3968,6 +4002,7 @@ class BatteryBacktester:
                 or c.startswith("afrr_bin_")
                 or c.startswith("afrr_bcm_")
                 or c.startswith("afrr_bem_")
+                or c.startswith("bem_only_")
             ]
         )
         out.rename(
@@ -4096,6 +4131,8 @@ class BatteryBacktester:
         discharge: float,
         reserve_pos: float,
         reserve_neg: float,
+        bem_only_pos: float,
+        bem_only_neg: float,
         soc: float,
     ) -> dict[str, object]:
         """Re-run market-clearing for realized settlement when no precleared execution exists."""
@@ -4152,6 +4189,8 @@ class BatteryBacktester:
             planned_discharge_mw=discharge,
             planned_reserve_pos_mw=reserve_pos,
             planned_reserve_neg_mw=reserve_neg,
+            planned_bem_only_pos_mw=bem_only_pos,
+            planned_bem_only_neg_mw=bem_only_neg,
             pred_da_price=pred_da_price,
             pred_da_price_p05=pred_da_price_p05,
             pred_da_price_p10=pred_da_price_p10,
@@ -5087,12 +5126,8 @@ class BatteryBacktester:
             awarded_afrr_mw += float(hourly["real_executed_reserve_neg_mw"].sum())
         summary["afrr_capacity_award_rate"] = float(awarded_afrr_mw / submitted_afrr_mw) if submitted_afrr_mw > 1e-12 else float("nan")
         summary["total_missed_activation_mwh"] = float(hourly["real_missed_activation_mwh"].sum()) if "real_missed_activation_mwh" in hourly.columns else 0.0
-        summary["bem_only_mode"] = str(summary.get("bem_only_mode", "approx_reuse_reserve_volume"))
-        summary["bem_only_explicit_optimizer"] = 0.0
-        summary["bem_only_warning"] = (
-            "BEM-only is approximated by reusing submitted reserve volume when no BCM obligation is active; "
-            "no independent bem_only decision variables are optimized."
-        )
+        summary["bem_only_mode"] = "explicit_optimizer"
+        summary["bem_only_explicit_optimizer"] = 1.0
         bcm_col = "real_afrr_bcm_auction_cleared"
         if bcm_col in hourly.columns:
             bcm_mask = pd.to_numeric(hourly[bcm_col], errors="coerce").fillna(0.0) > 0.5

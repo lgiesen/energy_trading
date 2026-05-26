@@ -316,13 +316,12 @@ def test_physical_exclusivity_limit_in_optimizer() -> None:
     assert dis + rpos <= bt.p_max_mw + 1e-6
 
 
-def test_bem_only_mode_is_explicitly_approximate() -> None:
+def test_bem_only_mode_is_explicit_optimizer() -> None:
     bt = _mk_backtester()
     df, col = _tiny_backtest_df(hours=4)
     out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=2, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
-    assert out.summary.get("bem_only_mode") == "approx_reuse_reserve_volume"
-    assert float(out.summary.get("bem_only_explicit_optimizer", 1.0)) == 0.0
-    assert "approx" in str(out.summary.get("bem_only_warning", "")).lower()
+    assert out.summary.get("bem_only_mode") == "explicit_optimizer"
+    assert float(out.summary.get("bem_only_explicit_optimizer", 0.0)) == 1.0
 
 
 def test_oracle_parity_comparable_pnl_in_tiny_deterministic_case() -> None:
@@ -342,8 +341,10 @@ def test_bem_only_positive_activation_without_bcm_award_is_activation_revenue_on
         is_oracle=False,
         planned_charge_mw=0.0,
         planned_discharge_mw=0.0,
-        planned_reserve_pos_mw=3.0,
+        planned_reserve_pos_mw=0.0,
         planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=3.0,
+        planned_bem_only_neg_mw=0.0,
         pred_da_price=0.0,
         true_da_price=0.0,
         pred_cap_pos=999.0,
@@ -358,7 +359,7 @@ def test_bem_only_positive_activation_without_bcm_award_is_activation_revenue_on
         true_rate_neg=0.0,
         obligation_pos_mw=0.0,
         obligation_neg_mw=0.0,
-        planned_reserve_pos_bins_mw=[3.0] + [0.0] * (n_bins - 1),
+        planned_reserve_pos_bins_mw=[0.0] * n_bins,
         planned_reserve_neg_bins_mw=[0.0] * n_bins,
         pred_cap_pos_bins_eur_mw=[999.0] + [0.0] * (n_bins - 1),
         pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
@@ -397,7 +398,9 @@ def test_bem_only_negative_activation_sign_without_bcm_award() -> None:
         planned_charge_mw=0.0,
         planned_discharge_mw=0.0,
         planned_reserve_pos_mw=0.0,
-        planned_reserve_neg_mw=2.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=0.0,
+        planned_bem_only_neg_mw=2.0,
         pred_da_price=0.0,
         true_da_price=0.0,
         pred_cap_pos=0.0,
@@ -413,7 +416,7 @@ def test_bem_only_negative_activation_sign_without_bcm_award() -> None:
         obligation_pos_mw=0.0,
         obligation_neg_mw=0.0,
         planned_reserve_pos_bins_mw=[0.0] * n_bins,
-        planned_reserve_neg_bins_mw=[2.0] + [0.0] * (n_bins - 1),
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
         pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
         pred_cap_neg_bins_eur_mw=[999.0] + [0.0] * (n_bins - 1),
     )
@@ -460,3 +463,52 @@ def test_bem_only_summary_fields_present() -> None:
     ]
     for k in required:
         assert k in out.summary
+
+
+def test_bem_only_positive_dominance_optimizer_decision() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=-200.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos=300.0,
+        act_neg=-10.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("DA", "aFRR"))
+    assert "bem_only_pos_mw" in out.columns
+    assert float(out["bem_only_pos_mw"].iloc[0]) > 0.0
+
+
+def test_bem_only_negative_dominance_optimizer_decision() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=200.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos=0.0,
+        act_neg=-300.0,
+        rate_pos=0.0,
+        rate_neg=1.0,
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("DA", "aFRR"))
+    assert "bem_only_neg_mw" in out.columns
+    assert float(out["bem_only_neg_mw"].iloc[0]) > 0.0
+
+
+def test_bem_only_vs_da_exclusivity() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=500.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos=500.0,
+        act_neg=0.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("DA", "aFRR"))
+    dis = float(out["discharge_mw"].iloc[0])
+    bem = float(out["bem_only_pos_mw"].iloc[0])
+    assert dis + bem <= bt.p_max_mw + 1e-6
