@@ -37,6 +37,8 @@ from energy_trading.models.training_policy import (
 from energy_trading.evaluation.metrics import (
     compute_forecast_metrics,
     compute_gate_closure_metrics,
+    compute_horizon_bucket_metrics,
+    horizon_bucket_metrics_to_table,
     gate_hour_for_target,
 )
 from energy_trading.evaluation.lead_weighting import weighted_metric_from_decay
@@ -48,6 +50,7 @@ from energy_trading.evaluation.conformal_calibration import (
     apply_conformal_shifts,
     calculate_conformal_shifts,
 )
+from energy_trading.models.horizon_weighting import get_training_weights
 
 
 CALENDAR_FEATURES = {
@@ -717,6 +720,12 @@ def _train_tft(
     # Ensure canonical UTC timestamp column for downstream usage.
     if ts_col != "timestamp_utc":
         full_sc["timestamp_utc"] = full_sc[ts_col]
+    full_sc["decoder_local_hour"] = (
+        pd.to_datetime(full_sc["timestamp_utc"], utc=True, errors="coerce")
+        .dt.tz_convert("Europe/Berlin")
+        .dt.hour
+        .astype(float)
+    )
 
     # Time-series integrity checks on timestamp column.
     ts_full = pd.to_datetime(full_sc["timestamp_utc"], utc=True, errors="coerce")
@@ -763,7 +772,7 @@ def _train_tft(
         max_encoder_length=max_encoder_length,
         min_encoder_length=max_encoder_length,
         max_prediction_length=max_prediction_length,
-        time_varying_known_reals=["time_idx", *known_reals],
+        time_varying_known_reals=["time_idx", "decoder_local_hour", *known_reals],
         time_varying_known_categoricals=known_categoricals,
         time_varying_unknown_reals=[tgt, *unknown_reals],
         target_normalizer=EncoderNormalizer(method="robust", center=True),
@@ -924,7 +933,169 @@ def _train_tft(
         logger=tb_logger,
     )
 
-    tft = TemporalFusionTransformer.from_dataset(
+    class WeightedTemporalFusionTransformer(TemporalFusionTransformer):
+        """TFT with target-specific horizon weighting applied in model loss calculation."""
+
+        def __init__(self, *args, target_name: str, decoder_hour_feature: str, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self._weight_target_name = str(target_name)
+            self._decoder_hour_feature = str(decoder_hour_feature)
+            x_reals = list(getattr(self.hparams, "x_reals", []) or [])
+            self._decoder_hour_idx = int(x_reals.index(self._decoder_hour_feature)) if self._decoder_hour_feature in x_reals else -1
+            self._weighted_step_calls = 0
+
+        def _weighted_quantile_loss(self, x, prediction, y):
+            import torch
+
+            target_tensor = y[0] if isinstance(y, (tuple, list)) else y
+            try:
+                raw = self.loss.loss(prediction, target_tensor)
+            except Exception as exc:
+                raise RuntimeError(
+                    "WeightedTemporalFusionTransformer failed to compute raw quantile loss."
+                ) from exc
+            if raw is None or raw.ndim != 3:
+                raise RuntimeError(
+                    "Expected raw quantile loss shape [B, T, Q] for TFT weighting, "
+                    f"got {None if raw is None else tuple(raw.shape)}."
+                )
+
+            if self._decoder_hour_idx < 0:
+                raise RuntimeError(
+                    f"decoder hour feature '{self._decoder_hour_feature}' not found in x_reals; "
+                    "cannot apply dynamic horizon weighting."
+                )
+            dec_cont = x.get("decoder_cont")
+            if dec_cont is None or dec_cont.ndim != 3 or self._decoder_hour_idx >= int(dec_cont.size(-1)):
+                raise RuntimeError(
+                    "decoder_cont missing/incompatible for dynamic horizon weighting "
+                    f"(shape={None if dec_cont is None else tuple(dec_cont.shape)}, "
+                    f"decoder_hour_idx={self._decoder_hour_idx})."
+                )
+
+            lead1_hour = dec_cont[:, 0, self._decoder_hour_idx]
+            current_hour = torch.remainder(torch.floor(lead1_hour) - 1.0, 24.0)
+            ch_np = current_hour.detach().to("cpu").numpy().astype(int)
+            pred_len = int(raw.size(1))
+            w_np = get_training_weights(
+                target_name=self._weight_target_name,
+                current_hour=ch_np,
+                horizon=pred_len,
+            ).astype(np.float32)
+            w = torch.as_tensor(w_np, device=raw.device, dtype=raw.dtype).unsqueeze(-1)
+            # TFT shares parameters across horizons and creation hours: apply raw semantic weights
+            # before fixed-mean reduction so non-actionable windows contribute smaller gradients.
+            return (raw * w).mean()
+
+        def step(self, x, y, batch_idx, **kwargs):
+            # Keep base TFT step structure, but replace scalar loss computation with weighted raw quantile loss.
+            from torch.nn.utils import rnn
+            from pytorch_forecasting.metrics import MASE, MultiLoss
+            from pytorch_forecasting.utils import detach, to_list
+            import torch
+
+            if (x["decoder_lengths"] < x["decoder_lengths"].max()).any():
+                if isinstance(y[0], list | tuple):
+                    y = (
+                        [
+                            rnn.pack_padded_sequence(
+                                y_part,
+                                lengths=x["decoder_lengths"].cpu(),
+                                batch_first=True,
+                                enforce_sorted=False,
+                            )
+                            for y_part in y[0]
+                        ],
+                        y[1],
+                    )
+                else:
+                    y = (
+                        rnn.pack_padded_sequence(
+                            y[0],
+                            lengths=x["decoder_lengths"].cpu(),
+                            batch_first=True,
+                            enforce_sorted=False,
+                        ),
+                        y[1],
+                    )
+
+            if self.training and len(self.hparams.monotone_constraints) > 0:
+                x["decoder_cont"].requires_grad_(True)
+                assert not torch._C._get_cudnn_enabled(), (
+                    "To use monotone constraints, wrap model and training in context "
+                    "`torch.backends.cudnn.flags(enable=False)`"
+                )
+                out = self(x, **kwargs)
+                prediction = out["prediction"]
+                prediction_list = to_list(prediction)
+                gradient = 0
+                for pred in prediction_list:
+                    gradient = (
+                        gradient
+                        + torch.autograd.grad(
+                            outputs=pred,
+                            inputs=x["decoder_cont"],
+                            grad_outputs=torch.ones_like(pred),
+                            create_graph=True,
+                            allow_unused=True,
+                        )[0]
+                    )
+
+                indices = torch.tensor(
+                    [
+                        self.hparams.x_reals.index(name)
+                        for name in self.hparams.monotone_constraints.keys()
+                    ]
+                )
+                monotonicity = torch.tensor(
+                    list(self.hparams.monotone_constraints.values()),
+                    dtype=gradient.dtype,
+                    device=gradient.device,
+                )
+                gradient = gradient[..., indices] * monotonicity[None, None]
+                monotinicity_loss = gradient.clamp_max(0).mean()
+                monotinicity_loss = 10 * torch.pow(monotinicity_loss, 2)
+                if not self.predicting:
+                    if isinstance(self.loss, MASE | MultiLoss):
+                        raise RuntimeError(
+                            "WeightedTemporalFusionTransformer currently supports quantile-style losses only, "
+                            "not MASE/MultiLoss with monotone constraints."
+                        )
+                    loss = self._weighted_quantile_loss(x=x, prediction=prediction, y=y)
+                    loss = loss * (1 + monotinicity_loss)
+                    self._weighted_step_calls += 1
+                else:
+                    loss = None
+            else:
+                out = self(x, **kwargs)
+                prediction = out["prediction"]
+                if not self.predicting:
+                    if isinstance(self.loss, MASE | MultiLoss):
+                        raise RuntimeError(
+                            "WeightedTemporalFusionTransformer currently supports quantile-style losses only, "
+                            "not MASE/MultiLoss."
+                        )
+                    loss = self._weighted_quantile_loss(x=x, prediction=prediction, y=y)
+                    self._weighted_step_calls += 1
+                else:
+                    loss = None
+
+            if loss is not None and loss.device.type == "mps":
+                loss.requires_grad_(True)
+            self.log(
+                f"{self.current_stage}_loss",
+                detach(loss),
+                on_step=self.training,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=len(x["decoder_target"]),
+            )
+            if self._weighted_step_calls <= 3:
+                LOGGER.debug("[TFT_WEIGHTED_STEP] calls=%s stage=%s", self._weighted_step_calls, self.current_stage)
+            log = {"loss": loss, "n_samples": x["decoder_lengths"].size(0)}
+            return log, out
+
+    tft = WeightedTemporalFusionTransformer.from_dataset(
         training,
         learning_rate=float(learning_rate),
         hidden_size=hidden_size,
@@ -934,6 +1105,8 @@ def _train_tft(
         loss=QuantileLoss(quantiles=QUANTILES),
         output_size=len(QUANTILES),
         reduce_on_plateau_patience=3,
+        target_name=tgt,
+        decoder_hour_feature="decoder_local_hour",
     )
 
     tft.to(torch_device)
@@ -949,7 +1122,11 @@ def _train_tft(
             "Cannot continue without explicit best-weight restoration."
         )
     shutil.copy2(best_model_path, model_path)
-    tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+    tft = WeightedTemporalFusionTransformer.load_from_checkpoint(
+        best_model_path,
+        target_name=tgt,
+        decoder_hour_feature="decoder_local_hour",
+    )
     tft.to(torch_device)
 
     if cleanup_lightning_checkpoints:
@@ -1136,6 +1313,31 @@ def _train_tft(
             timezone="Europe/Berlin",
         )
 
+    val_horizon_bucket = compute_horizon_bucket_metrics(
+        pred_val_long,
+        val_df[["timestamp_utc", tgt]].copy(),
+        target_col=tgt,
+        y_pred_col="p50" if "p50" in pred_val_long.columns else "predicted_value",
+        quantile_cols=[c for c in pred_val_long.columns if c.startswith("p") and c[1:].isdigit()],
+        timezone="Europe/Berlin",
+        max_horizon=int(max_prediction_length),
+    )
+    test_horizon_bucket = compute_horizon_bucket_metrics(
+        pred_test_long,
+        test_df[["timestamp_utc", tgt]].copy(),
+        target_col=tgt,
+        y_pred_col="p50" if "p50" in pred_test_long.columns else "predicted_value",
+        quantile_cols=[c for c in pred_test_long.columns if c.startswith("p") and c[1:].isdigit()],
+        timezone="Europe/Berlin",
+        max_horizon=int(max_prediction_length),
+    )
+    horizon_bucket_metrics_to_table(
+        val_horizon_bucket, split="val", target_col=tgt
+    ).to_csv(report_dir / f"{bundle}_{tgt}_val_horizon_bucket_metrics.csv", index=False)
+    horizon_bucket_metrics_to_table(
+        test_horizon_bucket, split="test", target_col=tgt
+    ).to_csv(report_dir / f"{bundle}_{tgt}_test_horizon_bucket_metrics.csv", index=False)
+
     decay_val = _leadtime_mae(pred_val_long, true_h1=y_val_true, horizon_hours=max_prediction_length)
     decay_test = _leadtime_mae(pred_test_long, true_h1=y_test_true, horizon_hours=max_prediction_length)
     decay_val_path = report_dir / f"{bundle}_{tgt}_val_forecast_decay.csv"
@@ -1248,6 +1450,8 @@ def _train_tft(
         "leadtime_rmse_test_h_last": rmse_test_h_last,
         "leadtime_mae_val_weighted": mae_val_weighted,
         "leadtime_mae_test_weighted": mae_test_weighted,
+        "decision_weighted_mae_val": mae_val_weighted,
+        "decision_weighted_mae_test": mae_test_weighted,
         "leadtime_rmse_val_weighted": rmse_val_weighted,
         "leadtime_rmse_test_weighted": rmse_test_weighted,
         "leadtime_weighting": {
@@ -1326,6 +1530,10 @@ def _train_tft(
         "timing_export_seconds": float(export_seconds),
         "timing_total_seconds": float(total_seconds),
     }
+    for k, v in val_horizon_bucket.items():
+        metrics[f"val_horizon_bucket_{k}"] = v
+    for k, v in test_horizon_bucket.items():
+        metrics[f"test_horizon_bucket_{k}"] = v
     # Export all probabilistic metrics present in H1 suites (all available quantiles + intervals).
     for k, v in val_metric_suite_h1.items():
         if (
@@ -1350,6 +1558,10 @@ def _train_tft(
         ):
             metrics[f"{k}_test_h1"] = v
     metrics.update(lead_pinball_weighted)
+    for k, v in list(lead_pinball_weighted.items()):
+        if k.startswith("leadtime_pinball_"):
+            alias = k.removeprefix("leadtime_").replace("_weighted", "")
+            metrics[f"decision_weighted_{alias}"] = v
     return metrics
 
 

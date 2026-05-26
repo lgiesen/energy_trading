@@ -30,6 +30,8 @@ if str(SRC_DIR) not in sys.path:
 from energy_trading.evaluation.metrics import (  # noqa: E402
     compute_forecast_metrics,
     compute_gate_closure_metrics,
+    compute_horizon_bucket_metrics,
+    horizon_bucket_metrics_to_table,
     gate_hour_for_target,
 )
 from energy_trading.evaluation.lead_weighting import weighted_metric_from_decay  # noqa: E402
@@ -44,6 +46,7 @@ from energy_trading.evaluation.conformal_calibration import (  # noqa: E402
 )
 from energy_trading.models.prepare_ml_bundles import load_processed_data  # noqa: E402
 from energy_trading.models.torch_linear_quantiles import TorchMultiQuantileLinearRegressor  # noqa: E402
+from energy_trading.models.horizon_weighting import get_lead_sample_weights  # noqa: E402
 
 BundleName = Literal["da", "afrr"]
 LOGGER = logging.getLogger(__name__)
@@ -136,6 +139,27 @@ def _write_bundle_manifest_fragment(
 
 def _qcol(q: float) -> str:
     return f"p{int(round(q * 100)):02d}"
+
+
+def _log_weight_audit(*, backend: str, target: str, lead: int, weights: np.ndarray) -> None:
+    arr = np.asarray(weights, dtype=float).reshape(-1)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        raise ValueError(
+            f"Non-finite training weights for backend={backend} target={target} lead={lead}"
+        )
+    LOGGER.info(
+        "[WEIGHT_AUDIT][%s] target=%s lead=%s n=%s min=%.6f p50=%.6f p95=%.6f mean=%.6f max=%.6f",
+        backend,
+        target,
+        lead,
+        int(arr.shape[0]),
+        float(np.min(finite)),
+        float(np.percentile(finite, 50.0)),
+        float(np.percentile(finite, 95.0)),
+        float(np.mean(finite)),
+        float(np.max(finite)),
+    )
 
 
 def _build_linear_pipeline(
@@ -351,7 +375,25 @@ def _train_target(
         preds_va: dict[str, np.ndarray] = {}
         preds_te: dict[str, np.ndarray] = {}
         fit_t0 = time.perf_counter()
+        tr_hours = (
+            train_ts.loc[tr_mask]
+            .dt.tz_convert("Europe/Berlin")
+            .dt.hour
+            .to_numpy(dtype=int)
+        )
+        tr_weights = get_lead_sample_weights(
+            target_name=target_col,
+            current_hour=tr_hours,
+            lead_time_h=int(lead_h),
+        )
+
         if str(backend).lower() == "sklearn":
+            _log_weight_audit(
+                backend="SKLEARN_LINEAR",
+                target=target_col,
+                lead=int(lead_h),
+                weights=tr_weights,
+            )
             for q in QUANTILES:
                 qcol = _qcol(q)
                 pipe = _build_linear_pipeline(
@@ -362,7 +404,13 @@ def _train_target(
                     eta0=eta0,
                     seed=seed,
                 )
-                pipe.fit(X_tr, y_tr)
+                try:
+                    pipe.fit(X_tr, y_tr, model__sample_weight=tr_weights)
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "sklearn linear backend does not support sample_weight for this estimator/version; "
+                        "horizon weighting cannot be applied safely."
+                    ) from exc
                 q_models[qcol] = pipe
                 preds_va[qcol] = pipe.predict(X_va)
                 preds_te[qcol] = pipe.predict(X_te)
@@ -378,7 +426,13 @@ def _train_target(
                 epochs=1000,
                 batch_size=1024,
             )
-            torch_model.fit(xtr, y_tr.to_numpy(dtype=float))
+            _log_weight_audit(
+                backend="TORCH_LINEAR",
+                target=target_col,
+                lead=int(lead_h),
+                weights=tr_weights,
+            )
+            torch_model.fit(xtr, y_tr.to_numpy(dtype=float), sample_weights=tr_weights)
             va_pred_all = torch_model.predict(xva)
             te_pred_all = torch_model.predict(xte)
             for i, q in enumerate(QUANTILES):
@@ -598,6 +652,24 @@ def _train_target(
         y_true_col="y_true",
         y_pred_col="y_pred",
     )
+    val_horizon_bucket = compute_horizon_bucket_metrics(
+        long_frames["val"],
+        pd.DataFrame({"timestamp_utc": val_ts, target_col: y_val_all.to_numpy(dtype=float)}),
+        target_col=target_col,
+        y_pred_col="p50" if "p50" in long_frames["val"].columns else "predicted_value",
+        quantile_cols=[c for c in [_qcol(q) for q in QUANTILES] if c in long_frames["val"].columns],
+        timezone="Europe/Berlin",
+        max_horizon=int(forecast_horizon_hours),
+    )
+    test_horizon_bucket = compute_horizon_bucket_metrics(
+        long_frames["test"],
+        pd.DataFrame({"timestamp_utc": test_ts, target_col: y_test_all.to_numpy(dtype=float)}),
+        target_col=target_col,
+        y_pred_col="p50" if "p50" in long_frames["test"].columns else "predicted_value",
+        quantile_cols=[c for c in [_qcol(q) for q in QUANTILES] if c in long_frames["test"].columns],
+        timezone="Europe/Berlin",
+        max_horizon=int(forecast_horizon_hours),
+    )
 
     gate_hour = gate_hour_for_target(target_col)
     val_gate: dict[str, object] = {}
@@ -699,6 +771,8 @@ def _train_target(
         "leadtime_mae_test_h_last": lead_mae_test_last,
         "leadtime_mae_val_weighted": lead_mae_val_weighted,
         "leadtime_mae_test_weighted": lead_mae_test_weighted,
+        "decision_weighted_mae_val": lead_mae_val_weighted,
+        "decision_weighted_mae_test": lead_mae_test_weighted,
         "leadtime_weighting": {
             "start_lead_h": int(lead_weight_start),
             "end_lead_h": int(lead_weight_end),
@@ -728,6 +802,10 @@ def _train_target(
         "timing_fit_seconds_total": fit_seconds_total,
         "trained_leads": sorted(int(k) for k in lead_models.keys()),
     }
+    for k, v in val_horizon_bucket.items():
+        metrics[f"val_horizon_bucket_{k}"] = v
+    for k, v in test_horizon_bucket.items():
+        metrics[f"test_horizon_bucket_{k}"] = v
     # Export all probabilistic metrics available in H1 suites (all quantiles + interval pairs).
     for k, v in val_metric_suite.items():
         if (
@@ -752,6 +830,9 @@ def _train_target(
         ):
             metrics[f"{k}_test_h1"] = v
     metrics.update(lead_pinball_weighted)
+    for k, v in list(lead_pinball_weighted.items()):
+        if k.startswith("leadtime_pinball_"):
+            metrics[f"decision_weighted_{k.removeprefix('leadtime_')}"] = v
     return lead_models, metrics, pred_frames, long_frames
 
 
@@ -905,6 +986,15 @@ def main() -> None:
         "gate_acceptance_rate_test": (metrics.get("gate_closure_metrics_test") or {}).get("acceptance_rate_gate"),
     }
     pd.DataFrame([flat_row]).to_csv(metrics_csv_path, index=False)
+
+    val_hb = {k.removeprefix("val_horizon_bucket_"): v for k, v in metrics.items() if k.startswith("val_horizon_bucket_")}
+    test_hb = {k.removeprefix("test_horizon_bucket_"): v for k, v in metrics.items() if k.startswith("test_horizon_bucket_")}
+    hb_val_df = horizon_bucket_metrics_to_table(val_hb, split="val", target_col=tgt) if val_hb else pd.DataFrame()
+    hb_test_df = horizon_bucket_metrics_to_table(test_hb, split="test", target_col=tgt) if test_hb else pd.DataFrame()
+    if not hb_val_df.empty:
+        hb_val_df.to_csv(report_dir / f"{args.bundle}_{tgt}_val_horizon_bucket_metrics.csv", index=False)
+    if not hb_test_df.empty:
+        hb_test_df.to_csv(report_dir / f"{args.bundle}_{tgt}_test_horizon_bucket_metrics.csv", index=False)
 
     fragment = _write_bundle_manifest_fragment(
         bundle=args.bundle,

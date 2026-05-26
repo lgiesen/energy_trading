@@ -2065,7 +2065,7 @@ class BatteryBacktester:
             bin_payload[f"executed_afrr_act_pos_bin_{b}_price_eur_mwh"] = 0.0
             bin_payload[f"executed_afrr_act_neg_bin_{b}_price_eur_mwh"] = 0.0
         if ob_pos > 0.0 or ob_neg > 0.0:
-            # Capacity already auctioned at D-1 09:00 CET: use mandatory obligation.
+            # Capacity already auctioned at configured gate hour: use mandatory obligation.
             cap_bids = []
             if ob_pos > 0.0:
                 cap_bids.append(
@@ -2378,8 +2378,11 @@ class BatteryBacktester:
         lock_energy_neg: dict[pd.Timestamp, float],
         is_oracle: bool = False,
     ) -> dict[str, float]:
-        # Gate closure for aFRR capacity auction: D-1 09:00 CET.
-        if not self._is_gate_hour_cet(snapshot_ts, 9):
+        # Gate closure for aFRR capacity auction:
+        # - model path: D-1 08:00 CET
+        # - oracle path: D-1 09:00 CET
+        afrr_gate_hour_cet = 9 if is_oracle else 8
+        if not self._is_gate_hour_cet(snapshot_ts, afrr_gate_hour_cet):
             return {"triggered": 0.0, "rejected_mw_total": 0.0}
         if snapshot_plan.empty:
             return {"triggered": 0.0, "rejected_mw_total": 0.0}
@@ -3069,7 +3072,10 @@ class BatteryBacktester:
             snapshot_plan["optimizer_fallback_used"] = float(optimization_fallback != "none")
             snapshot_plan["optimization_error"] = optimization_error
             snapshot_ts_current = pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True, errors="coerce")
-            is_afrr_gate_now = bool(afrr_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, 9))
+            afrr_gate_hour_cet = 9 if is_oracle else 8
+            is_afrr_gate_now = bool(
+                afrr_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, afrr_gate_hour_cet)
+            )
             is_da_gate_now = bool(da_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, da_gate_hour_cet))
             if is_afrr_gate_now and is_da_gate_now:
                 snapshot_plan["milp_event_type"] = "afrr_capacity_gate+da_gate"
@@ -3096,7 +3102,7 @@ class BatteryBacktester:
             snapshot_for_history.rename(columns=history_rename_dict, inplace=True)
             plan_history.append(snapshot_for_history)
 
-            # Phase 1 (D-1 09:00 CET): clear aFRR capacity in 4h blocks and
+            # Phase 1 (D-1 configured aFRR gate hour): clear aFRR capacity in 4h blocks and
             # propagate awarded obligations to delivery intervals.
             if afrr_enabled:
                 cap_gate_stats = self._update_afrr_capacity_lockbooks_from_snapshot(

@@ -41,6 +41,8 @@ from energy_trading.models.training_policy import (
 from energy_trading.evaluation.metrics import (
     compute_forecast_metrics,
     compute_gate_closure_metrics,
+    compute_horizon_bucket_metrics,
+    horizon_bucket_metrics_to_table,
     gate_hour_for_target,
 )
 from energy_trading.evaluation.lead_weighting import weighted_metric_from_decay
@@ -52,6 +54,7 @@ from energy_trading.evaluation.conformal_calibration import (
     apply_conformal_shifts,
     calculate_conformal_shifts,
 )
+from energy_trading.models.horizon_weighting import get_lead_sample_weights
 
 QUANTILES: list[float] = [0.01, 0.05, 0.10, 0.30, 0.50, 0.70, 0.90, 0.95, 0.99]
 LOGGER = logging.getLogger(__name__)
@@ -788,6 +791,13 @@ def train_and_evaluate(
     )
     target_cols = _resolve_targets(bundle, list(y_train_df.columns), target_col)
     primary_target = target_cols[0]
+    cfg = json.loads((base_dir / "feature_config.json").read_text(encoding="utf-8"))
+    bcfg = cfg["bundles"][bundle]
+    train_ts_full = pd.to_datetime(
+        pd.read_parquet(Path(bcfg["files"]["train"]), columns=["timestamp_utc"])["timestamp_utc"],
+        utc=True,
+        errors="coerce",
+    )
 
     # Train on rows where all selected targets are available.
     train_mask = y_train_df[target_cols].notna().all(axis=1)
@@ -796,6 +806,12 @@ def train_and_evaluate(
     X_val = X_val_df.loc[val_mask].copy()
     y_train_m = y_train_df.loc[train_mask, target_cols].copy()
     y_val_m = y_val_df.loc[val_mask, target_cols].copy()
+    train_hours_all = (
+        train_ts_full.loc[train_mask]
+        .dt.tz_convert("Europe/Berlin")
+        .dt.hour
+        .to_numpy(dtype=int)
+    )
 
     X_train = _add_dynamics_features(X_train, prune_midterm_lags=True)
     X_val = _add_dynamics_features(X_val, prune_midterm_lags=True)
@@ -941,10 +957,54 @@ def train_and_evaluate(
                     early_stopping_rounds=max(0, int(target_policy["early_stopping_rounds"])),
                     n_jobs=-1,
                 )
+                # Build training weights explicitly before fit call.
+                # Note: this path uses sklearn XGBRegressor API (not xgb.train),
+                # so weights are passed via fit(..., sample_weight=...).
+                sample_weight_h = (
+                    _tail_sample_weights(y_tr_model)
+                    * get_lead_sample_weights(
+                        target_name=tgt,
+                        current_hour=train_hours_all[tr_mask.to_numpy(dtype=bool)],
+                        lead_time_h=int(lead),
+                    )
+                )
+                w_mean = float(np.nanmean(sample_weight_h))
+                if not np.isfinite(w_mean) or abs(w_mean) <= 1e-12:
+                    raise ValueError(
+                        f"Invalid mean sample weight for target='{tgt}' lead={lead}: {w_mean}"
+                    )
+                sample_weight_h = sample_weight_h / w_mean
+                finite_w = sample_weight_h[np.isfinite(sample_weight_h)]
+                if finite_w.size == 0:
+                    raise ValueError(
+                        f"Non-finite sample weights for target='{tgt}' lead={lead}."
+                    )
+                p50_w = float(np.percentile(finite_w, 50.0))
+                p95_w = float(np.percentile(finite_w, 95.0))
+                LOGGER.info(
+                    "[WEIGHT_AUDIT][XGB] target=%s lead=%s n=%s min=%.6f p50=%.6f p95=%.6f mean=%.6f max=%.6f",
+                    tgt,
+                    lead,
+                    int(sample_weight_h.shape[0]),
+                    float(np.min(finite_w)),
+                    p50_w,
+                    p95_w,
+                    float(np.mean(finite_w)),
+                    float(np.max(finite_w)),
+                )
+                if ("afrr_activation_price_" in str(tgt).lower()) or (
+                    "afrr_activation_rate_" in str(tgt).lower()
+                ):
+                    LOGGER.info(
+                        "[WEIGHT_NOTE][XGB] target=%s lead=%s uses one direct-per-lead model; "
+                        "horizon-decay becomes a lead-constant scaling and is neutralized by mean-normalization.",
+                        tgt,
+                        lead,
+                    )
                 model.fit(
                     X_tr_h,
                     y_tr_model,
-                    sample_weight=_tail_sample_weights(y_tr_model),
+                    sample_weight=sample_weight_h,
                     eval_set=[(X_tr_h, y_tr_model), (X_va_h, y_va_model)],
                     verbose=False,
                 )
@@ -1761,6 +1821,21 @@ def main() -> None:
                                 timezone="Europe/Berlin",
                             )
                             gate_closure_metrics_by_split.setdefault(split, {})[pred_col] = gate_metrics
+                        if tgt_for_pred in split_df.columns:
+                            hb = compute_horizon_bucket_metrics(
+                                long_df,
+                                split_df[["timestamp_utc", tgt_for_pred]].copy(),
+                                target_col=tgt_for_pred,
+                                y_pred_col="p50" if "p50" in long_df.columns else "predicted_value",
+                                quantile_cols=[c for c in long_df.columns if c.startswith("p") and c[1:].isdigit()],
+                                timezone="Europe/Berlin",
+                                max_horizon=int(args.forecast_horizon_hours),
+                            )
+                            for hk, hv in hb.items():
+                                metrics[f"{split}_horizon_bucket_{pred_col}_{hk}"] = hv
+                            hb_df = horizon_bucket_metrics_to_table(hb, split=split, target_col=tgt_for_pred)
+                            hb_csv = report_dir / f"{args.bundle}_{tgt_for_pred}_{split}_horizon_bucket_metrics.csv"
+                            hb_df.to_csv(hb_csv, index=False)
                 long_export_seconds_by_split[split] = float(time.perf_counter() - long_split_start)
 
     fragment = _write_bundle_manifest_fragment(
@@ -1795,16 +1870,20 @@ def main() -> None:
     metrics["leadtime_mae_test_weighted"] = (
         leadtime_weighted_by_split.get("test", {}).get(primary_pred_col, {}).get("mae_weighted")
     )
+    metrics["decision_weighted_mae_val"] = metrics.get("leadtime_mae_val_weighted")
+    metrics["decision_weighted_mae_test"] = metrics.get("leadtime_mae_test_weighted")
     val_weighted = leadtime_weighted_by_split.get("val", {}).get(primary_pred_col, {})
     test_weighted = leadtime_weighted_by_split.get("test", {}).get(primary_pred_col, {})
     for key, value in val_weighted.items():
         if key.startswith("pinball_p") and key.endswith("_weighted"):
             qcol = key.removeprefix("pinball_").removesuffix("_weighted")
             metrics[f"leadtime_pinball_{qcol}_val_weighted"] = value
+            metrics[f"decision_weighted_pinball_{qcol}_val"] = value
     for key, value in test_weighted.items():
         if key.startswith("pinball_p") and key.endswith("_weighted"):
             qcol = key.removeprefix("pinball_").removesuffix("_weighted")
             metrics[f"leadtime_pinball_{qcol}_test_weighted"] = value
+            metrics[f"decision_weighted_pinball_{qcol}_test"] = value
     metrics["gate_closure_metrics_by_split"] = gate_closure_metrics_by_split
     metrics["timing_total_seconds"] = float(total_elapsed)
     # Export early-stopping diagnostics per target/lead/quantile for QA.

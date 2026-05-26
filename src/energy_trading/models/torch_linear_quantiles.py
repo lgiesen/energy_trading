@@ -63,13 +63,23 @@ class TorchMultiQuantileLinearRegressor(BaseEstimator, RegressorMixin):
         return X_np, y_np
 
     @staticmethod
-    def _pinball_loss(y_true: torch.Tensor, y_pred: torch.Tensor, quantiles: torch.Tensor) -> torch.Tensor:
+    def _pinball_loss(
+        y_true: torch.Tensor,
+        y_pred: torch.Tensor,
+        quantiles: torch.Tensor,
+        sample_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # y_true: [B], y_pred: [B, Q], quantiles: [Q]
         err = y_true.unsqueeze(1) - y_pred
         loss = torch.maximum(quantiles * err, (quantiles - 1.0) * err)
+        if sample_weights is not None:
+            # True weighted mean over all quantile/sample terms.
+            w = sample_weights.unsqueeze(1).expand_as(loss)
+            denom = w.sum().clamp_min(1e-12)
+            return (loss * w).sum() / denom
         return loss.mean()
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weights=None):
         X_np, y_np = self._validate_and_prepare(X, y)
 
         q = np.asarray(self.quantiles, dtype=np.float32)
@@ -88,6 +98,24 @@ class TorchMultiQuantileLinearRegressor(BaseEstimator, RegressorMixin):
         X_t = torch.from_numpy(X_np).to(self.device_)
         y_t = torch.from_numpy(y_np).to(self.device_)
         q_t = torch.from_numpy(q).to(self.device_)
+        w_t = None
+        if sample_weights is not None:
+            w_np = np.asarray(sample_weights, dtype=np.float32).reshape(-1)
+            if w_np.shape[0] != X_np.shape[0]:
+                raise ValueError(
+                    f"sample_weights length mismatch: got {w_np.shape[0]} expected {X_np.shape[0]}"
+                )
+            finite_w = w_np[np.isfinite(w_np)]
+            if finite_w.size == 0:
+                raise ValueError("sample_weights contains no finite values.")
+            print(
+                "[WEIGHT_AUDIT][TorchLinear] "
+                f"n={w_np.shape[0]} min={float(np.min(finite_w)):.6f} "
+                f"p50={float(np.percentile(finite_w, 50.0)):.6f} "
+                f"p95={float(np.percentile(finite_w, 95.0)):.6f} "
+                f"mean={float(np.mean(finite_w)):.6f} max={float(np.max(finite_w)):.6f}"
+            )
+            w_t = torch.from_numpy(w_np).to(self.device_)
 
         n = X_t.shape[0]
         if self.batch_size is None or self.batch_size <= 0 or self.batch_size >= n:
@@ -102,9 +130,10 @@ class TorchMultiQuantileLinearRegressor(BaseEstimator, RegressorMixin):
                 idx = perm[i : i + batch_size]
                 xb = X_t[idx]
                 yb = y_t[idx]
+                wb = w_t[idx] if w_t is not None else None
                 optimizer.zero_grad(set_to_none=True)
                 pred = self.model_(xb)
-                loss = self._pinball_loss(yb, pred, q_t)
+                loss = self._pinball_loss(yb, pred, q_t, sample_weights=wb)
                 loss.backward()
                 optimizer.step()
         return self
@@ -133,4 +162,3 @@ class TorchMultiQuantileLinearRegressor(BaseEstimator, RegressorMixin):
         w = self.model_.weight.detach().cpu().numpy().copy()
         b = self.model_.bias.detach().cpu().numpy().copy()
         return w, b
-

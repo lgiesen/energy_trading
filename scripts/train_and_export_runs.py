@@ -736,7 +736,7 @@ def main() -> None:
         afrr_base_dir = args.stacked_base_dir
 
     if args.model_type == "xgboost":
-        model_name = args.model_name.strip() or "xgboost_v1"
+        model_name = args.model_name.strip() or default_model_names["xgboost"]
         base_cmd = [
             sys.executable,
             "-m",
@@ -781,7 +781,7 @@ def main() -> None:
         if args.allow_cpu:
             base_cmd.append("--allow-cpu")
     elif args.model_type == "tft":
-        model_name = args.model_name.strip() or "tft_v1"
+        model_name = args.model_name.strip() or default_model_names["tft"]
         tft_max_encoder_length = int(args.tft_max_encoder_length) if args.tft_max_encoder_length is not None else 168
         base_cmd = [
             sys.executable,
@@ -827,13 +827,15 @@ def main() -> None:
         if args.cleanup_lightning_checkpoints:
             base_cmd.append("--cleanup-lightning-checkpoints")
     else:
-        model_name = args.model_name.strip() or "linear_ridge_v1"
+        model_name = args.model_name.strip() or default_model_names["linear"]
         base_cmd = [
             sys.executable,
             "-m",
             "src.energy_trading.models.train_linear_export",
             "--model-name",
             model_name,
+            "--backend",
+            "torch",
             "--run-dir",
             str(run_dir),
             "--alpha",
@@ -1125,3 +1127,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Canonical model names by family (used unless explicitly overridden).
+    default_model_names = {
+        "linear": "linear_torch_quantile",
+        "xgboost": "xgb_quantile",
+        "tft": "tft_quantile",
+    }
