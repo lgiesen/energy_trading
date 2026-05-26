@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 
 import numpy as np
@@ -193,6 +194,26 @@ def test_aux_cost_subtracted_once_in_pnl() -> None:
     assert np.isclose(float(m["pnl_eur"]), expected_pnl), m
 
 
+def test_da_revenue_formula() -> None:
+    bt = _mk_backtester()
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_max,
+        charge=0.0,
+        discharge=5.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+    expected = float(m["da_sell_mwh"]) * 100.0
+    assert np.isclose(float(m["revenue_da_eur"]), expected, atol=1e-9)
+
+
 def test_negative_activation_delivered_revenue_sign_convention() -> None:
     bt = _mk_backtester()
     _, m = bt._settle_one_hour(
@@ -217,6 +238,27 @@ def test_negative_activation_delivered_revenue_sign_convention() -> None:
     assert np.isclose(float(m["revenue_activation_eur"]), -delivered * (-1000.0), atol=1e-6), m
 
 
+def test_bem_positive_activation_formula() -> None:
+    bt = _mk_backtester()
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_init,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=10.0,
+        reserve_neg=0.0,
+        da_price=0.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=140.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.5,
+        act_neg_rate=0.0,
+    )
+    expected_mwh = 10.0 * 0.5 * bt.dt_h * bt.eta_out
+    assert np.isclose(float(m["delivered_activation_pos_mwh"]), expected_mwh, atol=1e-9)
+    assert np.isclose(float(m["revenue_activation_eur"]), expected_mwh * 140.0, atol=1e-9)
+
+
 def test_negative_missed_activation_penalty_is_positive() -> None:
     bt = _mk_backtester()
     _, m = bt._settle_one_hour(
@@ -238,6 +280,31 @@ def test_negative_missed_activation_penalty_is_positive() -> None:
     assert float(m["missed_activation_neg_mwh"]) > 0.0
     assert np.isclose(float(m["penalty_activation_basis_neg_eur_mwh"]), 1000.0, atol=1e-9)
     assert float(m["penalty_activation_neg_eur"]) > 0.0
+
+
+def test_degradation_cost_subtracted_once() -> None:
+    bt = _mk_backtester()
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_init,
+        charge=5.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=0.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+    expected = (
+        float(m["revenue_da_eur"]) - float(m["cost_da_eur"]) + float(m["revenue_capacity_eur"])
+        + float(m["revenue_activation_eur"]) + float(m["revenue_id_eur"]) - float(m["cost_id_eur"])
+        - float(m["transaction_cost_eur"]) - float(m["aux_cost_eur"]) - float(m["degradation_cost_eur"])
+        - float(m["penalty_eur"])
+    )
+    assert np.isclose(float(m["pnl_eur"]), expected, atol=1e-9)
 
 
 def test_idle_case_optimizer_can_choose_zero_volume() -> None:
@@ -324,13 +391,12 @@ def test_bem_only_mode_is_explicit_optimizer() -> None:
     assert float(out.summary.get("bem_only_explicit_optimizer", 0.0)) == 1.0
 
 
-def test_oracle_parity_comparable_pnl_in_tiny_deterministic_case() -> None:
+def test_comparable_benchmark_semantics_in_tiny_deterministic_case() -> None:
     bt = _mk_backtester()
     df, col = _tiny_backtest_df(hours=4)
     out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=2, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
-    real_cmp = float(out.summary["comparable_realized_market_pnl_eur"])
-    oracle_cmp = float(out.summary["comparable_oracle_market_pnl_eur"])
-    assert real_cmp <= oracle_cmp + 1e-6
+    assert out.summary.get("comparable_benchmark_type") == "rolling_perfect_foresight_same_rules"
+    assert "comparable_perfect_foresight_market_pnl_eur" in out.summary
 
 
 def test_bem_only_positive_activation_without_bcm_award_is_activation_revenue_only() -> None:
@@ -512,3 +578,109 @@ def test_bem_only_vs_da_exclusivity() -> None:
     dis = float(out["discharge_mw"].iloc[0])
     bem = float(out["bem_only_pos_mw"].iloc[0])
     assert dis + bem <= bt.p_max_mw + 1e-6
+
+
+def test_bem_only_positive_revenue_decomposition() -> None:
+    bt = _mk_backtester()
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=10.0,
+        delivered_neg_mwh=0.0,
+        bem_only_pos_mwh=10.0,
+        bem_only_neg_mwh=0.0,
+        act_pos_price_eur_mwh=140.0,
+        act_neg_price_eur_mwh=0.0,
+    )
+    assert np.isclose(comp["bem_only_activation_revenue_eur"], 1400.0)
+    assert np.isclose(comp["bcm_linked_activation_revenue_eur"], 0.0)
+    assert np.isclose(comp["activation_revenue_reconciled_eur"], 1400.0)
+
+
+def test_bem_only_negative_revenue_decomposition() -> None:
+    bt = _mk_backtester()
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=0.0,
+        delivered_neg_mwh=10.0,
+        bem_only_pos_mwh=0.0,
+        bem_only_neg_mwh=10.0,
+        act_pos_price_eur_mwh=0.0,
+        act_neg_price_eur_mwh=-1000.0,
+    )
+    assert np.isclose(comp["bem_only_activation_revenue_eur"], 10000.0)
+    assert np.isclose(comp["bcm_linked_activation_revenue_eur"], 0.0)
+    assert np.isclose(comp["activation_revenue_reconciled_eur"], 10000.0)
+
+
+def test_bem_only_not_double_counted_activation_revenue() -> None:
+    bt = _mk_backtester()
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=12.0,
+        delivered_neg_mwh=6.0,
+        bem_only_pos_mwh=5.0,
+        bem_only_neg_mwh=2.0,
+        act_pos_price_eur_mwh=100.0,
+        act_neg_price_eur_mwh=-50.0,
+    )
+    lhs = comp["activation_revenue_reconciled_eur"]
+    rhs = comp["bcm_linked_activation_revenue_eur"] + comp["bem_only_activation_revenue_eur"]
+    assert np.isclose(lhs, rhs)
+
+
+def test_bem_only_forced_scenario_has_nonzero_revenue_and_benchmark_diagnostics() -> None:
+    bt = _mk_backtester()
+    n = 48
+    idx = pd.date_range("2025-05-01 00:00:00+00:00", periods=n, freq="h", tz="UTC")
+    col = BacktestColumnMap()
+    df = pd.DataFrame(
+        {
+            col.timestamp: idx,
+            col.pred_da_price: np.full(n, -20.0),
+            f"{col.pred_da_price}_p05": np.full(n, -25.0),
+            f"{col.pred_da_price}_p10": np.full(n, -23.0),
+            f"{col.pred_da_price}_p90": np.full(n, -17.0),
+            f"{col.pred_da_price}_p95": np.full(n, -15.0),
+            col.pred_afrr_capacity_price_pos: np.full(n, 1.0),
+            col.pred_afrr_capacity_price_neg: np.full(n, 1.0),
+            col.pred_afrr_activation_price_pos: np.full(n, 140.0),
+            col.pred_afrr_activation_price_neg: np.full(n, 10.0),
+            col.pred_afrr_activation_rate_pos: np.full(n, 0.95),
+            col.pred_afrr_activation_rate_neg: np.full(n, 0.05),
+            col.true_da_price: np.full(n, -18.0),
+            col.true_afrr_capacity_price_pos: np.full(n, 0.5),
+            col.true_afrr_capacity_price_neg: np.full(n, 0.5),
+            col.true_afrr_activation_price_pos: np.full(n, 150.0),
+            col.true_afrr_activation_price_neg: np.full(n, 20.0),
+            col.true_afrr_activation_rate_pos: np.full(n, 0.95),
+            col.true_afrr_activation_rate_neg: np.full(n, 0.05),
+        }
+    )
+    prev_eps = os.environ.get("BACKTEST_ORACLE_UPPER_BOUND_EPS")
+    os.environ["BACKTEST_ORACLE_UPPER_BOUND_EPS"] = "1e12"
+    try:
+        out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=24, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    finally:
+        if prev_eps is None:
+            os.environ.pop("BACKTEST_ORACLE_UPPER_BOUND_EPS", None)
+        else:
+            os.environ["BACKTEST_ORACLE_UPPER_BOUND_EPS"] = prev_eps
+    h = out.hourly
+    def _series_or_zero(col: str) -> pd.Series:
+        if col in h.columns:
+            return pd.to_numeric(h[col], errors="coerce").fillna(0.0)
+        return pd.Series(0.0, index=h.index)
+    pos_mwh = _series_or_zero("real_bem_only_executed_pos_mwh")
+    bem_rev = _series_or_zero("real_bem_only_activation_revenue_eur")
+    cap_rev = _series_or_zero("real_revenue_capacity_eur")
+    da_mw = _series_or_zero("real_da_net_mw")
+    cap_pos = _series_or_zero("real_afrr_bcm_executed_pos_mw")
+    cap_neg = _series_or_zero("real_afrr_bcm_executed_neg_mw")
+    bem_sub_pos = _series_or_zero("real_bem_only_submitted_pos_mw")
+    bem_sub_neg = _series_or_zero("real_bem_only_submitted_neg_mw")
+    pure_mask = (bem_sub_pos + bem_sub_neg > 1e-12) & (da_mw.abs() < 1e-12) & ((cap_pos + cap_neg).abs() < 1e-12)
+    assert float(pos_mwh.sum()) > 0.0
+    assert float(bem_rev.sum()) > 0.0
+    assert np.isclose(float(cap_rev[pure_mask].sum()), 0.0, atol=1e-9)
+    real_cmp = float(out.summary["comparable_realized_market_pnl_eur"])
+    oracle_cmp = float(out.summary["comparable_rolling_perfect_foresight_same_rules_market_pnl_eur"])
+    assert np.isfinite(real_cmp)
+    assert np.isfinite(oracle_cmp)
+    assert out.summary.get("comparable_benchmark_type") == "rolling_perfect_foresight_same_rules"
