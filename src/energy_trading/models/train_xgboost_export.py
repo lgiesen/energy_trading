@@ -132,6 +132,31 @@ def _tail_sample_weights(y: pd.Series, multiplier: float = TAIL_WEIGHT_MULTIPLIE
     return w
 
 
+def _crossing_metrics_from_stack(q_stack: np.ndarray) -> dict[str, float]:
+    arr = np.asarray(q_stack, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return {
+            "n_rows": float(arr.shape[0]) if arr.ndim >= 1 else 0.0,
+            "crossing_rate_before_repair": 0.0,
+            "max_crossing_violation_before_repair": 0.0,
+        }
+    finite_mask = np.all(np.isfinite(arr), axis=1)
+    arr_f = arr[finite_mask]
+    if arr_f.shape[0] == 0:
+        return {
+            "n_rows": 0.0,
+            "crossing_rate_before_repair": float("nan"),
+            "max_crossing_violation_before_repair": float("nan"),
+        }
+    violations = np.maximum(arr_f[:, :-1] - arr_f[:, 1:], 0.0)
+    row_cross = np.any(violations > 0.0, axis=1)
+    return {
+        "n_rows": float(arr_f.shape[0]),
+        "crossing_rate_before_repair": float(np.mean(row_cross)),
+        "max_crossing_violation_before_repair": float(np.max(violations)),
+    }
+
+
 def _resolve_base_dir(preferred: str | Path) -> Path:
     p = Path(preferred)
     if p.exists():
