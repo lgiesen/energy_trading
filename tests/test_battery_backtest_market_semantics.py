@@ -774,7 +774,8 @@ def test_simultaneous_bem_only_pos_neg_capped_if_one_side_infeasible() -> None:
         pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
         pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
     )
-    assert float(out["submitted_bem_only_pos_mw"]) == 0.0
+    assert float(out["submitted_bem_only_pos_mw"]) < float(out["desired_bem_only_pos_mw"])
+    assert float(out["submitted_bem_only_pos_mw"]) <= float(out["safe_bem_only_pos_mw"]) + 1e-9
     assert float(out["submitted_bem_only_neg_mw"]) >= 0.0
 
 
@@ -785,9 +786,14 @@ def test_bem_only_guard_fields_written_to_hourly_and_summary() -> None:
     for c in (
         "desired_bem_only_pos_mw",
         "safe_bem_only_pos_mw",
+        "bem_only_submitted_pos_mw_before_guard",
+        "bem_only_submitted_pos_mw_after_guard",
         "submitted_bem_only_pos_mw",
         "bem_only_headroom_guard_applied",
         "bem_only_headroom_guard_reason",
+        "bem_only_guard_soc_now_mwh",
+        "bem_only_guard_protected_soc_min_mwh",
+        "bem_only_guard_protected_soc_max_mwh",
     ):
         assert c in out.hourly.columns
     for k in (
@@ -797,6 +803,21 @@ def test_bem_only_guard_fields_written_to_hourly_and_summary() -> None:
         "bem_only_headroom_guard_hours",
     ):
         assert k in out.summary
+
+
+def test_bem_only_guard_prevents_known_low_soc_positive_violation() -> None:
+    bt = _mk_backtester()
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=2.0,
+        desired_bem_only_neg_mw=0.0,
+        soc_start_mwh=3.5,
+        locked_reserve_pos_mw=8.0,
+        locked_reserve_neg_mw=0.0,
+        pred_act_pos=100.0,
+        pred_act_neg=-100.0,
+    )
+    assert float(guard["bem_only_guard_protected_soc_min_mwh"]) >= 5.0 - 1e-9
+    assert float(guard["bem_only_submitted_pos_mw_after_guard"]) == 0.0
 
 
 def test_bem_only_summary_fields_present() -> None:

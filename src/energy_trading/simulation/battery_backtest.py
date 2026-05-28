@@ -161,8 +161,28 @@ SETTLEMENT_NUMERIC_COLS = (
     "submitted_da_sell_price_eur_mwh",
     "submitted_afrr_pos_mw",
     "submitted_afrr_neg_mw",
+    "desired_bem_only_pos_mw",
+    "desired_bem_only_neg_mw",
+    "safe_bem_only_pos_mw",
+    "safe_bem_only_neg_mw",
+    "bem_only_submitted_pos_mw_before_guard",
+    "bem_only_submitted_neg_mw_before_guard",
+    "bem_only_submitted_pos_mw_after_guard",
+    "bem_only_submitted_neg_mw_after_guard",
     "bem_only_submitted_pos_mw",
     "bem_only_submitted_neg_mw",
+    "bem_only_pos_reduced_by_headroom_mw",
+    "bem_only_neg_reduced_by_headroom_mw",
+    "bem_only_headroom_guard_applied",
+    "bem_only_guard_soc_now_mwh",
+    "bem_only_guard_protected_soc_min_mwh",
+    "bem_only_guard_protected_soc_max_mwh",
+    "bem_only_protected_soc_min_mwh",
+    "bem_only_protected_soc_max_mwh",
+    "bem_only_soc_start_mwh",
+    "bem_only_pos_neg_exclusivity_applied",
+    "bem_only_disabled_by_config",
+    "max_bem_only_bid_mw",
     "executed_charge_mw",
     "executed_discharge_mw",
     "executed_reserve_pos_mw",
@@ -192,6 +212,7 @@ SETTLEMENT_NUMERIC_COLS = (
 SETTLEMENT_METADATA_COLS = (
     "da_buy_reason",
     "da_sell_reason",
+    "bem_only_headroom_guard_reason",
 )
 
 SETTLEMENT_CLEARING_COLS = SETTLEMENT_NUMERIC_COLS + SETTLEMENT_METADATA_COLS
@@ -411,7 +432,7 @@ class BatteryBacktester:
         )
         self.bem_only_headroom_safety_mwh = max(
             0.0,
-            float(MODEL_SPECS.get("bem_only_headroom_safety_mwh", self.reserve_headroom_safety_mwh)),
+            float(MODEL_SPECS.get("bem_only_headroom_safety_mwh", 0.0)),
         )
         _max_bem_only_bid_mw_cfg = MODEL_SPECS.get("max_bem_only_bid_mw", None)
         self.max_bem_only_bid_mw = (
@@ -2335,6 +2356,10 @@ class BatteryBacktester:
             "desired_bem_only_neg_mw": float(desired_bem_only_neg_mw),
             "safe_bem_only_pos_mw": float(safe_pos),
             "safe_bem_only_neg_mw": float(safe_neg),
+            "bem_only_submitted_pos_mw_before_guard": float(desired_bem_only_pos_mw),
+            "bem_only_submitted_neg_mw_before_guard": float(desired_bem_only_neg_mw),
+            "bem_only_submitted_pos_mw_after_guard": float(submitted_pos),
+            "bem_only_submitted_neg_mw_after_guard": float(submitted_neg),
             "submitted_bem_only_pos_mw": float(submitted_pos),
             "submitted_bem_only_neg_mw": float(submitted_neg),
             "bem_only_pos_reduced_by_headroom_mw": float(max(0.0, desired_bem_only_pos_mw - submitted_pos)),
@@ -2344,6 +2369,9 @@ class BatteryBacktester:
             "bem_only_protected_soc_min_mwh": float(protected_soc_min_mwh),
             "bem_only_protected_soc_max_mwh": float(protected_soc_max_mwh),
             "bem_only_soc_start_mwh": float(soc_start),
+            "bem_only_guard_soc_now_mwh": float(soc_start),
+            "bem_only_guard_protected_soc_min_mwh": float(protected_soc_min_mwh),
+            "bem_only_guard_protected_soc_max_mwh": float(protected_soc_max_mwh),
             "bem_only_pos_neg_exclusivity_applied": float(exclusivity_applied),
             "bem_only_disabled_by_config": float(self.disable_bem_only),
             "max_bem_only_bid_mw": float(self.max_bem_only_bid_mw) if self.max_bem_only_bid_mw is not None else float("nan"),
@@ -2786,6 +2814,18 @@ class BatteryBacktester:
             "desired_bem_only_neg_mw": float(bem_guard.get("desired_bem_only_neg_mw", 0.0)),
             "safe_bem_only_pos_mw": float(bem_guard.get("safe_bem_only_pos_mw", 0.0)),
             "safe_bem_only_neg_mw": float(bem_guard.get("safe_bem_only_neg_mw", 0.0)),
+            "bem_only_submitted_pos_mw_before_guard": float(
+                bem_guard.get("bem_only_submitted_pos_mw_before_guard", 0.0)
+            ),
+            "bem_only_submitted_neg_mw_before_guard": float(
+                bem_guard.get("bem_only_submitted_neg_mw_before_guard", 0.0)
+            ),
+            "bem_only_submitted_pos_mw_after_guard": float(
+                bem_guard.get("bem_only_submitted_pos_mw_after_guard", 0.0)
+            ),
+            "bem_only_submitted_neg_mw_after_guard": float(
+                bem_guard.get("bem_only_submitted_neg_mw_after_guard", 0.0)
+            ),
             "submitted_bem_only_pos_mw": float(bem_guard.get("submitted_bem_only_pos_mw", 0.0)),
             "submitted_bem_only_neg_mw": float(bem_guard.get("submitted_bem_only_neg_mw", 0.0)),
             "bem_only_pos_reduced_by_headroom_mw": float(bem_guard.get("bem_only_pos_reduced_by_headroom_mw", 0.0)),
@@ -2795,6 +2835,13 @@ class BatteryBacktester:
             "bem_only_protected_soc_min_mwh": float(bem_guard.get("bem_only_protected_soc_min_mwh", self.soc_min)),
             "bem_only_protected_soc_max_mwh": float(bem_guard.get("bem_only_protected_soc_max_mwh", self.soc_max)),
             "bem_only_soc_start_mwh": float(bem_guard.get("bem_only_soc_start_mwh", soc_ref)),
+            "bem_only_guard_soc_now_mwh": float(bem_guard.get("bem_only_guard_soc_now_mwh", soc_ref)),
+            "bem_only_guard_protected_soc_min_mwh": float(
+                bem_guard.get("bem_only_guard_protected_soc_min_mwh", self.soc_min)
+            ),
+            "bem_only_guard_protected_soc_max_mwh": float(
+                bem_guard.get("bem_only_guard_protected_soc_max_mwh", self.soc_max)
+            ),
             "bem_only_pos_neg_exclusivity_applied": float(bem_guard.get("bem_only_pos_neg_exclusivity_applied", 0.0)),
             "bem_only_disabled_by_config": float(bem_guard.get("bem_only_disabled_by_config", 0.0)),
             "max_bem_only_bid_mw": float(bem_guard.get("max_bem_only_bid_mw", float("nan"))),

@@ -991,7 +991,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--bem-only-headroom-safety-mwh",
         type=float,
-        default=None,
+        default=0.0,
         help="Additional safety margin for BEM-only submission guard relative to protected SoC envelope.",
     )
     p.add_argument(
@@ -1283,11 +1283,7 @@ def main() -> None:
     if MODEL_SPECS["max_reserve_bid_mw"] is not None and float(MODEL_SPECS["max_reserve_bid_mw"]) < 0.0:
         raise ValueError("--max-reserve-bid-mw must be >= 0.")
     MODEL_SPECS["disable_new_bcm_reserve_bids"] = bool(args.disable_new_bcm_reserve_bids)
-    MODEL_SPECS["bem_only_headroom_safety_mwh"] = (
-        float(args.bem_only_headroom_safety_mwh)
-        if args.bem_only_headroom_safety_mwh is not None
-        else float(MODEL_SPECS.get("reserve_headroom_safety_mwh", 0.0))
-    )
+    MODEL_SPECS["bem_only_headroom_safety_mwh"] = float(args.bem_only_headroom_safety_mwh)
     if float(MODEL_SPECS["bem_only_headroom_safety_mwh"]) < 0.0:
         raise ValueError("--bem-only-headroom-safety-mwh must be >= 0.")
     MODEL_SPECS["max_bem_only_bid_mw"] = (
@@ -1479,12 +1475,19 @@ def main() -> None:
                 "real_desired_bem_only_neg_mw",
                 "real_safe_bem_only_pos_mw",
                 "real_safe_bem_only_neg_mw",
+                "real_bem_only_submitted_pos_mw_before_guard",
+                "real_bem_only_submitted_neg_mw_before_guard",
+                "real_bem_only_submitted_pos_mw_after_guard",
+                "real_bem_only_submitted_neg_mw_after_guard",
                 "real_submitted_bem_only_pos_mw",
                 "real_submitted_bem_only_neg_mw",
                 "real_bem_only_pos_reduced_by_headroom_mw",
                 "real_bem_only_neg_reduced_by_headroom_mw",
                 "real_bem_only_headroom_guard_applied",
                 "real_bem_only_headroom_guard_reason",
+                "real_bem_only_guard_soc_now_mwh",
+                "real_bem_only_guard_protected_soc_min_mwh",
+                "real_bem_only_guard_protected_soc_max_mwh",
                 "real_bem_only_protected_soc_min_mwh",
                 "real_bem_only_protected_soc_max_mwh",
                 "real_bem_only_soc_start_mwh",
