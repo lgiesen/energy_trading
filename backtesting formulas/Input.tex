@@ -64,9 +64,9 @@ The cumulative realized strategy value is
 For benchmarking, two reference policies are used:
 \begin{align}
     \Pi^{\mathrm{naive}}  & : \text{forecast-driven benchmark without advanced probabilistic structure},          \\
-    \Pi^{\mathrm{oracle}} & : \text{perfect-foresight upper bound using realized prices/activations in planning}.
+    \Pi^{\mathrm{perfect_foresight}} & : \text{perfect-foresight upper bound using realized prices/activations in planning}.
 \end{align}
-The oracle is interpreted as an informational upper bound, not as an implementable trading policy.
+The perfect_foresight is interpreted as an informational upper bound, not as an implementable trading policy.
 
 
 This section is organized as follows: physical feasibility and \gls{soc} accounting first, then \gls{da}/\gls{id} and \gls{afrr} profit models (ex-post and ex-ante), followed by the master objective and assumptions.
@@ -698,13 +698,13 @@ For model $m$ and benchmark $b$, the incremental value of forecast quality is de
 Relevant comparisons include probabilistic models against naive baselines and against deterministic alternatives. Positive \gls{vof} indicates economically beneficial forecast information under identical physical constraints.
 
 \paragraph{Capture and benchmark ratios.}
-To normalize across periods with different market scales, profit capture is evaluated relative to benchmark and oracle envelopes:
+To normalize across periods with different market scales, profit capture is evaluated relative to benchmark and perfect_foresight envelopes:
 \begin{equation}
     CR^{\mathrm{bench}}_{m} = \frac{\Pi^{\mathrm{real}}_{m}}{\Pi^{\mathrm{real}}_{\mathrm{bench}}},
     \qquad
-    CR^{\mathrm{oracle}}_{m} = \frac{\Pi^{\mathrm{real}}_{m}}{\Pi^{\mathrm{real}}_{\mathrm{oracle}}}.
+    CR^{\mathrm{perfect_foresight}}_{m} = \frac{\Pi^{\mathrm{real}}_{m}}{\Pi^{\mathrm{real}}_{\mathrm{perfect_foresight}}}.
 \end{equation}
-$CR^{\mathrm{oracle}}_{m}\in(-\infty,1]$ measures proximity to the informational upper bound.
+$CR^{\mathrm{perfect_foresight}}_{m}\in(-\infty,1]$ measures proximity to the informational upper bound.
 
 \paragraph{Profit-component decomposition.}
 Total realized value is reported as:

@@ -27,11 +27,18 @@ data/raw/**
 
 artifacts/**
 !artifacts/model_runs/
-!artifacts/simulation_runs/
 !artifacts/**/.gitkeep
 !artifacts/model_runs/.gitkeep
-!artifacts/simulation_runs/.gitkeep
-artifacts/model_runs/2026-*/
+artifacts/model_runs/**
+!artifacts/model_runs/latest*
+!artifacts/model_runs/**/
+!artifacts/model_runs/**/.gitkeep
+artifacts/hpo/
+artifacts/forecast_benchmark/
+hpo/
+forecast_benchmark/
+artifacts/simulation_runs/
+simulation_runs/
 lightning_logs/
 checkpoints/
 
@@ -46,6 +53,7 @@ models/preprocessing/**
 build/
 develop-eggs/
 archive/
+*.zip
 dist/
 downloads/
 eggs/

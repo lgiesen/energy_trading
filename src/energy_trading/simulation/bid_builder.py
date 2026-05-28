@@ -134,7 +134,7 @@ class BidBuilder:
         pred_cap_neg: float,
         pred_act_pos: float,
         pred_act_neg: float,
-        is_oracle: bool = False,
+        is_perfect_foresight: bool = False,
     ) -> list[AFRRCapacityBid]:
         bids: list[AFRRCapacityBid] = []
         q_pos = self._qfloor(float(reserve_pos_mw), self.afrr_step_mw)
@@ -146,7 +146,7 @@ class BidBuilder:
         if q_pos > 0.0:
             cap_bid_pos = (
                 float(pred_cap_pos)
-                if is_oracle
+                if is_perfect_foresight
                 else self.pricing.capacity_price(pred=float(pred_cap_pos))
             )
         if q_pos > 0.0:
@@ -155,7 +155,7 @@ class BidBuilder:
                     ts=ts,
                     side="pos",
                     quantity_mw=q_pos,
-                    # Capacity is settled pay-as-bid: in oracle mode (pred=true),
+                    # Capacity is settled pay-as-bid: in perfect_foresight mode (pred=true),
                     # bid at forecast/true capacity price to both clear and keep
                     # economically consistent remuneration.
                     capacity_price_eur_mw=cap_bid_pos,
@@ -170,7 +170,7 @@ class BidBuilder:
         if q_neg > 0.0:
             cap_bid_neg = (
                 float(pred_cap_neg)
-                if is_oracle
+                if is_perfect_foresight
                 else self.pricing.capacity_price(pred=float(pred_cap_neg))
             )
         if q_neg > 0.0:
@@ -203,7 +203,7 @@ class BidBuilder:
         q10: float | None = None,
         q50: float | None = None,
         q90: float | None = None,
-        is_oracle: bool = False,
+        is_perfect_foresight: bool = False,
         true_act_price: float | None = None,
     ) -> float:
         """T-25 dynamic energy bid update based on latest forecast + current SoC."""
@@ -222,7 +222,7 @@ class BidBuilder:
             if available_headroom_mwh + 1e-9 < required_headroom_mwh:
                 return -9999.0
 
-        if is_oracle and true_act_price is not None and math.isfinite(float(true_act_price)):
+        if is_perfect_foresight and true_act_price is not None and math.isfinite(float(true_act_price)):
             # Oracle still avoids knowingly uneconomic activation prices.
             if side == "pos":
                 return max(float(self.mc_pos), float(true_act_price))
@@ -268,7 +268,7 @@ class BidBuilder:
         pred_da_price_p10: float | None = None,
         pred_da_price_p90: float | None = None,
         pred_da_price_p95: float | None = None,
-        is_oracle: bool = False,
+        is_perfect_foresight: bool = False,
     ) -> list[DABid]:
         # Use MILP schedule volumes directly (endogenous physics/hedging).
         # BidBuilder only sets execution mode/price policy.

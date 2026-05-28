@@ -15,6 +15,9 @@ MODEL_SPECS = {
     "bem_activation_headroom_h": 0.5,
     "reserve_headroom_safety_mwh": 0.1,
     "reserve_power_safety_mw": 0.05,
+    "reserve_bid_derate": 1.0,
+    "max_reserve_bid_mw": None,
+    "final_soc_mode": "terminal_repair",
 }
 MODEL_SPECS["optimization_step_min"] = int(MODEL_SPECS["time_step_hours"] * 60)
 
@@ -62,7 +65,7 @@ FINANCIAL_PARAMS = {
     "imbalance_penalty_eur_mwh": 500.0,  # Non-delivery/imbalance penalty proxy
     # Enforce final SoC >= soc_target_end effectively as hard in optimization:
     # very large soft-shortfall cost (not a settlement cashflow component).
-    "final_soc_shortfall_penalty_eur_per_mwh": 1000000000.0,
+    "final_soc_shortfall_penalty_eur_per_mwh": 100000000000000000.0,
 }
 
 # --- MARKET CONSTRAINTS ---

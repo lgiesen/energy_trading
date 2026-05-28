@@ -273,6 +273,6 @@ For each reported run, store:
 ### Consistency Checks
 
 - realized component balance check
-- oracle component balance check
-- oracle upper-bound consistency flag
+- perfect_foresight component balance check
+- perfect_foresight upper-bound consistency flag
 - final SoC feasibility checks

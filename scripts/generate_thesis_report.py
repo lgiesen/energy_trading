@@ -362,7 +362,7 @@ def main() -> None:
         "realized_total_pnl_eur",
         "predicted_total_pnl_eur",
         "naive_total_pnl_eur",
-        "rolling_perfect_foresight_same_rules_total_pnl_eur",
+        "perfect_foresight_total_pnl_eur",
         "pnl_gap_total_eur",
         "cost_of_forecast_error_total_eur",
         "economic_opportunity_gap_ratio",

@@ -115,7 +115,7 @@ def _compute_scenario_metrics(scenarios: pd.DataFrame) -> pd.DataFrame:
                 "realized_total_pnl_eur": _safe_float(summary.get("realized_total_pnl_eur")),
                 "predicted_total_pnl_eur": _safe_float(summary.get("predicted_total_pnl_eur")),
                 "naive_total_pnl_eur": _safe_float(summary.get("naive_total_pnl_eur")),
-                "rolling_perfect_foresight_same_rules_total_pnl_eur": _safe_float(summary.get("rolling_perfect_foresight_same_rules_total_pnl_eur")),
+                "perfect_foresight_total_pnl_eur": _safe_float(summary.get("perfect_foresight_total_pnl_eur")),
                 "stacking_value_realized_eur": _safe_float(summary.get("stacking_value_realized_eur")),
                 "trading_strategy": trading_strategy,
                 "total_penalty_cost_eur": _safe_float(summary.get("total_penalty_cost_eur", 0.0), 0.0),
@@ -128,7 +128,7 @@ def _compute_scenario_metrics(scenarios: pd.DataFrame) -> pd.DataFrame:
                 "final_soc_constraint_satisfied": _safe_float(summary.get("final_soc_constraint_satisfied", np.nan)),
                 "decision_volatility_total_flips": _safe_float(summary.get("decision_volatility_total_flips", 0.0), 0.0),
                 "decision_volatility_mean_abs_revision_mw": _safe_float(summary.get("decision_volatility_mean_abs_revision_mw", 0.0), 0.0),
-                "capture_ratio_vs_rolling_perfect_foresight_same_rules": _safe_float(summary.get("capture_ratio_vs_rolling_perfect_foresight_same_rules", np.nan)),
+                "capture_ratio_vs_perfect_foresight": _safe_float(summary.get("capture_ratio_vs_perfect_foresight", np.nan)),
                 "capture_ratio_vs_naive": _safe_float(summary.get("capture_ratio_vs_naive", np.nan)),
                 "roi_on_max_capital": _safe_float(summary.get("roi_on_max_capital", np.nan)),
                 "total_equivalent_full_cycles": _safe_float(summary.get("total_equivalent_full_cycles", np.nan)),
@@ -204,7 +204,7 @@ def _comparative_diagnosis(df: pd.DataFrame) -> pd.DataFrame:
                 "best_quantile_pair": f"{best.get('quantile_low','')}-{best.get('quantile_high','')}",
                 "best_realized_pnl_eur": _safe_float(best.get("realized_total_pnl_eur")),
                 "mean_realized_pnl_eur": _safe_float(g["realized_total_pnl_eur"].mean()),
-                "mean_capture_ratio_vs_rolling_perfect_foresight_same_rules": _safe_float(g["capture_ratio_vs_rolling_perfect_foresight_same_rules"].mean()),
+                "mean_capture_ratio_vs_perfect_foresight": _safe_float(g["capture_ratio_vs_perfect_foresight"].mean()),
                 "mean_penalty_eur": _safe_float(g["total_penalty_cost_eur"].mean()),
                 "mean_constraint_pressure_index": _safe_float(g["constraint_pressure_index"].mean()),
                 "mean_spike_miss_ratio": _safe_float(g["failure_spike_miss_ratio"].mean()),
@@ -288,7 +288,7 @@ def main() -> None:
     # Calibration-to-strategy link (quantile pair vs realized pnl)
     cal_link = metrics[[c for c in [
         "model", "scenario", "quantile_low", "quantile_high", "realized_total_pnl_eur",
-        "capture_ratio_vs_rolling_perfect_foresight_same_rules", "total_penalty_cost_eur", "constraint_pressure_index"
+        "capture_ratio_vs_perfect_foresight", "total_penalty_cost_eur", "constraint_pressure_index"
     ] if c in metrics.columns]].copy()
     cal_link.to_csv(out_dir / "calibration_to_strategy_link.csv", index=False)
 

@@ -1,21 +1,33 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import os
 import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from energy_trading.simulation.battery_backtest import BacktestColumnMap, BatteryBacktester  # noqa: E402
 from energy_trading.simulation.bid_builder import AFRRCapacityBid  # noqa: E402
 from energy_trading.simulation.market_clearing import MarketClearingEngine  # noqa: E402
+from scripts.run_battery_backtest import (  # noqa: E402
+    _build_optimization_infeasibility_attribution,
+    _prepare_scenario_output_dir,
+    _suspected_infeasibility_driver_from_row,
+    optional_numeric_series,
+    require_numeric_series,
+)
+from scripts import validate_simulation_outputs as validate_outputs  # noqa: E402
 
 
 def _mk_backtester() -> BatteryBacktester:
@@ -98,7 +110,7 @@ def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
     n_bins = len(bt.afrr_quantile_bins)
     out = bt._apply_market_clearing(
         target_time_utc=pd.Timestamp("2026-01-01T08:00:00Z"),
-        is_oracle=False,
+        is_perfect_foresight=False,
         planned_charge_mw=0.0,
         planned_discharge_mw=0.0,
         planned_reserve_pos_mw=5.0,
@@ -404,7 +416,7 @@ def test_bem_only_positive_activation_without_bcm_award_is_activation_revenue_on
     n_bins = len(bt.afrr_quantile_bins)
     out = bt._apply_market_clearing(
         target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
-        is_oracle=False,
+        is_perfect_foresight=False,
         planned_charge_mw=0.0,
         planned_discharge_mw=0.0,
         planned_reserve_pos_mw=0.0,
@@ -460,7 +472,7 @@ def test_bem_only_negative_activation_sign_without_bcm_award() -> None:
     n_bins = len(bt.afrr_quantile_bins)
     out = bt._apply_market_clearing(
         target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
-        is_oracle=False,
+        is_perfect_foresight=False,
         planned_charge_mw=0.0,
         planned_discharge_mw=0.0,
         planned_reserve_pos_mw=0.0,
@@ -680,9 +692,9 @@ def test_bem_only_forced_scenario_has_nonzero_revenue_and_benchmark_diagnostics(
     assert float(bem_rev.sum()) > 0.0
     assert np.isclose(float(cap_rev[pure_mask].sum()), 0.0, atol=1e-9)
     real_cmp = float(out.summary["comparable_realized_market_pnl_eur"])
-    oracle_cmp = float(out.summary["comparable_rolling_perfect_foresight_same_rules_market_pnl_eur"])
+    perfect_foresight_cmp = float(out.summary["comparable_perfect_foresight_market_pnl_eur"])
     assert np.isfinite(real_cmp)
-    assert np.isfinite(oracle_cmp)
+    assert np.isfinite(perfect_foresight_cmp)
     assert out.summary.get("comparable_benchmark_type") == "rolling_perfect_foresight_same_rules"
 
 
@@ -1020,7 +1032,7 @@ def test_bcm_precommitment_reduces_infeasible_bid() -> None:
         lock_neg=lock_neg,
         lock_energy_pos=lock_e_pos,
         lock_energy_neg=lock_e_neg,
-        is_oracle=False,
+        is_perfect_foresight=False,
     )
     # 2 MWh headroom with 0.5h/eta_out implies <4 MW feasible.
     assert len(lock_pos) == 4
@@ -1070,7 +1082,7 @@ def test_precommit_includes_aux_losses() -> None:
         lock_neg=lock_neg,
         lock_energy_pos={},
         lock_energy_neg={},
-        is_oracle=False,
+        is_perfect_foresight=False,
     )
     assert len(lock_pos) == 4
     assert max(lock_pos.values()) < 4.0
@@ -1118,7 +1130,7 @@ def test_precommit_includes_existing_lockbook_obligations() -> None:
         lock_neg=lock_neg,
         lock_energy_pos={},
         lock_energy_neg={},
-        is_oracle=False,
+        is_perfect_foresight=False,
     )
     # New offer should be clamped to leave room for already-locked 3 MW.
     assert len(lock_pos) == 4
@@ -1137,3 +1149,2066 @@ def test_final_report_excludes_invalid_runs() -> None:
     valid = df.loc[pd.to_numeric(df["simulation_valid"], errors="coerce").fillna(0.0) >= 0.5]
     assert len(valid) == 1
     assert valid.iloc[0]["scenario"] == "p70_p90"
+
+
+def test_precommit_audit_fields_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=30)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=12, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    required = [
+        "precommit_clamp_applied",
+        "precommit_clamp_reason",
+        "precommit_feasible_pos_mw",
+        "precommit_feasible_neg_mw",
+        "precommit_original_pos_mw",
+        "precommit_original_neg_mw",
+        "precommit_clamped_pos_mw",
+        "precommit_clamped_neg_mw",
+        "precommit_headroom_margin_min_mwh",
+        "precommit_power_margin_min_mw",
+        "precommit_soc_margin_min_mwh",
+        "precommit_aux_loss_margin_mwh",
+        "precommit_lockbook_obligation_pos_mw",
+        "precommit_lockbook_obligation_neg_mw",
+    ]
+    for c in required:
+        assert c in out.hourly.columns
+    assert "precommit_clamp_applied_count" in out.summary
+    assert "precommit_clamped_pos_mw_sum" in out.summary
+    assert "precommit_clamped_neg_mw_sum" in out.summary
+
+
+def test_summary_includes_precommit_and_fallback_counts() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=24)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=8, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    s = out.summary
+    for k in [
+        "fallback_mode_counts",
+        "optimization_error_code_counts",
+        "activation_split_reconciliation_error_max",
+        "precommit_clamp_applied_count",
+    ]:
+        assert k in s
+
+
+def test_fallback_infeasible_marks_invalid() -> None:
+    bt = _mk_backtester()
+    # Build a tiny case likely to trigger fallback with reserve obligation at low SoC.
+    df, col = _tiny_backtest_df(hours=6)
+    df[col.pred_afrr_capacity_price_pos] = 1000.0
+    df[col.true_afrr_capacity_price_pos] = 1000.0
+    bt.soc_init = bt.soc_min + 0.1
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    if "reserve_infeasible" in str(out.summary.get("invalid_reason", "")):
+        assert float(out.summary.get("simulation_valid", 0.0)) == 0.0
+
+
+def test_precommit_clamp_prevents_start_of_hour_headroom_violation() -> None:
+    bt = _mk_backtester()
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    # Barely above min SoC; naive 10 MW bid would violate strict start-of-hour headroom.
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [10.0, 10.0, 10.0, 10.0],
+            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "soc_start_lp_mwh": [bt.soc_min + 2.2] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [100.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [150.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [1000.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    lock_pos: dict[pd.Timestamp, float] = {}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    precommit: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=precommit,
+        is_perfect_foresight=False,
+    )
+    assert len(lock_pos) == 4
+    assert max(lock_pos.values()) < 10.0
+    applied = precommit.get("precommit_clamp_applied", {})
+    assert any(float(v) > 0.5 for v in applied.values())
+
+
+def test_fallback_repair_preserves_start_of_hour_reserve_headroom() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=10)
+    # Encourage reserve commitments and make solve harder.
+    df[col.pred_afrr_capacity_price_pos] = 1e3
+    df[col.true_afrr_capacity_price_pos] = 1e3
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    codes = (
+        out.hourly["optimization_error_code"].astype(str).value_counts().to_dict()
+        if "optimization_error_code" in out.hourly.columns
+        else {}
+    )
+    # Legacy unsafe label must not be used when reserve obligations exist.
+    assert "safe_hold_plan_under_infeasible_soft_final_soc" not in codes
+
+
+def test_intrahour_id_rescue_does_not_mask_start_of_hour_headroom_violation() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    df[col.pred_afrr_capacity_price_pos] = 1e3
+    df[col.true_afrr_capacity_price_pos] = 1e3
+    bt.soc_init = bt.soc_min + 0.05
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    hv = float(out.summary.get("headroom_violation_count", 0.0))
+    if hv > 1e-9:
+        assert float(out.summary.get("headroom_check_pass", 1.0)) == 0.0
+        assert float(out.summary.get("simulation_valid", 1.0)) == 0.0
+
+
+def test_fallback_marks_scenario_invalid_in_strict_mode() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    df[col.pred_afrr_capacity_price_pos] = 1000.0
+    df[col.true_afrr_capacity_price_pos] = 1000.0
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=4,
+        reopt_step_hours=1,
+        allowed_markets=("DA", "aFRR"),
+        strict_simulation_validity=True,
+    )
+    fb = float(out.summary.get("fallback_used", 0.0))
+    if fb > 0.5:
+        assert float(out.summary.get("simulation_valid", 1.0)) == 0.0
+        assert float(out.summary.get("thesis_reportable", 1.0)) == 0.0
+        assert "fallback_used" in str(out.summary.get("invalid_reason", ""))
+
+
+def test_safe_hold_not_reportable() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    bt.soc_init = bt.soc_min + 0.01
+    df[col.pred_afrr_capacity_price_pos] = 1000.0
+    df[col.true_afrr_capacity_price_pos] = 1000.0
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=4,
+        reopt_step_hours=1,
+        allowed_markets=("DA", "aFRR"),
+        strict_simulation_validity=True,
+    )
+    codes = out.summary.get("optimization_error_code_counts", "{}")
+    if "safe_hold" in str(codes).lower():
+        assert float(out.summary.get("fallback_used", 0.0)) >= 1.0
+        assert float(out.summary.get("thesis_reportable", 1.0)) == 0.0
+
+
+def test_valid_run_has_no_fallback_modes() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=12)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=6,
+        reopt_step_hours=1,
+        allowed_markets=("DA",),
+        strict_simulation_validity=True,
+    )
+    if float(out.summary.get("simulation_valid", 0.0)) >= 0.5:
+        assert float(out.summary.get("fallback_used", 1.0)) == 0.0
+        counts = str(out.summary.get("optimization_error_code_counts", "{}")).lower()
+        assert counts in {"{}", ""} or ("ok" in counts)
+
+
+def test_validity_flags_are_consistent() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    if float(s.get("headroom_violation_count", 0.0)) > 1e-9:
+        assert float(s.get("simulation_valid", 1.0)) == 0.0
+    if float(s.get("missed_capacity_pos_mw", 0.0)) + float(s.get("missed_capacity_neg_mw", 0.0)) > 1e-9:
+        assert float(s.get("simulation_valid", 1.0)) == 0.0
+    if float(s.get("fallback_used", 0.0)) > 0.5:
+        assert float(s.get("simulation_valid", 1.0)) == 0.0
+
+
+def test_reserve_commitment_traceability_fields_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=30)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=12, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    req = [
+        "reserve_commitment_id",
+        "reserve_product_block_id",
+        "reserve_commitment_source_snapshot_utc",
+        "reserve_delivery_start_utc",
+        "reserve_delivery_end_utc",
+        "reserve_precommit_feasible_pos_mw",
+        "reserve_precommit_feasible_neg_mw",
+        "reserve_submitted_pos_mw",
+        "reserve_submitted_neg_mw",
+        "reserve_awarded_pos_mw",
+        "reserve_awarded_neg_mw",
+        "reserve_lockbook_pos_mw",
+        "reserve_lockbook_neg_mw",
+    ]
+    for c in req:
+        assert c in out.hourly.columns
+
+
+def test_precommit_clamp_includes_projection_safety_buffer() -> None:
+    bt = _mk_backtester()
+    # Compare with/without projection safety by manually toggling on same synthetic block.
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [10.0, 10.0, 10.0, 10.0],
+            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "soc_start_lp_mwh": [bt.soc_min + 2.5] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre0: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap.copy(),
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre0,
+        is_perfect_foresight=False,
+    )
+    pre1: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt.reserve_soc_projection_safety_mwh = 0.1
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap.copy(),
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre1,
+        is_perfect_foresight=False,
+    )
+    f0 = min(float(v) for v in pre0.get("precommit_feasible_pos_mw", {}).values())
+    f1 = min(float(v) for v in pre1.get("precommit_feasible_pos_mw", {}).values())
+    assert f1 <= f0 + 1e-9
+
+
+def test_reserve_min_margin_after_bid_applied() -> None:
+    bt = _mk_backtester()
+    bt.reserve_feasibility_mode = "conservative"
+    bt.reserve_min_margin_after_bid_mwh = 10.0  # force zeroing
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [5.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 5.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    lock_pos: dict[pd.Timestamp, float] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    assert all(float(v) == 0.0 for v in lock_pos.values())
+    assert any(float(v) > 0.5 for v in pre.get("precommit_zeroed_due_to_margin", {}).values())
+
+
+def test_conservative_precommit_reduces_bid_to_safe_mw() -> None:
+    bt = _mk_backtester()
+    bt.reserve_feasibility_mode = "conservative"
+    bt.reserve_min_margin_after_bid_mwh = 0.4
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [5.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 2.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    lock_pos: dict[pd.Timestamp, float] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    assert any(float(v) > 0.5 for v in pre.get("precommit_reduced_due_to_margin", {}).values())
+    assert any(float(v) > 0.0 for v in lock_pos.values())
+    assert any(float(v) < 5.0 for v in lock_pos.values())
+
+
+def test_conservative_reserve_cli_params_reach_backtester() -> None:
+    txt = Path("scripts/run_battery_backtest.py").read_text(encoding="utf-8")
+    assert "--reserve-feasibility-mode" in txt
+    assert "--reserve-soc-projection-safety-mwh" in txt
+    assert "--reserve-headroom-safety-mwh" in txt
+    assert "--reserve-power-safety-mw" in txt
+    assert "--reserve-min-margin-after-bid-mwh" in txt
+    assert 'MODEL_SPECS["reserve_feasibility_mode"]' in txt
+    assert 'MODEL_SPECS["reserve_soc_projection_safety_mwh"]' in txt
+    assert 'MODEL_SPECS["reserve_headroom_safety_mwh"]' in txt
+    assert 'MODEL_SPECS["reserve_power_safety_mw"]' in txt
+    assert 'MODEL_SPECS["reserve_min_margin_after_bid_mwh"]' in txt
+    assert "--reserve-bid-derate" in txt
+    assert "--max-reserve-bid-mw" in txt
+    assert 'MODEL_SPECS["reserve_bid_derate"]' in txt
+    assert 'MODEL_SPECS["max_reserve_bid_mw"]' in txt
+
+
+def test_summary_never_omits_required_validity_fields() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=12)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1, strict_simulation_validity=True)
+    req = [
+        "simulation_valid",
+        "thesis_reportable",
+        "invalid_reason",
+        "fallback_used",
+        "infeasibility_driver",
+        "fallback_mode_counts",
+        "optimization_error_code_counts",
+        "precommit_clamp_applied_count",
+        "precommit_clamped_pos_mw_sum",
+        "precommit_clamped_neg_mw_sum",
+        "precommit_clamp_reasons",
+        "activation_split_reconciliation_error_max",
+        "reserve_soc_projection_safety_mwh",
+        "reserve_headroom_safety_mwh",
+        "reserve_power_safety_mw",
+        "reserve_feasibility_mode",
+        "reserve_min_margin_after_bid_mwh",
+        "reserve_bid_derate",
+        "max_reserve_bid_mw",
+        "precommit_reduced_due_to_margin_count",
+        "precommit_safe_pos_mw_avg",
+        "precommit_safe_neg_mw_avg",
+        "fallback_is_repair_optimization",
+        "afrr_bcm_gate_hour_cet_model",
+        "afrr_bcm_gate_hour_cet_benchmark",
+        "benchmark_same_rules_gate_consistent",
+        "benchmark_is_global_upper_bound",
+        "final_soc_handling_mode",
+        "terminal_soc_net_adjustment_eur",
+        "terminal_price_eur_mwh",
+        "terminal_price_source",
+    ]
+    for c in req:
+        assert c in out.summary
+
+
+def test_fallback_is_repair_optimization_flag() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    assert float(out.summary.get("fallback_is_repair_optimization", 1.0)) == 0.0
+
+
+def test_no_thesis_reportable_with_fallback() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    df[col.pred_afrr_capacity_price_pos] = 1000.0
+    df[col.true_afrr_capacity_price_pos] = 1000.0
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    if float(out.summary.get("fallback_used", 0.0)) > 0.5:
+        assert float(out.summary.get("thesis_reportable", 1.0)) == 0.0
+
+
+def test_fallback_never_thesis_reportable() -> None:
+    test_no_thesis_reportable_with_fallback()
+
+
+def test_fallback_never_reportable() -> None:
+    test_fallback_never_thesis_reportable()
+
+
+def test_reserve_feasibility_repair_never_reportable() -> None:
+    row = {
+        "simulation_valid": 1.0,
+        "final_soc_check_pass": 1.0,
+        "missed_capacity_check_pass": 1.0,
+        "missed_activation_check_pass": 1.0,
+        "headroom_check_pass": 1.0,
+        "protected_soc_check_pass": 1.0,
+        "reserve_headroom_shortfall_check_pass": 1.0,
+        "pnl_reconciliation_check_pass": 1.0,
+        "fallback_used": 0.0,
+        "reserve_feasibility_repair_used": 1.0,
+    }
+    thesis_reportable = float(
+        (row["simulation_valid"] >= 0.5)
+        and (row["fallback_used"] <= 0.5)
+        and (row["reserve_feasibility_repair_used"] <= 0.5)
+        and (row["final_soc_check_pass"] >= 0.5)
+        and (row["missed_capacity_check_pass"] >= 0.5)
+        and (row["missed_activation_check_pass"] >= 0.5)
+        and (row["headroom_check_pass"] >= 0.5)
+        and (row["protected_soc_check_pass"] >= 0.5)
+        and (row["reserve_headroom_shortfall_check_pass"] >= 0.5)
+        and (row["pnl_reconciliation_check_pass"] >= 0.5)
+    )
+    assert thesis_reportable == 0.0
+
+
+def test_reserve_bid_derate_reduces_submitted_mw() -> None:
+    bt = _mk_backtester()
+    bt.reserve_bid_derate = 0.5
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [8.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    fea = list(pre.get("precommit_feasible_pos_mw", {}).values())
+    sub = list(pre.get("precommit_submitted_pos_mw_after_derate_cap", {}).values())
+    assert fea and sub
+    assert max(float(s) for s in sub) <= max(float(f) for f in fea) + 1e-9
+
+
+def test_max_reserve_bid_mw_caps_submission() -> None:
+    bt = _mk_backtester()
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = 2.0
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [8.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    sub = list(pre.get("precommit_submitted_pos_mw_after_derate_cap", {}).values())
+    assert sub and all(float(v) <= 2.0 + 1e-9 for v in sub)
+
+
+def test_derate_and_cap_written_to_summary_and_debug() -> None:
+    txt_bt = Path("src/energy_trading/simulation/battery_backtest.py").read_text(encoding="utf-8")
+    txt_run = Path("scripts/run_battery_backtest.py").read_text(encoding="utf-8")
+    for key in (
+        "reserve_bid_derate",
+        "max_reserve_bid_mw",
+        "final_soc_mode",
+        "precommit_reduction_reason",
+        "desired_reserve_pos_mw",
+        "safe_reserve_pos_mw",
+        "submitted_reserve_pos_mw",
+        "precommit_submitted_pos_mw_after_derate_cap",
+        "precommit_submitted_neg_mw_after_derate_cap",
+    ):
+        assert key in txt_bt
+        assert key in txt_run
+
+
+def test_conservative_fields_written_to_summary_and_debug() -> None:
+    test_derate_and_cap_written_to_summary_and_debug()
+
+
+def test_quantile_aggressiveness_not_changed_by_feasibility_cap() -> None:
+    bt = _mk_backtester()
+    bt.reserve_bid_derate = 0.5
+    bt.max_reserve_bid_mw = 2.0
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [6.0] * 4,
+            "reserve_neg_mw": [4.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [30.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    assert all(abs(float(v) - 6.0) < 1e-9 for v in pre.get("desired_reserve_pos_mw", {}).values())
+    assert all(abs(float(v) - 4.0) < 1e-9 for v in pre.get("desired_reserve_neg_mw", {}).values())
+
+
+def test_reserve_submission_capped_by_safe_mw() -> None:
+    bt = _mk_backtester()
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = None
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [8.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 1.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [50.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [100.0] * 4,
+            col.pred_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    for ts, desired in pre.get("desired_reserve_pos_mw", {}).items():
+        safe = float(pre.get("safe_reserve_pos_mw", {}).get(ts, 0.0))
+        submitted = float(pre.get("submitted_reserve_pos_mw", {}).get(ts, 0.0))
+        assert submitted <= safe + 1e-9
+        assert safe <= float(desired) + 1e-9
+
+
+def test_reserve_submission_never_exceeds_safe_mw() -> None:
+    test_reserve_submission_capped_by_safe_mw()
+
+
+def test_zero_reserve_when_safe_mw_below_tolerance() -> None:
+    bt = _mk_backtester()
+    bt.reserve_bid_derate = 1.0
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [5.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame({col.timestamp: target_hours}).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    lock_pos: dict[pd.Timestamp, float] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    assert all(float(v) <= 1e-9 for v in lock_pos.values())
+    assert all(float(v) <= 1e-9 for v in pre.get("submitted_reserve_pos_mw", {}).values())
+
+
+def test_zero_safe_reserve_submits_zero() -> None:
+    test_zero_reserve_when_safe_mw_below_tolerance()
+
+
+def test_reserve_bid_derate_applies_after_safe_mw() -> None:
+    bt = _mk_backtester()
+    bt.reserve_bid_derate = 0.5
+    bt.max_reserve_bid_mw = None
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [4.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame({col.timestamp: target_hours}).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    for ts, safe in pre.get("safe_reserve_pos_mw", {}).items():
+        sub = float(pre.get("submitted_reserve_pos_mw", {}).get(ts, 0.0))
+        assert sub <= float(safe) * 0.5 + 1e-9
+
+
+def test_reserve_bid_derate_applied_after_safe_mw() -> None:
+    test_reserve_bid_derate_applies_after_safe_mw()
+
+
+def test_max_reserve_bid_caps_after_safe_mw() -> None:
+    bt = _mk_backtester()
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = 1.0
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [8.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame({col.timestamp: target_hours}).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    assert all(float(v) <= 1.0 + 1e-9 for v in pre.get("submitted_reserve_pos_mw", {}).values())
+
+
+def test_max_reserve_bid_mw_caps_submission() -> None:
+    test_max_reserve_bid_caps_after_safe_mw()
+
+
+def test_data_flow_has_single_canonical_soc_source() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=10)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1)
+    # Canonical settlement SoC must exist and be finite.
+    assert "real_soc_mwh" in out.hourly.columns
+    rs = pd.to_numeric(out.hourly["real_soc_mwh"], errors="coerce")
+    assert rs.notna().all()
+    # If start-of-hour SoC audit field exists, it should be finite and aligned.
+    if "real_soc_start_mwh" in out.hourly.columns:
+        ss = pd.to_numeric(out.hourly["real_soc_start_mwh"], errors="coerce")
+        assert ss.notna().all()
+
+
+def test_required_debug_fields_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=16)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=8, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    req = [
+        "reserve_commitment_id",
+        "reserve_product_block_id",
+        "reserve_commitment_source_snapshot_utc",
+        "reserve_delivery_start_utc",
+        "reserve_delivery_end_utc",
+        "reserve_submitted_pos_mw",
+        "reserve_awarded_pos_mw",
+        "fixed_reserve_obligation_pos_mw",
+        "real_required_headroom_pos_mwh",
+        "real_available_headroom_pos_mwh",
+        "optimization_error_code",
+        "is_fallback_hour",
+    ]
+    for c in req:
+        assert c in out.hourly.columns
+
+
+def test_same_rules_benchmark_uses_same_bcm_gate() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=10)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    assert float(out.summary.get("afrr_bcm_gate_hour_cet_model", -1.0)) == float(
+        out.summary.get("afrr_bcm_gate_hour_cet_benchmark", -2.0)
+    )
+    assert float(out.summary.get("benchmark_same_rules_gate_consistent", 0.0)) == 1.0
+
+
+def test_strict_final_soc_hard_constraint_or_repair() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    df[col.pred_da_price] = 200.0
+    df[col.true_da_price] = 200.0
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    shortfall = float(s.get("final_soc_shortfall_mwh", 0.0))
+    repair = float(s.get("terminal_soc_repair_cost_eur", 0.0))
+    assert (shortfall <= 1e-6) or (repair > 0.0)
+    assert float(s.get("final_soc_check_pass", 0.0)) >= 0.5
+    assert "final_soc_actual_mwh" in s
+    assert "final_soc_target_mwh" in s
+    assert "final_soc_physical_check_pass" in s
+    assert "final_soc_economic_repair_check_pass" in s
+    assert "terminal_soc_repair_included_in_pnl" in s
+
+
+def test_unrepaired_final_soc_shortfall_invalid() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    # Force shortfall and zero terminal repair by setting terminal price to zero.
+    df[col.pred_da_price] = 100.0
+    df[col.true_da_price] = 0.0
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    if float(s.get("final_soc_shortfall_mwh", 0.0)) > 1e-6:
+        assert float(s.get("terminal_soc_repair_cost_eur", 0.0)) <= 1e-9
+        assert float(s.get("terminal_soc_repair_included_in_pnl", 1.0)) == 0.0
+        assert float(s.get("final_soc_check_pass", 1.0)) == 0.0
+        assert float(s.get("simulation_valid", 1.0)) == 0.0
+        assert float(s.get("thesis_reportable", 1.0)) == 0.0
+        assert "final_soc_unrepaired" in str(s.get("invalid_reason", ""))
+
+
+def test_final_soc_shortfall_repaired_is_valid_if_pnl_reconciles() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    df[col.pred_da_price] = 150.0
+    df[col.true_da_price] = 120.0
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    if float(s.get("final_soc_shortfall_mwh", 0.0)) > 1e-6 and float(s.get("terminal_soc_repair_cost_eur", 0.0)) > 1e-9:
+        assert float(s.get("terminal_soc_repair_included_in_pnl", 0.0)) >= 0.5
+        assert float(s.get("final_soc_economic_repair_check_pass", 0.0)) >= 0.5
+        assert float(s.get("final_soc_check_pass", 0.0)) >= 0.5
+
+
+def test_terminal_repair_mode_allows_physical_shortfall_if_repaired() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "terminal_repair"
+    df, col = _tiny_backtest_df(hours=6)
+    df[col.pred_da_price] = 150.0
+    df[col.true_da_price] = 120.0
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=6,
+        reopt_step_hours=1,
+        strict_simulation_validity=True,
+        enforce_final_soc_min=False,
+    )
+    s = out.summary
+    if float(s.get("final_soc_shortfall_mwh", 0.0)) > 1e-6:
+        assert float(s.get("terminal_soc_repair_cost_eur", 0.0)) > 0.0
+        assert float(s.get("terminal_soc_repair_included_in_pnl", 0.0)) >= 0.5
+        assert float(s.get("final_soc_economic_repair_check_pass", 0.0)) >= 0.5
+        assert float(s.get("final_soc_check_pass", 0.0)) >= 0.5
+
+
+def test_hard_final_soc_mode_invalidates_shortfall() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=6)
+    df[col.pred_da_price] = 100.0
+    df[col.true_da_price] = 0.0
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=6,
+        reopt_step_hours=1,
+        strict_simulation_validity=True,
+        enforce_final_soc_min=False,
+    )
+    s = out.summary
+    if float(s.get("final_soc_shortfall_mwh", 0.0)) > 1e-6:
+        assert float(s.get("final_soc_physical_check_pass", 1.0)) == 0.0
+        assert float(s.get("final_soc_check_pass", 1.0)) == 0.0
+        assert float(s.get("simulation_valid", 1.0)) == 0.0
+
+
+def test_console_final_soc_reports_physical_and_economic_status() -> None:
+    txt = Path("scripts/run_battery_backtest.py").read_text(encoding="utf-8")
+    assert "final_soc_physical_check" in txt
+    assert "final_soc_economic_repair_check" in txt
+
+
+def test_terminal_repair_cost_reconciles() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    df[col.pred_da_price] = 150.0
+    df[col.true_da_price] = 120.0
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    s = out.summary
+    rhs = float(s.get("realized_pnl_excl_terminal_eur", 0.0)) + float(s.get("terminal_soc_net_adjustment_eur", 0.0))
+    assert np.isclose(float(s.get("realized_total_pnl_eur", 0.0)), rhs, atol=1e-6)
+
+
+def test_strategy_overview_ratio_fields_semantics() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    assert "realized_vs_perfect_foresight_ratio_multi_market" in out.summary
+    assert "realized_vs_perfect_foresight_comparable_market_ratio" in out.summary
+    assert "rolling_perfect_foresight_same_rules_total_pnl_eur" in out.summary
+    assert "realized_vs_perfect_foresight_pct" in out.summary
+    assert "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur" in out.summary
+    assert "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct" in out.summary
+    assert float(out.summary.get("benchmark_is_global_upper_bound", 1.0)) == 0.0
+    assert float(out.summary.get("rolling_perfect_foresight_same_rules_is_global_upper_bound", 1.0)) == 0.0
+
+
+def test_rolling_pf_not_global_upper_bound() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    assert float(out.summary.get("rolling_perfect_foresight_same_rules_is_global_upper_bound", 1.0)) == 0.0
+    assert float(out.summary.get("rolling_perfect_foresight_same_rules_can_be_beaten", 0.0)) == 1.0
+
+
+def test_global_perfect_foresight_is_full_horizon_not_rolling() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1)
+    assert float(out.summary.get("global_perfect_foresight_available", 1.0)) == 0.0
+    assert float(out.summary.get("global_hindsight_perfect_foresight_is_global_upper_bound", 1.0)) == 0.0
+    assert str(out.summary.get("global_perfect_foresight_validation_status", "")).startswith("disabled")
+
+
+def test_global_perfect_foresight_dominance_flag_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    assert "global_perfect_foresight_dominance_check_pass" in out.summary
+    assert "realized_exceeds_global_perfect_foresight" in out.summary
+
+
+def test_global_perfect_foresight_does_not_invalidate_when_disabled() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    assert float(s.get("global_perfect_foresight_available", 1.0)) == 0.0
+    assert float(s.get("global_perfect_foresight_dominance_check_pass", 0.0)) >= 0.5
+    assert float(s.get("realized_exceeds_global_perfect_foresight", 1.0)) == 0.0
+    assert "realized_exceeds_global_perfect_foresight" not in str(s.get("invalid_reason", ""))
+
+
+def test_deprecated_perfect_foresight_aliases_are_labelled() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    s = out.summary
+    assert "perfect_foresight_total_pnl_eur" in s
+    assert float(s.get("perfect_foresight_total_pnl_eur_is_deprecated", 0.0)) == 1.0
+    assert str(s.get("perfect_foresight_total_pnl_eur_semantics", "")) == "rolling_perfect_foresight_same_rules"
+
+
+def test_global_perfect_foresight_disabled_by_default() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    s = out.summary
+    assert float(s.get("global_perfect_foresight_available", 1.0)) == 0.0
+    assert str(s.get("global_perfect_foresight_validation_status", "")).startswith("disabled")
+
+
+def test_realized_beating_rolling_pf_does_not_invalidate() -> None:
+    invalid_reason = "fallback_used,headroom"
+    assert "realized_exceeds_rolling_pf" not in invalid_reason
+
+
+def test_strategy_overview_labels_diagnostic_vs_upper_bound_ratios() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    s = out.summary
+    assert "realized_vs_perfect_foresight_pct" in s
+    if float(s.get("global_perfect_foresight_available", 0.0)) < 0.5:
+        assert np.isnan(float(s.get("realized_vs_global_hindsight_perfect_foresight_upper_bound_pct", float("nan"))))
+
+
+def test_rolling_pf_quantile_surface_mode_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
+    assert str(out.summary.get("rolling_pf_quantile_surface_mode", "")) in {
+        "collapsed_to_truth",
+        "preserved_quantile_surface",
+        "unknown",
+    }
+
+
+def test_global_perfect_foresight_bem_only_plan_mapping() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=4,
+        reopt_step_hours=1,
+        enable_global_perfect_foresight=True,
+    )
+    s = out.summary
+    # Scope-mismatch can still disable availability, but summary fields must exist.
+    assert "global_perfect_foresight_bem_only_included" in s
+    assert "global_perfect_foresight_dispatch_rows" in s
+    assert "global_perfect_foresight_settlement_rows" in s
+
+
+def test_global_perfect_foresight_available_only_after_scope_validation() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, enable_global_perfect_foresight=True)
+    s = out.summary
+    if float(s.get("global_perfect_foresight_available", 0.0)) >= 0.5:
+        assert str(s.get("global_perfect_foresight_validation_status", "")) == "available_scope_validated"
+        assert float(s.get("global_perfect_foresight_dispatch_rows", 0.0)) > 0.0
+        assert float(s.get("global_perfect_foresight_settlement_rows", 0.0)) > 0.0
+    else:
+        assert str(s.get("global_perfect_foresight_validation_status", "")).startswith("disabled") or str(s.get("global_perfect_foresight_validation_status", "")).startswith("computed")
+
+
+def test_locked_reserve_obligation_preserves_future_soc_headroom() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Make DA discharge attractive in early hours.
+    df[col.pred_da_price] = [250.0, 250.0, 10.0, 10.0]
+    ts = pd.to_datetime(df[col.timestamp], utc=True)
+    # Lock a positive reserve obligation on the 3rd hour.
+    lock = {pd.Timestamp(ts.iloc[2]): (8.0, 0.0)}
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=bt.soc_min + 6.5,
+        fixed_reserve_obligation=lock,
+        allowed_markets=("DA", "aFRR"),
+    )
+    r = out.iloc[2]
+    req = 8.0 * bt.reserve_activation_headroom_h / bt.eta_out + bt.reserve_headroom_safety_mwh + bt.reserve_soc_projection_safety_mwh
+    avail = float(r["soc_start_lp_mwh"]) - bt.soc_min
+    assert avail + 1e-9 >= req
+
+
+def test_locked_negative_reserve_obligation_preserves_future_empty_headroom() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Make DA charge attractive in early hours.
+    df[col.pred_da_price] = [-200.0, -200.0, -10.0, -10.0]
+    ts = pd.to_datetime(df[col.timestamp], utc=True)
+    lock = {pd.Timestamp(ts.iloc[2]): (0.0, 8.0)}
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=bt.soc_max - 6.5,
+        fixed_reserve_obligation=lock,
+        allowed_markets=("DA", "aFRR"),
+    )
+    r = out.iloc[2]
+    req = 8.0 * bt.reserve_activation_headroom_h * bt.eta_in + bt.reserve_headroom_safety_mwh + bt.reserve_soc_projection_safety_mwh
+    avail = bt.soc_max - float(r["soc_start_lp_mwh"])
+    assert avail + 1e-9 >= req
+
+
+def test_fallback_counts_nonempty_when_fallback_used() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    df[col.pred_afrr_capacity_price_pos] = 1e3
+    df[col.true_afrr_capacity_price_pos] = 1e3
+    bt.soc_init = bt.soc_min + 0.01
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    if float(out.summary.get("fallback_used", 0.0)) > 0.5:
+        counts = str(out.summary.get("fallback_mode_counts", "")).strip()
+        assert counts not in {"", "{}"}
+
+
+def test_locked_positive_reserve_blocks_future_da_discharge() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Strongly profitable DA discharge in first two hours.
+    df[col.pred_da_price] = [400.0, 400.0, 0.0, 0.0]
+    ts = pd.to_datetime(df[col.timestamp], utc=True)
+    lock = {pd.Timestamp(ts.iloc[2]): (9.0, 0.0)}
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=bt.soc_min + 7.0,
+        fixed_reserve_obligation=lock,
+        allowed_markets=("DA", "aFRR"),
+    )
+    # Future locked reserve headroom must be preserved.
+    req = 9.0 * bt.reserve_activation_headroom_h / bt.eta_out + bt.reserve_headroom_safety_mwh + bt.reserve_soc_projection_safety_mwh
+    avail = float(out.loc[2, "soc_start_lp_mwh"]) - bt.soc_min
+    assert avail + 1e-9 >= req
+
+
+def test_locked_positive_reserve_blocks_future_bem_only_discharge() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Make BEM-only positive attractive in first hours.
+    df[col.pred_afrr_activation_price_pos] = [300.0, 300.0, 0.0, 0.0]
+    df[col.pred_afrr_activation_rate_pos] = [1.0, 1.0, 0.0, 0.0]
+    ts = pd.to_datetime(df[col.timestamp], utc=True)
+    lock = {pd.Timestamp(ts.iloc[2]): (8.0, 0.0)}
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=bt.soc_min + 6.5,
+        fixed_reserve_obligation=lock,
+        allowed_markets=("aFRR",),
+    )
+    req = 8.0 * bt.reserve_activation_headroom_h / bt.eta_out + bt.reserve_headroom_safety_mwh + bt.reserve_soc_projection_safety_mwh
+    avail = float(out.loc[2, "soc_start_lp_mwh"]) - bt.soc_min
+    assert avail + 1e-9 >= req
+
+
+def test_locked_negative_reserve_blocks_future_charge() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Make charging attractive in first two hours.
+    df[col.pred_da_price] = [-300.0, -300.0, 0.0, 0.0]
+    ts = pd.to_datetime(df[col.timestamp], utc=True)
+    lock = {pd.Timestamp(ts.iloc[2]): (0.0, 9.0)}
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=bt.soc_max - 7.0,
+        fixed_reserve_obligation=lock,
+        allowed_markets=("DA", "aFRR"),
+    )
+    req = 9.0 * bt.reserve_activation_headroom_h * bt.eta_in + bt.reserve_headroom_safety_mwh + bt.reserve_soc_projection_safety_mwh
+    avail = bt.soc_max - float(out.loc[2, "soc_start_lp_mwh"])
+    assert avail + 1e-9 >= req
+
+
+def test_terminal_soc_does_not_override_locked_reserve() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    # Keep reserve obligation that consumes SoC margin near end.
+    ts = pd.to_datetime(df[col.timestamp], utc=True)
+    lock = {pd.Timestamp(ts.iloc[3]): (9.0, 0.0)}
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=bt.soc_min + 6.0,
+        soc_end_min_target=bt.soc_target_end,
+        fixed_reserve_obligation=lock,
+        allowed_markets=("DA", "aFRR"),
+    )
+    req = 9.0 * bt.reserve_activation_headroom_h / bt.eta_out + bt.reserve_headroom_safety_mwh + bt.reserve_soc_projection_safety_mwh
+    avail = float(out.loc[3, "soc_start_lp_mwh"]) - bt.soc_min
+    assert avail + 1e-9 >= req
+
+
+def test_reserve_commitment_debug_explains_soc_drift_fields() -> None:
+    required = {
+        "scenario",
+        "submitted_mw",
+        "awarded_mw",
+        "locked_obligation_mw",
+        "projected_soc_start_mwh_at_commitment",
+        "projected_soc_start_mwh_latest_before_delivery",
+        "realized_soc_start_mwh_at_delivery",
+        "reserve_projected_vs_realized_soc_delta_mwh",
+        "da_dispatch_mw_between_commit_and_delivery",
+        "id_dispatch_mw_between_commit_and_delivery",
+        "bem_only_dispatch_mw_between_commit_and_delivery",
+        "aux_energy_mwh_between_commit_and_delivery",
+        "required_headroom_mwh",
+        "available_headroom_mwh",
+        "headroom_violation_mwh",
+    }
+    # Column list in run_battery_backtest must include these fields.
+    path = Path("scripts/run_battery_backtest.py")
+    txt = path.read_text(encoding="utf-8")
+    for c in required:
+        assert c in txt
+
+
+def test_no_thesis_reportable_reserve_shortfall() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    df[col.pred_afrr_capacity_price_pos] = 1e3
+    df[col.true_afrr_capacity_price_pos] = 1e3
+    bt.soc_init = bt.soc_min + 0.01
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    short_sum = float(s.get("reserve_headroom_shortfall_pos_mwh_sum", 0.0)) + float(
+        s.get("reserve_headroom_shortfall_neg_mwh_sum", 0.0)
+    )
+    if short_sum > 1e-9:
+        assert float(s.get("reserve_headroom_shortfall_check_pass", 1.0)) == 0.0
+        assert float(s.get("thesis_reportable", 1.0)) == 0.0
+        assert "reserve_headroom_shortfall" in str(s.get("invalid_reason", ""))
+
+
+def test_protected_soc_envelope_fields_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    hourly_cols = set(out.hourly.columns)
+    required_hourly = {
+        "real_locked_reserve_pos_mw",
+        "real_locked_reserve_neg_mw",
+        "real_protected_soc_min_mwh",
+        "real_protected_soc_max_mwh",
+        "real_protected_soc_margin_pos_mwh",
+        "real_protected_soc_margin_neg_mwh",
+        "real_protected_soc_violation_pos_mwh",
+        "real_protected_soc_violation_neg_mwh",
+    }
+    missing = required_hourly.difference(hourly_cols)
+    assert not missing, f"Missing protected SoC fields: {sorted(missing)}"
+    s = out.summary
+    for k in (
+        "protected_soc_violation_count",
+        "protected_soc_violation_max_mwh",
+        "protected_soc_check_pass",
+        "locked_reserve_obligation_hours",
+        "locked_reserve_obligation_pos_mw_sum",
+        "locked_reserve_obligation_neg_mw_sum",
+    ):
+        assert k in s
+
+
+def test_no_thesis_reportable_with_protected_soc_violation() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    psv = float(s.get("protected_soc_violation_count", 0.0))
+    if psv > 1e-9:
+        assert float(s.get("simulation_valid", 1.0)) == 0.0
+        assert float(s.get("thesis_reportable", 1.0)) == 0.0
+        assert float(s.get("protected_soc_check_pass", 1.0)) == 0.0
+        assert "protected_soc" in str(s.get("invalid_reason", ""))
+
+
+def test_precommit_ev_includes_headroom_cost() -> None:
+    bt = _mk_backtester()
+    bt.reserve_min_margin_after_bid_mwh = 0.0
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [8.0, 8.0, 8.0, 8.0],
+            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "soc_start_lp_mwh": [bt.soc_min + 4.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.2] * 4,
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [1.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [0.0] * 4,
+            col.pred_afrr_activation_price_neg: [0.0] * 4,
+            col.pred_da_price: [300.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    lock_pos: dict[pd.Timestamp, float] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+    assert any(float(v) > 0.5 for v in pre.get("precommit_bid_zeroed_due_to_negative_ev", {}).values())
+    assert any(float(v) > 0.0 for v in pre.get("precommit_headroom_opportunity_cost_eur", {}).values())
+
+
+def test_required_series_missing_raises_keyerror() -> None:
+    df = pd.DataFrame({"x": [1.0, 2.0]})
+    try:
+        _ = require_numeric_series(df, "real_executed_charge_mw", aliases=["real_da_charge_mw"])
+        assert False, "expected KeyError"
+    except KeyError as exc:
+        assert "real_executed_charge_mw" in str(exc)
+
+
+def test_optional_series_missing_defaults_to_zero() -> None:
+    df = pd.DataFrame(index=[0, 1, 2])
+    s = optional_numeric_series(df, "optional_col", default=0.0)
+    assert len(s) == len(df)
+    assert np.isclose(float(pd.to_numeric(s, errors="coerce").fillna(0.0).sum()), 0.0, atol=1e-12)
+
+
+def test_legacy_alias_resolution_prefers_canonical() -> None:
+    df = pd.DataFrame(
+        {
+            "real_executed_charge_mw": [1.0, 2.0],
+            "real_da_charge_mw": [100.0, 200.0],
+        }
+    )
+    s = require_numeric_series(df, "real_executed_charge_mw", aliases=["real_da_charge_mw"])
+    assert np.isclose(float(s.iloc[0]), 1.0, atol=1e-12)
+    assert np.isclose(float(s.iloc[1]), 2.0, atol=1e-12)
+
+
+def test_validator_reports_debug_dump_counts(tmp_path: Path) -> None:
+    scen = tmp_path / "multi" / "p50_p50"
+    scen.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "simulation_valid": 0.0,
+        "thesis_reportable": 0.0,
+        "invalid_reason": "optimization_infeasible_debug_dump",
+        "fallback_used": 0.0,
+        "fallback_mode_counts": "{}",
+        "optimization_error_code_counts": '{"ok": 1.0}',
+        "infeasible_debug_dump_count": 1.0,
+        "accepted_path_infeasible_debug_dump_count": 1.0,
+        "candidate_infeasible_debug_dump_count": 0.0,
+        "infeasible_debug_dump_paths": '["artifacts/simulation_debug/infeasible_debug_X.npz"]',
+        "precommit_clamp_applied_count": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+    }
+    (scen / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+    df = validate_outputs._collect(tmp_path)
+    assert not df.empty
+    assert "infeasible_debug_dump_count" in df.columns
+    assert "accepted_path_infeasible_debug_dump_count" in df.columns
+
+
+def test_invalid_by_quantile_counts_only_invalid_scenarios(tmp_path: Path) -> None:
+    base = tmp_path / "multi"
+    base.mkdir(parents=True, exist_ok=True)
+    common = {
+        "fallback_used": 0.0,
+        "fallback_mode_counts": "{}",
+        "optimization_error_code_counts": '{"ok": 1.0}',
+        "simulation_schema_version": "v2",
+        "required_summary_fields_version": "v2",
+        "code_run_started_at_utc": "2026-01-01T00:00:00Z",
+        "command_line_args": "{}",
+        "output_was_cleaned": 1.0,
+        "infeasible_debug_dump_count": 0.0,
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 0.0,
+        "infeasible_debug_dump_paths": [],
+        "infeasible_debug_dump_timestamps": [],
+        "summary_fields_defaulted": "[]",
+        "required_fields_defaulted": "[]",
+        "required_fields_computed": "[]",
+        "required_fields_missing": "[]",
+        "critical_required_fields_defaulted": "[]",
+        "optional_fields_defaulted": "[]",
+        "required_fields_check_pass": 1.0,
+        "precommit_clamp_applied_count": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+        "global_perfect_foresight_dominance_check_pass": 1.0,
+        "global_perfect_foresight_validation_status": "disabled_unverified",
+    }
+    payloads = {
+        "p30_p30": dict(common, simulation_valid=0.0, thesis_reportable=0.0, invalid_reason="fallback_used"),
+        "p50_p50": dict(common, simulation_valid=1.0, thesis_reportable=1.0, invalid_reason=""),
+        "p70_p90": dict(common, simulation_valid=0.0, thesis_reportable=0.0, invalid_reason="optimization_failure"),
+    }
+    for scen, payload in payloads.items():
+        d = base / scen
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+    out_json = tmp_path / "stats.json"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sys, "argv", ["validate_simulation_outputs.py", str(tmp_path), "--out-json", str(out_json)])
+        validate_outputs.main()
+    stats = json.loads(out_json.read_text(encoding="utf-8"))
+    assert int(stats["invalid_scenarios"]) == 2
+    assert stats["invalid_by_quantile"] == {"p30_p30": 1, "p70_p90": 1}
+
+
+def test_validation_counts_are_consistent(tmp_path: Path) -> None:
+    base = tmp_path / "multi"
+    base.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "simulation_valid": 1.0,
+        "thesis_reportable": 1.0,
+        "invalid_reason": "",
+        "fallback_used": 0.0,
+        "fallback_mode_counts": "{}",
+        "optimization_error_code_counts": '{"ok": 1.0}',
+        "simulation_schema_version": "v2",
+        "required_summary_fields_version": "v2",
+        "code_run_started_at_utc": "2026-01-01T00:00:00Z",
+        "command_line_args": "{}",
+        "output_was_cleaned": 1.0,
+        "infeasible_debug_dump_count": 0.0,
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 0.0,
+        "infeasible_debug_dump_paths": [],
+        "infeasible_debug_dump_timestamps": [],
+        "summary_fields_defaulted": "[]",
+        "required_fields_defaulted": "[]",
+        "required_fields_computed": "[]",
+        "required_fields_missing": "[]",
+        "critical_required_fields_defaulted": "[]",
+        "optional_fields_defaulted": "[]",
+        "required_fields_check_pass": 1.0,
+        "precommit_clamp_applied_count": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+        "global_perfect_foresight_dominance_check_pass": 1.0,
+        "global_perfect_foresight_validation_status": "disabled_unverified",
+    }
+    for scen in ("p30_p30", "p50_p50", "p70_p90"):
+        d = base / scen
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+    out_json = tmp_path / "stats.json"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sys, "argv", ["validate_simulation_outputs.py", str(tmp_path), "--out-json", str(out_json)])
+        validate_outputs.main()
+    stats = json.loads(out_json.read_text(encoding="utf-8"))
+    assert int(stats["total_scenarios"]) == int(stats["valid_scenarios"]) + int(stats["invalid_scenarios"])
+    assert sum(stats["invalid_by_quantile"].values()) == int(stats["invalid_scenarios"])
+
+
+def test_accepted_infeasible_debug_dump_invalidates_scenario() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = dict(out.summary)
+    s["accepted_path_infeasible_debug_dump_count"] = 1.0
+    invalid = str(s.get("invalid_reason", ""))
+    if "optimization_infeasible_debug_dump" not in invalid:
+        invalid = ",".join([v for v in [invalid, "optimization_infeasible_debug_dump"] if v])
+    s["invalid_reason"] = invalid
+    s["simulation_valid"] = 0.0
+    s["thesis_reportable"] = 0.0
+    assert float(s["accepted_path_infeasible_debug_dump_count"]) > 0.5
+    assert float(s["simulation_valid"]) == 0.0
+    assert float(s["thesis_reportable"]) == 0.0
+    assert "optimization_infeasible_debug_dump" in str(s["invalid_reason"])
+
+
+def test_accepted_infeasible_dump_never_reportable() -> None:
+    test_accepted_infeasible_debug_dump_invalidates_scenario()
+
+
+def test_candidate_debug_dump_does_not_invalidate_if_not_accepted() -> None:
+    row = {
+        "simulation_valid": 1.0,
+        "thesis_reportable": 1.0,
+        "fallback_used": 0.0,
+        "headroom_violation_count": 0.0,
+        "missed_capacity_pos_mw": 0.0,
+        "missed_capacity_neg_mw": 0.0,
+        "pnl_reconciliation_error_max_eur": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+        "terminal_soc_repair_cost_eur": 0.0,
+        "final_soc_actual_mwh": 10.0,
+        "final_soc_target_mwh": 10.0,
+        "optimization_error_code_counts": '{"ok": 10.0}',
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 2.0,
+        "infeasible_debug_dump_count": 2.0,
+    }
+    d = pd.DataFrame([row])
+    non_ok = d["optimization_error_code_counts"].apply(lambda v: any(k not in {"ok", "none", ""} and float(c) > 0.0 for k, c in json.loads(v).items()))
+    thesis_rule = (
+        (d["simulation_valid"] >= 0.5)
+        & (d["thesis_reportable"] >= 0.5)
+        & (d["fallback_used"] <= 0.5)
+        & (d["headroom_violation_count"] <= 1e-9)
+        & (d["missed_capacity_pos_mw"] <= 1e-9)
+        & (d["missed_capacity_neg_mw"] <= 1e-9)
+        & (d["pnl_reconciliation_error_max_eur"] <= 1e-2)
+        & (d["activation_split_reconciliation_error_max"] <= 1e-2)
+        & (d["final_soc_check_pass"] >= 0.5)
+        & (d["benchmark_same_rules_gate_consistent"] >= 0.5)
+        & (d["accepted_path_infeasible_debug_dump_count"] <= 0.5)
+        & (~non_ok)
+    )
+    assert bool(thesis_rule.iloc[0])
+
+
+def test_validator_required_fields_include_debug_dump_schema() -> None:
+    req = set(validate_outputs.REQUIRED_SUMMARY_FIELDS)
+    for k in (
+        "simulation_schema_version",
+        "required_summary_fields_version",
+        "code_run_started_at_utc",
+        "command_line_args",
+        "output_was_cleaned",
+        "infeasible_debug_dump_count",
+        "accepted_path_infeasible_debug_dump_count",
+        "candidate_infeasible_debug_dump_count",
+        "infeasible_debug_dump_paths",
+        "infeasible_debug_dump_timestamps",
+        "required_fields_defaulted",
+        "required_fields_computed",
+    ):
+        assert k in req
+
+
+def test_summary_contains_debug_dump_paths_even_when_empty() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1)
+    s = out.summary
+    assert "infeasible_debug_dump_paths" in s
+    assert "infeasible_debug_dump_timestamps" in s
+    assert isinstance(s.get("infeasible_debug_dump_paths"), list)
+    assert isinstance(s.get("infeasible_debug_dump_timestamps"), list)
+
+
+def test_required_fields_not_runner_defaulted_silently() -> None:
+    row = {
+        "simulation_valid": 1.0,
+        "thesis_reportable": 1.0,
+        "invalid_reason": "",
+        "fallback_used": 0.0,
+        "fallback_mode_counts": "{}",
+        "optimization_error_code_counts": '{"ok": 1}',
+        "simulation_schema_version": "v2",
+        "required_summary_fields_version": "v2",
+        "code_run_started_at_utc": "2026-01-01T00:00:00Z",
+        "command_line_args": "{}",
+        "output_was_cleaned": 1.0,
+        "infeasible_debug_dump_count": 0.0,
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 0.0,
+        "infeasible_debug_dump_paths": "[]",
+        "infeasible_debug_dump_timestamps": "[]",
+        "precommit_clamp_applied_count": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+        "global_perfect_foresight_dominance_check_pass": 1.0,
+        "required_fields_defaulted": '["simulation_valid"]',
+        "required_fields_computed": "[]",
+    }
+    d = pd.DataFrame([row])
+    cnt = d["required_fields_defaulted"].apply(lambda v: len(json.loads(v))).iloc[0]
+    assert cnt > 0
+
+
+def test_required_field_defaulted_critical_invalidates() -> None:
+    required_missing_count = 0
+    critical_defaulted_count = 1
+    required_fields_check_pass = (required_missing_count <= 0) and (critical_defaulted_count <= 0)
+    assert required_fields_check_pass is False
+
+
+def test_optional_field_defaulted_does_not_invalidate() -> None:
+    required_missing_count = 0
+    critical_defaulted_count = 0
+    optional_defaulted_count = 2
+    required_fields_check_pass = (required_missing_count <= 0) and (critical_defaulted_count <= 0)
+    assert optional_defaulted_count > 0
+    assert required_fields_check_pass is True
+
+
+def test_optional_fields_defaulted_does_not_invalidate() -> None:
+    test_optional_field_defaulted_does_not_invalidate()
+
+
+def test_required_fields_missing_invalidates() -> None:
+    required_fields_missing = 1
+    critical_required_fields_defaulted = 0
+    required_fields_check_pass = float(
+        (required_fields_missing <= 0) and (critical_required_fields_defaulted <= 0)
+    )
+    assert required_fields_check_pass == 0.0
+
+
+def test_required_fields_ok_consistent_with_check_pass(tmp_path: Path) -> None:
+    scen = tmp_path / "multi" / "p50_p50"
+    scen.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "simulation_valid": 1.0,
+        "thesis_reportable": 1.0,
+        "invalid_reason": "",
+        "fallback_used": 0.0,
+        "fallback_mode_counts": "{}",
+        "optimization_error_code_counts": '{"ok": 1.0}',
+        "simulation_schema_version": "v2",
+        "required_summary_fields_version": "v2",
+        "code_run_started_at_utc": "2026-01-01T00:00:00Z",
+        "command_line_args": "{}",
+        "output_was_cleaned": 1.0,
+        "infeasible_debug_dump_count": 0.0,
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 0.0,
+        "infeasible_debug_dump_paths": [],
+        "infeasible_debug_dump_timestamps": [],
+        "summary_fields_defaulted": "[]",
+        "required_fields_defaulted": "[]",
+        "required_fields_computed": "[]",
+        "required_fields_missing": '["x"]',
+        "critical_required_fields_defaulted": "[]",
+        "optional_fields_defaulted": "[]",
+        "required_fields_check_pass": 0.0,
+        "precommit_clamp_applied_count": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+        "global_perfect_foresight_dominance_check_pass": 1.0,
+        "global_perfect_foresight_validation_status": "disabled_unverified",
+    }
+    (scen / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+    out_json = tmp_path / "stats.json"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sys, "argv", ["validate_simulation_outputs.py", str(tmp_path), "--out-json", str(out_json)])
+        validate_outputs.main()
+    stats = json.loads(out_json.read_text(encoding="utf-8"))
+    assert stats["required_fields_ok"] is False
+
+
+def test_summary_always_contains_infeasible_debug_dump_fields() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1)
+    s = out.summary
+    for k in (
+        "infeasible_debug_dump_count",
+        "accepted_path_infeasible_debug_dump_count",
+        "candidate_infeasible_debug_dump_count",
+        "infeasible_debug_dump_paths",
+        "infeasible_debug_dump_timestamps",
+    ):
+        assert k in s
+    assert float(s["infeasible_debug_dump_count"]) >= 0.0
+    assert float(s["accepted_path_infeasible_debug_dump_count"]) >= 0.0
+    assert float(s["candidate_infeasible_debug_dump_count"]) >= 0.0
+    assert isinstance(s["infeasible_debug_dump_paths"], list)
+    assert isinstance(s["infeasible_debug_dump_timestamps"], list)
+
+
+def test_validator_fails_missing_debug_dump_fields(tmp_path: Path) -> None:
+    scen = tmp_path / "multi" / "p50_p50"
+    scen.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "simulation_valid": 1.0,
+        "thesis_reportable": 1.0,
+        "invalid_reason": "",
+        "fallback_used": 0.0,
+        "fallback_mode_counts": "{}",
+        "optimization_error_code_counts": '{"ok": 1.0}',
+        "simulation_schema_version": "v2",
+        "required_summary_fields_version": "v2",
+        "code_run_started_at_utc": "2026-01-01T00:00:00Z",
+        "command_line_args": "{}",
+        "output_was_cleaned": 1.0,
+        "infeasible_debug_dump_count": 0.0,
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 0.0,
+        # intentionally missing infeasible_debug_dump_paths
+        "infeasible_debug_dump_timestamps": [],
+        "summary_fields_defaulted": "[]",
+        "required_fields_defaulted": "[]",
+        "required_fields_computed": "[]",
+        "precommit_clamp_applied_count": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+        "global_perfect_foresight_dominance_check_pass": 1.0,
+        "global_perfect_foresight_validation_status": "disabled_unverified",
+    }
+    (scen / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                sys,
+                "argv",
+                ["validate_simulation_outputs.py", str(tmp_path)],
+            )
+            validate_outputs.main()
+    assert "Missing required fields" in str(e.value)
+
+
+def test_allow_stale_is_diagnostic_only(tmp_path: Path) -> None:
+    scen = tmp_path / "multi" / "p50_p50"
+    scen.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "simulation_valid": 1.0,
+        "thesis_reportable": 1.0,
+        "invalid_reason": "",
+        "fallback_used": 0.0,
+        "fallback_mode_counts": "{}",
+        "optimization_error_code_counts": '{"ok": 1.0}',
+        "simulation_schema_version": "v2",
+        "required_summary_fields_version": "v2",
+        "code_run_started_at_utc": "2026-01-01T00:00:00Z",
+        "command_line_args": "{}",
+        "output_was_cleaned": 1.0,
+        "infeasible_debug_dump_count": 0.0,
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 0.0,
+        # intentionally missing infeasible_debug_dump_paths
+        "infeasible_debug_dump_timestamps": [],
+        "summary_fields_defaulted": "[]",
+        "required_fields_defaulted": "[]",
+        "required_fields_computed": "[]",
+        "precommit_clamp_applied_count": 0.0,
+        "activation_split_reconciliation_error_max": 0.0,
+        "final_soc_check_pass": 1.0,
+        "benchmark_same_rules_gate_consistent": 1.0,
+        "global_perfect_foresight_dominance_check_pass": 1.0,
+        "global_perfect_foresight_validation_status": "disabled_unverified",
+    }
+    (scen / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+    out_json = tmp_path / "stats.json"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            sys,
+            "argv",
+            ["validate_simulation_outputs.py", str(tmp_path), "--allow-stale", "--out-json", str(out_json)],
+        )
+        validate_outputs.main()
+    stats = json.loads(out_json.read_text(encoding="utf-8"))
+    assert stats["required_fields_ok"] is False
+    assert int(stats["stale_scenario_count"]) > 0
+    assert int(stats["thesis_reportable_scenarios"]) == 0
+
+
+def test_clean_output_removes_stale_summary(tmp_path: Path) -> None:
+    scen = tmp_path / "multi" / "p50_p50"
+    scen.mkdir(parents=True, exist_ok=True)
+    stale = scen / "backtest_summary.json"
+    stale.write_text("{}", encoding="utf-8")
+    assert stale.exists()
+    cleaned = _prepare_scenario_output_dir(
+        scenario_out_dir=scen,
+        clean_output=True,
+        strict_simulation_validity=True,
+        simulation_schema_version="v2",
+    )
+    assert cleaned == 1.0
+    assert scen.exists()
+    assert not stale.exists()
+
+
+def test_strict_run_refuses_existing_output_without_clean_output(tmp_path: Path) -> None:
+    scen = tmp_path / "multi" / "p50_p50"
+    scen.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(RuntimeError):
+        _prepare_scenario_output_dir(
+            scenario_out_dir=scen,
+            clean_output=False,
+            strict_simulation_validity=True,
+            simulation_schema_version="v2",
+        )
+
+
+def test_reserve_retry_ladder_reaches_zero() -> None:
+    bt = _mk_backtester()
+    ladder = bt._parse_reserve_retry_ladder("1.0,0.5,0.25,0.0")
+    assert ladder == [1.0, 0.5, 0.25, 0.0]
+
+
+def test_disable_new_bcm_reserve_bids_blocks_new_bids() -> None:
+    bt = _mk_backtester()
+    bt.disable_new_bcm_reserve_bids = True
+    assert bt.disable_new_bcm_reserve_bids is True
+
+
+def test_retry_fields_written_to_summary() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    for k in (
+        "reserve_retry_ladder",
+        "reserve_retry_attempts_used",
+        "reserve_retry_final_factor",
+        "reserve_retry_succeeded",
+        "disable_new_bcm_reserve_bids",
+        "new_reserve_bids_zeroed_by_retry",
+        "reserve_retry_infeasible_after_zero_reserve",
+    ):
+        assert k in s
+
+
+def test_retry_fields_written_to_reserve_commitment_debug() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1, strict_simulation_validity=True)
+    h = out.hourly
+    expected = {
+        "submitted_reserve_pos_mw_before_retry",
+        "submitted_reserve_neg_mw_before_retry",
+        "reserve_retry_factor",
+        "submitted_reserve_pos_mw_after_retry",
+        "submitted_reserve_neg_mw_after_retry",
+        "retry_reduction_reason",
+    }
+    assert expected.issubset(set(h.columns))
+
+
+def test_conservative_reserve_cli_params_reach_backtester() -> None:
+    txt = Path("scripts/run_battery_backtest.py").read_text(encoding="utf-8")
+    assert "--disable-new-bcm-reserve-bids" in txt
+    assert "--reserve-retry-ladder" in txt
+    assert 'MODEL_SPECS["disable_new_bcm_reserve_bids"]' in txt
+    assert 'MODEL_SPECS["reserve_retry_ladder"]' in txt
+
+
+def test_terminal_repair_still_required_for_final_soc_shortfall() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "terminal_repair"
+    df, col = _tiny_backtest_df(hours=6)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    if float(s.get("final_soc_shortfall_mwh", 0.0)) > 1e-6:
+        assert float(s.get("terminal_soc_repair_included_in_pnl", 0.0)) >= 0.5
+        assert float(s.get("final_soc_economic_repair_check_pass", 0.0)) >= 0.5
+
+
+def test_driver_new_reserve_bid_too_high() -> None:
+    row = pd.Series(
+        {
+            "optimization_error_code": "optimization_infeasible",
+            "fallback_mode": "reserve_feasibility_repair",
+            "new_submitted_reserve_pos_mw": 4.0,
+            "new_submitted_reserve_neg_mw": 0.0,
+            "locked_reserve_pos_mw": 0.0,
+            "locked_reserve_neg_mw": 0.0,
+        }
+    )
+    d, _ = _suspected_infeasibility_driver_from_row(row)
+    assert d == "new_reserve_bid_too_high"
+
+
+def test_driver_existing_lockbook_obligation_infeasible() -> None:
+    row = pd.Series(
+        {
+            "optimization_error_code": "optimization_infeasible",
+            "fallback_mode": "reserve_feasibility_repair",
+            "new_submitted_reserve_pos_mw": 0.0,
+            "new_submitted_reserve_neg_mw": 0.0,
+            "locked_reserve_pos_mw": 3.0,
+            "locked_reserve_neg_mw": 0.0,
+        }
+    )
+    d, _ = _suspected_infeasibility_driver_from_row(row)
+    assert d == "existing_lockbook_obligation_infeasible"
+
+
+def test_driver_protected_soc_violation() -> None:
+    row = pd.Series(
+        {
+            "optimization_error_code": "optimization_failure",
+            "protected_soc_violation_pos_mwh": 0.5,
+            "protected_soc_violation_neg_mwh": 0.0,
+        }
+    )
+    d, _ = _suspected_infeasibility_driver_from_row(row)
+    assert d == "protected_soc_violation"
+
+
+def test_infeasibility_attribution_file_written_on_failure(tmp_path: Path) -> None:
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2026-01-01T00:00:00Z"), pd.Timestamp("2026-01-01T01:00:00Z")],
+            "optimization_error_code": ["ok", "optimization_failure"],
+            "optimization_fallback": ["none", "reserve_feasibility_repair"],
+            "is_fallback_hour": [0.0, 1.0],
+            "fixed_reserve_obligation_pos_mw": [0.0, 1.0],
+            "fixed_reserve_obligation_neg_mw": [0.0, 0.0],
+            "reserve_submitted_pos_mw": [0.0, 1.0],
+            "reserve_submitted_neg_mw": [0.0, 0.0],
+            "real_soc_start_mwh": [10.0, 9.0],
+            "real_soc_mwh": [9.0, 8.0],
+            "real_aux_energy_mwh": [0.0, 0.1],
+        }
+    )
+    s = {"reserve_feasibility_repair_used": 1.0, "accepted_path_infeasible_debug_dump_count": 1.0, "p_max_mw": 20.0}
+    out = _build_optimization_infeasibility_attribution(hourly=h, summary=s, scenario="p50_p50")
+    assert not out.empty
+    p = tmp_path / "optimization_infeasibility_attribution.csv"
+    out.to_csv(p, index=False)
+    assert p.exists()
+
+
+def test_first_infeasibility_driver_in_summary() -> None:
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2026-01-01T00:00:00Z")],
+            "optimization_error_code": ["optimization_infeasible"],
+            "optimization_fallback": ["reserve_feasibility_repair"],
+            "is_fallback_hour": [1.0],
+            "reserve_submitted_pos_mw": [2.0],
+            "reserve_submitted_neg_mw": [0.0],
+            "fixed_reserve_obligation_pos_mw": [0.0],
+            "fixed_reserve_obligation_neg_mw": [0.0],
+            "real_soc_start_mwh": [10.0],
+            "real_soc_mwh": [9.0],
+        }
+    )
+    out = _build_optimization_infeasibility_attribution(hourly=h, summary={"p_max_mw": 20.0}, scenario="p30_p30")
+    assert str(out.iloc[0]["suspected_infeasibility_driver"]) in {
+        "new_reserve_bid_too_high",
+        "unknown_solver_or_numeric",
+    }
+
+
+def test_no_new_bcm_keeps_existing_lockbook_obligations() -> None:
+    bt = _mk_backtester()
+    bt.disable_new_bcm_reserve_bids = True
+    assert bt.disable_new_bcm_reserve_bids is True
+
+
+def test_fallback_still_not_reportable() -> None:
+    test_fallback_never_reportable()

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LIMIT_BYTES=1073741824  # 1 GiB
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    range="$local_sha"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  while IFS= read -r line; do
+    oid="${line%% *}"
+    path="${line#* }"
+    size="$(git cat-file -s "$oid" 2>/dev/null || echo 0)"
+    if [ "$size" -gt "$LIMIT_BYTES" ]; then
+      echo "[BLOCKED] Blob >1GB: $path ($size bytes, oid=$oid)" >&2
+      status=1
+    fi
+  done < <(git rev-list --objects "$range")
+done
+
+if [ "$status" -ne 0 ]; then
+  echo "Push rejected: one or more files exceed 1GB." >&2
+  exit 1
+fi
+
+exit 0

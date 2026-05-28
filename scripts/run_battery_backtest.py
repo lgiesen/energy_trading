@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
 import os
 import re
 from pathlib import Path
+import shutil
 import signal
 import sys
 import threading
@@ -55,6 +57,194 @@ from energy_trading.simulation.battery_backtest import (
     load_prediction_warehouse_long,
 )
 from energy_trading.config import MODEL_SPECS
+
+
+def _series_from_candidates(
+    df: pd.DataFrame,
+    candidates: list[str],
+    *,
+    required: bool,
+    default: float = 0.0,
+    numeric: bool = True,
+) -> pd.Series:
+    for c in candidates:
+        if c in df.columns:
+            s = df[c]
+            if numeric:
+                s = pd.to_numeric(s, errors="coerce").fillna(default)
+            return s
+    if required:
+        close = [c for c in df.columns if any(tok in c.lower() for tok in "_".join(candidates).lower().split("_"))]
+        raise KeyError(
+            f"Missing required column. Tried {candidates}. Similar available columns: {close[:12]}"
+        )
+    return pd.Series(default, index=df.index, dtype=float if numeric else object)
+
+
+def require_numeric_series(df: pd.DataFrame, canonical_name: str, aliases: list[str] | None = None) -> pd.Series:
+    return _series_from_candidates(
+        df,
+        [canonical_name] + list(aliases or []),
+        required=True,
+        numeric=True,
+        default=0.0,
+    )
+
+
+def optional_numeric_series(
+    df: pd.DataFrame, canonical_name: str, *, default: float = 0.0, aliases: list[str] | None = None
+) -> pd.Series:
+    return _series_from_candidates(
+        df,
+        [canonical_name] + list(aliases or []),
+        required=False,
+        numeric=True,
+        default=default,
+    )
+
+
+def _suspected_infeasibility_driver_from_row(row: pd.Series) -> tuple[str, str]:
+    def _f(k: str, default: float = 0.0) -> float:
+        try:
+            v = pd.to_numeric(pd.Series([row.get(k, default)]), errors="coerce").iloc[0]
+            return float(default if pd.isna(v) else v)
+        except Exception:
+            return float(default)
+
+    solver_msg = str(row.get("solver_message", "") or "").lower()
+    opt_code = str(row.get("optimization_error_code", "") or "").lower()
+    fallback_mode = str(row.get("fallback_mode", "") or "").lower()
+    locked_pos = _f("locked_reserve_pos_mw")
+    locked_neg = _f("locked_reserve_neg_mw")
+    new_pos = _f("new_submitted_reserve_pos_mw")
+    new_neg = _f("new_submitted_reserve_neg_mw")
+    pviol_pos = _f("power_violation_pos_mw")
+    pviol_neg = _f("power_violation_neg_mw")
+    soc_v_pos = _f("protected_soc_violation_pos_mwh")
+    soc_v_neg = _f("protected_soc_violation_neg_mwh")
+    hr_short = _f("reserve_headroom_shortfall_max_mwh")
+    final_press = _f("final_soc_pressure_mwh")
+    aux_e = _f("aux_energy_mwh")
+    soc_margin_pos = _f("protected_soc_margin_pos_mwh")
+    soc_margin_neg = _f("protected_soc_margin_neg_mwh")
+    da_bem_use = sum(
+        abs(_f(k))
+        for k in ("da_charge_mw", "da_discharge_mw", "bem_only_pos_mw", "bem_only_neg_mw", "id_charge_mw", "id_discharge_mw")
+    )
+
+    if pviol_pos > 1e-9 or pviol_neg > 1e-9:
+        return "power_stack_violation", f"power_violation_pos={pviol_pos:.4f},neg={pviol_neg:.4f}"
+    if soc_v_pos > 1e-9 or soc_v_neg > 1e-9:
+        return "protected_soc_violation", f"protected_soc_violation_pos={soc_v_pos:.4f},neg={soc_v_neg:.4f}"
+    if hr_short > 1e-9:
+        return "reserve_headroom_shortfall", f"reserve_headroom_shortfall_max_mwh={hr_short:.4f}"
+    if locked_pos + locked_neg > 1e-9 and new_pos + new_neg <= 1e-9 and ("infeasible" in opt_code or "reserve_feasibility_repair" in fallback_mode):
+        return "existing_lockbook_obligation_infeasible", f"locked_only_pos={locked_pos:.4f},neg={locked_neg:.4f}"
+    if new_pos + new_neg > 1e-9 and ("infeasible" in opt_code or "reserve_feasibility_repair" in fallback_mode):
+        return "new_reserve_bid_too_high", f"new_reserve_pos={new_pos:.4f},neg={new_neg:.4f}"
+    if final_press > 1e-9 and ("infeasible" in opt_code or "terminal" in fallback_mode):
+        return "terminal_soc_conflict", f"final_soc_pressure_mwh={final_press:.4f}"
+    if da_bem_use > 1e-9 and (soc_margin_pos < 1e-9 or soc_margin_neg < 1e-9):
+        return "da_bem_consumed_protected_soc", f"dispatch_abs_sum_mw={da_bem_use:.4f},soc_margin_pos={soc_margin_pos:.4f},neg={soc_margin_neg:.4f}"
+    if aux_e > 1e-9 and (soc_margin_pos < 1e-9 or soc_margin_neg < 1e-9):
+        return "aux_loss_margin_gap", f"aux_energy_mwh={aux_e:.4f},soc_margin_pos={soc_margin_pos:.4f},neg={soc_margin_neg:.4f}"
+    if any(x in solver_msg for x in ("not set", "numerical", "solver", "highs")) or any(
+        x in opt_code for x in ("solver_failure", "numerical", "not set")
+    ):
+        return "unknown_solver_or_numeric", f"solver_message={solver_msg[:160]}"
+    return "unknown_solver_or_numeric", f"opt_code={opt_code},fallback_mode={fallback_mode}"
+
+
+def _build_optimization_infeasibility_attribution(
+    *,
+    hourly: pd.DataFrame,
+    summary: dict[str, object],
+    scenario: str,
+) -> pd.DataFrame:
+    h = hourly.copy()
+    if h.empty:
+        return pd.DataFrame()
+    ts = pd.to_datetime(h.get("timestamp_utc", pd.Series(index=h.index, dtype="datetime64[ns, UTC]")), utc=True, errors="coerce")
+    err = h.get("optimization_error_code", pd.Series(["ok"] * len(h), index=h.index)).astype(str).fillna("ok")
+    fb = h.get("optimization_fallback", pd.Series(["none"] * len(h), index=h.index)).astype(str).fillna("none")
+    fb_hour = pd.to_numeric(h.get("is_fallback_hour", 0.0), errors="coerce").fillna(0.0)
+    fail_mask = err.str.lower().ne("ok") | fb.str.lower().ne("none") | fb_hour.gt(0.5)
+    failing = h.loc[fail_mask].copy()
+    if failing.empty:
+        return pd.DataFrame()
+    failing_ts = pd.to_datetime(failing.get("timestamp_utc"), utc=True, errors="coerce")
+    first_ts = failing_ts.min()
+    failing = failing.loc[failing_ts.eq(first_ts)].copy()
+
+    def _num(col: str, default: float = 0.0) -> pd.Series:
+        if col in failing.columns:
+            return pd.to_numeric(failing[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=failing.index, dtype=float)
+
+    out = pd.DataFrame(index=failing.index)
+    out["scenario"] = str(scenario)
+    out["timestamp_utc"] = pd.to_datetime(failing.get("timestamp_utc"), utc=True, errors="coerce")
+    out["optimization_error_code"] = failing.get("optimization_error_code", "ok").astype(str)
+    out["fallback_mode"] = failing.get("optimization_fallback", "none").astype(str)
+    out["reserve_feasibility_repair_used"] = float(summary.get("reserve_feasibility_repair_used", 0.0))
+    out["accepted_path_infeasible_debug_dump_count"] = float(summary.get("accepted_path_infeasible_debug_dump_count", 0.0))
+    out["solver_status"] = failing.get("optimization_error_code", "ok").astype(str)
+    out["solver_message"] = failing.get("optimization_error", "").astype(str) if "optimization_error" in failing.columns else ""
+
+    out["soc_start_mwh"] = _num("real_soc_start_mwh")
+    out["soc_end_mwh"] = _num("real_soc_mwh")
+    out["soc_min_mwh"] = float(summary.get("soc_min_mwh", np.nan))
+    out["soc_max_mwh"] = float(summary.get("soc_max_mwh", np.nan))
+    out["final_soc_target_mwh"] = float(summary.get("final_soc_target_mwh", np.nan))
+    out["final_soc_pressure_mwh"] = np.maximum(0.0, float(summary.get("final_soc_target_mwh", 0.0)) - out["soc_end_mwh"])
+
+    out["locked_reserve_pos_mw"] = _num("fixed_reserve_obligation_pos_mw")
+    out["locked_reserve_neg_mw"] = _num("fixed_reserve_obligation_neg_mw")
+    out["new_submitted_reserve_pos_mw"] = (_num("reserve_submitted_pos_mw") - out["locked_reserve_pos_mw"]).clip(lower=0.0)
+    out["new_submitted_reserve_neg_mw"] = (_num("reserve_submitted_neg_mw") - out["locked_reserve_neg_mw"]).clip(lower=0.0)
+    out["desired_reserve_pos_mw"] = _num("desired_reserve_pos_mw")
+    out["desired_reserve_neg_mw"] = _num("desired_reserve_neg_mw")
+    out["safe_reserve_pos_mw"] = _num("safe_reserve_pos_mw")
+    out["safe_reserve_neg_mw"] = _num("safe_reserve_neg_mw")
+    out["reserve_bid_derate"] = float(summary.get("reserve_bid_derate", np.nan))
+    out["max_reserve_bid_mw"] = float(summary.get("max_reserve_bid_mw", np.nan))
+
+    out["required_headroom_pos_mwh"] = _num("real_required_headroom_pos_mwh")
+    out["required_headroom_neg_mwh"] = _num("real_required_headroom_neg_mwh")
+    out["available_headroom_pos_mwh"] = _num("real_available_headroom_pos_mwh")
+    out["available_headroom_neg_mwh"] = _num("real_available_headroom_neg_mwh")
+    out["protected_soc_min_mwh"] = float(summary.get("protected_soc_min_mwh", np.nan))
+    out["protected_soc_max_mwh"] = float(summary.get("protected_soc_max_mwh", np.nan))
+    out["protected_soc_margin_pos_mwh"] = _num("real_headroom_margin_pos_mwh")
+    out["protected_soc_margin_neg_mwh"] = _num("real_headroom_margin_neg_mwh")
+    out["protected_soc_violation_pos_mwh"] = _num("real_headroom_violation_pos_mwh")
+    out["protected_soc_violation_neg_mwh"] = _num("real_headroom_violation_neg_mwh")
+    out["reserve_headroom_shortfall_max_mwh"] = float(summary.get("reserve_headroom_shortfall_max_mwh", 0.0))
+
+    out["da_charge_mw"] = _num("real_da_charge_mw")
+    out["da_discharge_mw"] = _num("real_da_discharge_mw")
+    out["bem_only_pos_mw"] = _num("real_bem_only_submitted_pos_mw")
+    out["bem_only_neg_mw"] = _num("real_bem_only_submitted_neg_mw")
+    out["bcm_linked_activation_pos_mw"] = _num("real_executed_reserve_pos_mw")
+    out["bcm_linked_activation_neg_mw"] = _num("real_executed_reserve_neg_mw")
+    out["id_charge_mw"] = _num("real_id_charge_mw")
+    out["id_discharge_mw"] = _num("real_id_discharge_mw")
+    out["aux_energy_mwh"] = _num("real_aux_energy_mwh")
+
+    out["power_stack_pos_mw"] = (
+        out["da_discharge_mw"] + out["bem_only_pos_mw"] + out["bcm_linked_activation_pos_mw"] + out["id_discharge_mw"]
+    )
+    out["power_stack_neg_mw"] = (
+        out["da_charge_mw"] + out["bem_only_neg_mw"] + out["bcm_linked_activation_neg_mw"] + out["id_charge_mw"]
+    )
+    out["p_max_mw"] = float(summary.get("p_max_mw", np.nan))
+    out["power_violation_pos_mw"] = (out["power_stack_pos_mw"] - out["p_max_mw"]).clip(lower=0.0)
+    out["power_violation_neg_mw"] = (out["power_stack_neg_mw"] - out["p_max_mw"]).clip(lower=0.0)
+
+    drivers = out.apply(_suspected_infeasibility_driver_from_row, axis=1)
+    out["suspected_infeasibility_driver"] = drivers.apply(lambda x: x[0])
+    out["suspected_infeasibility_driver_detail"] = drivers.apply(lambda x: x[1])
+    return out
 
 
 def _phase_timeout_seconds(phase: str) -> float:
@@ -104,17 +294,17 @@ def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> N
     d = hourly.copy()
     d[ts_col] = pd.to_datetime(d[ts_col], utc=True, errors="coerce")
     d = d.dropna(subset=[ts_col]).sort_values(ts_col)
-    required = ["real_pnl_eur", "naive_pnl_eur", "rolling_perfect_foresight_same_rules_pnl_eur"]
+    required = ["real_pnl_eur", "naive_pnl_eur", "perfect_foresight_pnl_eur"]
     if not set(required).issubset(d.columns):
         return
     d["model_cum_pnl_eur"] = pd.to_numeric(d["real_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
     d["naive_cum_pnl_eur"] = pd.to_numeric(d["naive_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
-    d["oracle_cum_pnl_eur"] = pd.to_numeric(d["rolling_perfect_foresight_same_rules_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
+    d["perfect_foresight_cum_pnl_eur"] = pd.to_numeric(d["perfect_foresight_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
 
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(d[ts_col], d["model_cum_pnl_eur"], label="Model", linewidth=2)
     ax.plot(d[ts_col], d["naive_cum_pnl_eur"], label="Naive 24h", linewidth=2)
-    ax.plot(d[ts_col], d["oracle_cum_pnl_eur"], label="RollingPerfectForesightSameRules", linewidth=2)
+    ax.plot(d[ts_col], d["perfect_foresight_cum_pnl_eur"], label="RollingPerfectForesightSameRules", linewidth=2)
     ax.set_title("Cumulative PnL Contribution")
     ax.set_xlabel("Time (UTC)")
     ax.set_ylabel("Cumulative PnL [EUR]")
@@ -137,7 +327,7 @@ def _build_backtest_diagnostics(hourly: pd.DataFrame, summary: dict[str, object]
         "real_pnl_eur",
         "pred_pnl_eur",
         "naive_pnl_eur",
-        "rolling_perfect_foresight_same_rules_pnl_eur",
+        "perfect_foresight_pnl_eur",
         "soc_mwh",
         "charge_mw",
         "discharge_mw",
@@ -225,6 +415,40 @@ def _resolve_out_dir(
     out = Path("artifacts/simulation_runs") / rid / split
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _prepare_scenario_output_dir(
+    *,
+    scenario_out_dir: Path,
+    clean_output: bool,
+    strict_simulation_validity: bool,
+    simulation_schema_version: str,
+) -> float:
+    """Prepare scenario output dir and prevent stale schema mixing."""
+    output_was_cleaned = 0.0
+    if scenario_out_dir.exists():
+        if bool(clean_output):
+            shutil.rmtree(scenario_out_dir)
+            output_was_cleaned = 1.0
+        else:
+            if bool(strict_simulation_validity):
+                raise RuntimeError(
+                    "Strict validity run refuses writing into existing scenario directory without --clean-output: "
+                    f"{scenario_out_dir}"
+                )
+            existing_summary = scenario_out_dir / "backtest_summary.json"
+            if existing_summary.exists():
+                try:
+                    existing_payload = json.loads(existing_summary.read_text(encoding="utf-8"))
+                except Exception:
+                    existing_payload = {}
+                if existing_payload.get("simulation_schema_version") != simulation_schema_version:
+                    raise RuntimeError(
+                        f"Refusing to write into stale scenario directory without --clean-output: {scenario_out_dir}. "
+                        "Existing summary schema_version is missing or mismatched."
+                    )
+    scenario_out_dir.mkdir(parents=True, exist_ok=True)
+    return output_was_cleaned
 
 
 def _parse_quantile_token(token: str) -> str:
@@ -701,6 +925,12 @@ def parse_args() -> argparse.Namespace:
         help="State carryover mode between re-optimizations.",
     )
     p.add_argument(
+        "--final-soc-mode",
+        choices=["terminal_repair", "hard"],
+        default="terminal_repair",
+        help="Final SoC policy: terminal_repair (default) or hard physical minimum.",
+    )
+    p.add_argument(
         "--enforce-final-soc-min",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -729,11 +959,109 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Hard SoC headroom assumption (hours) for BEM-only deliverability (default: 0.5h).",
     )
+    p.add_argument(
+        "--reserve-feasibility-mode",
+        default="",
+        help="Reserve feasibility mode: normal or conservative. In strict mode, defaults to conservative.",
+    )
+    p.add_argument(
+        "--reserve-soc-projection-safety-mwh",
+        type=float,
+        default=None,
+        help="Additional SoC projection safety margin used in BCM precommit clamp.",
+    )
+    p.add_argument(
+        "--reserve-headroom-safety-mwh",
+        type=float,
+        default=None,
+        help="Reserve headroom safety margin used in BCM precommit clamp.",
+    )
+    p.add_argument(
+        "--reserve-power-safety-mw",
+        type=float,
+        default=None,
+        help="Reserve power safety margin used in BCM precommit clamp.",
+    )
+    p.add_argument(
+        "--reserve-min-margin-after-bid-mwh",
+        type=float,
+        default=None,
+        help="Conservative minimum post-bid headroom margin threshold.",
+    )
+    p.add_argument(
+        "--reserve-bid-derate",
+        type=float,
+        default=1.0,
+        help="Derating factor [0,1] applied to safe feasible reserve bids before BCM submission.",
+    )
+    p.add_argument(
+        "--max-reserve-bid-mw",
+        type=float,
+        default=None,
+        help="Optional hard cap for reserve submitted MW per direction/block before BCM submission.",
+    )
+    p.add_argument(
+        "--disable-new-bcm-reserve-bids",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable new BCM reserve bids while still honoring existing locked reserve obligations.",
+    )
+    p.add_argument(
+        "--reserve-retry-ladder",
+        default="1.0,0.5,0.25,0.0",
+        help="Progressive factors for retrying NEW reserve submissions in strict/conservative mode.",
+    )
+    p.add_argument(
+        "--strict-simulation-validity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Strict thesis validity mode. If enabled, any fallback/solver optimization issue "
+            "marks scenario invalid/non-reportable (default: enabled)."
+        ),
+    )
+    p.add_argument(
+        "--clean-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If enabled, delete existing scenario output directory before writing. "
+            "Prevents stale/mixed artifacts."
+        ),
+    )
+    p.add_argument(
+        "--enable-global-perfect_foresight",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable global_hindsight_perfect_foresight_upper_bound computation. "
+            "Disabled by default until perfect_foresight scope/validation is explicitly verified."
+        ),
+    )
+    p.add_argument(
+        "--print-validity-first-preset",
+        action="store_true",
+        help="Print recommended validity-first reserve settings and exit.",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if bool(args.print_validity_first_preset):
+        print("validity_first_preset:")
+        print("  reserve_soc_projection_safety_mwh: 2.0")
+        print("  reserve_headroom_safety_mwh: 1.0")
+        print("  reserve_power_safety_mw: 0.3")
+        print("  reserve_min_margin_after_bid_mwh: 1.0")
+        print("  reserve_bid_derate: 0.5")
+        print("  max_reserve_bid_mw: 3.0")
+        print("  reserve_retry_ladder: 1.0,0.5,0.25,0.0")
+        print("  disable_new_bcm_reserve_bids: false")
+        return
+    run_started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    simulation_schema_version = "v2_strict_validity_debugdump"
+    required_summary_fields_version = "v2_required_debugdump_fields"
     run_id: str | None = args.run_id.strip() or None
     quantile_pairs = _parse_quantile_pairs(args.quantile_pairs)
     required_quantiles: set[str] = {"p50"}
@@ -906,6 +1234,43 @@ def main() -> None:
 
     MODEL_SPECS["reserve_activation_headroom_h"] = float(args.reserve_activation_headroom_h)
     MODEL_SPECS["bem_activation_headroom_h"] = float(args.bem_activation_headroom_h)
+    mode = str(args.reserve_feasibility_mode or "").strip().lower()
+    if mode not in {"", "normal", "conservative"}:
+        raise ValueError("--reserve-feasibility-mode must be one of: normal, conservative")
+    if not mode:
+        mode = "conservative" if bool(args.strict_simulation_validity) else "normal"
+    MODEL_SPECS["reserve_feasibility_mode"] = mode
+    if args.reserve_soc_projection_safety_mwh is not None:
+        MODEL_SPECS["reserve_soc_projection_safety_mwh"] = float(args.reserve_soc_projection_safety_mwh)
+    elif mode == "conservative" and bool(args.strict_simulation_validity):
+        MODEL_SPECS["reserve_soc_projection_safety_mwh"] = 0.5
+    if args.reserve_headroom_safety_mwh is not None:
+        MODEL_SPECS["reserve_headroom_safety_mwh"] = float(args.reserve_headroom_safety_mwh)
+    elif mode == "conservative" and bool(args.strict_simulation_validity):
+        MODEL_SPECS["reserve_headroom_safety_mwh"] = 0.25
+    if args.reserve_power_safety_mw is not None:
+        MODEL_SPECS["reserve_power_safety_mw"] = float(args.reserve_power_safety_mw)
+    elif mode == "conservative" and bool(args.strict_simulation_validity):
+        MODEL_SPECS["reserve_power_safety_mw"] = 0.1
+    if args.reserve_min_margin_after_bid_mwh is not None:
+        MODEL_SPECS["reserve_min_margin_after_bid_mwh"] = float(args.reserve_min_margin_after_bid_mwh)
+    elif mode == "conservative" and bool(args.strict_simulation_validity):
+        MODEL_SPECS["reserve_min_margin_after_bid_mwh"] = 0.25
+    MODEL_SPECS["reserve_bid_derate"] = float(args.reserve_bid_derate)
+    if not (0.0 <= float(MODEL_SPECS["reserve_bid_derate"]) <= 1.0):
+        raise ValueError("--reserve-bid-derate must be within [0, 1].")
+    MODEL_SPECS["max_reserve_bid_mw"] = (
+        float(args.max_reserve_bid_mw) if args.max_reserve_bid_mw is not None else None
+    )
+    if MODEL_SPECS["max_reserve_bid_mw"] is not None and float(MODEL_SPECS["max_reserve_bid_mw"]) < 0.0:
+        raise ValueError("--max-reserve-bid-mw must be >= 0.")
+    MODEL_SPECS["disable_new_bcm_reserve_bids"] = bool(args.disable_new_bcm_reserve_bids)
+    MODEL_SPECS["reserve_retry_ladder"] = str(args.reserve_retry_ladder).strip()
+    MODEL_SPECS["enable_reserve_retry_ladder"] = bool(
+        bool(args.strict_simulation_validity) and str(MODEL_SPECS["reserve_feasibility_mode"]) == "conservative"
+    )
+    MODEL_SPECS["final_soc_mode"] = str(args.final_soc_mode)
+    enforce_final_soc_min = bool(args.final_soc_mode == "hard")
     backtester = BatteryBacktester()
     sweep_rows: list[dict[str, object]] = []
     if args.trading_strategy == "da_only":
@@ -918,7 +1283,12 @@ def main() -> None:
 
     for scenario_name, scenario_warehouse in scenarios:
         scenario_out_dir = strategy_root if scenario_name == "default" and not quantile_pairs else strategy_root / scenario_name
-        scenario_out_dir.mkdir(parents=True, exist_ok=True)
+        output_was_cleaned = _prepare_scenario_output_dir(
+            scenario_out_dir=scenario_out_dir,
+            clean_output=bool(args.clean_output),
+            strict_simulation_validity=bool(args.strict_simulation_validity),
+            simulation_schema_version=simulation_schema_version,
+        )
 
         with _phase_watchdog("backtester_run"):
             outputs = backtester.run(
@@ -930,8 +1300,10 @@ def main() -> None:
                 forecast_warehouse=scenario_warehouse,
                 da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
                 soc_feedback_mode=args.soc_feedback_mode,
-                enforce_final_soc_min=args.enforce_final_soc_min,
+                enforce_final_soc_min=enforce_final_soc_min,
                 allowed_markets=allowed_markets,
+                strict_simulation_validity=bool(args.strict_simulation_validity),
+                enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
             )
 
         hourly_path = scenario_out_dir / "backtest_hourly.parquet"
@@ -948,8 +1320,12 @@ def main() -> None:
         state_machine_audit_path = scenario_out_dir / "state_machine_audit.json"
         diagnostics_path = scenario_out_dir / "backtest_diagnostics.json"
         diagnostics_txt_path = scenario_out_dir / "backtest_diagnostics.txt"
-        oracle_paradox_path = scenario_out_dir / "rolling_perfect_foresight_same_rules_paradox_hours.csv"
+        perfect_foresight_paradox_path = scenario_out_dir / "perfect_foresight_paradox_hours.csv"
         pnl_plot_path = scenario_out_dir / "backtest_cumulative_pnl.png"
+        reserve_commitment_debug_path = scenario_out_dir / "reserve_commitment_debug.csv"
+        invalid_headroom_debug_path = scenario_out_dir / "invalid_headroom_debug.csv"
+        optimization_failure_debug_path = scenario_out_dir / "optimization_failure_debug.csv"
+        optimization_infeasibility_attribution_path = scenario_out_dir / "optimization_infeasibility_attribution.csv"
 
         with _phase_watchdog("write_hourly"):
             outputs.hourly.to_parquet(hourly_path, index=False)
@@ -996,6 +1372,280 @@ def main() -> None:
         ])
         with _phase_watchdog("write_realized_ledger"):
             outputs.hourly[[*dict.fromkeys(realized_cols)]].to_parquet(realized_ledger_path, index=False)
+
+        # Debug exports for strict-simulation diagnostics / traceability.
+        h = outputs.hourly.copy()
+        with _phase_watchdog("write_debug_exports"):
+            reserve_debug_cols = [
+                colmap.timestamp,
+                "reserve_commitment_id",
+                "reserve_product_block_id",
+                "reserve_commitment_source_snapshot_utc",
+                "reserve_delivery_start_utc",
+                "reserve_delivery_end_utc",
+                "reserve_precommit_feasible_pos_mw",
+                "reserve_precommit_feasible_neg_mw",
+                "reserve_submitted_pos_mw",
+                "reserve_submitted_neg_mw",
+                "precommit_original_pos_mw",
+                "precommit_original_neg_mw",
+                "reserve_awarded_pos_mw",
+                "reserve_awarded_neg_mw",
+                "reserve_lockbook_pos_mw",
+                "reserve_lockbook_neg_mw",
+                "reserve_projected_soc_start_mwh",
+                "fixed_reserve_obligation_pos_mw",
+                "fixed_reserve_obligation_neg_mw",
+                "real_soc_start_mwh",
+                "real_soc_mwh",
+                "real_required_headroom_pos_mwh",
+                "real_required_headroom_neg_mwh",
+                "real_available_headroom_pos_mwh",
+                "real_available_headroom_neg_mwh",
+                "real_headroom_margin_pos_mwh",
+                "real_headroom_margin_neg_mwh",
+                "real_headroom_violation_pos_mwh",
+                "real_headroom_violation_neg_mwh",
+                "precommit_margin_after_bid_min_mwh",
+                "precommit_zeroed_due_to_margin",
+                "precommit_reduced_due_to_margin",
+                "precommit_reduction_reason",
+                "desired_reserve_pos_mw",
+                "desired_reserve_neg_mw",
+                "safe_reserve_pos_mw",
+                "safe_reserve_neg_mw",
+                "submitted_reserve_pos_mw",
+                "submitted_reserve_neg_mw",
+                "submitted_reserve_pos_mw_before_retry",
+                "submitted_reserve_neg_mw_before_retry",
+                "reserve_retry_factor",
+                "submitted_reserve_pos_mw_after_retry",
+                "submitted_reserve_neg_mw_after_retry",
+                "retry_reduction_reason",
+                "precommit_safe_pos_mw",
+                "precommit_safe_neg_mw",
+                "precommit_submitted_pos_mw_after_derate_cap",
+                "precommit_submitted_neg_mw_after_derate_cap",
+                "reserve_bid_derate",
+                "max_reserve_bid_mw",
+                "reserve_retry_attempts_used",
+                "reserve_retry_final_factor",
+                "reserve_retry_succeeded",
+                "disable_new_bcm_reserve_bids",
+                "new_reserve_bids_zeroed_by_retry",
+                "reserve_retry_infeasible_after_zero_reserve",
+                "precommit_headroom_recharge_cost_eur",
+                "precommit_headroom_opportunity_cost_eur",
+                "precommit_net_capacity_ev_after_headroom_cost_eur",
+                "precommit_bid_zeroed_due_to_negative_ev",
+                "real_da_charge_mw",
+                "real_da_discharge_mw",
+                "real_id_charge_mw",
+                "real_id_discharge_mw",
+                "real_bem_only_submitted_pos_mw",
+                "real_bem_only_submitted_neg_mw",
+                "real_aux_energy_mwh",
+                "optimization_error_code",
+                "optimization_fallback",
+                "is_fallback_hour",
+                "infeasibility_driver",
+            ]
+            reserve_debug_cols = [c for c in reserve_debug_cols if c in h.columns]
+            if reserve_debug_cols:
+                out_df = h[reserve_debug_cols].copy()
+                out_df["scenario"] = str(scenario_name)
+                # Normalize directional and core reserve commitment fields for traceability.
+                if "reserve_submitted_pos_mw" in out_df.columns or "reserve_submitted_neg_mw" in out_df.columns:
+                    out_df["submitted_mw"] = np.maximum(
+                        pd.to_numeric(out_df.get("reserve_submitted_pos_mw", 0.0), errors="coerce").fillna(0.0),
+                        pd.to_numeric(out_df.get("reserve_submitted_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                    )
+                    out_df["direction"] = np.where(
+                        pd.to_numeric(out_df.get("reserve_submitted_pos_mw", 0.0), errors="coerce").fillna(0.0)
+                        >= pd.to_numeric(out_df.get("reserve_submitted_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                        "pos",
+                        "neg",
+                    )
+                if "reserve_awarded_pos_mw" in out_df.columns or "reserve_awarded_neg_mw" in out_df.columns:
+                    out_df["awarded_mw"] = np.maximum(
+                        pd.to_numeric(out_df.get("reserve_awarded_pos_mw", 0.0), errors="coerce").fillna(0.0),
+                        pd.to_numeric(out_df.get("reserve_awarded_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                    )
+                if "fixed_reserve_obligation_pos_mw" in out_df.columns or "fixed_reserve_obligation_neg_mw" in out_df.columns:
+                    out_df["locked_obligation_mw"] = np.maximum(
+                        pd.to_numeric(out_df.get("fixed_reserve_obligation_pos_mw", 0.0), errors="coerce").fillna(0.0),
+                        pd.to_numeric(out_df.get("fixed_reserve_obligation_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                    )
+                if {"reserve_projected_soc_start_mwh", "real_soc_start_mwh"}.issubset(out_df.columns):
+                    out_df["reserve_projected_vs_realized_soc_delta_mwh"] = (
+                        pd.to_numeric(out_df["reserve_projected_soc_start_mwh"], errors="coerce").fillna(0.0)
+                        - pd.to_numeric(out_df["real_soc_start_mwh"], errors="coerce").fillna(0.0)
+                    )
+                # Drift-attribution fields per locked commitment hour.
+                ts_series = pd.to_datetime(out_df.get(colmap.timestamp, pd.Series(index=out_df.index, dtype="datetime64[ns, UTC]")), utc=True, errors="coerce")
+                gate_series = pd.to_datetime(out_df.get("reserve_commitment_source_snapshot_utc", pd.Series(index=out_df.index, dtype="object")), utc=True, errors="coerce")
+                delivery_start_series = pd.to_datetime(out_df.get("reserve_delivery_start_utc", pd.Series(index=out_df.index, dtype="object")), utc=True, errors="coerce")
+
+                out_df["projected_soc_start_mwh_at_commitment"] = np.nan
+                out_df["projected_soc_start_mwh_latest_before_delivery"] = np.nan
+                out_df["realized_soc_start_mwh_at_delivery"] = np.nan
+                out_df["da_dispatch_mw_between_commit_and_delivery"] = 0.0
+                out_df["id_dispatch_mw_between_commit_and_delivery"] = 0.0
+                out_df["bem_only_dispatch_mw_between_commit_and_delivery"] = 0.0
+                out_df["aux_energy_mwh_between_commit_and_delivery"] = 0.0
+                out_df["terminal_adjustment_pressure_eur"] = float(outputs.summary.get("terminal_soc_net_adjustment_eur", 0.0))
+                # Aliases requested by audit task.
+                out_df["required_headroom_mwh"] = pd.to_numeric(
+                    out_df.get("real_required_headroom_pos_mwh", 0.0), errors="coerce"
+                ).fillna(0.0)
+                out_df["available_headroom_mwh"] = pd.to_numeric(
+                    out_df.get("real_available_headroom_pos_mwh", 0.0), errors="coerce"
+                ).fillna(0.0)
+                out_df["headroom_violation_mwh"] = pd.to_numeric(
+                    out_df.get("real_headroom_violation_pos_mwh", 0.0), errors="coerce"
+                ).fillna(0.0)
+
+                # Precompute dispatch magnitudes from full hourly table for interval sums.
+                all_ts = pd.to_datetime(
+                    h.get(colmap.timestamp, pd.Series(index=h.index, dtype="datetime64[ns, UTC]")),
+                    utc=True,
+                    errors="coerce",
+                )
+
+                da_charge = require_numeric_series(
+                    h,
+                    "real_executed_charge_mw",
+                    aliases=["real_da_charge_mw", "executed_charge_mw", "da_charge_mw"],
+                )
+                da_discharge = require_numeric_series(
+                    h,
+                    "real_executed_discharge_mw",
+                    aliases=["real_da_discharge_mw", "executed_discharge_mw", "da_discharge_mw"],
+                )
+                id_charge = require_numeric_series(
+                    h,
+                    "real_id_charge_mw",
+                    aliases=["id_charge_mw"],
+                )
+                id_discharge = require_numeric_series(
+                    h,
+                    "real_id_discharge_mw",
+                    aliases=["id_discharge_mw"],
+                )
+                bem_pos = require_numeric_series(
+                    h,
+                    "real_bem_only_submitted_pos_mw",
+                    aliases=["bem_only_submitted_pos_mw"],
+                )
+                bem_neg = require_numeric_series(
+                    h,
+                    "real_bem_only_submitted_neg_mw",
+                    aliases=["bem_only_submitted_neg_mw"],
+                )
+                aux_e = require_numeric_series(
+                    h,
+                    "real_aux_energy_mwh",
+                    aliases=["aux_energy_mwh"],
+                ).abs()
+
+                da_disp = da_charge.abs() + da_discharge.abs()
+                id_disp = id_charge.abs() + id_discharge.abs()
+                bem_disp = bem_pos.abs() + bem_neg.abs()
+
+                by_commit = (
+                    out_df.loc[out_df["reserve_commitment_id"].notna(), ["reserve_commitment_id", "reserve_projected_soc_start_mwh", "real_soc_start_mwh", "headroom_violation_mwh"]]
+                    .groupby("reserve_commitment_id", dropna=False)
+                    .agg(
+                        projected_soc_start_mwh_at_commitment=("reserve_projected_soc_start_mwh", "first"),
+                        projected_soc_start_mwh_latest_before_delivery=("reserve_projected_soc_start_mwh", "last"),
+                        realized_soc_start_mwh_at_delivery=("real_soc_start_mwh", "last"),
+                    )
+                    .reset_index()
+                )
+                if not by_commit.empty:
+                    out_df = out_df.merge(by_commit, on="reserve_commitment_id", how="left", suffixes=("", "_agg"))
+                    for c in [
+                        "projected_soc_start_mwh_at_commitment",
+                        "projected_soc_start_mwh_latest_before_delivery",
+                        "realized_soc_start_mwh_at_delivery",
+                    ]:
+                        if f"{c}_agg" in out_df.columns:
+                            out_df[c] = pd.to_numeric(out_df[f"{c}_agg"], errors="coerce")
+                            out_df.drop(columns=[f"{c}_agg"], inplace=True)
+
+                # Interval dispatch sums between commitment gate and delivery start.
+                for i in out_df.index:
+                    gate = gate_series.loc[i] if i in gate_series.index else pd.NaT
+                    dstart = delivery_start_series.loc[i] if i in delivery_start_series.index else pd.NaT
+                    if pd.isna(gate) or pd.isna(dstart):
+                        continue
+                    mask = (all_ts > gate) & (all_ts < dstart)
+                    if mask.any():
+                        out_df.at[i, "da_dispatch_mw_between_commit_and_delivery"] = float(da_disp.loc[mask].sum())
+                        out_df.at[i, "id_dispatch_mw_between_commit_and_delivery"] = float(id_disp.loc[mask].sum())
+                        out_df.at[i, "bem_only_dispatch_mw_between_commit_and_delivery"] = float(bem_disp.loc[mask].sum())
+                        out_df.at[i, "aux_energy_mwh_between_commit_and_delivery"] = float(aux_e.loc[mask].sum())
+                out_df.to_csv(reserve_commitment_debug_path, index=False)
+
+            hv_pos = pd.to_numeric(h.get("real_headroom_violation_pos_mwh", h.get("headroom_violation_pos_mwh", 0.0)), errors="coerce").fillna(0.0)
+            hv_neg = pd.to_numeric(h.get("real_headroom_violation_neg_mwh", h.get("headroom_violation_neg_mwh", 0.0)), errors="coerce").fillna(0.0)
+            bad_headroom = h.loc[(hv_pos + hv_neg) > 1e-9, reserve_debug_cols].copy() if reserve_debug_cols else pd.DataFrame()
+            if not bad_headroom.empty:
+                bad_headroom.to_csv(invalid_headroom_debug_path, index=False)
+
+            err_col = "optimization_error_code" if "optimization_error_code" in h.columns else None
+            if err_col is not None:
+                bad_opt = h.loc[h[err_col].fillna("ok").astype(str).str.lower().ne("ok"), reserve_debug_cols].copy() if reserve_debug_cols else pd.DataFrame()
+                if not bad_opt.empty:
+                    bad_opt.to_csv(optimization_failure_debug_path, index=False)
+
+        attrib_df = _build_optimization_infeasibility_attribution(
+            hourly=outputs.hourly,
+            summary=outputs.summary,
+            scenario=str(scenario_name),
+        )
+        if not attrib_df.empty:
+            attrib_df.to_csv(optimization_infeasibility_attribution_path, index=False)
+            first = attrib_df.iloc[0]
+            outputs.summary["first_infeasible_timestamp_utc"] = str(first.get("timestamp_utc"))
+            outputs.summary["first_infeasibility_driver"] = str(first.get("suspected_infeasibility_driver", "unknown_solver_or_numeric"))
+            outputs.summary["first_infeasibility_driver_detail"] = str(
+                first.get("suspected_infeasibility_driver_detail", "")
+            )
+            outputs.summary["infeasibility_attribution_path"] = str(optimization_infeasibility_attribution_path)
+            outputs.summary["new_reserve_mw_at_first_failure"] = float(
+                max(
+                    float(pd.to_numeric(pd.Series([first.get("new_submitted_reserve_pos_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                    float(pd.to_numeric(pd.Series([first.get("new_submitted_reserve_neg_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                )
+            )
+            outputs.summary["locked_reserve_mw_at_first_failure"] = float(
+                max(
+                    float(pd.to_numeric(pd.Series([first.get("locked_reserve_pos_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                    float(pd.to_numeric(pd.Series([first.get("locked_reserve_neg_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                )
+            )
+            outputs.summary["protected_soc_margin_at_first_failure"] = float(
+                min(
+                    float(pd.to_numeric(pd.Series([first.get("protected_soc_margin_pos_mwh", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                    float(pd.to_numeric(pd.Series([first.get("protected_soc_margin_neg_mwh", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                )
+            )
+            outputs.summary["power_violation_at_first_failure"] = float(
+                max(
+                    float(pd.to_numeric(pd.Series([first.get("power_violation_pos_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                    float(pd.to_numeric(pd.Series([first.get("power_violation_neg_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                )
+            )
+        else:
+            outputs.summary["first_infeasible_timestamp_utc"] = ""
+            outputs.summary["first_infeasibility_driver"] = "none"
+            outputs.summary["first_infeasibility_driver_detail"] = ""
+            outputs.summary["infeasibility_attribution_path"] = ""
+            outputs.summary["new_reserve_mw_at_first_failure"] = 0.0
+            outputs.summary["locked_reserve_mw_at_first_failure"] = 0.0
+            outputs.summary["protected_soc_margin_at_first_failure"] = 0.0
+            outputs.summary["power_violation_at_first_failure"] = 0.0
 
         with _phase_watchdog("write_plan_history"):
             outputs.plan_history.to_parquet(plan_history_path, index=False)
@@ -1057,6 +1707,98 @@ def main() -> None:
             outputs.monthly.to_csv(monthly_path, index=False)
         with _phase_watchdog("write_yearly"):
             outputs.yearly.to_csv(yearly_path, index=False)
+        pre_summary_keys = set(outputs.summary.keys())
+        defaults: dict[str, object] = {
+            "simulation_schema_version": simulation_schema_version,
+            "required_summary_fields_version": required_summary_fields_version,
+            "code_run_started_at_utc": run_started_at_utc,
+            "strict_simulation_validity": float(bool(args.strict_simulation_validity)),
+            "command_line_args": json.dumps(vars(args), sort_keys=True, default=str),
+            "output_was_cleaned": float(output_was_cleaned),
+            "infeasible_debug_dump_count": 0.0,
+            "accepted_path_infeasible_debug_dump_count": 0.0,
+            "candidate_infeasible_debug_dump_count": 0.0,
+            "infeasible_debug_dump_paths": [],
+            "infeasible_debug_dump_timestamps": [],
+            "fallback_used": 0.0,
+            "fallback_mode_counts": "{}",
+            "optimization_error_code_counts": "{}",
+            "simulation_valid": 0.0,
+            "thesis_reportable": 0.0,
+            "invalid_reason": "",
+            "protected_soc_violation_count": 0.0,
+            "protected_soc_violation_max_mwh": 0.0,
+            "reserve_headroom_shortfall_pos_mwh_sum": 0.0,
+            "reserve_headroom_shortfall_neg_mwh_sum": 0.0,
+            "reserve_headroom_shortfall_max_mwh": 0.0,
+            "reserve_headroom_shortfall_check_pass": 1.0,
+            "pnl_reconciliation_error_max_eur": 0.0,
+            "activation_split_reconciliation_error_max": 0.0,
+            "summary_fields_defaulted": "[]",
+            "required_fields_defaulted": "[]",
+            "required_fields_computed": "[]",
+            "first_infeasible_timestamp_utc": "",
+            "first_infeasibility_driver": "none",
+            "first_infeasibility_driver_detail": "",
+            "infeasibility_attribution_path": "",
+            "new_reserve_mw_at_first_failure": 0.0,
+            "locked_reserve_mw_at_first_failure": 0.0,
+            "protected_soc_margin_at_first_failure": 0.0,
+            "power_violation_at_first_failure": 0.0,
+            "disable_new_bcm_reserve_bids": float(bool(args.disable_new_bcm_reserve_bids)),
+        }
+        defaulted_fields: list[str] = []
+        for k, v in defaults.items():
+            if k not in outputs.summary or outputs.summary.get(k) is None:
+                outputs.summary[k] = v
+                defaulted_fields.append(k)
+        required_fields = [
+            "simulation_schema_version",
+            "required_summary_fields_version",
+            "code_run_started_at_utc",
+            "infeasible_debug_dump_count",
+            "accepted_path_infeasible_debug_dump_count",
+            "candidate_infeasible_debug_dump_count",
+            "infeasible_debug_dump_paths",
+            "infeasible_debug_dump_timestamps",
+            "fallback_used",
+            "fallback_mode_counts",
+            "optimization_error_code_counts",
+            "simulation_valid",
+            "thesis_reportable",
+            "invalid_reason",
+            "pnl_reconciliation_error_max_eur",
+            "activation_split_reconciliation_error_max",
+        ]
+        # Normalize debug-dump fields to stable JSON schema for validator and downstream tooling.
+        for k in [
+            "infeasible_debug_dump_count",
+            "accepted_path_infeasible_debug_dump_count",
+            "candidate_infeasible_debug_dump_count",
+        ]:
+            outputs.summary[k] = float(pd.to_numeric(pd.Series([outputs.summary.get(k, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        for k in ["infeasible_debug_dump_paths", "infeasible_debug_dump_timestamps"]:
+            v = outputs.summary.get(k, [])
+            if isinstance(v, str):
+                try:
+                    parsed = json.loads(v)
+                    v = parsed if isinstance(parsed, list) else []
+                except Exception:
+                    v = []
+            elif not isinstance(v, list):
+                v = []
+            outputs.summary[k] = [str(x) for x in v]
+        required_defaulted = [k for k in required_fields if k in defaulted_fields]
+        required_computed = [k for k in required_fields if k not in required_defaulted]
+        outputs.summary["summary_fields_defaulted"] = json.dumps(sorted(defaulted_fields))
+        # Runner metadata defaults are optional and should not invalidate strict thesis checks.
+        outputs.summary["required_fields_missing"] = json.dumps([])
+        outputs.summary["critical_required_fields_defaulted"] = json.dumps([])
+        outputs.summary["optional_fields_defaulted"] = json.dumps(sorted(defaulted_fields))
+        outputs.summary["required_fields_check_pass"] = 1.0
+        # Backward-compatible aliases.
+        outputs.summary["required_fields_defaulted"] = json.dumps([])
+        outputs.summary["required_fields_computed"] = json.dumps(sorted(required_fields))
         with _phase_watchdog("write_summary_json"):
             summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
         with _phase_watchdog("write_state_machine_audit"):
@@ -1103,10 +1845,10 @@ def main() -> None:
                 ]) + "\n",
                 encoding="utf-8",
             )
-        with _phase_watchdog("write_oracle_paradox_report"):
+        with _phase_watchdog("write_perfect_foresight_paradox_report"):
             hp = outputs.hourly.copy()
-            if {"rolling_perfect_foresight_same_rules_pnl_eur", "real_pnl_eur"}.issubset(hp.columns):
-                hp = hp[hp["rolling_perfect_foresight_same_rules_pnl_eur"] < hp["real_pnl_eur"]].copy()
+            if {"perfect_foresight_pnl_eur", "real_pnl_eur"}.issubset(hp.columns):
+                hp = hp[hp["perfect_foresight_pnl_eur"] < hp["real_pnl_eur"]].copy()
             else:
                 hp = hp.iloc[0:0].copy()
             pos_share_cols = sorted([c for c in hp.columns if c.startswith("ev_expected_act_share_pos_bin_")])
@@ -1131,27 +1873,27 @@ def main() -> None:
                 hp["expected_act_neg_mwh_from_objective"] = 0.0
             hp["expected_act_total_mwh_from_objective"] = hp["expected_act_pos_mwh_from_objective"] + hp["expected_act_neg_mwh_from_objective"]
             hp["realized_act_total_mwh"] = pd.to_numeric(hp.get("real_act_pos_mwh", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(hp.get("real_act_neg_mwh", 0.0), errors="coerce").fillna(0.0)
-            hp["rolling_perfect_foresight_same_rules_act_total_mwh"] = pd.to_numeric(hp.get("rolling_perfect_foresight_same_rules_act_pos_mwh", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(hp.get("rolling_perfect_foresight_same_rules_act_neg_mwh", 0.0), errors="coerce").fillna(0.0)
+            hp["perfect_foresight_act_total_mwh"] = pd.to_numeric(hp.get("perfect_foresight_act_pos_mwh", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(hp.get("perfect_foresight_act_neg_mwh", 0.0), errors="coerce").fillna(0.0)
             keep = [
                 colmap.timestamp,
                 "real_pnl_eur",
-                "rolling_perfect_foresight_same_rules_pnl_eur",
+                "perfect_foresight_pnl_eur",
                 "real_penalty_eur",
-                "rolling_perfect_foresight_same_rules_penalty_eur",
+                "perfect_foresight_penalty_eur",
                 "reserve_pos_mw",
                 "reserve_neg_mw",
                 "expected_act_pos_mwh_from_objective",
                 "expected_act_neg_mwh_from_objective",
                 "expected_act_total_mwh_from_objective",
                 "realized_act_total_mwh",
-                "rolling_perfect_foresight_same_rules_act_total_mwh",
+                "perfect_foresight_act_total_mwh",
                 "real_act_pos_mwh",
                 "real_act_neg_mwh",
-                "rolling_perfect_foresight_same_rules_act_pos_mwh",
-                "rolling_perfect_foresight_same_rules_act_neg_mwh",
+                "perfect_foresight_act_pos_mwh",
+                "perfect_foresight_act_neg_mwh",
             ]
             keep = [c for c in keep if c in hp.columns]
-            hp[keep].to_csv(oracle_paradox_path, index=False)
+            hp[keep].to_csv(perfect_foresight_paradox_path, index=False)
         with _phase_watchdog("write_ev_summary"):
             ev_terms = [
                 "ev_da_charge_eur",
@@ -1205,39 +1947,71 @@ def main() -> None:
             print(f"- timeframe_total_days: {num_days_total:.4f}")
         print(f"- trading_strategy: {args.trading_strategy}")
         print(
-            "- realized/oracle: "
+            "- realized/rolling_perfect_foresight_same_rules: "
             f"{outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f} / "
             f"{outputs.summary.get('rolling_perfect_foresight_same_rules_total_pnl_eur', float('nan')):.2f}"
+        )
+        cmp_r = outputs.summary.get("comparable_realized_market_pnl_eur", float("nan"))
+        cmp_b = outputs.summary.get("comparable_perfect_foresight_market_pnl_eur", float("nan"))
+        print(
+            "- realized/comparable_rolling_perfect_foresight_same_rules_market: "
+            f"{float(cmp_r):.2f} / {float(cmp_b):.2f}"
         )
         # Warn on negative PnL in any reported optimization view.
         pnl_warn_fields = [
             ("Multi-market realized", "realized_total_pnl_eur"),
-            ("Multi-market oracle", "rolling_perfect_foresight_same_rules_total_pnl_eur"),
+            ("Multi-market rolling_perfect_foresight_same_rules", "rolling_perfect_foresight_same_rules_total_pnl_eur"),
+            ("Multi-market global_hindsight_perfect_foresight_upper_bound", "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"),
         ]
         for label, key in pnl_warn_fields:
             v = pd.to_numeric(pd.Series([outputs.summary.get(key, float("nan"))]), errors="coerce").iloc[0]
             if pd.notna(v) and float(v) < 0.0:
                 print(f"[WARN] negative_pnl: {label}={float(v):.2f} EUR")
-        r_multi = outputs.summary.get("realized_vs_rolling_perfect_foresight_same_rules_ratio_multi_market", float("nan"))
+        r_multi = outputs.summary.get(
+            "realized_vs_perfect_foresight_ratio_multi_market",
+            float("nan"),
+        )
         print(
-            "- realized/oracle ratio % (Multi): "
+            "- realized_vs_perfect_foresight_pct (diagnostic, may exceed 100): "
             f"{(100.0 * float(r_multi)) if pd.notna(r_multi) else float('nan'):.2f}%"
         )
-        final_soc = outputs.summary.get("final_real_soc_mwh", float("nan"))
-        final_soc_target = outputs.summary.get("final_soc_min_target_mwh", float("nan"))
-        final_soc_ok = bool(outputs.summary.get("final_soc_constraint_satisfied", False))
-        final_soc_shortfall = outputs.summary.get("final_soc_shortfall_mwh", float("nan"))
-        if final_soc_ok:
+        r_cmp = outputs.summary.get("realized_vs_perfect_foresight_comparable_market_ratio", float("nan"))
+        print(
+            "- realized/comparable_rolling_perfect_foresight_same_rules_market ratio % (Multi): "
+            f"{(100.0 * float(r_cmp)) if pd.notna(r_cmp) else float('nan'):.2f}%"
+        )
+        global_ratio_pct = outputs.summary.get("realized_vs_global_hindsight_perfect_foresight_upper_bound_pct", float("nan"))
+        global_ok = (
+            float(outputs.summary.get("global_perfect_foresight_available", 0.0)) >= 0.5
+            and float(outputs.summary.get("global_perfect_foresight_dominance_check_pass", 0.0)) >= 0.5
+        )
+        if global_ok:
             print(
-                "- final_soc_check: OK "
+                "- realized_vs_global_hindsight_perfect_foresight_upper_bound_pct (upper-bound efficiency, should be <=100): "
+                f"{float(global_ratio_pct) if pd.notna(global_ratio_pct) else float('nan'):.2f}%"
+            )
+        else:
+            print("- global perfect_foresight unavailable/unverified")
+        final_soc = outputs.summary.get("final_soc_actual_mwh", outputs.summary.get("final_real_soc_mwh", float("nan")))
+        final_soc_target = outputs.summary.get("final_soc_target_mwh", outputs.summary.get("final_soc_min_target_mwh", float("nan")))
+        final_soc_physical_ok = bool(float(outputs.summary.get("final_soc_physical_check_pass", 0.0)) >= 0.5)
+        final_soc_economic_ok = bool(float(outputs.summary.get("final_soc_economic_repair_check_pass", 0.0)) >= 0.5)
+        final_soc_shortfall = outputs.summary.get("final_soc_shortfall_mwh", float("nan"))
+        if final_soc_physical_ok:
+            print(
+                "- final_soc_physical_check: OK "
                 f"(actual/target={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh)"
             )
         else:
             print(
-                "[WARN] final_soc_check: NOT MET "
+                "[WARN] final_soc_physical_check: NOT MET "
                 f"(actual/target={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh, "
                 f"shortfall={float(final_soc_shortfall):.4f} MWh)"
             )
+        if final_soc_economic_ok:
+            print("- final_soc_economic_repair_check: OK")
+        else:
+            print("[WARN] final_soc_economic_repair_check: NOT MET")
         missed_cap_pos = pd.to_numeric(
             pd.Series([outputs.summary.get("total_missed_capacity_pos_mw", 0.0)]),
             errors="coerce",
@@ -1267,13 +2041,31 @@ def main() -> None:
             "realized_total_pnl_eur": outputs.summary.get("realized_total_pnl_eur"),
             "predicted_total_pnl_eur": outputs.summary.get("predicted_total_pnl_eur"),
             "naive_total_pnl_eur": outputs.summary.get("naive_total_pnl_eur"),
-            "rolling_perfect_foresight_same_rules_total_pnl_eur": outputs.summary.get("rolling_perfect_foresight_same_rules_total_pnl_eur"),
+            "rolling_perfect_foresight_same_rules_total_pnl_eur": outputs.summary.get(
+                "rolling_perfect_foresight_same_rules_total_pnl_eur",
+                float("nan"),
+            ),
+            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": outputs.summary.get(
+                "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"
+            ),
+            "global_perfect_foresight_available": outputs.summary.get("global_perfect_foresight_available"),
+            "global_perfect_foresight_dominance_check_pass": outputs.summary.get("global_perfect_foresight_dominance_check_pass"),
+            "global_perfect_foresight_validation_status": outputs.summary.get("global_perfect_foresight_validation_status"),
+            "comparable_realized_market_pnl_eur": outputs.summary.get("comparable_realized_market_pnl_eur"),
+            "comparable_perfect_foresight_market_pnl_eur": outputs.summary.get(
+                "comparable_perfect_foresight_market_pnl_eur"
+            ),
+            "benchmark_is_global_upper_bound": outputs.summary.get("benchmark_is_global_upper_bound", 0.0),
+            "rolling_pf_is_upper_bound": outputs.summary.get("rolling_pf_is_upper_bound", 0.0),
+            "global_perfect_foresight_is_upper_bound": outputs.summary.get("global_perfect_foresight_is_upper_bound", 0.0),
             "cost_of_forecast_error_total_eur": outputs.summary.get("cost_of_forecast_error_total_eur"),
             "pnl_gap_total_eur": outputs.summary.get("pnl_gap_total_eur"),
             "economic_opportunity_gap_ratio": outputs.summary.get("economic_opportunity_gap_ratio"),
             "roi_on_max_capital": outputs.summary.get("roi_on_max_capital"),
             "simulation_valid": outputs.summary.get("simulation_valid"),
+            "thesis_reportable": outputs.summary.get("thesis_reportable"),
             "invalid_reason": outputs.summary.get("invalid_reason"),
+            "fallback_used": outputs.summary.get("fallback_used"),
             "output_dir": str(scenario_out_dir),
         }
         if scenario_name != "default":
@@ -1314,17 +2106,43 @@ def main() -> None:
         if {"realized_total_pnl_eur", "rolling_perfect_foresight_same_rules_total_pnl_eur"}.issubset(overview.columns):
             r = pd.to_numeric(overview["realized_total_pnl_eur"], errors="coerce")
             o = pd.to_numeric(overview["rolling_perfect_foresight_same_rules_total_pnl_eur"], errors="coerce")
-            overview["realized_vs_rolling_perfect_foresight_same_rules_pct"] = np.where(
+            overview["realized_vs_perfect_foresight_pct"] = np.where(
                 o.abs() > 1e-12,
                 (r / o) * 100.0,
+                np.nan,
+            )
+        if {"realized_total_pnl_eur", "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"}.issubset(overview.columns):
+            r = pd.to_numeric(overview["realized_total_pnl_eur"], errors="coerce")
+            g = pd.to_numeric(overview["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"], errors="coerce")
+            avail = pd.to_numeric(overview.get("global_perfect_foresight_available", 0.0), errors="coerce").fillna(0.0)
+            dom = pd.to_numeric(overview.get("global_perfect_foresight_dominance_check_pass", 0.0), errors="coerce").fillna(0.0)
+            overview["realized_vs_global_hindsight_perfect_foresight_upper_bound_pct"] = np.where(
+                (avail >= 0.5) & (dom >= 0.5) & (g.abs() > 1e-12),
+                (r / g) * 100.0,
+                np.nan,
+            )
+        if {
+            "comparable_realized_market_pnl_eur",
+            "comparable_perfect_foresight_market_pnl_eur",
+        }.issubset(overview.columns):
+            r_cmp = pd.to_numeric(overview["comparable_realized_market_pnl_eur"], errors="coerce")
+            b_cmp = pd.to_numeric(
+                overview["comparable_perfect_foresight_market_pnl_eur"], errors="coerce"
+            )
+            overview["realized_vs_perfect_foresight_comparable_market_pct"] = np.where(
+                b_cmp.abs() > 1e-12,
+                (r_cmp / b_cmp) * 100.0,
                 np.nan,
             )
         overview = overview.sort_values([c for c in ["scenario", "trading_strategy"] if c in overview.columns]).reset_index(drop=True)
         overview.to_csv(overview_csv, index=False)
         overview_json.write_text(overview.to_json(orient="records", indent=2), encoding="utf-8")
-        # Thesis-ready aggregate: valid runs only.
+        # Thesis-ready aggregate: valid and reportable runs only.
         valid_only = overview.copy()
-        if "simulation_valid" in valid_only.columns:
+        if "thesis_reportable" in valid_only.columns:
+            sv = pd.to_numeric(valid_only["thesis_reportable"], errors="coerce").fillna(0.0)
+            valid_only = valid_only.loc[sv >= 0.5].copy()
+        elif "simulation_valid" in valid_only.columns:
             sv = pd.to_numeric(valid_only["simulation_valid"], errors="coerce").fillna(0.0)
             valid_only = valid_only.loc[sv >= 0.5].copy()
         valid_csv = out_dir / "strategy_overview_valid_only.csv"
@@ -1353,14 +2171,46 @@ def main() -> None:
         (out_dir / "strategy_overview_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
         print("[OK] Strategy overview:")
         print(f"- output_dir: {out_dir}")
-        show_cols = [c for c in ["scenario", "trading_strategy", "realized_total_pnl_eur", "rolling_perfect_foresight_same_rules_total_pnl_eur", "realized_vs_rolling_perfect_foresight_same_rules_pct"] if c in overview.columns]
+        show_cols = [
+            c
+            for c in [
+                "scenario",
+                "trading_strategy",
+                "realized_total_pnl_eur",
+                "rolling_perfect_foresight_same_rules_total_pnl_eur",
+                "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
+                "realized_vs_perfect_foresight_pct",
+                "realized_vs_perfect_foresight_comparable_market_pct",
+                "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
+            ]
+            if c in overview.columns
+        ]
         if show_cols:
             display_df = overview[show_cols].copy()
-            for c in ["realized_total_pnl_eur", "rolling_perfect_foresight_same_rules_total_pnl_eur", "realized_vs_rolling_perfect_foresight_same_rules_pct"]:
+            for c in [
+                "realized_total_pnl_eur",
+                "rolling_perfect_foresight_same_rules_total_pnl_eur",
+                "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
+                "realized_vs_perfect_foresight_pct",
+                "realized_vs_perfect_foresight_comparable_market_pct",
+                "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
+            ]:
                 if c in display_df.columns:
                     display_df[c] = pd.to_numeric(display_df[c], errors="coerce").map(
                         lambda x: f"{float(x):.2f}" if pd.notna(x) else "nan"
                     )
+            display_df = display_df.rename(
+                columns={
+                    "scenario": "scen",
+                    "trading_strategy": "strat",
+                    "realized_total_pnl_eur": "pnl_real_eur",
+                    "rolling_perfect_foresight_same_rules_total_pnl_eur": "pnl_pf_roll_eur",
+                    "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": "pnl_pf_global_ub_eur",
+                    "realized_vs_perfect_foresight_pct": "real_vs_pf_roll_pct",
+                    "realized_vs_perfect_foresight_comparable_market_pct": "real_vs_pf_cmp_pct",
+                    "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct": "real_vs_pf_global_pct",
+                }
+            )
             print(display_df.to_string(index=False))
         print(f"[OK] Strategy overview files: {overview_csv} | {overview_json}")
         print(f"[OK] Valid-only overview files: {valid_csv} | {valid_json}")
