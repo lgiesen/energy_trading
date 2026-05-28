@@ -9,7 +9,7 @@ _CANONICAL_TARGETS: dict[str, dict[str, object]] = {
     "da": {
         "canonical_target": "da_price",
         "prediction_aliases": ["da_price", "target_da_price", "pred_da_price"],
-        "truth_candidates": ["da_price"],
+        "truth_candidates": ["da_price", "target_da_price"],
     },
     "afrr_capacity_pos": {
         "canonical_target": "afrr_capacity_price_pos",

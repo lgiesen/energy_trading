@@ -1,0 +1,42 @@
+models:
+  xgb_manifest: artifacts/model_runs/latest_xgboost.json
+  tft_manifest: artifacts/model_runs/latest_tft.json
+  rlqr_manifest: artifacts/model_runs/latest_linear.json
+
+target_groups:
+  - da
+  - afrr_capacity_pos
+  - afrr_capacity_neg
+  - afrr_activation_price_pos
+  - afrr_activation_price_neg
+  - afrr_activation_rate_pos
+  - afrr_activation_rate_neg
+
+quantiles: [0.1, 0.3, 0.5, 0.7, 0.9]
+
+horizon:
+  max_lead_h: 48
+  buckets:
+    short: [1, 8]
+    medium: [9, 16]
+    long: [17, 48]
+
+gate_contexts:
+  da_gate_relevant:
+    description: DA decision-relevant delivery hours
+  afrr_capacity_gate_relevant:
+    description: BCM decision-relevant delivery hours
+  bem_short_horizon:
+    leads: [1, 2, 3, 4]
+
+tail_events:
+  upper_tail_q: 0.90
+  extreme_upper_tail_q: 0.95
+  lower_tail_q: 0.10
+  activation_event_threshold: 0.0
+  high_activation_rate_q: 0.90
+
+figures:
+  typical_week: auto
+  high_volatility_week: auto
+  spike_week: auto

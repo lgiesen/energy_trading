@@ -47,7 +47,7 @@ def approx_crps(y: np.ndarray, q_preds: dict[float, np.ndarray]) -> float:
         return float("nan")
     qs = np.asarray([p[0] for p in pairs], dtype=float)
     ls = np.asarray([p[1] for p in pairs], dtype=float)
-    return float(2.0 * np.trapz(ls, qs))
+    return float(2.0 * np.trapezoid(ls, qs))
 
 
 def empirical_coverage(y: np.ndarray, yq: np.ndarray) -> float:
