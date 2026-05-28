@@ -32,8 +32,8 @@ from energy_trading.evaluation.forecast_metrics import (
     tail_event_metrics,
     winkler_score,
 )
+from energy_trading.evaluation.forecast_figures import generate_forecast_benchmark_figures
 from energy_trading.evaluation.forecast_truth_mapping import resolve_truth_mapping
-from energy_trading.visualization.style import apply_geo_style
 
 
 @dataclass
@@ -237,6 +237,13 @@ def _compute_metrics_for_frame(
                 "mean_pinball": mean_pinball_loss(yy, {q: q_preds[q][g.index.to_numpy()] for q in q_preds}),
                 "approx_crps": approx_crps(yy, {q: q_preds[q][g.index.to_numpy()] for q in q_preds}),
             })
+            if 0.1 in q_preds and 0.9 in q_preds:
+                rows_lead[-1]["coverage_p10_p90"] = interval_coverage(
+                    yy, q_preds[0.1][g.index.to_numpy()], q_preds[0.9][g.index.to_numpy()]
+                )
+                rows_lead[-1]["interval_width_p10_p90"] = interval_width(
+                    q_preds[0.1][g.index.to_numpy()], q_preds[0.9][g.index.to_numpy()]
+                )
             bucket = assign_horizon_bucket(float(lh), horizon_buckets)
             rows_hb.append({
                 "model": model,
@@ -351,6 +358,7 @@ def run_benchmark(
     min_join_coverage: float,
     fail_on_missing_truth: bool,
     make_figures: bool,
+    save_joined_predictions: bool,
     overwrite: bool,
 ) -> BenchmarkArtifacts:
     if overwrite and out_dir.exists():
@@ -361,9 +369,11 @@ def run_benchmark(
                 p.rmdir()
     out_dir.mkdir(parents=True, exist_ok=True)
     diagnostics = out_dir / "diagnostics"
+    joined_diag_dir = diagnostics / "joined_predictions"
     metrics_dir = out_dir / "metrics"
     figures = out_dir / "figures"
     diagnostics.mkdir(parents=True, exist_ok=True)
+    joined_diag_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
     figures.mkdir(parents=True, exist_ok=True)
 
@@ -391,6 +401,7 @@ def run_benchmark(
     m_tail: list[pd.DataFrame] = []
     m_cal: list[pd.DataFrame] = []
     m_cross: list[pd.DataFrame] = []
+    joined_frames: list[pd.DataFrame] = []
 
     for pointer in model_run_manifests:
         manifest_path, manifest = _load_latest_or_manifest(pointer)
@@ -462,6 +473,20 @@ def run_benchmark(
                         f"Predictions outside truth window dropped={n_out_of_window}."
                     )
                 joined = joined.loc[pd.notna(joined["y_true"])].copy()
+                joined["model"] = model
+                joined["split"] = split
+                joined["target"] = target
+                joined["predicted_value"] = pd.to_numeric(joined.get("predicted_value", joined.get("p50")), errors="coerce")
+                for q in quantiles:
+                    q_col = _qcol_for(q)
+                    if q_col not in joined.columns:
+                        joined[q_col] = np.nan
+                joined_min = joined[
+                    [c for c in ["model", "split", "target", "target_time_utc", "lead_time_h", "y_true", "p10", "p30", "p50", "p70", "p90", "predicted_value"] if c in joined.columns]
+                ].copy()
+                if save_joined_predictions:
+                    joined_min.to_parquet(joined_diag_dir / f"{model}__{split}__{target}.parquet", index=False)
+                joined_frames.append(joined_min)
                 inventory_rows.append(_build_inventory_row(model=model, split=split, target=target, pred_path=pred_path, truth_path=truth_source, joined=joined, truth_col=mapr.truth_column))
 
                 schema_rows.append(
@@ -525,26 +550,24 @@ def run_benchmark(
     (metrics_dir / "metrics_crossing.csv").write_text(crossing.to_csv(index=False), encoding="utf-8")
     (metrics_dir / "metrics_model_ranking_by_target.csv").write_text(per_target_rank.to_csv(index=False), encoding="utf-8")
     (metrics_dir / "metrics_model_ranking_global_normalized.csv").write_text(global_rank.to_csv(index=False), encoding="utf-8")
+    # Always materialize extended diagnostics metric files for validator stability.
+    for extra in ["metrics_residual_patterns.csv", "metrics_volatility_regimes.csv", "metrics_directional_bias.csv"]:
+        p = metrics_dir / extra
+        if not p.exists():
+            p.write_text("", encoding="utf-8")
 
-    # Placeholder empty figures directory content if disabled.
-    if make_figures:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        apply_geo_style()
-
-        if not by_lead.empty:
-            for (model, target), g in by_lead.groupby(["model", "target"]):
-                g = g.sort_values("lead_time_h")
-                fig, ax = plt.subplots(figsize=(8, 4))
-                ax.plot(g["lead_time_h"], g["mae_p50"], marker="o")
-                ax.set_title(f"Leadtime MAE | {model} | {target}")
-                ax.set_xlabel("lead_time_h")
-                ax.set_ylabel("mae_p50")
-                fig.tight_layout()
-                fig.savefig(figures / f"{model}_{target}_leadtime_mae.png", dpi=120)
-                plt.close(fig)
+    joined_all = pd.concat(joined_frames, ignore_index=True) if joined_frames else pd.DataFrame()
+    if make_figures and not joined_all.empty:
+        generate_forecast_benchmark_figures(
+            joined_df=joined_all,
+            by_lead=by_lead,
+            calibration=cal,
+            figures_dir=figures,
+            diagnostics_dir=diagnostics,
+            config=config,
+        )
+    elif not (diagnostics / "example_window_report.csv").exists():
+        (diagnostics / "example_window_report.csv").write_text("", encoding="utf-8")
 
     resolved_cfg_path = out_dir / "benchmark_config_resolved.yaml"
     try:
@@ -559,6 +582,7 @@ def run_benchmark(
         "truth_source": str(truth_source),
         "truth_source_sha256": _sha256(truth_source),
         "inventory_rows": len(inv_df),
+        "save_joined_predictions": bool(save_joined_predictions),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
     (out_dir / "input_manifest.json").write_text(json.dumps(input_manifest, indent=2), encoding="utf-8")
@@ -576,6 +600,8 @@ def run_benchmark(
         "quantiles": quantiles,
         "min_join_coverage": min_join_coverage,
         "quantile_repair_reported": True,
+        "figures_enabled": bool(make_figures),
+        "save_joined_predictions": bool(save_joined_predictions),
     }
     (out_dir / "benchmark_manifest.json").write_text(json.dumps(benchmark_manifest, indent=2), encoding="utf-8")
 

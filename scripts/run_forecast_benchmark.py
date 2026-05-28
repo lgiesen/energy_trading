@@ -31,7 +31,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--truth-source", default="data/features/all_data_features.parquet")
     p.add_argument("--min-join-coverage", type=float, default=0.999)
     p.add_argument("--fail-on-missing-truth", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--make-figures", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--make-figures", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--save-joined-predictions", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--example-weeks", default="auto")
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
     return p.parse_args()
@@ -43,6 +44,7 @@ def main() -> int:
     cfg["example_weeks"] = args.example_weeks
     splits = [s.strip() for s in str(args.splits).split(",") if s.strip()]
 
+    make_figures = bool(cfg.get("figures", {}).get("enabled", True)) if args.make_figures is None else bool(args.make_figures)
     art = run_benchmark(
         config=cfg,
         model_run_manifests=[Path(p).resolve() for p in args.model_run_manifest],
@@ -51,7 +53,8 @@ def main() -> int:
         truth_source=Path(args.truth_source).resolve(),
         min_join_coverage=float(args.min_join_coverage),
         fail_on_missing_truth=bool(args.fail_on_missing_truth),
-        make_figures=bool(args.make_figures),
+        make_figures=make_figures,
+        save_joined_predictions=bool(args.save_joined_predictions),
         overwrite=bool(args.overwrite),
     )
     print(f"[OK] Forecast benchmark completed: {art.benchmark_dir}")

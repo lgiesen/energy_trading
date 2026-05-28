@@ -115,7 +115,7 @@ def test_global_ranking_uses_normalized_rank_not_raw_mae_average(tmp_path: Path)
     d = tmp_path / "bench"
     (d / "metrics").mkdir(parents=True)
     (d / "diagnostics").mkdir(parents=True)
-    (d / "benchmark_manifest.json").write_text(json.dumps({"config_sha256":"x","quantiles":[0.1],"package_versions":{}}))
+    (d / "benchmark_manifest.json").write_text(json.dumps({"config_sha256":"x","quantiles":[0.1],"package_versions":{},"save_joined_predictions":False}))
     (d / "input_manifest.json").write_text("{}")
     (d / "benchmark_config_resolved.yaml").write_text("x: 1")
     pd.DataFrame([{"status":"ok"}]).to_csv(d / "diagnostics" / "truth_mapping_report.csv", index=False)
@@ -125,7 +125,8 @@ def test_global_ranking_uses_normalized_rank_not_raw_mae_average(tmp_path: Path)
     for f in [
         "metrics_overall.csv","metrics_by_target.csv","metrics_by_model.csv","metrics_by_lead.csv",
         "metrics_by_horizon_bucket.csv","metrics_gate_time.csv","metrics_tail_events.csv",
-        "metrics_calibration.csv","metrics_model_ranking_by_target.csv",
+        "metrics_calibration.csv","metrics_model_ranking_by_target.csv","metrics_residual_patterns.csv",
+        "metrics_volatility_regimes.csv","metrics_directional_bias.csv",
     ]:
         pd.DataFrame([{"model":"m","target":"t","split":"test","mae_p50":1.0,"mean_pinball":1.0,"approx_crps":1.0}]).to_csv(d / "metrics" / f, index=False)
     pd.DataFrame([{"model":"m","target":"t","split":"test","crossing_rate_before_repair":0.0,"max_crossing_violation_before_repair":0.0}]).to_csv(
@@ -171,6 +172,7 @@ def test_output_manifest_includes_hashes_and_config(tmp_path: Path) -> None:
         min_join_coverage=0.9,
         fail_on_missing_truth=True,
         make_figures=False,
+        save_joined_predictions=True,
         overwrite=True,
     )
     bm = json.loads((out / "benchmark_manifest.json").read_text())
@@ -205,6 +207,7 @@ def test_join_fails_if_coverage_below_threshold(tmp_path: Path) -> None:
             min_join_coverage=0.999,
             fail_on_missing_truth=True,
             make_figures=False,
+            save_joined_predictions=True,
             overwrite=True,
         )
 
@@ -217,3 +220,157 @@ def test_validation_script_detects_missing_required_files(tmp_path: Path) -> Non
         "--min-join-coverage", "0.9",
     ], capture_output=True, text=True)
     assert cp.returncode != 0
+
+
+def _run_small_benchmark(tmp_path: Path, make_figures: bool) -> Path:
+    truth = tmp_path / "truth.parquet"
+    pred_xgb = tmp_path / "pred_xgb.parquet"
+    pred_rlqr = tmp_path / "pred_rlqr.parquet"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ts = pd.date_range("2025-01-01", periods=24 * 10, freq="h", tz="UTC")
+    truth_df = pd.DataFrame({"timestamp_utc": ts, "da_price": np.sin(np.arange(len(ts)) / 8.0) * 10 + 50})
+    truth_df.to_parquet(truth, index=False)
+    base = truth_df["da_price"].to_numpy(dtype=float)
+    for path, shift in [(pred_xgb, 0.5), (pred_rlqr, -0.3)]:
+        df_pred = pd.DataFrame({
+            "target_time_utc": ts,
+            "lead_time_h": np.tile(np.arange(1, 25), len(ts) // 24),
+            "predicted_value": base + shift,
+            "p10": base - 3 + shift,
+            "p30": base - 1 + shift,
+            "p50": base + shift,
+            "p70": base + 1 + shift,
+            "p90": base + 3 + shift,
+        })
+        df_pred.to_parquet(path, index=False)
+    (run_dir / "manifest_xgb.json").write_text(json.dumps({
+        "training": {"model_type": "xgboost"},
+        "bundles": {"da": {"predictions_long": {"test": {"pred_da_price": f"../{pred_xgb.name}"}}}},
+    }))
+    (run_dir / "manifest_rlqr.json").write_text(json.dumps({
+        "training": {"model_type": "linear"},
+        "bundles": {"da": {"predictions_long": {"test": {"pred_da_price": f"../{pred_rlqr.name}"}}}},
+    }))
+    out = tmp_path / "out"
+    cfg = {
+        "quantiles": [0.1, 0.3, 0.5, 0.7, 0.9],
+        "horizon": {"buckets": {"short": [1, 8], "medium": [9, 16], "long": [17, 48]}},
+        "tail_events": {},
+        "figures": {"enabled": make_figures, "dpi": 150, "make": {
+            "leadtime_metrics": True,
+            "calibration": True,
+            "coverage_width": True,
+            "forecast_bands": True,
+            "tail_scatter": True,
+            "residual_diagnostics": True,
+            "volatility_diagnostics": True,
+        }, "example_windows": {"window_days": 7, "min_coverage": 0.8}},
+    }
+    run_benchmark(
+        config=cfg,
+        model_run_manifests=[run_dir / "manifest_xgb.json", run_dir / "manifest_rlqr.json"],
+        out_dir=out,
+        splits=["test"],
+        truth_source=truth,
+        min_join_coverage=0.9,
+        fail_on_missing_truth=True,
+        make_figures=make_figures,
+        save_joined_predictions=True,
+        overwrite=True,
+    )
+    return out
+
+
+def test_make_figures_creates_leadtime_metric_figures(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    assert (out / "figures" / "test" / "pred_da_price" / "leadtime_mae_p50.png").exists()
+    assert (out / "figures" / "test" / "pred_da_price" / "leadtime_mean_pinball.png").exists()
+    assert (out / "figures" / "test" / "pred_da_price" / "leadtime_approx_crps.png").exists()
+
+
+def test_make_figures_creates_calibration_curve(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    assert (out / "figures" / "test" / "pred_da_price" / "calibration_curve.png").exists()
+
+
+def test_make_figures_creates_forecast_band_examples(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    assert list((out / "figures" / "test" / "pred_da_price").glob("*/typical_week_forecast_band.png"))
+
+
+def test_make_figures_creates_tail_scatter(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    assert list((out / "figures" / "test" / "pred_da_price").glob("*/tail_event_scatter.png"))
+
+
+def test_make_figures_creates_residual_diagnostics(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    assert list((out / "figures" / "test" / "pred_da_price").glob("*/residual_by_hour_of_day.png"))
+    assert (out / "metrics" / "metrics_residual_patterns.csv").exists()
+
+
+def test_make_figures_creates_volatility_diagnostics(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    assert (out / "figures" / "test" / "pred_da_price" / "error_by_volatility_bucket.png").exists()
+    assert (out / "metrics" / "metrics_volatility_regimes.csv").exists()
+
+
+def test_figures_are_split_aware(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    assert (out / "figures" / "test").exists()
+
+
+def test_joined_predictions_are_saved(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=False)
+    files = list((out / "diagnostics" / "joined_predictions").glob("*.parquet"))
+    assert files
+
+
+def test_example_window_report_written(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    p = out / "diagnostics" / "example_window_report.csv"
+    assert p.exists()
+    assert p.stat().st_size > 0
+
+
+def test_validator_fails_when_required_figure_missing(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    missing = out / "figures" / "test" / "pred_da_price" / "calibration_curve.png"
+    missing.unlink()
+    cp = subprocess.run([
+        str(ROOT / ".venv" / "bin" / "python"),
+        str(ROOT / "scripts" / "validate_forecast_benchmark.py"),
+        "--benchmark-dir", str(out),
+        "--require-figures",
+    ], capture_output=True, text=True)
+    assert cp.returncode != 0
+
+
+def test_validator_passes_with_required_figures(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=True)
+    cp = subprocess.run([
+        str(ROOT / ".venv" / "bin" / "python"),
+        str(ROOT / "scripts" / "validate_forecast_benchmark.py"),
+        "--benchmark-dir", str(out),
+        "--require-figures",
+    ], capture_output=True, text=True)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
+def test_no_make_figures_skips_figure_validation_unless_required(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=False)
+    cp_ok = subprocess.run([
+        str(ROOT / ".venv" / "bin" / "python"),
+        str(ROOT / "scripts" / "validate_forecast_benchmark.py"),
+        "--benchmark-dir", str(out),
+        "--no-require-figures",
+    ], capture_output=True, text=True)
+    assert cp_ok.returncode == 0, cp_ok.stdout + cp_ok.stderr
+    cp_fail = subprocess.run([
+        str(ROOT / ".venv" / "bin" / "python"),
+        str(ROOT / "scripts" / "validate_forecast_benchmark.py"),
+        "--benchmark-dir", str(out),
+        "--require-figures",
+    ], capture_output=True, text=True)
+    assert cp_fail.returncode != 0

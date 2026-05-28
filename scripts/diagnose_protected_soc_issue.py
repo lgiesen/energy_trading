@@ -256,6 +256,10 @@ def diagnose_run(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "protected_soc_max_mwh": reported_max,
                 "soc_min_mwh": soc_min_mwh,
                 "soc_max_mwh": soc_max_mwh,
+                "physical_soc_min_mwh": float(r.get("real_physical_soc_min_mwh", r.get("physical_soc_min_mwh", soc_min_mwh))),
+                "physical_soc_max_mwh": float(r.get("real_physical_soc_max_mwh", r.get("physical_soc_max_mwh", soc_max_mwh))),
+                "obligation_headroom_pos_active": float(r.get("real_obligation_headroom_pos_active", r.get("obligation_headroom_pos_active", 0.0))),
+                "obligation_headroom_neg_active": float(r.get("real_obligation_headroom_neg_active", r.get("obligation_headroom_neg_active", 0.0))),
                 "da_buy_mwh": da_buy_mwh,
                 "da_sell_mwh": da_sell_mwh,
                 "da_buy_accepted": da_buy_acc,
@@ -271,6 +275,12 @@ def diagnose_run(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "aux_energy_mwh": aux_e,
                 "optimization_error_code": opt_code,
                 "fallback_mode": fallback_mode,
+                "protected_soc_violation_without_obligation": float(
+                    r.get(
+                        "real_protected_soc_violation_without_obligation",
+                        r.get("protected_soc_violation_without_obligation", 0.0),
+                    )
+                ),
             }
             viol_rows.append(base)
 
@@ -328,6 +338,12 @@ def diagnose_run(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "stale_or_missing_column_risk": stale_risk,
                 "protected_min_diff_mwh": min_diff,
                 "protected_max_diff_mwh": max_diff,
+                "protected_soc_violation_without_obligation": float(
+                    r.get(
+                        "real_protected_soc_violation_without_obligation",
+                        r.get("protected_soc_violation_without_obligation", 0.0),
+                    )
+                ),
             }
             drv, detail = _classify_driver(pd.Series(attrib))
             attrib["suspected_driver"] = drv

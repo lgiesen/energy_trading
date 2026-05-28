@@ -2377,6 +2377,75 @@ class BatteryBacktester:
             "max_bem_only_bid_mw": float(self.max_bem_only_bid_mw) if self.max_bem_only_bid_mw is not None else float("nan"),
         }
 
+    def _compute_obligation_driven_protected_soc_bounds(
+        self,
+        *,
+        soc_start_mwh: float,
+        required_headroom_pos_mwh: float,
+        required_headroom_neg_mwh: float,
+        locked_reserve_pos_mw: float,
+        locked_reserve_neg_mw: float,
+        committed_bem_pos_mw: float = 0.0,
+        committed_bem_neg_mw: float = 0.0,
+        reserve_pos_mw: float = 0.0,
+        reserve_neg_mw: float = 0.0,
+    ) -> dict[str, float]:
+        physical_soc_min_mwh = float(self.soc_min)
+        physical_soc_max_mwh = float(self.soc_max)
+        req_pos = max(0.0, float(required_headroom_pos_mwh))
+        req_neg = max(0.0, float(required_headroom_neg_mwh))
+        locked_pos = max(0.0, float(locked_reserve_pos_mw))
+        locked_neg = max(0.0, float(locked_reserve_neg_mw))
+        ob_pos_active = float(
+            (locked_pos > 1e-9)
+            or (req_pos > 1e-9)
+            or (max(0.0, float(committed_bem_pos_mw)) > 1e-9)
+            or (max(0.0, float(reserve_pos_mw)) > 1e-9)
+        )
+        ob_neg_active = float(
+            (locked_neg > 1e-9)
+            or (req_neg > 1e-9)
+            or (max(0.0, float(committed_bem_neg_mw)) > 1e-9)
+            or (max(0.0, float(reserve_neg_mw)) > 1e-9)
+        )
+        buffer_pos = float(
+            (self.reserve_headroom_safety_mwh + self.reserve_soc_projection_safety_mwh)
+            if ob_pos_active > 0.5
+            else 0.0
+        )
+        buffer_neg = float(
+            (self.reserve_headroom_safety_mwh + self.reserve_soc_projection_safety_mwh)
+            if ob_neg_active > 0.5
+            else 0.0
+        )
+        protected_soc_min_mwh = float(physical_soc_min_mwh + (req_pos if ob_pos_active > 0.5 else 0.0) + buffer_pos)
+        protected_soc_max_mwh = float(physical_soc_max_mwh - (req_neg if ob_neg_active > 0.5 else 0.0) - buffer_neg)
+        soc_start = float(soc_start_mwh)
+        protected_violation_pos = float(max(0.0, protected_soc_min_mwh - soc_start))
+        protected_violation_neg = float(max(0.0, soc_start - protected_soc_max_mwh))
+        physical_violation_pos = float(max(0.0, physical_soc_min_mwh - soc_start))
+        physical_violation_neg = float(max(0.0, soc_start - physical_soc_max_mwh))
+        violation_without_obligation = float(
+            ((protected_violation_pos + protected_violation_neg) > 1e-9)
+            and (ob_pos_active < 0.5)
+            and (ob_neg_active < 0.5)
+        )
+        return {
+            "physical_soc_min_mwh": physical_soc_min_mwh,
+            "physical_soc_max_mwh": physical_soc_max_mwh,
+            "obligation_headroom_pos_active": float(ob_pos_active),
+            "obligation_headroom_neg_active": float(ob_neg_active),
+            "protected_soc_min_mwh": float(protected_soc_min_mwh),
+            "protected_soc_max_mwh": float(protected_soc_max_mwh),
+            "protected_soc_buffer_pos_mwh": float(buffer_pos),
+            "protected_soc_buffer_neg_mwh": float(buffer_neg),
+            "protected_soc_violation_pos_mwh": float(protected_violation_pos),
+            "protected_soc_violation_neg_mwh": float(protected_violation_neg),
+            "protected_soc_violation_without_obligation": float(violation_without_obligation),
+            "physical_soc_violation_pos_mwh": float(physical_violation_pos),
+            "physical_soc_violation_neg_mwh": float(physical_violation_neg),
+        }
+
     def _apply_market_clearing(
         self,
         *,
@@ -5097,31 +5166,39 @@ class BatteryBacktester:
             avail_neg_mwh = max(0.0, self.soc_max - soc_start_hour)
             locked_reserve_pos_mw = float(clearing_rec.get("fixed_reserve_obligation_pos_mw", 0.0))
             locked_reserve_neg_mw = float(clearing_rec.get("fixed_reserve_obligation_neg_mw", 0.0))
-            protected_soc_min_mwh = float(
-                self.soc_min
-                + locked_reserve_pos_mw * self.reserve_activation_headroom_h / max(self.eta_out, 1e-12)
-                + self.reserve_headroom_safety_mwh
-                + self.reserve_soc_projection_safety_mwh
-            )
-            protected_soc_max_mwh = float(
-                self.soc_max
-                - locked_reserve_neg_mw * self.reserve_activation_headroom_h * self.eta_in
-                - self.reserve_headroom_safety_mwh
-                - self.reserve_soc_projection_safety_mwh
+            psv = self._compute_obligation_driven_protected_soc_bounds(
+                soc_start_mwh=float(soc_start_hour),
+                required_headroom_pos_mwh=float(req_pos_mwh),
+                required_headroom_neg_mwh=float(req_neg_mwh),
+                locked_reserve_pos_mw=float(locked_reserve_pos_mw),
+                locked_reserve_neg_mw=float(locked_reserve_neg_mw),
+                committed_bem_pos_mw=float(committed_bem_pos_mw),
+                committed_bem_neg_mw=float(committed_bem_neg_mw),
+                reserve_pos_mw=float(reserve_pos),
+                reserve_neg_mw=float(reserve_neg),
             )
             m.update(
                 {
                     "soc_start_mwh": soc_start_hour,
                     "soc_min_mwh": float(self.soc_min),
                     "soc_max_mwh": float(self.soc_max),
+                    "physical_soc_min_mwh": float(psv["physical_soc_min_mwh"]),
+                    "physical_soc_max_mwh": float(psv["physical_soc_max_mwh"]),
                     "locked_reserve_pos_mw": float(locked_reserve_pos_mw),
                     "locked_reserve_neg_mw": float(locked_reserve_neg_mw),
-                    "protected_soc_min_mwh": float(protected_soc_min_mwh),
-                    "protected_soc_max_mwh": float(protected_soc_max_mwh),
-                    "protected_soc_margin_pos_mwh": float(soc_start_hour - protected_soc_min_mwh),
-                    "protected_soc_margin_neg_mwh": float(protected_soc_max_mwh - soc_start_hour),
-                    "protected_soc_violation_pos_mwh": float(max(0.0, protected_soc_min_mwh - soc_start_hour)),
-                    "protected_soc_violation_neg_mwh": float(max(0.0, soc_start_hour - protected_soc_max_mwh)),
+                    "obligation_headroom_pos_active": float(psv["obligation_headroom_pos_active"]),
+                    "obligation_headroom_neg_active": float(psv["obligation_headroom_neg_active"]),
+                    "protected_soc_min_mwh": float(psv["protected_soc_min_mwh"]),
+                    "protected_soc_max_mwh": float(psv["protected_soc_max_mwh"]),
+                    "protected_soc_buffer_pos_mwh": float(psv["protected_soc_buffer_pos_mwh"]),
+                    "protected_soc_buffer_neg_mwh": float(psv["protected_soc_buffer_neg_mwh"]),
+                    "protected_soc_margin_pos_mwh": float(soc_start_hour - float(psv["protected_soc_min_mwh"])),
+                    "protected_soc_margin_neg_mwh": float(float(psv["protected_soc_max_mwh"]) - soc_start_hour),
+                    "protected_soc_violation_pos_mwh": float(psv["protected_soc_violation_pos_mwh"]),
+                    "protected_soc_violation_neg_mwh": float(psv["protected_soc_violation_neg_mwh"]),
+                    "protected_soc_violation_without_obligation": float(psv["protected_soc_violation_without_obligation"]),
+                    "physical_soc_violation_pos_mwh": float(psv["physical_soc_violation_pos_mwh"]),
+                    "physical_soc_violation_neg_mwh": float(psv["physical_soc_violation_neg_mwh"]),
                     "required_headroom_pos_mwh": float(req_pos_mwh),
                     "required_headroom_neg_mwh": float(req_neg_mwh),
                     "available_headroom_pos_mwh": float(avail_pos_mwh),
@@ -6782,6 +6859,34 @@ class BatteryBacktester:
         else:
             summary["protected_soc_violation_count"] = 0.0
             summary["protected_soc_violation_max_mwh"] = 0.0
+        psv_wo = pd.to_numeric(
+            hourly.get("real_protected_soc_violation_without_obligation", hourly.get("protected_soc_violation_without_obligation", 0.0)),
+            errors="coerce",
+        ).fillna(0.0)
+        summary["protected_soc_violation_without_obligation_count"] = float((psv_wo > 0.5).sum())
+        oph_pos = pd.to_numeric(
+            hourly.get("real_obligation_headroom_pos_active", hourly.get("obligation_headroom_pos_active", 0.0)),
+            errors="coerce",
+        ).fillna(0.0)
+        oph_neg = pd.to_numeric(
+            hourly.get("real_obligation_headroom_neg_active", hourly.get("obligation_headroom_neg_active", 0.0)),
+            errors="coerce",
+        ).fillna(0.0)
+        summary["protected_soc_obligation_pos_active_count"] = float((oph_pos > 0.5).sum())
+        summary["protected_soc_obligation_neg_active_count"] = float((oph_neg > 0.5).sum())
+        summary["protected_soc_mode"] = "obligation_driven"
+        summary["protected_soc_global_buffer_applied"] = float(0.0)
+        phys_pos = pd.to_numeric(
+            hourly.get("real_physical_soc_violation_pos_mwh", hourly.get("physical_soc_violation_pos_mwh", 0.0)),
+            errors="coerce",
+        ).fillna(0.0)
+        phys_neg = pd.to_numeric(
+            hourly.get("real_physical_soc_violation_neg_mwh", hourly.get("physical_soc_violation_neg_mwh", 0.0)),
+            errors="coerce",
+        ).fillna(0.0)
+        phys = phys_pos + phys_neg
+        summary["physical_soc_violation_count"] = float((phys > 1e-9).sum())
+        summary["physical_soc_violation_max_mwh"] = float(phys.max() if len(phys) else 0.0)
         if (
             "real_locked_reserve_pos_mw" in hourly.columns
             or "real_locked_reserve_neg_mw" in hourly.columns
@@ -7245,12 +7350,19 @@ class BatteryBacktester:
         missed_capacity_ok = (missed_cap_pos + missed_cap_neg) <= 1e-9
         missed_activation_ok = (missed_act_pos + missed_act_neg) <= 1e-9
         pnl_recon_ok = pnl_recon_err <= 1e-2
-        protected_soc_ok = float(summary.get("protected_soc_violation_count", 0.0)) <= 1e-9
+        protected_soc_effective_count = max(
+            0.0,
+            float(summary.get("protected_soc_violation_count", 0.0))
+            - float(summary.get("protected_soc_violation_without_obligation_count", 0.0)),
+        )
+        protected_soc_ok = protected_soc_effective_count <= 1e-9
+        physical_soc_ok = float(summary.get("physical_soc_violation_count", 0.0)) <= 1e-9
         summary["missed_capacity_check_pass"] = float(missed_capacity_ok)
         summary["missed_activation_check_pass"] = float(missed_activation_ok)
         summary["pnl_reconciliation_check_pass"] = float(pnl_recon_ok)
         summary["headroom_check_pass"] = float(headroom_ok)
         summary["protected_soc_check_pass"] = float(protected_soc_ok)
+        summary["physical_soc_check_pass"] = float(physical_soc_ok)
         summary["strict_simulation_validity"] = float(bool(strict_simulation_validity))
         if "real_optimization_fallback" in hourly.columns:
             fb_counts = hourly["real_optimization_fallback"].fillna("none").astype(str).value_counts(dropna=False).to_dict()
@@ -7370,6 +7482,8 @@ class BatteryBacktester:
             invalid_reasons.append("headroom")
         if float(summary.get("reserve_headroom_shortfall_check_pass", 1.0)) < 0.5:
             invalid_reasons.append("reserve_headroom_shortfall")
+        if not physical_soc_ok:
+            invalid_reasons.append("physical_soc")
         if not protected_soc_ok:
             invalid_reasons.append("protected_soc")
         invalid_reasons = list(dict.fromkeys(invalid_reasons))
@@ -7469,6 +7583,13 @@ class BatteryBacktester:
             ("thesis_reportable", 0.0),
             ("reserve_feasibility_repair_used", 0.0),
             ("infeasibility_driver", "none"),
+            ("protected_soc_mode", "obligation_driven"),
+            ("protected_soc_global_buffer_applied", 0.0),
+            ("protected_soc_obligation_pos_active_count", 0.0),
+            ("protected_soc_obligation_neg_active_count", 0.0),
+            ("protected_soc_violation_without_obligation_count", 0.0),
+            ("physical_soc_violation_count", 0.0),
+            ("physical_soc_violation_max_mwh", 0.0),
             ("reserve_feasibility_mode", "normal"),
             ("reserve_min_margin_after_bid_mwh", 0.25),
             ("reserve_bid_derate", 1.0),

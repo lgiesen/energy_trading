@@ -3511,3 +3511,118 @@ def test_no_new_bcm_keeps_existing_lockbook_obligations() -> None:
 
 def test_fallback_still_not_reportable() -> None:
     test_fallback_never_reportable()
+
+
+def test_no_obligation_protected_soc_equals_physical_bounds() -> None:
+    bt = _mk_backtester()
+    bt.reserve_headroom_safety_mwh = 0.75
+    bt.reserve_soc_projection_safety_mwh = 1.5
+    res = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=3.5,
+        required_headroom_pos_mwh=0.0,
+        required_headroom_neg_mwh=0.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        committed_bem_pos_mw=0.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+    )
+    assert np.isclose(float(res["physical_soc_min_mwh"]), bt.soc_min)
+    assert np.isclose(float(res["physical_soc_max_mwh"]), bt.soc_max)
+    assert np.isclose(float(res["protected_soc_min_mwh"]), bt.soc_min)
+    assert np.isclose(float(res["protected_soc_max_mwh"]), bt.soc_max)
+    assert np.isclose(float(res["protected_soc_violation_pos_mwh"]), 0.0)
+    assert np.isclose(float(res["protected_soc_violation_neg_mwh"]), 0.0)
+
+
+def test_positive_obligation_protected_soc_uses_headroom_and_safety() -> None:
+    bt = _mk_backtester()
+    bt.reserve_headroom_safety_mwh = 0.75
+    bt.reserve_soc_projection_safety_mwh = 1.5
+    res = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=3.0,
+        required_headroom_pos_mwh=0.5,
+        required_headroom_neg_mwh=0.0,
+        locked_reserve_pos_mw=1.0,
+        locked_reserve_neg_mw=0.0,
+        committed_bem_pos_mw=0.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+    )
+    assert float(res["protected_soc_min_mwh"]) > bt.soc_min
+    assert float(res["protected_soc_violation_pos_mwh"]) > 0.0
+
+
+def test_negative_obligation_protected_soc_uses_headroom_and_safety() -> None:
+    bt = _mk_backtester()
+    bt.reserve_headroom_safety_mwh = 0.75
+    bt.reserve_soc_projection_safety_mwh = 1.5
+    res = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=17.5,
+        required_headroom_pos_mwh=0.0,
+        required_headroom_neg_mwh=0.5,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=1.0,
+        committed_bem_pos_mw=0.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+    )
+    assert float(res["protected_soc_max_mwh"]) < bt.soc_max
+    assert float(res["protected_soc_violation_neg_mwh"]) > 0.0
+
+
+def test_zero_required_headroom_does_not_invalidate_da_only_soc_path() -> None:
+    bt = _mk_backtester()
+    bt.reserve_headroom_safety_mwh = 0.75
+    bt.reserve_soc_projection_safety_mwh = 1.5
+    res = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=3.5,
+        required_headroom_pos_mwh=0.0,
+        required_headroom_neg_mwh=0.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        committed_bem_pos_mw=0.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+    )
+    assert float(res["protected_soc_violation_pos_mwh"]) <= 1e-12
+    assert float(res["protected_soc_violation_without_obligation"]) <= 1e-12
+
+
+def test_real_physical_soc_violation_still_invalidates() -> None:
+    bt = _mk_backtester()
+    res = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=bt.soc_min - 0.1,
+        required_headroom_pos_mwh=0.0,
+        required_headroom_neg_mwh=0.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        committed_bem_pos_mw=0.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+    )
+    assert float(res["physical_soc_violation_pos_mwh"]) > 0.0
+
+
+def test_protected_soc_violation_with_obligation_still_invalidates() -> None:
+    bt = _mk_backtester()
+    bt.reserve_headroom_safety_mwh = 0.75
+    bt.reserve_soc_projection_safety_mwh = 1.5
+    res = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=3.0,
+        required_headroom_pos_mwh=0.75,
+        required_headroom_neg_mwh=0.0,
+        locked_reserve_pos_mw=0.5,
+        locked_reserve_neg_mw=0.0,
+        committed_bem_pos_mw=0.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+    )
+    assert float(res["obligation_headroom_pos_active"]) > 0.5
+    assert float(res["protected_soc_violation_pos_mwh"]) > 0.0

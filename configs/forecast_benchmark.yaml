@@ -37,6 +37,20 @@ tail_events:
   high_activation_rate_q: 0.90
 
 figures:
-  typical_week: auto
-  high_volatility_week: auto
-  spike_week: auto
+  enabled: true
+  dpi: 150
+  formats: ["png"]
+  make:
+    leadtime_metrics: true
+    calibration: true
+    coverage_width: true
+    forecast_bands: true
+    tail_scatter: true
+    residual_diagnostics: true
+    volatility_diagnostics: true
+  example_windows:
+    mode: auto
+    window_days: 7
+    min_coverage: 0.8
+    volatility_method: mean_abs_diff
+    spike_method: upper_tail_count
