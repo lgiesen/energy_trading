@@ -989,6 +989,24 @@ def parse_args() -> argparse.Namespace:
         help="Conservative minimum post-bid headroom margin threshold.",
     )
     p.add_argument(
+        "--bem-only-headroom-safety-mwh",
+        type=float,
+        default=None,
+        help="Additional safety margin for BEM-only submission guard relative to protected SoC envelope.",
+    )
+    p.add_argument(
+        "--max-bem-only-bid-mw",
+        type=float,
+        default=None,
+        help="Optional hard cap for BEM-only submitted MW per direction.",
+    )
+    p.add_argument(
+        "--disallow-simultaneous-bem-only-pos-neg",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If enabled, keep only the higher-EV side when both BEM-only pos and neg are desired.",
+    )
+    p.add_argument(
         "--reserve-bid-derate",
         type=float,
         default=1.0,
@@ -1265,6 +1283,19 @@ def main() -> None:
     if MODEL_SPECS["max_reserve_bid_mw"] is not None and float(MODEL_SPECS["max_reserve_bid_mw"]) < 0.0:
         raise ValueError("--max-reserve-bid-mw must be >= 0.")
     MODEL_SPECS["disable_new_bcm_reserve_bids"] = bool(args.disable_new_bcm_reserve_bids)
+    MODEL_SPECS["bem_only_headroom_safety_mwh"] = (
+        float(args.bem_only_headroom_safety_mwh)
+        if args.bem_only_headroom_safety_mwh is not None
+        else float(MODEL_SPECS.get("reserve_headroom_safety_mwh", 0.0))
+    )
+    if float(MODEL_SPECS["bem_only_headroom_safety_mwh"]) < 0.0:
+        raise ValueError("--bem-only-headroom-safety-mwh must be >= 0.")
+    MODEL_SPECS["max_bem_only_bid_mw"] = (
+        float(args.max_bem_only_bid_mw) if args.max_bem_only_bid_mw is not None else None
+    )
+    if MODEL_SPECS["max_bem_only_bid_mw"] is not None and float(MODEL_SPECS["max_bem_only_bid_mw"]) < 0.0:
+        raise ValueError("--max-bem-only-bid-mw must be >= 0.")
+    MODEL_SPECS["disallow_simultaneous_bem_only_pos_neg"] = bool(args.disallow_simultaneous_bem_only_pos_neg)
     MODEL_SPECS["reserve_retry_ladder"] = str(args.reserve_retry_ladder).strip()
     MODEL_SPECS["enable_reserve_retry_ladder"] = bool(
         bool(args.strict_simulation_validity) and str(MODEL_SPECS["reserve_feasibility_mode"]) == "conservative"
@@ -1444,6 +1475,19 @@ def main() -> None:
                 "real_id_discharge_mw",
                 "real_bem_only_submitted_pos_mw",
                 "real_bem_only_submitted_neg_mw",
+                "real_desired_bem_only_pos_mw",
+                "real_desired_bem_only_neg_mw",
+                "real_safe_bem_only_pos_mw",
+                "real_safe_bem_only_neg_mw",
+                "real_submitted_bem_only_pos_mw",
+                "real_submitted_bem_only_neg_mw",
+                "real_bem_only_pos_reduced_by_headroom_mw",
+                "real_bem_only_neg_reduced_by_headroom_mw",
+                "real_bem_only_headroom_guard_applied",
+                "real_bem_only_headroom_guard_reason",
+                "real_bem_only_protected_soc_min_mwh",
+                "real_bem_only_protected_soc_max_mwh",
+                "real_bem_only_soc_start_mwh",
                 "real_aux_energy_mwh",
                 "optimization_error_code",
                 "optimization_fallback",

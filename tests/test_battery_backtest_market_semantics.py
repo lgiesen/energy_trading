@@ -521,6 +521,284 @@ def test_bem_only_negative_activation_sign_without_bcm_award() -> None:
         assert float(m["revenue_activation_eur"]) > 0.0
 
 
+def test_bem_only_pos_submission_capped_by_protected_soc_headroom() -> None:
+    bt = _mk_backtester()
+    n_bins = len(bt.afrr_quantile_bins)
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=2.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=-100.0,
+        true_act_neg=-100.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        soc_now=bt.soc_min + 0.05,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+        planned_reserve_pos_bins_mw=[0.0] * n_bins,
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
+        pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
+        pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
+    )
+    assert float(out["desired_bem_only_pos_mw"]) == 2.0
+    assert float(out["submitted_bem_only_pos_mw"]) <= 2.0 + 1e-9
+    assert float(out["submitted_bem_only_pos_mw"]) <= float(out["safe_bem_only_pos_mw"]) + 1e-9
+
+
+def test_bem_only_neg_submission_capped_by_protected_soc_headroom() -> None:
+    bt = _mk_backtester()
+    n_bins = len(bt.afrr_quantile_bins)
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=0.0,
+        planned_bem_only_neg_mw=2.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=-100.0,
+        true_act_neg=-100.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        soc_now=bt.soc_max - 0.05,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+        planned_reserve_pos_bins_mw=[0.0] * n_bins,
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
+        pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
+        pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
+    )
+    assert float(out["desired_bem_only_neg_mw"]) == 2.0
+    assert float(out["submitted_bem_only_neg_mw"]) <= 2.0 + 1e-9
+    assert float(out["submitted_bem_only_neg_mw"]) <= float(out["safe_bem_only_neg_mw"]) + 1e-9
+
+
+def test_bem_only_guard_uses_locked_reserve_protected_envelope() -> None:
+    bt = _mk_backtester()
+    n_bins = len(bt.afrr_quantile_bins)
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=3.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=100.0,
+        true_cap_pos=100.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=-100.0,
+        true_act_neg=-100.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        soc_now=bt.soc_init,
+        obligation_pos_mw=2.0,
+        obligation_neg_mw=0.0,
+        planned_reserve_pos_bins_mw=[0.0] * n_bins,
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
+        pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
+        pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
+    )
+    assert float(out["bem_only_protected_soc_min_mwh"]) > bt.soc_min
+
+
+def test_bem_only_guard_does_not_change_bcm_linked_activation() -> None:
+    bt = _mk_backtester()
+    n_bins = len(bt.afrr_quantile_bins)
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T08:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=5.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=3.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=10.0,
+        true_cap_pos=10.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=-100.0,
+        true_act_neg=-100.0,
+        true_rate_pos=1.0,
+        true_rate_neg=0.0,
+        obligation_pos_mw=5.0,
+        obligation_neg_mw=0.0,
+        planned_reserve_pos_bins_mw=[5.0] + [0.0] * (n_bins - 1),
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
+        pred_cap_pos_bins_eur_mw=[10.0] + [0.0] * (n_bins - 1),
+        pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
+    )
+    assert float(out["executed_reserve_pos_mw"]) >= 5.0 - 1e-9
+    assert float(out["bem_only_submitted_pos_mw"]) == 0.0
+
+
+def test_bem_only_guard_keeps_forecast_values_unchanged() -> None:
+    bt = _mk_backtester()
+    n_bins = len(bt.afrr_quantile_bins)
+    pred_pos = 123.45
+    pred_neg = -67.89
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=2.0,
+        planned_bem_only_neg_mw=2.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=pred_pos,
+        true_act_pos=pred_pos,
+        pred_act_neg=pred_neg,
+        true_act_neg=pred_neg,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        soc_now=bt.soc_init,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+        planned_reserve_pos_bins_mw=[0.0] * n_bins,
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
+        pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
+        pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
+    )
+    assert float(out["desired_bem_only_pos_mw"]) == 2.0
+    assert float(out["desired_bem_only_neg_mw"]) == 2.0
+    assert float(out["submitted_bem_only_pos_mw"]) <= 2.0 + 1e-9
+    assert float(out["submitted_bem_only_neg_mw"]) <= 2.0 + 1e-9
+
+
+def test_simultaneous_bem_only_pos_neg_allowed_if_both_feasible() -> None:
+    bt = _mk_backtester()
+    bt.disallow_simultaneous_bem_only_pos_neg = False
+    n_bins = len(bt.afrr_quantile_bins)
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=1.0,
+        planned_bem_only_neg_mw=1.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=-100.0,
+        true_act_neg=-100.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        soc_now=bt.soc_init,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+        planned_reserve_pos_bins_mw=[0.0] * n_bins,
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
+        pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
+        pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
+    )
+    assert float(out["submitted_bem_only_pos_mw"]) > 0.0
+    assert float(out["submitted_bem_only_neg_mw"]) > 0.0
+
+
+def test_simultaneous_bem_only_pos_neg_capped_if_one_side_infeasible() -> None:
+    bt = _mk_backtester()
+    n_bins = len(bt.afrr_quantile_bins)
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=2.0,
+        planned_bem_only_neg_mw=2.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=-100.0,
+        true_act_neg=-100.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        soc_now=bt.soc_min + 0.05,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+        planned_reserve_pos_bins_mw=[0.0] * n_bins,
+        planned_reserve_neg_bins_mw=[0.0] * n_bins,
+        pred_cap_pos_bins_eur_mw=[0.0] * n_bins,
+        pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
+    )
+    assert float(out["submitted_bem_only_pos_mw"]) == 0.0
+    assert float(out["submitted_bem_only_neg_mw"]) >= 0.0
+
+
+def test_bem_only_guard_fields_written_to_hourly_and_summary() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=2, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
+    for c in (
+        "desired_bem_only_pos_mw",
+        "safe_bem_only_pos_mw",
+        "submitted_bem_only_pos_mw",
+        "bem_only_headroom_guard_applied",
+        "bem_only_headroom_guard_reason",
+    ):
+        assert c in out.hourly.columns
+    for k in (
+        "bem_only_headroom_safety_mwh",
+        "bem_only_headroom_guard_applied_count",
+        "bem_only_pos_reduced_by_headroom_mw_sum",
+        "bem_only_headroom_guard_hours",
+    ):
+        assert k in out.summary
+
+
 def test_bem_only_summary_fields_present() -> None:
     bt = _mk_backtester()
     df, col = _tiny_backtest_df(hours=4)

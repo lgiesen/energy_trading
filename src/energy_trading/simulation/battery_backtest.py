@@ -409,6 +409,18 @@ class BatteryBacktester:
         self.max_reserve_bid_mw = (
             None if _max_reserve_bid_mw_cfg is None else max(0.0, float(_max_reserve_bid_mw_cfg))
         )
+        self.bem_only_headroom_safety_mwh = max(
+            0.0,
+            float(MODEL_SPECS.get("bem_only_headroom_safety_mwh", self.reserve_headroom_safety_mwh)),
+        )
+        _max_bem_only_bid_mw_cfg = MODEL_SPECS.get("max_bem_only_bid_mw", None)
+        self.max_bem_only_bid_mw = (
+            None if _max_bem_only_bid_mw_cfg is None else max(0.0, float(_max_bem_only_bid_mw_cfg))
+        )
+        self.disable_bem_only = bool(MODEL_SPECS.get("disable_bem_only", False))
+        self.disallow_simultaneous_bem_only_pos_neg = bool(
+            MODEL_SPECS.get("disallow_simultaneous_bem_only_pos_neg", False)
+        )
         self.disable_new_bcm_reserve_bids = bool(MODEL_SPECS.get("disable_new_bcm_reserve_bids", False))
         self.enable_reserve_retry_ladder = bool(MODEL_SPECS.get("enable_reserve_retry_ladder", False))
         self.reserve_retry_ladder = self._parse_reserve_retry_ladder(
@@ -2250,6 +2262,93 @@ class BatteryBacktester:
             id_discharge = max(0.0, min(needed_discharge_mw, self.p_max_mw - max(0.0, da_discharge_next_mw)))
         return float(id_charge), float(id_discharge)
 
+    def _apply_bem_only_submission_guard(
+        self,
+        *,
+        desired_bem_only_pos_mw: float,
+        desired_bem_only_neg_mw: float,
+        soc_start_mwh: float,
+        locked_reserve_pos_mw: float,
+        locked_reserve_neg_mw: float,
+        pred_act_pos: float,
+        pred_act_neg: float,
+    ) -> dict[str, float | str]:
+        desired_pos = max(0.0, float(desired_bem_only_pos_mw))
+        desired_neg = max(0.0, float(desired_bem_only_neg_mw))
+        soc_start = float(soc_start_mwh)
+        locked_pos = max(0.0, float(locked_reserve_pos_mw))
+        locked_neg = max(0.0, float(locked_reserve_neg_mw))
+        protected_soc_min_mwh = float(self.soc_min)
+        protected_soc_max_mwh = float(self.soc_max)
+        if locked_pos > 0.0 or locked_neg > 0.0:
+            protected_soc_min_mwh = float(
+                self.soc_min
+                + locked_pos * self.reserve_activation_headroom_h / max(self.eta_out, 1e-12)
+            )
+            protected_soc_max_mwh = float(
+                self.soc_max
+                - locked_neg * self.reserve_activation_headroom_h * self.eta_in
+            )
+        safe_pos = max(
+            0.0,
+            (soc_start - protected_soc_min_mwh - self.bem_only_headroom_safety_mwh)
+            * max(self.eta_out, 1e-12)
+            / max(self.bem_activation_headroom_h, 1e-12),
+        )
+        safe_neg = max(
+            0.0,
+            (protected_soc_max_mwh - soc_start - self.bem_only_headroom_safety_mwh)
+            / max(self.eta_in * self.bem_activation_headroom_h, 1e-12),
+        )
+        guard_reason = "none"
+        exclusivity_applied = 0.0
+        if self.disable_bem_only:
+            desired_pos = 0.0
+            desired_neg = 0.0
+            guard_reason = "disabled_by_config"
+        if self.disallow_simultaneous_bem_only_pos_neg and desired_pos > 1e-12 and desired_neg > 1e-12:
+            pos_ev = float(pred_act_pos) * desired_pos
+            neg_ev = -float(pred_act_neg) * desired_neg
+            if pos_ev >= neg_ev:
+                desired_neg = 0.0
+            else:
+                desired_pos = 0.0
+            exclusivity_applied = 1.0
+            guard_reason = "pos_neg_exclusivity"
+
+        submitted_pos = min(desired_pos, safe_pos)
+        submitted_neg = min(desired_neg, safe_neg)
+        if self.max_bem_only_bid_mw is not None:
+            submitted_pos = min(submitted_pos, float(self.max_bem_only_bid_mw))
+            submitted_neg = min(submitted_neg, float(self.max_bem_only_bid_mw))
+        if submitted_pos <= 1e-9:
+            submitted_pos = 0.0
+        if submitted_neg <= 1e-9:
+            submitted_neg = 0.0
+        if guard_reason == "none" and (
+            abs(submitted_pos - desired_pos) > 1e-9 or abs(submitted_neg - desired_neg) > 1e-9
+        ):
+            guard_reason = "protected_soc_headroom_cap"
+        guard_applied = float(guard_reason != "none")
+        return {
+            "desired_bem_only_pos_mw": float(desired_bem_only_pos_mw),
+            "desired_bem_only_neg_mw": float(desired_bem_only_neg_mw),
+            "safe_bem_only_pos_mw": float(safe_pos),
+            "safe_bem_only_neg_mw": float(safe_neg),
+            "submitted_bem_only_pos_mw": float(submitted_pos),
+            "submitted_bem_only_neg_mw": float(submitted_neg),
+            "bem_only_pos_reduced_by_headroom_mw": float(max(0.0, desired_bem_only_pos_mw - submitted_pos)),
+            "bem_only_neg_reduced_by_headroom_mw": float(max(0.0, desired_bem_only_neg_mw - submitted_neg)),
+            "bem_only_headroom_guard_applied": guard_applied,
+            "bem_only_headroom_guard_reason": str(guard_reason),
+            "bem_only_protected_soc_min_mwh": float(protected_soc_min_mwh),
+            "bem_only_protected_soc_max_mwh": float(protected_soc_max_mwh),
+            "bem_only_soc_start_mwh": float(soc_start),
+            "bem_only_pos_neg_exclusivity_applied": float(exclusivity_applied),
+            "bem_only_disabled_by_config": float(self.disable_bem_only),
+            "max_bem_only_bid_mw": float(self.max_bem_only_bid_mw) if self.max_bem_only_bid_mw is not None else float("nan"),
+        }
+
     def _apply_market_clearing(
         self,
         *,
@@ -2436,9 +2535,18 @@ class BatteryBacktester:
         else:
             # No BCM obligation for this delivery hour.
             # Explicit BEM-only participation uses independent planned BEM volumes.
+            bem_guard = self._apply_bem_only_submission_guard(
+                desired_bem_only_pos_mw=float(bem_pos_plan),
+                desired_bem_only_neg_mw=float(bem_neg_plan),
+                soc_start_mwh=float(soc_ref),
+                locked_reserve_pos_mw=float(ob_pos),
+                locked_reserve_neg_mw=float(ob_neg),
+                pred_act_pos=float(pred_act_pos),
+                pred_act_neg=float(pred_act_neg),
+            )
             cap_bids: list[AFRRCapacityBid] = []
-            q_pos = self.bid_builder._qfloor(float(bem_pos_plan), self.afrr_step_mw)
-            q_neg = self.bid_builder._qfloor(float(bem_neg_plan), self.afrr_step_mw)
+            q_pos = self.bid_builder._qfloor(float(bem_guard["submitted_bem_only_pos_mw"]), self.afrr_step_mw)
+            q_neg = self.bid_builder._qfloor(float(bem_guard["submitted_bem_only_neg_mw"]), self.afrr_step_mw)
             if 0.0 < q_pos < self.afrr_min_bid_size_mw:
                 q_pos = 0.0
             if 0.0 < q_neg < self.afrr_min_bid_size_mw:
@@ -2501,6 +2609,16 @@ class BatteryBacktester:
                 )
                 for b in cap_bids
             ]
+        if ob_pos > 0.0 or ob_neg > 0.0:
+            bem_guard = self._apply_bem_only_submission_guard(
+                desired_bem_only_pos_mw=0.0,
+                desired_bem_only_neg_mw=0.0,
+                soc_start_mwh=float(soc_ref),
+                locked_reserve_pos_mw=float(ob_pos),
+                locked_reserve_neg_mw=float(ob_neg),
+                pred_act_pos=float(pred_act_pos),
+                pred_act_neg=float(pred_act_neg),
+            )
         da_bids = self.bid_builder.build_da_bids_from_plan(
             ts=ts,
             planned_charge_mw=ch_plan,
@@ -2664,6 +2782,22 @@ class BatteryBacktester:
             "plan_discharge_mw": dis_plan,
             "plan_reserve_pos_mw": res_pos_plan,
             "plan_reserve_neg_mw": res_neg_plan,
+            "desired_bem_only_pos_mw": float(bem_guard.get("desired_bem_only_pos_mw", 0.0)),
+            "desired_bem_only_neg_mw": float(bem_guard.get("desired_bem_only_neg_mw", 0.0)),
+            "safe_bem_only_pos_mw": float(bem_guard.get("safe_bem_only_pos_mw", 0.0)),
+            "safe_bem_only_neg_mw": float(bem_guard.get("safe_bem_only_neg_mw", 0.0)),
+            "submitted_bem_only_pos_mw": float(bem_guard.get("submitted_bem_only_pos_mw", 0.0)),
+            "submitted_bem_only_neg_mw": float(bem_guard.get("submitted_bem_only_neg_mw", 0.0)),
+            "bem_only_pos_reduced_by_headroom_mw": float(bem_guard.get("bem_only_pos_reduced_by_headroom_mw", 0.0)),
+            "bem_only_neg_reduced_by_headroom_mw": float(bem_guard.get("bem_only_neg_reduced_by_headroom_mw", 0.0)),
+            "bem_only_headroom_guard_applied": float(bem_guard.get("bem_only_headroom_guard_applied", 0.0)),
+            "bem_only_headroom_guard_reason": str(bem_guard.get("bem_only_headroom_guard_reason", "none")),
+            "bem_only_protected_soc_min_mwh": float(bem_guard.get("bem_only_protected_soc_min_mwh", self.soc_min)),
+            "bem_only_protected_soc_max_mwh": float(bem_guard.get("bem_only_protected_soc_max_mwh", self.soc_max)),
+            "bem_only_soc_start_mwh": float(bem_guard.get("bem_only_soc_start_mwh", soc_ref)),
+            "bem_only_pos_neg_exclusivity_applied": float(bem_guard.get("bem_only_pos_neg_exclusivity_applied", 0.0)),
+            "bem_only_disabled_by_config": float(bem_guard.get("bem_only_disabled_by_config", 0.0)),
+            "max_bem_only_bid_mw": float(bem_guard.get("max_bem_only_bid_mw", float("nan"))),
             "submitted_da_buy_mw": float(da_res.submitted_buy_mw),
             "submitted_da_sell_mw": float(da_res.submitted_sell_mw),
             "submitted_da_buy_price_eur_mwh": submitted_da_buy_price,
@@ -6791,6 +6925,11 @@ class BatteryBacktester:
                 summary["precommit_reduction_reason"] = json.dumps({str(k): float(v) for k, v in vc2.items()}, sort_keys=True)
         summary["bem_only_mode"] = "explicit_optimizer"
         summary["bem_only_explicit_optimizer"] = 1.0
+        summary["bem_only_disabled_by_config"] = float(self.disable_bem_only)
+        summary["bem_only_headroom_safety_mwh"] = float(self.bem_only_headroom_safety_mwh)
+        summary["max_bem_only_bid_mw"] = (
+            float(self.max_bem_only_bid_mw) if self.max_bem_only_bid_mw is not None else float("nan")
+        )
         bcm_col = "real_afrr_bcm_auction_cleared"
         if bcm_col in hourly.columns:
             bcm_mask = pd.to_numeric(hourly[bcm_col], errors="coerce").fillna(0.0) > 0.5
@@ -6849,6 +6988,24 @@ class BatteryBacktester:
             summary["bem_only_activation_revenue_eur"] = float(
                 pd.to_numeric(hourly.get("real_bem_only_activation_revenue_eur", 0.0), errors="coerce").fillna(0.0).sum()
             )
+            guard_applied = pd.to_numeric(hourly.get("real_bem_only_headroom_guard_applied", 0.0), errors="coerce").fillna(0.0)
+            red_pos = pd.to_numeric(hourly.get("real_bem_only_pos_reduced_by_headroom_mw", 0.0), errors="coerce").fillna(0.0)
+            red_neg = pd.to_numeric(hourly.get("real_bem_only_neg_reduced_by_headroom_mw", 0.0), errors="coerce").fillna(0.0)
+            summary["bem_only_headroom_guard_applied_count"] = float((guard_applied > 0.5).sum())
+            summary["bem_only_pos_reduced_by_headroom_mw_sum"] = float(red_pos.sum())
+            summary["bem_only_neg_reduced_by_headroom_mw_sum"] = float(red_neg.sum())
+            summary["bem_only_headroom_guard_max_reduction_mw"] = float(
+                max((red_pos + red_neg).max() if len(red_pos) else 0.0, 0.0)
+            )
+            guard_hours = pd.to_datetime(
+                hourly.loc[guard_applied > 0.5, colmap.timestamp] if colmap.timestamp in hourly.columns else pd.Series([], dtype="datetime64[ns, UTC]"),
+                utc=True,
+                errors="coerce",
+            ).dropna()
+            summary["bem_only_headroom_guard_hours"] = json.dumps(
+                [ts.isoformat() for ts in guard_hours.tolist()],
+                sort_keys=False,
+            )
         else:
             summary["bem_only_hours"] = 0.0
             summary["bem_only_pos_bid_hours"] = 0.0
@@ -6862,6 +7019,11 @@ class BatteryBacktester:
             summary["bem_only_pos_activation_mwh_sum"] = 0.0
             summary["bem_only_neg_activation_mwh_sum"] = 0.0
             summary["bem_only_activation_revenue_eur"] = 0.0
+            summary["bem_only_headroom_guard_applied_count"] = 0.0
+            summary["bem_only_pos_reduced_by_headroom_mw_sum"] = 0.0
+            summary["bem_only_neg_reduced_by_headroom_mw_sum"] = 0.0
+            summary["bem_only_headroom_guard_max_reduction_mw"] = 0.0
+            summary["bem_only_headroom_guard_hours"] = "[]"
         # Keep ROI numerically stable by flooring denominator at 1 EUR.
         roi_denom = max(1.0, float(summary["max_capital_required_eur"]))
         summary["roi_on_max_capital"] = float(summary["realized_total_pnl_eur"] / roi_denom)
