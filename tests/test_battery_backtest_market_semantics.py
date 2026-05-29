@@ -3244,6 +3244,68 @@ def test_candidate_debug_dump_does_not_invalidate_if_not_accepted() -> None:
     assert bool(thesis_rule.iloc[0])
 
 
+def test_candidate_retry_infeasible_dumps_with_final_ok_path_do_not_invalidate() -> None:
+    bt = _mk_backtester()
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [
+                pd.Timestamp("2025-05-01T06:00:00Z"),
+                pd.Timestamp("2025-05-01T07:00:00Z"),
+            ],
+            "optimization_error_code": ["ok", "ok"],
+            "optimization_fallback": ["none", "none"],
+            "optimizer_fallback_used": [0.0, 0.0],
+        }
+    )
+    dumps = [
+        {"timestamp_utc": "20250501T060000Z", "path": "a.npz", "solve_context": '{"final_accepted_path": false}'},
+        {"timestamp_utc": "20250501T070000Z", "path": "b.npz", "solve_context": '{"final_accepted_path": false}'},
+    ]
+    accepted, candidate = bt._classify_infeasible_debug_dumps(dumps, hourly, timestamp_col="timestamp_utc")
+    assert len(accepted) == 0
+    assert len(candidate) == 2
+
+
+def test_accepted_fallback_hour_marks_dump_as_accepted_and_invalidating() -> None:
+    bt = _mk_backtester()
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2025-05-01T09:00:00Z")],
+            "optimization_error_code": ["safe_hold_plan"],
+            "optimization_fallback": ["safe_hold_plan"],
+            "optimizer_fallback_used": [1.0],
+        }
+    )
+    dumps = [{"timestamp_utc": "20250501T090000Z", "path": "x.npz"}]
+    accepted, candidate = bt._classify_infeasible_debug_dumps(dumps, hourly, timestamp_col="timestamp_utc")
+    assert len(accepted) == 1
+    assert len(candidate) == 0
+
+
+def test_accepted_infeasible_dump_count_requires_first_timestamp() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    if float(s.get("accepted_path_infeasible_debug_dump_count", 0.0)) > 0.5:
+        assert str(s.get("first_infeasible_timestamp_utc", "")).strip() != ""
+
+
+def test_invalid_reason_includes_infeasible_debug_dump_only_for_accepted_path() -> None:
+    s = {
+        "accepted_path_infeasible_debug_dump_count": 0.0,
+        "candidate_infeasible_debug_dump_count": 5.0,
+        "fallback_used": 0.0,
+        "reserve_feasibility_repair_used": 0.0,
+        "simulation_valid": 1.0,
+        "invalid_reason": "",
+    }
+    invalid_reason = str(s.get("invalid_reason", ""))
+    if float(s.get("accepted_path_infeasible_debug_dump_count", 0.0)) > 0.5:
+        invalid_reason = ",".join([v for v in [invalid_reason, "optimization_infeasible_debug_dump"] if v])
+    assert "optimization_infeasible_debug_dump" not in invalid_reason
+
+
 def test_validator_required_fields_include_debug_dump_schema() -> None:
     req = set(validate_outputs.REQUIRED_SUMMARY_FIELDS)
     for k in (

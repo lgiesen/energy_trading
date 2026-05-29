@@ -884,6 +884,7 @@ class BatteryBacktester:
         lb: np.ndarray,
         ub: np.ndarray,
         message: str,
+        solve_context: dict[str, object] | None = None,
     ) -> None:
         """Persist MILP matrices for post-mortem infeasibility debugging."""
         try:
@@ -902,16 +903,68 @@ class BatteryBacktester:
                 lb=lb,
                 ub=ub,
                 message=np.array([str(message)]),
+                solve_context=np.array([json.dumps(solve_context or {}, sort_keys=True)]),
+                variable_names=np.array([], dtype=str),
+                constraint_names=np.array([], dtype=str),
             )
             self._infeasible_debug_dumps.append(
                 {
                     "path": str(path),
                     "timestamp_utc": str(tag),
+                    "solve_context": json.dumps(solve_context or {}, sort_keys=True),
                 }
             )
             print(f"[DIAG] wrote infeasible debug dump: {path}")
         except Exception as exc:
             print(f"[WARN] failed to write infeasible debug dump: {exc}")
+
+    @staticmethod
+    def _classify_infeasible_debug_dumps(
+        dumps: list[dict[str, str]],
+        hourly: pd.DataFrame,
+        *,
+        timestamp_col: str,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Return (accepted_path_dumps, candidate_dumps)."""
+        if not dumps:
+            return [], []
+        accepted_mask = pd.Series(False, index=hourly.index)
+        if "real_optimization_error_code" in hourly.columns:
+            ec = hourly["real_optimization_error_code"].fillna("ok").astype(str).str.strip().str.lower()
+            accepted_mask |= ~ec.isin(["ok", "none", ""])
+        elif "optimization_error_code" in hourly.columns:
+            ec = hourly["optimization_error_code"].fillna("ok").astype(str).str.strip().str.lower()
+            accepted_mask |= ~ec.isin(["ok", "none", ""])
+        if "real_optimization_fallback" in hourly.columns:
+            fb = hourly["real_optimization_fallback"].fillna("none").astype(str).str.strip().str.lower()
+            accepted_mask |= fb.ne("none")
+        elif "optimization_fallback" in hourly.columns:
+            fb = hourly["optimization_fallback"].fillna("none").astype(str).str.strip().str.lower()
+            accepted_mask |= fb.ne("none")
+        if "optimizer_fallback_used" in hourly.columns:
+            accepted_mask |= pd.to_numeric(hourly["optimizer_fallback_used"], errors="coerce").fillna(0.0).gt(0.5)
+        accepted_ts = set(
+            pd.to_datetime(hourly.loc[accepted_mask, timestamp_col], utc=True, errors="coerce")
+            .dropna()
+            .tolist()
+        )
+        accepted: list[dict[str, str]] = []
+        candidate: list[dict[str, str]] = []
+        for d in dumps:
+            ctx_raw = str(d.get("solve_context", "")).strip()
+            ctx_ts = ""
+            if ctx_raw:
+                try:
+                    ctx_ts = str(json.loads(ctx_raw).get("timestamp_utc", "")).strip()
+                except Exception:
+                    ctx_ts = ""
+            ts_raw = ctx_ts or str(d.get("timestamp_utc", "")).strip()
+            ts = pd.to_datetime(ts_raw, utc=True, errors="coerce")
+            if pd.notna(ts) and ts in accepted_ts:
+                accepted.append(d)
+            else:
+                candidate.append(d)
+        return accepted, candidate
 
     @staticmethod
     def _quantile_map_from_row(row: pd.Series) -> dict[float, float]:
@@ -1708,6 +1761,15 @@ class BatteryBacktester:
                     lb=lb,
                     ub=ub,
                     message=msg,
+                    solve_context={
+                        "timestamp_utc": (
+                            pd.to_datetime(df[colmap.timestamp].iloc[0], utc=True, errors="coerce").isoformat()
+                            if len(df) > 0
+                            else ""
+                        ),
+                        "attempt_type": "optimize_dispatch_primary",
+                        "final_accepted_path": False,
+                    },
                 )
             raise RuntimeError(f"MIP optimization failed: {sol.message}")
         if sol.x is None or len(sol.x) != n_vars:
@@ -6607,15 +6669,30 @@ class BatteryBacktester:
             "reserve_activation_headroom_h": float(self.reserve_activation_headroom_h),
             "bem_activation_headroom_h": float(self.bem_activation_headroom_h),
         }
+        accepted_dumps, candidate_dumps = self._classify_infeasible_debug_dumps(
+            self._infeasible_debug_dumps,
+            hourly,
+            timestamp_col=colmap.timestamp,
+        )
         summary["infeasible_debug_dump_count"] = float(len(self._infeasible_debug_dumps))
-        summary["accepted_path_infeasible_debug_dump_count"] = float(len(self._infeasible_debug_dumps))
-        summary["candidate_infeasible_debug_dump_count"] = 0.0
+        summary["accepted_path_infeasible_debug_dump_count"] = float(len(accepted_dumps))
+        summary["candidate_infeasible_debug_dump_count"] = float(len(candidate_dumps))
         summary["infeasible_debug_dump_paths"] = [
             d.get("path", "") for d in self._infeasible_debug_dumps
         ]
         summary["infeasible_debug_dump_timestamps"] = [
             d.get("timestamp_utc", "") for d in self._infeasible_debug_dumps
         ]
+        accepted_dump_timestamps = [
+            d.get("timestamp_utc", "") for d in accepted_dumps if str(d.get("timestamp_utc", "")).strip()
+        ]
+        if accepted_dump_timestamps:
+            first_inf_ts = pd.to_datetime(accepted_dump_timestamps, utc=True, errors="coerce").dropna()
+            summary["first_infeasible_timestamp_utc"] = (
+                first_inf_ts.min().isoformat() if len(first_inf_ts) else ""
+            )
+        else:
+            summary["first_infeasible_timestamp_utc"] = ""
         # Optimizer data-quality and fallback diagnostics.
         if "optimizer_fallback_used" in hourly.columns:
             fb = pd.to_numeric(hourly["optimizer_fallback_used"], errors="coerce").fillna(0.0)
@@ -7502,6 +7579,15 @@ class BatteryBacktester:
         optimization_non_ok = float(False)
         if opt_codes_series is not None:
             optimization_non_ok = float((~opt_codes_series.isin(["ok", "none", ""])).any())
+        if float(summary.get("accepted_path_infeasible_debug_dump_count", 0.0)) > 0.5 and not str(
+            summary.get("first_infeasible_timestamp_utc", "")
+        ).strip():
+            if opt_codes_series is not None:
+                bad_idx = opt_codes_series[~opt_codes_series.isin(["ok", "none", ""])].index
+                if len(bad_idx) > 0:
+                    ts_bad = pd.to_datetime(hourly.loc[bad_idx, colmap.timestamp], utc=True, errors="coerce").dropna()
+                    if len(ts_bad) > 0:
+                        summary["first_infeasible_timestamp_utc"] = ts_bad.min().isoformat()
         reserve_infeasible_hours = 0.0
         if "optimizer_fallback_used" in hourly.columns:
             def _num_series(col: str) -> pd.Series:
@@ -7751,6 +7837,7 @@ class BatteryBacktester:
             ("candidate_infeasible_debug_dump_count", 0.0),
             ("infeasible_debug_dump_paths", []),
             ("infeasible_debug_dump_timestamps", []),
+            ("first_infeasible_timestamp_utc", ""),
         ]:
             if k not in summary or summary[k] is None:
                 summary[k] = v

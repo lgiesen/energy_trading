@@ -6,7 +6,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-
 MANDATORY_QUANTILES = ["p10", "p30", "p50", "p70", "p90"]
 OPTIONAL_SYMMETRIC_PAIRS = [("p01", "p99"), ("p05", "p95")]
 MANDATORY_SYMMETRIC_PAIRS = [("p10", "p90"), ("p30", "p70"), ("p50", "p50")]
@@ -41,6 +40,7 @@ SPECS: dict[str, TargetPostprocessingSpec] = {
         semantic_type="market_price_or_value_neg",
         sign_transform="none",
         quantile_flip=False,
+        clip_lower=0.0,
     ),
     "pred_afrr_activation_price_pos": TargetPostprocessingSpec(
         target_name="pred_afrr_activation_price_pos",
