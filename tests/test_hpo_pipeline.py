@@ -162,3 +162,24 @@ def test_makefile_dry_run_train_tft_uses_hpo_map_only() -> None:
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert "--hpo-artifact-map \"artifacts/hpo/tft_hpo_artifact_map.json\"" in cp.stdout
     assert "--hpo-artifact " not in cp.stdout
+
+
+def test_makefile_default_hpo_trial_budgets() -> None:
+    text = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "XGB_HPO_TRIALS ?= 30" in text
+    assert "TFT_HPO_TRIALS ?= 6" in text
+
+
+def test_makefile_dry_run_tuning_uses_unweighted_default_selection_metrics() -> None:
+    cp = subprocess.run(
+        ["make", "-n", "tune-all"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    out = cp.stdout
+    assert "--selection-metric mae" in out
+    assert "--selection-metric mae_val" in out
+    assert "tail_upper_mae" not in out
+    assert "leadtime_pinball_p90_val_weighted" not in out

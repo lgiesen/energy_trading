@@ -129,6 +129,12 @@ def _tail_sample_weights(y: pd.Series, multiplier: float = TAIL_WEIGHT_MULTIPLIE
     return w
 
 
+def _training_sample_weights(y: pd.Series, *, use_tail_sample_weighting: bool) -> np.ndarray | None:
+    if not use_tail_sample_weighting:
+        return None
+    return _tail_sample_weights(y)
+
+
 def _resolve_base_dir(preferred: str | Path) -> Path:
     p = Path(preferred)
     if p.exists():
@@ -696,12 +702,11 @@ def run_purged_cv_with_pipeline(
             random_state=seed,
             n_jobs=-1,
         )
-        model.fit(
-            X_tr,
-            y_tr,
-            sample_weight=_tail_sample_weights(y_tr),
-            verbose=False,
-        )
+        fit_kwargs: dict[str, object] = {"verbose": False}
+        tr_w = _training_sample_weights(y_tr, use_tail_sample_weighting=use_tail_sample_weighting)
+        if tr_w is not None:
+            fit_kwargs["sample_weight"] = tr_w
+        model.fit(X_tr, y_tr, **fit_kwargs)
         pred = _predict_with_device_alignment(model, X_va, resolved_device=device)
         mae = float(mean_absolute_error(y_va, pred))
         rmse = float(np.sqrt(mean_squared_error(y_va, pred)))
@@ -764,6 +769,7 @@ def train_and_evaluate(
     horizon_hours: int = 48,
     seed: int = 42,
     activation_price_transform: str = "symlog_clip",
+    use_tail_sample_weighting: bool = False,
 ) -> tuple[dict[str, float], dict[str, dict[int, dict[str, object]]], list[str]]:
     try:
         from xgboost import XGBRegressor
@@ -941,13 +947,16 @@ def train_and_evaluate(
                     early_stopping_rounds=max(0, int(target_policy["early_stopping_rounds"])),
                     n_jobs=-1,
                 )
-                model.fit(
-                    X_tr_h,
-                    y_tr_model,
-                    sample_weight=_tail_sample_weights(y_tr_model),
-                    eval_set=[(X_tr_h, y_tr_model), (X_va_h, y_va_model)],
-                    verbose=False,
+                fit_kwargs: dict[str, object] = {
+                    "eval_set": [(X_tr_h, y_tr_model), (X_va_h, y_va_model)],
+                    "verbose": False,
+                }
+                tr_w_h = _training_sample_weights(
+                    y_tr_model, use_tail_sample_weighting=use_tail_sample_weighting
                 )
+                if tr_w_h is not None:
+                    fit_kwargs["sample_weight"] = tr_w_h
+                model.fit(X_tr_h, y_tr_model, **fit_kwargs)
 
                 # Track early-stopping outcome per lead/quantile.
                 best_it = getattr(model, "best_iteration", None)
@@ -1535,6 +1544,12 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--cv-gap-hours", type=int, default=72)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--use-tail-sample-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optional tail upweighting for XGB training; disabled by default.",
+    )
+    p.add_argument(
         "--activation-price-transform",
         choices=["none", "symlog_clip"],
         default="symlog_clip",
@@ -1616,6 +1631,7 @@ def main() -> None:
         horizon_hours=args.forecast_horizon_hours,
         seed=args.seed,
         activation_price_transform=args.activation_price_transform,
+        use_tail_sample_weighting=bool(args.use_tail_sample_weighting),
     )
     train_eval_elapsed = time.perf_counter() - train_eval_start
 

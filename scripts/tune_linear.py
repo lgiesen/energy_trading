@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tail-risk tuning for linear SGD quantile baseline."""
+"""Target-specific tuning for linear SGD quantile baseline."""
 
 from __future__ import annotations
 
@@ -101,11 +101,11 @@ def _resolve_target(bundle: BundleName, cols: list[str], requested: str | None) 
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Tune linear SGD quantile model for tail risk.")
+    p = argparse.ArgumentParser(description="Tune linear SGD quantile model.")
     p.add_argument("--base-dir", default="data/model_input")
     p.add_argument("--bundle", choices=["da", "afrr"], default="afrr")
     p.add_argument("--target-col", default="")
-    p.add_argument("--selection-metric", choices=["tail_upper_mae", "asymmetric_mae"], default="tail_upper_mae")
+    p.add_argument("--selection-metric", choices=["mae", "tail_upper_mae", "asymmetric_mae"], default="mae")
     p.add_argument("--tail-penalty", type=float, default=3.0)
     p.add_argument("--alpha-grid", default="1e-5,5e-5,1e-4,5e-4,1e-3")
     p.add_argument("--l1-ratio-grid", default="0.05,0.15,0.30")
@@ -179,11 +179,14 @@ def main() -> None:
                     shared = compute_shared_metrics(y_va, {"point": pred})
                     tail_upper = shared.get("tail_upper_mae")
                     asym = _asymmetric_mae(y_va, pred, penalty=float(args.tail_penalty))
-                    obj = (
-                        float(tail_upper)
-                        if args.selection_metric == "tail_upper_mae" and tail_upper is not None and np.isfinite(tail_upper)
-                        else float(asym)
-                    )
+                    if args.selection_metric == "mae":
+                        obj = float(shared.get("mae")) if shared.get("mae") is not None else float("nan")
+                    elif args.selection_metric == "tail_upper_mae":
+                        obj = float(tail_upper) if tail_upper is not None and np.isfinite(tail_upper) else float("nan")
+                    else:
+                        obj = float(asym) if np.isfinite(asym) else float("nan")
+                    if not np.isfinite(obj):
+                        obj = float(asym) if np.isfinite(asym) else float("inf")
                     rows.append(
                         {
                             "alpha": alpha,

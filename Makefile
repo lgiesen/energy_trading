@@ -47,8 +47,8 @@ DA_TARGETS ?= target_da_price
 AFRR_TARGETS ?= target_afrr_activation_price_vwap_pos target_afrr_activation_price_vwap_neg target_afrr_activation_rate_pos target_afrr_activation_rate_neg target_afrr_capacity_price_pos target_afrr_capacity_price_neg
 ALL_TARGETS ?= $(DA_TARGETS) $(AFRR_TARGETS)
 HPO_SCOPE ?= all
-XGB_HPO_TRIALS ?= 60
-TFT_HPO_TRIALS ?= 24
+XGB_HPO_TRIALS ?= 30
+TFT_HPO_TRIALS ?= 6
 
 # HPO maps
 XGB_HPO_MAP := $(HPO_OUT_DIR)/xgb_hpo_artifact_map.json
@@ -159,12 +159,12 @@ define TUNE_XGB_LOOP
 	@scope="$(1)"; \
 	if [ "$$scope" = "da" ] || [ "$$scope" = "all" ]; then \
 	  for TGT in $(DA_TARGETS); do \
-	    python3 scripts/tune_xgboost.py --bundle da --target-col "$$TGT" --n-trials $(XGB_HPO_TRIALS) --n-estimators 400 --selection-metric tail_upper_mae --allow-cpu --out-dir $(HPO_OUT_DIR); \
+	    python3 scripts/tune_xgboost.py --bundle da --target-col "$$TGT" --n-trials $(XGB_HPO_TRIALS) --n-estimators 400 --selection-metric mae --allow-cpu --out-dir $(HPO_OUT_DIR); \
 	  done; \
 	fi; \
 	if [ "$$scope" = "afrr" ] || [ "$$scope" = "all" ]; then \
 	  for TGT in $(AFRR_TARGETS); do \
-	    python3 scripts/tune_xgboost.py --bundle afrr --target-col "$$TGT" --n-trials $(XGB_HPO_TRIALS) --n-estimators 400 --selection-metric tail_upper_mae --allow-cpu --out-dir $(HPO_OUT_DIR); \
+	    python3 scripts/tune_xgboost.py --bundle afrr --target-col "$$TGT" --n-trials $(XGB_HPO_TRIALS) --n-estimators 400 --selection-metric mae --allow-cpu --out-dir $(HPO_OUT_DIR); \
 	  done; \
 	fi
 endef
@@ -174,12 +174,12 @@ define TUNE_LINEAR_LOOP
 	@scope="$(1)"; \
 	if [ "$$scope" = "da" ] || [ "$$scope" = "all" ]; then \
 	  for TGT in $(DA_TARGETS); do \
-	    python3 scripts/tune_linear.py --bundle da --target-col "$$TGT" --selection-metric tail_upper_mae --alpha-grid 1e-4,5e-4,1e-3 --l1-ratio-grid 0.1,0.3,0.5 --learning-rate-grid optimal,adaptive --eta0-grid 0.001,0.01 --out-dir $(HPO_OUT_DIR); \
+	    python3 scripts/tune_linear.py --bundle da --target-col "$$TGT" --selection-metric mae --alpha-grid 1e-4,5e-4,1e-3 --l1-ratio-grid 0.1,0.3,0.5 --learning-rate-grid optimal,adaptive --eta0-grid 0.001,0.01 --out-dir $(HPO_OUT_DIR); \
 	  done; \
 	fi; \
 	if [ "$$scope" = "afrr" ] || [ "$$scope" = "all" ]; then \
 	  for TGT in $(AFRR_TARGETS); do \
-	    python3 scripts/tune_linear.py --bundle afrr --target-col "$$TGT" --selection-metric tail_upper_mae --alpha-grid 1e-4,5e-4,1e-3 --l1-ratio-grid 0.1,0.3,0.5 --learning-rate-grid optimal,adaptive --eta0-grid 0.001,0.01 --out-dir $(HPO_OUT_DIR); \
+	    python3 scripts/tune_linear.py --bundle afrr --target-col "$$TGT" --selection-metric mae --alpha-grid 1e-4,5e-4,1e-3 --l1-ratio-grid 0.1,0.3,0.5 --learning-rate-grid optimal,adaptive --eta0-grid 0.001,0.01 --out-dir $(HPO_OUT_DIR); \
 	  done; \
 	fi
 endef
@@ -189,12 +189,12 @@ define TUNE_TFT_LOOP
 	@scope="$(1)"; \
 	if [ "$$scope" = "da" ] || [ "$$scope" = "all" ]; then \
 	  for TGT in $(DA_TARGETS); do \
-	    python3 scripts/tune_tft.py --bundle da --target-col "$$TGT" --selection-metric leadtime_pinball_p90_val_weighted --fallback-metric leadtime_mae_val_weighted --n-trials $(TFT_HPO_TRIALS) --device $(DEVICE) --precision $(TFT_PRECISION) --seed $(SEED) --out-dir $(HPO_OUT_DIR) --run-root $(HPO_OUT_DIR)/tft_trials/da_$$TGT; \
+	    python3 scripts/tune_tft.py --bundle da --target-col "$$TGT" --selection-metric mae_val --fallback-metric rmse_val --n-trials $(TFT_HPO_TRIALS) --device $(DEVICE) --precision $(TFT_PRECISION) --seed $(SEED) --out-dir $(HPO_OUT_DIR) --run-root $(HPO_OUT_DIR)/tft_trials/da_$$TGT; \
 	  done; \
 	fi; \
 	if [ "$$scope" = "afrr" ] || [ "$$scope" = "all" ]; then \
 	  for TGT in $(AFRR_TARGETS); do \
-	    python3 scripts/tune_tft.py --bundle afrr --target-col "$$TGT" --selection-metric leadtime_pinball_p90_val_weighted --fallback-metric leadtime_mae_val_weighted --n-trials $(TFT_HPO_TRIALS) --device $(DEVICE) --precision $(TFT_PRECISION) --seed $(SEED) --out-dir $(HPO_OUT_DIR) --run-root $(HPO_OUT_DIR)/tft_trials/afrr_$$TGT; \
+	    python3 scripts/tune_tft.py --bundle afrr --target-col "$$TGT" --selection-metric mae_val --fallback-metric rmse_val --n-trials $(TFT_HPO_TRIALS) --device $(DEVICE) --precision $(TFT_PRECISION) --seed $(SEED) --out-dir $(HPO_OUT_DIR) --run-root $(HPO_OUT_DIR)/tft_trials/afrr_$$TGT; \
 	  done; \
 	fi
 endef

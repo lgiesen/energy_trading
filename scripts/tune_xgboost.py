@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Tail-risk tuning for XGBoost with shared evaluator objective.
-
-This script keeps the project's fixed chronological split (train/val) and
-optimizes hyperparameters against tail-focused objectives from shared evaluator.
-"""
+"""Target-specific tuning for XGBoost with shared evaluator objective."""
 from __future__ import annotations
 
 import argparse
@@ -87,7 +83,7 @@ def _asymmetric_mae(y_true: np.ndarray, y_pred: np.ndarray, penalty: float = 3.0
 
 
 def _build_cli() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Tune XGBoost with tail-weighted objective via Optuna.")
+    p = argparse.ArgumentParser(description="Tune XGBoost with Optuna on chronological splits.")
     p.add_argument("--base-dir", default="data/model_input")
     p.add_argument("--bundle", choices=["da", "afrr"], default="afrr")
     p.add_argument("--target-col", default="", help="Optional explicit target column.")
@@ -100,12 +96,13 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--q-low", type=float, default=0.05)
     p.add_argument("--q-high", type=float, default=0.95)
     p.add_argument("--tail-weight", type=float, default=3.0)
+    p.add_argument("--use-tail-weights", action="store_true", help="Optional tail weighting (off by default).")
     p.add_argument(
         "--selection-metric",
-        choices=["tail_upper_mae", "asymmetric_mae"],
-        default="tail_upper_mae",
+        choices=["mae", "tail_upper_mae", "asymmetric_mae"],
+        default="mae",
     )
-    p.add_argument("--study-name", default="xgb_tail_weighted_tuning")
+    p.add_argument("--study-name", default="xgb_tuning")
     p.add_argument("--out-dir", default="artifacts/hpo")
     return p
 
@@ -156,25 +153,26 @@ def main() -> None:
         X_va = X_va.tail(min(len(X_va), 1000)).copy()
         y_va = y_va.tail(min(len(y_va), 1000)).copy()
 
-    tr_w, ql, qh = _build_tail_weights(
-        y_tr, q_low=float(args.q_low), q_high=float(args.q_high), tail_weight=float(args.tail_weight)
-    )
-    va_w, _, _ = _build_tail_weights(
-        y_va, q_low=float(args.q_low), q_high=float(args.q_high), tail_weight=float(args.tail_weight)
-    )
+    tr_w = np.ones(len(y_tr), dtype=float)
+    va_w = np.ones(len(y_va), dtype=float)
+    ql = float("nan")
+    qh = float("nan")
+    if args.use_tail_weights:
+        tr_w, ql, qh = _build_tail_weights(
+            y_tr, q_low=float(args.q_low), q_high=float(args.q_high), tail_weight=float(args.tail_weight)
+        )
+        va_w, _, _ = _build_tail_weights(
+            y_va, q_low=float(args.q_low), q_high=float(args.q_high), tail_weight=float(args.tail_weight)
+        )
     y_va_np = y_va.to_numpy(dtype=float)
 
     LOGGER.info(
-        "Tuning target=%s bundle=%s rows(train=%s,val=%s) tail-weights=(q%.2f, q%.2f, w=%.2f) thresholds=(%.4f, %.4f)",
+        "Tuning target=%s bundle=%s rows(train=%s,val=%s) use_tail_weights=%s",
         target_col,
         bundle,
         len(X_tr),
         len(X_va),
-        args.q_low,
-        args.q_high,
-        args.tail_weight,
-        ql,
-        qh,
+        bool(args.use_tail_weights),
     )
 
     trial_rows: list[dict[str, float | int]] = []
@@ -205,22 +203,20 @@ def main() -> None:
             early_stopping_rounds=max(0, int(args.early_stopping_rounds)),
             n_jobs=-1,
         )
-        # Weighted training = asymmetric objective pressure on tail hours.
-        model.fit(
-            X_tr,
-            y_tr,
-            sample_weight=tr_w,
-            eval_set=[(X_va, y_va)],
-            sample_weight_eval_set=[va_w],
-            verbose=False,
-        )
+        fit_kwargs: dict[str, object] = {"eval_set": [(X_va, y_va)], "verbose": False}
+        if args.use_tail_weights:
+            fit_kwargs["sample_weight"] = tr_w
+            fit_kwargs["sample_weight_eval_set"] = [va_w]
+        model.fit(X_tr, y_tr, **fit_kwargs)
         pred = model.predict(X_va)
         wmae = _weighted_mae(y_va_np, pred, va_w)
         mae = float(np.mean(np.abs(y_va_np - pred)))
         shared = compute_shared_metrics(y_va_np, {"point": pred})
         tail_upper_mae = shared.get("tail_upper_mae")
         asym = _asymmetric_mae(y_va_np, pred, penalty=float(args.tail_weight))
-        if args.selection_metric == "tail_upper_mae":
+        if args.selection_metric == "mae":
+            objective = float(mae)
+        elif args.selection_metric == "tail_upper_mae":
             objective = float(tail_upper_mae) if tail_upper_mae is not None and np.isfinite(tail_upper_mae) else float(wmae)
         else:
             objective = float(asym) if np.isfinite(asym) else float(wmae)
@@ -260,6 +256,7 @@ def main() -> None:
         "n_estimators": int(args.n_estimators),
         "early_stopping_rounds": int(args.early_stopping_rounds),
         "tail_weighting": {
+            "enabled": bool(args.use_tail_weights),
             "q_low": float(args.q_low),
             "q_high": float(args.q_high),
             "tail_weight": float(args.tail_weight),
