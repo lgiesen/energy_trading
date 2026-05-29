@@ -12,6 +12,10 @@ import pandas as pd
 _QCOL_RE = re.compile(r"(?:^|_)p(?P<q>\d{1,2})$", re.IGNORECASE)
 _DA_TARGET_RE = re.compile(r"target_da_price", re.IGNORECASE)
 _AFRR_CAP_TARGET_RE = re.compile(r"target_afrr_capacity_price_(?:pos|neg)", re.IGNORECASE)
+_AFRR_ACT_TARGET_RE = re.compile(
+    r"target_afrr_activation_(?:price_vwap|rate)_(?:pos|neg)",
+    re.IGNORECASE,
+)
 _STRATEGIC_INTERVAL_PAIRS: tuple[tuple[float, float], ...] = (
     (0.10, 0.90),
     (0.30, 0.70),
@@ -147,7 +151,12 @@ def _crps_from_quantile_losses(pinball_by_q: dict[float, float | None]) -> float
         )
     qs = np.asarray([p[0] for p in pairs], dtype=float)
     losses = np.asarray([p[1] for p in pairs], dtype=float)
-    area = float(np.trapz(losses, qs))
+    trapz_fn = getattr(np, "trapz", None)
+    if trapz_fn is None:
+        trapz_fn = getattr(np, "trapezoid", None)
+    if trapz_fn is None:
+        raise AttributeError("NumPy has neither trapz nor trapezoid; cannot compute CRPS approximation.")
+    area = float(trapz_fn(losses, qs))
     return float(2.0 * area)
 
 
@@ -543,3 +552,210 @@ def compute_gate_closure_metrics(
         "acceptance_rate_gate": acceptance,
         "metric_suite_gate": suite,
     }
+
+
+def _horizon_target_group(target_col: str) -> str:
+    t = str(target_col)
+    if _AFRR_ACT_TARGET_RE.search(t):
+        return "activation"
+    if _AFRR_CAP_TARGET_RE.search(t):
+        return "capacity"
+    if _DA_TARGET_RE.search(t):
+        return "da"
+    raise ValueError(f"Unknown target for horizon-bucket evaluation: {target_col}")
+
+
+def _horizon_bucket_masks(
+    *,
+    merged: pd.DataFrame,
+    target_col: str,
+    max_horizon: int,
+    timezone: str,
+) -> dict[str, np.ndarray]:
+    lead = pd.to_numeric(merged["lead_time_h"], errors="coerce").to_numpy(dtype=float)
+    in_full = np.isfinite(lead) & (lead >= 1) & (lead <= float(max_horizon))
+    in_short = np.isfinite(lead) & (lead >= 1) & (lead <= 8)
+    group = _horizon_target_group(target_col)
+
+    out: dict[str, np.ndarray] = {"full": in_full, "short_h1_8": in_short}
+    if group == "activation":
+        out["medium_h9_16"] = np.isfinite(lead) & (lead >= 9) & (lead <= 16)
+        out["long_h17_max"] = np.isfinite(lead) & (lead >= 17) & (lead <= float(max_horizon))
+        return out
+
+    snap_local_hour = (
+        pd.to_datetime(merged["snapshot_time_utc"], utc=True, errors="coerce")
+        .dt.tz_convert(timezone)
+        .dt.hour
+        .to_numpy(dtype=float)
+    )
+    if group == "capacity":
+        out["pre_actionable_h1_15"] = np.isfinite(lead) & (lead >= 1) & (lead <= 15)
+        out["actionable_capacity_gate_dplus1"] = (
+            np.isfinite(lead)
+            & np.isfinite(snap_local_hour)
+            & (snap_local_hour == 8)
+            & (lead >= 16)
+            & (lead <= 39)
+        )
+        out["post_actionable_h40_max"] = np.isfinite(lead) & (lead >= 40) & (lead <= float(max_horizon))
+        return out
+
+    out["pre_actionable_h1_11"] = np.isfinite(lead) & (lead >= 1) & (lead <= 11)
+    out["actionable_da_gate_dplus1"] = (
+        np.isfinite(lead)
+        & np.isfinite(snap_local_hour)
+        & (snap_local_hour == 12)
+        & (lead >= 12)
+        & (lead <= 35)
+    )
+    out["post_actionable_h36_max"] = np.isfinite(lead) & (lead >= 36) & (lead <= float(max_horizon))
+    return out
+
+
+def _quantile_cols_to_map(df: pd.DataFrame, quantile_cols: list[str] | None) -> dict[float, str]:
+    if not quantile_cols:
+        return _extract_quantile_columns(df, None)
+    out: dict[float, str] = {}
+    for c in quantile_cols:
+        if c not in df.columns:
+            continue
+        m = _QCOL_RE.search(str(c))
+        if not m:
+            continue
+        q_int = int(m.group("q"))
+        if 0 < q_int < 100:
+            out[q_int / 100.0] = c
+    return dict(sorted(out.items(), key=lambda kv: kv[0]))
+
+
+def _bucket_suite_to_flat(
+    *,
+    bucket: str,
+    n_rows: int,
+    suite: dict[str, Any] | None,
+) -> dict[str, Any]:
+    prefix = f"horizon_{bucket}_"
+    out: dict[str, Any] = {f"{prefix}n": int(n_rows)}
+    if not suite:
+        for k in ("mae", "rmse", "mbe", "wmape", "mape", "r2", "crps_quantile_approx"):
+            out[f"{prefix}{k}"] = float("nan")
+        return out
+    keep_scalar = (
+        "mae",
+        "rmse",
+        "mbe",
+        "wmape",
+        "mape",
+        "r2",
+        "directional_accuracy",
+        "over_prediction_ratio",
+        "crps_quantile_approx",
+    )
+    for k in keep_scalar:
+        v = suite.get(k)
+        out[f"{prefix}{k}"] = float(v) if v is not None and np.isfinite(v) else (float("nan") if v is None else float(v))
+    for k, v in suite.items():
+        if (
+            k.startswith("pinball_loss_p")
+            or k.startswith("picp_")
+            or k.startswith("winkler_score_")
+            or k.startswith("pinaw_")
+            or k.startswith("coverage_gap_")
+            or k.startswith("tradeoff_score_")
+        ):
+            out[f"{prefix}{k}"] = float(v) if v is not None and np.isfinite(v) else (float("nan") if v is None else float(v))
+    return out
+
+
+def compute_horizon_bucket_metrics(
+    pred_long: pd.DataFrame,
+    truth_df: pd.DataFrame,
+    *,
+    target_col: str,
+    y_pred_col: str = "p50",
+    quantile_cols: list[str] | None = None,
+    timezone: str = "Europe/Berlin",
+    max_horizon: int | None = None,
+) -> dict[str, object]:
+    """Compute unweighted full/bucketed horizon metrics from long prediction tables."""
+    required_pred = {"snapshot_time_utc", "target_time_utc", "lead_time_h"}
+    missing_pred = [c for c in required_pred if c not in pred_long.columns]
+    if missing_pred:
+        raise KeyError(f"Missing required pred_long columns: {missing_pred}")
+    if y_pred_col not in pred_long.columns:
+        raise KeyError(f"Missing prediction column '{y_pred_col}' in pred_long.")
+    if "timestamp_utc" not in truth_df.columns or target_col not in truth_df.columns:
+        raise KeyError("truth_df must contain timestamp_utc and target_col.")
+
+    # fail-fast for unknown targets
+    _horizon_target_group(target_col)
+
+    d = pred_long.copy()
+    d["target_time_utc"] = pd.to_datetime(d["target_time_utc"], utc=True, errors="coerce")
+    d["snapshot_time_utc"] = pd.to_datetime(d["snapshot_time_utc"], utc=True, errors="coerce")
+    d["lead_time_h"] = pd.to_numeric(d["lead_time_h"], errors="coerce")
+    truth = truth_df.loc[:, ["timestamp_utc", target_col]].copy()
+    truth["timestamp_utc"] = pd.to_datetime(truth["timestamp_utc"], utc=True, errors="coerce")
+    truth[target_col] = pd.to_numeric(truth[target_col], errors="coerce")
+    merged = d.merge(truth, how="left", left_on="target_time_utc", right_on="timestamp_utc")
+    merged = merged.rename(columns={target_col: "y_true", y_pred_col: "y_pred"})
+
+    qmap = _quantile_cols_to_map(merged, quantile_cols)
+    if max_horizon is None:
+        lead_finite = pd.to_numeric(merged["lead_time_h"], errors="coerce")
+        max_horizon = int(lead_finite.max()) if bool(lead_finite.notna().any()) else 1
+    max_horizon = max(1, int(max_horizon))
+
+    bucket_masks = _horizon_bucket_masks(
+        merged=merged,
+        target_col=target_col,
+        max_horizon=max_horizon,
+        timezone=timezone,
+    )
+    out: dict[str, object] = {"horizon_max_h": int(max_horizon)}
+    for bucket, mask in bucket_masks.items():
+        mask = np.asarray(mask, dtype=bool)
+        bucket_df = merged.loc[mask].copy()
+        n = int(bucket_df.shape[0])
+        if n == 0:
+            out.update(_bucket_suite_to_flat(bucket=bucket, n_rows=0, suite=None))
+            continue
+        suite = compute_forecast_metrics(
+            bucket_df,
+            y_true_col="y_true",
+            y_pred_col="y_pred",
+            quantile_cols=qmap,
+        )
+        out.update(_bucket_suite_to_flat(bucket=bucket, n_rows=n, suite=suite))
+    return out
+
+
+def horizon_bucket_metrics_to_table(
+    flat_metrics: dict[str, object],
+    *,
+    split: str,
+    target_col: str,
+) -> pd.DataFrame:
+    """Convert flat horizon_bucket metrics dict into report-friendly table."""
+    buckets = sorted(
+        {
+            k[len("horizon_") : -len("_n")]
+            for k in flat_metrics.keys()
+            if k.startswith("horizon_") and k.endswith("_n")
+        }
+    )
+    rows: list[dict[str, object]] = []
+    for b in buckets:
+        prefix = f"horizon_{b}_"
+        row: dict[str, object] = {
+            "split": split,
+            "target_col": target_col,
+            "bucket": b,
+        }
+        for k, v in flat_metrics.items():
+            if not k.startswith(prefix):
+                continue
+            row[k.removeprefix(prefix)] = v
+        rows.append(row)
+    return pd.DataFrame(rows)
