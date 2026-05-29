@@ -2071,6 +2071,47 @@ def build_features(input_path: Path, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(output_path, compression="zstd")
 
+    # Diagnostics for canonical negative activation-price target + lag scale.
+    report_rows: list[dict[str, object]] = []
+    raw_col = "afrr_activation_price_vwap_neg_raw"
+    canonical_col = "afrr_activation_price_vwap_neg"
+    lag_cols = sorted([c for c in df.columns if c.startswith("afrr_activation_price_vwap_neg_lag_")])
+    raw_min = raw_max = canonical_min = canonical_max = lag_min = lag_max = np.nan
+    raw_positive_count = canonical_negative_count = 0
+    if raw_col in df.columns:
+        raw_s = df.select(pl.col(raw_col)).to_series().to_pandas()
+        raw_min = float(pd.to_numeric(raw_s, errors="coerce").min())
+        raw_max = float(pd.to_numeric(raw_s, errors="coerce").max())
+        raw_positive_count = int((pd.to_numeric(raw_s, errors="coerce") > 0).sum())
+    if canonical_col in df.columns:
+        can_s = df.select(pl.col(canonical_col)).to_series().to_pandas()
+        canonical_min = float(pd.to_numeric(can_s, errors="coerce").min())
+        canonical_max = float(pd.to_numeric(can_s, errors="coerce").max())
+        canonical_negative_count = int((pd.to_numeric(can_s, errors="coerce") < 0).sum())
+    if lag_cols:
+        lag_df = df.select([pl.col(c) for c in lag_cols]).to_pandas()
+        lag_num = lag_df.apply(pd.to_numeric, errors="coerce")
+        lag_min = float(np.nanmin(lag_num.to_numpy(dtype=float)))
+        lag_max = float(np.nanmax(lag_num.to_numpy(dtype=float)))
+    report_rows.append(
+        {
+            "target": "target_afrr_activation_price_vwap_neg",
+            "raw_column": raw_col,
+            "canonical_column": canonical_col,
+            "raw_min": raw_min,
+            "raw_max": raw_max,
+            "canonical_min": canonical_min,
+            "canonical_max": canonical_max,
+            "canonical_negative_count": canonical_negative_count,
+            "raw_positive_count": raw_positive_count,
+            "lag_columns_detected": "|".join(lag_cols),
+            "lag_min": lag_min,
+            "lag_max": lag_max,
+            "target_value_mode": "canonical_economic",
+        }
+    )
+    pd.DataFrame(report_rows).to_csv(output_path.parent / "feature_generation_report.csv", index=False)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build ML features from transformed data.")

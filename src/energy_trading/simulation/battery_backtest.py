@@ -43,6 +43,10 @@ import pandas as pd
 from scipy.optimize import Bounds, LinearConstraint, milp
 
 from energy_trading.config import BATTERY_SPECS, FINANCIAL_PARAMS, MARKET_SPECS, MODEL_SPECS
+from energy_trading.evaluation.forecast_postprocessing import (
+    canonicalize_prediction_frame,
+    canonicalize_truth_series,
+)
 from energy_trading.simulation.bid_builder import AFRRCapacityBid, BidBuilder, BidPricingPolicy
 from energy_trading.simulation.market_clearing import AFRRCapacityClearingResult, MarketClearingEngine
 
@@ -288,6 +292,8 @@ def load_and_align_market_data(
     predictions_path: str | Path,
     ground_truth_path: str | Path,
     colmap: BacktestColumnMap,
+    *,
+    target_value_modes: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Load prediction and truth parquet files, align them by timestamp."""
     pred = pd.read_parquet(predictions_path)
@@ -309,11 +315,13 @@ def load_and_align_market_data(
     merged = merged.sort_values(colmap.timestamp).reset_index(drop=True)
     if merged.empty:
         raise ValueError("No overlapping timestamps between predictions and ground truth.")
-    return merged
+    return canonicalize_market_frame(merged, colmap=colmap, target_value_modes=target_value_modes)
 
 
 def load_prediction_warehouse_long(
     prediction_files: dict[str, str | Path],
+    *,
+    target_value_modes: dict[str, str] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Load long-format forecast warehouse files keyed by canonical prediction column."""
     warehouse: dict[str, pd.DataFrame] = {}
@@ -333,12 +341,61 @@ def load_prediction_warehouse_long(
         out["predicted_value"] = pd.to_numeric(out["predicted_value"], errors="coerce")
         for qc in available_quantiles:
             out[qc] = pd.to_numeric(out[qc], errors="coerce")
+        out, _ = canonicalize_prediction_frame(
+            out,
+            target_name=pred_col,
+            quantile_cols=available_quantiles,
+            predicted_value_col="predicted_value",
+            target_value_mode=(target_value_modes or {}).get(pred_col),
+        )
         out = out.dropna(subset=["snapshot_time_utc", "target_time_utc", "lead_time_h"]).copy()
         out = out.sort_values(["snapshot_time_utc", "lead_time_h", "target_time_utc"]).reset_index(drop=True)
         warehouse[pred_col] = out
     if not warehouse:
         raise ValueError("No valid long-format prediction files loaded.")
     return warehouse
+
+
+def canonicalize_market_frame(
+    df: pd.DataFrame, *, colmap: BacktestColumnMap, target_value_modes: dict[str, str] | None = None
+) -> pd.DataFrame:
+    out = df.copy()
+    target_map = {
+        "pred_da_price": (colmap.pred_da_price, colmap.true_da_price),
+        "pred_afrr_capacity_price_pos": (colmap.pred_afrr_capacity_price_pos, colmap.true_afrr_capacity_price_pos),
+        "pred_afrr_capacity_price_neg": (colmap.pred_afrr_capacity_price_neg, colmap.true_afrr_capacity_price_neg),
+        "pred_afrr_activation_price_pos": (colmap.pred_afrr_activation_price_pos, colmap.true_afrr_activation_price_pos),
+        "pred_afrr_activation_price_neg": (colmap.pred_afrr_activation_price_neg, colmap.true_afrr_activation_price_neg),
+        "pred_afrr_activation_rate_pos": (colmap.pred_afrr_activation_rate_pos, colmap.true_afrr_activation_rate_pos),
+        "pred_afrr_activation_rate_neg": (colmap.pred_afrr_activation_rate_neg, colmap.true_afrr_activation_rate_neg),
+    }
+    for target_name, (pred_col, true_col) in target_map.items():
+        if pred_col in out.columns:
+            out[pred_col] = canonicalize_truth_series(
+                out[pred_col],
+                target_name=target_name,
+                target_value_mode=(target_value_modes or {}).get(target_name),
+            )
+        q_cols = [f"{pred_col}_{q}" for q in QUANTILE_COLUMNS if f"{pred_col}_{q}" in out.columns]
+        if q_cols:
+            temp = out[q_cols].copy()
+            temp.columns = [c.rsplit("_", 1)[-1] for c in q_cols]
+            temp, _ = canonicalize_prediction_frame(
+                temp,
+                target_name=target_name,
+                quantile_cols=list(temp.columns),
+                predicted_value_col="predicted_value",
+                target_value_mode=(target_value_modes or {}).get(target_name),
+            )
+            for src_col, q_col in zip(q_cols, temp.columns, strict=False):
+                out[src_col] = pd.to_numeric(temp[q_col], errors="coerce")
+        if true_col in out.columns:
+            out[true_col] = canonicalize_truth_series(
+                out[true_col],
+                target_name=target_name,
+                target_value_mode=(target_value_modes or {}).get(target_name),
+            )
+    return out
 
 
 class BatteryBacktester:
@@ -497,6 +554,9 @@ class BatteryBacktester:
             da_mode_default=self.da_execution_mode,
         )
         self.id_rescue_spread_eur_mwh = float(MARKET_SPECS.get("id_rescue_spread_eur_mwh", 30.0))
+        self.forecast_value_mode = str(MODEL_SPECS.get("forecast_value_mode", "canonical_economic")).strip().lower()
+        if self.forecast_value_mode not in {"canonical_economic", "raw_signed"}:
+            self.forecast_value_mode = "canonical_economic"
         self._neg_activation_sign_diagnostic_emitted = False
         self.id_buy_price_cap_eur_mwh = float(MARKET_SPECS.get("id_buy_price_cap_eur_mwh", 3000.0))
         self.id_sell_price_floor_eur_mwh = float(MARKET_SPECS.get("id_sell_price_floor_eur_mwh", -500.0))
@@ -2071,25 +2131,47 @@ class BatteryBacktester:
         # here; replenishment economics are reflected through subsequent DA/ID trades.
         # NEG (downward) price is stored with market-side sign. Provider-side
         # settlement cashflow is therefore the negative of that signed price.
-        requested_activation_revenue_eur = act_pos_grid_req * act_pos_price - act_neg_grid_req * act_neg_price
-        delivered_activation_revenue_eur = act_pos_grid * act_pos_price - act_neg_grid * act_neg_price
+        if self.forecast_value_mode == "canonical_economic":
+            requested_activation_revenue_eur = act_pos_grid_req * act_pos_price + act_neg_grid_req * act_neg_price
+            delivered_activation_revenue_eur = act_pos_grid * act_pos_price + act_neg_grid * act_neg_price
+        else:
+            requested_activation_revenue_eur = act_pos_grid_req * act_pos_price - act_neg_grid_req * act_neg_price
+            delivered_activation_revenue_eur = act_pos_grid * act_pos_price - act_neg_grid * act_neg_price
         missed_activation_revenue_eur = max(0.0, requested_activation_revenue_eur - delivered_activation_revenue_eur)
         rev_act = float(delivered_activation_revenue_eur)
         if not self._neg_activation_sign_diagnostic_emitted:
-            zero_volume_revenue = -0.0 * float(act_neg_price)
+            zero_volume_revenue = 0.0 * float(act_neg_price)
             if abs(zero_volume_revenue) > 1e-12:
                 raise AssertionError(
                     "NEG activation sign diagnostic failed: volume=0 must imply zero NEG activation revenue."
                 )
-            neg_cashflow = -float(act_neg_grid) * float(act_neg_price)
-            if float(act_neg_grid) > 1e-12 and float(act_neg_price) < 0.0 and neg_cashflow <= 0.0:
+            neg_cashflow = (
+                float(act_neg_grid) * float(act_neg_price)
+                if self.forecast_value_mode == "canonical_economic"
+                else -float(act_neg_grid) * float(act_neg_price)
+            )
+            if (
+                self.forecast_value_mode == "canonical_economic"
+                and float(act_neg_grid) > 1e-12
+                and float(act_neg_price) > 0.0
+                and neg_cashflow <= 0.0
+            ):
                 raise AssertionError(
-                    "NEG activation sign diagnostic failed: volume>0 with negative NEG price must yield positive revenue."
+                    "NEG activation sign diagnostic failed: canonical mode expects positive NEG activation value to yield positive revenue."
+                )
+            if (
+                self.forecast_value_mode == "raw_signed"
+                and float(act_neg_grid) > 1e-12
+                and float(act_neg_price) < 0.0
+                and neg_cashflow <= 0.0
+            ):
+                raise AssertionError(
+                    "NEG activation sign diagnostic failed: raw_signed mode expects negative NEG price to yield positive revenue."
                 )
             print(
                 "[DIAG] NEG activation sign check: "
                 f"volume_mwh={float(act_neg_grid):.6f}, price_eur_mwh={float(act_neg_price):.6f}, "
-                f"provider_cashflow_eur={neg_cashflow:.6f}"
+                f"provider_cashflow_eur={neg_cashflow:.6f}, mode={self.forecast_value_mode}"
             )
             self._neg_activation_sign_diagnostic_emitted = True
         missed_activation_mwh = max(0.0, act_pos_grid_req - act_pos_grid) + max(0.0, act_neg_grid_req - act_neg_grid)
@@ -2210,8 +2292,8 @@ class BatteryBacktester:
         }
         return soc_next, metrics
 
-    @staticmethod
     def _split_activation_revenue_components(
+        self,
         *,
         delivered_pos_mwh: float,
         delivered_neg_mwh: float,
@@ -2235,9 +2317,13 @@ class BatteryBacktester:
         c_neg = max(0.0, d_neg - b_neg)
 
         bem_pos_rev = b_pos * p_pos
-        bem_neg_rev = -b_neg * p_neg
         bcm_pos_rev = c_pos * p_pos
-        bcm_neg_rev = -c_neg * p_neg
+        if self.forecast_value_mode == "canonical_economic":
+            bem_neg_rev = b_neg * p_neg
+            bcm_neg_rev = c_neg * p_neg
+        else:
+            bem_neg_rev = -b_neg * p_neg
+            bcm_neg_rev = -c_neg * p_neg
 
         return {
             "bem_only_pos_activation_revenue_eur": float(bem_pos_rev),

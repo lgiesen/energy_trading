@@ -408,6 +408,37 @@ def load_bid_hourly_features_from_bids(bids_dir: Path) -> pl.DataFrame:
     ).sort("timestamp_utc")
 
 
+def canonicalize_activation_price_neg(df: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, float]]:
+    """Canonicalize negative activation-price to provider-value scale (canonical = -raw)."""
+    if "afrr_activation_price_vwap_neg" not in df.columns:
+        return df, {
+            "raw_positive_count": 0.0,
+            "canonical_negative_count": 0.0,
+            "raw_min": np.nan,
+            "raw_max": np.nan,
+            "canonical_min": np.nan,
+            "canonical_max": np.nan,
+        }
+    out = df.with_columns(
+        pl.col("afrr_activation_price_vwap_neg")
+        .cast(pl.Float64, strict=False)
+        .alias("afrr_activation_price_vwap_neg_raw")
+    ).with_columns(
+        (-pl.col("afrr_activation_price_vwap_neg_raw")).alias("afrr_activation_price_vwap_neg")
+    )
+    raw = out.select(pl.col("afrr_activation_price_vwap_neg_raw")).to_series()
+    can = out.select(pl.col("afrr_activation_price_vwap_neg")).to_series()
+    stats = {
+        "raw_positive_count": float((raw > 0).sum()),
+        "canonical_negative_count": float((can < 0).sum()),
+        "raw_min": float(raw.min()) if raw.len() else np.nan,
+        "raw_max": float(raw.max()) if raw.len() else np.nan,
+        "canonical_min": float(can.min()) if can.len() else np.nan,
+        "canonical_max": float(can.max()) if can.len() else np.nan,
+    }
+    return out, stats
+
+
 def _parse_bid_merit_rows_15m(df_raw: pd.DataFrame) -> pd.DataFrame:
     """Parse anonymous bid rows into 15-minute UTC merit-order points."""
     if df_raw.empty:
@@ -1198,6 +1229,18 @@ def refine(df: pl.DataFrame) -> pl.DataFrame:
     for c in ("afrr_activation_price_vwap_pos", "afrr_activation_price_vwap_neg"):
         if c in df.columns:
             df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False).alias(c))
+
+    # Canonicalize only negative aFRR activation price to provider-value convention:
+    # canonical = -raw (not abs). Keep raw diagnostic column.
+    if "afrr_activation_price_vwap_neg" in df.columns:
+        df, can_stats = canonicalize_activation_price_neg(df)
+        raw_pos_count = int(can_stats["raw_positive_count"])
+        canonical_neg_count = int(can_stats["canonical_negative_count"])
+        LOGGER.info(
+            "Canonicalized afrr_activation_price_vwap_neg via -raw: raw_positive_count=%s canonical_negative_count=%s",
+            raw_pos_count,
+            canonical_neg_count,
+        )
 
     drop_cols = [c for c in SMARD_REDUNDANT_COLS if c in df.columns]
     if drop_cols:

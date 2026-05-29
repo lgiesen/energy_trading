@@ -28,6 +28,13 @@ AFRR_TARGETS = [
 ]
 
 
+def filter_afrr_targets(available_targets: list[str], requested_csv: str) -> list[str]:
+    requested = {t.strip() for t in str(requested_csv).split(",") if t.strip()}
+    if not requested:
+        return list(available_targets)
+    return [t for t in available_targets if t in requested]
+
+
 def _run_id_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 
@@ -433,7 +440,7 @@ def _infer_prediction_family(pred_col: str) -> str:
 
 def _prediction_output_quality_report(
     *,
-    da_meta: dict[str, object],
+    da_meta: dict[str, object] | None,
     afrr_meta_list: list[dict[str, object]],
     afrr_pred_val: Path,
     afrr_pred_test: Path,
@@ -452,13 +459,13 @@ def _prediction_output_quality_report(
 
     checks: list[tuple[str, Path, str | None, str]] = []
     # Wide DA files
-    for split, p in (da_meta.get("predictions", {}) or {}).items():
+    for split, p in ((da_meta or {}).get("predictions", {}) or {}).items():
         checks.append((f"da_wide_{split}", Path(p), None, "wide"))
     # Wide merged aFRR files
     checks.append(("afrr_wide_val", afrr_pred_val, None, "wide"))
     checks.append(("afrr_wide_test", afrr_pred_test, None, "wide"))
     # Long DA files
-    for split, pred_map in (da_meta.get("predictions_long", {}) or {}).items():
+    for split, pred_map in ((da_meta or {}).get("predictions_long", {}) or {}).items():
         for pred_col, p in (pred_map or {}).items():
             checks.append((f"da_long_{split}_{pred_col}", Path(p), pred_col, "long"))
     # Long aFRR files
@@ -580,6 +587,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of parallel aFRR target training jobs (useful for linear model runs).",
+    )
+    p.add_argument(
+        "--afrr-targets",
+        default="",
+        help="Optional comma-separated aFRR target filter, e.g. target_afrr_activation_price_vwap_neg",
+    )
+    p.add_argument(
+        "--skip-da",
+        action="store_true",
+        help="Skip day-ahead model training and train only selected aFRR targets.",
     )
     p.add_argument(
         "--lead-parallel-jobs",
@@ -856,13 +873,14 @@ def main() -> None:
             str(args.seed),
         ]
 
-    # Train DA model.
-    cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]
-    cmd_da = [*cmd_da, "--base-dir", args.base_dir]
-    cmd_records.append(_run_train_cmd(cmd_da, run_dir=run_dir, log_stem=f"01_train_da_{args.model_type}"))
+    # Train DA model unless explicitly skipped.
+    if not args.skip_da:
+        cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]
+        cmd_da = [*cmd_da, "--base-dir", args.base_dir]
+        cmd_records.append(_run_train_cmd(cmd_da, run_dir=run_dir, log_stem=f"01_train_da_{args.model_type}"))
 
     # Train aFRR models target-wise to produce full canonical prediction columns.
-    afrr_targets = _resolve_available_afrr_targets(afrr_base_dir)
+    afrr_targets = filter_afrr_targets(_resolve_available_afrr_targets(afrr_base_dir), args.afrr_targets)
     if not afrr_targets:
         raise RuntimeError(f"No aFRR targets found in bundle config under '{afrr_base_dir}'.")
     skipped = [t for t in AFRR_TARGETS if t not in afrr_targets]
@@ -905,7 +923,7 @@ def main() -> None:
                     raise RuntimeError(f"aFRR training failed for target '{tgt}': {exc}") from exc
                 cmd_records.append(rec)
 
-    da_meta = _load_fragment(da_fragment)
+    da_meta = _load_fragment(da_fragment) if not args.skip_da else None
     afrr_meta_list = [_load_fragment(p) for p in afrr_fragment_paths if p.exists()]
     if not afrr_meta_list:
         raise RuntimeError("No aFRR manifest fragments found.")
@@ -951,7 +969,8 @@ def main() -> None:
                     f"val h48={m.get('mae_h48', float('nan')):.4f}"
                 )
 
-    _print_leadtime_summary(da_meta["metrics_path"], "da")
+    if da_meta:
+        _print_leadtime_summary(da_meta["metrics_path"], "da")
     for i, meta in enumerate(afrr_meta_list, start=1):
         _print_leadtime_summary(meta["metrics_path"], f"afrr_target_{i}")
 
@@ -1050,14 +1069,6 @@ def main() -> None:
             "git_commit": training_context.get("git_commit"),
         },
         "bundles": {
-            "da": {
-                "model_path": da_meta["model_path"],
-                "metrics_path": da_meta["metrics_path"],
-                "predictions": da_meta["predictions"],
-                "predictions_long": da_meta.get("predictions_long", {}),
-                "prediction_columns": da_meta["prediction_columns"],
-                "target_columns": da_meta["target_columns"],
-            },
             "afrr": {
                 "model_paths": [m["model_path"] for m in afrr_meta_list],
                 "metrics_paths": [m["metrics_path"] for m in afrr_meta_list],
@@ -1082,8 +1093,22 @@ def main() -> None:
         },
         "simulation": {
             "default_split": "test",
+            "canonical_economic_targets": ["pred_afrr_activation_price_neg"],
+            "transformed_targets": ["pred_afrr_activation_price_neg"],
+        },
+        "target_value_mode": {
+            "pred_afrr_activation_price_neg": "canonical_economic",
         },
     }
+    if da_meta:
+        manifest["bundles"]["da"] = {
+            "model_path": da_meta["model_path"],
+            "metrics_path": da_meta["metrics_path"],
+            "predictions": da_meta["predictions"],
+            "predictions_long": da_meta.get("predictions_long", {}),
+            "prediction_columns": da_meta["prediction_columns"],
+            "target_columns": da_meta["target_columns"],
+        }
 
     manifest_path = run_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

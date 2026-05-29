@@ -33,6 +33,10 @@ from energy_trading.evaluation.forecast_metrics import (
     winkler_score,
 )
 from energy_trading.evaluation.forecast_figures import generate_forecast_benchmark_figures
+from energy_trading.evaluation.forecast_postprocessing import (
+    canonicalize_prediction_frame,
+    canonicalize_truth_series,
+)
 from energy_trading.evaluation.forecast_truth_mapping import resolve_truth_mapping
 
 
@@ -111,6 +115,22 @@ def _extract_pred_paths(manifest_path: Path, manifest: dict[str, Any], split: st
             if target in TARGETS:
                 out[target] = (manifest_path.parent / str(rel)).resolve()
     return out
+
+
+def _target_value_mode_from_manifest(manifest: dict[str, Any], target: str) -> str | None:
+    tvm = manifest.get("target_value_mode", {})
+    if isinstance(tvm, dict) and target in tvm:
+        return str(tvm[target])
+    sim = manifest.get("simulation", {})
+    canonical_targets = sim.get("canonical_economic_targets", [])
+    if isinstance(canonical_targets, list) and target in canonical_targets:
+        return "canonical_economic"
+    transformed = sim.get("transformed_targets", [])
+    if isinstance(transformed, list) and target in transformed:
+        return "canonical_economic"
+    if target == "pred_afrr_activation_price_neg":
+        return "raw_signed_legacy"
+    return None
 
 
 def _build_inventory_row(*, model: str, split: str, target: str, pred_path: Path, truth_path: Path, joined: pd.DataFrame, truth_col: str) -> dict[str, Any]:
@@ -393,6 +413,7 @@ def run_benchmark(
     coverage_rows = []
     inventory_rows = []
     schema_rows = []
+    postprocess_rows: list[dict[str, Any]] = []
 
     m_overall: list[pd.DataFrame] = []
     m_lead: list[pd.DataFrame] = []
@@ -402,6 +423,7 @@ def run_benchmark(
     m_cal: list[pd.DataFrame] = []
     m_cross: list[pd.DataFrame] = []
     joined_frames: list[pd.DataFrame] = []
+    canonical_targets_seen: set[str] = set()
 
     for pointer in model_run_manifests:
         manifest_path, manifest = _load_latest_or_manifest(pointer)
@@ -414,6 +436,25 @@ def run_benchmark(
                     raise ValueError(f"{model}/{target}/{split}: missing target_time_utc in {pred_path}")
                 pred = pred.copy()
                 pred["target_time_utc"] = pd.to_datetime(pred["target_time_utc"], utc=True, errors="coerce")
+                target_value_mode = _target_value_mode_from_manifest(manifest, target)
+                if str(target_value_mode or "").strip().lower() == "canonical_economic":
+                    canonical_targets_seen.add(target)
+                required_q_cols = [_qcol_for(q) for q in quantiles]
+                pred, post_report = canonicalize_prediction_frame(
+                    pred,
+                    target_name=target,
+                    quantile_cols=required_q_cols,
+                    predicted_value_col="predicted_value",
+                    target_value_mode=target_value_mode,
+                )
+                postprocess_rows.append(
+                    {
+                        "model": model,
+                        "split": split,
+                        "target": target,
+                        **post_report,
+                    }
+                )
                 mapr = resolve_truth_mapping(
                     prediction_target_name=target,
                     available_truth_columns=list(truth_df.columns),
@@ -425,6 +466,9 @@ def run_benchmark(
                     continue
                 truth_take = truth_df[["target_time_utc", mapr.truth_column]].copy()
                 truth_take["y_true"] = pd.to_numeric(truth_take[mapr.truth_column], errors="coerce")
+                truth_take["y_true"] = canonicalize_truth_series(
+                    truth_take["y_true"], target_name=target, target_value_mode=target_value_mode
+                )
                 truth_take = truth_take.loc[pd.notna(truth_take["y_true"]), ["target_time_utc", "y_true"]].copy()
                 if truth_take.empty:
                     raise ValueError(
@@ -521,6 +565,7 @@ def run_benchmark(
     cov_df = pd.DataFrame(coverage_rows)
     inv_df = pd.DataFrame(inventory_rows)
     schema_df = pd.DataFrame(schema_rows)
+    post_df = pd.DataFrame(postprocess_rows)
 
     overall = pd.concat(m_overall, ignore_index=True) if m_overall else pd.DataFrame()
     by_lead = pd.concat(m_lead, ignore_index=True) if m_lead else pd.DataFrame()
@@ -538,6 +583,7 @@ def run_benchmark(
     diagnostics.joinpath("join_coverage_report.csv").write_text(cov_df.to_csv(index=False), encoding="utf-8")
     diagnostics.joinpath("benchmark_input_inventory.csv").write_text(inv_df.to_csv(index=False), encoding="utf-8")
     diagnostics.joinpath("schema_report.json").write_text(schema_df.to_json(orient="records", indent=2), encoding="utf-8")
+    diagnostics.joinpath("forecast_postprocessing_report.csv").write_text(post_df.to_csv(index=False), encoding="utf-8")
 
     (metrics_dir / "metrics_overall.csv").write_text(overall.to_csv(index=False), encoding="utf-8")
     (metrics_dir / "metrics_by_target.csv").write_text(by_target.to_csv(index=False), encoding="utf-8")
@@ -602,6 +648,9 @@ def run_benchmark(
         "quantile_repair_reported": True,
         "figures_enabled": bool(make_figures),
         "save_joined_predictions": bool(save_joined_predictions),
+        "forecast_postprocessing_applied": True,
+        "forecast_value_mode": "canonical_economic",
+        "canonical_economic_targets": sorted(canonical_targets_seen),
     }
     (out_dir / "benchmark_manifest.json").write_text(json.dumps(benchmark_manifest, indent=2), encoding="utf-8")
 

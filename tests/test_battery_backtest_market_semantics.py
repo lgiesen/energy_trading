@@ -17,7 +17,13 @@ if str(SRC) not in sys.path:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from energy_trading.simulation.battery_backtest import BacktestColumnMap, BatteryBacktester  # noqa: E402
+from energy_trading.simulation.battery_backtest import (  # noqa: E402
+    BacktestColumnMap,
+    BatteryBacktester,
+    canonicalize_market_frame,
+    load_prediction_warehouse_long,
+)
+from energy_trading.config import MODEL_SPECS  # noqa: E402
 from energy_trading.simulation.bid_builder import AFRRCapacityBid  # noqa: E402
 from energy_trading.simulation.market_clearing import MarketClearingEngine  # noqa: E402
 from scripts.run_battery_backtest import (  # noqa: E402
@@ -30,7 +36,8 @@ from scripts.run_battery_backtest import (  # noqa: E402
 from scripts import validate_simulation_outputs as validate_outputs  # noqa: E402
 
 
-def _mk_backtester() -> BatteryBacktester:
+def _mk_backtester(forecast_value_mode: str = "raw_signed") -> BatteryBacktester:
+    MODEL_SPECS["forecast_value_mode"] = forecast_value_mode
     return BatteryBacktester()
 
 
@@ -103,6 +110,78 @@ def _tiny_backtest_df(hours: int = 6) -> tuple[pd.DataFrame, BacktestColumnMap]:
         for q in ["p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"]:
             data[f"{pref}_{q}"] = [0.0] * hours
     return pd.DataFrame(data), col
+
+
+def test_simulation_forecast_loader_applies_negative_target_quantile_flip(tmp_path: Path) -> None:
+    p = tmp_path / "neg.parquet"
+    pd.DataFrame(
+        {
+            "snapshot_time_utc": [pd.Timestamp("2026-01-01T00:00:00Z")],
+            "target_time_utc": [pd.Timestamp("2026-01-01T01:00:00Z")],
+            "lead_time_h": [1],
+            "predicted_value": [-50.0],
+            "p10": [-100.0],
+            "p30": [-80.0],
+            "p50": [-50.0],
+            "p70": [-20.0],
+            "p90": [-10.0],
+        }
+    ).to_parquet(p, index=False)
+    wh = load_prediction_warehouse_long({"pred_afrr_activation_price_neg": p})
+    out = wh["pred_afrr_activation_price_neg"].iloc[0]
+    assert np.isclose(float(out["p10"]), 10.0)
+    assert np.isclose(float(out["p30"]), 20.0)
+    assert np.isclose(float(out["p50"]), 50.0)
+    assert np.isclose(float(out["p70"]), 80.0)
+    assert np.isclose(float(out["p90"]), 100.0)
+    assert np.isclose(float(out["predicted_value"]), 50.0)
+
+
+def test_simulation_forecast_loader_canonical_activation_neg_no_flip(tmp_path: Path) -> None:
+    p = tmp_path / "neg_can.parquet"
+    pd.DataFrame(
+        {
+            "snapshot_time_utc": [pd.Timestamp("2026-01-01T00:00:00Z")],
+            "target_time_utc": [pd.Timestamp("2026-01-01T01:00:00Z")],
+            "lead_time_h": [1],
+            "predicted_value": [50.0],
+            "p10": [10.0],
+            "p30": [20.0],
+            "p50": [50.0],
+            "p70": [80.0],
+            "p90": [100.0],
+        }
+    ).to_parquet(p, index=False)
+    wh = load_prediction_warehouse_long(
+        {"pred_afrr_activation_price_neg": p},
+        target_value_modes={"pred_afrr_activation_price_neg": "canonical_economic"},
+    )
+    out = wh["pred_afrr_activation_price_neg"].iloc[0]
+    assert np.isclose(float(out["p10"]), 10.0)
+    assert np.isclose(float(out["p90"]), 100.0)
+    assert np.isclose(float(out["predicted_value"]), 50.0)
+
+
+def test_simulation_forecast_loader_clips_activation_rates() -> None:
+    col = BacktestColumnMap()
+    df = pd.DataFrame(
+        {
+            col.timestamp: [pd.Timestamp("2026-01-01T00:00:00Z")],
+            col.pred_afrr_activation_rate_pos: [1.4],
+            col.pred_afrr_activation_rate_neg: [-0.4],
+            f"{col.pred_afrr_activation_rate_pos}_p10": [-0.2],
+            f"{col.pred_afrr_activation_rate_pos}_p90": [1.5],
+            f"{col.pred_afrr_activation_rate_neg}_p10": [-0.3],
+            f"{col.pred_afrr_activation_rate_neg}_p90": [1.7],
+            col.true_afrr_activation_rate_pos: [1.8],
+            col.true_afrr_activation_rate_neg: [-0.6],
+        }
+    )
+    out = canonicalize_market_frame(df, colmap=col)
+    assert np.isclose(float(out.loc[0, col.pred_afrr_activation_rate_pos]), 1.0)
+    assert np.isclose(float(out.loc[0, col.pred_afrr_activation_rate_neg]), 0.0)
+    assert np.isclose(float(out.loc[0, col.true_afrr_activation_rate_pos]), 1.0)
+    assert np.isclose(float(out.loc[0, col.true_afrr_activation_rate_neg]), 0.0)
 
 
 def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
@@ -248,6 +327,50 @@ def test_negative_activation_delivered_revenue_sign_convention() -> None:
     delivered = float(m["delivered_activation_neg_mwh"])
     assert delivered > 0.0
     assert np.isclose(float(m["revenue_activation_eur"]), -delivered * (-1000.0), atol=1e-6), m
+
+
+def test_negative_activation_revenue_uses_canonical_positive_value() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_min,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=10.0,
+        da_price=0.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=1000.0,
+        act_pos_rate=0.0,
+        act_neg_rate=1.0,
+        cap_bid_pos=0.0,
+        cap_bid_neg=0.0,
+    )
+    delivered = float(m["delivered_activation_neg_mwh"])
+    assert delivered > 0.0
+    assert np.isclose(float(m["revenue_activation_eur"]), delivered * 1000.0, atol=1e-6), m
+
+
+def test_no_double_sign_flip_negative_activation() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_min,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=10.0,
+        da_price=0.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=1000.0,
+        act_pos_rate=0.0,
+        act_neg_rate=1.0,
+        cap_bid_pos=0.0,
+        cap_bid_neg=0.0,
+    )
+    assert float(m["revenue_activation_eur"]) > 0.0
 
 
 def test_bem_positive_activation_formula() -> None:
@@ -906,8 +1029,8 @@ def test_bem_only_positive_revenue_decomposition() -> None:
     assert np.isclose(comp["activation_revenue_reconciled_eur"], 1400.0)
 
 
-def test_bem_only_negative_revenue_decomposition() -> None:
-    bt = _mk_backtester()
+def test_split_activation_revenue_components_raw_signed_neg_price() -> None:
+    bt = _mk_backtester("raw_signed")
     comp = bt._split_activation_revenue_components(
         delivered_pos_mwh=0.0,
         delivered_neg_mwh=10.0,
@@ -915,6 +1038,21 @@ def test_bem_only_negative_revenue_decomposition() -> None:
         bem_only_neg_mwh=10.0,
         act_pos_price_eur_mwh=0.0,
         act_neg_price_eur_mwh=-1000.0,
+    )
+    assert np.isclose(comp["bem_only_activation_revenue_eur"], 10000.0)
+    assert np.isclose(comp["bcm_linked_activation_revenue_eur"], 0.0)
+    assert np.isclose(comp["activation_revenue_reconciled_eur"], 10000.0)
+
+
+def test_split_activation_revenue_components_canonical_neg_positive_value() -> None:
+    bt = _mk_backtester("canonical_economic")
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=0.0,
+        delivered_neg_mwh=10.0,
+        bem_only_pos_mwh=0.0,
+        bem_only_neg_mwh=10.0,
+        act_pos_price_eur_mwh=0.0,
+        act_neg_price_eur_mwh=1000.0,
     )
     assert np.isclose(comp["bem_only_activation_revenue_eur"], 10000.0)
     assert np.isclose(comp["bcm_linked_activation_revenue_eur"], 0.0)
@@ -934,6 +1072,30 @@ def test_bem_only_not_double_counted_activation_revenue() -> None:
     lhs = comp["activation_revenue_reconciled_eur"]
     rhs = comp["bcm_linked_activation_revenue_eur"] + comp["bem_only_activation_revenue_eur"]
     assert np.isclose(lhs, rhs)
+
+
+def test_full_settlement_activation_revenue_not_overwritten_by_wrong_split() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_min,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=10.0,
+        da_price=0.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=1000.0,
+        act_pos_rate=0.0,
+        act_neg_rate=1.0,
+        cap_bid_pos=0.0,
+        cap_bid_neg=0.0,
+    )
+    delivered = float(m["delivered_activation_neg_mwh"])
+    expected = delivered * 1000.0
+    assert delivered > 0.0
+    assert np.isclose(float(m["revenue_activation_eur"]), expected, atol=1e-6), m
 
 
 def test_bem_only_forced_scenario_has_nonzero_revenue_and_benchmark_diagnostics() -> None:

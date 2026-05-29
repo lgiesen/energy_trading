@@ -212,6 +212,70 @@ def test_join_fails_if_coverage_below_threshold(tmp_path: Path) -> None:
         )
 
 
+def test_benchmark_applies_postprocessing_to_predictions_and_truth(tmp_path: Path) -> None:
+    truth = tmp_path / "truth.parquet"
+    pred = tmp_path / "pred.parquet"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ts = pd.date_range("2025-01-01", periods=4, freq="h", tz="UTC")
+    pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "afrr_activation_price_vwap_neg": [-100.0, -200.0, -300.0, -400.0],
+        }
+    ).to_parquet(truth, index=False)
+    pd.DataFrame(
+        {
+            "target_time_utc": ts,
+            "lead_time_h": [1, 1, 1, 1],
+            "predicted_value": [-80.0, -150.0, -260.0, -350.0],
+            "p10": [-110.0, -210.0, -310.0, -410.0],
+            "p30": [-100.0, -200.0, -300.0, -400.0],
+            "p50": [-80.0, -150.0, -260.0, -350.0],
+            "p70": [-60.0, -120.0, -220.0, -300.0],
+            "p90": [-40.0, -100.0, -180.0, -260.0],
+        }
+    ).to_parquet(pred, index=False)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "training": {"model_type": "xgb"},
+                "bundles": {
+                    "afrr": {
+                        "predictions_long": {
+                            "test": {"pred_afrr_activation_price_neg": f"../{pred.name}"}
+                        }
+                    }
+                },
+            }
+        )
+    )
+    out = tmp_path / "out"
+    run_benchmark(
+        config={"quantiles": [0.1, 0.3, 0.5, 0.7, 0.9], "horizon": {"buckets": {"short": [1, 8], "medium": [9, 16], "long": [17, 48]}}, "tail_events": {}},
+        model_run_manifests=[run_dir / "manifest.json"],
+        out_dir=out,
+        splits=["test"],
+        truth_source=truth,
+        min_join_coverage=0.9,
+        fail_on_missing_truth=True,
+        make_figures=False,
+        save_joined_predictions=True,
+        overwrite=True,
+    )
+    joined = pd.read_parquet(out / "diagnostics" / "joined_predictions" / "xgb__test__pred_afrr_activation_price_neg.parquet")
+    assert (joined["y_true"] >= 0.0).all()
+    assert (joined["predicted_value"] >= 0.0).all()
+
+
+def test_benchmark_writes_postprocessing_report(tmp_path: Path) -> None:
+    out = _run_small_benchmark(tmp_path, make_figures=False)
+    p = out / "diagnostics" / "forecast_postprocessing_report.csv"
+    assert p.exists()
+    df = pd.read_csv(p)
+    assert {"model", "split", "target", "sign_flipped", "status", "target_value_mode"}.issubset(df.columns)
+
+
 def test_validation_script_detects_missing_required_files(tmp_path: Path) -> None:
     cp = subprocess.run([
         str(ROOT / ".venv" / "bin" / "python"),

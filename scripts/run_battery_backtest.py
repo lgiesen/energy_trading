@@ -26,17 +26,17 @@ Usage (manual files):
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import json
 import os
 import re
-from pathlib import Path
 import shutil
 import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable
 
 import matplotlib.pyplot as plt
@@ -49,14 +49,11 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from energy_trading.simulation.battery_backtest import (
-    BacktestColumnMap,
-    BatteryBacktester,
-    PhaseTimeoutError,
-    load_and_align_market_data,
-    load_prediction_warehouse_long,
-)
 from energy_trading.config import MODEL_SPECS
+from energy_trading.simulation.battery_backtest import (
+    BacktestColumnMap, BatteryBacktester, PhaseTimeoutError,
+    canonicalize_market_frame, load_and_align_market_data,
+    load_prediction_warehouse_long)
 
 
 def _series_from_candidates(
@@ -185,7 +182,7 @@ def _build_optimization_infeasibility_attribution(
     out["scenario"] = str(scenario)
     out["timestamp_utc"] = pd.to_datetime(failing.get("timestamp_utc"), utc=True, errors="coerce")
     out["optimization_error_code"] = failing.get("optimization_error_code", "ok").astype(str)
-    out["fallback_mode"] = failing.get("optimization_fallback", "none").astype(str)
+    out["fallback_mode"] = failing["optimization_fallback"].astype(str) if "optimization_fallback" in failing else "none"
     out["reserve_feasibility_repair_used"] = float(summary.get("reserve_feasibility_repair_used", 0.0))
     out["accepted_path_infeasible_debug_dump_count"] = float(summary.get("accepted_path_infeasible_debug_dump_count", 0.0))
     out["solver_status"] = failing.get("optimization_error_code", "ok").astype(str)
@@ -636,6 +633,23 @@ def _resolve_long_map(
     return resolved
 
 
+def _target_value_modes_from_manifest(payload: dict[str, object]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    tvm = payload.get("target_value_mode", {})
+    if isinstance(tvm, dict):
+        for k, v in tvm.items():
+            out[str(k)] = str(v)
+    sim = payload.get("simulation", {})
+    if isinstance(sim, dict):
+        canonical_targets = sim.get("canonical_economic_targets", [])
+        if isinstance(canonical_targets, list):
+            for t in canonical_targets:
+                out[str(t)] = "canonical_economic"
+    if "pred_afrr_activation_price_neg" not in out:
+        out["pred_afrr_activation_price_neg"] = "raw_signed_legacy"
+    return out
+
+
 def _read_parquet_columns(path: Path) -> list[str]:
     try:
         import pyarrow.parquet as pq  # type: ignore
@@ -1039,6 +1053,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--forecast-value-mode",
+        choices=["canonical_economic", "raw_signed"],
+        default="canonical_economic",
+        help="Forecast/settlement value convention. canonical_economic uses central postprocessing sign conventions.",
+    )
+    p.add_argument(
         "--clean-output",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1091,6 +1111,10 @@ def main() -> None:
     ground_truth_path = args.ground_truth.strip()
     payload: dict[str, object] = {}
     manifest_path: Path | None = None
+
+    target_value_modes: dict[str, str] = {}
+    if payload:
+        target_value_modes = _target_value_modes_from_manifest(payload)
 
     if not predictions_path:
         if args.run_manifest.strip():
@@ -1160,7 +1184,10 @@ def main() -> None:
                 split=args.split,
                 model_key=args.model_key.strip(),
             )
-            forecast_warehouse = load_prediction_warehouse_long(resolved_long_map)
+            forecast_warehouse = load_prediction_warehouse_long(
+                resolved_long_map,
+                target_value_modes=target_value_modes,
+            )
             print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
             cov_min_list: list[pd.Timestamp] = []
             cov_max_list: list[pd.Timestamp] = []
@@ -1220,13 +1247,19 @@ def main() -> None:
     colmap = _apply_fallback_column_map(pred_preview, truth_preview, colmap_in)
 
     if predictions_path:
-        df = load_and_align_market_data(predictions_path, ground_truth_path, colmap)
+        df = load_and_align_market_data(
+            predictions_path,
+            ground_truth_path,
+            colmap,
+            target_value_modes=target_value_modes,
+        )
     else:
         df = truth_preview.copy()
         if colmap.timestamp not in df.columns and isinstance(df.index, pd.DatetimeIndex):
             df[colmap.timestamp] = df.index
         df[colmap.timestamp] = pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce")
         df = df.dropna(subset=[colmap.timestamp]).sort_values(colmap.timestamp).reset_index(drop=True)
+        df = canonicalize_market_frame(df, colmap=colmap, target_value_modes=target_value_modes)
         if forecast_warehouse and coverage_min is not None and coverage_max is not None:
             df = df[(df[colmap.timestamp] >= coverage_min) & (df[colmap.timestamp] <= coverage_max)].copy()
     if args.start:
@@ -1296,6 +1329,7 @@ def main() -> None:
     MODEL_SPECS["enable_reserve_retry_ladder"] = bool(
         bool(args.strict_simulation_validity) and str(MODEL_SPECS["reserve_feasibility_mode"]) == "conservative"
     )
+    MODEL_SPECS["forecast_value_mode"] = str(args.forecast_value_mode).strip().lower()
     MODEL_SPECS["final_soc_mode"] = str(args.final_soc_mode)
     enforce_final_soc_min = bool(args.final_soc_mode == "hard")
     backtester = BatteryBacktester()
@@ -1793,6 +1827,23 @@ def main() -> None:
             "protected_soc_margin_at_first_failure": 0.0,
             "power_violation_at_first_failure": 0.0,
             "disable_new_bcm_reserve_bids": float(bool(args.disable_new_bcm_reserve_bids)),
+            "forecast_postprocessing_applied": 1.0,
+            "forecast_value_mode": str(args.forecast_value_mode),
+            "forecast_postprocessing_targets": json.dumps(
+                [
+                    colmap.pred_da_price,
+                    colmap.pred_afrr_capacity_price_pos,
+                    colmap.pred_afrr_capacity_price_neg,
+                    colmap.pred_afrr_activation_price_pos,
+                    colmap.pred_afrr_activation_price_neg,
+                    colmap.pred_afrr_activation_rate_pos,
+                    colmap.pred_afrr_activation_rate_neg,
+                ]
+            ),
+            "forecast_postprocessing_report_path": "",
+            "canonical_economic_targets": json.dumps(
+                [k for k, v in target_value_modes.items() if str(v).strip().lower() == "canonical_economic"]
+            ),
         }
         defaulted_fields: list[str] = []
         for k, v in defaults.items():
