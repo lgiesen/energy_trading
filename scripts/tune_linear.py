@@ -41,6 +41,40 @@ def _asymmetric_mae(y_true: np.ndarray, y_pred: np.ndarray, penalty: float = 3.0
     return float(np.mean(np.abs(err) * w))
 
 
+def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, tau: float) -> float:
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not bool(m.any()):
+        return float("nan")
+    e = y_true[m] - y_pred[m]
+    return float(np.mean(np.maximum(tau * e, (tau - 1.0) * e)))
+
+
+def _mean_pinball_loss(y_true: np.ndarray, preds_by_q: dict[float, np.ndarray]) -> float:
+    vals: list[float] = []
+    for tau, pred in preds_by_q.items():
+        v = _pinball_loss(y_true, pred, tau)
+        if np.isfinite(v):
+            vals.append(float(v))
+    if not vals:
+        return float("nan")
+    return float(np.mean(vals))
+
+
+def _parse_hpo_quantiles(raw: str) -> list[float]:
+    out = []
+    for tok in str(raw).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        q = float(tok)
+        if not (0.0 < q < 1.0):
+            raise ValueError(f"Invalid quantile in --hpo-quantiles: {q}")
+        out.append(q)
+    if not out:
+        raise ValueError("--hpo-quantiles must contain at least one quantile.")
+    return sorted(set(out))
+
+
 def _build_model(
     alpha: float,
     l1_ratio: float,
@@ -105,7 +139,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-dir", default="data/model_input")
     p.add_argument("--bundle", choices=["da", "afrr"], default="afrr")
     p.add_argument("--target-col", default="")
-    p.add_argument("--selection-metric", choices=["mae", "tail_upper_mae", "asymmetric_mae"], default="mae")
+    p.add_argument("--selection-metric", choices=["pinball_mean", "mae", "tail_upper_mae", "asymmetric_mae"], default="pinball_mean")
+    p.add_argument("--hpo-quantiles", default="0.1,0.5,0.9")
     p.add_argument("--tail-penalty", type=float, default=3.0)
     p.add_argument("--alpha-grid", default="1e-5,5e-5,1e-4,5e-4,1e-3")
     p.add_argument("--l1-ratio-grid", default="0.05,0.15,0.30")
@@ -129,6 +164,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     bundle: BundleName = args.bundle  # type: ignore[assignment]
+    hpo_quantiles = _parse_hpo_quantiles(args.hpo_quantiles)
     X_tr_df, y_tr_df = load_processed_data(bundle=bundle, split="train", base_dir=args.base_dir)
     X_va_df, y_va_df = load_processed_data(bundle=bundle, split="val", base_dir=args.base_dir)
     target = _resolve_target(bundle, list(y_tr_df.columns), args.target_col.strip() or None)
@@ -166,20 +202,33 @@ def main() -> None:
             for learning_rate in lr_grid:
                 for eta0 in eta0_grid:
                     trial_t0 = time.perf_counter()
-                    model = _build_model(
-                        alpha=alpha,
-                        l1_ratio=l1_ratio,
-                        learning_rate=learning_rate,
-                        eta0=eta0,
-                        quantile=0.5,
-                        seed=args.seed,
-                    )
-                    model.fit(X_tr, y_tr)
-                    pred = model.predict(X_va)
+                    preds_by_q: dict[float, np.ndarray] = {}
+                    pred_p50: np.ndarray | None = None
+                    for q in hpo_quantiles:
+                        model_q = _build_model(
+                            alpha=alpha,
+                            l1_ratio=l1_ratio,
+                            learning_rate=learning_rate,
+                            eta0=eta0,
+                            quantile=float(q),
+                            seed=args.seed,
+                        )
+                        model_q.fit(X_tr, y_tr)
+                        pred_q = model_q.predict(X_va)
+                        preds_by_q[float(q)] = pred_q
+                        if abs(float(q) - 0.5) < 1e-9:
+                            pred_p50 = pred_q
+                    if pred_p50 is None:
+                        closest_q = min(hpo_quantiles, key=lambda z: abs(z - 0.5))
+                        pred_p50 = preds_by_q[closest_q]
+                    pred = pred_p50
+                    pinball_mean = _mean_pinball_loss(y_va, preds_by_q)
                     shared = compute_shared_metrics(y_va, {"point": pred})
                     tail_upper = shared.get("tail_upper_mae")
                     asym = _asymmetric_mae(y_va, pred, penalty=float(args.tail_penalty))
-                    if args.selection_metric == "mae":
+                    if args.selection_metric == "pinball_mean":
+                        obj = float(pinball_mean) if np.isfinite(pinball_mean) else float("nan")
+                    elif args.selection_metric == "mae":
                         obj = float(shared.get("mae")) if shared.get("mae") is not None else float("nan")
                     elif args.selection_metric == "tail_upper_mae":
                         obj = float(tail_upper) if tail_upper is not None and np.isfinite(tail_upper) else float("nan")
@@ -194,6 +243,8 @@ def main() -> None:
                             "learning_rate": learning_rate,
                             "eta0": eta0,
                             "objective": obj,
+                            "pinball_mean": float(pinball_mean) if np.isfinite(pinball_mean) else np.nan,
+                            "hpo_quantiles": ",".join(f"{q:.2f}" for q in hpo_quantiles),
                             "tail_upper_mae": float(tail_upper)
                             if tail_upper is not None and np.isfinite(tail_upper)
                             else np.nan,
@@ -240,8 +291,10 @@ def main() -> None:
         "bundle": bundle,
         "target_col": target,
         "selection_metric": args.selection_metric,
+        "hpo_quantiles": [float(q) for q in hpo_quantiles],
         "tail_penalty": float(args.tail_penalty),
         "best_objective_value": float(best_obj),
+        "best_pinball_mean": float(trials.iloc[0]["pinball_mean"]) if not trials.empty and "pinball_mean" in trials.columns else float("nan"),
         "best_params": best_cfg,
     }
     out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")

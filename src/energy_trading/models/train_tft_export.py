@@ -379,6 +379,35 @@ def _leadtime_mae(
     return pd.DataFrame(rows)
 
 
+def _mean_pinball_from_decay(decay_df: pd.DataFrame) -> float:
+    """Compute full-horizon unweighted mean pinball from lead-decay table.
+
+    Per quantile column `pinball_pXX`, first aggregate across leads weighted by
+    observation count `n`. Then average quantile means equally.
+    """
+    if decay_df is None or decay_df.empty or "n" not in decay_df.columns:
+        return float("nan")
+    n = pd.to_numeric(decay_df["n"], errors="coerce").to_numpy(dtype=float)
+    valid_n = np.isfinite(n) & (n > 0)
+    if not bool(valid_n.any()):
+        return float("nan")
+
+    pinball_cols = [c for c in decay_df.columns if c.startswith("pinball_p")]
+    if not pinball_cols:
+        return float("nan")
+
+    q_means: list[float] = []
+    for col in pinball_cols:
+        v = pd.to_numeric(decay_df[col], errors="coerce").to_numpy(dtype=float)
+        m = valid_n & np.isfinite(v)
+        if not bool(m.any()):
+            continue
+        q_means.append(float(np.average(v[m], weights=n[m])))
+    if not q_means:
+        return float("nan")
+    return float(np.mean(q_means))
+
+
 def _save_tft_attention_plot(
     *,
     tft_model,
@@ -1350,6 +1379,14 @@ def _train_tft(
         ):
             metrics[f"{k}_test_h1"] = v
     metrics.update(lead_pinball_weighted)
+    val_pinball_keys = sorted([k for k in val_metric_suite_h1.keys() if k.startswith("pinball_loss_p")])
+    test_pinball_keys = sorted([k for k in test_metric_suite_h1.keys() if k.startswith("pinball_loss_p")])
+    val_pinball_vals = [float(val_metric_suite_h1[k]) for k in val_pinball_keys if np.isfinite(float(val_metric_suite_h1[k]))]
+    test_pinball_vals = [float(test_metric_suite_h1[k]) for k in test_pinball_keys if np.isfinite(float(test_metric_suite_h1[k]))]
+    metrics["pinball_mean_val_h1"] = float(np.mean(val_pinball_vals)) if val_pinball_vals else float("nan")
+    metrics["pinball_mean_test_h1"] = float(np.mean(test_pinball_vals)) if test_pinball_vals else float("nan")
+    metrics["pinball_mean_val"] = _mean_pinball_from_decay(decay_val)
+    metrics["pinball_mean_test"] = _mean_pinball_from_decay(decay_test)
     return metrics
 
 

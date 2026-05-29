@@ -82,6 +82,40 @@ def _asymmetric_mae(y_true: np.ndarray, y_pred: np.ndarray, penalty: float = 3.0
     return float(np.mean(np.abs(err) * w))
 
 
+def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, tau: float) -> float:
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not bool(m.any()):
+        return float("nan")
+    e = y_true[m] - y_pred[m]
+    return float(np.mean(np.maximum(tau * e, (tau - 1.0) * e)))
+
+
+def _mean_pinball_loss(y_true: np.ndarray, preds_by_q: dict[float, np.ndarray]) -> float:
+    vals: list[float] = []
+    for tau, pred in preds_by_q.items():
+        v = _pinball_loss(y_true, pred, tau)
+        if np.isfinite(v):
+            vals.append(float(v))
+    if not vals:
+        return float("nan")
+    return float(np.mean(vals))
+
+
+def _parse_hpo_quantiles(raw: str) -> list[float]:
+    out = []
+    for tok in str(raw).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        q = float(tok)
+        if not (0.0 < q < 1.0):
+            raise ValueError(f"Invalid quantile in --hpo-quantiles: {q}")
+        out.append(q)
+    if not out:
+        raise ValueError("--hpo-quantiles must contain at least one quantile.")
+    return sorted(set(out))
+
+
 def _build_cli() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Tune XGBoost with Optuna on chronological splits.")
     p.add_argument("--base-dir", default="data/model_input")
@@ -97,10 +131,11 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--q-high", type=float, default=0.95)
     p.add_argument("--tail-weight", type=float, default=3.0)
     p.add_argument("--use-tail-weights", action="store_true", help="Optional tail weighting (off by default).")
+    p.add_argument("--hpo-quantiles", default="0.1,0.5,0.9")
     p.add_argument(
         "--selection-metric",
-        choices=["mae", "tail_upper_mae", "asymmetric_mae"],
-        default="mae",
+        choices=["pinball_mean", "mae", "tail_upper_mae", "asymmetric_mae"],
+        default="pinball_mean",
     )
     p.add_argument("--study-name", default="xgb_tuning")
     p.add_argument("--out-dir", default="artifacts/hpo")
@@ -132,6 +167,7 @@ def main() -> None:
 
     bundle: BundleName = args.bundle  # type: ignore[assignment]
     device = _resolve_device(args.device, allow_cpu=args.allow_cpu)
+    hpo_quantiles = _parse_hpo_quantiles(args.hpo_quantiles)
 
     X_train_df, y_train_df = load_processed_data(bundle=bundle, split="train", base_dir=base_dir)
     X_val_df, y_val_df = load_processed_data(bundle=bundle, split="val", base_dir=base_dir)
@@ -175,7 +211,7 @@ def main() -> None:
         bool(args.use_tail_weights),
     )
 
-    trial_rows: list[dict[str, float | int]] = []
+    trial_rows: list[dict[str, float | int | str]] = []
 
     def _objective(trial: "optuna.Trial") -> float:
         max_depth = trial.suggest_int("max_depth", 3, 6)
@@ -186,35 +222,48 @@ def main() -> None:
         reg_alpha = trial.suggest_float("reg_alpha", 2.0, 30.0, log=True)
         reg_lambda = trial.suggest_float("reg_lambda", 5.0, 80.0, log=True)
 
-        model = XGBRegressor(
-            objective="reg:quantileerror",
-            quantile_alpha=0.5,
-            n_estimators=int(args.n_estimators),
-            max_depth=int(max_depth),
-            learning_rate=float(learning_rate),
-            tree_method="hist",
-            device=device,
-            subsample=float(subsample),
-            colsample_bytree=float(colsample_bytree),
-            min_child_weight=float(min_child_weight),
-            reg_alpha=float(reg_alpha),
-            reg_lambda=float(reg_lambda),
-            random_state=int(args.seed),
-            early_stopping_rounds=max(0, int(args.early_stopping_rounds)),
-            n_jobs=-1,
-        )
-        fit_kwargs: dict[str, object] = {"eval_set": [(X_va, y_va)], "verbose": False}
-        if args.use_tail_weights:
-            fit_kwargs["sample_weight"] = tr_w
-            fit_kwargs["sample_weight_eval_set"] = [va_w]
-        model.fit(X_tr, y_tr, **fit_kwargs)
-        pred = model.predict(X_va)
+        preds_by_q: dict[float, np.ndarray] = {}
+        pred_p50: np.ndarray | None = None
+        for q in hpo_quantiles:
+            model = XGBRegressor(
+                objective="reg:quantileerror",
+                quantile_alpha=float(q),
+                n_estimators=int(args.n_estimators),
+                max_depth=int(max_depth),
+                learning_rate=float(learning_rate),
+                tree_method="hist",
+                device=device,
+                subsample=float(subsample),
+                colsample_bytree=float(colsample_bytree),
+                min_child_weight=float(min_child_weight),
+                reg_alpha=float(reg_alpha),
+                reg_lambda=float(reg_lambda),
+                random_state=int(args.seed),
+                early_stopping_rounds=max(0, int(args.early_stopping_rounds)),
+                n_jobs=-1,
+            )
+            fit_kwargs: dict[str, object] = {"eval_set": [(X_va, y_va)], "verbose": False}
+            if args.use_tail_weights:
+                fit_kwargs["sample_weight"] = tr_w
+                fit_kwargs["sample_weight_eval_set"] = [va_w]
+            model.fit(X_tr, y_tr, **fit_kwargs)
+            pred_q = model.predict(X_va)
+            preds_by_q[float(q)] = pred_q
+            if abs(float(q) - 0.5) < 1e-9:
+                pred_p50 = pred_q
+        if pred_p50 is None:
+            closest_q = min(hpo_quantiles, key=lambda z: abs(z - 0.5))
+            pred_p50 = preds_by_q[closest_q]
+        pred = pred_p50
         wmae = _weighted_mae(y_va_np, pred, va_w)
         mae = float(np.mean(np.abs(y_va_np - pred)))
+        pinball_mean = _mean_pinball_loss(y_va_np, preds_by_q)
         shared = compute_shared_metrics(y_va_np, {"point": pred})
         tail_upper_mae = shared.get("tail_upper_mae")
         asym = _asymmetric_mae(y_va_np, pred, penalty=float(args.tail_weight))
-        if args.selection_metric == "mae":
+        if args.selection_metric == "pinball_mean":
+            objective = float(pinball_mean) if np.isfinite(pinball_mean) else float(mae)
+        elif args.selection_metric == "mae":
             objective = float(mae)
         elif args.selection_metric == "tail_upper_mae":
             objective = float(tail_upper_mae) if tail_upper_mae is not None and np.isfinite(tail_upper_mae) else float(wmae)
@@ -226,6 +275,8 @@ def main() -> None:
                 "objective": float(objective),
                 "weighted_mae": float(wmae),
                 "mae": float(mae),
+                "pinball_mean": float(pinball_mean) if np.isfinite(pinball_mean) else np.nan,
+                "hpo_quantiles": ",".join(f"{q:.2f}" for q in hpo_quantiles),
                 "tail_upper_mae": float(tail_upper_mae) if tail_upper_mae is not None and np.isfinite(tail_upper_mae) else np.nan,
                 "asymmetric_mae": float(asym) if np.isfinite(asym) else np.nan,
                 "max_depth": int(max_depth),
@@ -238,6 +289,7 @@ def main() -> None:
             }
         )
         trial.set_user_attr("mae", float(mae))
+        trial.set_user_attr("pinball_mean", float(pinball_mean) if np.isfinite(pinball_mean) else np.nan)
         trial.set_user_attr("weighted_mae", float(wmae))
         trial.set_user_attr("tail_upper_mae", float(tail_upper_mae) if tail_upper_mae is not None and np.isfinite(tail_upper_mae) else np.nan)
         trial.set_user_attr("asymmetric_mae", float(asym) if np.isfinite(asym) else np.nan)
@@ -265,7 +317,9 @@ def main() -> None:
         },
         "best_trial": int(best.number),
         "selection_metric": str(args.selection_metric),
+        "hpo_quantiles": [float(q) for q in hpo_quantiles],
         "best_objective_value": float(best.value),
+        "best_pinball_mean": float(best.user_attrs.get("pinball_mean", np.nan)),
         "best_weighted_mae": float(best.user_attrs.get("weighted_mae", np.nan)),
         "best_mae": float(best.user_attrs.get("mae", np.nan)),
         "best_tail_upper_mae": float(best.user_attrs.get("tail_upper_mae", np.nan)),

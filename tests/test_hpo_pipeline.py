@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,10 @@ from scripts.train_and_export_runs import (  # noqa: E402
     load_hpo_artifact_map,
     validate_hpo_cli_choice,
 )
+from src.energy_trading.models.train_tft_export import _mean_pinball_from_decay  # noqa: E402
+from scripts.tune_linear import _mean_pinball_loss as linear_mean_pinball_loss  # noqa: E402
+from scripts.tune_xgboost import _build_cli as xgb_tune_build_cli  # noqa: E402
+from scripts.tune_xgboost import _mean_pinball_loss as xgb_mean_pinball_loss  # noqa: E402
 
 
 def _mk_hpo_json(path: Path, *, bundle: str, target: str) -> None:
@@ -179,7 +185,78 @@ def test_makefile_dry_run_tuning_uses_unweighted_default_selection_metrics() -> 
     )
     assert cp.returncode == 0, cp.stdout + cp.stderr
     out = cp.stdout
-    assert "--selection-metric mae" in out
-    assert "--selection-metric mae_val" in out
+    assert "--selection-metric pinball_mean" in out
+    assert "--selection-metric pinball_mean_val" in out
+    assert "--hpo-quantiles 0.1,0.5,0.9" in out
+    assert "--fallback-metric mae_val" in out
     assert "tail_upper_mae" not in out
     assert "leadtime_pinball_p90_val_weighted" not in out
+    assert "--use-tail-weights" not in out
+
+
+def test_pinball_helpers_perfect_predictions_are_zero() -> None:
+    y = np.array([1.0, 2.0, 3.0], dtype=float)
+    preds = {0.1: y.copy(), 0.5: y.copy(), 0.9: y.copy()}
+    assert xgb_mean_pinball_loss(y, preds) == 0.0
+    assert linear_mean_pinball_loss(y, preds) == 0.0
+
+
+def test_pinball_helpers_worse_predictions_have_larger_loss() -> None:
+    y = np.array([1.0, 2.0, 3.0], dtype=float)
+    good = {0.1: y.copy(), 0.5: y.copy(), 0.9: y.copy()}
+    bad = {0.1: y - 1.0, 0.5: y + 1.0, 0.9: y + 2.0}
+    assert xgb_mean_pinball_loss(y, bad) > xgb_mean_pinball_loss(y, good)
+    assert linear_mean_pinball_loss(y, bad) > linear_mean_pinball_loss(y, good)
+
+
+def test_xgb_tune_defaults_pinball_mean_and_quantiles() -> None:
+    parser = xgb_tune_build_cli()
+    args = parser.parse_args([])
+    assert args.selection_metric == "pinball_mean"
+    assert args.hpo_quantiles == "0.1,0.5,0.9"
+    assert args.use_tail_weights is False
+
+
+def test_tft_pinball_mean_uses_full_horizon_not_h1_only() -> None:
+    decay = pd.DataFrame(
+        {
+            "lead_time_h": [1.0, 2.0],
+            "n": [10.0, 10.0],
+            "pinball_p10": [1.0, 3.0],
+            "pinball_p50": [2.0, 4.0],
+            "pinball_p90": [3.0, 5.0],
+        }
+    )
+    got = _mean_pinball_from_decay(decay)
+    # Per-quantile lead-mean = [2,3,4], overall = 3
+    assert got == pytest.approx(3.0)
+
+
+def test_tft_pinball_mean_changes_when_non_h1_lead_changes() -> None:
+    decay_a = pd.DataFrame(
+        {
+            "lead_time_h": [1.0, 2.0],
+            "n": [10.0, 10.0],
+            "pinball_p10": [1.0, 1.0],
+            "pinball_p50": [1.0, 1.0],
+            "pinball_p90": [1.0, 1.0],
+        }
+    )
+    decay_b = decay_a.copy()
+    decay_b.loc[decay_b["lead_time_h"] == 2.0, ["pinball_p10", "pinball_p50", "pinball_p90"]] = [5.0, 5.0, 5.0]
+    assert _mean_pinball_from_decay(decay_b) > _mean_pinball_from_decay(decay_a)
+
+
+def test_tft_pinball_mean_ignores_invalid_rows_and_requires_positive_n() -> None:
+    decay = pd.DataFrame(
+        {
+            "lead_time_h": [1.0, 2.0, 3.0],
+            "n": [10.0, 0.0, np.nan],
+            "pinball_p10": [1.0, 99.0, 99.0],
+            "pinball_p50": [2.0, np.inf, np.nan],
+            "pinball_p90": [3.0, -np.inf, np.nan],
+        }
+    )
+    got = _mean_pinball_from_decay(decay)
+    # only lead 1 is valid -> mean(1,2,3)=2
+    assert got == pytest.approx(2.0)
