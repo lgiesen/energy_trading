@@ -44,7 +44,7 @@ def test_hpo_artifact_map_generation_creates_expected_mapping(tmp_path: Path) ->
     out_map = tmp_path / "xgb_map.json"
     cp = subprocess.run(
         [
-            str(ROOT / ".venv" / "bin" / "python"),
+            sys.executable,
             str(ROOT / "scripts" / "build_hpo_artifact_map.py"),
             "--model-type",
             "xgboost",
@@ -72,7 +72,7 @@ def test_missing_hpo_file_fails_in_full_hpo_mode(tmp_path: Path) -> None:
     out_map = tmp_path / "xgb_map.json"
     cp = subprocess.run(
         [
-            str(ROOT / ".venv" / "bin" / "python"),
+            sys.executable,
             str(ROOT / "scripts" / "build_hpo_artifact_map.py"),
             "--model-type",
             "xgboost",
@@ -137,3 +137,28 @@ def test_makefile_dry_run_train_xgb_uses_hpo_map() -> None:
     )
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert "--hpo-artifact-map \"artifacts/hpo/xgb_hpo_artifact_map.json\"" in cp.stdout
+    assert "--hpo-artifact " not in cp.stdout
+
+
+def test_makefile_dry_run_train_linear_uses_hpo_map_only() -> None:
+    cp = subprocess.run(
+        ["make", "-n", "train-linear"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "--hpo-artifact-map \"artifacts/hpo/linear_hpo_artifact_map.json\"" in cp.stdout
+    assert "--hpo-artifact " not in cp.stdout
+
+
+def test_makefile_dry_run_train_tft_uses_hpo_map_only() -> None:
+    cp = subprocess.run(
+        ["make", "-n", "train-tft"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "--hpo-artifact-map \"artifacts/hpo/tft_hpo_artifact_map.json\"" in cp.stdout
+    assert "--hpo-artifact " not in cp.stdout
