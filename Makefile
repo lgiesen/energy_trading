@@ -41,13 +41,19 @@ RUN_ID_TFT := tft_$(shell date +%Y%m%d_%H%M%S)
 # Common artifacts
 DATA_HASH_FILE := artifacts/hpo/data_model_input.md5
 
-# HPO outputs
-XGB_TUNE_JSON := artifacts/hpo/xgb_optuna_da_target_da_price.json
-XGB_TUNE_CSV := artifacts/hpo/xgb_optuna_da_target_da_price_trials.csv
-LINEAR_TUNE_JSON := artifacts/hpo/linear_sgd_tuning_da_target_da_price.json
-LINEAR_TUNE_CSV := artifacts/hpo/linear_sgd_tuning_da_target_da_price_trials.csv
-TFT_TUNE_JSON := artifacts/hpo/tft_optuna_da_target_da_price.json
-TFT_TUNE_CSV := artifacts/hpo/tft_optuna_da_target_da_price_trials.csv
+# HPO config
+HPO_OUT_DIR ?= artifacts/hpo
+DA_TARGETS ?= target_da_price
+AFRR_TARGETS ?= target_afrr_activation_price_vwap_pos target_afrr_activation_price_vwap_neg target_afrr_activation_rate_pos target_afrr_activation_rate_neg target_afrr_capacity_price_pos target_afrr_capacity_price_neg
+ALL_TARGETS ?= $(DA_TARGETS) $(AFRR_TARGETS)
+HPO_SCOPE ?= all
+XGB_HPO_TRIALS ?= 60
+TFT_HPO_TRIALS ?= 24
+
+# HPO maps
+XGB_HPO_MAP := $(HPO_OUT_DIR)/xgb_hpo_artifact_map.json
+LINEAR_HPO_MAP := $(HPO_OUT_DIR)/linear_hpo_artifact_map.json
+TFT_HPO_MAP := $(HPO_OUT_DIR)/tft_hpo_artifact_map.json
 
 # Train outputs
 XGB_MANIFEST := artifacts/model_runs/$(RUN_ID_XGB)/manifest.json
@@ -67,7 +73,11 @@ TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 .PHONY: help \
 	doctor \
 	data_hash \
-	tune-xgb tune-linear tune-tft \
+	tune-xgb-da tune-xgb-afrr tune-xgb-all tune-xgb \
+	tune-linear-da tune-linear-afrr tune-linear-all tune-linear \
+	tune-tft-da tune-tft-afrr tune-tft-all tune-tft \
+	tune-all \
+	validate-hpo-artifacts hpo-inventory \
 	train-xgb train-linear train-tft \
 	sim-xgb sim-linear sim-tft \
 	sim-latest-xgb sim-latest-linear sim-latest-tft \
@@ -144,46 +154,94 @@ $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input p
 
 data_hash: $(DATA_HASH_FILE) ## Alias for provenance hash generation
 
-$(XGB_TUNE_JSON): $(DATA_HASH_FILE)
-	@mkdir -p artifacts/hpo
-	python3 scripts/tune_xgboost.py \
-	  --bundle da \
-	  --target-col target_da_price \
-	  --n-trials 60 \
-	  --n-estimators 400 \
-	  --selection-metric tail_upper_mae \
-	  --allow-cpu
+define TUNE_XGB_LOOP
+	@mkdir -p $(HPO_OUT_DIR)
+	@scope="$(1)"; \
+	if [ "$$scope" = "da" ] || [ "$$scope" = "all" ]; then \
+	  for TGT in $(DA_TARGETS); do \
+	    python3 scripts/tune_xgboost.py --bundle da --target-col "$$TGT" --n-trials $(XGB_HPO_TRIALS) --n-estimators 400 --selection-metric tail_upper_mae --allow-cpu --out-dir $(HPO_OUT_DIR); \
+	  done; \
+	fi; \
+	if [ "$$scope" = "afrr" ] || [ "$$scope" = "all" ]; then \
+	  for TGT in $(AFRR_TARGETS); do \
+	    python3 scripts/tune_xgboost.py --bundle afrr --target-col "$$TGT" --n-trials $(XGB_HPO_TRIALS) --n-estimators 400 --selection-metric tail_upper_mae --allow-cpu --out-dir $(HPO_OUT_DIR); \
+	  done; \
+	fi
+endef
 
-tune-xgb: $(XGB_TUNE_JSON) ## Tune XGBoost (depends on data_hash)
+define TUNE_LINEAR_LOOP
+	@mkdir -p $(HPO_OUT_DIR)
+	@scope="$(1)"; \
+	if [ "$$scope" = "da" ] || [ "$$scope" = "all" ]; then \
+	  for TGT in $(DA_TARGETS); do \
+	    python3 scripts/tune_linear.py --bundle da --target-col "$$TGT" --selection-metric tail_upper_mae --alpha-grid 1e-4,5e-4,1e-3 --l1-ratio-grid 0.1,0.3,0.5 --learning-rate-grid optimal,adaptive --eta0-grid 0.001,0.01 --out-dir $(HPO_OUT_DIR); \
+	  done; \
+	fi; \
+	if [ "$$scope" = "afrr" ] || [ "$$scope" = "all" ]; then \
+	  for TGT in $(AFRR_TARGETS); do \
+	    python3 scripts/tune_linear.py --bundle afrr --target-col "$$TGT" --selection-metric tail_upper_mae --alpha-grid 1e-4,5e-4,1e-3 --l1-ratio-grid 0.1,0.3,0.5 --learning-rate-grid optimal,adaptive --eta0-grid 0.001,0.01 --out-dir $(HPO_OUT_DIR); \
+	  done; \
+	fi
+endef
 
-$(LINEAR_TUNE_JSON): $(DATA_HASH_FILE)
-	@mkdir -p artifacts/hpo
-	python3 scripts/tune_linear.py \
-	  --bundle da \
-	  --target-col target_da_price \
-	  --selection-metric tail_upper_mae \
-	  --alpha-grid 1e-4,5e-4,1e-3 \
-	  --l1-ratio-grid 0.1,0.3,0.5 \
-	  --learning-rate-grid optimal,adaptive \
-	  --eta0-grid 0.001,0.01
+define TUNE_TFT_LOOP
+	@mkdir -p $(HPO_OUT_DIR)
+	@scope="$(1)"; \
+	if [ "$$scope" = "da" ] || [ "$$scope" = "all" ]; then \
+	  for TGT in $(DA_TARGETS); do \
+	    python3 scripts/tune_tft.py --bundle da --target-col "$$TGT" --selection-metric leadtime_pinball_p90_val_weighted --fallback-metric leadtime_mae_val_weighted --n-trials $(TFT_HPO_TRIALS) --device $(DEVICE) --precision $(TFT_PRECISION) --seed $(SEED) --out-dir $(HPO_OUT_DIR) --run-root $(HPO_OUT_DIR)/tft_trials/da_$$TGT; \
+	  done; \
+	fi; \
+	if [ "$$scope" = "afrr" ] || [ "$$scope" = "all" ]; then \
+	  for TGT in $(AFRR_TARGETS); do \
+	    python3 scripts/tune_tft.py --bundle afrr --target-col "$$TGT" --selection-metric leadtime_pinball_p90_val_weighted --fallback-metric leadtime_mae_val_weighted --n-trials $(TFT_HPO_TRIALS) --device $(DEVICE) --precision $(TFT_PRECISION) --seed $(SEED) --out-dir $(HPO_OUT_DIR) --run-root $(HPO_OUT_DIR)/tft_trials/afrr_$$TGT; \
+	  done; \
+	fi
+endef
 
-tune-linear: $(LINEAR_TUNE_JSON) ## Tune Linear model (depends on data_hash)
+tune-xgb-da: $(DATA_HASH_FILE)
+	$(call TUNE_XGB_LOOP,da)
+tune-xgb-afrr: $(DATA_HASH_FILE)
+	$(call TUNE_XGB_LOOP,afrr)
+tune-xgb-all: $(DATA_HASH_FILE)
+	$(call TUNE_XGB_LOOP,all)
+tune-xgb: tune-xgb-$(HPO_SCOPE) ## Tune XGBoost according to HPO_SCOPE (default all)
+tune-xgb-da-only: tune-xgb-da
 
-$(TFT_TUNE_JSON): $(DATA_HASH_FILE)
-	@mkdir -p artifacts/hpo
-	python3 scripts/tune_tft.py \
-	  --bundle da \
-	  --target-col target_da_price \
-	  --selection-metric leadtime_pinball_p90_val_weighted \
-	  --fallback-metric leadtime_mae_val_weighted \
-	  --n-trials 24 \
-	  --device $(DEVICE) \
-	  --precision $(TFT_PRECISION) \
-	  --seed $(SEED)
+tune-linear-da: $(DATA_HASH_FILE)
+	$(call TUNE_LINEAR_LOOP,da)
+tune-linear-afrr: $(DATA_HASH_FILE)
+	$(call TUNE_LINEAR_LOOP,afrr)
+tune-linear-all: $(DATA_HASH_FILE)
+	$(call TUNE_LINEAR_LOOP,all)
+tune-linear: tune-linear-$(HPO_SCOPE) ## Tune Linear according to HPO_SCOPE (default all)
+tune-linear-da-only: tune-linear-da
 
-tune-tft: $(TFT_TUNE_JSON) ## Tune TFT model (depends on data_hash)
+tune-tft-da: $(DATA_HASH_FILE)
+	$(call TUNE_TFT_LOOP,da)
+tune-tft-afrr: $(DATA_HASH_FILE)
+	$(call TUNE_TFT_LOOP,afrr)
+tune-tft-all: $(DATA_HASH_FILE)
+	$(call TUNE_TFT_LOOP,all)
+tune-tft: tune-tft-$(HPO_SCOPE) ## Tune TFT according to HPO_SCOPE (default all)
+tune-tft-da-only: tune-tft-da
 
-$(XGB_MANIFEST): $(XGB_TUNE_JSON)
+tune-all: tune-xgb tune-linear tune-tft ## Tune all model families
+
+$(XGB_HPO_MAP): tune-xgb
+	python3 scripts/build_hpo_artifact_map.py --model-type xgboost --hpo-out-dir $(HPO_OUT_DIR) --out $(XGB_HPO_MAP)
+$(LINEAR_HPO_MAP): tune-linear
+	python3 scripts/build_hpo_artifact_map.py --model-type linear --hpo-out-dir $(HPO_OUT_DIR) --out $(LINEAR_HPO_MAP)
+$(TFT_HPO_MAP): tune-tft
+	python3 scripts/build_hpo_artifact_map.py --model-type tft --hpo-out-dir $(HPO_OUT_DIR) --out $(TFT_HPO_MAP)
+
+validate-hpo-artifacts:
+	python3 scripts/hpo_inventory.py --hpo-out-dir $(HPO_OUT_DIR) --out-csv $(HPO_OUT_DIR)/hpo_inventory.csv --validate
+
+hpo-inventory:
+	python3 scripts/hpo_inventory.py --hpo-out-dir $(HPO_OUT_DIR) --out-csv $(HPO_OUT_DIR)/hpo_inventory.csv
+
+$(XGB_MANIFEST): $(XGB_HPO_MAP)
 		python3 scripts/train_and_export_runs.py \
 	  --model-type xgboost \
 	  --run-id "$(RUN_ID_XGB)" \
@@ -193,14 +251,14 @@ $(XGB_MANIFEST): $(XGB_TUNE_JSON)
 	  --lead-weight-end $(LEAD_WEIGHT_END) \
 	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
-	  --hpo-artifact "$(XGB_TUNE_JSON)" \
+	  --hpo-artifact-map "$(XGB_HPO_MAP)" \
 	  --n-estimators 400 \
 	  --early-stopping-rounds 50 \
 	  --allow-cpu
 
-train-xgb: $(XGB_MANIFEST) ## Train+evaluate XGBoost (depends on tune-xgb output)
+train-xgb: $(XGB_MANIFEST) ## Train+evaluate XGBoost (depends on full target HPO)
 
-$(LINEAR_MANIFEST): $(LINEAR_TUNE_JSON)
+$(LINEAR_MANIFEST): $(LINEAR_HPO_MAP)
 	python3 scripts/train_and_export_runs.py \
 	  --model-type linear \
 	  --run-id "$(RUN_ID_LINEAR)" \
@@ -211,11 +269,11 @@ $(LINEAR_MANIFEST): $(LINEAR_TUNE_JSON)
 	  --seed $(SEED) \
 	  --afrr-parallel-jobs $(LINEAR_AFRR_PARALLEL_JOBS) \
 	  --lead-parallel-jobs $(LINEAR_LEAD_PARALLEL_JOBS) \
-	  --hpo-artifact "$(LINEAR_TUNE_JSON)"
+	  --hpo-artifact-map "$(LINEAR_HPO_MAP)"
 
-train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on tune-linear output)
+train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on full target HPO)
 
-$(TFT_MANIFEST): $(TFT_TUNE_JSON)
+$(TFT_MANIFEST): $(TFT_HPO_MAP)
 	@DEVICE_USE="$(DEVICE)"; \
 	if [ "$(IS_SMOKE_TEST)" != "1" ] && [ "$$DEVICE_USE" != "cuda" ]; then \
 	  echo "TFT final runs must use CUDA. Got DEVICE=$$DEVICE_USE"; \
@@ -233,12 +291,12 @@ $(TFT_MANIFEST): $(TFT_TUNE_JSON)
 	  --lead-weight-end $(LEAD_WEIGHT_END) \
 	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
 	  --seed $(SEED) \
-		  --hpo-artifact "$(TFT_TUNE_JSON)" \
+		  --hpo-artifact-map "$(TFT_HPO_MAP)" \
 		  --device $$DEVICE_USE \
 		  --tft-precision $(TFT_PRECISION) \
 		  --num-workers 0
 
-train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on tune-tft output)
+train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on full target HPO)
 
 define SIM_RULE
 $($(1)_SIM_DONE): $$($(1)_MANIFEST)

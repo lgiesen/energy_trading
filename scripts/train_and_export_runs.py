@@ -26,6 +26,7 @@ AFRR_TARGETS = [
     "target_afrr_capacity_price_pos",
     "target_afrr_capacity_price_neg",
 ]
+DA_TARGET = "target_da_price"
 
 
 def filter_afrr_targets(available_targets: list[str], requested_csv: str) -> list[str]:
@@ -33,6 +34,76 @@ def filter_afrr_targets(available_targets: list[str], requested_csv: str) -> lis
     if not requested:
         return list(available_targets)
     return [t for t in available_targets if t in requested]
+
+
+def load_hpo_artifact_map(path: str | Path) -> dict[str, str]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid HPO artifact map in {path}: expected JSON object.")
+    out: dict[str, str] = {}
+    for k, v in payload.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise RuntimeError(f"Invalid HPO artifact map entry in {path}: keys/values must be strings.")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def load_hpo_best_params(path: str | Path) -> dict[str, object]:
+    hpo_path = Path(path)
+    if not hpo_path.exists():
+        raise FileNotFoundError(f"HPO artifact not found: {hpo_path}")
+    payload = json.loads(hpo_path.read_text(encoding="utf-8"))
+    best_params = payload.get("best_params", {})
+    if not isinstance(best_params, dict):
+        raise RuntimeError(f"Invalid HPO artifact format in {hpo_path}: missing dict 'best_params'")
+    return best_params
+
+
+def hpo_override_cli_args(model_type: str, best_params: dict[str, object]) -> list[str]:
+    def _v(key: str) -> object | None:
+        return best_params.get(key)
+
+    args: list[str] = []
+    if model_type == "xgboost":
+        mapping = [
+            ("max_depth", "--max-depth"),
+            ("learning_rate", "--learning-rate"),
+            ("subsample", "--subsample"),
+            ("colsample_bytree", "--colsample-bytree"),
+            ("min_child_weight", "--min-child-weight"),
+            ("reg_alpha", "--reg-alpha"),
+            ("reg_lambda", "--reg-lambda"),
+        ]
+    elif model_type == "linear":
+        mapping = [
+            ("alpha", "--alpha"),
+            ("l1_ratio", "--l1-ratio"),
+            ("learning_rate", "--learning-rate"),
+            ("eta0", "--eta0"),
+        ]
+    elif model_type == "tft":
+        mapping = [
+            ("hidden_size", "--hidden-size"),
+            ("attention_head_size", "--attention-head-size"),
+            ("dropout", "--dropout"),
+            ("learning_rate", "--learning-rate"),
+            ("gradient_clip_val", "--gradient-clip-val"),
+            ("max_encoder_length", "--max-encoder-length"),
+            ("max_epochs", "--max-epochs"),
+            ("early_stopping_patience", "--early-stopping-patience"),
+        ]
+    else:
+        mapping = []
+    for key, flag in mapping:
+        val = _v(key)
+        if val is not None:
+            args.extend([flag, str(val)])
+    return args
+
+
+def validate_hpo_cli_choice(hpo_artifact: str | None, hpo_artifact_map: str | None) -> None:
+    if hpo_artifact and hpo_artifact_map:
+        raise ValueError("Use either --hpo-artifact or --hpo-artifact-map, not both.")
 
 
 def _run_id_now() -> str:
@@ -628,6 +699,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to Optuna/tuning JSON artifact",
     )
     p.add_argument(
+        "--hpo-artifact-map",
+        type=str,
+        default=None,
+        help="Path to JSON map: target_col -> tuning JSON artifact",
+    )
+    p.add_argument(
         "--cleanup-lightning-checkpoints",
         action="store_true",
         help="For TFT runs: delete intermediate Lightning checkpoint files under ./checkpoints after training.",
@@ -676,43 +753,14 @@ def main() -> None:
     if args.model_type == "linear" and args.enable_da_stacking_afrr:
         raise ValueError("--enable-da-stacking-afrr is only supported for model-type=xgboost.")
 
-    # Direct artifact consumption: load best_params from tuning JSON and
-    # override model arguments in-memory (no fragile shell extraction needed).
+    validate_hpo_cli_choice(args.hpo_artifact, args.hpo_artifact_map)
+
+    global_hpo_best_params: dict[str, object] | None = None
+    hpo_artifact_map: dict[str, str] = {}
     if args.hpo_artifact:
-        hpo_path = Path(args.hpo_artifact)
-        if not hpo_path.exists():
-            raise FileNotFoundError(f"HPO artifact not found: {hpo_path}")
-        payload = json.loads(hpo_path.read_text(encoding="utf-8"))
-        best_params = payload.get("best_params", {})
-        if not isinstance(best_params, dict):
-            raise RuntimeError(f"Invalid HPO artifact format in {hpo_path}: missing dict 'best_params'")
-
-        def _set_if_present(obj: argparse.Namespace, attr: str, key: str) -> None:
-            if key in best_params and best_params[key] is not None:
-                setattr(obj, attr, best_params[key])
-
-        if args.model_type == "xgboost":
-            _set_if_present(args, "max_depth", "max_depth")
-            _set_if_present(args, "learning_rate", "learning_rate")
-            _set_if_present(args, "subsample", "subsample")
-            _set_if_present(args, "colsample_bytree", "colsample_bytree")
-            _set_if_present(args, "min_child_weight", "min_child_weight")
-            _set_if_present(args, "reg_alpha", "reg_alpha")
-            _set_if_present(args, "reg_lambda", "reg_lambda")
-        elif args.model_type == "linear":
-            _set_if_present(args, "linear_alpha", "alpha")
-            _set_if_present(args, "linear_l1_ratio", "l1_ratio")
-            _set_if_present(args, "linear_learning_rate", "learning_rate")
-            _set_if_present(args, "linear_eta0", "eta0")
-        elif args.model_type == "tft":
-            _set_if_present(args, "tft_hidden_size", "hidden_size")
-            _set_if_present(args, "tft_attention_head_size", "attention_head_size")
-            _set_if_present(args, "tft_dropout", "dropout")
-            _set_if_present(args, "tft_learning_rate", "learning_rate")
-            _set_if_present(args, "tft_gradient_clip_val", "gradient_clip_val")
-            _set_if_present(args, "tft_max_encoder_length", "max_encoder_length")
-            _set_if_present(args, "tft_max_epochs", "max_epochs")
-            _set_if_present(args, "tft_early_stopping_patience", "early_stopping_patience")
+        global_hpo_best_params = load_hpo_best_params(args.hpo_artifact)
+    elif args.hpo_artifact_map:
+        hpo_artifact_map = load_hpo_artifact_map(args.hpo_artifact_map)
 
     run_id = args.run_id.strip() or _run_id_now()
     run_dir = Path(args.run_root) / run_id
@@ -723,6 +771,7 @@ def main() -> None:
     da_fragment = run_dir / "da_manifest_fragment.json"
     afrr_fragment_paths: list[Path] = []
     afrr_base_dir = args.base_dir
+    hpo_used_by_target: dict[str, str] = {}
 
     if args.enable_da_stacking_afrr:
         stack_cmd = [
@@ -877,6 +926,16 @@ def main() -> None:
     if not args.skip_da:
         cmd_da = [*base_cmd, "--bundle", "da", "--manifest-fragment-out", str(da_fragment)]
         cmd_da = [*cmd_da, "--base-dir", args.base_dir]
+        if hpo_artifact_map:
+            hpo_path = hpo_artifact_map.get(DA_TARGET, "").strip()
+            if not hpo_path:
+                raise RuntimeError(f"Missing HPO artifact map entry for {DA_TARGET}")
+            da_best_params = load_hpo_best_params(hpo_path)
+            cmd_da.extend(hpo_override_cli_args(args.model_type, da_best_params))
+            hpo_used_by_target[DA_TARGET] = str(Path(hpo_path).resolve())
+        elif global_hpo_best_params is not None:
+            cmd_da.extend(hpo_override_cli_args(args.model_type, global_hpo_best_params))
+            hpo_used_by_target[DA_TARGET] = str(Path(args.hpo_artifact).resolve())
         cmd_records.append(_run_train_cmd(cmd_da, run_dir=run_dir, log_stem=f"01_train_da_{args.model_type}"))
 
     # Train aFRR models target-wise to produce full canonical prediction columns.
@@ -901,6 +960,16 @@ def main() -> None:
             "--manifest-fragment-out",
             str(frag),
         ]
+        if hpo_artifact_map:
+            hpo_path = hpo_artifact_map.get(tgt, "").strip()
+            if not hpo_path:
+                raise RuntimeError(f"Missing HPO artifact map entry for {tgt}")
+            tgt_best_params = load_hpo_best_params(hpo_path)
+            cmd_afrr.extend(hpo_override_cli_args(args.model_type, tgt_best_params))
+            hpo_used_by_target[tgt] = str(Path(hpo_path).resolve())
+        elif global_hpo_best_params is not None:
+            cmd_afrr.extend(hpo_override_cli_args(args.model_type, global_hpo_best_params))
+            hpo_used_by_target[tgt] = str(Path(args.hpo_artifact).resolve())
         afrr_jobs.append((tgt, frag, cmd_afrr, f"02_train_afrr_{args.model_type}_{tgt}"))
 
     afrr_parallel_jobs = max(1, int(args.afrr_parallel_jobs))
@@ -1021,12 +1090,14 @@ def main() -> None:
             "available_afrr_targets": afrr_targets,
             "skipped_afrr_targets": skipped,
             "target_policy_source": "energy_trading.models.training_policy",
+            "hpo_mode": "artifact_map" if hpo_artifact_map else ("single_artifact" if global_hpo_best_params is not None else "none"),
         },
         "input_checksums": {
             "da_base_dir": _bundle_input_checksums(args.base_dir),
             "afrr_base_dir": _bundle_input_checksums(afrr_base_dir),
         },
         "executed_commands": cmd_records,
+        "hpo_artifacts_by_target": hpo_used_by_target,
     }
     training_context["prediction_output_quality_report_path"] = str(prediction_quality_report_path.resolve())
     training_context["prediction_output_quality_passed"] = bool(prediction_quality_report.get("passed", False))
@@ -1067,6 +1138,8 @@ def main() -> None:
             "model_type": args.model_type,
             "model_name": model_name,
             "git_commit": training_context.get("git_commit"),
+            "hpo_mode": training_context["resolved"]["hpo_mode"],
+            "hpo_artifacts_by_target": hpo_used_by_target,
         },
         "bundles": {
             "afrr": {
