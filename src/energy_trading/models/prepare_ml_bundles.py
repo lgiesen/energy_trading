@@ -184,7 +184,12 @@ class MLDataFactory:
         "afrr_bid_avg_activation_price_pos",
         "afrr_bid_vwap_activation_price_neg",
         "afrr_bid_vwap_activation_price_pos",
+        "bid_alloc_mw_neg",
+        "bid_alloc_mw_pos",
+        "bid_signed_vwap_eur_mwh_neg",
+        "bid_signed_vwap_eur_mwh_pos",
     }
+    FOREIGN_DA_PRICE_RE = re.compile(r"^da_price_[A-Z0-9]+$")
     FORECAST_FAMILY_PATTERNS: dict[str, str] = {
         "load_forecast": r"^load_forecast",
         "residual_load_forecast": r"^residual_load_forecast",
@@ -327,6 +332,8 @@ class MLDataFactory:
     @classmethod
     def _is_leaky_feature_name(cls, col: str) -> bool:
         if col in cls.HARD_LEAKAGE_EXACT_EXCLUDE:
+            return True
+        if cls.FOREIGN_DA_PRICE_RE.match(col):
             return True
         if col.startswith(cls.HARD_LEAKAGE_PREFIX_EXCLUDE):
             return True

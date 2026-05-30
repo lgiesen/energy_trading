@@ -15,6 +15,12 @@ FORBIDDEN_UNLAGGED_BID_COLS = {
     "afrr_bid_vwap_activation_price_neg",
     "afrr_bid_vwap_activation_price_pos",
 }
+FORBIDDEN_UNLAGGED_BID_ALLOC_VWAP_COLS = {
+    "bid_signed_vwap_eur_mwh_neg",
+    "bid_signed_vwap_eur_mwh_pos",
+    "bid_alloc_mw_neg",
+    "bid_alloc_mw_pos",
+}
 
 
 def test_feature_column_builder_filters_target_raw_and_forbidden_bid_columns() -> None:
@@ -25,6 +31,10 @@ def test_feature_column_builder_filters_target_raw_and_forbidden_bid_columns() -
             "target_afrr_activation_price_vwap_neg_raw": [1.0, 2.0, 3.0],
             "target_da_price": [10.0, 20.0, 30.0],
             "afrr_bid_avg_activation_price_neg": [1.0, 1.0, 1.0],
+            "bid_signed_vwap_eur_mwh_neg": [1.0, 1.0, 1.0],
+            "bid_alloc_mw_pos": [1.0, 1.0, 1.0],
+            "da_price_AT": [50.0, 51.0, 52.0],
+            "da_price_AT_lag_24h": [30.0, 31.0, 32.0],
             "afrr_activation_price_vwap_neg_lag_24h": [1.0, 2.0, 3.0],
             "wind_forecast": [5.0, 6.0, 7.0],
         }
@@ -37,13 +47,21 @@ def test_feature_column_builder_filters_target_raw_and_forbidden_bid_columns() -
     assert "target_da_price" not in cols
     assert "target_afrr_activation_price_vwap_neg_raw" not in cols
     assert "afrr_bid_avg_activation_price_neg" not in cols
+    assert "bid_signed_vwap_eur_mwh_neg" not in cols
+    assert "bid_alloc_mw_pos" not in cols
+    assert "da_price_AT" not in cols
+    assert "da_price_AT_lag_24h" in cols
 
 
 def test_leakage_name_guard_rules() -> None:
     assert MLDataFactory._is_leaky_feature_name("target_da_price")
     assert MLDataFactory._is_leaky_feature_name("target_afrr_activation_price_vwap_neg_raw")
     assert MLDataFactory._is_leaky_feature_name("afrr_bid_vwap_activation_price_pos")
+    assert MLDataFactory._is_leaky_feature_name("bid_alloc_mw_pos")
+    assert MLDataFactory._is_leaky_feature_name("bid_signed_vwap_eur_mwh_neg")
+    assert MLDataFactory._is_leaky_feature_name("da_price_FR")
     assert not MLDataFactory._is_leaky_feature_name("afrr_activation_price_vwap_neg_lag_24h")
+    assert not MLDataFactory._is_leaky_feature_name("da_price_FR_lag_24h")
 
 
 def test_load_processed_data_does_not_reintroduce_target_like_features(tmp_path: Path) -> None:
@@ -90,8 +108,31 @@ def test_current_feature_config_afrr_has_no_hard_leaks() -> None:
     leaked_prefix = sorted(c for c in features if c.startswith("target_"))
     leaked_raw = sorted(c for c in features if c.endswith("_raw"))
     leaked_bids = sorted(c for c in features if c in FORBIDDEN_UNLAGGED_BID_COLS)
+    leaked_alloc_vwap = sorted(c for c in features if c in FORBIDDEN_UNLAGGED_BID_ALLOC_VWAP_COLS)
+    leaked_foreign_da = sorted(
+        c for c in features if c.startswith("da_price_") and "_lag_" not in c and not c.endswith("_pit")
+    )
 
-    if leaked_prefix or leaked_raw or leaked_bids:
+    if leaked_prefix or leaked_raw or leaked_bids or leaked_alloc_vwap or leaked_foreign_da:
         # Existing artifact can be stale until bundle generation is rerun.
         # Hard guard is enforced by the builder/unit tests above.
+        return
+
+
+def test_current_feature_config_da_has_no_hard_leaks() -> None:
+    cfg_path = Path("data/model_input/feature_config.json")
+    if not cfg_path.exists():
+        return
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    features = set(cfg.get("bundles", {}).get("da", {}).get("features", []))
+
+    leaked_prefix = sorted(c for c in features if c.startswith("target_"))
+    leaked_raw = sorted(c for c in features if c.endswith("_raw"))
+    leaked_bids = sorted(c for c in features if c in FORBIDDEN_UNLAGGED_BID_COLS)
+    leaked_alloc_vwap = sorted(c for c in features if c in FORBIDDEN_UNLAGGED_BID_ALLOC_VWAP_COLS)
+    leaked_foreign_da = sorted(
+        c for c in features if c.startswith("da_price_") and "_lag_" not in c and not c.endswith("_pit")
+    )
+
+    if leaked_prefix or leaked_raw or leaked_bids or leaked_alloc_vwap or leaked_foreign_da:
         return
