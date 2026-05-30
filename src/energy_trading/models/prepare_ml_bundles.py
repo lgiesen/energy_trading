@@ -177,6 +177,14 @@ class MLDataFactory:
         # Analysis-only regime marker; excluded from model training features.
         "is_picasso_active",
     }
+    HARD_LEAKAGE_PREFIX_EXCLUDE = ("target_",)
+    HARD_LEAKAGE_SUFFIX_EXCLUDE = ("_raw",)
+    HARD_LEAKAGE_EXACT_EXCLUDE = {
+        "afrr_bid_avg_activation_price_neg",
+        "afrr_bid_avg_activation_price_pos",
+        "afrr_bid_vwap_activation_price_neg",
+        "afrr_bid_vwap_activation_price_pos",
+    }
     FORECAST_FAMILY_PATTERNS: dict[str, str] = {
         "load_forecast": r"^load_forecast",
         "residual_load_forecast": r"^residual_load_forecast",
@@ -316,11 +324,22 @@ class MLDataFactory:
             return self._resolve_afrr_targets(df)
         raise ValueError(f"Unsupported bundle: {bundle}")
 
+    @classmethod
+    def _is_leaky_feature_name(cls, col: str) -> bool:
+        if col in cls.HARD_LEAKAGE_EXACT_EXCLUDE:
+            return True
+        if col.startswith(cls.HARD_LEAKAGE_PREFIX_EXCLUDE):
+            return True
+        if col.endswith(cls.HARD_LEAKAGE_SUFFIX_EXCLUDE):
+            return True
+        return False
+
     def _feature_columns(self, df: pd.DataFrame, targets: list[str]) -> list[str]:
         # Law 2: explicit target drop before model fitting/preprocessing.
         excluded = set(targets) | self.HARD_META_EXCLUDE | self._excluded_from_docs()
         X = df.drop(columns=[c for c in excluded if c in df.columns], errors="ignore")
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [c for c in numeric_cols if not self._is_leaky_feature_name(c)]
         return numeric_cols
 
     @staticmethod

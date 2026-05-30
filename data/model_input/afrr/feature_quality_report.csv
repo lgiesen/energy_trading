@@ -94,10 +94,6 @@ afrr_activation_rate_pos_lag_24h,0.0,keep
 afrr_activation_rate_pos_lag_2h,0.0,keep
 afrr_activation_rate_pos_lag_3h,0.0,keep
 afrr_activation_rate_pos_lag_6h,0.0,keep
-afrr_bid_avg_activation_price_neg,0.0,keep
-afrr_bid_avg_activation_price_pos,0.0,keep
-afrr_bid_vwap_activation_price_neg,0.0,keep
-afrr_bid_vwap_activation_price_pos,0.0,keep
 afrr_capacity_awarded_mw_neg_lag_12h,0.0,keep
 afrr_capacity_awarded_mw_neg_lag_1h,0.0,keep
 afrr_capacity_awarded_mw_neg_lag_24h,0.0,keep
@@ -365,9 +361,6 @@ system_stress_signal_lag_24h,0.0,keep
 system_stress_signal_lag_2h,0.0,keep
 system_stress_signal_lag_3h,0.0,keep
 system_stress_signal_lag_6h,0.0,keep
-target_afrr_activation_price_vwap_neg_raw,0.0,keep
-target_afrr_activation_price_vwap_pos_raw,0.0,keep
-target_da_price,0.0,keep
 total_wind_solar_id_error_lag_2h,0.0,keep
 unplanned_outages_mw_lag_2h,0.0,keep
 weekday_cos,0.0,keep

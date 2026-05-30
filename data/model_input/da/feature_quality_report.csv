@@ -145,14 +145,6 @@ solar_forecast_update,0.0,keep
 solar_forecast_update_lag_24h,0.0,keep
 solar_mae_rolling_72h,0.0,keep
 solar_ramp,0.0,keep
-target_afrr_activation_price_vwap_neg,0.0,keep
-target_afrr_activation_price_vwap_neg_raw,0.0,keep
-target_afrr_activation_price_vwap_pos,0.0,keep
-target_afrr_activation_price_vwap_pos_raw,0.0,keep
-target_afrr_activation_rate_neg,0.0,keep
-target_afrr_activation_rate_pos,0.0,keep
-target_afrr_capacity_price_neg,0.0,keep
-target_afrr_capacity_price_pos,0.0,keep
 weekday_cos,0.0,keep
 weekday_sin,0.0,keep
 wind_offshore_abs_error,0.0,keep
