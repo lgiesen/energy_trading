@@ -24,6 +24,10 @@ from src.energy_trading.models.train_tft_export import _mean_pinball_from_decay 
 from scripts.tune_linear import _mean_pinball_loss as linear_mean_pinball_loss  # noqa: E402
 from scripts.tune_xgboost import _build_cli as xgb_tune_build_cli  # noqa: E402
 from scripts.tune_xgboost import _mean_pinball_loss as xgb_mean_pinball_loss  # noqa: E402
+from src.energy_trading.models.training_policy import (  # noqa: E402
+    resolve_tft_params_for_target,
+    resolve_xgb_params_for_target,
+)
 
 
 def _mk_hpo_json(path: Path, *, bundle: str, target: str) -> None:
@@ -260,3 +264,51 @@ def test_tft_pinball_mean_ignores_invalid_rows_and_requires_positive_n() -> None
     got = _mean_pinball_from_decay(decay)
     # only lead 1 is valid -> mean(1,2,3)=2
     assert got == pytest.approx(2.0)
+
+
+def test_makefile_dry_run_existing_hpo_targets_do_not_trigger_tuning() -> None:
+    for tgt, map_path in [
+        ("build-xgb-hpo-map-existing", "xgb_hpo_artifact_map.json"),
+        ("build-linear-hpo-map-existing", "linear_hpo_artifact_map.json"),
+        ("build-tft-hpo-map-existing", "tft_hpo_artifact_map.json"),
+    ]:
+        cp = subprocess.run(["make", "-n", tgt], cwd=ROOT, capture_output=True, text=True)
+        assert cp.returncode == 0, cp.stdout + cp.stderr
+        out = cp.stdout
+        assert "build_hpo_artifact_map.py" in out
+        assert map_path in out
+        assert "tune_xgboost.py" not in out
+        assert "tune_linear.py" not in out
+        assert "tune_tft.py" not in out
+
+
+def test_makefile_dry_run_train_existing_hpo_targets_use_map_without_tuning() -> None:
+    for tgt, map_path in [
+        ("train-xgb-existing-hpo", "artifacts/hpo/xgb_hpo_artifact_map.json"),
+        ("train-linear-existing-hpo", "artifacts/hpo/linear_hpo_artifact_map.json"),
+        ("train-tft-existing-hpo", "artifacts/hpo/tft_hpo_artifact_map.json"),
+    ]:
+        cp = subprocess.run(["make", "-n", tgt], cwd=ROOT, capture_output=True, text=True)
+        assert cp.returncode == 0, cp.stdout + cp.stderr
+        out = cp.stdout
+        assert "--hpo-artifact-map" in out
+        assert map_path in out
+        assert "tune_xgboost.py" not in out
+        assert "tune_linear.py" not in out
+        assert "tune_tft.py" not in out
+
+
+def test_training_policy_merge_order_allows_cli_hpo_override_for_xgb() -> None:
+    base = {"max_depth": 6, "reg_alpha": 3.95, "learning_rate": 0.03}
+    resolved = resolve_xgb_params_for_target("target_da_price", base)
+    assert resolved["max_depth"] == 6
+    assert resolved["reg_alpha"] == pytest.approx(3.95)
+    assert resolved["learning_rate"] == pytest.approx(0.03)
+
+
+def test_training_policy_merge_order_allows_cli_hpo_override_for_tft() -> None:
+    base = {"dropout": 0.12, "max_epochs": 140.0, "early_stopping_patience": 11.0}
+    resolved = resolve_tft_params_for_target("target_afrr_activation_price_vwap_pos", base)
+    assert resolved["dropout"] == pytest.approx(0.12)
+    assert resolved["max_epochs"] == pytest.approx(140.0)
+    assert resolved["early_stopping_patience"] == pytest.approx(11.0)

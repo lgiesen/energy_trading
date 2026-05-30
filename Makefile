@@ -78,7 +78,9 @@ TFT_AUDIT_ZIP := artifacts/model_runs/$(RUN_ID_TFT)_deliverable.zip
 	tune-tft-da tune-tft-afrr tune-tft-all tune-tft \
 	tune-all \
 	validate-hpo-artifacts hpo-inventory \
+	build-xgb-hpo-map-existing build-linear-hpo-map-existing build-tft-hpo-map-existing \
 	train-xgb train-linear train-tft \
+	train-xgb-existing-hpo train-linear-existing-hpo train-tft-existing-hpo \
 	sim-xgb sim-linear sim-tft \
 	sim-latest-xgb sim-latest-linear sim-latest-tft \
 	sim-all-quantiles \
@@ -235,6 +237,13 @@ $(LINEAR_HPO_MAP): tune-linear
 $(TFT_HPO_MAP): tune-tft
 	python3 scripts/build_hpo_artifact_map.py --model-type tft --hpo-out-dir $(HPO_OUT_DIR) --out $(TFT_HPO_MAP)
 
+build-xgb-hpo-map-existing:
+	python3 scripts/build_hpo_artifact_map.py --model-type xgboost --hpo-out-dir $(HPO_OUT_DIR) --out $(XGB_HPO_MAP)
+build-linear-hpo-map-existing:
+	python3 scripts/build_hpo_artifact_map.py --model-type linear --hpo-out-dir $(HPO_OUT_DIR) --out $(LINEAR_HPO_MAP)
+build-tft-hpo-map-existing:
+	python3 scripts/build_hpo_artifact_map.py --model-type tft --hpo-out-dir $(HPO_OUT_DIR) --out $(TFT_HPO_MAP)
+
 validate-hpo-artifacts:
 	python3 scripts/hpo_inventory.py --hpo-out-dir $(HPO_OUT_DIR) --out-csv $(HPO_OUT_DIR)/hpo_inventory.csv --validate
 
@@ -257,6 +266,20 @@ $(XGB_MANIFEST): $(XGB_HPO_MAP)
 	  --allow-cpu
 
 train-xgb: $(XGB_MANIFEST) ## Train+evaluate XGBoost (depends on full target HPO)
+train-xgb-existing-hpo: build-xgb-hpo-map-existing
+	python3 scripts/train_and_export_runs.py \
+	  --model-type xgboost \
+	  --run-id "$(RUN_ID_XGB)" \
+	  --device $(DEVICE) \
+	  --forecast-horizon-hours $(FORECAST_HOURS) \
+	  --lead-weight-start $(LEAD_WEIGHT_START) \
+	  --lead-weight-end $(LEAD_WEIGHT_END) \
+	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
+	  --seed $(SEED) \
+	  --hpo-artifact-map "$(XGB_HPO_MAP)" \
+	  --n-estimators 400 \
+	  --early-stopping-rounds 50 \
+	  --allow-cpu
 
 $(LINEAR_MANIFEST): $(LINEAR_HPO_MAP)
 	python3 scripts/train_and_export_runs.py \
@@ -272,6 +295,18 @@ $(LINEAR_MANIFEST): $(LINEAR_HPO_MAP)
 	  --hpo-artifact-map "$(LINEAR_HPO_MAP)"
 
 train-linear: $(LINEAR_MANIFEST) ## Train+evaluate Linear (depends on full target HPO)
+train-linear-existing-hpo: build-linear-hpo-map-existing
+	python3 scripts/train_and_export_runs.py \
+	  --model-type linear \
+	  --run-id "$(RUN_ID_LINEAR)" \
+	  --forecast-horizon-hours $(FORECAST_HOURS) \
+	  --lead-weight-start $(LEAD_WEIGHT_START) \
+	  --lead-weight-end $(LEAD_WEIGHT_END) \
+	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
+	  --seed $(SEED) \
+	  --afrr-parallel-jobs $(LINEAR_AFRR_PARALLEL_JOBS) \
+	  --lead-parallel-jobs $(LINEAR_LEAD_PARALLEL_JOBS) \
+	  --hpo-artifact-map "$(LINEAR_HPO_MAP)"
 
 $(TFT_MANIFEST): $(TFT_HPO_MAP)
 	@DEVICE_USE="$(DEVICE)"; \
@@ -297,6 +332,28 @@ $(TFT_MANIFEST): $(TFT_HPO_MAP)
 		  --num-workers 0
 
 train-tft: $(TFT_MANIFEST) ## Train+evaluate TFT (depends on full target HPO)
+train-tft-existing-hpo: build-tft-hpo-map-existing
+	@DEVICE_USE="$(DEVICE)"; \
+	if [ "$(IS_SMOKE_TEST)" != "1" ] && [ "$$DEVICE_USE" != "cuda" ]; then \
+	  echo "TFT final runs must use CUDA. Got DEVICE=$$DEVICE_USE"; \
+	  exit 1; \
+	fi; \
+	if [ "$(IS_SMOKE_TEST)" != "1" ]; then \
+	  command -v nvidia-smi >/dev/null 2>&1 || (echo "CUDA requested but nvidia-smi not found." && exit 1); \
+	  nvidia-smi >/dev/null 2>&1 || (echo "CUDA requested but GPU is unavailable." && exit 1); \
+	fi; \
+	python3 scripts/train_and_export_runs.py \
+	  --model-type tft \
+	  --run-id "$(RUN_ID_TFT)" \
+	  --forecast-horizon-hours $(FORECAST_HOURS) \
+	  --lead-weight-start $(LEAD_WEIGHT_START) \
+	  --lead-weight-end $(LEAD_WEIGHT_END) \
+	  --lead-weight-max $(LEAD_WEIGHT_MAX) \
+	  --seed $(SEED) \
+	  --hpo-artifact-map "$(TFT_HPO_MAP)" \
+	  --device $$DEVICE_USE \
+	  --tft-precision $(TFT_PRECISION) \
+	  --num-workers 0
 
 define SIM_RULE
 $($(1)_SIM_DONE): $$($(1)_MANIFEST)

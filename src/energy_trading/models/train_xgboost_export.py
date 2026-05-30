@@ -1525,6 +1525,9 @@ def _build_cli() -> argparse.ArgumentParser:
         default="",
         help="Optional path to write bundle manifest fragment JSON.",
     )
+    p.add_argument("--hpo-artifact-path", default="")
+    p.add_argument("--hpo-selection-metric", default="")
+    p.add_argument("--hpo-best-params-json", default="")
     p.add_argument("--n-estimators", type=int, default=1000)
     p.add_argument("--max-depth", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=0.05)
@@ -1633,6 +1636,22 @@ def main() -> None:
         activation_price_transform=args.activation_price_transform,
         use_tail_sample_weighting=bool(args.use_tail_sample_weighting),
     )
+    hpo_best_params: dict[str, object] = {}
+    if str(args.hpo_best_params_json).strip():
+        try:
+            hpo_best_params = json.loads(str(args.hpo_best_params_json))
+        except Exception:
+            hpo_best_params = {}
+    if isinstance(metrics.get("per_target_policy"), dict):
+        for tgt in metrics["per_target_policy"].keys():
+            tgt_pol = metrics["per_target_policy"][tgt]
+            if isinstance(tgt_pol, dict):
+                tgt_pol["hpo_artifact_path"] = str(args.hpo_artifact_path or "")
+                tgt_pol["hpo_selection_metric"] = str(args.hpo_selection_metric or "")
+                tgt_pol["hpo_best_params"] = hpo_best_params
+    metrics["hpo_artifact_path"] = str(args.hpo_artifact_path or "")
+    metrics["hpo_selection_metric"] = str(args.hpo_selection_metric or "")
+    metrics["hpo_best_params"] = hpo_best_params
     train_eval_elapsed = time.perf_counter() - train_eval_start
 
     metrics_json_out.parent.mkdir(parents=True, exist_ok=True)

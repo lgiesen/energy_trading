@@ -1,7 +1,7 @@
 {
-  "run_id": "xgb_20260526_123033",
-  "manifest_path": "xgb_20260526_123033/manifest.json",
-  "manifest_path_abs": "xgb_20260526_123033/manifest.json",
-  "updated_at_utc": "2026-05-26T17:32:30.952408+00:00",
+  "run_id": "xgb_20260529_194854",
+  "manifest_path": "xgb_20260529_194854/manifest.json",
+  "manifest_path_abs": "xgb_20260529_194854/manifest.json",
+  "updated_at_utc": "2026-05-30T01:23:06.917753+00:00",
   "model_type": "xgboost"
 }

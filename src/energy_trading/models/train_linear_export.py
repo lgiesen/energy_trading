@@ -776,6 +776,9 @@ def _build_cli() -> argparse.ArgumentParser:
     p.add_argument("--metrics-json-out", default="")
     p.add_argument("--metrics-csv-out", default="")
     p.add_argument("--manifest-fragment-out", default="")
+    p.add_argument("--hpo-artifact-path", default="")
+    p.add_argument("--hpo-selection-metric", default="")
+    p.add_argument("--hpo-best-params-json", default="")
     return p
 
 
@@ -821,6 +824,21 @@ def main() -> None:
         lead_parallel_jobs=max(1, int(args.lead_parallel_jobs)),
         backend=str(args.backend),
     )
+    hpo_best_params: dict[str, object] = {}
+    if str(args.hpo_best_params_json).strip():
+        try:
+            hpo_best_params = json.loads(str(args.hpo_best_params_json))
+        except Exception:
+            hpo_best_params = {}
+    metrics["effective_model_params"] = {
+        "alpha": float(args.alpha),
+        "l1_ratio": float(args.l1_ratio),
+        "learning_rate": str(args.learning_rate),
+        "eta0": float(args.eta0),
+    }
+    metrics["hpo_artifact_path"] = str(args.hpo_artifact_path or "")
+    metrics["hpo_selection_metric"] = str(args.hpo_selection_metric or "")
+    metrics["hpo_best_params"] = hpo_best_params
 
     file_tag = f"linear_{args.bundle}_{tgt.replace('target_', '')}"
     model_path = model_dir / f"{file_tag}_model.joblib"

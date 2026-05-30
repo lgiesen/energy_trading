@@ -59,6 +59,16 @@ def load_hpo_best_params(path: str | Path) -> dict[str, object]:
     return best_params
 
 
+def load_hpo_artifact_payload(path: str | Path) -> dict[str, object]:
+    hpo_path = Path(path)
+    if not hpo_path.exists():
+        raise FileNotFoundError(f"HPO artifact not found: {hpo_path}")
+    payload = json.loads(hpo_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid HPO artifact format in {hpo_path}: expected object")
+    return payload
+
+
 def hpo_override_cli_args(model_type: str, best_params: dict[str, object]) -> list[str]:
     def _v(key: str) -> object | None:
         return best_params.get(key)
@@ -772,6 +782,8 @@ def main() -> None:
     afrr_fragment_paths: list[Path] = []
     afrr_base_dir = args.base_dir
     hpo_used_by_target: dict[str, str] = {}
+    hpo_best_params_by_target: dict[str, dict[str, object]] = {}
+    hpo_selection_metric_by_target: dict[str, str] = {}
 
     if args.enable_da_stacking_afrr:
         stack_cmd = [
@@ -930,12 +942,28 @@ def main() -> None:
             hpo_path = hpo_artifact_map.get(DA_TARGET, "").strip()
             if not hpo_path:
                 raise RuntimeError(f"Missing HPO artifact map entry for {DA_TARGET}")
-            da_best_params = load_hpo_best_params(hpo_path)
+            hpo_payload = load_hpo_artifact_payload(hpo_path)
+            da_best_params = hpo_payload.get("best_params", {})
+            if not isinstance(da_best_params, dict):
+                raise RuntimeError(f"Invalid best_params in HPO artifact: {hpo_path}")
             cmd_da.extend(hpo_override_cli_args(args.model_type, da_best_params))
+            cmd_da.extend(
+                [
+                    "--hpo-artifact-path",
+                    str(Path(hpo_path).resolve()),
+                    "--hpo-selection-metric",
+                    str(hpo_payload.get("selection_metric", "")),
+                    "--hpo-best-params-json",
+                    json.dumps(da_best_params),
+                ]
+            )
             hpo_used_by_target[DA_TARGET] = str(Path(hpo_path).resolve())
+            hpo_best_params_by_target[DA_TARGET] = {str(k): v for k, v in da_best_params.items()}
+            hpo_selection_metric_by_target[DA_TARGET] = str(hpo_payload.get("selection_metric", ""))
         elif global_hpo_best_params is not None:
             cmd_da.extend(hpo_override_cli_args(args.model_type, global_hpo_best_params))
             hpo_used_by_target[DA_TARGET] = str(Path(args.hpo_artifact).resolve())
+            hpo_best_params_by_target[DA_TARGET] = {str(k): v for k, v in global_hpo_best_params.items()}
         cmd_records.append(_run_train_cmd(cmd_da, run_dir=run_dir, log_stem=f"01_train_da_{args.model_type}"))
 
     # Train aFRR models target-wise to produce full canonical prediction columns.
@@ -964,12 +992,28 @@ def main() -> None:
             hpo_path = hpo_artifact_map.get(tgt, "").strip()
             if not hpo_path:
                 raise RuntimeError(f"Missing HPO artifact map entry for {tgt}")
-            tgt_best_params = load_hpo_best_params(hpo_path)
+            hpo_payload = load_hpo_artifact_payload(hpo_path)
+            tgt_best_params = hpo_payload.get("best_params", {})
+            if not isinstance(tgt_best_params, dict):
+                raise RuntimeError(f"Invalid best_params in HPO artifact: {hpo_path}")
             cmd_afrr.extend(hpo_override_cli_args(args.model_type, tgt_best_params))
+            cmd_afrr.extend(
+                [
+                    "--hpo-artifact-path",
+                    str(Path(hpo_path).resolve()),
+                    "--hpo-selection-metric",
+                    str(hpo_payload.get("selection_metric", "")),
+                    "--hpo-best-params-json",
+                    json.dumps(tgt_best_params),
+                ]
+            )
             hpo_used_by_target[tgt] = str(Path(hpo_path).resolve())
+            hpo_best_params_by_target[tgt] = {str(k): v for k, v in tgt_best_params.items()}
+            hpo_selection_metric_by_target[tgt] = str(hpo_payload.get("selection_metric", ""))
         elif global_hpo_best_params is not None:
             cmd_afrr.extend(hpo_override_cli_args(args.model_type, global_hpo_best_params))
             hpo_used_by_target[tgt] = str(Path(args.hpo_artifact).resolve())
+            hpo_best_params_by_target[tgt] = {str(k): v for k, v in global_hpo_best_params.items()}
         afrr_jobs.append((tgt, frag, cmd_afrr, f"02_train_afrr_{args.model_type}_{tgt}"))
 
     afrr_parallel_jobs = max(1, int(args.afrr_parallel_jobs))
@@ -1098,6 +1142,8 @@ def main() -> None:
         },
         "executed_commands": cmd_records,
         "hpo_artifacts_by_target": hpo_used_by_target,
+        "hpo_best_params_by_target": hpo_best_params_by_target,
+        "hpo_selection_metric_by_target": hpo_selection_metric_by_target,
     }
     training_context["prediction_output_quality_report_path"] = str(prediction_quality_report_path.resolve())
     training_context["prediction_output_quality_passed"] = bool(prediction_quality_report.get("passed", False))
@@ -1140,6 +1186,8 @@ def main() -> None:
             "git_commit": training_context.get("git_commit"),
             "hpo_mode": training_context["resolved"]["hpo_mode"],
             "hpo_artifacts_by_target": hpo_used_by_target,
+            "hpo_best_params_by_target": hpo_best_params_by_target,
+            "hpo_selection_metric_by_target": hpo_selection_metric_by_target,
         },
         "bundles": {
             "afrr": {

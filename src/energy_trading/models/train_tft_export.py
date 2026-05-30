@@ -907,12 +907,14 @@ def _train_tft(
     is_afrr_target = "afrr" in tgt.lower()
     if is_afrr_target:
         hidden_size = 32
-        effective_dropout = min(0.30, max(0.25, dropout))
-        early_stopping_patience = min(4, max(3, early_stopping_patience))
+        effective_dropout = float(dropout) if dropout_override is not None else min(0.30, max(0.25, dropout))
+        if early_stopping_patience_override is None:
+            early_stopping_patience = min(4, max(3, early_stopping_patience))
     else:
         hidden_size = 64
         effective_dropout = float(dropout)
-        early_stopping_patience = min(10, max(8, early_stopping_patience))
+        if early_stopping_patience_override is None:
+            early_stopping_patience = min(10, max(8, early_stopping_patience))
     if hidden_size_override is not None:
         hidden_size = int(hidden_size_override)
     attention_head_size = int(attention_head_size_override) if attention_head_size_override is not None else 4
@@ -1332,6 +1334,16 @@ def _train_tft(
             "early_stopping_patience": int(early_stopping_patience),
             "is_afrr_target": bool(is_afrr_target),
         },
+        "effective_model_params": {
+            "learning_rate": float(learning_rate),
+            "gradient_clip_val": float(gradient_clip_val),
+            "hidden_size": int(hidden_size),
+            "attention_head_size": int(attention_head_size),
+            "dropout": float(effective_dropout),
+            "max_encoder_length": int(max_encoder_length),
+            "max_epochs": int(max_epochs),
+            "early_stopping_patience": int(early_stopping_patience),
+        },
         "hidden_size": hidden_size,
         "attention_head_size": attention_head_size,
         "dropout": effective_dropout,
@@ -1425,6 +1437,9 @@ def _build_cli() -> argparse.ArgumentParser:
     )
     p.add_argument("--metrics-json-out", default="")
     p.add_argument("--manifest-fragment-out", default="")
+    p.add_argument("--hpo-artifact-path", default="")
+    p.add_argument("--hpo-selection-metric", default="")
+    p.add_argument("--hpo-best-params-json", default="")
     return p
 
 
@@ -1458,6 +1473,15 @@ def main() -> None:
         early_stopping_patience_override=args.early_stopping_patience,
         precision_mode=args.precision,
     )
+    hpo_best_params: dict[str, object] = {}
+    if str(args.hpo_best_params_json).strip():
+        try:
+            hpo_best_params = json.loads(str(args.hpo_best_params_json))
+        except Exception:
+            hpo_best_params = {}
+    metrics["hpo_artifact_path"] = str(args.hpo_artifact_path or "")
+    metrics["hpo_selection_metric"] = str(args.hpo_selection_metric or "")
+    metrics["hpo_best_params"] = hpo_best_params
 
     # Keep metrics path unique per bundle+target to avoid overwrite in target-wise
     # aFRR training loops (train_and_export_runs.py).

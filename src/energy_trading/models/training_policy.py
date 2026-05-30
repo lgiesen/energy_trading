@@ -184,13 +184,13 @@ def resolve_feature_columns_for_target(
 
 def resolve_xgb_params_for_target(target_col: str, base_params: dict[str, Any]) -> dict[str, Any]:
     policy = TARGET_XGB_PARAMS.get(target_col, {})
-    out = dict(base_params)
-    out.update(policy)
+    out = dict(policy)
+    out.update(base_params)
     return out
 
 
 def resolve_tft_params_for_target(target_col: str, base_params: dict[str, Any]) -> dict[str, Any]:
     policy = TARGET_TFT_PARAMS.get(target_col, {})
-    out = dict(base_params)
-    out.update(policy)
+    out = dict(policy)
+    out.update(base_params)
     return out
