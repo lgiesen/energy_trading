@@ -322,6 +322,7 @@ def load_prediction_warehouse_long(
     prediction_files: dict[str, str | Path],
     *,
     target_value_modes: dict[str, str] | None = None,
+    allow_p50_materialization_from_predicted_value: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """Load long-format forecast warehouse files keyed by canonical prediction column."""
     warehouse: dict[str, pd.DataFrame] = {}
@@ -341,6 +342,17 @@ def load_prediction_warehouse_long(
         out["predicted_value"] = pd.to_numeric(out["predicted_value"], errors="coerce")
         for qc in available_quantiles:
             out[qc] = pd.to_numeric(out[qc], errors="coerce")
+        materialized_p50 = False
+        if "p50" not in out.columns:
+            if not bool(allow_p50_materialization_from_predicted_value):
+                raise KeyError(
+                    f"Long prediction file for {pred_col} is missing required quantile column 'p50'. "
+                    "Enable explicit compatibility mode allow_p50_materialization_from_predicted_value "
+                    "to map predicted_value -> p50."
+                )
+            out["p50"] = pd.to_numeric(out["predicted_value"], errors="coerce")
+            materialized_p50 = True
+            available_quantiles = [c for c in QUANTILE_COLUMNS if c in out.columns]
         out, _ = canonicalize_prediction_frame(
             out,
             target_name=pred_col,
@@ -348,6 +360,7 @@ def load_prediction_warehouse_long(
             predicted_value_col="predicted_value",
             target_value_mode=(target_value_modes or {}).get(pred_col),
         )
+        out["materialized_p50_from_predicted_value"] = 1.0 if materialized_p50 else 0.0
         out = out.dropna(subset=["snapshot_time_utc", "target_time_utc", "lead_time_h"]).copy()
         out = out.sort_values(["snapshot_time_utc", "lead_time_h", "target_time_utc"]).reset_index(drop=True)
         warehouse[pred_col] = out
@@ -520,7 +533,18 @@ class BatteryBacktester:
         self.afrr_min_bid_size_mw = float(MARKET_SPECS.get("afrr_min_bid_size", self.afrr_bid_granularity_mw))
         # Dynamic quantile bidding bins:
         # reserve decision bins are tied to model quantile outputs instead of static price levels.
-        self.afrr_quantile_bins = list(AFRR_QUANTILE_BINS)
+        configured_bins = MODEL_SPECS.get("afrr_quantile_bins")
+        if isinstance(configured_bins, (list, tuple)) and configured_bins:
+            requested = [str(x).lower() for x in configured_bins]
+            allowed = set(AFRR_QUANTILE_BINS)
+            invalid = [q for q in requested if q not in allowed]
+            if invalid:
+                raise ValueError(
+                    f"Invalid MODEL_SPECS['afrr_quantile_bins'] entries: {invalid}. Allowed: {AFRR_QUANTILE_BINS}"
+                )
+            self.afrr_quantile_bins = list(dict.fromkeys(requested))
+        else:
+            self.afrr_quantile_bins = list(AFRR_QUANTILE_BINS)
         self.afrr_quantile_prob = {q: 1.0 - float(q.replace("p", "")) / 100.0 for q in self.afrr_quantile_bins}
         self.da_execution_mode = str(MARKET_SPECS.get("da_execution_mode", "price_taker"))
         self.da_bid_fail_fast_debug = bool(MARKET_SPECS.get("da_bid_fail_fast_debug", False))
@@ -789,8 +813,8 @@ class BatteryBacktester:
         out["dis"] = slice(s, s + n); s += n
         out["rpos_bin"] = slice(s, s + n_r); s += n_r
         out["rneg_bin"] = slice(s, s + n_r); s += n_r
-        out["bem_pos"] = slice(s, s + n); s += n
-        out["bem_neg"] = slice(s, s + n); s += n
+        out["bem_pos_bin"] = slice(s, s + n_r); s += n_r
+        out["bem_neg_bin"] = slice(s, s + n_r); s += n_r
         out["u"] = slice(s, s + n); s += n
         out["soc"] = slice(s, s + (n + 1)); s += (n + 1)
         out["slack_pos"] = slice(s, s + n); s += n
@@ -1105,6 +1129,57 @@ class BatteryBacktester:
             strict_non_null=strict_input_validation,
         ).to_numpy(dtype=float)
 
+        act_price_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        act_price_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        act_rate_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        act_rate_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        missing_bin_cols: list[str] = []
+        for b, qcol in enumerate(self.afrr_quantile_bins):
+            c_app = f"{colmap.pred_afrr_activation_price_pos}_{qcol}"
+            c_apn = f"{colmap.pred_afrr_activation_price_neg}_{qcol}"
+            c_arp = f"{colmap.pred_afrr_activation_rate_pos}_{qcol}"
+            c_arn = f"{colmap.pred_afrr_activation_rate_neg}_{qcol}"
+            if c_app in df.columns:
+                act_price_pos_by_bin[:, b] = pd.to_numeric(df[c_app], errors="coerce").to_numpy(dtype=float)
+            else:
+                missing_bin_cols.append(c_app)
+                act_price_pos_by_bin[:, b] = np.nan
+            if c_apn in df.columns:
+                act_price_neg_by_bin[:, b] = pd.to_numeric(df[c_apn], errors="coerce").to_numpy(dtype=float)
+            else:
+                missing_bin_cols.append(c_apn)
+                act_price_neg_by_bin[:, b] = np.nan
+            if c_arp in df.columns:
+                act_rate_pos_by_bin[:, b] = self._clip_rate(pd.to_numeric(df[c_arp], errors="coerce").to_numpy(dtype=float))
+            else:
+                missing_bin_cols.append(c_arp)
+                act_rate_pos_by_bin[:, b] = np.nan
+            if c_arn in df.columns:
+                act_rate_neg_by_bin[:, b] = self._clip_rate(pd.to_numeric(df[c_arn], errors="coerce").to_numpy(dtype=float))
+            else:
+                missing_bin_cols.append(c_arn)
+                act_rate_neg_by_bin[:, b] = np.nan
+        if strict_input_validation and missing_bin_cols:
+            uniq = sorted(set(missing_bin_cols))
+            raise ValueError(
+                "Missing required aFRR quantile-bin inputs in strict mode. "
+                f"missing_columns={uniq[:40]}"
+            )
+        # Non-strict fallback remains explicit and deterministic.
+        for b in range(n_bins):
+            bad_pos_price = ~np.isfinite(act_price_pos_by_bin[:, b])
+            bad_neg_price = ~np.isfinite(act_price_neg_by_bin[:, b])
+            bad_pos_rate = ~np.isfinite(act_rate_pos_by_bin[:, b])
+            bad_neg_rate = ~np.isfinite(act_rate_neg_by_bin[:, b])
+            if bad_pos_price.any():
+                act_price_pos_by_bin[bad_pos_price, b] = act_price_pos[bad_pos_price]
+            if bad_neg_price.any():
+                act_price_neg_by_bin[bad_neg_price, b] = act_price_neg[bad_neg_price]
+            if bad_pos_rate.any():
+                act_rate_pos_by_bin[bad_pos_rate, b] = r_act_pos_base[bad_pos_rate]
+            if bad_neg_rate.any():
+                act_rate_neg_by_bin[bad_neg_rate, b] = r_act_neg_base[bad_neg_rate]
+
         # Fail-fast critical-input validation before MILP formulation.
         critical_inputs = {
             "pred_da_price": p_da,
@@ -1162,6 +1237,16 @@ class BatteryBacktester:
             neg_quant_cols = [f"{colmap.pred_afrr_capacity_price_neg}_{q}" for q in self.afrr_quantile_bins]
             pos_quant_struct_missing = any(c not in df.columns for c in pos_quant_cols)
             neg_quant_struct_missing = any(c not in df.columns for c in neg_quant_cols)
+            if strict_input_validation and (pos_quant_struct_missing or neg_quant_struct_missing):
+                missing_cap_cols: list[str] = []
+                if pos_quant_struct_missing:
+                    missing_cap_cols.extend([c for c in pos_quant_cols if c not in df.columns])
+                if neg_quant_struct_missing:
+                    missing_cap_cols.extend([c for c in neg_quant_cols if c not in df.columns])
+                raise ValueError(
+                    "Missing required aFRR capacity quantile-bin inputs in strict mode. "
+                    f"missing_columns={sorted(set(missing_cap_cols))}"
+                )
 
             for b, qcol in enumerate(self.afrr_quantile_bins):
                 q_level = float(qcol.replace("p", "")) / 100.0
@@ -1253,29 +1338,30 @@ class BatteryBacktester:
         c[sl["dis"]] = -(dis_coef * da_step)
         rpos_coef_by_bin = np.zeros((n, n_bins), dtype=float)
         rneg_coef_by_bin = np.zeros((n, n_bins), dtype=float)
-        bem_pos_coef = (
-            r_act_pos_base
-            * (
-                act_price_pos
-                - self.trans_eur_mwh
-                - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
-            )
-        )
-        bem_neg_coef = (
-            r_act_neg_base
-            * (
-                -act_price_neg
-                - self.trans_eur_mwh
-                - (self.deg_eur_mwh * self.eta_in)
-            )
-        )
+        bem_pos_coef_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_neg_coef_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_expected_capacity_revenue_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_expected_capacity_revenue_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_expected_activation_revenue_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_expected_activation_revenue_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_expected_aux_cost_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_expected_aux_cost_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_offer_cost_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_activation_margin_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_activation_margin_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_expected_activation_revenue_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_expected_activation_revenue_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_expected_aux_cost_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_expected_aux_cost_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_activation_margin_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_activation_margin_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         for b in range(n_bins):
             # Correct EV split:
             # 1) offer-side fixed availability cost (no p_acc multiplier)
             # 2) activation/throughput terms scaled by expected activated share
             #    exp_act = p_acc * expected_activation_rate
-            exp_act_pos = p_acc_cap_pos[:, b] * r_act_pos_base
-            exp_act_neg = p_acc_cap_neg[:, b] * r_act_neg_base
+            exp_act_pos = p_acc_cap_pos[:, b] * act_rate_pos_by_bin[:, b]
+            exp_act_neg = p_acc_cap_neg[:, b] * act_rate_neg_by_bin[:, b]
             offer_cost = self.afrr_offer_cost_eur_mw_h * self.dt_h
             # Expected aFRR auxiliary energy over reserve product window:
             # hours_afrr_active = window_h * p_acc * activation_rate
@@ -1302,31 +1388,35 @@ class BatteryBacktester:
                 )
                 * p_da
             )
+            bcm_cap_rev_pos = p_acc_cap_pos[:, b] * cap_price_pos_by_bin[:, b]
+            bcm_cap_rev_neg = p_acc_cap_neg[:, b] * cap_price_neg_by_bin[:, b]
+            bcm_act_margin_pos = (
+                act_price_pos_by_bin[:, b]
+                - self.trans_eur_mwh
+                - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
+            )
+            bcm_act_margin_neg = (
+                -act_price_neg_by_bin[:, b]
+                - self.trans_eur_mwh
+                - (self.deg_eur_mwh * self.eta_in)
+            )
+            bcm_act_rev_pos = exp_act_pos * bcm_act_margin_pos
+            bcm_act_rev_neg = exp_act_neg * bcm_act_margin_neg
             # aFRR EV terms:
             # - capacity remuneration is expected via p_acc
             # - activation remuneration/cost is expected via p_acc * act_rate
             # - market price terms remain grid-side (no eta scaling)
             # - degradation is internal-throughput based (eta conversion kept)
             rpos_coef = (
-                p_acc_cap_pos[:, b] * cap_price_pos_by_bin[:, b]
+                bcm_cap_rev_pos
                 - offer_cost
-                + exp_act_pos
-                * (
-                    act_price_pos
-                    - self.trans_eur_mwh
-                    - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
-                )
+                + bcm_act_rev_pos
                 - afrr_aux_cost_pos
             )
             rneg_coef = (
-                p_acc_cap_neg[:, b] * cap_price_neg_by_bin[:, b]
+                bcm_cap_rev_neg
                 - offer_cost
-                + exp_act_neg
-                * (
-                    -act_price_neg
-                    - self.trans_eur_mwh
-                    - (self.deg_eur_mwh * self.eta_in)
-                )
+                + bcm_act_rev_neg
                 - afrr_aux_cost_neg
             )
             s_pos = sl["rpos_bin"].start + b * n
@@ -1335,8 +1425,71 @@ class BatteryBacktester:
             rneg_coef_by_bin[:, b] = rneg_coef
             c[s_pos : s_pos + n] = -(rpos_coef * afrr_step)
             c[s_neg : s_neg + n] = -(rneg_coef * afrr_step)
-        c[sl["bem_pos"]] = -(bem_pos_coef * afrr_step)
-        c[sl["bem_neg"]] = -(bem_neg_coef * afrr_step)
+            bem_exec_prob_pos = p_acc_cap_pos[:, b]
+            bem_exec_prob_neg = p_acc_cap_neg[:, b]
+            bem_act_margin_pos = (
+                act_price_pos_by_bin[:, b]
+                - self.trans_eur_mwh
+                - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
+            )
+            bem_act_margin_neg = (
+                -act_price_neg_by_bin[:, b]
+                - self.trans_eur_mwh
+                - (self.deg_eur_mwh * self.eta_in)
+            )
+            bem_pos_coef = (
+                bem_exec_prob_pos
+                * act_rate_pos_by_bin[:, b]
+                * bem_act_margin_pos
+            )
+            bem_neg_coef = (
+                bem_exec_prob_neg
+                * act_rate_neg_by_bin[:, b]
+                * bem_act_margin_neg
+            )
+            # Expected BEM active auxiliary energy cost (no standby component).
+            bem_aux_hours_equiv_per_mw = self.dt_h / max(self.p_max_mw, 1e-12)
+            bem_aux_cost_pos = (
+                bem_aux_hours_equiv_per_mw
+                * bem_exec_prob_pos
+                * act_rate_pos_by_bin[:, b]
+                * self.aux_afrr_active_mw
+                * p_da
+            )
+            bem_aux_cost_neg = (
+                bem_aux_hours_equiv_per_mw
+                * bem_exec_prob_neg
+                * act_rate_neg_by_bin[:, b]
+                * self.aux_afrr_active_mw
+                * p_da
+            )
+            bem_pos_coef -= bem_aux_cost_pos
+            bem_neg_coef -= bem_aux_cost_neg
+            bcm_expected_capacity_revenue_pos_by_bin[:, b] = bcm_cap_rev_pos
+            bcm_expected_capacity_revenue_neg_by_bin[:, b] = bcm_cap_rev_neg
+            bcm_expected_activation_revenue_pos_by_bin[:, b] = bcm_act_rev_pos
+            bcm_expected_activation_revenue_neg_by_bin[:, b] = bcm_act_rev_neg
+            bcm_expected_aux_cost_pos_by_bin[:, b] = afrr_aux_cost_pos
+            bcm_expected_aux_cost_neg_by_bin[:, b] = afrr_aux_cost_neg
+            bcm_offer_cost_by_bin[:, b] = np.full(n, offer_cost, dtype=float)
+            bcm_activation_margin_pos_by_bin[:, b] = bcm_act_margin_pos
+            bcm_activation_margin_neg_by_bin[:, b] = bcm_act_margin_neg
+            bem_expected_activation_revenue_pos_by_bin[:, b] = (
+                bem_exec_prob_pos * act_rate_pos_by_bin[:, b] * bem_act_margin_pos
+            )
+            bem_expected_activation_revenue_neg_by_bin[:, b] = (
+                bem_exec_prob_neg * act_rate_neg_by_bin[:, b] * bem_act_margin_neg
+            )
+            bem_expected_aux_cost_pos_by_bin[:, b] = bem_aux_cost_pos
+            bem_expected_aux_cost_neg_by_bin[:, b] = bem_aux_cost_neg
+            bem_activation_margin_pos_by_bin[:, b] = bem_act_margin_pos
+            bem_activation_margin_neg_by_bin[:, b] = bem_act_margin_neg
+            bem_pos_coef_by_bin[:, b] = bem_pos_coef
+            bem_neg_coef_by_bin[:, b] = bem_neg_coef
+            s_bem_pos = sl["bem_pos_bin"].start + b * n
+            s_bem_neg = sl["bem_neg_bin"].start + b * n
+            c[s_bem_pos : s_bem_pos + n] = -(bem_pos_coef * afrr_step)
+            c[s_bem_neg : s_bem_neg + n] = -(bem_neg_coef * afrr_step)
         # Soft chance-constraint penalties (continuous non-delivery slack).
         # Make slack prohibitively expensive relative to capacity revenues so
         # solver prioritizes physical feasibility over speculative awards.
@@ -1355,7 +1508,12 @@ class BatteryBacktester:
         )
         c[sl["slack_pos"]] = strict_slack_lambda
         c[sl["slack_neg"]] = strict_slack_lambda
-        c[sl["slack_final_soc"]] = max(0.0, float(self.final_soc_shortfall_penalty_eur_per_mwh))
+        # In thesis hard mode, terminal SoC is a hard feasibility constraint and
+        # must not be softened via slack penalties.
+        if str(self.final_soc_mode) == "hard":
+            c[sl["slack_final_soc"]] = 0.0
+        else:
+            c[sl["slack_final_soc"]] = max(0.0, float(self.final_soc_shortfall_penalty_eur_per_mwh))
         # Emergency physical SoC slacks: make violations possible but extremely expensive.
         emergency_soc_slack_lambda = max(
             10_000.0,
@@ -1403,12 +1561,17 @@ class BatteryBacktester:
             row[sl["u"].start + t] = self.dt_h
             for b in range(n_bins):
                 # Base SoC drift on expected awarded-and-activated reserve.
-                exp_pos = p_acc_cap_pos[t, b] * r_act_pos_base[t]
-                exp_neg = p_acc_cap_neg[t, b] * r_act_neg_base[t]
+                exp_pos = p_acc_cap_pos[t, b] * act_rate_pos_by_bin[t, b]
+                exp_neg = p_acc_cap_neg[t, b] * act_rate_neg_by_bin[t, b]
                 row[sl["rpos_bin"].start + b * n + t] = (exp_pos / self.eta_out) * afrr_step
                 row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * exp_neg * afrr_step
-            row[sl["bem_pos"].start + t] = (r_act_pos_base[t] / self.eta_out) * afrr_step
-            row[sl["bem_neg"].start + t] = -self.eta_in * r_act_neg_base[t] * afrr_step
+            for b in range(n_bins):
+                row[sl["bem_pos_bin"].start + b * n + t] = (
+                    act_rate_pos_by_bin[t, b] / self.eta_out
+                ) * afrr_step
+                row[sl["bem_neg_bin"].start + b * n + t] = (
+                    -self.eta_in * act_rate_neg_by_bin[t, b]
+                ) * afrr_step
             a_eq.append(row)
             b_eq.append(0.0)
 
@@ -1438,7 +1601,8 @@ class BatteryBacktester:
             row[sl["ch"].start + t] = da_step
             for b in range(n_bins):
                 row[sl["rneg_bin"].start + b * n + t] = afrr_step
-            row[sl["bem_neg"].start + t] = afrr_step
+            for b in range(n_bins):
+                row[sl["bem_neg_bin"].start + b * n + t] = afrr_step
             a_ub.append(row)
             b_ub.append(self.p_max_mw)
 
@@ -1447,7 +1611,8 @@ class BatteryBacktester:
             row[sl["dis"].start + t] = da_step
             for b in range(n_bins):
                 row[sl["rpos_bin"].start + b * n + t] = afrr_step
-            row[sl["bem_pos"].start + t] = afrr_step
+            for b in range(n_bins):
+                row[sl["bem_pos_bin"].start + b * n + t] = afrr_step
             a_ub.append(row)
             b_ub.append(self.p_max_mw)
 
@@ -1484,8 +1649,8 @@ class BatteryBacktester:
                 row = np.zeros(n_vars, dtype=float)
                 row[sl["u"].start + t] = -1.0
                 for b in range(n_bins):
-                    exp_pos = p_acc_cap_pos[t, b] * r_act_pos_base[t]
-                    exp_neg = p_acc_cap_neg[t, b] * r_act_neg_base[t]
+                    exp_pos = p_acc_cap_pos[t, b] * act_rate_pos_by_bin[t, b]
+                    exp_neg = p_acc_cap_neg[t, b] * act_rate_neg_by_bin[t, b]
                     row[sl["rpos_bin"].start + b * n + t] = (self.aux_afrr_active_mw / power_scale) * exp_pos * afrr_step
                     row[sl["rneg_bin"].start + b * n + t] = (self.aux_afrr_active_mw / power_scale) * exp_neg * afrr_step
                 a_ub.append(row)
@@ -1553,15 +1718,19 @@ class BatteryBacktester:
             # under full-activation headroom assumption.
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = -1.0
-            row[sl["bem_pos"].start + t] = (
-                self.bem_activation_headroom_h / max(self.eta_out, 1e-12)
-            ) * afrr_step
+            for b in range(n_bins):
+                row[sl["bem_pos_bin"].start + b * n + t] = (
+                    self.bem_activation_headroom_h / max(self.eta_out, 1e-12)
+                ) * afrr_step
             a_ub.append(row)
             b_ub.append(-self.soc_min)
 
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = 1.0
-            row[sl["bem_neg"].start + t] = (self.bem_activation_headroom_h * self.eta_in) * afrr_step
+            for b in range(n_bins):
+                row[sl["bem_neg_bin"].start + b * n + t] = (
+                    self.bem_activation_headroom_h * self.eta_in
+                ) * afrr_step
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
@@ -1669,15 +1838,21 @@ class BatteryBacktester:
             a_ub.append(row)
             b_ub.append(self.soc_max)
 
-        # Soft final SoC floor (replacement for hard constraint SoC_T >= target):
-        # soc_T + slack_final_soc >= soc_end_min_target, slack_final_soc >= 0
-        # The objective penalizes slack_final_soc with a high EUR/MWh coefficient.
         if soc_end_min_target is not None:
-            row = np.zeros(n_vars, dtype=float)
-            row[sl["soc"].start + n] = -1.0
-            row[sl["slack_final_soc"].start] = -1.0
-            a_ub.append(row)
-            b_ub.append(-float(soc_end_min_target))
+            if str(self.final_soc_mode) == "hard":
+                # Hard terminal SoC floor for thesis-reportable strict runs.
+                # No slack-based repair is allowed in this mode.
+                row = np.zeros(n_vars, dtype=float)
+                row[sl["soc"].start + n] = -1.0
+                a_ub.append(row)
+                b_ub.append(-float(soc_end_min_target))
+            else:
+                # Diagnostic terminal-repair mode (soft floor via slack).
+                row = np.zeros(n_vars, dtype=float)
+                row[sl["soc"].start + n] = -1.0
+                row[sl["slack_final_soc"].start] = -1.0
+                a_ub.append(row)
+                b_ub.append(-float(soc_end_min_target))
 
         lb = np.zeros(n_vars, dtype=float)
         ub = np.full(n_vars, np.inf, dtype=float)
@@ -1689,8 +1864,8 @@ class BatteryBacktester:
         ub[sl["dis"]] = da_units_max
         ub[sl["rpos_bin"]] = afrr_units_max
         ub[sl["rneg_bin"]] = afrr_units_max
-        ub[sl["bem_pos"]] = afrr_units_max
-        ub[sl["bem_neg"]] = afrr_units_max
+        ub[sl["bem_pos_bin"]] = afrr_units_max
+        ub[sl["bem_neg_bin"]] = afrr_units_max
         if self.aux_mode == "state_dependent":
             lb[sl["u"]] = max(0.0, self.aux_off_mw)
             ub[sl["u"]] = self.aux_peak_mw
@@ -1788,13 +1963,15 @@ class BatteryBacktester:
         x = sol.x
         rpos_bin = x[sl["rpos_bin"]].reshape(n_bins, n).T
         rneg_bin = x[sl["rneg_bin"]].reshape(n_bins, n).T
+        bem_pos_bin = x[sl["bem_pos_bin"]].reshape(n_bins, n).T
+        bem_neg_bin = x[sl["bem_neg_bin"]].reshape(n_bins, n).T
         out = df[[colmap.timestamp]].copy()
         out["charge_mw"] = x[sl["ch"]] * da_step
         out["discharge_mw"] = x[sl["dis"]] * da_step
         out["reserve_pos_mw"] = rpos_bin.sum(axis=1) * afrr_step
         out["reserve_neg_mw"] = rneg_bin.sum(axis=1) * afrr_step
-        out["bem_only_pos_mw"] = x[sl["bem_pos"]] * afrr_step
-        out["bem_only_neg_mw"] = x[sl["bem_neg"]] * afrr_step
+        out["bem_only_pos_mw"] = bem_pos_bin.sum(axis=1) * afrr_step
+        out["bem_only_neg_mw"] = bem_neg_bin.sum(axis=1) * afrr_step
         out["aux_power_mw"] = x[sl["u"]]
         reserve_pos_bin_mw = rpos_bin * afrr_step
         reserve_neg_bin_mw = rneg_bin * afrr_step
@@ -1802,7 +1979,11 @@ class BatteryBacktester:
         discharge_mw = out["discharge_mw"].to_numpy(dtype=float)
         soc_lp = x[sl["soc"].start + 1 : sl["soc"].start + n + 1]
         soc_start_lp = x[sl["soc"].start : sl["soc"].start + n]
-        final_soc_shortfall_mwh = float(x[sl["slack_final_soc"].start]) if "slack_final_soc" in sl else 0.0
+        final_soc_shortfall_mwh = (
+            float(x[sl["slack_final_soc"].start])
+            if ("slack_final_soc" in sl and str(self.final_soc_mode) != "hard")
+            else 0.0
+        )
         slack_pos = x[sl["slack_pos"]]
         slack_neg = x[sl["slack_neg"]]
         slack_soc_min = x[sl["slack_soc_min"]]
@@ -1811,8 +1992,10 @@ class BatteryBacktester:
         ev_da_discharge_eur = dis_coef * discharge_mw
         ev_afrr_pos_eur = (rpos_coef_by_bin * reserve_pos_bin_mw).sum(axis=1)
         ev_afrr_neg_eur = (rneg_coef_by_bin * reserve_neg_bin_mw).sum(axis=1)
-        ev_bem_only_pos_eur = bem_pos_coef * out["bem_only_pos_mw"].to_numpy(dtype=float)
-        ev_bem_only_neg_eur = bem_neg_coef * out["bem_only_neg_mw"].to_numpy(dtype=float)
+        bem_pos_bin_mw = bem_pos_bin * afrr_step
+        bem_neg_bin_mw = bem_neg_bin * afrr_step
+        ev_bem_only_pos_eur = (bem_pos_coef_by_bin * bem_pos_bin_mw).sum(axis=1)
+        ev_bem_only_neg_eur = (bem_neg_coef_by_bin * bem_neg_bin_mw).sum(axis=1)
         ev_slack_penalty_pos_eur = c[sl["slack_pos"]] * slack_pos
         ev_slack_penalty_neg_eur = c[sl["slack_neg"]] * slack_neg
         ev_terminal_soc_credit_eur = np.zeros(n, dtype=float)
@@ -1920,14 +2103,46 @@ class BatteryBacktester:
         else:
             extra_cols["optimizer_fallback_used"] = np.zeros(n, dtype=float)
         for b in range(n_bins):
+            extra_cols[f"afrr_bin_{b}_quantile"] = np.full(n, str(self.afrr_quantile_bins[b]), dtype=object)
+            extra_cols[f"afrr_bin_{b}_cap_price_pos"] = cap_price_pos_by_bin[:, b]
+            extra_cols[f"afrr_bin_{b}_cap_price_neg"] = cap_price_neg_by_bin[:, b]
             extra_cols[f"reserve_pos_bin_{b}_mw"] = reserve_pos_bin_mw[:, b]
             extra_cols[f"reserve_neg_bin_{b}_mw"] = reserve_neg_bin_mw[:, b]
+            extra_cols[f"bem_pos_bin_{b}_mw"] = bem_pos_bin_mw[:, b]
+            extra_cols[f"bem_neg_bin_{b}_mw"] = bem_neg_bin_mw[:, b]
             extra_cols[f"ev_pacc_pos_bin_{b}"] = p_acc_cap_pos[:, b]
             extra_cols[f"ev_pacc_neg_bin_{b}"] = p_acc_cap_neg[:, b]
-            extra_cols[f"ev_expected_act_share_pos_bin_{b}"] = p_acc_cap_pos[:, b] * r_act_pos_base
-            extra_cols[f"ev_expected_act_share_neg_bin_{b}"] = p_acc_cap_neg[:, b] * r_act_neg_base
+            extra_cols[f"ev_expected_act_share_pos_bin_{b}"] = p_acc_cap_pos[:, b] * act_rate_pos_by_bin[:, b]
+            extra_cols[f"ev_expected_act_share_neg_bin_{b}"] = p_acc_cap_neg[:, b] * act_rate_neg_by_bin[:, b]
+            extra_cols[f"ev_afrr_bin_{b}_act_price_pos"] = act_price_pos_by_bin[:, b]
+            extra_cols[f"ev_afrr_bin_{b}_act_price_neg"] = act_price_neg_by_bin[:, b]
+            extra_cols[f"ev_afrr_bin_{b}_act_rate_pos"] = act_rate_pos_by_bin[:, b]
+            extra_cols[f"ev_afrr_bin_{b}_act_rate_neg"] = act_rate_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_bin_{b}_act_price_pos"] = act_price_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_bin_{b}_act_price_neg"] = act_price_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_bin_{b}_act_rate_pos"] = act_rate_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_bin_{b}_act_rate_neg"] = act_rate_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_bin_{b}_p_exec_pos"] = p_acc_cap_pos[:, b]
+            extra_cols[f"ev_bem_bin_{b}_p_exec_neg"] = p_acc_cap_neg[:, b]
+            extra_cols[f"ev_bem_pos_coef_bin_{b}_eur_per_mw"] = bem_pos_coef_by_bin[:, b]
+            extra_cols[f"ev_bem_neg_coef_bin_{b}_eur_per_mw"] = bem_neg_coef_by_bin[:, b]
             extra_cols[f"ev_rpos_coef_bin_{b}_eur_per_mw"] = rpos_coef_by_bin[:, b]
             extra_cols[f"ev_rneg_coef_bin_{b}_eur_per_mw"] = rneg_coef_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_capacity_revenue_pos_bin_{b}"] = bcm_expected_capacity_revenue_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_capacity_revenue_neg_bin_{b}"] = bcm_expected_capacity_revenue_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_activation_revenue_pos_bin_{b}"] = bcm_expected_activation_revenue_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_activation_revenue_neg_bin_{b}"] = bcm_expected_activation_revenue_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_aux_cost_pos_bin_{b}"] = bcm_expected_aux_cost_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_aux_cost_neg_bin_{b}"] = bcm_expected_aux_cost_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_offer_cost_bin_{b}"] = bcm_offer_cost_by_bin[:, b]
+            extra_cols[f"ev_bcm_activation_margin_pos_bin_{b}"] = bcm_activation_margin_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_activation_margin_neg_bin_{b}"] = bcm_activation_margin_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_expected_activation_revenue_pos_bin_{b}"] = bem_expected_activation_revenue_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_expected_activation_revenue_neg_bin_{b}"] = bem_expected_activation_revenue_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_expected_aux_cost_pos_bin_{b}"] = bem_expected_aux_cost_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_expected_aux_cost_neg_bin_{b}"] = bem_expected_aux_cost_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_activation_margin_pos_bin_{b}"] = bem_activation_margin_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_activation_margin_neg_bin_{b}"] = bem_activation_margin_neg_by_bin[:, b]
         out = pd.concat([out, pd.DataFrame(extra_cols, index=out.index)], axis=1)
         out["predicted_objective_eur"] = -sol.fun
         return out
@@ -2544,18 +2759,11 @@ class BatteryBacktester:
         req_neg = max(0.0, float(required_headroom_neg_mwh))
         locked_pos = max(0.0, float(locked_reserve_pos_mw))
         locked_neg = max(0.0, float(locked_reserve_neg_mw))
-        ob_pos_active = float(
-            (locked_pos > 1e-9)
-            or (req_pos > 1e-9)
-            or (max(0.0, float(committed_bem_pos_mw)) > 1e-9)
-            or (max(0.0, float(reserve_pos_mw)) > 1e-9)
-        )
-        ob_neg_active = float(
-            (locked_neg > 1e-9)
-            or (req_neg > 1e-9)
-            or (max(0.0, float(committed_bem_neg_mw)) > 1e-9)
-            or (max(0.0, float(reserve_neg_mw)) > 1e-9)
-        )
+        # Strict thesis validity: protected envelope is obligation-driven.
+        # Submitted/current-hour reserve or BEM-only volumes do not create a
+        # future deliverability obligation by themselves.
+        ob_pos_active = float((locked_pos > 1e-9) or (req_pos > 1e-9))
+        ob_neg_active = float((locked_neg > 1e-9) or (req_neg > 1e-9))
         buffer_pos = float(
             (self.reserve_headroom_safety_mwh + self.reserve_soc_projection_safety_mwh)
             if ob_pos_active > 0.5
@@ -4032,6 +4240,19 @@ class BatteryBacktester:
                             for qc in q_cols:
                                 filled_q = _asof_fill_from_long(src_df, qc)
                                 window[f"{base}_{qc}"] = filled_q.to_numpy(dtype=float)
+                    # Propagate activation-price quantiles into window columns
+                    # used directly by strict quantile-bin optimizer inputs.
+                    if pred_col in {colmap.pred_afrr_activation_price_pos, colmap.pred_afrr_activation_price_neg}:
+                        q_cols = [c for c in QUANTILE_COLUMNS if c in src_df.columns]
+                        if q_cols:
+                            base = (
+                                colmap.pred_afrr_activation_price_pos
+                                if pred_col == colmap.pred_afrr_activation_price_pos
+                                else colmap.pred_afrr_activation_price_neg
+                            )
+                            for qc in q_cols:
+                                filled_q = _asof_fill_from_long(src_df, qc)
+                                window[f"{base}_{qc}"] = filled_q.to_numpy(dtype=float)
                     # Propagate DA quantile columns used by DA limit bid pricing.
                     if pred_col == colmap.pred_da_price:
                         q_cols = [c for c in QUANTILE_COLUMNS if c in src_df.columns]
@@ -4185,6 +4406,7 @@ class BatteryBacktester:
                     "ev_pacc_pos_fallback_used",
                     "ev_pacc_neg_fallback_used",
                     "optimizer_fallback_used",
+                    "terminal_constraint_dropped",
                 ]
                 for c in scalar_zero_cols:
                     if c not in out.columns:
@@ -4215,6 +4437,7 @@ class BatteryBacktester:
                 enforce_end_min = None
             optimization_fallback = "none"
             optimization_error = ""
+            terminal_constraint_dropped = 0.0
             fixed_reserve_obligation: dict[pd.Timestamp, tuple[float, float]] = {}
             reserve_retry_attempts_used = 0.0
             reserve_retry_final_factor = 1.0
@@ -4283,6 +4506,7 @@ class BatteryBacktester:
                     )
                     fixed_reserve_obligation = trial_ob
                     reserve_retry_succeeded = 1.0
+                    plan["terminal_constraint_dropped"] = 0.0
                     if float(fac) <= 1e-12:
                         new_reserve_bids_zeroed_by_retry = 1.0
                     break
@@ -4390,7 +4614,15 @@ class BatteryBacktester:
                     return (avail_pos + 1e-9 < req_pos) or (avail_neg + 1e-9 < req_neg)
                 # If terminal SoC floor conflicts with already locked reserve obligations,
                 # keep reserve obligations and retry without terminal minimum first.
-                if is_infeasible and has_fixed_reserve_obligation and (enforce_end_min is not None):
+                allow_terminal_drop_retry = not (
+                    bool(strict_simulation_validity) and str(self.final_soc_mode) == "hard"
+                )
+                if (
+                    is_infeasible
+                    and has_fixed_reserve_obligation
+                    and (enforce_end_min is not None)
+                    and allow_terminal_drop_retry
+                ):
                     try:
                         plan = self.optimize_dispatch(
                             window,
@@ -4404,6 +4636,8 @@ class BatteryBacktester:
                             allowed_markets=allowed_markets,
                             strict_input_validation=bool(forecast_warehouse is not None),
                         )
+                        terminal_constraint_dropped = 1.0
+                        plan["terminal_constraint_dropped"] = 1.0
                         optimization_fallback = "none"
                         optimization_error = ""
                     except RuntimeError:
@@ -4416,17 +4650,21 @@ class BatteryBacktester:
                     if recoverable_solver_failure:
                         plan = _safe_hold_with_obligations()
                         plan["optimizer_fallback_used"] = 1.0
+                        plan["terminal_constraint_dropped"] = float(terminal_constraint_dropped)
                         optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan_under_solver_not_set"
                     elif enforce_end_min is not None:
-                        # Final SoC is now handled via soft shortfall slack inside the
-                        # optimizer objective. If infeasibility still occurs, fall back
-                        # to safe-hold for robustness.
+                        # In strict hard mode we do not drop the terminal target.
+                        # If infeasible, degrade to safe hold and mark invalid later.
                         plan = _safe_hold_with_obligations()
                         plan["optimizer_fallback_used"] = 1.0
+                        plan["terminal_constraint_dropped"] = float(terminal_constraint_dropped)
                         if _has_headroom_violation_now():
                             optimization_fallback = "reserve_infeasible"
                         else:
-                            optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan_under_infeasible_soft_final_soc"
+                            if bool(strict_simulation_validity) and str(self.final_soc_mode) == "hard":
+                                optimization_fallback = "hard_final_soc_infeasible"
+                            else:
+                                optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan_under_infeasible_soft_final_soc"
                     else:
                         # Last-resort fallback: if rolling MILP is infeasible even
                         # without terminal floor, degrade to a physically safe hold
@@ -4434,9 +4672,12 @@ class BatteryBacktester:
                         # This avoids full-run aborts from local pathological windows.
                         plan = _safe_hold_with_obligations()
                         plan["optimizer_fallback_used"] = 1.0
+                        plan["terminal_constraint_dropped"] = float(terminal_constraint_dropped)
                         optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan"
 
             snapshot_plan = plan.copy()
+            if "terminal_constraint_dropped" not in snapshot_plan.columns:
+                snapshot_plan["terminal_constraint_dropped"] = float(terminal_constraint_dropped)
             snapshot_plan["snapshot_time_utc"] = snapshot_ts if forecast_warehouse else pd.to_datetime(window.iloc[0][colmap.timestamp], utc=True, errors="coerce")
             snapshot_plan["target_time_utc"] = pd.to_datetime(snapshot_plan[colmap.timestamp], utc=True, errors="coerce")
             if snapshot_plan["target_time_utc"].isna().any():
@@ -5302,18 +5543,18 @@ class BatteryBacktester:
             # Realized headroom audit (aligned to settlement-time commitments).
             committed_bem_pos_mw = float(clearing_rec.get("bem_only_submitted_pos_mw", 0.0))
             committed_bem_neg_mw = float(clearing_rec.get("bem_only_submitted_neg_mw", 0.0))
-            req_pos_mwh = (
-                float(reserve_pos) * self.reserve_activation_headroom_h
-                + committed_bem_pos_mw * self.bem_activation_headroom_h
-            ) / max(self.eta_out, 1e-12)
-            req_neg_mwh = (
-                float(reserve_neg) * self.reserve_activation_headroom_h
-                + committed_bem_neg_mw * self.bem_activation_headroom_h
-            ) * self.eta_in
             avail_pos_mwh = max(0.0, soc_start_hour - self.soc_min)
             avail_neg_mwh = max(0.0, self.soc_max - soc_start_hour)
             locked_reserve_pos_mw = float(clearing_rec.get("fixed_reserve_obligation_pos_mw", 0.0))
             locked_reserve_neg_mw = float(clearing_rec.get("fixed_reserve_obligation_neg_mw", 0.0))
+            # Protected-SoC validity must be obligation-driven:
+            # use locked/awarded reserve obligations only (not merely submitted volume).
+            req_pos_mwh = (
+                float(locked_reserve_pos_mw) * self.reserve_activation_headroom_h
+            ) / max(self.eta_out, 1e-12)
+            req_neg_mwh = (
+                float(locked_reserve_neg_mw) * self.reserve_activation_headroom_h
+            ) * self.eta_in
             psv = self._compute_obligation_driven_protected_soc_bounds(
                 soc_start_mwh=float(soc_start_hour),
                 required_headroom_pos_mwh=float(req_pos_mwh),
@@ -5322,8 +5563,8 @@ class BatteryBacktester:
                 locked_reserve_neg_mw=float(locked_reserve_neg_mw),
                 committed_bem_pos_mw=float(committed_bem_pos_mw),
                 committed_bem_neg_mw=float(committed_bem_neg_mw),
-                reserve_pos_mw=float(reserve_pos),
-                reserve_neg_mw=float(reserve_neg),
+                reserve_pos_mw=0.0,
+                reserve_neg_mw=0.0,
             )
             m.update(
                 {
@@ -6582,6 +6823,19 @@ class BatteryBacktester:
             opportunity_gap_ratio = float("nan")
         summary = {
             "rows": float(len(hourly)),
+            "input_row_count": float(len(df)),
+            "optimized_hour_count": float(len(hourly)),
+            "first_input_timestamp_utc": (
+                pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce").dropna().min().isoformat()
+                if (colmap.timestamp in df.columns and not df.empty)
+                else ""
+            ),
+            "first_optimized_target_timestamp_utc": (
+                pd.to_datetime(hourly[colmap.timestamp], utc=True, errors="coerce").dropna().min().isoformat()
+                if (colmap.timestamp in hourly.columns and not hourly.empty)
+                else ""
+            ),
+            "dropped_initial_rows_due_to_forecast_target_alignment": float(max(0, len(df) - len(hourly))),
             "planned_total_pnl_eur": float(pred_pnl_total),
             "predicted_total_pnl_eur": float(pred_pnl_total),
             "realized_total_pnl_eur": float(real_pnl_total),
@@ -7457,7 +7711,67 @@ class BatteryBacktester:
         summary["final_soc_handling_mode"] = "terminal_settlement_to_target"
         summary["final_soc_check_mode"] = "terminal_settlement_to_target"
         summary["final_soc_shortfall_mwh"] = float(term_adj_real["shortfall_mwh"])
+        summary["final_soc_slack_used_mwh"] = float(
+            pd.to_numeric(
+                hourly.get("real_final_soc_shortfall_mwh", hourly.get("final_soc_shortfall_mwh", 0.0)),
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .max()
+            if len(hourly) > 0
+            else 0.0
+        )
         summary["final_soc_surplus_mwh"] = float(term_adj_real["surplus_mwh"])
+        summary["terminal_constraint_dropped"] = float(
+            pd.to_numeric(
+                hourly.get("real_terminal_constraint_dropped", hourly.get("terminal_constraint_dropped", 0.0)),
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .gt(0.5)
+            .any()
+            if len(hourly) > 0
+            else 0.0
+        )
+        ts_series_utc = pd.to_datetime(hourly[colmap.timestamp], utc=True, errors="coerce") if colmap.timestamp in hourly.columns else pd.Series(dtype="datetime64[ns, UTC]")
+        if len(ts_series_utc) > 0 and ts_series_utc.notna().any():
+            ts_max = ts_series_utc.dropna().max()
+            last24_mask = ts_series_utc >= (ts_max - pd.Timedelta(hours=23))
+        else:
+            last24_mask = pd.Series(False, index=hourly.index, dtype=bool)
+        def _sum_last24(col_name: str) -> float:
+            if col_name not in hourly.columns:
+                return 0.0
+            return float(pd.to_numeric(hourly[col_name], errors="coerce").fillna(0.0)[last24_mask].sum())
+        def _max_last24(col_name: str) -> float:
+            if col_name not in hourly.columns:
+                return 0.0
+            s = pd.to_numeric(hourly[col_name], errors="coerce").fillna(0.0)[last24_mask]
+            return float(s.max()) if len(s) else 0.0
+        summary["da_charge_mwh_last_24h"] = _sum_last24("real_da_buy_mwh")
+        if {"real_submitted_da_buy_mw", "real_da_buy_accepted"}.issubset(hourly.columns):
+            locked_da_buy = (
+                pd.to_numeric(hourly["real_submitted_da_buy_mw"], errors="coerce").fillna(0.0)
+                * pd.to_numeric(hourly["real_da_buy_accepted"], errors="coerce").fillna(0.0)
+                * float(self.dt_h)
+            )
+            summary["locked_da_buy_mwh_last_24h"] = float(locked_da_buy[last24_mask].sum())
+        else:
+            summary["locked_da_buy_mwh_last_24h"] = 0.0
+        if {"real_submitted_da_sell_mw", "real_da_sell_accepted"}.issubset(hourly.columns):
+            locked_da_sell = (
+                pd.to_numeric(hourly["real_submitted_da_sell_mw"], errors="coerce").fillna(0.0)
+                * pd.to_numeric(hourly["real_da_sell_accepted"], errors="coerce").fillna(0.0)
+                * float(self.dt_h)
+            )
+            summary["locked_da_sell_mwh_last_24h"] = float(locked_da_sell[last24_mask].sum())
+        else:
+            summary["locked_da_sell_mwh_last_24h"] = 0.0
+        summary["max_possible_charge_mwh_last_24h"] = float(last24_mask.sum()) * float(self.p_max_mw) * float(self.dt_h)
+        summary["final_window_locked_reserve_pos_mw_sum"] = _sum_last24("real_fixed_reserve_obligation_pos_mw")
+        summary["final_window_locked_reserve_neg_mw_sum"] = _sum_last24("real_fixed_reserve_obligation_neg_mw")
+        summary["final_window_locked_reserve_pos_mw_max"] = _max_last24("real_fixed_reserve_obligation_pos_mw")
+        summary["final_window_locked_reserve_neg_mw_max"] = _max_last24("real_fixed_reserve_obligation_neg_mw")
         shortfall_tol_mwh = 1e-6
         terminal_repair_included = bool(
             np.isfinite(float(summary.get("terminal_soc_net_adjustment_eur", float("nan"))))
@@ -7683,6 +7997,7 @@ class BatteryBacktester:
             and (summary.get("fallback_used", 0.0) <= 0.5)
             and (summary.get("reserve_feasibility_repair_used", 0.0) <= 0.5)
             and (summary.get("final_soc_check_pass", 0.0) >= 0.5)
+            and (summary.get("final_soc_physical_check_pass", 0.0) >= 0.5)
             and (summary.get("missed_capacity_check_pass", 0.0) >= 0.5)
             and (summary.get("missed_activation_check_pass", 0.0) >= 0.5)
             and (summary.get("headroom_check_pass", 0.0) >= 0.5)

@@ -51,6 +51,7 @@ if str(SRC_DIR) not in sys.path:
 
 from energy_trading.config import MODEL_SPECS
 from energy_trading.simulation.battery_backtest import (
+    AFRR_QUANTILE_BINS,
     BacktestColumnMap, BatteryBacktester, PhaseTimeoutError,
     canonicalize_market_frame, load_and_align_market_data,
     load_prediction_warehouse_long)
@@ -414,6 +415,21 @@ def _resolve_out_dir(
     return out
 
 
+def _resolve_final_soc_policy(
+    *,
+    strict_simulation_validity: bool,
+    final_soc_mode: str,
+    enforce_final_soc_min_flag: bool,
+    allow_terminal_soc_repair_in_strict: bool,
+) -> bool:
+    if bool(strict_simulation_validity) and str(final_soc_mode) == "terminal_repair" and not bool(allow_terminal_soc_repair_in_strict):
+        raise ValueError(
+            "Strict mode requires --final-soc-mode hard for thesis-reportable runs. "
+            "Set --allow-terminal-soc-repair-in-strict only for diagnostic runs."
+        )
+    return bool(enforce_final_soc_min_flag) or (str(final_soc_mode) == "hard")
+
+
 def _prepare_scenario_output_dir(
     *,
     scenario_out_dir: Path,
@@ -485,6 +501,22 @@ def _parse_quantile_pairs(raw: str) -> list[tuple[str, str]]:
     return out
 
 
+def _expand_quantile_range(q_low: str, q_high: str) -> list[str]:
+    ordered = list(AFRR_QUANTILE_BINS)
+    if q_low not in ordered or q_high not in ordered:
+        raise ValueError(
+            f"Unsupported quantile range '{q_low}-{q_high}'. Allowed bins: {ordered}"
+        )
+    i0 = ordered.index(q_low)
+    i1 = ordered.index(q_high)
+    if i0 > i1:
+        raise ValueError(f"Invalid range '{q_low}-{q_high}': low quantile must be <= high quantile.")
+    out = ordered[i0 : i1 + 1]
+    if not out:
+        raise ValueError(f"Quantile range '{q_low}-{q_high}' expands to empty bin set.")
+    return out
+
+
 def _apply_quantile_pair_to_warehouse(
     warehouse: dict[str, pd.DataFrame],
     *,
@@ -493,31 +525,235 @@ def _apply_quantile_pair_to_warehouse(
     da_role: str,
 ) -> dict[str, pd.DataFrame]:
     da_q = {"low": q_low, "high": q_high, "mid": "p50"}[da_role]
-    quantile_by_target = {
-        "pred_da_price": da_q,
-        "pred_afrr_capacity_price_pos": q_high,
-        "pred_afrr_activation_price_pos": q_high,
-        "pred_afrr_activation_rate_pos": q_high,
-        "pred_afrr_capacity_price_neg": q_low,
-        "pred_afrr_activation_price_neg": q_low,
-        "pred_afrr_activation_rate_neg": q_low,
-    }
     out: dict[str, pd.DataFrame] = {}
     for pred_col, df in warehouse.items():
-        q_col = quantile_by_target.get(pred_col, "p50")
         cur = df.copy()
-        if q_col not in cur.columns:
-            available = [c for c in cur.columns if re.fullmatch(r"p\d{2}", str(c))]
-            raise KeyError(
-                f"Requested quantile '{q_col}' missing for {pred_col}. Available: {available}"
-            )
-        cur["predicted_value"] = pd.to_numeric(cur[q_col], errors="coerce")
+        # DA remains independent from aFRR bin-range selection and can still use
+        # role-based point quantile for predicted_value if configured.
+        if pred_col == "pred_da_price":
+            q_col = da_q
+            if q_col not in cur.columns:
+                available = [c for c in cur.columns if re.fullmatch(r"p\d{2}", str(c))]
+                raise KeyError(
+                    f"Requested DA quantile '{q_col}' missing for {pred_col}. Available: {available}"
+                )
+            cur["predicted_value"] = pd.to_numeric(cur[q_col], errors="coerce")
+        elif "predicted_value" not in cur.columns:
+            # Keep central point forecast for non-DA targets; do not force
+            # directional low/high substitution.
+            if "p50" not in cur.columns:
+                available = [c for c in cur.columns if re.fullmatch(r"p\d{2}", str(c))]
+                raise KeyError(
+                    f"Missing both predicted_value and p50 for {pred_col}. Available quantiles: {available}"
+                )
+            cur["predicted_value"] = pd.to_numeric(cur["p50"], errors="coerce")
         out[pred_col] = cur
     return out
 
 
 def _scenario_suffix(q_low: str, q_high: str) -> str:
     return f"{q_low}_{q_high}"
+
+
+def _discover_afrr_bin_ids(columns: Iterable[str]) -> list[int]:
+    return sorted(
+        {
+            int(m.group(1))
+            for c in columns
+            for m in [re.match(r"^reserve_pos_bin_(\d+)_mw$", str(c))]
+            if m
+        }
+    )
+
+
+def _build_afrr_bin_ev_audit(
+    *,
+    hourly: pd.DataFrame,
+    scenario_name: str,
+    active_bins: list[str],
+    backtester: BatteryBacktester,
+    timestamp_col: str,
+) -> pd.DataFrame:
+    h_ev = hourly.copy()
+    if h_ev.empty:
+        return pd.DataFrame()
+    ts_s = pd.to_datetime(h_ev.get(timestamp_col), utc=True, errors="coerce")
+    bin_ids = _discover_afrr_bin_ids(list(h_ev.columns))
+    if not bin_ids and active_bins:
+        bin_ids = list(range(len(active_bins)))
+
+    def _row_num(i: int, col: str, default: float = np.nan) -> float:
+        if col not in h_ev.columns:
+            return float(default)
+        return float(pd.to_numeric(pd.Series([h_ev.iloc[i][col]]), errors="coerce").iloc[0])
+
+    def _row_qname(i: int, b: int) -> str:
+        qcol = f"afrr_bin_{b}_quantile"
+        if qcol in h_ev.columns:
+            qv = h_ev.iloc[i][qcol]
+            if pd.notna(qv) and str(qv).strip():
+                return str(qv)
+        if 0 <= b < len(active_bins):
+            return str(active_bins[b])
+        return ""
+
+    rows: list[dict[str, object]] = []
+    for i in range(len(h_ev)):
+        ts = ts_s.iloc[i] if i < len(ts_s) else pd.NaT
+        for b in bin_ids:
+            q_name = _row_qname(i, b)
+            rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "scenario": scenario_name,
+                    "market_component": "BCM",
+                    "direction": "pos",
+                    "quantile_bin": q_name,
+                    "decision_variable_name": f"reserve_pos_bin_{b}_mw",
+                    "capacity_price_q": _row_num(i, f"afrr_bin_{b}_cap_price_pos"),
+                    "activation_price_q": _row_num(i, f"ev_afrr_bin_{b}_act_price_pos"),
+                    "activation_rate_q": _row_num(i, f"ev_afrr_bin_{b}_act_rate_pos"),
+                    "p_acc_or_p_exec_q": _row_num(i, f"ev_pacc_pos_bin_{b}"),
+                    "expected_capacity_revenue": _row_num(i, f"ev_bcm_expected_capacity_revenue_pos_bin_{b}"),
+                    "expected_activation_revenue": _row_num(i, f"ev_bcm_expected_activation_revenue_pos_bin_{b}"),
+                    "expected_aux_cost": _row_num(i, f"ev_bcm_expected_aux_cost_pos_bin_{b}"),
+                    "offer_cost": _row_num(i, f"ev_bcm_offer_cost_bin_{b}"),
+                    "transaction_cost": float(backtester.trans_eur_mwh),
+                    "degradation_cost": float(backtester.deg_eur_mwh / max(backtester.eta_out, 1e-12)),
+                    "activation_margin": _row_num(i, f"ev_bcm_activation_margin_pos_bin_{b}"),
+                    "ev_coefficient": _row_num(i, f"ev_rpos_coef_bin_{b}_eur_per_mw"),
+                    "selected_mw": _row_num(i, f"reserve_pos_bin_{b}_mw"),
+                }
+            )
+            rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "scenario": scenario_name,
+                    "market_component": "BCM",
+                    "direction": "neg",
+                    "quantile_bin": q_name,
+                    "decision_variable_name": f"reserve_neg_bin_{b}_mw",
+                    "capacity_price_q": _row_num(i, f"afrr_bin_{b}_cap_price_neg"),
+                    "activation_price_q": _row_num(i, f"ev_afrr_bin_{b}_act_price_neg"),
+                    "activation_rate_q": _row_num(i, f"ev_afrr_bin_{b}_act_rate_neg"),
+                    "p_acc_or_p_exec_q": _row_num(i, f"ev_pacc_neg_bin_{b}"),
+                    "expected_capacity_revenue": _row_num(i, f"ev_bcm_expected_capacity_revenue_neg_bin_{b}"),
+                    "expected_activation_revenue": _row_num(i, f"ev_bcm_expected_activation_revenue_neg_bin_{b}"),
+                    "expected_aux_cost": _row_num(i, f"ev_bcm_expected_aux_cost_neg_bin_{b}"),
+                    "offer_cost": _row_num(i, f"ev_bcm_offer_cost_bin_{b}"),
+                    "transaction_cost": float(backtester.trans_eur_mwh),
+                    "degradation_cost": float(backtester.deg_eur_mwh * backtester.eta_in),
+                    "activation_margin": _row_num(i, f"ev_bcm_activation_margin_neg_bin_{b}"),
+                    "ev_coefficient": _row_num(i, f"ev_rneg_coef_bin_{b}_eur_per_mw"),
+                    "selected_mw": _row_num(i, f"reserve_neg_bin_{b}_mw"),
+                }
+            )
+            rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "scenario": scenario_name,
+                    "market_component": "BEM",
+                    "direction": "pos",
+                    "quantile_bin": q_name,
+                    "decision_variable_name": f"bem_pos_bin_{b}_mw",
+                    "capacity_price_q": np.nan,
+                    "activation_price_q": _row_num(i, f"ev_bem_bin_{b}_act_price_pos"),
+                    "activation_rate_q": _row_num(i, f"ev_bem_bin_{b}_act_rate_pos"),
+                    "p_acc_or_p_exec_q": _row_num(i, f"ev_bem_bin_{b}_p_exec_pos"),
+                    "expected_capacity_revenue": 0.0,
+                    "expected_activation_revenue": _row_num(i, f"ev_bem_expected_activation_revenue_pos_bin_{b}"),
+                    "expected_aux_cost": _row_num(i, f"ev_bem_expected_aux_cost_pos_bin_{b}"),
+                    "offer_cost": 0.0,
+                    "transaction_cost": float(backtester.trans_eur_mwh),
+                    "degradation_cost": float(backtester.deg_eur_mwh / max(backtester.eta_out, 1e-12)),
+                    "activation_margin": _row_num(i, f"ev_bem_activation_margin_pos_bin_{b}"),
+                    "ev_coefficient": _row_num(i, f"ev_bem_pos_coef_bin_{b}_eur_per_mw"),
+                    "selected_mw": _row_num(i, f"bem_pos_bin_{b}_mw"),
+                }
+            )
+            rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "scenario": scenario_name,
+                    "market_component": "BEM",
+                    "direction": "neg",
+                    "quantile_bin": q_name,
+                    "decision_variable_name": f"bem_neg_bin_{b}_mw",
+                    "capacity_price_q": np.nan,
+                    "activation_price_q": _row_num(i, f"ev_bem_bin_{b}_act_price_neg"),
+                    "activation_rate_q": _row_num(i, f"ev_bem_bin_{b}_act_rate_neg"),
+                    "p_acc_or_p_exec_q": _row_num(i, f"ev_bem_bin_{b}_p_exec_neg"),
+                    "expected_capacity_revenue": 0.0,
+                    "expected_activation_revenue": _row_num(i, f"ev_bem_expected_activation_revenue_neg_bin_{b}"),
+                    "expected_aux_cost": _row_num(i, f"ev_bem_expected_aux_cost_neg_bin_{b}"),
+                    "offer_cost": 0.0,
+                    "transaction_cost": float(backtester.trans_eur_mwh),
+                    "degradation_cost": float(backtester.deg_eur_mwh * backtester.eta_in),
+                    "activation_margin": _row_num(i, f"ev_bem_activation_margin_neg_bin_{b}"),
+                    "ev_coefficient": _row_num(i, f"ev_bem_neg_coef_bin_{b}_eur_per_mw"),
+                    "selected_mw": _row_num(i, f"bem_neg_bin_{b}_mw"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _validate_afrr_bin_ev_audit(audit: pd.DataFrame, tol: float = 1e-6) -> dict[str, float]:
+    if audit.empty:
+        return {
+            "ev_audit_row_count": 0.0,
+            "ev_audit_max_bcm_formula_error": 0.0,
+            "ev_audit_max_bem_formula_error": 0.0,
+        }
+    required = [
+        "market_component",
+        "expected_capacity_revenue",
+        "expected_activation_revenue",
+        "expected_aux_cost",
+        "offer_cost",
+        "ev_coefficient",
+    ]
+    missing = [c for c in required if c not in audit.columns]
+    if missing:
+        raise ValueError(f"EV audit missing required columns: {missing}")
+    d = audit.copy()
+    for c in required:
+        if c == "market_component":
+            continue
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    bcm = d.loc[d["market_component"].astype(str).eq("BCM")].copy()
+    bem = d.loc[d["market_component"].astype(str).eq("BEM")].copy()
+    if not bcm.empty:
+        bcm_req = ["expected_capacity_revenue", "expected_activation_revenue", "expected_aux_cost", "offer_cost", "ev_coefficient"]
+        if bcm[bcm_req].isna().any().any():
+            raise ValueError("EV audit contains NaN/non-finite BCM reconciliation fields.")
+        bcm["formula"] = (
+            bcm["expected_capacity_revenue"]
+            + bcm["expected_activation_revenue"]
+            - bcm["expected_aux_cost"]
+            - bcm["offer_cost"]
+        )
+        bcm_err = (bcm["formula"] - bcm["ev_coefficient"]).abs()
+        max_bcm = float(bcm_err.max()) if len(bcm_err) else 0.0
+    else:
+        max_bcm = 0.0
+    if not bem.empty:
+        bem_req = ["expected_activation_revenue", "expected_aux_cost", "ev_coefficient"]
+        if bem[bem_req].isna().any().any():
+            raise ValueError("EV audit contains NaN/non-finite BEM reconciliation fields.")
+        bem["formula"] = bem["expected_activation_revenue"] - bem["expected_aux_cost"]
+        bem_err = (bem["formula"] - bem["ev_coefficient"]).abs()
+        max_bem = float(bem_err.max()) if len(bem_err) else 0.0
+    else:
+        max_bem = 0.0
+    if max(max_bcm, max_bem) > float(tol):
+        raise ValueError(
+            f"EV audit formula reconciliation failed: max_bcm={max_bcm:.6g}, max_bem={max_bem:.6g}, tol={tol:.6g}"
+        )
+    return {
+        "ev_audit_row_count": float(len(d)),
+        "ev_audit_max_bcm_formula_error": float(max_bcm),
+        "ev_audit_max_bem_formula_error": float(max_bem),
+    }
 
 
 def _matches_model_key(path: Path, model_key: str) -> bool:
@@ -948,7 +1184,25 @@ def parse_args() -> argparse.Namespace:
         "--enforce-final-soc-min",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enforce final SoC >= soc_target_end (default: enabled).",
+        help="Enforce final SoC >= soc_target_end in optimizer (default: enabled).",
+    )
+    p.add_argument(
+        "--allow-terminal-soc-repair-in-strict",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow --final-soc-mode terminal_repair even in strict mode (diagnostic only).",
+    )
+    p.add_argument(
+        "--allow-p50-from-predicted-value",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Explicit compatibility mode: materialize missing p50 from predicted_value in long forecasts.",
+    )
+    p.add_argument(
+        "--allow-invalid-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If disabled, strict mode exits non-zero when any scenario is invalid after writing artifacts.",
     )
     p.add_argument(
         "--disable-rolling-horizon",
@@ -1081,6 +1335,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print recommended validity-first reserve settings and exit.",
     )
+    p.add_argument(
+        "--export-afrr-bin-ev-audit",
+        action="store_true",
+        help="Export per-bin BCM/BEM EV audit CSV from optimizer hourly outputs.",
+    )
     return p.parse_args()
 
 
@@ -1103,9 +1362,11 @@ def main() -> None:
     run_id: str | None = args.run_id.strip() or None
     quantile_pairs = _parse_quantile_pairs(args.quantile_pairs)
     required_quantiles: set[str] = {"p50"}
+    scenario_bin_map: dict[str, list[str]] = {}
     for q_lo, q_hi in quantile_pairs:
-        required_quantiles.add(q_lo.lower())
-        required_quantiles.add(q_hi.lower())
+        expanded = _expand_quantile_range(q_lo.lower(), q_hi.lower())
+        required_quantiles.update(expanded)
+        scenario_bin_map[_scenario_suffix(q_lo, q_hi)] = expanded
 
     predictions_path = args.predictions.strip()
     ground_truth_path = args.ground_truth.strip()
@@ -1113,8 +1374,6 @@ def main() -> None:
     manifest_path: Path | None = None
 
     target_value_modes: dict[str, str] = {}
-    if payload:
-        target_value_modes = _target_value_modes_from_manifest(payload)
 
     if not predictions_path:
         if args.run_manifest.strip():
@@ -1165,6 +1424,7 @@ def main() -> None:
             manifest_dir=manifest_dir,
             expected_quantiles=required_quantiles,
         )
+        target_value_modes = _target_value_modes_from_manifest(payload)
     else:
         manifest_dir = Path.cwd()
 
@@ -1187,6 +1447,7 @@ def main() -> None:
             forecast_warehouse = load_prediction_warehouse_long(
                 resolved_long_map,
                 target_value_modes=target_value_modes,
+                allow_p50_materialization_from_predicted_value=bool(args.allow_p50_from_predicted_value),
             )
             print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
             cov_min_list: list[pd.Timestamp] = []
@@ -1268,7 +1529,9 @@ def main() -> None:
         df = df[df[colmap.timestamp] <= pd.to_datetime(args.end, utc=True)].copy()
     if df.empty:
         raise ValueError("No rows after timestamp filtering.")
-    scenarios: list[tuple[str, dict[str, pd.DataFrame] | None]] = [("default", forecast_warehouse)]
+    scenarios: list[tuple[str, dict[str, pd.DataFrame] | None, list[str]]] = [
+        ("default", forecast_warehouse, list(AFRR_QUANTILE_BINS))
+    ]
     if quantile_pairs:
         if forecast_warehouse is None:
             raise ValueError("--quantile-pairs requires long-format predictions from --run-manifest.")
@@ -1281,7 +1544,7 @@ def main() -> None:
                 q_high=q_high,
                 da_role=args.da_quantile_role,
             )
-            scenarios.append((name, wh))
+            scenarios.append((name, wh, list(scenario_bin_map[name])))
 
     MODEL_SPECS["reserve_activation_headroom_h"] = float(args.reserve_activation_headroom_h)
     MODEL_SPECS["bem_activation_headroom_h"] = float(args.bem_activation_headroom_h)
@@ -1331,7 +1594,12 @@ def main() -> None:
     )
     MODEL_SPECS["forecast_value_mode"] = str(args.forecast_value_mode).strip().lower()
     MODEL_SPECS["final_soc_mode"] = str(args.final_soc_mode)
-    enforce_final_soc_min = bool(args.final_soc_mode == "hard")
+    enforce_final_soc_min = _resolve_final_soc_policy(
+        strict_simulation_validity=bool(args.strict_simulation_validity),
+        final_soc_mode=str(args.final_soc_mode),
+        enforce_final_soc_min_flag=bool(args.enforce_final_soc_min),
+        allow_terminal_soc_repair_in_strict=bool(args.allow_terminal_soc_repair_in_strict),
+    )
     backtester = BatteryBacktester()
     sweep_rows: list[dict[str, object]] = []
     if args.trading_strategy == "da_only":
@@ -1342,7 +1610,25 @@ def main() -> None:
         allowed_markets = ("DA", "aFRR")
     strategy_root = out_dir / args.trading_strategy
 
-    for scenario_name, scenario_warehouse in scenarios:
+    for scenario_name, scenario_warehouse, scenario_bins in scenarios:
+        backtester.afrr_quantile_bins = list(scenario_bins)
+        backtester.afrr_quantile_prob = {
+            q: 1.0 - float(q.replace("p", "")) / 100.0 for q in backtester.afrr_quantile_bins
+        }
+        materialized_p50_from_predicted_value_count = 0.0
+        materialized_p50_targets: list[str] = []
+        if scenario_warehouse is not None:
+            for target_name, sdf in scenario_warehouse.items():
+                if "materialized_p50_from_predicted_value" not in sdf.columns:
+                    continue
+                cnt = float(
+                    pd.to_numeric(sdf["materialized_p50_from_predicted_value"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+                if cnt > 0.0:
+                    materialized_p50_from_predicted_value_count += cnt
+                    materialized_p50_targets.append(str(target_name))
         scenario_out_dir = strategy_root if scenario_name == "default" and not quantile_pairs else strategy_root / scenario_name
         output_was_cleaned = _prepare_scenario_output_dir(
             scenario_out_dir=scenario_out_dir,
@@ -1386,10 +1672,29 @@ def main() -> None:
         reserve_commitment_debug_path = scenario_out_dir / "reserve_commitment_debug.csv"
         invalid_headroom_debug_path = scenario_out_dir / "invalid_headroom_debug.csv"
         optimization_failure_debug_path = scenario_out_dir / "optimization_failure_debug.csv"
+        protected_soc_forensics_path = scenario_out_dir / "protected_soc_forensics.csv"
         optimization_infeasibility_attribution_path = scenario_out_dir / "optimization_infeasibility_attribution.csv"
+        afrr_bin_ev_audit_path = scenario_out_dir / "afrr_bid_bin_ev_audit.csv"
 
         with _phase_watchdog("write_hourly"):
             outputs.hourly.to_parquet(hourly_path, index=False)
+        ev_audit_stats = {
+            "ev_audit_row_count": 0.0,
+            "ev_audit_max_bcm_formula_error": 0.0,
+            "ev_audit_max_bem_formula_error": 0.0,
+        }
+        if bool(args.export_afrr_bin_ev_audit):
+            ev_audit = _build_afrr_bin_ev_audit(
+                hourly=outputs.hourly,
+                scenario_name=scenario_name,
+                active_bins=list(scenario_bins),
+                backtester=backtester,
+                timestamp_col=colmap.timestamp,
+            )
+            if not ev_audit.empty:
+                ev_audit.to_csv(afrr_bin_ev_audit_path, index=False)
+            ev_audit_stats = _validate_afrr_bin_ev_audit(ev_audit, tol=1e-6)
+            outputs.summary.update(ev_audit_stats)
         planned_cols = [c for c in [
             colmap.timestamp, "charge_mw", "discharge_mw", "reserve_pos_mw", "reserve_neg_mw", "soc_lp_mwh",
             "planned_soc_mwh", "aFRR_Capacity_Won_Pos_MW", "aFRR_Capacity_Won_Neg_MW", "aFRR_Capacity_Won_MW",
@@ -1679,6 +1984,51 @@ def main() -> None:
                 bad_opt = h.loc[h[err_col].fillna("ok").astype(str).str.lower().ne("ok"), reserve_debug_cols].copy() if reserve_debug_cols else pd.DataFrame()
                 if not bad_opt.empty:
                     bad_opt.to_csv(optimization_failure_debug_path, index=False)
+            invalid_reason_txt = str(outputs.summary.get("invalid_reason", "") or "")
+            if "protected_soc" in invalid_reason_txt:
+                psv_pos = pd.to_numeric(
+                    h.get("real_protected_soc_violation_pos_mwh", h.get("protected_soc_violation_pos_mwh", 0.0)),
+                    errors="coerce",
+                ).fillna(0.0)
+                psv_neg = pd.to_numeric(
+                    h.get("real_protected_soc_violation_neg_mwh", h.get("protected_soc_violation_neg_mwh", 0.0)),
+                    errors="coerce",
+                ).fillna(0.0)
+                psv = psv_pos + psv_neg
+                bad_ps = h.loc[psv > 1e-9].copy()
+                if not bad_ps.empty:
+                    direction = np.where(
+                        (psv_pos.loc[bad_ps.index] > 1e-9) & (psv_neg.loc[bad_ps.index] > 1e-9),
+                        "both",
+                        np.where(psv_pos.loc[bad_ps.index] > 1e-9, "pos", np.where(psv_neg.loc[bad_ps.index] > 1e-9, "neg", "unknown")),
+                    )
+                    out_ps = pd.DataFrame(
+                        {
+                            "scenario": str(scenario_name),
+                            "timestamp_utc": pd.to_datetime(bad_ps[colmap.timestamp], utc=True, errors="coerce"),
+                            "direction": direction,
+                            "violation_mwh": psv.loc[bad_ps.index].to_numpy(dtype=float),
+                            "soc_start_mwh": pd.to_numeric(bad_ps.get("real_soc_start_mwh", bad_ps.get("soc_start_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "soc_after_executed_mwh": pd.to_numeric(bad_ps.get("real_soc_mwh", bad_ps.get("soc_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "protected_soc_min_mwh": pd.to_numeric(bad_ps.get("real_protected_soc_min_mwh", bad_ps.get("protected_soc_min_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "protected_soc_max_mwh": pd.to_numeric(bad_ps.get("real_protected_soc_max_mwh", bad_ps.get("protected_soc_max_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "locked_reserve_pos_mw": pd.to_numeric(bad_ps.get("real_locked_reserve_pos_mw", bad_ps.get("locked_reserve_pos_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "locked_reserve_neg_mw": pd.to_numeric(bad_ps.get("real_locked_reserve_neg_mw", bad_ps.get("locked_reserve_neg_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "awarded_or_executed_reserve_pos_mw": pd.to_numeric(bad_ps.get("real_reserve_pos_mw", bad_ps.get("reserve_pos_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "awarded_or_executed_reserve_neg_mw": pd.to_numeric(bad_ps.get("real_reserve_neg_mw", bad_ps.get("reserve_neg_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "bem_only_pos_mw": pd.to_numeric(bad_ps.get("real_bem_only_submitted_pos_mw", bad_ps.get("bem_only_submitted_pos_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "bem_only_neg_mw": pd.to_numeric(bad_ps.get("real_bem_only_submitted_neg_mw", bad_ps.get("bem_only_submitted_neg_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "da_charge_mw": pd.to_numeric(bad_ps.get("real_da_charge_mw", bad_ps.get("da_charge_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "da_discharge_mw": pd.to_numeric(bad_ps.get("real_da_discharge_mw", bad_ps.get("da_discharge_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "id_charge_mw": pd.to_numeric(bad_ps.get("real_id_charge_mw", bad_ps.get("id_charge_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "id_discharge_mw": pd.to_numeric(bad_ps.get("real_id_discharge_mw", bad_ps.get("id_discharge_mw", 0.0)), errors="coerce").fillna(0.0),
+                            "act_pos_mwh": pd.to_numeric(bad_ps.get("real_act_pos_mwh", bad_ps.get("act_pos_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "act_neg_mwh": pd.to_numeric(bad_ps.get("real_act_neg_mwh", bad_ps.get("act_neg_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "aux_energy_mwh": pd.to_numeric(bad_ps.get("real_aux_energy_mwh", bad_ps.get("aux_energy_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "suspected_cause": "submitted_without_locked_obligation" ,
+                        }
+                    )
+                    out_ps.to_csv(protected_soc_forensics_path, index=False)
 
         attrib_df = _build_optimization_infeasibility_attribution(
             hourly=outputs.hourly,
@@ -1844,6 +2194,11 @@ def main() -> None:
             "canonical_economic_targets": json.dumps(
                 [k for k, v in target_value_modes.items() if str(v).strip().lower() == "canonical_economic"]
             ),
+            "materialized_p50_from_predicted_value_count": float(materialized_p50_from_predicted_value_count),
+            "materialized_p50_targets": json.dumps(sorted(set(materialized_p50_targets))),
+            "ev_audit_row_count": float(ev_audit_stats.get("ev_audit_row_count", 0.0)),
+            "ev_audit_max_bcm_formula_error": float(ev_audit_stats.get("ev_audit_max_bcm_formula_error", 0.0)),
+            "ev_audit_max_bem_formula_error": float(ev_audit_stats.get("ev_audit_max_bem_formula_error", 0.0)),
         }
         defaulted_fields: list[str] = []
         for k, v in defaults.items():
@@ -2110,6 +2465,17 @@ def main() -> None:
             print("- final_soc_economic_repair_check: OK")
         else:
             print("[WARN] final_soc_economic_repair_check: NOT MET")
+        print(
+            "- validity: "
+            f"simulation_valid={float(outputs.summary.get('simulation_valid', float('nan'))):.0f}, "
+            f"thesis_reportable={float(outputs.summary.get('thesis_reportable', float('nan'))):.0f}, "
+            f"invalid_reason={str(outputs.summary.get('invalid_reason', '')) or 'none'}"
+        )
+        print(
+            "- fallback/solver: "
+            f"fallback_used={float(outputs.summary.get('fallback_used', 0.0)):.0f}, "
+            f"optimization_error_code_counts={outputs.summary.get('optimization_error_code_counts', '{}')}"
+        )
         missed_cap_pos = pd.to_numeric(
             pd.Series([outputs.summary.get("total_missed_capacity_pos_mw", 0.0)]),
             errors="coerce",
@@ -2170,6 +2536,7 @@ def main() -> None:
             q_lo, q_hi = scenario_name.split("_", 1)
             row["quantile_low"] = q_lo
             row["quantile_high"] = q_hi
+            row["afrr_bid_quantile_bins"] = ",".join(_expand_quantile_range(q_lo, q_hi))
         sweep_rows.append(row)
 
     global_plan_history_path = Path("artifacts/backtest_plan_history.parquet")
@@ -2280,6 +2647,9 @@ def main() -> None:
                 "realized_vs_perfect_foresight_pct",
                 "realized_vs_perfect_foresight_comparable_market_pct",
                 "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
+                "simulation_valid",
+                "thesis_reportable",
+                "invalid_reason",
             ]
             if c in overview.columns
         ]
@@ -2316,6 +2686,11 @@ def main() -> None:
             f"[OK] Validity stats: total={total_scenarios}, valid={valid_scenarios}, "
             f"invalid={invalid_scenarios}, invalid_rate={invalid_rate_pct:.2f}%"
         )
+        if bool(args.strict_simulation_validity) and invalid_scenarios > 0 and not bool(args.allow_invalid_output):
+            raise SystemExit(
+                "Strict validity failed: one or more scenarios are invalid/non-reportable. "
+                "Artifacts were written. Re-run with --allow-invalid-output for diagnostic runs."
+            )
 
 
 if __name__ == "__main__":

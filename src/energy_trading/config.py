@@ -8,7 +8,7 @@ MODEL_SPECS = {
     # 0.25 means 15 minutes within a 1-hour optimization step.
     "min_activation_headroom_fraction": 0.25,
     "market_scope": "DE_LU",  # Sign/settlement convention scope
-    "terminal_soc_value_discount": 0.8,  # Discount for terminal SoC value in objective
+    "terminal_soc_value_discount": 1,  # Discount for terminal SoC value in objective
     # Hard headroom assumptions for reserve/activation deliverability (hours).
     # 0.5h means full awarded MW must be energetically deliverable for 30 minutes.
     "reserve_activation_headroom_h": 0.5,

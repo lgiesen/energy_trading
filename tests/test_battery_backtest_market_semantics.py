@@ -29,7 +29,9 @@ from energy_trading.simulation.market_clearing import MarketClearingEngine  # no
 from scripts.run_battery_backtest import (  # noqa: E402
     _build_optimization_infeasibility_attribution,
     _prepare_scenario_output_dir,
+    _resolve_final_soc_policy,
     _suspected_infeasibility_driver_from_row,
+    _target_value_modes_from_manifest,
     optional_numeric_series,
     require_numeric_series,
 )
@@ -160,6 +162,242 @@ def test_simulation_forecast_loader_canonical_activation_neg_no_flip(tmp_path: P
     assert np.isclose(float(out["p10"]), 10.0)
     assert np.isclose(float(out["p90"]), 100.0)
     assert np.isclose(float(out["predicted_value"]), 50.0)
+
+
+def test_manifest_target_value_modes_applied_to_loader_post_load(tmp_path: Path) -> None:
+    p = tmp_path / "neg_from_manifest.parquet"
+    pd.DataFrame(
+        {
+            "snapshot_time_utc": [pd.Timestamp("2026-01-01T00:00:00Z")],
+            "target_time_utc": [pd.Timestamp("2026-01-01T01:00:00Z")],
+            "lead_time_h": [1],
+            "predicted_value": [50.0],
+            "p10": [10.0],
+            "p30": [20.0],
+            "p50": [50.0],
+            "p70": [80.0],
+            "p90": [100.0],
+        }
+    ).to_parquet(p, index=False)
+    payload = {
+        "target_value_mode": {
+            "pred_afrr_activation_price_neg": "canonical_economic",
+        }
+    }
+    modes = _target_value_modes_from_manifest(payload)
+    wh = load_prediction_warehouse_long(
+        {"pred_afrr_activation_price_neg": p},
+        target_value_modes=modes,
+    )
+    out = wh["pred_afrr_activation_price_neg"].iloc[0]
+    assert np.isclose(float(out["p10"]), 10.0)
+    assert np.isclose(float(out["p90"]), 100.0)
+
+
+def test_resolve_final_soc_policy_strict_terminal_repair_refused() -> None:
+    with pytest.raises(ValueError, match="Strict mode requires --final-soc-mode hard"):
+        _resolve_final_soc_policy(
+            strict_simulation_validity=True,
+            final_soc_mode="terminal_repair",
+            enforce_final_soc_min_flag=True,
+            allow_terminal_soc_repair_in_strict=False,
+        )
+
+
+def test_resolve_final_soc_policy_hard_or_enforce_flag() -> None:
+    assert _resolve_final_soc_policy(
+        strict_simulation_validity=True,
+        final_soc_mode="hard",
+        enforce_final_soc_min_flag=False,
+        allow_terminal_soc_repair_in_strict=False,
+    )
+    assert _resolve_final_soc_policy(
+        strict_simulation_validity=False,
+        final_soc_mode="terminal_repair",
+        enforce_final_soc_min_flag=True,
+        allow_terminal_soc_repair_in_strict=False,
+    )
+
+
+def test_simulation_forecast_loader_missing_p50_fails_by_default(tmp_path: Path) -> None:
+    p = tmp_path / "missing_p50.parquet"
+    pd.DataFrame(
+        {
+            "snapshot_time_utc": [pd.Timestamp("2026-01-01T00:00:00Z")],
+            "target_time_utc": [pd.Timestamp("2026-01-01T01:00:00Z")],
+            "lead_time_h": [1],
+            "predicted_value": [42.0],
+            "p10": [10.0],
+            "p30": [30.0],
+            "p70": [70.0],
+            "p90": [90.0],
+        }
+    ).to_parquet(p, index=False)
+    with pytest.raises(KeyError, match="missing required quantile column 'p50'"):
+        load_prediction_warehouse_long({"pred_afrr_activation_price_pos": p})
+
+
+def test_simulation_forecast_loader_materializes_p50_only_with_explicit_flag(tmp_path: Path) -> None:
+    p = tmp_path / "missing_p50_optin.parquet"
+    pd.DataFrame(
+        {
+            "snapshot_time_utc": [pd.Timestamp("2026-01-01T00:00:00Z")],
+            "target_time_utc": [pd.Timestamp("2026-01-01T01:00:00Z")],
+            "lead_time_h": [1],
+            "predicted_value": [42.0],
+            "p10": [10.0],
+            "p30": [30.0],
+            "p70": [70.0],
+            "p90": [90.0],
+        }
+    ).to_parquet(p, index=False)
+    wh = load_prediction_warehouse_long(
+        {"pred_afrr_activation_price_pos": p},
+        allow_p50_materialization_from_predicted_value=True,
+    )
+    out = wh["pred_afrr_activation_price_pos"].iloc[0]
+    assert np.isclose(float(out["p50"]), 42.0)
+    assert np.isclose(float(out["materialized_p50_from_predicted_value"]), 1.0)
+
+
+def _write_long_pred(
+    path: Path,
+    *,
+    ts: pd.DatetimeIndex,
+    predicted_value: float,
+    quantiles: dict[str, float],
+) -> None:
+    snap = pd.Timestamp(ts.min()).tz_convert("UTC") - pd.Timedelta(hours=6)
+    df = pd.DataFrame(
+        {
+            "snapshot_time_utc": [snap] * len(ts),
+            "target_time_utc": ts,
+            "lead_time_h": [1] * len(ts),
+            "predicted_value": [predicted_value] * len(ts),
+        }
+    )
+    for q, v in quantiles.items():
+        df[q] = [v] * len(ts)
+    df.to_parquet(path, index=False)
+
+
+def test_strict_preparation_materializes_activation_price_p50_into_optimize_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.afrr_quantile_bins = ["p30", "p50", "p70"]
+    bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
+    base_df, col = _tiny_backtest_df(hours=4)
+    drop_cols = [
+        c
+        for c in base_df.columns
+        if c.startswith(f"{col.pred_afrr_activation_price_pos}_")
+        or c.startswith(f"{col.pred_afrr_activation_price_neg}_")
+    ]
+    base_df = base_df.drop(columns=drop_cols, errors="ignore")
+    ts = pd.to_datetime(base_df[col.timestamp], utc=True)
+    files: dict[str, Path] = {}
+    for target in [
+        "pred_da_price",
+        "pred_afrr_capacity_price_pos",
+        "pred_afrr_capacity_price_neg",
+        "pred_afrr_activation_rate_pos",
+        "pred_afrr_activation_rate_neg",
+    ]:
+        p = tmp_path / f"{target}.parquet"
+        _write_long_pred(
+            p,
+            ts=ts,
+            predicted_value=1.0,
+            quantiles={"p30": 0.8, "p50": 1.0, "p70": 1.2},
+        )
+        files[target] = p
+    for target in ["pred_afrr_activation_price_pos", "pred_afrr_activation_price_neg"]:
+        p = tmp_path / f"{target}.parquet"
+        _write_long_pred(
+            p,
+            ts=ts,
+            predicted_value=10.0,
+            quantiles={"p30": 8.0, "p70": 12.0},
+        )
+        files[target] = p
+    warehouse = load_prediction_warehouse_long(
+        files,
+        target_value_modes={"pred_afrr_activation_price_neg": "canonical_economic"},
+        allow_p50_materialization_from_predicted_value=True,
+    )
+    seen_cols: list[set[str]] = []
+    orig_opt = bt.optimize_dispatch
+
+    def _wrapped_opt(df: pd.DataFrame, *args, **kwargs):
+        seen_cols.append(set(df.columns))
+        return orig_opt(df, *args, **kwargs)
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _wrapped_opt)
+    bt.run(
+        base_df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=4,
+        reopt_step_hours=1,
+        forecast_warehouse=warehouse,
+        strict_simulation_validity=True,
+        enable_global_perfect_foresight=False,
+    )
+    assert seen_cols, "optimize_dispatch should be called at least once"
+    assert f"{col.pred_afrr_activation_price_pos}_p50" in seen_cols[0]
+    assert f"{col.pred_afrr_activation_price_neg}_p50" in seen_cols[0]
+
+
+def test_strict_preparation_fails_for_missing_non_p50_active_bin(tmp_path: Path) -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.afrr_quantile_bins = ["p30", "p50", "p70"]
+    bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
+    base_df, col = _tiny_backtest_df(hours=4)
+    drop_cols = [
+        c
+        for c in base_df.columns
+        if c.startswith(f"{col.pred_afrr_activation_price_pos}_")
+        or c.startswith(f"{col.pred_afrr_activation_price_neg}_")
+    ]
+    base_df = base_df.drop(columns=drop_cols, errors="ignore")
+    ts = pd.to_datetime(base_df[col.timestamp], utc=True)
+    files: dict[str, Path] = {}
+    for target in [
+        "pred_da_price",
+        "pred_afrr_capacity_price_pos",
+        "pred_afrr_capacity_price_neg",
+        "pred_afrr_activation_rate_pos",
+        "pred_afrr_activation_rate_neg",
+        "pred_afrr_activation_price_pos",
+        "pred_afrr_activation_price_neg",
+    ]:
+        p = tmp_path / f"{target}.parquet"
+        qmap = {"p30": 8.0, "p50": 10.0}
+        if "rate" in target:
+            qmap = {"p30": 0.2, "p50": 0.3}
+        _write_long_pred(
+            p,
+            ts=ts,
+            predicted_value=10.0,
+            quantiles=qmap,
+        )
+        files[target] = p
+    warehouse = load_prediction_warehouse_long(
+        files,
+        target_value_modes={"pred_afrr_activation_price_neg": "canonical_economic"},
+    )
+    with pytest.raises(ValueError, match="Missing required aFRR quantile-bin inputs in strict mode"):
+        bt.run(
+            base_df,
+            col,
+            use_rolling_horizon=True,
+            horizon_hours=4,
+            reopt_step_hours=1,
+            forecast_warehouse=warehouse,
+            strict_simulation_validity=True,
+            enable_global_perfect_foresight=False,
+        )
 
 
 def test_simulation_forecast_loader_clips_activation_rates() -> None:
@@ -461,18 +699,26 @@ def test_idle_case_optimizer_can_choose_zero_volume() -> None:
 
 
 def test_da_only_dominance_prefers_da_discharge() -> None:
-    bt = _mk_backtester()
-    df, col = _one_hour_pred_df(
-        da=400.0,
-        cap_pos=0.0,
-        cap_neg=0.0,
-        act_pos=0.0,
-        act_neg=0.0,
-        rate_pos=0.0,
-        rate_neg=0.0,
-    )
-    out = bt.optimize_dispatch(df, col, allowed_markets=("DA",))
-    assert float(out["discharge_mw"].iloc[0]) > 0.0
+    old_discount = MODEL_SPECS.get("terminal_soc_value_discount", None)
+    try:
+        MODEL_SPECS["terminal_soc_value_discount"] = 0.0
+        bt = _mk_backtester()
+        df, col = _one_hour_pred_df(
+            da=400.0,
+            cap_pos=0.0,
+            cap_neg=0.0,
+            act_pos=0.0,
+            act_neg=0.0,
+            rate_pos=0.0,
+            rate_neg=0.0,
+        )
+        out = bt.optimize_dispatch(df, col, allowed_markets=("DA",))
+        assert float(out["discharge_mw"].iloc[0]) > 0.0
+    finally:
+        if old_discount is None:
+            MODEL_SPECS.pop("terminal_soc_value_discount", None)
+        else:
+            MODEL_SPECS["terminal_soc_value_discount"] = old_discount
     assert np.isclose(float(out["reserve_pos_mw"].iloc[0]), 0.0)
     assert np.isclose(float(out["reserve_neg_mw"].iloc[0]), 0.0)
 
@@ -2624,6 +2870,115 @@ def test_hard_final_soc_mode_invalidates_shortfall() -> None:
         assert float(s.get("simulation_valid", 1.0)) == 0.0
 
 
+def test_hard_mode_final_soc_slack_not_used() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=8,
+        reopt_step_hours=1,
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+    )
+    assert float(out.summary.get("final_soc_slack_used_mwh", 0.0)) <= 1e-9
+
+
+def test_hard_mode_reaches_target_when_feasible() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=8)
+    # Encourage charging to satisfy terminal SoC hard floor.
+    df[col.pred_da_price] = -100.0
+    df[col.true_da_price] = -100.0
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=8,
+        reopt_step_hours=1,
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+    )
+    assert float(out.summary.get("final_soc_physical_check_pass", 0.0)) >= 0.5
+
+
+def test_strict_hard_mode_never_drops_terminal_constraint_in_fallback() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=6)
+    calls: list[float | None] = []
+    original_opt = bt.optimize_dispatch
+
+    def _wrapped(*args, **kwargs):
+        calls.append(kwargs.get("soc_end_min_target"))
+        return original_opt(*args, **kwargs)
+
+    bt.optimize_dispatch = _wrapped  # type: ignore[method-assign]
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=6,
+        reopt_step_hours=1,
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+    )
+    assert all(v is not None for v in calls)
+    assert float(out.summary.get("terminal_constraint_dropped", 0.0)) == 0.0
+
+
+def test_terminal_repair_mode_not_thesis_reportable_when_physical_shortfall() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "terminal_repair"
+    df, col = _tiny_backtest_df(hours=6)
+    df[col.pred_da_price] = 200.0
+    df[col.true_da_price] = 120.0
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=6,
+        reopt_step_hours=1,
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+    )
+    s = out.summary
+    if float(s.get("final_soc_physical_check_pass", 1.0)) < 0.5:
+        assert float(s.get("thesis_reportable", 1.0)) == 0.0
+
+
+def test_terminal_soc_value_discount_does_not_replace_hard_final_soc() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=4)
+    orig_target = bt.soc_target_end
+    orig_discount = MODEL_SPECS.get("terminal_soc_value_discount", None)
+    try:
+        bt.soc_target_end = float(bt.soc_max) + 5.0  # physically infeasible
+        MODEL_SPECS["terminal_soc_value_discount"] = 1.0
+        out = bt.run(
+            df,
+            col,
+            use_rolling_horizon=True,
+            horizon_hours=4,
+            reopt_step_hours=1,
+            strict_simulation_validity=True,
+            enforce_final_soc_min=True,
+        )
+        s = out.summary
+        assert float(s.get("final_soc_physical_check_pass", 1.0)) == 0.0
+        assert float(s.get("thesis_reportable", 1.0)) == 0.0
+    finally:
+        bt.soc_target_end = orig_target
+        if orig_discount is None:
+            MODEL_SPECS.pop("terminal_soc_value_discount", None)
+        else:
+            MODEL_SPECS["terminal_soc_value_discount"] = orig_discount
+
+
 def test_console_final_soc_reports_physical_and_economic_status() -> None:
     txt = Path("scripts/run_battery_backtest.py").read_text(encoding="utf-8")
     assert "final_soc_physical_check" in txt
@@ -2982,6 +3337,44 @@ def test_no_thesis_reportable_with_protected_soc_violation() -> None:
         assert "protected_soc" in str(s.get("invalid_reason", ""))
 
 
+def test_submitted_bem_only_without_locked_obligation_does_not_activate_protected_envelope() -> None:
+    bt = _mk_backtester()
+    psv = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=4.0,
+        required_headroom_pos_mwh=0.0,
+        required_headroom_neg_mwh=0.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        committed_bem_pos_mw=4.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=4.0,
+        reserve_neg_mw=0.0,
+    )
+    assert float(psv["obligation_headroom_pos_active"]) == 0.0
+    assert np.isclose(float(psv["protected_soc_min_mwh"]), bt.soc_min)
+    assert np.isclose(float(psv["protected_soc_max_mwh"]), bt.soc_max)
+    assert float(psv["protected_soc_violation_pos_mwh"]) == 0.0
+
+
+def test_locked_obligation_still_activates_protected_envelope() -> None:
+    bt = _mk_backtester()
+    req_pos = 2.0 * bt.reserve_activation_headroom_h / max(bt.eta_out, 1e-12)
+    psv = bt._compute_obligation_driven_protected_soc_bounds(
+        soc_start_mwh=bt.soc_min + req_pos - 0.1,
+        required_headroom_pos_mwh=req_pos,
+        required_headroom_neg_mwh=0.0,
+        locked_reserve_pos_mw=2.0,
+        locked_reserve_neg_mw=0.0,
+        committed_bem_pos_mw=0.0,
+        committed_bem_neg_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+    )
+    assert float(psv["obligation_headroom_pos_active"]) == 1.0
+    assert float(psv["protected_soc_min_mwh"]) > bt.soc_min
+    assert float(psv["protected_soc_violation_pos_mwh"]) > 0.0
+
+
 def test_precommit_ev_includes_headroom_cost() -> None:
     bt = _mk_backtester()
     bt.reserve_min_margin_after_bid_mwh = 0.0
@@ -3304,6 +3697,22 @@ def test_invalid_reason_includes_infeasible_debug_dump_only_for_accepted_path() 
     if float(s.get("accepted_path_infeasible_debug_dump_count", 0.0)) > 0.5:
         invalid_reason = ",".join([v for v in [invalid_reason, "optimization_infeasible_debug_dump"] if v])
     assert "optimization_infeasible_debug_dump" not in invalid_reason
+
+
+def test_summary_includes_input_vs_optimized_row_diagnostics() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=6)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, strict_simulation_validity=True)
+    s = out.summary
+    for k in [
+        "input_row_count",
+        "optimized_hour_count",
+        "first_input_timestamp_utc",
+        "first_optimized_target_timestamp_utc",
+        "dropped_initial_rows_due_to_forecast_target_alignment",
+    ]:
+        assert k in s
+    assert float(s["input_row_count"]) >= float(s["optimized_hour_count"])
 
 
 def test_validator_required_fields_include_debug_dump_schema() -> None:
