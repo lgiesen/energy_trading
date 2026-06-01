@@ -415,6 +415,427 @@ def _resolve_out_dir(
     return out
 
 
+def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _safe_ratio(num: float, den: float) -> float:
+    return float(num / den) if abs(float(den)) > 1e-12 else float("nan")
+
+
+def _infer_dt_hours(hourly: pd.DataFrame) -> float:
+    if "timestamp_utc" not in hourly.columns or hourly.empty:
+        return 1.0
+    ts = pd.to_datetime(hourly["timestamp_utc"], utc=True, errors="coerce").dropna().sort_values()
+    if len(ts) < 2:
+        return 1.0
+    diffs_h = ts.diff().dt.total_seconds().dropna() / 3600.0
+    diffs_h = diffs_h[(diffs_h > 0.0) & np.isfinite(diffs_h)]
+    if diffs_h.empty:
+        return 1.0
+    dt_h = float(diffs_h.median())
+    return dt_h if dt_h > 0.0 else 1.0
+
+
+def _build_performance_metrics(
+    *,
+    hourly: pd.DataFrame,
+    summary: dict[str, object],
+    args: argparse.Namespace,
+    scenario_name: str,
+    scenario_bins: list[str],
+    scenario_start_utc: pd.Timestamp | None,
+    scenario_end_utc: pd.Timestamp | None,
+) -> tuple[pd.DataFrame, list[str]]:
+    warnings: list[str] = []
+    dt_h = _infer_dt_hours(hourly)
+    ts = pd.to_datetime(hourly.get("timestamp_utc", pd.Series(dtype="datetime64[ns, UTC]")), utc=True, errors="coerce")
+    if ts.notna().any():
+        start = ts.min()
+        end = ts.max()
+        n_hours = int(ts.notna().sum())
+        n_days = max(float((end - start).total_seconds() / 86400.0) + (1.0 / 24.0), 1e-12)
+    else:
+        start = scenario_start_utc
+        end = scenario_end_utc
+        n_hours = int(len(hourly))
+        n_days = max(float(n_hours / 24.0), 1e-12)
+    annualization_factor = float(365.0 / n_days)
+    p_max_mw = float(pd.to_numeric(pd.Series([summary.get("p_max_mw", np.nan)]), errors="coerce").iloc[0])
+    cap_mwh = float(pd.to_numeric(pd.Series([summary.get("capacity_mwh", np.nan)]), errors="coerce").iloc[0])
+    if not np.isfinite(p_max_mw) or p_max_mw <= 0.0:
+        p_max_mw = float("nan")
+        warnings.append("missing_or_invalid:p_max_mw")
+    if not np.isfinite(cap_mwh) or cap_mwh <= 0.0:
+        cap_mwh = float("nan")
+        warnings.append("missing_or_invalid:capacity_mwh")
+
+    realized_net = float(pd.to_numeric(pd.Series([summary.get("realized_total_pnl_eur", np.nan)]), errors="coerce").iloc[0])
+    predicted_net = float(pd.to_numeric(pd.Series([summary.get("predicted_total_pnl_eur", np.nan)]), errors="coerce").iloc[0])
+
+    da_gross_revenue = float(pd.to_numeric(pd.Series([summary.get("total_da_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    da_gross_cost = float(pd.to_numeric(pd.Series([summary.get("total_da_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    id_gross_revenue = float(pd.to_numeric(pd.Series([summary.get("total_id_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    id_gross_cost = float(pd.to_numeric(pd.Series([summary.get("total_id_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    bcm_capacity_revenue = float(pd.to_numeric(pd.Series([summary.get("total_afrr_capacity_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    bcm_linked_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_bcm_linked_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    bem_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_bem_only_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+
+    realized_degradation_cost = float(pd.to_numeric(pd.Series([summary.get("total_degradation_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    realized_aux_cost = float(pd.to_numeric(pd.Series([summary.get("total_auxiliary_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    transaction_cost = float(pd.to_numeric(pd.Series([summary.get("total_transaction_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    offer_cost = float(pd.to_numeric(pd.Series([summary.get("total_offer_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    penalty_cost = float(pd.to_numeric(pd.Series([summary.get("total_penalty_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    terminal_soc_repair_cost = float(pd.to_numeric(pd.Series([summary.get("terminal_soc_repair_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+
+    da_net = da_gross_revenue - da_gross_cost
+    id_net = id_gross_revenue - id_gross_cost
+    bcm_offer_cost = offer_cost
+    bcm_strategy_total_revenue = bcm_capacity_revenue + bcm_linked_activation_revenue
+    bem_activation_cost = 0.0
+    bem_net = bem_activation_revenue - bem_activation_cost
+    afrr_capacity_revenue = bcm_capacity_revenue
+    afrr_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_afrr_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    afrr_activation_cost = 0.0
+    afrr_total_net_revenue = afrr_capacity_revenue + afrr_activation_revenue - afrr_activation_cost
+
+    gross_revenue_without_costs = da_gross_revenue + id_gross_revenue + afrr_capacity_revenue + afrr_activation_revenue
+    gross_market_costs = da_gross_cost + id_gross_cost + afrr_activation_cost
+    net_market_revenue_before_operational_costs = gross_revenue_without_costs - gross_market_costs
+    total_costs = realized_degradation_cost + realized_aux_cost + transaction_cost + offer_cost + penalty_cost + terminal_soc_repair_cost
+    reconciliation = realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs)
+
+    da_bid_buy_mwh_total = float((_num_series(hourly, "real_submitted_da_buy_mw") * dt_h).sum())
+    da_bid_sell_mwh_total = float((_num_series(hourly, "real_submitted_da_sell_mw") * dt_h).sum())
+    da_realized_buy_mwh_total = float(_num_series(hourly, "real_da_buy_mwh").sum())
+    da_realized_sell_mwh_total = float(_num_series(hourly, "real_da_sell_mwh").sum())
+    da_bid_abs_mwh_total = abs(da_bid_buy_mwh_total) + abs(da_bid_sell_mwh_total)
+    da_realized_abs_mwh_total = abs(da_realized_buy_mwh_total) + abs(da_realized_sell_mwh_total)
+
+    bem_bid_pos_mwh_total = float((_num_series(hourly, "real_bem_only_submitted_pos_mw") * dt_h).sum())
+    bem_bid_neg_mwh_total = float((_num_series(hourly, "real_bem_only_submitted_neg_mw") * dt_h).sum())
+    bem_realized_pos_mwh_total = float(_num_series(hourly, "real_bem_only_executed_pos_mwh").sum())
+    bem_realized_neg_mwh_total = float(_num_series(hourly, "real_bem_only_executed_neg_mwh").sum())
+    bem_bid_abs_mwh_total = abs(bem_bid_pos_mwh_total) + abs(bem_bid_neg_mwh_total)
+    bem_realized_abs_mwh_total = abs(bem_realized_pos_mwh_total) + abs(bem_realized_neg_mwh_total)
+
+    bcm_bid_capacity_pos_mw_mean = float(_num_series(hourly, "real_submitted_afrr_pos_mw").mean())
+    bcm_bid_capacity_neg_mw_mean = float(_num_series(hourly, "real_submitted_afrr_neg_mw").mean())
+    bcm_realized_capacity_pos_mw_mean = float(_num_series(hourly, "real_executed_reserve_pos_mw").mean())
+    bcm_realized_capacity_neg_mw_mean = float(_num_series(hourly, "real_executed_reserve_neg_mw").mean())
+    bcm_bid_capacity_abs_mw_mean = abs(bcm_bid_capacity_pos_mw_mean) + abs(bcm_bid_capacity_neg_mw_mean)
+    bcm_realized_capacity_abs_mw_mean = abs(bcm_realized_capacity_pos_mw_mean) + abs(bcm_realized_capacity_neg_mw_mean)
+
+    id_buy_mwh_total = float(_num_series(hourly, "real_id_buy_mwh").sum())
+    id_sell_mwh_total = float(_num_series(hourly, "real_id_sell_mwh").sum())
+    id_net_mwh_total = id_sell_mwh_total - id_buy_mwh_total
+    id_abs_mwh_total = abs(id_buy_mwh_total) + abs(id_sell_mwh_total)
+
+    throughput_mwh_total = float(_num_series(hourly, "real_throughput_mwh").sum()) if "real_throughput_mwh" in hourly.columns else float(
+        (_num_series(hourly, "real_da_buy_mwh").abs() + _num_series(hourly, "real_da_sell_mwh").abs() + _num_series(hourly, "real_id_buy_mwh").abs() + _num_series(hourly, "real_id_sell_mwh").abs() + _num_series(hourly, "real_act_pos_mwh").abs() + _num_series(hourly, "real_act_neg_mwh").abs()).sum()
+    )
+    eq_cycles_total = float(throughput_mwh_total / (2.0 * cap_mwh)) if np.isfinite(cap_mwh) and cap_mwh > 0 else float("nan")
+    mean_soc_mwh = float(_num_series(hourly, "real_soc_mwh").mean()) if "real_soc_mwh" in hourly.columns else float("nan")
+    min_soc_mwh = float(_num_series(hourly, "real_soc_mwh").min()) if "real_soc_mwh" in hourly.columns else float("nan")
+    max_soc_mwh = float(_num_series(hourly, "real_soc_mwh").max()) if "real_soc_mwh" in hourly.columns else float("nan")
+    final_soc_mwh = float(pd.to_numeric(pd.Series([summary.get("final_soc_actual_mwh", np.nan)]), errors="coerce").iloc[0])
+    target_final_soc_mwh = float(pd.to_numeric(pd.Series([summary.get("final_soc_target_mwh", np.nan)]), errors="coerce").iloc[0])
+    final_soc_shortfall_mwh = max(0.0, target_final_soc_mwh - final_soc_mwh) if np.isfinite(final_soc_mwh) and np.isfinite(target_final_soc_mwh) else float("nan")
+    final_soc_surplus_mwh = max(0.0, final_soc_mwh - target_final_soc_mwh) if np.isfinite(final_soc_mwh) and np.isfinite(target_final_soc_mwh) else float("nan")
+
+    additive_daily_fields = [
+        "realized_net_revenue_eur",
+        "da_gross_revenue_eur",
+        "da_gross_cost_eur",
+        "id_gross_revenue_eur",
+        "id_gross_cost_eur",
+        "bcm_capacity_revenue_eur",
+        "bcm_linked_activation_revenue_eur",
+        "bem_activation_revenue_eur",
+        "realized_degradation_cost_eur",
+        "realized_aux_cost_eur",
+        "transaction_cost_eur",
+        "penalty_cost_eur",
+        "throughput_mwh_total",
+        "da_bid_buy_mwh_total",
+        "da_bid_sell_mwh_total",
+        "da_realized_buy_mwh_total",
+        "da_realized_sell_mwh_total",
+        "bem_bid_pos_mwh_total",
+        "bem_bid_neg_mwh_total",
+        "bem_realized_pos_mwh_total",
+        "bem_realized_neg_mwh_total",
+        "id_buy_mwh_total",
+        "id_sell_mwh_total",
+        "id_net_mwh_total",
+        "id_abs_mwh_total",
+    ]
+    row = {
+        "performance_metrics_schema_version": "v1",
+        "model_name": str(args.model_key or "unknown"),
+        "model_key": str(args.model_key or ""),
+        "run_manifest": str(args.run_manifest or ""),
+        "split": str(args.split),
+        "trading_strategy": str(args.trading_strategy),
+        "id_recourse_mode": str(args.id_recourse_mode),
+        "scenario": str(scenario_name),
+        "quantile_pair": str(scenario_name),
+        "da_quantile_role": str(args.da_quantile_role),
+        "start_utc": str(start.isoformat() if pd.notna(start) else ""),
+        "end_utc": str(end.isoformat() if pd.notna(end) else ""),
+        "n_hours": float(n_hours),
+        "n_days": float(n_days),
+        "annualization_factor": annualization_factor,
+        "capacity_mwh": cap_mwh,
+        "p_max_mw": p_max_mw,
+        "simulation_valid": float(pd.to_numeric(pd.Series([summary.get("simulation_valid", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+        "thesis_reportable": float(pd.to_numeric(pd.Series([summary.get("thesis_reportable", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+        "invalid_reason": str(summary.get("invalid_reason", "")),
+        "realized_net_revenue_eur": realized_net,
+        "predicted_net_revenue_eur": predicted_net,
+        "annualized_realized_net_revenue_eur": realized_net * annualization_factor,
+        "annualized_predicted_net_revenue_eur": predicted_net * annualization_factor,
+        "realized_net_revenue_eur_per_mw": _safe_ratio(realized_net, p_max_mw),
+        "predicted_net_revenue_eur_per_mw": _safe_ratio(predicted_net, p_max_mw),
+        "annualized_realized_net_revenue_eur_per_mw": _safe_ratio(realized_net * annualization_factor, p_max_mw),
+        "annualized_predicted_net_revenue_eur_per_mw": _safe_ratio(predicted_net * annualization_factor, p_max_mw),
+        "da_gross_revenue_eur": da_gross_revenue,
+        "da_gross_cost_eur": da_gross_cost,
+        "da_net_revenue_eur": da_net,
+        "id_gross_revenue_eur": id_gross_revenue,
+        "id_gross_cost_eur": id_gross_cost,
+        "id_net_revenue_eur": id_net,
+        "bcm_capacity_revenue_eur": bcm_capacity_revenue,
+        "bcm_offer_cost_eur": bcm_offer_cost,
+        "bcm_linked_activation_revenue_eur": bcm_linked_activation_revenue,
+        "bcm_strategy_total_revenue_eur": bcm_strategy_total_revenue,
+        "bem_activation_revenue_eur": bem_activation_revenue,
+        "bem_activation_cost_eur": bem_activation_cost,
+        "bem_net_revenue_eur": bem_net,
+        "afrr_capacity_revenue_eur": afrr_capacity_revenue,
+        "afrr_activation_revenue_eur": afrr_activation_revenue,
+        "afrr_activation_cost_eur": afrr_activation_cost,
+        "afrr_total_net_revenue_eur": afrr_total_net_revenue,
+        "gross_revenue_without_costs_eur": gross_revenue_without_costs,
+        "gross_market_costs_eur": gross_market_costs,
+        "net_market_revenue_before_operational_costs_eur": net_market_revenue_before_operational_costs,
+        "realized_degradation_cost_eur": realized_degradation_cost,
+        "realized_aux_cost_eur": realized_aux_cost,
+        "transaction_cost_eur": transaction_cost,
+        "offer_cost_eur": offer_cost,
+        "penalty_cost_eur": penalty_cost,
+        "terminal_soc_repair_cost_eur": terminal_soc_repair_cost,
+        "total_costs_eur": total_costs,
+        "net_revenue_reconciliation_error_eur": reconciliation,
+        "da_bid_buy_mwh_total": da_bid_buy_mwh_total,
+        "da_bid_sell_mwh_total": da_bid_sell_mwh_total,
+        "da_realized_buy_mwh_total": da_realized_buy_mwh_total,
+        "da_realized_sell_mwh_total": da_realized_sell_mwh_total,
+        "da_bid_abs_mwh_total": da_bid_abs_mwh_total,
+        "da_realized_abs_mwh_total": da_realized_abs_mwh_total,
+        "da_bid_realized_ratio": _safe_ratio(da_realized_abs_mwh_total, da_bid_abs_mwh_total),
+        "bem_bid_pos_mwh_total": bem_bid_pos_mwh_total,
+        "bem_bid_neg_mwh_total": bem_bid_neg_mwh_total,
+        "bem_realized_pos_mwh_total": bem_realized_pos_mwh_total,
+        "bem_realized_neg_mwh_total": bem_realized_neg_mwh_total,
+        "bem_bid_abs_mwh_total": bem_bid_abs_mwh_total,
+        "bem_realized_abs_mwh_total": bem_realized_abs_mwh_total,
+        "bem_bid_realized_ratio": _safe_ratio(bem_realized_abs_mwh_total, bem_bid_abs_mwh_total),
+        "bcm_bid_capacity_pos_mw_mean": bcm_bid_capacity_pos_mw_mean,
+        "bcm_bid_capacity_neg_mw_mean": bcm_bid_capacity_neg_mw_mean,
+        "bcm_realized_capacity_pos_mw_mean": bcm_realized_capacity_pos_mw_mean,
+        "bcm_realized_capacity_neg_mw_mean": bcm_realized_capacity_neg_mw_mean,
+        "bcm_bid_capacity_abs_mw_mean": bcm_bid_capacity_abs_mw_mean,
+        "bcm_realized_capacity_abs_mw_mean": bcm_realized_capacity_abs_mw_mean,
+        "bcm_bid_realized_capacity_ratio": _safe_ratio(bcm_realized_capacity_abs_mw_mean, bcm_bid_capacity_abs_mw_mean),
+        "id_buy_mwh_total": id_buy_mwh_total,
+        "id_sell_mwh_total": id_sell_mwh_total,
+        "id_net_mwh_total": id_net_mwh_total,
+        "id_abs_mwh_total": id_abs_mwh_total,
+        "id_abs_mwh_mean_per_day": _safe_ratio(id_abs_mwh_total, n_days),
+        "id_mean_mw": _safe_ratio(id_abs_mwh_total, n_hours),
+        "throughput_mwh_total": throughput_mwh_total,
+        "throughput_mwh_per_day": _safe_ratio(throughput_mwh_total, n_days),
+        "equivalent_full_cycles_total": eq_cycles_total,
+        "equivalent_full_cycles_per_day": _safe_ratio(eq_cycles_total, n_days),
+        "mean_soc_mwh": mean_soc_mwh,
+        "mean_soc_pct": _safe_ratio(mean_soc_mwh, cap_mwh) * 100.0 if np.isfinite(mean_soc_mwh) else float("nan"),
+        "min_soc_mwh": min_soc_mwh,
+        "max_soc_mwh": max_soc_mwh,
+        "final_soc_mwh": final_soc_mwh,
+        "target_final_soc_mwh": target_final_soc_mwh,
+        "final_soc_shortfall_mwh": final_soc_shortfall_mwh,
+        "final_soc_surplus_mwh": final_soc_surplus_mwh,
+        "performance_metric_warnings": json.dumps(sorted(set(warnings))),
+        "metric_validation_tolerance_eur": 1e-6,
+        "daily_additive_metric_fields": json.dumps(additive_daily_fields),
+    }
+    for base in [
+        "da_bid_buy_mwh_total", "da_bid_sell_mwh_total", "da_realized_buy_mwh_total", "da_realized_sell_mwh_total",
+        "da_bid_abs_mwh_total", "da_realized_abs_mwh_total", "bem_bid_pos_mwh_total", "bem_bid_neg_mwh_total",
+        "bem_realized_pos_mwh_total", "bem_realized_neg_mwh_total", "bem_bid_abs_mwh_total", "bem_realized_abs_mwh_total",
+        "id_buy_mwh_total", "id_sell_mwh_total", "id_net_mwh_total", "id_abs_mwh_total", "throughput_mwh_total",
+        "equivalent_full_cycles_total",
+    ]:
+        row[f"{base}_per_day"] = _safe_ratio(float(row[base]), n_days)
+    row["net_revenue_reconciliation_ok"] = float(abs(reconciliation) <= 1e-6)
+    return pd.DataFrame([row]), warnings
+
+
+def _build_daily_performance_metrics(
+    *,
+    hourly: pd.DataFrame,
+    perf_row: pd.Series,
+) -> pd.DataFrame:
+    if hourly.empty:
+        return pd.DataFrame()
+    d = hourly.copy()
+    d["date_utc"] = pd.to_datetime(d.get("timestamp_utc"), utc=True, errors="coerce").dt.date.astype(str)
+    grp = d.groupby("date_utc", dropna=False)
+    dt_h = _infer_dt_hours(d)
+    out = pd.DataFrame(
+        {
+            "date_utc": grp.size().index,
+            "n_hours": grp.size().values.astype(float),
+            "da_gross_revenue_eur": grp["real_revenue_da_eur"].sum() if "real_revenue_da_eur" in d.columns else 0.0,
+            "da_gross_cost_eur": grp["real_cost_da_eur"].sum() if "real_cost_da_eur" in d.columns else 0.0,
+            "id_gross_revenue_eur": grp["real_revenue_id_eur"].sum() if "real_revenue_id_eur" in d.columns else 0.0,
+            "id_gross_cost_eur": grp["real_cost_id_eur"].sum() if "real_cost_id_eur" in d.columns else 0.0,
+            "afrr_capacity_revenue_eur": grp["real_revenue_capacity_eur"].sum() if "real_revenue_capacity_eur" in d.columns else 0.0,
+            "afrr_activation_revenue_eur": grp["real_revenue_activation_eur"].sum() if "real_revenue_activation_eur" in d.columns else 0.0,
+            "bem_activation_revenue_eur": grp["real_bem_only_activation_revenue_eur"].sum() if "real_bem_only_activation_revenue_eur" in d.columns else 0.0,
+            "degradation_cost_eur": grp["real_degradation_cost_eur"].sum() if "real_degradation_cost_eur" in d.columns else 0.0,
+            "aux_cost_eur": grp["real_aux_cost_eur"].sum() if "real_aux_cost_eur" in d.columns else 0.0,
+            "transaction_cost_eur": grp["real_transaction_cost_eur"].sum() if "real_transaction_cost_eur" in d.columns else 0.0,
+            "penalty_cost_eur": grp["real_penalty_eur"].sum() if "real_penalty_eur" in d.columns else 0.0,
+            "offer_cost_eur": 0.0,
+            "terminal_soc_repair_cost_eur": 0.0,
+            "net_revenue_eur": grp["real_pnl_eur"].sum() if "real_pnl_eur" in d.columns else 0.0,
+            "da_bid_buy_mwh": (grp["real_submitted_da_buy_mw"].sum() * dt_h) if "real_submitted_da_buy_mw" in d.columns else 0.0,
+            "da_bid_sell_mwh": (grp["real_submitted_da_sell_mw"].sum() * dt_h) if "real_submitted_da_sell_mw" in d.columns else 0.0,
+            "da_realized_buy_mwh": grp["real_da_buy_mwh"].sum() if "real_da_buy_mwh" in d.columns else 0.0,
+            "da_realized_sell_mwh": grp["real_da_sell_mwh"].sum() if "real_da_sell_mwh" in d.columns else 0.0,
+            "bem_bid_pos_mwh": (grp["real_bem_only_submitted_pos_mw"].sum() * dt_h) if "real_bem_only_submitted_pos_mw" in d.columns else 0.0,
+            "bem_bid_neg_mwh": (grp["real_bem_only_submitted_neg_mw"].sum() * dt_h) if "real_bem_only_submitted_neg_mw" in d.columns else 0.0,
+            "bem_realized_pos_mwh": grp["real_bem_only_executed_pos_mwh"].sum() if "real_bem_only_executed_pos_mwh" in d.columns else 0.0,
+            "bem_realized_neg_mwh": grp["real_bem_only_executed_neg_mwh"].sum() if "real_bem_only_executed_neg_mwh" in d.columns else 0.0,
+            "bcm_bid_capacity_pos_mw_mean": grp["real_submitted_afrr_pos_mw"].mean() if "real_submitted_afrr_pos_mw" in d.columns else float("nan"),
+            "bcm_bid_capacity_neg_mw_mean": grp["real_submitted_afrr_neg_mw"].mean() if "real_submitted_afrr_neg_mw" in d.columns else float("nan"),
+            "bcm_realized_capacity_pos_mw_mean": grp["real_executed_reserve_pos_mw"].mean() if "real_executed_reserve_pos_mw" in d.columns else float("nan"),
+            "bcm_realized_capacity_neg_mw_mean": grp["real_executed_reserve_neg_mw"].mean() if "real_executed_reserve_neg_mw" in d.columns else float("nan"),
+            "id_buy_mwh": grp["real_id_buy_mwh"].sum() if "real_id_buy_mwh" in d.columns else 0.0,
+            "id_sell_mwh": grp["real_id_sell_mwh"].sum() if "real_id_sell_mwh" in d.columns else 0.0,
+            "throughput_mwh": grp["real_throughput_mwh"].sum() if "real_throughput_mwh" in d.columns else float("nan"),
+            "mean_soc_mwh": grp["real_soc_mwh"].mean() if "real_soc_mwh" in d.columns else float("nan"),
+            "fallback_hours": grp["is_fallback_hour"].sum() if "is_fallback_hour" in d.columns else 0.0,
+        }
+    ).reset_index(drop=True)
+    if "throughput_mwh" in out.columns and np.isfinite(float(perf_row.get("equivalent_full_cycles_total", float("nan")))):
+        cap_mwh = float(perf_row.get("capacity_mwh", float("nan")))
+        if not np.isfinite(cap_mwh) or cap_mwh <= 0:
+            out["equivalent_full_cycles"] = float("nan")
+        else:
+            out["equivalent_full_cycles"] = out["throughput_mwh"] / (2.0 * cap_mwh)
+    else:
+        out["equivalent_full_cycles"] = float("nan")
+    out["simulation_valid"] = float(perf_row.get("simulation_valid", 0.0))
+    out["thesis_reportable"] = float(perf_row.get("thesis_reportable", 0.0))
+    out["invalid_reason"] = str(perf_row.get("invalid_reason", ""))
+    out["total_costs_eur"] = (
+        pd.to_numeric(out["degradation_cost_eur"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["aux_cost_eur"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["transaction_cost_eur"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["penalty_cost_eur"], errors="coerce").fillna(0.0)
+    )
+    out["has_fallback_hour"] = pd.to_numeric(out["fallback_hours"], errors="coerce").fillna(0.0) > 0.0
+    out["has_non_ok_optimization_hour"] = (
+        grp["optimization_error_code"].apply(lambda s: (~s.fillna("ok").astype(str).str.lower().eq("ok")).any()).to_numpy()
+        if "optimization_error_code" in d.columns
+        else False
+    )
+    return out
+
+
+def _write_performance_metric_definitions(path: Path) -> None:
+    defs = [
+        {"field": "realized_net_revenue_eur", "unit": "EUR", "formula": "sum(real_pnl_eur)", "source_columns": ["real_pnl_eur"], "kind": "realized_net"},
+        {"field": "annualized_realized_net_revenue_eur", "unit": "EUR/year", "formula": "realized_net_revenue_eur * 365 / n_days", "source_columns": ["realized_net_revenue_eur", "n_days"], "kind": "derived"},
+        {"field": "realized_net_revenue_eur_per_mw", "unit": "EUR/MW", "formula": "realized_net_revenue_eur / p_max_mw", "source_columns": ["realized_net_revenue_eur", "p_max_mw"], "kind": "derived"},
+        {"field": "equivalent_full_cycles_total", "unit": "cycles", "formula": "throughput_mwh_total / (2 * capacity_mwh)", "source_columns": ["throughput_mwh_total", "capacity_mwh"], "kind": "battery"},
+        {"field": "net_revenue_reconciliation_error_eur", "unit": "EUR", "formula": "realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs)", "source_columns": ["realized_net_revenue_eur", "gross_revenue_without_costs_eur", "gross_market_costs_eur", "total_costs_eur"], "kind": "validation"},
+        {"field": "da_bid_buy_mwh_total", "unit": "MWh", "formula": "sum(real_submitted_da_buy_mw * dt_h)", "source_columns": ["real_submitted_da_buy_mw", "timestamp_utc"], "kind": "volume"},
+        {"field": "bem_bid_pos_mwh_total", "unit": "MWh", "formula": "sum(real_bem_only_submitted_pos_mw * dt_h)", "source_columns": ["real_bem_only_submitted_pos_mw", "timestamp_utc"], "kind": "volume"},
+    ]
+    path.write_text(json.dumps(defs, indent=2), encoding="utf-8")
+
+
+def _validate_performance_metrics(
+    *,
+    perf_row: pd.Series,
+    daily_df: pd.DataFrame,
+    tolerance: float = 1e-6,
+) -> dict[str, object]:
+    checks: dict[str, object] = {}
+    recon_error = float(pd.to_numeric(pd.Series([perf_row.get("net_revenue_reconciliation_error_eur", np.nan)]), errors="coerce").iloc[0])
+    checks["net_revenue_reconciliation_ok"] = bool(np.isfinite(recon_error) and abs(recon_error) <= tolerance)
+    checks["cost_reconciliation_ok"] = bool(
+        abs(
+            float(pd.to_numeric(pd.Series([perf_row.get("total_costs_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+            - (
+                float(pd.to_numeric(pd.Series([perf_row.get("realized_degradation_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                + float(pd.to_numeric(pd.Series([perf_row.get("realized_aux_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                + float(pd.to_numeric(pd.Series([perf_row.get("transaction_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                + float(pd.to_numeric(pd.Series([perf_row.get("offer_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                + float(pd.to_numeric(pd.Series([perf_row.get("penalty_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                + float(pd.to_numeric(pd.Series([perf_row.get("terminal_soc_repair_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+            )
+        )
+        <= tolerance
+    )
+    if daily_df.empty:
+        checks["daily_to_scenario_reconciliation_ok"] = True
+        checks["daily_to_scenario_error_max_abs"] = 0.0
+        return checks
+
+    daily_error_max = 0.0
+    additive_map = {
+        "realized_net_revenue_eur": "net_revenue_eur",
+        "da_gross_revenue_eur": "da_gross_revenue_eur",
+        "da_gross_cost_eur": "da_gross_cost_eur",
+        "id_gross_revenue_eur": "id_gross_revenue_eur",
+        "id_gross_cost_eur": "id_gross_cost_eur",
+        "bcm_capacity_revenue_eur": "afrr_capacity_revenue_eur",
+        "bem_activation_revenue_eur": "bem_activation_revenue_eur",
+        "realized_degradation_cost_eur": "degradation_cost_eur",
+        "realized_aux_cost_eur": "aux_cost_eur",
+        "transaction_cost_eur": "transaction_cost_eur",
+        "penalty_cost_eur": "penalty_cost_eur",
+        "da_bid_buy_mwh_total": "da_bid_buy_mwh",
+        "da_bid_sell_mwh_total": "da_bid_sell_mwh",
+        "da_realized_buy_mwh_total": "da_realized_buy_mwh",
+        "da_realized_sell_mwh_total": "da_realized_sell_mwh",
+        "bem_bid_pos_mwh_total": "bem_bid_pos_mwh",
+        "bem_bid_neg_mwh_total": "bem_bid_neg_mwh",
+        "bem_realized_pos_mwh_total": "bem_realized_pos_mwh",
+        "bem_realized_neg_mwh_total": "bem_realized_neg_mwh",
+        "id_buy_mwh_total": "id_buy_mwh",
+        "id_sell_mwh_total": "id_sell_mwh",
+        "throughput_mwh_total": "throughput_mwh",
+    }
+    for scenario_col, daily_col in additive_map.items():
+        if daily_col not in daily_df.columns:
+            continue
+        scen_v = float(pd.to_numeric(pd.Series([perf_row.get(scenario_col, np.nan)]), errors="coerce").iloc[0])
+        day_v = float(pd.to_numeric(daily_df[daily_col], errors="coerce").fillna(0.0).sum())
+        if np.isfinite(scen_v):
+            daily_error_max = max(daily_error_max, abs(scen_v - day_v))
+    checks["daily_to_scenario_reconciliation_ok"] = bool(daily_error_max <= tolerance)
+    checks["daily_to_scenario_error_max_abs"] = float(daily_error_max)
+    return checks
+
+
 def _resolve_final_soc_policy(
     *,
     strict_simulation_validity: bool,
@@ -1898,6 +2319,8 @@ def main() -> None:
     )
     backtester = BatteryBacktester()
     sweep_rows: list[dict[str, object]] = []
+    perf_rows_all: list[pd.DataFrame] = []
+    daily_perf_rows_all: list[pd.DataFrame] = []
     resolved_id_mode = str(args.id_mode).strip().lower()
     resolved_id_recourse_mode = str(args.id_recourse_mode).strip().lower()
     if (
@@ -1979,6 +2402,10 @@ def main() -> None:
         monthly_path = scenario_out_dir / "backtest_monthly.csv"
         yearly_path = scenario_out_dir / "backtest_yearly.csv"
         summary_path = scenario_out_dir / "backtest_summary.json"
+        performance_json_path = scenario_out_dir / "performance_metrics.json"
+        performance_csv_path = scenario_out_dir / "performance_metrics.csv"
+        daily_performance_json_path = scenario_out_dir / "daily_performance_metrics.json"
+        daily_performance_csv_path = scenario_out_dir / "daily_performance_metrics.csv"
         state_machine_audit_path = scenario_out_dir / "state_machine_audit.json"
         diagnostics_path = scenario_out_dir / "backtest_diagnostics.json"
         diagnostics_txt_path = scenario_out_dir / "backtest_diagnostics.txt"
@@ -2602,6 +3029,38 @@ def main() -> None:
         outputs.summary["required_fields_computed"] = json.dumps(sorted(required_fields))
         with _phase_watchdog("write_summary_json"):
             summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+        with _phase_watchdog("write_performance_metrics"):
+            scenario_start_utc = pd.to_datetime(args.start, utc=True, errors="coerce") if args.start else None
+            scenario_end_utc = pd.to_datetime(args.end, utc=True, errors="coerce") if args.end else None
+            perf_df, _ = _build_performance_metrics(
+                hourly=outputs.hourly,
+                summary=outputs.summary,
+                args=args,
+                scenario_name=scenario_name,
+                scenario_bins=scenario_bins,
+                scenario_start_utc=scenario_start_utc,
+                scenario_end_utc=scenario_end_utc,
+            )
+            daily_df = _build_daily_performance_metrics(hourly=outputs.hourly, perf_row=perf_df.iloc[0])
+            checks = _validate_performance_metrics(perf_row=perf_df.iloc[0], daily_df=daily_df)
+            for k, v in checks.items():
+                perf_df[k] = [v]
+            if bool(args.strict_simulation_validity) and not all(
+                bool(checks.get(k, True))
+                for k in ["net_revenue_reconciliation_ok", "cost_reconciliation_ok", "daily_to_scenario_reconciliation_ok"]
+            ):
+                raise RuntimeError(
+                    "Performance metric reconciliation failed in strict mode: "
+                    f"{json.dumps(checks, sort_keys=True)}"
+                )
+            perf_df.to_csv(performance_csv_path, index=False)
+            performance_json_path.write_text(perf_df.to_json(orient="records", indent=2), encoding="utf-8")
+            daily_df.insert(0, "scenario", str(scenario_name))
+            daily_df.insert(1, "trading_strategy", str(args.trading_strategy))
+            daily_df.to_csv(daily_performance_csv_path, index=False)
+            daily_performance_json_path.write_text(daily_df.to_json(orient="records", indent=2), encoding="utf-8")
+            perf_rows_all.append(perf_df.assign(scenario_path=str(scenario_out_dir)))
+            daily_perf_rows_all.append(daily_df.assign(scenario_path=str(scenario_out_dir)))
         with _phase_watchdog("write_state_machine_audit"):
             state_machine_audit_path.write_text(json.dumps(_build_state_machine_audit(outputs.hourly), indent=2), encoding="utf-8")
         with _phase_watchdog("build_and_write_diagnostics"):
@@ -2879,6 +3338,16 @@ def main() -> None:
             "invalid_reason": outputs.summary.get("invalid_reason"),
             "fallback_used": outputs.summary.get("fallback_used"),
             "output_dir": str(scenario_out_dir),
+            "realized_net_revenue_eur": float(perf_df.iloc[0].get("realized_net_revenue_eur", float("nan"))),
+            "annualized_realized_net_revenue_eur": float(perf_df.iloc[0].get("annualized_realized_net_revenue_eur", float("nan"))),
+            "realized_net_revenue_eur_per_mw": float(perf_df.iloc[0].get("realized_net_revenue_eur_per_mw", float("nan"))),
+            "da_net_revenue_eur": float(perf_df.iloc[0].get("da_net_revenue_eur", float("nan"))),
+            "id_net_revenue_eur": float(perf_df.iloc[0].get("id_net_revenue_eur", float("nan"))),
+            "bcm_capacity_revenue_eur": float(perf_df.iloc[0].get("bcm_capacity_revenue_eur", float("nan"))),
+            "bem_net_revenue_eur": float(perf_df.iloc[0].get("bem_net_revenue_eur", float("nan"))),
+            "throughput_mwh_total": float(perf_df.iloc[0].get("throughput_mwh_total", float("nan"))),
+            "equivalent_full_cycles_total": float(perf_df.iloc[0].get("equivalent_full_cycles_total", float("nan"))),
+            "total_costs_eur": float(perf_df.iloc[0].get("total_costs_eur", float("nan"))),
         }
         if scenario_name != "default":
             q_lo, q_hi = scenario_name.split("_", 1)
@@ -2900,6 +3369,20 @@ def main() -> None:
         sweep_df.to_csv(sweep_csv, index=False)
         sweep_json.write_text(sweep_df.to_json(orient="records", indent=2), encoding="utf-8")
         print(f"[OK] Quantile sweep summary: {sweep_csv}")
+
+    if perf_rows_all:
+        perf_all = pd.concat(perf_rows_all, ignore_index=True, sort=False)
+        perf_all_csv = out_dir / "performance_metrics_all_scenarios.csv"
+        perf_all_json = out_dir / "performance_metrics_all_scenarios.json"
+        perf_all.to_csv(perf_all_csv, index=False)
+        perf_all_json.write_text(perf_all.to_json(orient="records", indent=2), encoding="utf-8")
+        print(f"[OK] Performance metrics (all scenarios): {perf_all_csv}")
+    if daily_perf_rows_all:
+        daily_all = pd.concat(daily_perf_rows_all, ignore_index=True, sort=False)
+        daily_all_csv = out_dir / "daily_performance_metrics_all_scenarios.csv"
+        daily_all.to_csv(daily_all_csv, index=False)
+        print(f"[OK] Daily performance metrics (all scenarios): {daily_all_csv}")
+    _write_performance_metric_definitions(out_dir / "performance_metric_definitions.json")
 
     # Strategy overview across separate runs (multi / da_only / afrr_only).
     if sweep_rows:
