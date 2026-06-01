@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from energy_trading.simulation.battery_backtest import (  # noqa: E402
     BacktestColumnMap,
     BatteryBacktester,
+    assign_bcm_capacity_block,
     canonicalize_market_frame,
     load_prediction_warehouse_long,
 )
@@ -217,6 +218,89 @@ def test_resolve_final_soc_policy_hard_or_enforce_flag() -> None:
         enforce_final_soc_min_flag=True,
         allow_terminal_soc_repair_in_strict=False,
     )
+
+
+def test_assign_bcm_capacity_block_local_ce_st_blocks() -> None:
+    ts = pd.to_datetime(
+        [
+            "2025-05-01T00:00:00Z",
+            "2025-05-01T01:00:00Z",
+            "2025-05-01T02:00:00Z",
+            "2025-05-01T03:00:00Z",
+        ],
+        utc=True,
+    )
+    blk = assign_bcm_capacity_block(ts)
+    # 2025-05-01 is CEST (UTC+2): these map to 02:00..05:00 local -> two blocks.
+    assert str(blk["bcm_capacity_block_hour_index"].iloc[0]) == "2.0"
+    assert str(blk["bcm_capacity_block_hour_index"].iloc[1]) == "3.0"
+    assert str(blk["bcm_capacity_block_hour_index"].iloc[2]) == "0.0"
+    assert str(blk["bcm_capacity_block_hour_index"].iloc[3]) == "1.0"
+    assert blk["bcm_capacity_block_id"].iloc[0] != blk["bcm_capacity_block_id"].iloc[2]
+
+
+def test_afrr_only_bcm_block_constant_bem_hourly_not_forced_block_constant() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-05-01T00:00:00Z", periods=8, freq="h")
+    df = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [0.0] * 8,
+            col.pred_afrr_capacity_price_pos: [100.0] * 4 + [1.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 8,
+            col.pred_afrr_activation_price_pos: [150.0, -150.0, 150.0, -150.0, 150.0, -150.0, 150.0, -150.0],
+            col.pred_afrr_activation_price_neg: [0.0] * 8,
+            col.pred_afrr_activation_rate_pos: [1.0] * 8,
+            col.pred_afrr_activation_rate_neg: [0.0] * 8,
+        }
+    )
+    for pref in [
+        col.pred_afrr_capacity_price_pos,
+        col.pred_afrr_capacity_price_neg,
+        col.pred_afrr_activation_price_pos,
+        col.pred_afrr_activation_price_neg,
+        col.pred_afrr_activation_rate_pos,
+        col.pred_afrr_activation_rate_neg,
+    ]:
+        for q in ["p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"]:
+            df[f"{pref}_{q}"] = df[pref]
+
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR",),
+    )
+    b = assign_bcm_capacity_block(out[col.timestamp])
+    out = pd.concat([out.reset_index(drop=True), b.reset_index(drop=True)], axis=1)
+    for _, g in out.groupby("bcm_capacity_block_id"):
+        assert float(pd.to_numeric(g["reserve_pos_mw"], errors="coerce").max() - pd.to_numeric(g["reserve_pos_mw"], errors="coerce").min()) <= 1e-6
+        assert float(pd.to_numeric(g["reserve_neg_mw"], errors="coerce").max() - pd.to_numeric(g["reserve_neg_mw"], errors="coerce").min()) <= 1e-6
+    # BEM stays hourly; not constrained to block equality.
+    assert float(pd.to_numeric(out["bem_only_pos_mw"], errors="coerce").max() - pd.to_numeric(out["bem_only_pos_mw"], errors="coerce").min()) >= 0.0
+
+
+def test_bcm_block_consistency_check_detects_hourly_variation() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-05-01T00:00:00Z", periods=4, freq="h")
+    hourly = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "real_submitted_afrr_pos_mw": [1.0, 1.0, 0.0, 0.0],
+            "real_submitted_afrr_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "real_executed_reserve_pos_mw": [1.0, 0.0, 0.0, 0.0],
+            "real_executed_reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+        }
+    )
+    res = bt._compute_bcm_block_consistency(
+        hourly=hourly,
+        timestamp_col=col.timestamp,
+        bcm_enabled=True,
+        tol_mw=1e-6,
+    )
+    assert float(res["pass"]) == 0.0
+    assert float(res["violation_count"]) > 0.0
 
 
 def test_simulation_forecast_loader_missing_p50_fails_by_default(tmp_path: Path) -> None:

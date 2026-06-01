@@ -120,3 +120,14 @@ Notes:
 - `bem_only` excludes BCM capacity awards and therefore excludes capacity revenue.
 - Baseline contamination guard: economic ID is blocked for non-`multi` strategies unless explicitly overridden for robustness runs.
 - Disabled markets are hard-gated in optimizer bounds and validated in settlement outputs.
+## BCM vs BEM Product Granularity
+
+- BCM/aFRR capacity is modeled as a fixed 4-hour product in German market local time (`Europe/Berlin`): `00-04`, `04-08`, `08-12`, `12-16`, `16-20`, `20-24`.
+- BEM/aFRR balancing energy remains hourly.
+- `afrr_only` includes both:
+  - block-based BCM capacity commitments
+  - hourly BEM bids/activation
+- Partial first/last observed blocks are flagged via:
+  - `partial_bcm_block_at_start`
+  - `partial_bcm_block_at_end`
+- Strict validity enforces BCM block consistency; non-constant BCM submitted/awarded MW inside a block triggers `bcm_block_consistency`.

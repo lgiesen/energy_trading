@@ -125,6 +125,41 @@ QUANTILE_COLUMNS = ["p01", "p05", "p10", "p20", "p30", "p40", "p50", "p60", "p70
 # Dynamic quantile bidding bins (ordered from most aggressive to most conservative).
 AFRR_QUANTILE_BINS = ["p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"]
 
+
+def assign_bcm_capacity_block(timestamp_utc: pd.Series | pd.DatetimeIndex) -> pd.DataFrame:
+    ts_utc = pd.to_datetime(timestamp_utc, utc=True, errors="coerce")
+    if isinstance(ts_utc, pd.Series):
+        local = ts_utc.dt.tz_convert("Europe/Berlin")
+        block_hour = (local.dt.hour // 4) * 4
+        start_local = local.dt.normalize() + pd.to_timedelta(block_hour, unit="h")
+    else:
+        local = ts_utc.tz_convert("Europe/Berlin")
+        block_hour = (local.hour // 4) * 4
+        start_local = local.normalize() + pd.to_timedelta(block_hour, unit="h")
+    end_local = start_local + pd.Timedelta(hours=4)
+    if isinstance(start_local, pd.Series):
+        start_utc = start_local.dt.tz_convert("UTC")
+        end_utc = end_local.dt.tz_convert("UTC")
+        start_local_txt = start_local.dt.strftime("%Y-%m-%dT%H:%M:%S%z").str.replace(r"([+-]\d{2})(\d{2})$", r"\1:\2", regex=True)
+        end_local_txt = end_local.dt.strftime("%Y-%m-%dT%H:%M:%S%z").str.replace(r"([+-]\d{2})(\d{2})$", r"\1:\2", regex=True)
+        hour_idx = (local.dt.hour % 4).astype(float)
+    else:
+        start_utc = start_local.tz_convert("UTC")
+        end_utc = end_local.tz_convert("UTC")
+        start_local_txt = start_local.strftime("%Y-%m-%dT%H:%M:%S%z").str.replace(r"([+-]\d{2})(\d{2})$", r"\1:\2", regex=True)
+        end_local_txt = end_local.strftime("%Y-%m-%dT%H:%M:%S%z").str.replace(r"([+-]\d{2})(\d{2})$", r"\1:\2", regex=True)
+        hour_idx = (local.hour % 4).astype(float)
+    return pd.DataFrame(
+        {
+            "bcm_capacity_block_start_local": start_local,
+            "bcm_capacity_block_end_local": end_local,
+            "bcm_capacity_block_start_utc": start_utc,
+            "bcm_capacity_block_end_utc": end_utc,
+            "bcm_capacity_block_id": start_local_txt + "__" + end_local_txt,
+            "bcm_capacity_block_hour_index": hour_idx,
+        }
+    )
+
 # Central schema registry for settlement validation.
 # These are logical keys resolved via BacktestColumnMap at runtime.
 CRITICAL_PRED_COL_KEYS = (
@@ -1991,6 +2026,39 @@ class BatteryBacktester:
                         row[sl["soc"].start + t] = 1.0
                         a_ub.append(row)
                         b_ub.append(float(self.soc_max) - req_neg_mwh)
+
+        # BCM capacity is a fixed 4-hour product in German market time.
+        # Keep BEM hourly; only reserve capacity bin decisions are block-constant.
+        if perms.allow_bcm:
+            block_info = assign_bcm_capacity_block(ts_index)
+            block_ids = block_info["bcm_capacity_block_id"].astype(str).to_numpy()
+            fixed_mask = np.zeros(n, dtype=bool)
+            if fixed_reserve_obligation:
+                fixed_mask = np.array(
+                    [pd.notna(ts) and (pd.to_datetime(ts, utc=True, errors="coerce") in fixed_reserve_obligation) for ts in ts_index],
+                    dtype=bool,
+                )
+            for bid in np.unique(block_ids):
+                idx = np.where(block_ids == bid)[0]
+                if len(idx) <= 1:
+                    continue
+                unlocked_idx = [int(i) for i in idx if not bool(fixed_mask[i])]
+                if len(unlocked_idx) <= 1:
+                    continue
+                t0 = int(unlocked_idx[0])
+                for t in unlocked_idx[1:]:
+                    for b in range(n_bins):
+                        row = np.zeros(n_vars, dtype=float)
+                        row[sl["rpos_bin"].start + b * n + t] = 1.0
+                        row[sl["rpos_bin"].start + b * n + t0] = -1.0
+                        a_eq.append(row)
+                        b_eq.append(0.0)
+
+                        row = np.zeros(n_vars, dtype=float)
+                        row[sl["rneg_bin"].start + b * n + t] = 1.0
+                        row[sl["rneg_bin"].start + b * n + t0] = -1.0
+                        a_eq.append(row)
+                        b_eq.append(0.0)
 
         # Soft physical SoC bounds (including terminal state):
         # soc_t + slack_soc_min_t >= soc_min
@@ -6270,6 +6338,64 @@ class BatteryBacktester:
                 total += float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).abs().sum())
         return total
 
+    def _compute_bcm_block_consistency(
+        self,
+        *,
+        hourly: pd.DataFrame,
+        timestamp_col: str,
+        bcm_enabled: bool,
+        tol_mw: float = 1e-6,
+    ) -> dict[str, float | str]:
+        if timestamp_col not in hourly.columns or hourly.empty:
+            return {
+                "pass": 1.0,
+                "violation_count": 0.0,
+                "violation_max_mw": 0.0,
+                "partial_start": 0.0,
+                "partial_end": 0.0,
+            }
+        bi = assign_bcm_capacity_block(hourly[timestamp_col])
+        ts_utc = pd.to_datetime(hourly[timestamp_col], utc=True, errors="coerce")
+        start_min = ts_utc.min()
+        end_max = ts_utc.max()
+        partial_start = float((bi["bcm_capacity_block_start_utc"] < start_min).any()) if pd.notna(start_min) else 0.0
+        partial_end = float((bi["bcm_capacity_block_end_utc"] > end_max).any()) if pd.notna(end_max) else 0.0
+        if not bcm_enabled:
+            return {
+                "pass": 1.0,
+                "violation_count": 0.0,
+                "violation_max_mw": 0.0,
+                "partial_start": partial_start,
+                "partial_end": partial_end,
+            }
+        cols = [c for c in ["real_submitted_afrr_pos_mw", "real_submitted_afrr_neg_mw", "real_executed_reserve_pos_mw", "real_executed_reserve_neg_mw"] if c in hourly.columns]
+        if not cols:
+            return {
+                "pass": 1.0,
+                "violation_count": 0.0,
+                "violation_max_mw": 0.0,
+                "partial_start": partial_start,
+                "partial_end": partial_end,
+            }
+        tmp = pd.concat([hourly.reset_index(drop=True), bi.reset_index(drop=True)], axis=1)
+        tmp = tmp.loc[:, ~tmp.columns.duplicated()]
+        violation_count = 0.0
+        violation_max = 0.0
+        for _, g in tmp.groupby("bcm_capacity_block_id", dropna=False):
+            for c in cols:
+                s = pd.to_numeric(g[c], errors="coerce").fillna(0.0)
+                spread = float(s.max() - s.min()) if len(s) else 0.0
+                if spread > tol_mw:
+                    violation_count += 1.0
+                    violation_max = max(violation_max, spread)
+        return {
+            "pass": float(violation_count <= 0.0),
+            "violation_count": float(violation_count),
+            "violation_max_mw": float(violation_max),
+            "partial_start": partial_start,
+            "partial_end": partial_end,
+        }
+
     def _validate_strategy_isolation_outputs(
         self,
         *,
@@ -7148,6 +7274,50 @@ class BatteryBacktester:
             opportunity_gap_ratio = float((perfect_foresight_pnl_total - real_pnl_total) / perfect_foresight_pnl_total)
         else:
             opportunity_gap_ratio = float("nan")
+
+        if colmap.timestamp in hourly.columns:
+            bcm_cols = [
+                "bcm_capacity_block_start_local",
+                "bcm_capacity_block_end_local",
+                "bcm_capacity_block_start_utc",
+                "bcm_capacity_block_end_utc",
+                "bcm_capacity_block_id",
+                "bcm_capacity_block_hour_index",
+                "bcm_capacity_block_partial_start",
+                "bcm_capacity_block_partial_end",
+            ]
+            hourly = hourly.drop(columns=[c for c in bcm_cols if c in hourly.columns], errors="ignore")
+            bcm_blk = assign_bcm_capacity_block(hourly[colmap.timestamp]).reset_index(drop=True)
+            hourly = pd.concat([hourly.reset_index(drop=True), bcm_blk], axis=1)
+            ts_all = pd.to_datetime(hourly[colmap.timestamp], utc=True, errors="coerce")
+            ts_min = ts_all.min()
+            ts_max = ts_all.max()
+            if pd.notna(ts_min) and pd.notna(ts_max):
+                hourly["bcm_capacity_block_partial_start"] = (
+                    pd.to_datetime(hourly["bcm_capacity_block_start_utc"], utc=True, errors="coerce") < ts_min
+                ).astype(float)
+                hourly["bcm_capacity_block_partial_end"] = (
+                    pd.to_datetime(hourly["bcm_capacity_block_end_utc"], utc=True, errors="coerce") > ts_max
+                ).astype(float)
+            else:
+                hourly["bcm_capacity_block_partial_start"] = 0.0
+                hourly["bcm_capacity_block_partial_end"] = 0.0
+        else:
+            hourly["bcm_capacity_block_id"] = ""
+            hourly["bcm_capacity_block_start_local"] = pd.NaT
+            hourly["bcm_capacity_block_end_local"] = pd.NaT
+            hourly["bcm_capacity_block_start_utc"] = pd.NaT
+            hourly["bcm_capacity_block_end_utc"] = pd.NaT
+            hourly["bcm_capacity_block_hour_index"] = np.nan
+            hourly["bcm_capacity_block_partial_start"] = 0.0
+            hourly["bcm_capacity_block_partial_end"] = 0.0
+        bcm_block_consistency = self._compute_bcm_block_consistency(
+            hourly=hourly,
+            timestamp_col=colmap.timestamp,
+            bcm_enabled=bool(self._strategy_permissions.allow_bcm),
+            tol_mw=1e-6,
+        )
+
         summary = {
             "rows": float(len(hourly)),
             "input_row_count": float(len(df)),
@@ -7251,6 +7421,14 @@ class BatteryBacktester:
             "id_spread": float(self.id_rescue_spread_eur_mwh),
             "id_price_cap": float(self.id_buy_price_cap_eur_mwh),
             "id_price_floor": float(self.id_sell_price_floor_eur_mwh),
+            "bcm_block_constraint_enabled": float(bool(self._strategy_permissions.allow_bcm)),
+            "bcm_block_timezone": "Europe/Berlin",
+            "bcm_block_duration_hours": 4.0,
+            "bcm_block_consistency_check_pass": float(bcm_block_consistency["pass"]),
+            "bcm_block_consistency_violation_count": float(bcm_block_consistency["violation_count"]),
+            "bcm_block_consistency_violation_max_mw": float(bcm_block_consistency["violation_max_mw"]),
+            "partial_bcm_block_at_start": float(bcm_block_consistency["partial_start"]),
+            "partial_bcm_block_at_end": float(bcm_block_consistency["partial_end"]),
             "strategy": ",".join(sorted({str(m).strip().lower() for m in allowed_markets})),
             "id_recourse_mode": str(getattr(self, "_id_recourse_mode", "common")),
             "id_mode": str(self._strategy_permissions.id_mode),
@@ -8341,6 +8519,8 @@ class BatteryBacktester:
             invalid_reasons.append("headroom")
         if float(summary.get("reserve_headroom_shortfall_check_pass", 1.0)) < 0.5:
             invalid_reasons.append("reserve_headroom_shortfall")
+        if float(summary.get("bcm_block_consistency_check_pass", 1.0)) < 0.5:
+            invalid_reasons.append("bcm_block_consistency")
         if not physical_soc_ok:
             invalid_reasons.append("physical_soc")
         if not protected_soc_ok:
@@ -8463,6 +8643,14 @@ class BatteryBacktester:
             ("reserve_retry_infeasible_after_zero_reserve", 0.0),
             ("afrr_bcm_gate_hour_cet_model", 8.0),
             ("afrr_bcm_gate_hour_cet_benchmark", 8.0),
+            ("bcm_block_constraint_enabled", 0.0),
+            ("bcm_block_timezone", "Europe/Berlin"),
+            ("bcm_block_duration_hours", 4.0),
+            ("bcm_block_consistency_check_pass", 1.0),
+            ("bcm_block_consistency_violation_count", 0.0),
+            ("bcm_block_consistency_violation_max_mw", 0.0),
+            ("partial_bcm_block_at_start", 0.0),
+            ("partial_bcm_block_at_end", 0.0),
             ("benchmark_same_rules_gate_consistent", 1.0),
             ("final_soc_mode", "terminal_repair"),
             ("benchmark_is_global_upper_bound", 0.0),
