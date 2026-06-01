@@ -260,6 +260,101 @@ def test_simulation_forecast_loader_materializes_p50_only_with_explicit_flag(tmp
     assert np.isclose(float(out["materialized_p50_from_predicted_value"]), 1.0)
 
 
+def test_strategy_permissions_enum() -> None:
+    cls = BatteryBacktester
+    p = cls.strategy_permissions_from_name("multi")
+    assert p.allow_da and p.allow_id and p.allow_bcm and p.allow_bem_only
+    assert p.id_mode == "economic"
+    p = cls.strategy_permissions_from_name("da_only")
+    assert p.allow_da and (not p.allow_id) and (not p.allow_bcm) and (not p.allow_bem_only)
+    assert p.id_mode == "none"
+    p = cls.strategy_permissions_from_name("afrr_only")
+    assert (not p.allow_da) and p.allow_id and p.allow_bcm and p.allow_bem_only
+    assert p.id_mode == "technical_repair"
+    p = cls.strategy_permissions_from_name("bcm_only")
+    assert (not p.allow_da) and p.allow_id and p.allow_bcm and (not p.allow_bem_only)
+    assert p.id_mode == "technical_repair"
+    p = cls.strategy_permissions_from_name("bem_only")
+    assert (not p.allow_da) and p.allow_id and (not p.allow_bcm) and p.allow_bem_only
+    assert p.id_mode == "technical_repair"
+    with pytest.raises(ValueError):
+        cls.strategy_permissions_from_name("nope")
+
+
+def test_bcm_only_optimizer_gating() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=200.0,
+        cap_pos=200.0,
+        cap_neg=0.0,
+        act_pos=250.0,
+        act_neg=-50.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("aFRR", "BCM"))
+    assert float(out["charge_mw"].iloc[0]) == 0.0
+    assert float(out["discharge_mw"].iloc[0]) == 0.0
+    assert float(out["bem_only_pos_mw"].iloc[0]) == 0.0
+    assert float(out["bem_only_neg_mw"].iloc[0]) == 0.0
+    assert float(out["reserve_pos_mw"].iloc[0]) >= 0.0
+
+
+def test_bem_only_optimizer_gating() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=200.0,
+        cap_pos=200.0,
+        cap_neg=0.0,
+        act_pos=300.0,
+        act_neg=-50.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("aFRR", "BEM"))
+    assert float(out["charge_mw"].iloc[0]) == 0.0
+    assert float(out["discharge_mw"].iloc[0]) == 0.0
+    assert float(out["reserve_pos_mw"].iloc[0]) == 0.0
+    assert float(out["reserve_neg_mw"].iloc[0]) == 0.0
+    assert float(out["bem_only_pos_mw"].iloc[0]) >= 0.0
+
+
+def test_afrr_only_optimizer_gating() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=300.0,
+        cap_pos=100.0,
+        cap_neg=0.0,
+        act_pos=200.0,
+        act_neg=-100.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("aFRR", "BCM", "BEM"))
+    assert float(out["charge_mw"].iloc[0]) == 0.0
+    assert float(out["discharge_mw"].iloc[0]) == 0.0
+    assert float(out["reserve_pos_mw"].iloc[0]) >= 0.0
+    assert float(out["bem_only_pos_mw"].iloc[0]) >= 0.0
+
+
+def test_da_only_optimizer_gating() -> None:
+    bt = _mk_backtester()
+    df, col = _one_hour_pred_df(
+        da=300.0,
+        cap_pos=200.0,
+        cap_neg=0.0,
+        act_pos=200.0,
+        act_neg=-100.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(df, col, allowed_markets=("DA",))
+    assert float(out["reserve_pos_mw"].iloc[0]) == 0.0
+    assert float(out["reserve_neg_mw"].iloc[0]) == 0.0
+    assert float(out["bem_only_pos_mw"].iloc[0]) == 0.0
+    assert float(out["bem_only_neg_mw"].iloc[0]) == 0.0
+
+
 def _write_long_pred(
     path: Path,
     *,
@@ -1461,6 +1556,9 @@ def test_id_is_price_taker() -> None:
     assert float(m["id_buy_mwh"]) > 0.0
     # ID cost follows modeled realized settlement price path directly.
     assert float(m["cost_id_eur"]) > 0.0
+    assert np.isclose(float(m["id_buy_price_eur_mwh"]), min(bt.id_buy_price_cap_eur_mwh, 100.0 + bt.id_rescue_spread_eur_mwh))
+    assert np.isclose(float(m["id_sell_price_eur_mwh"]), max(bt.id_sell_price_floor_eur_mwh, 100.0 - bt.id_rescue_spread_eur_mwh))
+    assert float(m["id_buy_price_eur_mwh"]) >= float(m["id_sell_price_eur_mwh"]) - 1e-12
 
 
 def test_bcm_positive_headroom_30min() -> None:

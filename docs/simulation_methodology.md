@@ -105,3 +105,18 @@ activation rates used in EV:
 - `exp_neg[t,q] = p_acc_neg[t,q] * ActRate_neg[t,q]`
 
 and enters SoC dynamics with efficiency-adjusted energy terms.
+
+## J. Strategy Modes
+Supported strategy modes:
+
+- `multi`: DA + BCM + BEM enabled, `id_mode=economic` (technical repair also possible).
+- `da_only`: DA enabled, BCM/BEM disabled, default `id_mode=none`.
+- `afrr_only`: DA disabled, BCM + BEM enabled, default `id_mode=technical_repair`.
+- `bcm_only`: DA disabled, BCM enabled (including activation settlement from awarded reserve), BEM-only disabled, default `id_mode=technical_repair`.
+- `bem_only`: DA disabled, BCM disabled, standalone BEM enabled, default `id_mode=technical_repair`.
+
+Notes:
+- `bcm_only` is not capacity-only accounting; awarded capacity can still trigger activation settlement.
+- `bem_only` excludes BCM capacity awards and therefore excludes capacity revenue.
+- Baseline contamination guard: economic ID is blocked for non-`multi` strategies unless explicitly overridden for robustness runs.
+- Disabled markets are hard-gated in optimizer bounds and validated in settlement outputs.

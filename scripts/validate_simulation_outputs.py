@@ -40,6 +40,18 @@ def _collect(root: Path) -> pd.DataFrame:
                 "fallback_used": s.get("fallback_used"),
                 "fallback_mode_counts": s.get("fallback_mode_counts"),
                 "optimization_error_code_counts": s.get("optimization_error_code_counts"),
+                "id_mode": s.get("id_mode"),
+                "id_recourse_mode": s.get("id_recourse_mode"),
+                "id_economic_enabled": s.get("id_economic_enabled"),
+                "id_technical_repair_enabled": s.get("id_technical_repair_enabled"),
+                "total_id_revenue_eur": s.get("total_id_revenue_eur"),
+                "total_id_cost_eur": s.get("total_id_cost_eur"),
+                "total_id_pnl_eur": s.get("total_id_pnl_eur"),
+                "id_repair_mwh_total": s.get("id_repair_mwh_total"),
+                "id_repair_cost_eur_total": s.get("id_repair_cost_eur_total"),
+                "id_economic_mwh_total": s.get("id_economic_mwh_total"),
+                "id_economic_pnl_eur_total": s.get("id_economic_pnl_eur_total"),
+                "id_technical_repair_pnl_eur_total": s.get("id_technical_repair_pnl_eur_total"),
                 "simulation_schema_version": s.get("simulation_schema_version"),
                 "required_summary_fields_version": s.get("required_summary_fields_version"),
                 "code_run_started_at_utc": s.get("code_run_started_at_utc"),
@@ -171,6 +183,16 @@ def main() -> None:
         "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
         "realized_exceeds_global_perfect_foresight",
         "global_perfect_foresight_dominance_check_pass",
+        "id_economic_enabled",
+        "id_technical_repair_enabled",
+        "total_id_revenue_eur",
+        "total_id_cost_eur",
+        "total_id_pnl_eur",
+        "id_repair_mwh_total",
+        "id_repair_cost_eur_total",
+        "id_economic_mwh_total",
+        "id_economic_pnl_eur_total",
+        "id_technical_repair_pnl_eur_total",
     ):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -258,6 +280,25 @@ def main() -> None:
         & (required_fields_check_pass)
         & (~non_ok_codes)
     )
+    strategy_series = df.get("trading_strategy", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
+    id_mode_series = df.get("id_mode", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
+    id_recourse_mode_series = df.get("id_recourse_mode", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
+    id_abs_mwh = (
+        df.get("total_id_revenue_eur", 0.0).fillna(0.0).abs()
+        + df.get("total_id_cost_eur", 0.0).fillna(0.0).abs()
+    )
+    baseline_mask = strategy_series.isin({"da_only", "afrr_only", "bcm_only", "bem_only"})
+    da_only_mask = strategy_series.eq("da_only")
+    # Baseline contamination guard:
+    # - da_only: no ID activity at all.
+    # - other baselines: no economic ID mode; technical-repair-only allowed.
+    invalid_id_policy = (
+        (da_only_mask & (id_abs_mwh > 1e-9))
+        | (baseline_mask & id_mode_series.eq("economic"))
+        | (id_recourse_mode_series.eq("disabled") & (id_abs_mwh > 1e-9))
+        | (id_recourse_mode_series.eq("afrr_obligation_only") & da_only_mask & (id_abs_mwh > 1e-9))
+    )
+    thesis_rule = thesis_rule & (~invalid_id_policy)
     # If shortfall exists, explicit repair must be present.
     if "final_soc_actual_mwh" in df.columns and "final_soc_target_mwh" in df.columns:
         shortfall = (df["final_soc_target_mwh"].fillna(0.0) - df["final_soc_actual_mwh"].fillna(0.0)).clip(lower=0.0)

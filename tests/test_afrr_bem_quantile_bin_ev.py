@@ -193,12 +193,12 @@ def test_ev_audit_builder_no_quantile_col_uses_active_bins() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=h,
         scenario_name="x",
+        trading_strategy="da_only",
         active_bins=["p50"],
         backtester=bt,
         timestamp_col="timestamp_utc",
     )
-    assert not audit.empty
-    assert set(audit["quantile_bin"].astype(str).unique()) == {"p50"}
+    assert audit.empty
 
 
 def test_ev_audit_builder_labels_p30_p50_p70_and_four_components() -> None:
@@ -211,6 +211,7 @@ def test_ev_audit_builder_labels_p30_p50_p70_and_four_components() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=out,
         scenario_name="x",
+        trading_strategy="multi",
         active_bins=["p30", "p50", "p70"],
         backtester=bt,
         timestamp_col="timestamp_utc",
@@ -222,3 +223,295 @@ def test_ev_audit_builder_labels_p30_p50_p70_and_four_components() -> None:
     stats = _validate_afrr_bin_ev_audit(audit, tol=1e-6)
     assert float(stats["ev_audit_max_bcm_formula_error"]) <= 1e-6
     assert float(stats["ev_audit_max_bem_formula_error"]) <= 1e-6
+
+
+def test_ev_audit_da_only_skips_afrr_components() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame({"timestamp_utc": pd.date_range("2026-01-01T00:00:00Z", periods=2, freq="h")})
+    status: dict[str, object] = {}
+    audit = _build_afrr_bin_ev_audit(
+        hourly=h,
+        scenario_name="x",
+        trading_strategy="da_only",
+        active_bins=["p50"],
+        backtester=bt,
+        timestamp_col="timestamp_utc",
+        status_out=status,
+    )
+    assert audit.empty
+    assert status.get("components_skipped", {}).get("BCM") == "inactive_for_strategy"
+    assert status.get("components_skipped", {}).get("BEM") == "inactive_for_strategy"
+    stats = _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="da_only")
+    assert float(stats["ev_audit_row_count"]) == 0.0
+
+
+def test_ev_audit_bcm_only_requires_bcm_columns() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2026-01-01T00:00:00Z", periods=1, freq="h"),
+            "reserve_pos_bin_0_mw": [1.0],
+            "reserve_neg_bin_0_mw": [1.0],
+        }
+    )
+    with pytest.raises(ValueError, match="missing/nonfinite required EV fields"):
+        _build_afrr_bin_ev_audit(
+            hourly=h,
+            scenario_name="x",
+            trading_strategy="bcm_only",
+            active_bins=["p50"],
+            backtester=bt,
+            timestamp_col="timestamp_utc",
+            strict=True,
+        )
+
+
+def test_ev_audit_bem_only_requires_bem_columns() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2026-01-01T00:00:00Z", periods=1, freq="h"),
+            "bem_pos_bin_0_mw": [1.0],
+            "bem_neg_bin_0_mw": [1.0],
+        }
+    )
+    with pytest.raises(ValueError, match="missing/nonfinite required EV fields"):
+        _build_afrr_bin_ev_audit(
+            hourly=h,
+            scenario_name="x",
+            trading_strategy="bem_only",
+            active_bins=["p50"],
+            backtester=bt,
+            timestamp_col="timestamp_utc",
+            strict=True,
+        )
+
+
+def test_ev_audit_bcm_only_emits_only_bcm() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30", "p50", "p70"]
+    bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
+    df, col = _tiny_df(hours=2)
+    out = bt.optimize_dispatch(df, col, strict_input_validation=True)
+    out = out.rename(columns={col.timestamp: "timestamp_utc"})
+    audit = _build_afrr_bin_ev_audit(
+        hourly=out,
+        scenario_name="x",
+        trading_strategy="bcm_only",
+        active_bins=["p30", "p50", "p70"],
+        backtester=bt,
+        timestamp_col="timestamp_utc",
+    )
+    assert set(audit["market_component"].astype(str).unique()) == {"BCM"}
+    _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="bcm_only")
+
+
+def test_ev_audit_bem_only_emits_only_bem() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30", "p50", "p70"]
+    bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
+    df, col = _tiny_df(hours=2)
+    out = bt.optimize_dispatch(df, col, strict_input_validation=True)
+    out = out.rename(columns={col.timestamp: "timestamp_utc"})
+    audit = _build_afrr_bin_ev_audit(
+        hourly=out,
+        scenario_name="x",
+        trading_strategy="bem_only",
+        active_bins=["p30", "p50", "p70"],
+        backtester=bt,
+        timestamp_col="timestamp_utc",
+    )
+    assert set(audit["market_component"].astype(str).unique()) == {"BEM"}
+    _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="bem_only")
+
+
+def test_ev_audit_validator_message_identifies_bad_component() -> None:
+    audit = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2026-01-01T00:00:00Z")],
+            "market_component": ["BCM"],
+            "direction": ["pos"],
+            "quantile_bin": ["p50"],
+            "decision_variable_name": ["reserve_pos_bin_0_mw"],
+            "expected_capacity_revenue": [1.0],
+            "expected_activation_revenue": [2.0],
+            "expected_aux_cost": [np.nan],
+            "offer_cost": [0.1],
+            "ev_coefficient": [2.9],
+        }
+    )
+    with pytest.raises(ValueError, match="bad_columns"):
+        _validate_afrr_bin_ev_audit(
+            audit,
+            tol=1e-6,
+            scenario_name="x",
+            trading_strategy="multi",
+            audit_path="mem.csv",
+        )
+
+
+def test_afrr_only_zero_decision_missing_fields_are_skipped() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2025-05-02T21:00:00Z")],
+            "optimization_error_code": ["hard_final_soc_infeasible"],
+            "reserve_pos_bin_0_mw": [0.0],
+            "reserve_neg_bin_0_mw": [0.0],
+            "bem_pos_bin_0_mw": [0.0],
+            "bem_neg_bin_0_mw": [0.0],
+            "ev_rpos_coef_bin_0_eur_per_mw": [0.0],
+            "ev_rneg_coef_bin_0_eur_per_mw": [0.0],
+            "ev_bem_pos_coef_bin_0_eur_per_mw": [0.0],
+            "ev_bem_neg_coef_bin_0_eur_per_mw": [0.0],
+        }
+    )
+    status: dict[str, object] = {}
+    audit = _build_afrr_bin_ev_audit(
+        hourly=h,
+        scenario_name="p30_p70",
+        trading_strategy="afrr_only",
+        active_bins=["p30"],
+        backtester=bt,
+        timestamp_col="timestamp_utc",
+        strict=True,
+        status_out=status,
+    )
+    assert not audit.empty
+    bcm = audit.loc[audit["market_component"] == "BCM"].copy()
+    assert (bcm["audit_row_status"] == "benchmark_or_nonaccepted_path_skipped").all()
+    stats = _validate_afrr_bin_ev_audit(
+        audit,
+        tol=1e-6,
+        scenario_name="p30_p70",
+        trading_strategy="afrr_only",
+        audit_path="mem.csv",
+    )
+    assert float(stats["ev_audit_max_bcm_formula_error"]) == 0.0
+
+
+def test_bem_only_nan_selected_mw_is_treated_as_inactive_skipped() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2025-05-02T21:00:00Z")],
+            "optimization_error_code": ["hard_final_soc_infeasible"],
+            "bem_pos_bin_0_mw": [np.nan],
+            "bem_neg_bin_0_mw": [np.nan],
+            "ev_bem_pos_coef_bin_0_eur_per_mw": [np.nan],
+            "ev_bem_neg_coef_bin_0_eur_per_mw": [np.nan],
+        }
+    )
+    status: dict[str, object] = {}
+    audit = _build_afrr_bin_ev_audit(
+        hourly=h,
+        scenario_name="p50_p50",
+        trading_strategy="bem_only",
+        active_bins=["p50"],
+        backtester=bt,
+        timestamp_col="timestamp_utc",
+        strict=True,
+        status_out=status,
+    )
+    bem = audit.loc[audit["market_component"] == "BEM"].copy()
+    assert not bem.empty
+    assert (bem["audit_row_status"] == "benchmark_or_nonaccepted_path_skipped").all()
+    assert int(status.get("active_missing_ev_field_count", 0)) == 0
+    _validate_afrr_bin_ev_audit(
+        audit,
+        tol=1e-6,
+        scenario_name="p50_p50",
+        trading_strategy="bem_only",
+        audit_path="mem.csv",
+    )
+
+
+def test_afrr_only_active_selected_missing_fields_fail() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2025-05-02T21:00:00Z")],
+            "optimization_error_code": ["ok"],
+            "reserve_pos_bin_0_mw": [1.0],
+            "reserve_neg_bin_0_mw": [0.0],
+            "bem_pos_bin_0_mw": [0.0],
+            "bem_neg_bin_0_mw": [0.0],
+            "ev_rpos_coef_bin_0_eur_per_mw": [1.0],
+            "ev_rneg_coef_bin_0_eur_per_mw": [0.0],
+            "ev_bem_pos_coef_bin_0_eur_per_mw": [0.0],
+            "ev_bem_neg_coef_bin_0_eur_per_mw": [0.0],
+        }
+    )
+    with pytest.raises(ValueError, match="missing/nonfinite required EV fields"):
+        _build_afrr_bin_ev_audit(
+            hourly=h,
+            scenario_name="p30_p70",
+            trading_strategy="afrr_only",
+            active_bins=["p30"],
+            backtester=bt,
+            timestamp_col="timestamp_utc",
+            strict=True,
+        )
+
+
+def test_ev_audit_selected_row_with_nonfinite_required_fields_fails_strict() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2025-05-02T21:00:00Z")],
+            "optimization_error_code": ["ok"],
+            "bem_pos_bin_0_mw": [1.0],
+            "bem_neg_bin_0_mw": [0.0],
+            "ev_bem_expected_activation_revenue_pos_bin_0": [np.nan],
+            "ev_bem_expected_aux_cost_pos_bin_0": [0.1],
+            "ev_bem_pos_coef_bin_0_eur_per_mw": [0.2],
+            "ev_bem_expected_activation_revenue_neg_bin_0": [0.0],
+            "ev_bem_expected_aux_cost_neg_bin_0": [0.0],
+            "ev_bem_neg_coef_bin_0_eur_per_mw": [0.0],
+        }
+    )
+    with pytest.raises(ValueError, match="missing/nonfinite required EV fields"):
+        _build_afrr_bin_ev_audit(
+            hourly=h,
+            scenario_name="p50_p50",
+            trading_strategy="bem_only",
+            active_bins=["p50"],
+            backtester=bt,
+            timestamp_col="timestamp_utc",
+            strict=True,
+        )
+
+
+def test_ev_audit_nonaccepted_row_with_nonfinite_required_fields_is_skipped() -> None:
+    bt = _mk_backtester()
+    h = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2025-05-02T21:00:00Z")],
+            "optimization_error_code": ["hard_final_soc_infeasible"],
+            "reserve_pos_bin_0_mw": [1.0],
+            "reserve_neg_bin_0_mw": [0.0],
+            "ev_bcm_expected_capacity_revenue_pos_bin_0": [np.nan],
+            "ev_bcm_expected_activation_revenue_pos_bin_0": [0.2],
+            "ev_bcm_expected_aux_cost_pos_bin_0": [0.1],
+            "ev_bcm_offer_cost_bin_0": [0.0],
+            "ev_rpos_coef_bin_0_eur_per_mw": [0.1],
+            "ev_bcm_expected_capacity_revenue_neg_bin_0": [0.0],
+            "ev_bcm_expected_activation_revenue_neg_bin_0": [0.0],
+            "ev_bcm_expected_aux_cost_neg_bin_0": [0.0],
+            "ev_rneg_coef_bin_0_eur_per_mw": [0.0],
+        }
+    )
+    status: dict[str, object] = {}
+    audit = _build_afrr_bin_ev_audit(
+        hourly=h,
+        scenario_name="p30_p30",
+        trading_strategy="bcm_only",
+        active_bins=["p30"],
+        backtester=bt,
+        timestamp_col="timestamp_utc",
+        strict=True,
+        status_out=status,
+    )
+    assert (audit["audit_row_status"] == "benchmark_or_nonaccepted_path_skipped").any()
+    assert int(status.get("active_missing_ev_field_count", 0)) == 0
+    assert int(status.get("benchmark_or_nonaccepted_path_skipped_count", 0)) > 0

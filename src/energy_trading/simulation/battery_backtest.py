@@ -87,6 +87,30 @@ class BacktestOutputs:
     isolated_hourly: dict[str, pd.DataFrame] | None = None
 
 
+@dataclass(frozen=True)
+class StrategyPermissions:
+    allow_da: bool
+    id_mode: str
+    allow_bcm: bool
+    allow_bcm_activation_obligations: bool
+    allow_bem_only: bool
+
+    @property
+    def allow_id(self) -> bool:
+        return self.id_mode in {"technical_repair", "economic"}
+
+    @property
+    def allow_id_technical_repair(self) -> bool:
+        return self.id_mode in {"technical_repair", "economic"}
+
+    @property
+    def allow_id_economic(self) -> bool:
+        return self.id_mode == "economic"
+
+
+ID_RECOURSE_MODES = {"common", "disabled", "afrr_obligation_only"}
+
+
 CANONICAL_PREDICTION_COLUMNS = [
     "pred_da_price",
     "pred_afrr_capacity_price_pos",
@@ -206,6 +230,19 @@ SETTLEMENT_NUMERIC_COLS = (
     "afrr_act_pos_accepted",
     "afrr_act_neg_accepted",
     "da_price_taker_mode",
+    "id_economic_enabled",
+    "id_technical_repair_enabled",
+    "id_allowed",
+    "id_buy_price_eur_mwh",
+    "id_sell_price_eur_mwh",
+    "id_net_mwh",
+    "id_net_pnl_eur",
+    "id_repair_mwh",
+    "id_repair_cost_eur",
+    "id_economic_mwh",
+    "id_economic_pnl_eur",
+    "id_technical_repair_pnl_eur",
+    "pnl_id_eur",
     "aFRR_Capacity_Won_MW",
     "DA_Energy_Sold_MW",
     "aFRR_Energy_Price_EUR_MWh",
@@ -217,6 +254,12 @@ SETTLEMENT_METADATA_COLS = (
     "da_buy_reason",
     "da_sell_reason",
     "bem_only_headroom_guard_reason",
+    "id_mode",
+    "id_recourse_mode",
+    "id_trade_type",
+    "id_repair_reason",
+    "id_recourse_reason",
+    "pending_id_recourse_reason",
 )
 
 SETTLEMENT_CLEARING_COLS = SETTLEMENT_NUMERIC_COLS + SETTLEMENT_METADATA_COLS
@@ -594,6 +637,132 @@ class BatteryBacktester:
         self.milp_diag_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_DIAG_TIME_LIMIT_S", "60.0"))
         # Per-run infeasibility diagnostics written by _write_infeasible_debug_dump.
         self._infeasible_debug_dumps: list[dict[str, str]] = []
+        self._strategy_permissions = StrategyPermissions(
+            allow_da=True,
+            id_mode="economic",
+            allow_bcm=True,
+            allow_bcm_activation_obligations=True,
+            allow_bem_only=True,
+        )
+        self._id_recourse_mode = "common"
+
+    @staticmethod
+    def strategy_permissions_from_name(strategy: str) -> StrategyPermissions:
+        s = str(strategy).strip().lower()
+        if s == "multi":
+            return StrategyPermissions(True, "economic", True, True, True)
+        if s == "da_only":
+            return StrategyPermissions(True, "none", False, False, False)
+        if s == "afrr_only":
+            return StrategyPermissions(False, "technical_repair", True, True, True)
+        if s == "bcm_only":
+            return StrategyPermissions(False, "technical_repair", True, True, False)
+        if s == "bem_only":
+            return StrategyPermissions(False, "technical_repair", False, False, True)
+        raise ValueError(f"Unknown trading strategy: {strategy}")
+
+    @classmethod
+    def strategy_permissions_from_allowed_markets(
+        cls, allowed_markets: list[str] | tuple[str, ...] | set[str]
+    ) -> StrategyPermissions:
+        allowed = {str(m).strip().lower() for m in allowed_markets}
+        allow_da = "da" in allowed
+        allow_id = "id" in allowed
+        if "afrr" not in allowed:
+            allow_bcm = False
+            allow_bem = False
+        else:
+            # Backward compatibility: ("aFRR",) implies both BCM and BEM are allowed.
+            explicit_bcm = "bcm" in allowed
+            explicit_bem = "bem" in allowed
+            if explicit_bcm or explicit_bem:
+                allow_bcm = explicit_bcm
+                allow_bem = explicit_bem
+            else:
+                allow_bcm = True
+                allow_bem = True
+        return StrategyPermissions(
+            allow_da=bool(allow_da),
+            id_mode=("economic" if bool(allow_id) else "none"),
+            allow_bcm=bool(allow_bcm),
+            allow_bcm_activation_obligations=bool(allow_bcm),
+            allow_bem_only=bool(allow_bem),
+        )
+
+    @staticmethod
+    def _normalize_id_mode(id_mode: str | None) -> str:
+        mode = str(id_mode or "").strip().lower()
+        if not mode:
+            return ""
+        if mode not in {"none", "technical_repair", "economic"}:
+            raise ValueError(f"Unknown id_mode '{id_mode}'. Expected one of: none, technical_repair, economic.")
+        return mode
+
+    @staticmethod
+    def _normalize_id_recourse_mode(id_recourse_mode: str | None) -> str:
+        mode = str(id_recourse_mode or "").strip().lower()
+        if not mode:
+            return "common"
+        if mode not in ID_RECOURSE_MODES:
+            raise ValueError(
+                f"Unknown id_recourse_mode '{id_recourse_mode}'. Expected one of: common, disabled, afrr_obligation_only."
+            )
+        return mode
+
+    @classmethod
+    def _apply_id_recourse_policy(
+        cls,
+        *,
+        strategy_name: str | None,
+        base_permissions: StrategyPermissions,
+        id_recourse_mode: str,
+    ) -> StrategyPermissions:
+        s = str(strategy_name or "").strip().lower()
+        mode = cls._normalize_id_recourse_mode(id_recourse_mode)
+        if mode == "disabled":
+            id_mode = "none"
+        elif mode == "common":
+            id_mode = "technical_repair"
+        else:  # afrr_obligation_only
+            id_mode = "none" if s == "da_only" else "technical_repair"
+        return StrategyPermissions(
+            allow_da=base_permissions.allow_da,
+            id_mode=id_mode,
+            allow_bcm=base_permissions.allow_bcm,
+            allow_bcm_activation_obligations=base_permissions.allow_bcm_activation_obligations,
+            allow_bem_only=base_permissions.allow_bem_only,
+        )
+
+    @classmethod
+    def resolve_strategy_permissions(
+        cls,
+        *,
+        strategy_name: str | None,
+        allowed_markets: list[str] | tuple[str, ...] | set[str],
+        id_mode: str | None = None,
+        id_recourse_mode: str | None = None,
+    ) -> StrategyPermissions:
+        perms = (
+            cls.strategy_permissions_from_name(strategy_name)
+            if strategy_name is not None
+            else cls.strategy_permissions_from_allowed_markets(allowed_markets)
+        )
+        policy_mode = cls._normalize_id_recourse_mode(id_recourse_mode)
+        perms = cls._apply_id_recourse_policy(
+            strategy_name=strategy_name,
+            base_permissions=perms,
+            id_recourse_mode=policy_mode,
+        )
+        override = cls._normalize_id_mode(id_mode)
+        if not override:
+            return perms
+        return StrategyPermissions(
+            allow_da=perms.allow_da,
+            id_mode=override,
+            allow_bcm=perms.allow_bcm,
+            allow_bcm_activation_obligations=perms.allow_bcm_activation_obligations,
+            allow_bem_only=perms.allow_bem_only,
+        )
 
     @staticmethod
     def _parse_reserve_retry_ladder(raw: object) -> list[float]:
@@ -1034,9 +1203,10 @@ class BatteryBacktester:
         n_vars = int(sl["slack_obligation_neg"].stop)
         if sl["ch"].start != 0 or sl["slack_neg"].stop <= 0:
             raise ValueError("Invalid variable slice definition for MILP.")
-        allowed = {str(m).strip().lower() for m in allowed_markets}
-        da_enabled = "da" in allowed
-        afrr_enabled = "afrr" in allowed
+        perms = self.strategy_permissions_from_allowed_markets(allowed_markets)
+        self._strategy_permissions = perms
+        da_enabled = bool(perms.allow_da)
+        afrr_enabled = bool(perms.allow_bcm or perms.allow_bem_only)
 
         p_da = self._finite_numeric_series(
             df,
@@ -1862,10 +2032,10 @@ class BatteryBacktester:
         # Integer decision blocks.
         ub[sl["ch"]] = da_units_max
         ub[sl["dis"]] = da_units_max
-        ub[sl["rpos_bin"]] = afrr_units_max
-        ub[sl["rneg_bin"]] = afrr_units_max
-        ub[sl["bem_pos_bin"]] = afrr_units_max
-        ub[sl["bem_neg_bin"]] = afrr_units_max
+        ub[sl["rpos_bin"]] = afrr_units_max if perms.allow_bcm else 0.0
+        ub[sl["rneg_bin"]] = afrr_units_max if perms.allow_bcm else 0.0
+        ub[sl["bem_pos_bin"]] = afrr_units_max if perms.allow_bem_only else 0.0
+        ub[sl["bem_neg_bin"]] = afrr_units_max if perms.allow_bem_only else 0.0
         if self.aux_mode == "state_dependent":
             lb[sl["u"]] = max(0.0, self.aux_off_mw)
             ub[sl["u"]] = self.aux_peak_mw
@@ -2197,6 +2367,7 @@ class BatteryBacktester:
         average_capacity_price_product_eur_mw_h: float | None = None,
         aufschlag_eur_mwh: float | None = None,
         aufschlag_eur_mw_h: float | None = None,
+        id_recourse_reason_hint: str = "none",
     ) -> tuple[float, dict[str, float]]:
         """
         3-Layer ID Rescue settlement:
@@ -2224,43 +2395,43 @@ class BatteryBacktester:
             id_discharge,
             max(0.0, self.p_max_mw - max(0.0, da_discharge) - max(0.0, reserve_pos)),
         )
-        # Reserve-aware ID rescue: if the hour starts short on reserve headroom,
-        # buy/sell ID energy (price-taker) to restore deliverability first.
-        req_soc_min_for_pos = (
-            self.soc_min
-            + (max(0.0, reserve_pos) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
-            + float(self.reserve_headroom_safety_mwh)
-        )
-        req_soc_max_for_neg = (
-            self.soc_max
-            - (max(0.0, reserve_neg) * self.reserve_activation_headroom_h) * self.eta_in
-            - float(self.reserve_headroom_safety_mwh)
-        )
-        soc_after_id = soc + self.eta_in * (id_charge * self.dt_h) - (id_discharge * self.dt_h) / max(self.eta_out, 1e-12)
-        if soc_after_id < req_soc_min_for_pos:
-            need_soc_up = req_soc_min_for_pos - soc_after_id
-            add_id_charge_mw = (need_soc_up / max(self.eta_in, 1e-12)) / max(self.dt_h, 1e-12)
-            add_id_charge_mw = max(
-                0.0,
-                min(
-                    add_id_charge_mw,
-                    self.p_max_mw - max(0.0, da_charge) - max(0.0, reserve_neg) - id_charge,
-                ),
+        # Reserve-aware ID rescue is only allowed in strategies that enable ID.
+        if self._strategy_permissions.allow_id:
+            req_soc_min_for_pos = (
+                self.soc_min
+                + (max(0.0, reserve_pos) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
+                + float(self.reserve_headroom_safety_mwh)
             )
-            id_charge += add_id_charge_mw
-            id_discharge = 0.0
-        elif soc_after_id > req_soc_max_for_neg:
-            need_soc_down = soc_after_id - req_soc_max_for_neg
-            add_id_discharge_mw = (need_soc_down * max(self.eta_out, 1e-12)) / max(self.dt_h, 1e-12)
-            add_id_discharge_mw = max(
-                0.0,
-                min(
-                    add_id_discharge_mw,
-                    self.p_max_mw - max(0.0, da_discharge) - max(0.0, reserve_pos) - id_discharge,
-                ),
+            req_soc_max_for_neg = (
+                self.soc_max
+                - (max(0.0, reserve_neg) * self.reserve_activation_headroom_h) * self.eta_in
+                - float(self.reserve_headroom_safety_mwh)
             )
-            id_discharge += add_id_discharge_mw
-            id_charge = 0.0
+            soc_after_id = soc + self.eta_in * (id_charge * self.dt_h) - (id_discharge * self.dt_h) / max(self.eta_out, 1e-12)
+            if soc_after_id < req_soc_min_for_pos:
+                need_soc_up = req_soc_min_for_pos - soc_after_id
+                add_id_charge_mw = (need_soc_up / max(self.eta_in, 1e-12)) / max(self.dt_h, 1e-12)
+                add_id_charge_mw = max(
+                    0.0,
+                    min(
+                        add_id_charge_mw,
+                        self.p_max_mw - max(0.0, da_charge) - max(0.0, reserve_neg) - id_charge,
+                    ),
+                )
+                id_charge += add_id_charge_mw
+                id_discharge = 0.0
+            elif soc_after_id > req_soc_max_for_neg:
+                need_soc_down = soc_after_id - req_soc_max_for_neg
+                add_id_discharge_mw = (need_soc_down * max(self.eta_out, 1e-12)) / max(self.dt_h, 1e-12)
+                add_id_discharge_mw = max(
+                    0.0,
+                    min(
+                        add_id_discharge_mw,
+                        self.p_max_mw - max(0.0, da_discharge) - max(0.0, reserve_pos) - id_discharge,
+                    ),
+                )
+                id_discharge += add_id_discharge_mw
+                id_charge = 0.0
 
         # Requested internal energies for this hour.
         act_pos_internal_req = max(0.0, act_pos_rate) * reserve_pos * self.dt_h
@@ -2350,6 +2521,7 @@ class BatteryBacktester:
         da_sell_grid = da_dis_internal * self.eta_out
         id_buy_mwh = id_ch_internal / self.eta_in
         id_sell_mwh = id_dis_internal * self.eta_out
+        id_repair_mwh = id_buy_mwh + id_sell_mwh
         act_pos_grid = act_pos_internal * self.eta_out
         act_neg_grid = act_neg_internal / self.eta_in
 
@@ -2358,10 +2530,28 @@ class BatteryBacktester:
         # Synthetic ID rescue prices with EPEX technical caps.
         id_buy_price_eur_mwh = min(self.id_buy_price_cap_eur_mwh, float(da_price) + self.id_rescue_spread_eur_mwh)
         id_sell_price_eur_mwh = max(self.id_sell_price_floor_eur_mwh, float(da_price) - self.id_rescue_spread_eur_mwh)
+        if float(id_buy_price_eur_mwh) < float(id_sell_price_eur_mwh) - 1e-12:
+            raise ValueError(
+                "Invalid ID price configuration: id_buy_price < id_sell_price. "
+                f"buy={id_buy_price_eur_mwh:.6f}, sell={id_sell_price_eur_mwh:.6f}, "
+                f"da={float(da_price):.6f}, spread={float(self.id_rescue_spread_eur_mwh):.6f}, "
+                f"cap={float(self.id_buy_price_cap_eur_mwh):.6f}, floor={float(self.id_sell_price_floor_eur_mwh):.6f}"
+            )
         cost_id_eur = id_buy_mwh * id_buy_price_eur_mwh
         revenue_id_eur = id_sell_mwh * id_sell_price_eur_mwh
         id_trade_mwh = id_buy_mwh + id_sell_mwh
         id_slippage_cost_eur = id_trade_mwh * self.id_rescue_spread_eur_mwh
+        id_repair_reason = "none"
+        id_trade_type = "none"
+        if id_trade_mwh > 1e-12:
+            if self._strategy_permissions.id_mode == "economic":
+                # Current ID implementation is reserve/SoC rescue logic.
+                # Keep explicit tagging to avoid silent baseline contamination.
+                id_trade_type = "technical_repair"
+                id_repair_reason = "soc_or_obligation_repair"
+            elif self._strategy_permissions.id_mode == "technical_repair":
+                id_trade_type = "technical_repair"
+                id_repair_reason = str(id_recourse_reason_hint or "soc_or_obligation_repair")
 
         # Capacity non-delivery check on post-rescue SoC (ID already applied).
         soc_for_capacity = soc + self.eta_in * id_ch_internal - id_dis_internal / self.eta_out
@@ -2535,9 +2725,29 @@ class BatteryBacktester:
             "id_discharge_mw": id_discharge,
             "id_buy_mwh": id_buy_mwh,
             "id_sell_mwh": id_sell_mwh,
+            "id_net_mwh": float(id_sell_mwh - id_buy_mwh),
+            "id_buy_price_eur_mwh": float(id_buy_price_eur_mwh),
+            "id_sell_price_eur_mwh": float(id_sell_price_eur_mwh),
             "revenue_id_eur": revenue_id_eur,
             "cost_id_eur": cost_id_eur,
+            "id_revenue_eur": revenue_id_eur,
+            "id_cost_eur": cost_id_eur,
+            "id_net_pnl_eur": float(revenue_id_eur - cost_id_eur),
             "id_slippage_cost_eur": id_slippage_cost_eur,
+            "id_recourse_mode": str(getattr(self, "_id_recourse_mode", "common")),
+            "id_allowed": float(self._strategy_permissions.allow_id),
+            "id_mode": str(self._strategy_permissions.id_mode),
+            "id_economic_enabled": float(self._strategy_permissions.allow_id_economic),
+            "id_technical_repair_enabled": float(self._strategy_permissions.allow_id_technical_repair),
+            "id_trade_type": str(id_trade_type),
+            "id_repair_reason": str(id_repair_reason),
+            "id_recourse_reason": str(id_repair_reason),
+            "id_repair_mwh": float(id_repair_mwh if id_trade_type == "technical_repair" else 0.0),
+            "id_repair_cost_eur": float((cost_id_eur - revenue_id_eur) if id_trade_type == "technical_repair" else 0.0),
+            "id_economic_mwh": float(id_trade_mwh if id_trade_type == "economic" else 0.0),
+            "id_economic_pnl_eur": float((revenue_id_eur - cost_id_eur) if id_trade_type == "economic" else 0.0),
+            "id_technical_repair_pnl_eur": float((revenue_id_eur - cost_id_eur) if id_trade_type == "technical_repair" else 0.0),
+            "pnl_id_eur": float(revenue_id_eur - cost_id_eur),
             "aux_power_mw": aux_power_mw,
             "aux_energy_mwh": aux_mwh,
             "aux_cost_eur": aux_cost_eur,
@@ -2620,10 +2830,11 @@ class BatteryBacktester:
         reserve_neg_next_mw: float,
         da_charge_next_mw: float,
         da_discharge_next_mw: float,
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, str]:
         """Compute ID rescue setpoints decided at t for execution in t+1."""
         id_charge = 0.0
         id_discharge = 0.0
+        reason = "none"
         req_soc_min_for_pos = (
             self.soc_min
             + (max(0.0, reserve_pos_next_mw) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
@@ -2639,12 +2850,14 @@ class BatteryBacktester:
             needed_internal_charge_mwh = soc_gap_up / max(self.eta_in, 1e-12)
             needed_charge_mw = needed_internal_charge_mwh / max(self.dt_h, 1e-12)
             id_charge = max(0.0, min(needed_charge_mw, self.p_max_mw - max(0.0, da_charge_next_mw)))
+            reason = "afrr_headroom_repair" if reserve_pos_next_mw > 1e-12 else "soc_min_repair"
         elif soc_next > req_soc_max_for_neg:
             soc_gap_down = soc_next - req_soc_max_for_neg
             needed_internal_discharge_mwh = soc_gap_down * self.eta_out
             needed_discharge_mw = needed_internal_discharge_mwh / max(self.dt_h, 1e-12)
             id_discharge = max(0.0, min(needed_discharge_mw, self.p_max_mw - max(0.0, da_discharge_next_mw)))
-        return float(id_charge), float(id_discharge)
+            reason = "afrr_headroom_repair" if reserve_neg_next_mw > 1e-12 else "soc_max_repair"
+        return float(id_charge), float(id_discharge), str(reason)
 
     def _apply_bem_only_submission_guard(
         self,
@@ -2848,17 +3061,30 @@ class BatteryBacktester:
         pred_cap_neg_bins_eur_mw: list[float] | None = None,
     ) -> dict[str, float | str]:
         """Sequential market clearing: aFRR capacity -> DA -> aFRR activation."""
+        perms = self._strategy_permissions
+        allow_da = bool(perms.allow_da)
+        allow_bcm = bool(perms.allow_bcm)
+        allow_bem = bool(perms.allow_bem_only)
         ch_plan, dis_plan = self._normalize_da_bid(planned_charge_mw, planned_discharge_mw)
         res_pos_plan = max(0.0, float(planned_reserve_pos_mw))
         res_neg_plan = max(0.0, float(planned_reserve_neg_mw))
         bem_pos_plan = max(0.0, float(planned_bem_only_pos_mw))
         bem_neg_plan = max(0.0, float(planned_bem_only_neg_mw))
+        if not allow_da:
+            ch_plan = 0.0
+            dis_plan = 0.0
+        if not allow_bcm:
+            res_pos_plan = 0.0
+            res_neg_plan = 0.0
+        if not allow_bem:
+            bem_pos_plan = 0.0
+            bem_neg_plan = 0.0
         ts = pd.to_datetime(target_time_utc, utc=True, errors="coerce")
         if pd.isna(ts):
             ts = pd.Timestamp("1970-01-01T00:00:00Z")
 
-        ob_pos = max(0.0, float(obligation_pos_mw))
-        ob_neg = max(0.0, float(obligation_neg_mw))
+        ob_pos = max(0.0, float(obligation_pos_mw)) if allow_bcm else 0.0
+        ob_neg = max(0.0, float(obligation_neg_mw)) if allow_bcm else 0.0
         soc_ref = float(self.soc_init if soc_now is None else soc_now)
         n_bins = int(len(self.afrr_quantile_bins))
 
@@ -3072,19 +3298,22 @@ class BatteryBacktester:
                 pred_act_pos=float(pred_act_pos),
                 pred_act_neg=float(pred_act_neg),
             )
-        da_bids = self.bid_builder.build_da_bids_from_plan(
-            ts=ts,
-            planned_charge_mw=ch_plan,
-            planned_discharge_mw=dis_plan,
-            obligation_pos_mw=ob_pos if ob_pos > 0.0 else cap_res.awarded_pos_mw,
-            obligation_neg_mw=ob_neg if ob_neg > 0.0 else cap_res.awarded_neg_mw,
-            pred_da_price=float(pred_da_price),
-            pred_da_price_p05=float(pred_da_price_p05) if pred_da_price_p05 is not None and np.isfinite(pred_da_price_p05) else None,
-            pred_da_price_p10=float(pred_da_price_p10) if pred_da_price_p10 is not None and np.isfinite(pred_da_price_p10) else None,
-            pred_da_price_p90=float(pred_da_price_p90) if pred_da_price_p90 is not None and np.isfinite(pred_da_price_p90) else None,
-            pred_da_price_p95=float(pred_da_price_p95) if pred_da_price_p95 is not None and np.isfinite(pred_da_price_p95) else None,
-            is_perfect_foresight=is_perfect_foresight,
-        )
+        if allow_da:
+            da_bids = self.bid_builder.build_da_bids_from_plan(
+                ts=ts,
+                planned_charge_mw=ch_plan,
+                planned_discharge_mw=dis_plan,
+                obligation_pos_mw=ob_pos if ob_pos > 0.0 else cap_res.awarded_pos_mw,
+                obligation_neg_mw=ob_neg if ob_neg > 0.0 else cap_res.awarded_neg_mw,
+                pred_da_price=float(pred_da_price),
+                pred_da_price_p05=float(pred_da_price_p05) if pred_da_price_p05 is not None and np.isfinite(pred_da_price_p05) else None,
+                pred_da_price_p10=float(pred_da_price_p10) if pred_da_price_p10 is not None and np.isfinite(pred_da_price_p10) else None,
+                pred_da_price_p90=float(pred_da_price_p90) if pred_da_price_p90 is not None and np.isfinite(pred_da_price_p90) else None,
+                pred_da_price_p95=float(pred_da_price_p95) if pred_da_price_p95 is not None and np.isfinite(pred_da_price_p95) else None,
+                is_perfect_foresight=is_perfect_foresight,
+            )
+        else:
+            da_bids = []
         if ob_pos > 0.0 or ob_neg > 0.0:
             # Phase 2 DA restriction: available power after aFRR capacity lock.
             available_da = max(0.0, self.p_max_mw - max(ob_pos, ob_neg))
@@ -3984,6 +4213,9 @@ class BatteryBacktester:
         deterministic_reserve_settlement: bool = False,
         is_perfect_foresight: bool = False,
         allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
+        strategy_name: str | None = None,
+        id_mode: str | None = None,
+        id_recourse_mode: str = "common",
         run_mode: str = "advanced_ml",
         strict_simulation_validity: bool = True,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -3993,9 +4225,16 @@ class BatteryBacktester:
         if soc_feedback_mode not in {"realized", "predicted"}:
             raise ValueError("soc_feedback_mode must be one of {'realized', 'predicted'}")
         self._assert_valid_time_index(df, colmap.timestamp)
-        allowed = {str(m).strip().lower() for m in allowed_markets}
-        da_enabled = "da" in allowed
-        afrr_enabled = "afrr" in allowed
+        perms = self.resolve_strategy_permissions(
+            strategy_name=strategy_name,
+            allowed_markets=allowed_markets,
+            id_mode=id_mode,
+            id_recourse_mode=id_recourse_mode,
+        )
+        self._id_recourse_mode = self._normalize_id_recourse_mode(id_recourse_mode)
+        self._strategy_permissions = perms
+        da_enabled = bool(perms.allow_da)
+        afrr_enabled = bool(perms.allow_bcm or perms.allow_bem_only)
         if df.empty:
             empty_dispatch = pd.DataFrame(
                 columns=[
@@ -4074,6 +4313,7 @@ class BatteryBacktester:
         # ID rescue decided at t and executed at t+1 (one-hour execution lag).
         pending_id_charge_mw = 0.0
         pending_id_discharge_mw = 0.0
+        pending_id_reason = "none"
         reopt_restart_done: set[pd.Timestamp] = set()
         asof_right_cache: dict[tuple[int, str], dict[int, pd.DataFrame]] = {}
         i = 0
@@ -4445,7 +4685,7 @@ class BatteryBacktester:
             new_reserve_bids_zeroed_by_retry = 0.0
             reserve_retry_infeasible_after_zero_reserve = 0.0
             disable_new_bcm_reserve_bids_used = float(self.disable_new_bcm_reserve_bids)
-            if afrr_enabled:
+            if perms.allow_bcm:
                 w_ts = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
                 for tsw in w_ts:
                     if pd.isna(tsw):
@@ -4454,6 +4694,12 @@ class BatteryBacktester:
                     ob_neg = float(afrr_cap_neg_lockbook.get(tsw, 0.0))
                     if ob_pos > 0.0 or ob_neg > 0.0:
                         fixed_reserve_obligation[tsw] = (ob_pos, ob_neg)
+            else:
+                # Strategy purity guard: bem_only must not carry BCM lockbook obligations.
+                if bool(afrr_cap_pos_lockbook) or bool(afrr_cap_neg_lockbook):
+                    raise RuntimeError(
+                        "Strategy contamination: bcm lockbook obligations exist while BCM is disabled."
+                    )
             def _apply_retry_factor_to_new_obligations(
                 obligations: dict[pd.Timestamp, tuple[float, float]],
                 factor: float,
@@ -4715,7 +4961,7 @@ class BatteryBacktester:
             snapshot_ts_current = pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True, errors="coerce")
             afrr_bcm_gate_hour_cet = int(self.afrr_bcm_gate_hour_cet)
             is_afrr_gate_now = bool(
-                afrr_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, afrr_bcm_gate_hour_cet)
+                perms.allow_bcm and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, afrr_bcm_gate_hour_cet)
             )
             is_da_gate_now = bool(da_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, da_gate_hour_cet))
             if is_afrr_gate_now and is_da_gate_now:
@@ -4747,7 +4993,7 @@ class BatteryBacktester:
 
             # Phase 1 (D-1 configured aFRR BCM gate hour): clear aFRR capacity in 4h blocks and
             # propagate awarded obligations to delivery intervals.
-            if afrr_enabled:
+            if perms.allow_bcm:
                 cap_gate_stats = self._update_afrr_capacity_lockbooks_from_snapshot(
                     snapshot_ts=pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True, errors="coerce"),
                     snapshot_plan=snapshot_plan,
@@ -5072,9 +5318,13 @@ class BatteryBacktester:
                     act_neg_price=_sf(src, colmap.true_afrr_activation_price_neg, 0.0),
                     act_pos_rate=float(cleared["executed_rate_pos"]),
                     act_neg_rate=float(cleared["executed_rate_neg"]),
+                    id_recourse_reason_hint=str(pending_id_reason),
                 )
                 clearing_records[-1]["pending_id_charge_mw"] = float(pending_id_charge_mw)
                 clearing_records[-1]["pending_id_discharge_mw"] = float(pending_id_discharge_mw)
+                clearing_records[-1]["pending_id_buy_mwh"] = float(pending_id_charge_mw * self.dt_h / max(self.eta_in, 1e-12))
+                clearing_records[-1]["pending_id_sell_mwh"] = float(pending_id_discharge_mw * self.dt_h * self.eta_out)
+                clearing_records[-1]["pending_id_recourse_reason"] = str(pending_id_reason)
                 executed_soc_vals.append(float(executed_s))
                 shock_sources: list[str] = []
                 if float(cleared.get("submitted_da_buy_mw", 0.0)) > 0 and not bool(cleared.get("da_buy_accepted", 0.0)):
@@ -5093,7 +5343,7 @@ class BatteryBacktester:
                 # Decide ID rescue for next hour (t+1) and store as pending.
                 # Uses post-settlement SoC and next-hour DA plan + aFRR obligation.
                 next_idx = step_idx + 1
-                if next_idx < len(take):
+                if perms.allow_id and next_idx < len(take):
                     next_row = take.iloc[next_idx]
                     next_ts = pd.to_datetime(next_row[colmap.timestamp], utc=True, errors="coerce")
                     next_da_charge = float(pd.to_numeric(pd.Series([next_row.get("charge_mw", 0.0)]), errors="coerce").iloc[0])
@@ -5104,7 +5354,7 @@ class BatteryBacktester:
                     next_ob_neg = float(afrr_cap_neg_lockbook.get(next_ts, 0.0)) if pd.notna(next_ts) else 0.0
                     reserve_pos_next = max(next_reserve_pos_plan, next_ob_pos)
                     reserve_neg_next = max(next_reserve_neg_plan, next_ob_neg)
-                    pending_id_charge_mw, pending_id_discharge_mw = self._plan_id_rescue_for_next_hour(
+                    pending_id_charge_mw, pending_id_discharge_mw, pending_id_reason = self._plan_id_rescue_for_next_hour(
                         soc_next=float(executed_s),
                         reserve_pos_next_mw=reserve_pos_next,
                         reserve_neg_next_mw=reserve_neg_next,
@@ -5114,6 +5364,7 @@ class BatteryBacktester:
                 else:
                     pending_id_charge_mw = 0.0
                     pending_id_discharge_mw = 0.0
+                    pending_id_reason = "none"
                 soc = float(executed_s)
                 i += 1
                 _log_progress()
@@ -6027,8 +6278,8 @@ class BatteryBacktester:
         tol: float = 1e-9,
     ) -> None:
         """Runtime assertions that final settled outputs respect strategy isolation."""
-        allowed = {str(m).strip().lower() for m in allowed_markets}
-        if allowed == {"da"}:
+        perms = self.strategy_permissions_from_allowed_markets(allowed_markets)
+        if perms.allow_da and (not perms.allow_bcm) and (not perms.allow_bem_only):
             afrr_cols = [
                 "real_reserve_pos_mw",
                 "real_reserve_neg_mw",
@@ -6047,7 +6298,7 @@ class BatteryBacktester:
                     "Strategy isolation check failed for da_only: non-zero aFRR activity detected "
                     f"(abs-sum={afrr_mag:.6f})."
                 )
-        elif allowed == {"afrr"}:
+        elif (not perms.allow_da) and (perms.allow_bcm or perms.allow_bem_only):
             da_cols = [
                 "real_charge_mw",
                 "real_discharge_mw",
@@ -6066,6 +6317,57 @@ class BatteryBacktester:
                     "Strategy isolation check failed for afrr_only: non-zero DA activity detected "
                     f"(abs-sum={da_mag:.6f})."
                 )
+        if not perms.allow_bem_only:
+            bem_cols = [
+                "real_bem_only_submitted_pos_mw",
+                "real_bem_only_submitted_neg_mw",
+                "real_bem_only_executed_pos_mw",
+                "real_bem_only_executed_neg_mw",
+            ]
+            bem_mag = self._sum_abs_present(hourly, bem_cols)
+            if bem_mag > tol:
+                raise RuntimeError(
+                    "Strategy isolation check failed: non-zero BEM-only activity while BEM-only is disabled "
+                    f"(abs-sum={bem_mag:.6f})."
+                )
+        if not perms.allow_bcm:
+            bcm_cols = [
+                "real_revenue_capacity_eur",
+                "real_afrr_cap_pos_awarded",
+                "real_afrr_cap_neg_awarded",
+                "real_locked_reserve_pos_mw",
+                "real_locked_reserve_neg_mw",
+            ]
+            bcm_mag = self._sum_abs_present(hourly, bcm_cols)
+            if bcm_mag > tol:
+                raise RuntimeError(
+                    "Strategy isolation check failed: non-zero BCM activity while BCM is disabled "
+                    f"(abs-sum={bcm_mag:.6f})."
+                )
+        # ID policy guardrails
+        id_cols = [
+            "real_id_charge_mw",
+            "real_id_discharge_mw",
+            "real_pending_id_charge_mw",
+            "real_pending_id_discharge_mw",
+        ]
+        id_mag = self._sum_abs_present(hourly, id_cols)
+        if perms.id_mode == "none" and id_mag > tol:
+            raise RuntimeError(
+                "Strategy isolation check failed: non-zero ID activity while id_mode=none "
+                f"(abs-sum={id_mag:.6f})."
+            )
+        if perms.id_mode == "technical_repair" and id_mag > tol and "real_id_trade_type" in hourly.columns:
+            tags = hourly["real_id_trade_type"].fillna("").astype(str).str.strip().str.lower()
+            bad = ((tags != "technical_repair") & (tags != "none")) & (
+                pd.to_numeric(hourly.get("real_id_charge_mw", 0.0), errors="coerce").fillna(0.0).abs()
+                + pd.to_numeric(hourly.get("real_id_discharge_mw", 0.0), errors="coerce").fillna(0.0).abs()
+                > tol
+            )
+            if bool(bad.any()):
+                raise RuntimeError(
+                    "Strategy isolation check failed: non-technical ID trade type detected while id_mode=technical_repair."
+                )
 
     def run(
         self,
@@ -6080,6 +6382,9 @@ class BatteryBacktester:
         soc_feedback_mode: str = "realized",
         enforce_final_soc_min: bool = True,
         allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
+        strategy_name: str | None = None,
+        id_mode: str | None = None,
+        id_recourse_mode: str = "common",
         strict_simulation_validity: bool = True,
         enable_global_perfect_foresight: bool = False,
     ) -> BacktestOutputs:
@@ -6087,6 +6392,13 @@ class BatteryBacktester:
         if horizon_hours <= 0 or reopt_step_hours <= 0:
             raise ValueError("horizon_hours and reopt_step_hours must be > 0")
         self._infeasible_debug_dumps = []
+        self._strategy_permissions = self.resolve_strategy_permissions(
+            strategy_name=strategy_name,
+            allowed_markets=allowed_markets,
+            id_mode=id_mode,
+            id_recourse_mode=id_recourse_mode,
+        )
+        self._id_recourse_mode = self._normalize_id_recourse_mode(id_recourse_mode)
         self._assert_valid_time_index(df, colmap.timestamp)
         def _run_isolated_path(
             *,
@@ -6111,6 +6423,9 @@ class BatteryBacktester:
                         deterministic_reserve_settlement=deterministic_local,
                         is_perfect_foresight=is_perfect_foresight_local,
                         allowed_markets=allowed_markets_local,
+                        strategy_name=strategy_name,
+                        id_mode=id_mode,
+                        id_recourse_mode=id_recourse_mode,
                         run_mode=("perfect_foresight" if is_perfect_foresight_local else "advanced_ml"),
                         strict_simulation_validity=bool(strict_simulation_validity),
                     )
@@ -6219,6 +6534,9 @@ class BatteryBacktester:
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
                 allowed_markets=allowed_markets,
+                strategy_name=strategy_name,
+                id_mode=id_mode,
+                id_recourse_mode=id_recourse_mode,
                 run_mode="advanced_ml",
                 strict_simulation_validity=bool(strict_simulation_validity),
             )
@@ -6278,6 +6596,9 @@ class BatteryBacktester:
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
                 allowed_markets=allowed_markets,
+                strategy_name=strategy_name,
+                id_mode=id_mode,
+                id_recourse_mode=id_recourse_mode,
                 run_mode="naive",
                 strict_simulation_validity=bool(strict_simulation_validity),
             )
@@ -6353,6 +6674,9 @@ class BatteryBacktester:
                     deterministic_reserve_settlement=True,
                     is_perfect_foresight=True,
                     allowed_markets=allowed_markets,
+                    strategy_name=strategy_name,
+                    id_mode=id_mode,
+                    id_recourse_mode=id_recourse_mode,
                     run_mode="perfect_foresight",
                     strict_simulation_validity=bool(strict_simulation_validity),
                 )
@@ -6405,6 +6729,9 @@ class BatteryBacktester:
                     deterministic_reserve_settlement=False,
                     is_perfect_foresight=False,
                     allowed_markets=allowed_markets,
+                    strategy_name=strategy_name,
+                    id_mode=id_mode,
+                    id_recourse_mode=id_recourse_mode,
                     run_mode="perfect_foresight",
                     strict_simulation_validity=bool(strict_simulation_validity),
                 )
@@ -6920,6 +7247,20 @@ class BatteryBacktester:
             "perfect_foresight_afrr_only_feasible": float(perfect_foresight_afrr_only_feasible),
             "bem_only_mode": "approx_reuse_reserve_volume",
             "id_price_taker": 1.0,
+            "id_price_mode": "synthetic_da_spread_price_taker",
+            "id_spread": float(self.id_rescue_spread_eur_mwh),
+            "id_price_cap": float(self.id_buy_price_cap_eur_mwh),
+            "id_price_floor": float(self.id_sell_price_floor_eur_mwh),
+            "strategy": ",".join(sorted({str(m).strip().lower() for m in allowed_markets})),
+            "id_recourse_mode": str(getattr(self, "_id_recourse_mode", "common")),
+            "id_mode": str(self._strategy_permissions.id_mode),
+            "id_economic_enabled": float(self._strategy_permissions.allow_id_economic),
+            "id_technical_repair_enabled": float(self._strategy_permissions.allow_id_technical_repair),
+            "allow_da": float(self._strategy_permissions.allow_da),
+            "allow_id": float(self._strategy_permissions.allow_id),
+            "allow_bcm": float(self._strategy_permissions.allow_bcm),
+            "allow_bcm_activation_obligations": float(self._strategy_permissions.allow_bcm_activation_obligations),
+            "allow_bem_only": float(self._strategy_permissions.allow_bem_only),
             "reserve_activation_headroom_h": float(self.reserve_activation_headroom_h),
             "bem_activation_headroom_h": float(self.bem_activation_headroom_h),
         }
@@ -7029,6 +7370,38 @@ class BatteryBacktester:
         summary["total_da_cost_eur"] = float(hourly["real_cost_da_eur"].sum())
         summary["total_id_revenue_eur"] = float(hourly["real_revenue_id_eur"].sum()) if "real_revenue_id_eur" in hourly.columns else 0.0
         summary["total_id_cost_eur"] = float(hourly["real_cost_id_eur"].sum()) if "real_cost_id_eur" in hourly.columns else 0.0
+        summary["total_id_pnl_eur"] = float(summary["total_id_revenue_eur"] - summary["total_id_cost_eur"])
+        summary["total_id_buy_mwh"] = float(pd.to_numeric(hourly.get("real_id_buy_mwh", 0.0), errors="coerce").fillna(0.0).sum())
+        summary["total_id_sell_mwh"] = float(pd.to_numeric(hourly.get("real_id_sell_mwh", 0.0), errors="coerce").fillna(0.0).sum())
+        summary["total_id_net_mwh"] = float(summary["total_id_sell_mwh"] - summary["total_id_buy_mwh"])
+        summary["id_repair_mwh_total"] = float(
+            pd.to_numeric(hourly.get("real_id_repair_mwh", 0.0), errors="coerce").fillna(0.0).sum()
+        )
+        summary["id_repair_cost_eur_total"] = float(
+            pd.to_numeric(hourly.get("real_id_repair_cost_eur", 0.0), errors="coerce").fillna(0.0).sum()
+        )
+        summary["id_economic_mwh_total"] = float(
+            pd.to_numeric(hourly.get("real_id_economic_mwh", 0.0), errors="coerce").fillna(0.0).sum()
+        )
+        summary["id_economic_pnl_eur_total"] = float(
+            pd.to_numeric(hourly.get("real_id_economic_pnl_eur", 0.0), errors="coerce").fillna(0.0).sum()
+        )
+        summary["id_technical_repair_pnl_eur_total"] = float(
+            pd.to_numeric(hourly.get("real_id_technical_repair_pnl_eur", 0.0), errors="coerce").fillna(0.0).sum()
+        )
+        if "real_id_recourse_reason" in hourly.columns:
+            reason_counts = hourly["real_id_recourse_reason"].fillna("none").astype(str).str.strip().str.lower().value_counts().to_dict()
+        else:
+            reason_counts = {}
+        summary["id_recourse_events_total"] = float(
+            (
+                pd.to_numeric(hourly.get("real_id_buy_mwh", 0.0), errors="coerce").fillna(0.0).abs()
+                + pd.to_numeric(hourly.get("real_id_sell_mwh", 0.0), errors="coerce").fillna(0.0).abs()
+            ).gt(1e-12).sum()
+        )
+        summary["id_recourse_events_by_reason"] = json.dumps(reason_counts, ensure_ascii=False, sort_keys=True)
+        summary["id_recourse_share_hours"] = float(summary["id_recourse_events_total"] / max(len(hourly), 1))
+        summary["realized_total_pnl_excluding_id_eur"] = float(summary["realized_total_pnl_eur"] - summary["total_id_pnl_eur"])
         summary["total_afrr_capacity_revenue_eur"] = float(hourly["real_revenue_capacity_eur"].sum())
         summary["total_afrr_activation_revenue_eur"] = float(hourly["real_revenue_activation_eur"].sum())
         summary["total_bcm_linked_activation_revenue_eur"] = float(

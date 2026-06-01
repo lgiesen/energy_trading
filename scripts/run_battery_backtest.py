@@ -570,12 +570,48 @@ def _build_afrr_bin_ev_audit(
     *,
     hourly: pd.DataFrame,
     scenario_name: str,
+    trading_strategy: str,
     active_bins: list[str],
     backtester: BatteryBacktester,
     timestamp_col: str,
+    strict: bool = True,
+    status_out: dict[str, object] | None = None,
 ) -> pd.DataFrame:
     h_ev = hourly.copy()
+    strategy = str(trading_strategy).strip().lower()
+    expected_by_strategy = {
+        "da_only": {"BCM": False, "BEM": False},
+        "bcm_only": {"BCM": True, "BEM": False},
+        "bem_only": {"BCM": False, "BEM": True},
+        "afrr_only": {"BCM": True, "BEM": True},
+        "multi": {"BCM": True, "BEM": True},
+    }
+    expected = expected_by_strategy.get(strategy, {"BCM": True, "BEM": True})
+    status: dict[str, object] = {
+        "scenario": scenario_name,
+        "trading_strategy": strategy,
+        "active_bins": list(active_bins),
+        "expected_components_by_strategy": expected,
+        "actual_components_with_selected_mw": [],
+        "audit_row_count": 0,
+        "components_emitted": [],
+        "components_skipped": {},
+        "missing_required_columns_by_component": {},
+        "nonfinite_required_fields_by_component": {},
+        "active_reconciled_row_count": 0,
+        "skipped_zero_decision_row_count": 0,
+        "inactive_zero_decision_skipped_count": 0,
+        "inactive_zero_decision_reconciled_count": 0,
+        "benchmark_or_nonaccepted_path_skipped_count": 0,
+        "active_missing_ev_field_count": 0,
+        "first_bad_rows": [],
+        "strict_audit_pass": True,
+    }
     if h_ev.empty:
+        status["components_skipped"] = {"BCM": "empty_hourly", "BEM": "empty_hourly"}
+        if status_out is not None:
+            status_out.clear()
+            status_out.update(status)
         return pd.DataFrame()
     ts_s = pd.to_datetime(h_ev.get(timestamp_col), utc=True, errors="coerce")
     bin_ids = _discover_afrr_bin_ids(list(h_ev.columns))
@@ -597,107 +633,301 @@ def _build_afrr_bin_ev_audit(
             return str(active_bins[b])
         return ""
 
+    missing_required: dict[str, list[str]] = {}
+    nonfinite_required: dict[str, list[str]] = {}
+
+    bcm_required_by_bin = {
+        "pos": [
+            "ev_bcm_expected_capacity_revenue_pos_bin_{b}",
+            "ev_bcm_expected_activation_revenue_pos_bin_{b}",
+            "ev_bcm_expected_aux_cost_pos_bin_{b}",
+            "ev_bcm_offer_cost_bin_{b}",
+            "ev_rpos_coef_bin_{b}_eur_per_mw",
+        ],
+        "neg": [
+            "ev_bcm_expected_capacity_revenue_neg_bin_{b}",
+            "ev_bcm_expected_activation_revenue_neg_bin_{b}",
+            "ev_bcm_expected_aux_cost_neg_bin_{b}",
+            "ev_bcm_offer_cost_bin_{b}",
+            "ev_rneg_coef_bin_{b}_eur_per_mw",
+        ],
+    }
+    bem_required_by_bin = {
+        "pos": [
+            "ev_bem_expected_activation_revenue_pos_bin_{b}",
+            "ev_bem_expected_aux_cost_pos_bin_{b}",
+            "ev_bem_pos_coef_bin_{b}_eur_per_mw",
+        ],
+        "neg": [
+            "ev_bem_expected_activation_revenue_neg_bin_{b}",
+            "ev_bem_expected_aux_cost_neg_bin_{b}",
+            "ev_bem_neg_coef_bin_{b}_eur_per_mw",
+        ],
+    }
+
     rows: list[dict[str, object]] = []
+    first_bad_rows: list[dict[str, object]] = []
+
+    def _is_ok_hour(i: int) -> bool:
+        code = str(h_ev.iloc[i].get("optimization_error_code", "ok")).strip().lower()
+        return code in {"ok", "", "none"}
+
+    def _append_row(
+        *,
+        i: int,
+        ts: pd.Timestamp,
+        bin_id: int,
+        q_name: str,
+        component: str,
+        direction: str,
+        decision_variable_name: str,
+        selected_mw: float,
+        payload: dict[str, object],
+        required_templates: list[str],
+    ) -> None:
+        required_cols = [t.format(b=bin_id) for t in required_templates]
+        missing = [c for c in required_cols if c not in h_ev.columns]
+        present_required = [c for c in required_cols if c in h_ev.columns]
+        nonfinite = [
+            c
+            for c in present_required
+            if not np.isfinite(float(pd.to_numeric(pd.Series([h_ev.iloc[i][c]]), errors="coerce").iloc[0]))
+        ]
+        sel_val = pd.to_numeric(pd.Series([selected_mw]), errors="coerce").iloc[0]
+        sel_for_logic = float(sel_val) if pd.notna(sel_val) and np.isfinite(float(sel_val)) else 0.0
+        sel_abs = abs(sel_for_logic)
+        is_selected = bool(sel_abs > 1e-9)
+        is_ok = _is_ok_hour(i)
+        has_bad_required = bool(missing or nonfinite)
+        if is_selected and is_ok and has_bad_required:
+            row_status = "active_missing_ev_fields"
+        elif is_selected and not is_ok:
+            row_status = "benchmark_or_nonaccepted_path_skipped"
+        elif (not is_selected) and is_ok and has_bad_required:
+            row_status = "inactive_zero_decision_skipped"
+        elif (not is_selected) and is_ok:
+            row_status = "inactive_zero_decision_reconciled"
+        else:
+            row_status = "benchmark_or_nonaccepted_path_skipped"
+        if missing:
+            missing_required[f"{component}_{direction}_bin_{bin_id}"] = missing
+        if nonfinite:
+            nonfinite_required[f"{component}_{direction}_bin_{bin_id}"] = nonfinite
+        if row_status == "active_missing_ev_fields" and len(first_bad_rows) < 10:
+            first_bad_rows.append(
+                {
+                    "timestamp_utc": str(ts),
+                    "market_component": component,
+                    "direction": direction,
+                    "quantile_bin": q_name,
+                    "decision_variable_name": decision_variable_name,
+                    "selected_mw": float(sel_for_logic),
+                    "audit_row_status": row_status,
+                    "optimization_error_code": str(h_ev.iloc[i].get("optimization_error_code", "")),
+                    "missing_columns": missing[:12],
+                    "nonfinite_required_audit_fields": nonfinite[:12],
+                }
+            )
+        out_row = {
+            "timestamp_utc": ts,
+            "scenario": scenario_name,
+            "trading_strategy": strategy,
+            "market_component": component,
+            "direction": direction,
+            "quantile_bin": q_name,
+            "decision_variable_name": decision_variable_name,
+            "selected_mw": float(sel_for_logic),
+            "audit_row_status": row_status,
+            "optimization_error_code": str(h_ev.iloc[i].get("optimization_error_code", "")),
+            "missing_required_columns": "|".join(missing),
+            "nonfinite_required_audit_fields": "|".join(nonfinite),
+        }
+        out_row.update(payload)
+        rows.append(out_row)
     for i in range(len(h_ev)):
         ts = ts_s.iloc[i] if i < len(ts_s) else pd.NaT
         for b in bin_ids:
             q_name = _row_qname(i, b)
-            rows.append(
-                {
-                    "timestamp_utc": ts,
-                    "scenario": scenario_name,
-                    "market_component": "BCM",
-                    "direction": "pos",
-                    "quantile_bin": q_name,
-                    "decision_variable_name": f"reserve_pos_bin_{b}_mw",
-                    "capacity_price_q": _row_num(i, f"afrr_bin_{b}_cap_price_pos"),
-                    "activation_price_q": _row_num(i, f"ev_afrr_bin_{b}_act_price_pos"),
-                    "activation_rate_q": _row_num(i, f"ev_afrr_bin_{b}_act_rate_pos"),
-                    "p_acc_or_p_exec_q": _row_num(i, f"ev_pacc_pos_bin_{b}"),
-                    "expected_capacity_revenue": _row_num(i, f"ev_bcm_expected_capacity_revenue_pos_bin_{b}"),
-                    "expected_activation_revenue": _row_num(i, f"ev_bcm_expected_activation_revenue_pos_bin_{b}"),
-                    "expected_aux_cost": _row_num(i, f"ev_bcm_expected_aux_cost_pos_bin_{b}"),
-                    "offer_cost": _row_num(i, f"ev_bcm_offer_cost_bin_{b}"),
-                    "transaction_cost": float(backtester.trans_eur_mwh),
-                    "degradation_cost": float(backtester.deg_eur_mwh / max(backtester.eta_out, 1e-12)),
-                    "activation_margin": _row_num(i, f"ev_bcm_activation_margin_pos_bin_{b}"),
-                    "ev_coefficient": _row_num(i, f"ev_rpos_coef_bin_{b}_eur_per_mw"),
-                    "selected_mw": _row_num(i, f"reserve_pos_bin_{b}_mw"),
-                }
+            if expected.get("BCM", False):
+                sel_pos = _row_num(i, f"reserve_pos_bin_{b}_mw", default=0.0)
+                _append_row(
+                    i=i,
+                    ts=ts,
+                    bin_id=b,
+                    q_name=q_name,
+                    component="BCM",
+                    direction="pos",
+                    decision_variable_name=f"reserve_pos_bin_{b}_mw",
+                    selected_mw=sel_pos,
+                    required_templates=bcm_required_by_bin["pos"],
+                    payload={
+                        "capacity_price_q": _row_num(i, f"afrr_bin_{b}_cap_price_pos"),
+                        "activation_price_q": _row_num(i, f"ev_afrr_bin_{b}_act_price_pos"),
+                        "activation_rate_q": _row_num(i, f"ev_afrr_bin_{b}_act_rate_pos"),
+                        "p_acc_or_p_exec_q": _row_num(i, f"ev_pacc_pos_bin_{b}"),
+                        "expected_capacity_revenue": _row_num(i, f"ev_bcm_expected_capacity_revenue_pos_bin_{b}"),
+                        "expected_activation_revenue": _row_num(i, f"ev_bcm_expected_activation_revenue_pos_bin_{b}"),
+                        "expected_aux_cost": _row_num(i, f"ev_bcm_expected_aux_cost_pos_bin_{b}"),
+                        "offer_cost": _row_num(i, f"ev_bcm_offer_cost_bin_{b}"),
+                        "transaction_cost": float(backtester.trans_eur_mwh),
+                        "degradation_cost": float(backtester.deg_eur_mwh / max(backtester.eta_out, 1e-12)),
+                        "activation_margin": _row_num(i, f"ev_bcm_activation_margin_pos_bin_{b}"),
+                        "ev_coefficient": _row_num(i, f"ev_rpos_coef_bin_{b}_eur_per_mw"),
+                    },
+                )
+                sel_neg = _row_num(i, f"reserve_neg_bin_{b}_mw", default=0.0)
+                _append_row(
+                    i=i,
+                    ts=ts,
+                    bin_id=b,
+                    q_name=q_name,
+                    component="BCM",
+                    direction="neg",
+                    decision_variable_name=f"reserve_neg_bin_{b}_mw",
+                    selected_mw=sel_neg,
+                    required_templates=bcm_required_by_bin["neg"],
+                    payload={
+                        "capacity_price_q": _row_num(i, f"afrr_bin_{b}_cap_price_neg"),
+                        "activation_price_q": _row_num(i, f"ev_afrr_bin_{b}_act_price_neg"),
+                        "activation_rate_q": _row_num(i, f"ev_afrr_bin_{b}_act_rate_neg"),
+                        "p_acc_or_p_exec_q": _row_num(i, f"ev_pacc_neg_bin_{b}"),
+                        "expected_capacity_revenue": _row_num(i, f"ev_bcm_expected_capacity_revenue_neg_bin_{b}"),
+                        "expected_activation_revenue": _row_num(i, f"ev_bcm_expected_activation_revenue_neg_bin_{b}"),
+                        "expected_aux_cost": _row_num(i, f"ev_bcm_expected_aux_cost_neg_bin_{b}"),
+                        "offer_cost": _row_num(i, f"ev_bcm_offer_cost_bin_{b}"),
+                        "transaction_cost": float(backtester.trans_eur_mwh),
+                        "degradation_cost": float(backtester.deg_eur_mwh * backtester.eta_in),
+                        "activation_margin": _row_num(i, f"ev_bcm_activation_margin_neg_bin_{b}"),
+                        "ev_coefficient": _row_num(i, f"ev_rneg_coef_bin_{b}_eur_per_mw"),
+                    },
+                )
+
+            if expected.get("BEM", False):
+                sel_pos = _row_num(i, f"bem_pos_bin_{b}_mw", default=0.0)
+                _append_row(
+                    i=i,
+                    ts=ts,
+                    bin_id=b,
+                    q_name=q_name,
+                    component="BEM",
+                    direction="pos",
+                    decision_variable_name=f"bem_pos_bin_{b}_mw",
+                    selected_mw=sel_pos,
+                    required_templates=bem_required_by_bin["pos"],
+                    payload={
+                        "capacity_price_q": np.nan,
+                        "activation_price_q": _row_num(i, f"ev_bem_bin_{b}_act_price_pos"),
+                        "activation_rate_q": _row_num(i, f"ev_bem_bin_{b}_act_rate_pos"),
+                        "p_acc_or_p_exec_q": _row_num(i, f"ev_bem_bin_{b}_p_exec_pos"),
+                        "expected_capacity_revenue": 0.0,
+                        "expected_activation_revenue": _row_num(i, f"ev_bem_expected_activation_revenue_pos_bin_{b}"),
+                        "expected_aux_cost": _row_num(i, f"ev_bem_expected_aux_cost_pos_bin_{b}"),
+                        "offer_cost": 0.0,
+                        "transaction_cost": float(backtester.trans_eur_mwh),
+                        "degradation_cost": float(backtester.deg_eur_mwh / max(backtester.eta_out, 1e-12)),
+                        "activation_margin": _row_num(i, f"ev_bem_activation_margin_pos_bin_{b}"),
+                        "ev_coefficient": _row_num(i, f"ev_bem_pos_coef_bin_{b}_eur_per_mw"),
+                    },
+                )
+                sel_neg = _row_num(i, f"bem_neg_bin_{b}_mw", default=0.0)
+                _append_row(
+                    i=i,
+                    ts=ts,
+                    bin_id=b,
+                    q_name=q_name,
+                    component="BEM",
+                    direction="neg",
+                    decision_variable_name=f"bem_neg_bin_{b}_mw",
+                    selected_mw=sel_neg,
+                    required_templates=bem_required_by_bin["neg"],
+                    payload={
+                        "capacity_price_q": np.nan,
+                        "activation_price_q": _row_num(i, f"ev_bem_bin_{b}_act_price_neg"),
+                        "activation_rate_q": _row_num(i, f"ev_bem_bin_{b}_act_rate_neg"),
+                        "p_acc_or_p_exec_q": _row_num(i, f"ev_bem_bin_{b}_p_exec_neg"),
+                        "expected_capacity_revenue": 0.0,
+                        "expected_activation_revenue": _row_num(i, f"ev_bem_expected_activation_revenue_neg_bin_{b}"),
+                        "expected_aux_cost": _row_num(i, f"ev_bem_expected_aux_cost_neg_bin_{b}"),
+                        "offer_cost": 0.0,
+                        "transaction_cost": float(backtester.trans_eur_mwh),
+                        "degradation_cost": float(backtester.deg_eur_mwh * backtester.eta_in),
+                        "activation_margin": _row_num(i, f"ev_bem_activation_margin_neg_bin_{b}"),
+                        "ev_coefficient": _row_num(i, f"ev_bem_neg_coef_bin_{b}_eur_per_mw"),
+                    },
+                )
+    if missing_required:
+        status["missing_required_columns_by_component"] = missing_required
+    if nonfinite_required:
+        status["nonfinite_required_fields_by_component"] = nonfinite_required
+    if missing_required or nonfinite_required:
+        active_missing_count = int(
+            (pd.DataFrame(rows).get("audit_row_status", pd.Series(dtype=str)) == "active_missing_ev_fields").sum()
+        )
+        if strict and active_missing_count > 0:
+            sample_keys = list(missing_required.keys())[:8]
+            details = "; ".join([f"{k}: {missing_required[k][:5]}" for k in sample_keys])
+            sample_nonfinite_keys = list(nonfinite_required.keys())[:8]
+            details_nonfinite = "; ".join([f"{k}: {nonfinite_required[k][:5]}" for k in sample_nonfinite_keys])
+            raise ValueError(
+                f"EV audit build failed for scenario={scenario_name}, strategy={strategy}: "
+                f"missing/nonfinite required EV fields for active components. "
+                f"missing={details or 'none'}; nonfinite={details_nonfinite or 'none'}"
             )
-            rows.append(
-                {
-                    "timestamp_utc": ts,
-                    "scenario": scenario_name,
-                    "market_component": "BCM",
-                    "direction": "neg",
-                    "quantile_bin": q_name,
-                    "decision_variable_name": f"reserve_neg_bin_{b}_mw",
-                    "capacity_price_q": _row_num(i, f"afrr_bin_{b}_cap_price_neg"),
-                    "activation_price_q": _row_num(i, f"ev_afrr_bin_{b}_act_price_neg"),
-                    "activation_rate_q": _row_num(i, f"ev_afrr_bin_{b}_act_rate_neg"),
-                    "p_acc_or_p_exec_q": _row_num(i, f"ev_pacc_neg_bin_{b}"),
-                    "expected_capacity_revenue": _row_num(i, f"ev_bcm_expected_capacity_revenue_neg_bin_{b}"),
-                    "expected_activation_revenue": _row_num(i, f"ev_bcm_expected_activation_revenue_neg_bin_{b}"),
-                    "expected_aux_cost": _row_num(i, f"ev_bcm_expected_aux_cost_neg_bin_{b}"),
-                    "offer_cost": _row_num(i, f"ev_bcm_offer_cost_bin_{b}"),
-                    "transaction_cost": float(backtester.trans_eur_mwh),
-                    "degradation_cost": float(backtester.deg_eur_mwh * backtester.eta_in),
-                    "activation_margin": _row_num(i, f"ev_bcm_activation_margin_neg_bin_{b}"),
-                    "ev_coefficient": _row_num(i, f"ev_rneg_coef_bin_{b}_eur_per_mw"),
-                    "selected_mw": _row_num(i, f"reserve_neg_bin_{b}_mw"),
-                }
+        if active_missing_count > 0:
+            status["strict_audit_pass"] = False
+
+    if not expected.get("BCM", False):
+        status["components_skipped"]["BCM"] = "inactive_for_strategy"
+    elif any(k.startswith("BCM_") for k in missing_required):
+        status["components_skipped"]["BCM"] = "missing_required_columns"
+    else:
+        status["components_emitted"].append("BCM")
+    if not expected.get("BEM", False):
+        status["components_skipped"]["BEM"] = "inactive_for_strategy"
+    elif any(k.startswith("BEM_") for k in missing_required):
+        status["components_skipped"]["BEM"] = "missing_required_columns"
+    else:
+        status["components_emitted"].append("BEM")
+
+    out = pd.DataFrame(rows)
+    if not out.empty and "audit_row_status" in out.columns:
+        status["active_reconciled_row_count"] = int((out["audit_row_status"] == "active_reconciled").sum())
+        status["skipped_zero_decision_row_count"] = int((out["audit_row_status"] == "inactive_zero_decision_skipped").sum())
+        status["inactive_zero_decision_skipped_count"] = int(
+            (out["audit_row_status"] == "inactive_zero_decision_skipped").sum()
+        )
+        status["inactive_zero_decision_reconciled_count"] = int(
+            (out["audit_row_status"] == "inactive_zero_decision_reconciled").sum()
+        )
+        status["benchmark_or_nonaccepted_path_skipped_count"] = int(
+            (out["audit_row_status"] == "benchmark_or_nonaccepted_path_skipped").sum()
+        )
+        status["active_missing_ev_field_count"] = int((out["audit_row_status"] == "active_missing_ev_fields").sum())
+        comp_sel: list[str] = []
+        for comp in ("BCM", "BEM"):
+            m = (
+                out["market_component"].astype(str).eq(comp)
+                & pd.to_numeric(out["selected_mw"], errors="coerce").fillna(0.0).abs().gt(1e-9)
             )
-            rows.append(
-                {
-                    "timestamp_utc": ts,
-                    "scenario": scenario_name,
-                    "market_component": "BEM",
-                    "direction": "pos",
-                    "quantile_bin": q_name,
-                    "decision_variable_name": f"bem_pos_bin_{b}_mw",
-                    "capacity_price_q": np.nan,
-                    "activation_price_q": _row_num(i, f"ev_bem_bin_{b}_act_price_pos"),
-                    "activation_rate_q": _row_num(i, f"ev_bem_bin_{b}_act_rate_pos"),
-                    "p_acc_or_p_exec_q": _row_num(i, f"ev_bem_bin_{b}_p_exec_pos"),
-                    "expected_capacity_revenue": 0.0,
-                    "expected_activation_revenue": _row_num(i, f"ev_bem_expected_activation_revenue_pos_bin_{b}"),
-                    "expected_aux_cost": _row_num(i, f"ev_bem_expected_aux_cost_pos_bin_{b}"),
-                    "offer_cost": 0.0,
-                    "transaction_cost": float(backtester.trans_eur_mwh),
-                    "degradation_cost": float(backtester.deg_eur_mwh / max(backtester.eta_out, 1e-12)),
-                    "activation_margin": _row_num(i, f"ev_bem_activation_margin_pos_bin_{b}"),
-                    "ev_coefficient": _row_num(i, f"ev_bem_pos_coef_bin_{b}_eur_per_mw"),
-                    "selected_mw": _row_num(i, f"bem_pos_bin_{b}_mw"),
-                }
-            )
-            rows.append(
-                {
-                    "timestamp_utc": ts,
-                    "scenario": scenario_name,
-                    "market_component": "BEM",
-                    "direction": "neg",
-                    "quantile_bin": q_name,
-                    "decision_variable_name": f"bem_neg_bin_{b}_mw",
-                    "capacity_price_q": np.nan,
-                    "activation_price_q": _row_num(i, f"ev_bem_bin_{b}_act_price_neg"),
-                    "activation_rate_q": _row_num(i, f"ev_bem_bin_{b}_act_rate_neg"),
-                    "p_acc_or_p_exec_q": _row_num(i, f"ev_bem_bin_{b}_p_exec_neg"),
-                    "expected_capacity_revenue": 0.0,
-                    "expected_activation_revenue": _row_num(i, f"ev_bem_expected_activation_revenue_neg_bin_{b}"),
-                    "expected_aux_cost": _row_num(i, f"ev_bem_expected_aux_cost_neg_bin_{b}"),
-                    "offer_cost": 0.0,
-                    "transaction_cost": float(backtester.trans_eur_mwh),
-                    "degradation_cost": float(backtester.deg_eur_mwh * backtester.eta_in),
-                    "activation_margin": _row_num(i, f"ev_bem_activation_margin_neg_bin_{b}"),
-                    "ev_coefficient": _row_num(i, f"ev_bem_neg_coef_bin_{b}_eur_per_mw"),
-                    "selected_mw": _row_num(i, f"bem_neg_bin_{b}_mw"),
-                }
-            )
-    return pd.DataFrame(rows)
+            if bool(m.any()):
+                comp_sel.append(comp)
+        status["actual_components_with_selected_mw"] = comp_sel
+    status["first_bad_rows"] = first_bad_rows
+    status["audit_row_count"] = int(len(out))
+    if status_out is not None:
+        status_out.clear()
+        status_out.update(status)
+    return out
 
 
-def _validate_afrr_bin_ev_audit(audit: pd.DataFrame, tol: float = 1e-6) -> dict[str, float]:
+def _validate_afrr_bin_ev_audit(
+    audit: pd.DataFrame,
+    tol: float = 1e-6,
+    *,
+    scenario_name: str = "",
+    trading_strategy: str = "",
+    audit_path: str = "",
+) -> dict[str, float]:
     if audit.empty:
         return {
             "ev_audit_row_count": 0.0,
@@ -720,12 +950,49 @@ def _validate_afrr_bin_ev_audit(audit: pd.DataFrame, tol: float = 1e-6) -> dict[
         if c == "market_component":
             continue
         d[c] = pd.to_numeric(d[c], errors="coerce")
-    bcm = d.loc[d["market_component"].astype(str).eq("BCM")].copy()
-    bem = d.loc[d["market_component"].astype(str).eq("BEM")].copy()
+    if "audit_row_status" not in d.columns:
+        d["audit_row_status"] = "active_reconciled"
+    active = d.loc[d["audit_row_status"].astype(str).eq("active_reconciled")].copy()
+    active_missing = d.loc[d["audit_row_status"].astype(str).eq("active_missing_ev_fields")].copy()
+    if not active_missing.empty:
+        cols = [
+            "timestamp_utc",
+            "market_component",
+            "direction",
+            "quantile_bin",
+            "decision_variable_name",
+            "selected_mw",
+            "audit_row_status",
+            "optimization_error_code",
+            "missing_required_columns",
+            "nonfinite_required_audit_fields",
+        ]
+        sample = active_missing.loc[:, [c for c in cols if c in active_missing.columns]].head(10).to_dict(orient="records")
+        raise ValueError(
+            "EV audit has active rows with missing EV fields. "
+            f"scenario={scenario_name}, strategy={trading_strategy}, audit_path={audit_path or '<memory>'}, "
+            f"first_bad_rows={sample}"
+        )
+    if active.empty:
+        return {
+            "ev_audit_row_count": float(len(d)),
+            "ev_audit_max_bcm_formula_error": 0.0,
+            "ev_audit_max_bem_formula_error": 0.0,
+        }
+    bcm = active.loc[active["market_component"].astype(str).eq("BCM")].copy()
+    bem = active.loc[active["market_component"].astype(str).eq("BEM")].copy()
     if not bcm.empty:
         bcm_req = ["expected_capacity_revenue", "expected_activation_revenue", "expected_aux_cost", "offer_cost", "ev_coefficient"]
-        if bcm[bcm_req].isna().any().any():
-            raise ValueError("EV audit contains NaN/non-finite BCM reconciliation fields.")
+        bad_mask = bcm[bcm_req].isna().any(axis=1)
+        if bool(bad_mask.any()):
+            bad = bcm.loc[bad_mask].copy()
+            bad_cols = [c for c in bcm_req if bad[c].isna().any()]
+            sample = bad.loc[:, [c for c in ["timestamp_utc", "market_component", "direction", "quantile_bin", "decision_variable_name", *bad_cols] if c in bad.columns]].head(10)
+            raise ValueError(
+                "EV audit contains NaN/non-finite BCM reconciliation fields. "
+                f"scenario={scenario_name}, strategy={trading_strategy}, bad_columns={bad_cols}, "
+                f"audit_path={audit_path or '<memory>'}, sample={sample.to_dict(orient='records')}"
+            )
         bcm["formula"] = (
             bcm["expected_capacity_revenue"]
             + bcm["expected_activation_revenue"]
@@ -738,8 +1005,16 @@ def _validate_afrr_bin_ev_audit(audit: pd.DataFrame, tol: float = 1e-6) -> dict[
         max_bcm = 0.0
     if not bem.empty:
         bem_req = ["expected_activation_revenue", "expected_aux_cost", "ev_coefficient"]
-        if bem[bem_req].isna().any().any():
-            raise ValueError("EV audit contains NaN/non-finite BEM reconciliation fields.")
+        bad_mask = bem[bem_req].isna().any(axis=1)
+        if bool(bad_mask.any()):
+            bad = bem.loc[bad_mask].copy()
+            bad_cols = [c for c in bem_req if bad[c].isna().any()]
+            sample = bad.loc[:, [c for c in ["timestamp_utc", "market_component", "direction", "quantile_bin", "decision_variable_name", *bad_cols] if c in bad.columns]].head(10)
+            raise ValueError(
+                "EV audit contains NaN/non-finite BEM reconciliation fields. "
+                f"scenario={scenario_name}, strategy={trading_strategy}, bad_columns={bad_cols}, "
+                f"audit_path={audit_path or '<memory>'}, sample={sample.to_dict(orient='records')}"
+            )
         bem["formula"] = bem["expected_activation_revenue"] - bem["expected_aux_cost"]
         bem_err = (bem["formula"] - bem["ev_coefficient"]).abs()
         max_bem = float(bem_err.max()) if len(bem_err) else 0.0
@@ -1177,8 +1452,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--final-soc-mode",
         choices=["terminal_repair", "hard"],
-        default="terminal_repair",
-        help="Final SoC policy: terminal_repair (default) or hard physical minimum.",
+        default="hard",
+        help="Final SoC policy: hard physical minimum (default) or terminal_repair.",
     )
     p.add_argument(
         "--enforce-final-soc-min",
@@ -1211,9 +1486,30 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--trading-strategy",
-        choices=["multi", "da_only", "afrr_only"],
+        choices=["multi", "da_only", "afrr_only", "bcm_only", "bem_only"],
         default="multi",
-        help="Strategy isolation mode: multi (DA+aFRR), da_only (DA only), afrr_only (aFRR only).",
+        help="Strategy isolation mode: multi, da_only, afrr_only, bcm_only, bem_only.",
+    )
+    p.add_argument(
+        "--id-mode",
+        choices=["none", "technical_repair", "economic"],
+        default="",
+        help="Legacy override for low-level ID trade type. Prefer --id-recourse-mode.",
+    )
+    p.add_argument(
+        "--id-recourse-mode",
+        choices=["common", "disabled", "afrr_obligation_only"],
+        default="common",
+        help=(
+            "ID recourse policy: common (all strategies), disabled (none), "
+            "afrr_obligation_only (no ID for da_only)."
+        ),
+    )
+    p.add_argument(
+        "--allow-economic-id-in-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow --id-mode economic for non-multi baseline strategies.",
     )
     p.add_argument(
         "--reserve-activation-headroom-h",
@@ -1602,12 +1898,28 @@ def main() -> None:
     )
     backtester = BatteryBacktester()
     sweep_rows: list[dict[str, object]] = []
+    resolved_id_mode = str(args.id_mode).strip().lower()
+    resolved_id_recourse_mode = str(args.id_recourse_mode).strip().lower()
+    if (
+        args.trading_strategy != "multi"
+        and resolved_id_mode == "economic"
+        and not bool(args.allow_economic_id_in_baseline)
+    ):
+        raise ValueError(
+            "Economic ID is disabled for baseline strategies by default. "
+            "Use --allow-economic-id-in-baseline only for explicit robustness variants."
+        )
+
     if args.trading_strategy == "da_only":
         allowed_markets = ("DA",)
     elif args.trading_strategy == "afrr_only":
-        allowed_markets = ("aFRR",)
+        allowed_markets = ("aFRR", "BCM", "BEM")
+    elif args.trading_strategy == "bcm_only":
+        allowed_markets = ("aFRR", "BCM")
+    elif args.trading_strategy == "bem_only":
+        allowed_markets = ("aFRR", "BEM")
     else:
-        allowed_markets = ("DA", "aFRR")
+        allowed_markets = ("DA", "aFRR", "ID", "BCM", "BEM")
     strategy_root = out_dir / args.trading_strategy
 
     for scenario_name, scenario_warehouse, scenario_bins in scenarios:
@@ -1649,6 +1961,9 @@ def main() -> None:
                 soc_feedback_mode=args.soc_feedback_mode,
                 enforce_final_soc_min=enforce_final_soc_min,
                 allowed_markets=allowed_markets,
+                strategy_name=str(args.trading_strategy),
+                id_mode=resolved_id_mode,
+                id_recourse_mode=resolved_id_recourse_mode,
                 strict_simulation_validity=bool(args.strict_simulation_validity),
                 enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
             )
@@ -1675,6 +1990,8 @@ def main() -> None:
         protected_soc_forensics_path = scenario_out_dir / "protected_soc_forensics.csv"
         optimization_infeasibility_attribution_path = scenario_out_dir / "optimization_infeasibility_attribution.csv"
         afrr_bin_ev_audit_path = scenario_out_dir / "afrr_bid_bin_ev_audit.csv"
+        afrr_bin_ev_audit_status_path = scenario_out_dir / "afrr_bid_bin_ev_audit_status.json"
+        run_status_path = scenario_out_dir / "run_status.json"
 
         with _phase_watchdog("write_hourly"):
             outputs.hourly.to_parquet(hourly_path, index=False)
@@ -1684,17 +2001,48 @@ def main() -> None:
             "ev_audit_max_bem_formula_error": 0.0,
         }
         if bool(args.export_afrr_bin_ev_audit):
-            ev_audit = _build_afrr_bin_ev_audit(
-                hourly=outputs.hourly,
-                scenario_name=scenario_name,
-                active_bins=list(scenario_bins),
-                backtester=backtester,
-                timestamp_col=colmap.timestamp,
-            )
-            if not ev_audit.empty:
-                ev_audit.to_csv(afrr_bin_ev_audit_path, index=False)
-            ev_audit_stats = _validate_afrr_bin_ev_audit(ev_audit, tol=1e-6)
-            outputs.summary.update(ev_audit_stats)
+            ev_audit_status: dict[str, object] = {}
+            try:
+                ev_audit = _build_afrr_bin_ev_audit(
+                    hourly=outputs.hourly,
+                    scenario_name=scenario_name,
+                    trading_strategy=str(args.trading_strategy),
+                    active_bins=list(scenario_bins),
+                    backtester=backtester,
+                    timestamp_col=colmap.timestamp,
+                    strict=True,
+                    status_out=ev_audit_status,
+                )
+                if not ev_audit.empty:
+                    ev_audit.to_csv(afrr_bin_ev_audit_path, index=False)
+                afrr_bin_ev_audit_status_path.write_text(
+                    json.dumps(ev_audit_status, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                ev_audit_stats = _validate_afrr_bin_ev_audit(
+                    ev_audit,
+                    tol=1e-6,
+                    scenario_name=scenario_name,
+                    trading_strategy=str(args.trading_strategy),
+                    audit_path=str(afrr_bin_ev_audit_path),
+                )
+                outputs.summary.update(ev_audit_stats)
+            except Exception as exc:
+                run_status_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "failed",
+                            "phase": "ev_audit_validation",
+                            "scenario": scenario_name,
+                            "trading_strategy": str(args.trading_strategy),
+                            "error_message": str(exc),
+                            "audit_path": str(afrr_bin_ev_audit_path),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                raise
         planned_cols = [c for c in [
             colmap.timestamp, "charge_mw", "discharge_mw", "reserve_pos_mw", "reserve_neg_mw", "soc_lp_mwh",
             "planned_soc_mwh", "aFRR_Capacity_Won_Pos_MW", "aFRR_Capacity_Won_Neg_MW", "aFRR_Capacity_Won_MW",
