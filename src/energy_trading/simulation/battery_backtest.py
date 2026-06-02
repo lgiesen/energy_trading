@@ -676,7 +676,7 @@ class BatteryBacktester:
         # - diagnostic mode can be enabled to inspect HiGHS solver behavior
         #   (presolve, branching, degeneracy / collinearity indicators).
         self.milp_diagnostic_mode = os.environ.get("BACKTEST_MILP_DIAG", "0") == "1"
-        self.milp_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_TIME_LIMIT_S", "10.0"))
+        self.milp_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_TIME_LIMIT_S", "20.0"))
         self.milp_rel_gap = float(os.environ.get("BACKTEST_MILP_REL_GAP", "1e-4"))
         self.milp_diag_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_DIAG_TIME_LIMIT_S", "60.0"))
         # Per-run infeasibility diagnostics written by _write_infeasible_debug_dump.
@@ -5076,7 +5076,7 @@ class BatteryBacktester:
                             act_pos_mwh=float(act_pos_mwh),
                             act_neg_mwh=float(act_neg_mwh),
                             aux_mwh=float(aux_mwh),
-                            battery_specs=BATTERY_SPECS,
+                            battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
                             dt_h=float(self.dt_h),
                         )
                         safe_soc += float(delta)

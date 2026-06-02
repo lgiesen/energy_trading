@@ -1207,6 +1207,64 @@ def _validate_performance_metrics(
     return checks
 
 
+def _performance_reconciliation_failure_detail(
+    *,
+    checks: dict[str, object],
+    recon_debug_df: pd.DataFrame,
+    perf_row: pd.Series,
+    tolerance: float = 1e-6,
+) -> dict[str, object]:
+    """Return the most relevant failing reconciliation row for strict errors."""
+    if not bool(checks.get("net_revenue_reconciliation_ok", True)):
+        err = float(
+            pd.to_numeric(
+                pd.Series([perf_row.get("net_revenue_reconciliation_error_eur", np.nan)]),
+                errors="coerce",
+            ).iloc[0]
+        )
+        return {
+            "failure_check": "net_revenue_reconciliation_ok",
+            "metric": "net_revenue_decomposition",
+            "scenario_col": "net_revenue_reconciliation_error_eur",
+            "scenario_value": err,
+            "daily_sum_value": "",
+            "hourly_sum_value": "",
+            "daily_abs_error": "",
+            "details": f"abs(net_revenue_reconciliation_error_eur)={abs(err)} > tolerance={tolerance}",
+        }
+    if not bool(checks.get("cost_reconciliation_ok", True)):
+        return {
+            "failure_check": "cost_reconciliation_ok",
+            "metric": "total_costs_decomposition",
+            "scenario_col": "total_costs_eur",
+            "scenario_value": perf_row.get("total_costs_eur", ""),
+            "daily_sum_value": "",
+            "hourly_sum_value": "",
+            "daily_abs_error": "",
+            "details": f"total_costs_eur component decomposition exceeds tolerance={tolerance}",
+        }
+    top_row = None
+    if not recon_debug_df.empty:
+        tmp = recon_debug_df.loc[
+            pd.to_numeric(
+                recon_debug_df.get("checked_daily_to_scenario", False),
+                errors="coerce",
+            ).fillna(0.0)
+            >= 0.5
+        ].copy()
+        tmp["daily_abs_error"] = pd.to_numeric(tmp.get("daily_abs_error", np.nan), errors="coerce")
+        tmp = tmp.loc[tmp["daily_abs_error"].notna()]
+        tmp = tmp.loc[tmp["daily_abs_error"].abs() > float(tolerance)]
+        tmp = tmp.sort_values("daily_abs_error", ascending=False)
+        if len(tmp) > 0:
+            top_row = tmp.iloc[0].to_dict()
+    if top_row is None:
+        return {"failure_check": "unknown", "metric": "", "details": "no failing row found"}
+    top_row["failure_check"] = "daily_to_scenario_reconciliation_ok"
+    top_row["details"] = f"daily_abs_error exceeds tolerance={tolerance}"
+    return top_row
+
+
 def _build_performance_reconciliation_debug(
     *,
     scenario: str,
@@ -3754,26 +3812,24 @@ def main() -> None:
                 bool(checks.get(k, True))
                 for k in ["net_revenue_reconciliation_ok", "cost_reconciliation_ok", "daily_to_scenario_reconciliation_ok"]
             ):
-                top_row = None
-                if not recon_debug_df.empty:
-                    _tmp = recon_debug_df.loc[
-                        pd.to_numeric(recon_debug_df.get("checked_daily_to_scenario", False), errors="coerce").fillna(0.0) >= 0.5
-                    ].copy()
-                    _tmp["daily_abs_error"] = pd.to_numeric(_tmp.get("daily_abs_error", np.nan), errors="coerce")
-                    _tmp = _tmp.loc[_tmp["daily_abs_error"].notna()].sort_values("daily_abs_error", ascending=False)
-                    if len(_tmp) > 0:
-                        top_row = _tmp.iloc[0].to_dict()
+                top_row = _performance_reconciliation_failure_detail(
+                    checks=checks,
+                    recon_debug_df=recon_debug_df,
+                    perf_row=perf_df.iloc[0],
+                )
                 raise RuntimeError(
                     "Performance metric reconciliation failed in strict mode: "
                     f"{json.dumps(checks, sort_keys=True)}; "
                     f"scenario={scenario_name}; "
-                    f"offending_metric={'' if top_row is None else top_row.get('metric', '')}; "
-                    f"scenario_col={'' if top_row is None else top_row.get('scenario_col', '')}; "
-                    f"daily_col={'' if top_row is None else top_row.get('daily_col', '')}; "
-                    f"scenario_value={'' if top_row is None else top_row.get('scenario_value', '')}; "
-                    f"daily_sum={'' if top_row is None else top_row.get('daily_sum_value', '')}; "
-                    f"hourly_sum={'' if top_row is None else top_row.get('hourly_sum_value', '')}; "
-                    f"daily_abs_error={'' if top_row is None else top_row.get('daily_abs_error', '')}; "
+                    f"failure_check={top_row.get('failure_check', '')}; "
+                    f"offending_metric={top_row.get('metric', '')}; "
+                    f"scenario_col={top_row.get('scenario_col', '')}; "
+                    f"daily_col={top_row.get('daily_col', '')}; "
+                    f"scenario_value={top_row.get('scenario_value', '')}; "
+                    f"daily_sum={top_row.get('daily_sum_value', '')}; "
+                    f"hourly_sum={top_row.get('hourly_sum_value', '')}; "
+                    f"daily_abs_error={top_row.get('daily_abs_error', '')}; "
+                    f"details={top_row.get('details', '')}; "
                     f"debug_path={recon_debug_path}"
                 )
             perf_df.to_csv(performance_csv_path, index=False)

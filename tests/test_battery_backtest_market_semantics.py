@@ -842,6 +842,24 @@ def test_soc_mass_balance_audit_uses_settled_physical_columns_and_writes_debug(t
     assert "da_bid_locked" in debug.columns
 
 
+def test_safe_hold_delta_uses_backtester_eta_mapping_not_raw_battery_specs() -> None:
+    bt = _mk_backtester()
+    delta_soc, components = bt._calculate_soc_delta(
+        charge_mw=0.0,
+        discharge_mw=0.0,
+        id_charge_mw=0.0,
+        id_discharge_mw=0.0,
+        act_pos_mwh=0.0,
+        act_neg_mwh=0.0,
+        aux_mwh=0.25,
+        battery_specs={"eta_in": bt.eta_in, "eta_out": bt.eta_out},
+        dt_h=bt.dt_h,
+    )
+    assert delta_soc == pytest.approx(-0.25)
+    assert components["eta_in"] == pytest.approx(bt.eta_in)
+    assert components["eta_out"] == pytest.approx(bt.eta_out)
+
+
 def test_soc_mass_balance_audit_aux_energy_is_required() -> None:
     bt = _mk_backtester()
     col = BacktestColumnMap()

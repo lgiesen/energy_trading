@@ -13,6 +13,7 @@ from scripts.run_battery_backtest import (
     _build_performance_metrics,
     _compute_hourly_throughput_mwh,
     _ensure_hourly_throughput,
+    _performance_reconciliation_failure_detail,
     _validate_performance_metrics,
 )
 
@@ -174,6 +175,68 @@ def test_daily_metrics_reconcile_to_scenario():
     assert checks["net_revenue_reconciliation_ok"] is True
     assert checks["cost_reconciliation_ok"] is True
     assert checks["daily_to_scenario_reconciliation_ok"] is True
+
+
+def test_performance_validation_allows_exact_negative_revenue_reconciliation():
+    value = -153.72621966902076
+    perf_row = pd.Series(
+        {
+            "realized_net_revenue_eur": value,
+            "net_revenue_reconciliation_error_eur": 0.0,
+            "total_costs_eur": 0.0,
+            "realized_degradation_cost_eur": 0.0,
+            "realized_aux_cost_eur": 0.0,
+            "transaction_cost_eur": 0.0,
+            "offer_cost_eur": 0.0,
+            "penalty_cost_eur": 0.0,
+            "terminal_soc_repair_cost_eur": 0.0,
+        }
+    )
+    daily_df = pd.DataFrame({"date_utc": ["2025-09-04"], "net_revenue_eur": [value]})
+    checks = _validate_performance_metrics(perf_row=perf_row, daily_df=daily_df)
+    assert checks["net_revenue_reconciliation_ok"] is True
+    assert checks["cost_reconciliation_ok"] is True
+    assert checks["daily_to_scenario_reconciliation_ok"] is True
+    assert float(checks["daily_to_scenario_error_max_abs"]) == pytest.approx(0.0)
+
+
+def test_performance_failure_detail_reports_net_decomposition_mismatch():
+    perf_row = pd.Series(
+        {
+            "realized_net_revenue_eur": -153.72621966902076,
+            "net_revenue_reconciliation_error_eur": 0.01,
+            "total_costs_eur": 0.0,
+            "realized_degradation_cost_eur": 0.0,
+            "realized_aux_cost_eur": 0.0,
+            "transaction_cost_eur": 0.0,
+            "offer_cost_eur": 0.0,
+            "penalty_cost_eur": 0.0,
+            "terminal_soc_repair_cost_eur": 0.0,
+        }
+    )
+    daily_df = pd.DataFrame({"date_utc": ["2025-09-04"], "net_revenue_eur": [-153.72621966902076]})
+    checks = _validate_performance_metrics(perf_row=perf_row, daily_df=daily_df)
+    debug_df = _build_performance_reconciliation_debug(
+        scenario="p30_p30",
+        perf_row=perf_row,
+        daily_df=daily_df,
+        hourly=pd.DataFrame(
+            {
+                "timestamp_utc": [pd.Timestamp("2025-09-04T00:00:00Z")],
+                "real_pnl_eur": [-153.72621966902076],
+            }
+        ),
+    )
+    detail = _performance_reconciliation_failure_detail(
+        checks=checks,
+        recon_debug_df=debug_df,
+        perf_row=perf_row,
+    )
+    assert checks["net_revenue_reconciliation_ok"] is False
+    assert checks["daily_to_scenario_reconciliation_ok"] is True
+    assert detail["failure_check"] == "net_revenue_reconciliation_ok"
+    assert detail["metric"] == "net_revenue_decomposition"
+    assert "net_revenue_reconciliation_error_eur" in str(detail["scenario_col"])
 
 
 def test_scenario_daily_hourly_throughput_reconciliation_without_existing_hourly_column():
