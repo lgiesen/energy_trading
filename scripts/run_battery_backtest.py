@@ -2,17 +2,26 @@
 
 Usage (manifest-autoload, recommended):
     ./.venv/bin/python scripts/run_battery_backtest.py \
-      --run-id 2026-04-20T15-36-58Z \
-      --split test \
-      --horizon-hours 48 \
-      --reopt-step-hours 1 \
-      --da-gate-hour-cet 11 \
-      --soc-feedback-mode realized
+      --model xgb \
+      --start 2025-05-01T00:00:00Z \
+      --end 2025-05-07T23:00:00Z \
+      --out-dir artifacts/simulation_runs/sim_xgb_test
 
-Usage (explicit manifest path override):
+Usage (validation split):
     ./.venv/bin/python scripts/run_battery_backtest.py \
-      --run-manifest artifacts/model_runs/latest_xgboost.json \
-      --split test
+      --model xgb \
+      --split val \
+      --start 2025-05-01T00:00:00Z \
+      --end 2025-05-07T23:00:00Z \
+      --out-dir artifacts/simulation_runs/sim_xgb_val
+
+Usage (multiple quantile policies):
+    ./.venv/bin/python scripts/run_battery_backtest.py \
+      --model xgb \
+      --quantile-pairs p50-p50,p50-p70 \
+      --start 2025-05-01T00:00:00Z \
+      --end 2025-05-07T23:00:00Z \
+      --out-dir artifacts/simulation_runs/sim_xgb_policies
 
 Usage (manual files):
     ./.venv/bin/python scripts/run_battery_backtest.py \
@@ -439,6 +448,38 @@ def _infer_dt_hours(hourly: pd.DataFrame) -> float:
     return dt_h if dt_h > 0.0 else 1.0
 
 
+THROUGHPUT_SOURCE_COLUMNS = [
+    "real_da_buy_mwh",
+    "real_da_sell_mwh",
+    "real_id_buy_mwh",
+    "real_id_sell_mwh",
+    "real_act_pos_mwh",
+    "real_act_neg_mwh",
+]
+
+
+def _compute_hourly_throughput_mwh(hourly: pd.DataFrame) -> pd.Series:
+    """Canonical realized physical throughput used by scenario, daily and hourly reports."""
+    if "real_throughput_mwh" in hourly.columns:
+        return pd.to_numeric(hourly["real_throughput_mwh"], errors="coerce").fillna(0.0).astype(float)
+    missing = [c for c in THROUGHPUT_SOURCE_COLUMNS if c not in hourly.columns]
+    if missing:
+        raise ValueError(
+            "Cannot compute real_throughput_mwh: missing required source columns "
+            f"{missing}. Required columns: {THROUGHPUT_SOURCE_COLUMNS}"
+        )
+    total = pd.Series(0.0, index=hourly.index, dtype=float)
+    for c in THROUGHPUT_SOURCE_COLUMNS:
+        total = total + pd.to_numeric(hourly[c], errors="coerce").fillna(0.0).abs()
+    return total.astype(float)
+
+
+def _ensure_hourly_throughput(hourly: pd.DataFrame) -> pd.DataFrame:
+    out = hourly.copy()
+    out["real_throughput_mwh"] = _compute_hourly_throughput_mwh(out)
+    return out
+
+
 def _build_performance_metrics(
     *,
     hourly: pd.DataFrame,
@@ -450,6 +491,7 @@ def _build_performance_metrics(
     scenario_end_utc: pd.Timestamp | None,
 ) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
+    hourly = _ensure_hourly_throughput(hourly)
     dt_h = _infer_dt_hours(hourly)
     ts = pd.to_datetime(hourly.get("timestamp_utc", pd.Series(dtype="datetime64[ns, UTC]")), utc=True, errors="coerce")
     if ts.notna().any():
@@ -566,9 +608,7 @@ def _build_performance_metrics(
     id_net_mwh_total = id_sell_mwh_total - id_buy_mwh_total
     id_abs_mwh_total = abs(id_buy_mwh_total) + abs(id_sell_mwh_total)
 
-    throughput_mwh_total = float(_num_series(hourly, "real_throughput_mwh").sum()) if "real_throughput_mwh" in hourly.columns else float(
-        (_num_series(hourly, "real_da_buy_mwh").abs() + _num_series(hourly, "real_da_sell_mwh").abs() + _num_series(hourly, "real_id_buy_mwh").abs() + _num_series(hourly, "real_id_sell_mwh").abs() + _num_series(hourly, "real_act_pos_mwh").abs() + _num_series(hourly, "real_act_neg_mwh").abs()).sum()
-    )
+    throughput_mwh_total = float(_compute_hourly_throughput_mwh(hourly).sum())
     eq_cycles_total = float(throughput_mwh_total / (2.0 * cap_mwh)) if np.isfinite(cap_mwh) and cap_mwh > 0 else float("nan")
     mean_soc_mwh = float(_num_series(hourly, "real_soc_mwh").mean()) if "real_soc_mwh" in hourly.columns else float("nan")
     min_soc_mwh = float(_num_series(hourly, "real_soc_mwh").min()) if "real_soc_mwh" in hourly.columns else float("nan")
@@ -724,7 +764,7 @@ def _build_daily_performance_metrics(
 ) -> pd.DataFrame:
     if hourly.empty:
         return pd.DataFrame()
-    d = hourly.copy()
+    d = _ensure_hourly_throughput(hourly)
     d["date_utc"] = pd.to_datetime(d.get("timestamp_utc"), utc=True, errors="coerce").dt.date.astype(str)
     grp = d.groupby("date_utc", dropna=False)
     dt_h = _infer_dt_hours(d)
@@ -761,7 +801,7 @@ def _build_daily_performance_metrics(
             "bcm_realized_capacity_neg_mw_mean": grp["real_executed_reserve_neg_mw"].mean() if "real_executed_reserve_neg_mw" in d.columns else float("nan"),
             "id_buy_mwh": grp["real_id_buy_mwh"].sum() if "real_id_buy_mwh" in d.columns else 0.0,
             "id_sell_mwh": grp["real_id_sell_mwh"].sum() if "real_id_sell_mwh" in d.columns else 0.0,
-            "throughput_mwh": grp["real_throughput_mwh"].sum() if "real_throughput_mwh" in d.columns else float("nan"),
+            "throughput_mwh": grp["real_throughput_mwh"].sum(),
             "mean_soc_mwh": grp["real_soc_mwh"].mean() if "real_soc_mwh" in d.columns else float("nan"),
             "fallback_hours": grp["is_fallback_hour"].sum() if "is_fallback_hour" in d.columns else 0.0,
         }
@@ -1056,6 +1096,7 @@ def _write_performance_metric_definitions(path: Path) -> None:
         {"field": "annualized_realized_net_revenue_eur", "unit": "EUR/year", "formula": "realized_net_revenue_eur * 365 / n_days", "source_columns": ["realized_net_revenue_eur", "n_days"], "kind": "derived"},
         {"field": "realized_net_revenue_eur_per_mw", "unit": "EUR/MW", "formula": "realized_net_revenue_eur / p_max_mw", "source_columns": ["realized_net_revenue_eur", "p_max_mw"], "kind": "derived"},
         {"field": "equivalent_full_cycles_total", "unit": "cycles", "formula": "throughput_mwh_total / (2 * capacity_mwh)", "source_columns": ["throughput_mwh_total", "capacity_mwh"], "kind": "battery"},
+        {"field": "throughput_mwh_total", "unit": "MWh", "formula": "sum(real_throughput_mwh); real_throughput_mwh = abs(real_da_buy_mwh)+abs(real_da_sell_mwh)+abs(real_id_buy_mwh)+abs(real_id_sell_mwh)+abs(real_act_pos_mwh)+abs(real_act_neg_mwh)", "source_columns": THROUGHPUT_SOURCE_COLUMNS, "kind": "battery"},
         {"field": "net_revenue_reconciliation_error_eur", "unit": "EUR", "formula": "realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs)", "source_columns": ["realized_net_revenue_eur", "gross_revenue_without_costs_eur", "gross_market_costs_eur", "total_costs_eur"], "kind": "validation"},
         {"field": "da_bid_buy_mwh_total", "unit": "MWh", "formula": "sum(real_submitted_da_buy_mw * dt_h)", "source_columns": ["real_submitted_da_buy_mw", "timestamp_utc"], "kind": "volume"},
         {"field": "bem_bid_pos_mwh_total", "unit": "MWh", "formula": "sum(real_bem_only_submitted_pos_mw * dt_h)", "source_columns": ["real_bem_only_submitted_pos_mw", "timestamp_utc"], "kind": "volume"},
@@ -1849,10 +1890,50 @@ def _matches_model_key(path: Path, model_key: str) -> bool:
     mk = model_key.strip().lower()
     name = path.name.lower()
     if mk in {"xgb", "xgboost"}:
-        return "xgboost" in name
+        return re.search(r"(^|[^a-z0-9])(xgb|xgboost)([^a-z0-9]|$)", name) is not None
     if mk == "tft":
-        return "xgboost" not in name
-    return mk in name
+        return re.search(r"(^|[^a-z0-9])tft([^a-z0-9]|$)", name) is not None
+    if mk in {"linear", "rlqr"}:
+        return re.search(r"(^|[^a-z0-9])(linear|rlqr)([^a-z0-9]|$)", name) is not None
+    return re.search(rf"(^|[^a-z0-9]){re.escape(mk)}([^a-z0-9]|$)", name) is not None
+
+
+def _normalize_model_choice(model: str) -> tuple[str, str]:
+    m = str(model or "").strip().lower()
+    if m in {"xgb", "xgboost"}:
+        return "xgb", "latest_xgboost.json"
+    if m == "tft":
+        return "tft", "latest_tft.json"
+    if m in {"linear", "rlqr"}:
+        return "linear", "latest_linear.json"
+    raise ValueError(f"Unsupported model selector '{model}'. Expected one of xgb, xgboost, tft, linear, rlqr.")
+
+
+def _load_manifest_payload(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _candidate_manifest_paths_for_model(*, model_key: str, model_runs_root: Path) -> list[Path]:
+    mk, _ = _normalize_model_choice(model_key)
+    patterns: list[str]
+    if mk == "xgb":
+        patterns = ["xgb_*/manifest.json", "xgboost_*/manifest.json"]
+    elif mk == "tft":
+        patterns = ["tft_*/manifest.json"]
+    else:
+        patterns = ["linear_*/manifest.json", "rlqr_*/manifest.json"]
+    out: list[Path] = []
+    for pat in patterns:
+        out.extend(sorted(model_runs_root.glob(pat)))
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for p in out:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(p)
+    return deduped
 
 
 def _score_long_candidate(path: Path, *, split: str) -> tuple[int, int]:
@@ -1895,8 +1976,30 @@ def _resolve_long_prediction_path(
     model_key: str,
 ) -> Path:
     p = Path(configured_path)
+    tried: list[Path] = []
     if p.exists() and _matches_model_key(p, model_key):
         return p
+    tried.append(p)
+
+    explicit_candidates = [
+        manifest_dir / p,
+        manifest_dir / "predictions" / p.name,
+        manifest_dir.parent / "predictions" / p.name,
+    ]
+    if str(p).startswith("predictions/"):
+        explicit_candidates.append(manifest_dir / p)
+    seen_explicit: list[Path] = []
+    seen_keys: set[str] = set()
+    for cand in explicit_candidates:
+        key = str(cand)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        seen_explicit.append(cand)
+    for cand in seen_explicit:
+        tried.append(cand)
+        if cand.exists() and _matches_model_key(cand, model_key):
+            return cand
 
     pred_dir = manifest_dir / "predictions"
     candidates: list[Path] = []
@@ -1927,12 +2030,13 @@ def _resolve_long_prediction_path(
         return candidates[0]
 
     # Final explicit fallbacks by filename
-    for c in [manifest_dir / p.name, manifest_dir / "predictions" / p.name]:
+    for c in [manifest_dir / p.name, manifest_dir / "predictions" / p.name, manifest_dir.parent / "predictions" / p.name]:
+        tried.append(c)
         if c.exists() and _matches_model_key(c, model_key):
             return c
     raise FileNotFoundError(
         f"Could not resolve long prediction file for pred_col='{pred_col}', split='{split}', model_key='{model_key}'. "
-        f"Configured path: {p}"
+        f"Configured path: {p}. Tried: {[str(x) for x in tried]}"
     )
 
 
@@ -1954,6 +2058,167 @@ def _resolve_long_map(
         )
         resolved[pred_col] = str(rp)
     return resolved
+
+
+def _manifest_can_resolve_long_predictions(
+    payload: dict[str, object],
+    manifest_dir: Path,
+    split: str,
+    model_key: str,
+    required_quantiles: set[str] | None = None,
+) -> tuple[bool, list[str]]:
+    bundles = payload.get("bundles", {}) if isinstance(payload, dict) else {}
+    da_long = bundles.get("da", {}).get("predictions_long", {}).get(split, {}) if isinstance(bundles, dict) else {}
+    afrr_long = bundles.get("afrr", {}).get("predictions_long", {}).get(split, {}) if isinstance(bundles, dict) else {}
+    long_map = {**da_long, **afrr_long}
+    if not long_map:
+        return False, [f"no predictions_long entries for split='{split}'"]
+    issues: list[str] = []
+    try:
+        resolved = _resolve_long_map(
+            long_map=long_map,
+            manifest_dir=manifest_dir,
+            split=split,
+            model_key=model_key,
+        )
+    except Exception as exc:
+        return False, [str(exc)]
+    if required_quantiles:
+        expected = {str(q).lower() for q in required_quantiles}
+        for pred_col, file_path in sorted(resolved.items()):
+            try:
+                cols = set(_read_parquet_columns(Path(file_path)))
+            except Exception as exc:
+                issues.append(f"{pred_col}: failed reading parquet columns from {file_path}: {exc}")
+                continue
+            missing = sorted(expected - cols)
+            if missing:
+                issues.append(f"{pred_col}: missing quantiles {missing} in {file_path}")
+    return (len(issues) == 0), issues
+
+
+def _resolve_pointer_or_latest_manifest(
+    *,
+    candidate_path: Path,
+    model_runs_root: Path,
+) -> tuple[Path, dict[str, object], str | None]:
+    payload = _load_manifest_payload(candidate_path)
+    run_id = payload.get("run_id")
+    if "manifest_path" in payload:
+        manifest_raw = Path(str(payload["manifest_path"]))
+        resolved = manifest_raw if manifest_raw.is_absolute() else (candidate_path.parent / manifest_raw)
+        if resolved.exists():
+            return resolved, _load_manifest_payload(resolved), str(run_id) if run_id else None
+        fallback_candidates: list[Path] = []
+        if run_id:
+            fallback_candidates.append(model_runs_root / str(run_id) / "manifest.json")
+            fallback_candidates.append(candidate_path.parent / str(run_id) / "manifest.json")
+        fallback_candidates.append(candidate_path.parent / "manifest.json")
+        fallback = next((p for p in fallback_candidates if p.exists()), None)
+        if fallback is None:
+            raise FileNotFoundError(
+                "Latest pointer resolves to missing manifest path and no local fallback was found. "
+                f"pointer={candidate_path}, manifest_path={resolved}, run_id={run_id}"
+            )
+        print(f"[WARN] Latest pointer manifest path not found: {resolved}. Using local fallback: {fallback}")
+        return fallback, _load_manifest_payload(fallback), str(run_id) if run_id else None
+
+    if candidate_path.parent == model_runs_root and candidate_path.name.startswith("latest_") and run_id:
+        actual = model_runs_root / str(run_id) / "manifest.json"
+        if actual.exists():
+            return actual, _load_manifest_payload(actual), str(run_id)
+    return candidate_path, payload, str(run_id) if run_id else None
+
+
+def _resolve_model_manifest(
+    *,
+    run_manifest_arg: str,
+    run_id: str | None,
+    model_key: str,
+    split: str,
+    model_runs_root: Path = Path("artifacts/model_runs"),
+) -> tuple[Path, dict[str, object], str | None]:
+    latest_name = ""
+    if model_key:
+        _, latest_name = _normalize_model_choice(model_key)
+    attempted: list[str] = []
+    scanned_candidates: list[str] = []
+
+    if str(run_manifest_arg or "").strip():
+        initial = Path(str(run_manifest_arg).strip())
+    elif run_id:
+        initial = model_runs_root / str(run_id) / "manifest.json"
+    else:
+        if not model_key:
+            raise ValueError("Model manifest auto-resolution requires --model or --model-key.")
+        initial = model_runs_root / latest_name
+    attempted.append(str(initial))
+    if not initial.exists():
+        initial = None  # type: ignore[assignment]
+
+    candidate_infos: list[tuple[Path, dict[str, object], str | None]] = []
+    if initial is not None:
+        resolved_path, payload, resolved_run_id = _resolve_pointer_or_latest_manifest(
+            candidate_path=initial,
+            model_runs_root=model_runs_root,
+        )
+        candidate_infos.append((resolved_path, payload, resolved_run_id))
+
+    if model_key:
+        for path in _candidate_manifest_paths_for_model(model_key=model_key, model_runs_root=model_runs_root):
+            scanned_candidates.append(str(path))
+            if not path.exists():
+                continue
+            try:
+                payload = _load_manifest_payload(path)
+            except Exception:
+                continue
+            candidate_infos.append((path, payload, str(payload.get("run_id")) if payload.get("run_id") else None))
+
+    seen: set[str] = set()
+    deduped_infos: list[tuple[Path, dict[str, object], str | None]] = []
+    for path, payload, rid in candidate_infos:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_infos.append((path, payload, rid))
+
+    requested_quantiles = {"p50"}
+    for idx, (path, payload, rid) in enumerate(deduped_infos):
+        usable, issues = _manifest_can_resolve_long_predictions(
+            payload=payload,
+            manifest_dir=path.parent,
+            split=split,
+            model_key=model_key,
+            required_quantiles=requested_quantiles,
+        )
+        if usable:
+            if idx > 0 and initial is not None:
+                print(
+                    f"[WARN] Using actual run manifest instead of latest/candidate pointer: {path} "
+                    f"(initial attempt: {attempted[0]})"
+                )
+            return path, payload, (rid or run_id)
+        attempted.extend(issues)
+
+    configured_path = ""
+    if deduped_infos:
+        bundles = deduped_infos[0][1].get("bundles", {})
+        if isinstance(bundles, dict):
+            da_long = bundles.get("da", {}).get("predictions_long", {}).get(split, {})
+            afrr_long = bundles.get("afrr", {}).get("predictions_long", {}).get(split, {})
+            long_map = {**(da_long if isinstance(da_long, dict) else {}), **(afrr_long if isinstance(afrr_long, dict) else {})}
+            configured_path = next(iter(long_map.values()), "")
+    raise FileNotFoundError(
+        "Could not resolve a usable model manifest for simulation. "
+        f"model={model_key}, split={split}, attempted_latest_or_explicit={attempted[:1]}, "
+        f"attempted_run_id_path={str(model_runs_root / str(run_id) / 'manifest.json') if run_id else ''}, "
+        f"scanned_candidates={scanned_candidates}, missing_configured_prediction_path={configured_path}, "
+        f"expected_predictions_dir='predictions'. "
+        "If using latest_xgboost.json, ensure it is a pointer to xgb_<timestamp>/manifest.json or run with "
+        f"--model {model_key or 'xgb'} so the resolver can select the newest model run."
+    )
 
 
 def _target_value_modes_from_manifest(payload: dict[str, object]) -> dict[str, str]:
@@ -2005,12 +2270,21 @@ def _preflight_manifest_and_quantiles(
             "Quantile simulation requires predictions_long entries."
         )
 
-    resolved = _resolve_long_map(
-        long_map=long_map,
-        manifest_dir=manifest_dir,
-        split=split,
-        model_key=model_key,
-    )
+    try:
+        resolved = _resolve_long_map(
+            long_map=long_map,
+            manifest_dir=manifest_dir,
+            split=split,
+            model_key=model_key,
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Preflight failed while resolving long-format prediction files. "
+            f"resolved_manifest_path={manifest_path}, manifest_dir={manifest_dir}, model_key={model_key}, split={split}. "
+            f"{exc} "
+            "Hint: If using latest_xgboost.json, ensure it is a pointer to xgb_<timestamp>/manifest.json or run with "
+            f"--model {model_key or 'xgb'} so the resolver can select the newest compatible run."
+        ) from exc
     expected = {str(q).lower() for q in expected_quantiles}
     if not expected:
         expected = {"p50"}
@@ -2180,10 +2454,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ground-truth", default="", help="Path to ground-truth parquet file.")
     p.add_argument(
         "--run-id",
-        default="2026-04-20T15-36-58Z",
+        default="",
         help=(
             "Run id used to resolve manifest path when --run-manifest is not set. "
-            "Default: 2026-04-20T15-36-58Z"
+            "If omitted, --model / --model-key resolves the newest thesis-safe manifest."
         ),
     )
     p.add_argument(
@@ -2195,11 +2469,20 @@ def parse_args() -> argparse.Namespace:
             "If omitted, resolves to artifacts/model_runs/<run-id>/manifest.json."
         ),
     )
+    p.add_argument(
+        "--model",
+        choices=["xgb", "xgboost", "tft", "linear", "rlqr"],
+        default="",
+        help=(
+            "User-facing model selector. If --run-manifest is omitted, resolves the latest thesis-safe manifest "
+            "for the selected model."
+        ),
+    )
     p.add_argument("--split", choices=["val", "test"], default="test", help="Prediction split for manifest mode.")
     p.add_argument(
         "--model-key",
         default="",
-        help="Optional model selector when one run dir contains multiple models (e.g. 'xgboost' or 'tft').",
+        help="Optional canonical model selector when one run dir contains multiple models (e.g. 'xgb', 'tft', 'linear').",
     )
     p.add_argument(
         "--out-dir",
@@ -2208,7 +2491,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--quantile-pairs",
-        default="",
+        default="p50-p50",
         help=(
             "Optional comma-separated sweep list, e.g. "
             "'p50-p50,p30-p70,p10-p90' or '0.5-0.5,0.3-0.7'. "
@@ -2247,7 +2530,22 @@ def parse_args() -> argparse.Namespace:
         "--da-gate-hour-cet",
         type=int,
         default=11,
-        help="Day-Ahead gate-closure hour in CET/CEST used for locking next-day DA bids (default: 11).",
+        help="Day-Ahead gate-closure hour in Europe/Berlin local time used for locking next-day DA bids (default: 11).",
+    )
+    p.add_argument(
+        "--bcm-bid-hour-local",
+        type=int,
+        default=8,
+        help="aFRR BCM bid/gate hour in Europe/Berlin local time for D+1 capacity products (default: 8).",
+    )
+    p.add_argument(
+        "--fast-gated-decisions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If enabled, keep hourly rolling reoptimization for BEM/SoC feedback but only allow new DA bids "
+            "at --da-gate-hour-cet and new BCM bids at --bcm-bid-hour-local. Existing lockbooks still settle."
+        ),
     )
     p.add_argument(
         "--da-gate-hour-utc",
@@ -2423,7 +2721,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--clean-output",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "If enabled, delete existing scenario output directory before writing. "
             "Prevents stale/mixed artifacts."
@@ -2468,6 +2766,20 @@ def main() -> None:
     simulation_schema_version = "v2_strict_validity_debugdump"
     required_summary_fields_version = "v2_required_debugdump_fields"
     run_id: str | None = args.run_id.strip() or None
+    model_arg = str(getattr(args, "model", "") or "").strip()
+    model_key_arg = str(args.model_key or "").strip()
+    if model_arg:
+        canonical_model_key, _ = _normalize_model_choice(model_arg)
+        if model_key_arg:
+            canonical_model_key_from_key, _ = _normalize_model_choice(model_key_arg)
+            if canonical_model_key_from_key != canonical_model_key:
+                raise ValueError(
+                    f"Incompatible --model and --model-key: model={model_arg}, model_key={model_key_arg}. "
+                    "Use matching selectors only."
+                )
+        args.model_key = canonical_model_key
+    elif model_key_arg:
+        args.model_key = _normalize_model_choice(model_key_arg)[0]
     quantile_pairs = _parse_quantile_pairs(args.quantile_pairs)
     required_quantiles: set[str] = {"p50"}
     scenario_bin_map: dict[str, list[str]] = {}
@@ -2484,42 +2796,15 @@ def main() -> None:
     target_value_modes: dict[str, str] = {}
 
     if not predictions_path:
-        if args.run_manifest.strip():
-            manifest_path = Path(args.run_manifest.strip())
-        else:
-            if not run_id:
-                raise ValueError("Missing run id. Provide --run-id or --run-manifest.")
-            manifest_path = Path("artifacts/model_runs") / run_id / "manifest.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"Run manifest/latest pointer not found: {manifest_path}. "
-                "Pass --run-id <RUN_ID> or --run-manifest <PATH>."
-            )
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if "manifest_path" in payload:
-            pointer_path = manifest_path
-            run_id = payload.get("run_id")
-            manifest_raw = Path(str(payload["manifest_path"]))
-            manifest_path = manifest_raw if manifest_raw.is_absolute() else (pointer_path.parent / manifest_raw)
-            if not manifest_path.exists():
-                candidates: list[Path] = []
-                if run_id:
-                    candidates.append(Path("artifacts/model_runs") / str(run_id) / "manifest.json")
-                    candidates.append(pointer_path.parent / str(run_id) / "manifest.json")
-                candidates.append(pointer_path.parent / "manifest.json")
-                fallback = next((c for c in candidates if c.exists()), None)
-                if fallback is None:
-                    raise FileNotFoundError(
-                        "Latest pointer resolves to missing manifest path and no local fallback was found. "
-                        f"pointer={pointer_path}, manifest_path={manifest_path}, run_id={run_id}"
-                    )
-                print(
-                    f"[WARN] Latest pointer manifest path not found: {manifest_path}. "
-                    f"Using local fallback: {fallback}"
-                )
-                manifest_path = fallback
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        run_id = run_id or payload.get("run_id") or (args.run_id.strip() or None)
+        if not args.run_manifest.strip() and not run_id and not args.model_key:
+            raise ValueError("Missing model selector or manifest. Provide --model, --model-key, --run-id, or --run-manifest.")
+        manifest_path, payload, resolved_run_id = _resolve_model_manifest(
+            run_manifest_arg=args.run_manifest.strip(),
+            run_id=run_id,
+            model_key=args.model_key.strip(),
+            split=args.split,
+        )
+        run_id = resolved_run_id or run_id or payload.get("run_id") or (args.run_id.strip() or None)
         manifest_dir = manifest_path.parent
 
         # Strict fail-fast preflight for thesis reproducibility:
@@ -2687,6 +2972,7 @@ def main() -> None:
     if MODEL_SPECS["max_reserve_bid_mw"] is not None and float(MODEL_SPECS["max_reserve_bid_mw"]) < 0.0:
         raise ValueError("--max-reserve-bid-mw must be >= 0.")
     MODEL_SPECS["disable_new_bcm_reserve_bids"] = bool(args.disable_new_bcm_reserve_bids)
+    MODEL_SPECS["afrr_bcm_gate_hour_cet"] = int(args.bcm_bid_hour_local)
     MODEL_SPECS["bem_only_headroom_safety_mwh"] = float(args.bem_only_headroom_safety_mwh)
     if float(MODEL_SPECS["bem_only_headroom_safety_mwh"]) < 0.0:
         raise ValueError("--bem-only-headroom-safety-mwh must be >= 0.")
@@ -2781,7 +3067,10 @@ def main() -> None:
                 id_recourse_mode=resolved_id_recourse_mode,
                 strict_simulation_validity=bool(args.strict_simulation_validity),
                 enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
+                fast_gated_decisions=bool(args.fast_gated_decisions),
+                bcm_bid_hour_local=int(args.bcm_bid_hour_local),
             )
+        outputs.hourly = _ensure_hourly_throughput(outputs.hourly)
 
         hourly_path = scenario_out_dir / "backtest_hourly.parquet"
         planned_ledger_path = scenario_out_dir / "planned_ledger.parquet"

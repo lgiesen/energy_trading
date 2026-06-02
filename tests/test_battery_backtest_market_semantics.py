@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 from energy_trading.simulation.battery_backtest import (  # noqa: E402
     BacktestColumnMap,
     BatteryBacktester,
+    DecisionAvailability,
     assign_bcm_capacity_block,
     canonicalize_market_frame,
     load_prediction_warehouse_long,
@@ -118,6 +119,112 @@ def _tiny_backtest_df(hours: int = 6) -> tuple[pd.DataFrame, BacktestColumnMap]:
         for q in ["p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"]:
             data[f"{pref}_{q}"] = [0.0] * hours
     return pd.DataFrame(data), col
+
+
+def test_fast_gated_decision_availability_keeps_bem_hourly() -> None:
+    perms = BatteryBacktester.resolve_strategy_permissions(
+        strategy_name="multi",
+        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
+        id_recourse_mode="common",
+    )
+    avail = BatteryBacktester.decision_availability_for_strategy(
+        decision_timestamp_utc=pd.Timestamp("2026-01-01T09:00:00Z"),  # 10:00 Europe/Berlin
+        permissions=perms,
+        fast_gated_decisions=True,
+        da_gate_hour_local=11,
+        bcm_bid_hour_local=8,
+    )
+    assert avail.fast_gated_decisions_enabled
+    assert not avail.can_submit_new_da
+    assert not avail.can_submit_new_bcm
+    assert avail.can_submit_new_bem
+
+
+def test_fast_gated_decision_availability_allows_da_and_bcm_at_local_gates() -> None:
+    perms = BatteryBacktester.resolve_strategy_permissions(
+        strategy_name="multi",
+        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
+        id_recourse_mode="common",
+    )
+    da_avail = BatteryBacktester.decision_availability_for_strategy(
+        decision_timestamp_utc=pd.Timestamp("2026-01-01T10:00:00Z"),  # 11:00 Europe/Berlin
+        permissions=perms,
+        fast_gated_decisions=True,
+        da_gate_hour_local=11,
+        bcm_bid_hour_local=8,
+    )
+    bcm_avail = BatteryBacktester.decision_availability_for_strategy(
+        decision_timestamp_utc=pd.Timestamp("2026-01-01T07:00:00Z"),  # 08:00 Europe/Berlin
+        permissions=perms,
+        fast_gated_decisions=True,
+        da_gate_hour_local=11,
+        bcm_bid_hour_local=8,
+    )
+    assert da_avail.can_submit_new_da
+    assert not da_avail.can_submit_new_bcm
+    assert bcm_avail.can_submit_new_bcm
+    assert not bcm_avail.can_submit_new_da
+
+
+def test_fast_gate_blocks_new_da_but_preserves_fixed_da_lockbook() -> None:
+    df, col = _tiny_backtest_df(hours=2)
+    bt = _mk_backtester("canonical_economic")
+    ts0 = pd.to_datetime(df[col.timestamp].iloc[0], utc=True)
+    avail = DecisionAvailability(
+        fast_gated_decisions_enabled=True,
+        decision_timestamp_utc=pd.Timestamp("2026-01-01T09:00:00Z"),
+        decision_timestamp_local="2026-01-01T10:00:00+01:00",
+        can_submit_new_da=False,
+        can_submit_new_bcm=True,
+        can_submit_new_bem=True,
+        can_use_id_recourse=True,
+        da_gate_hour_local=11,
+        bcm_bid_hour_local=8,
+    )
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=10.0,
+        soc_end_min_target=None,
+        fixed_da_dispatch={ts0: (1.0, 0.0)},
+        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
+        decision_availability=avail,
+    )
+    assert np.isclose(float(out["charge_mw"].iloc[0]), 1.0)
+    assert np.isclose(float(out["discharge_mw"].iloc[0]), 0.0)
+    assert np.isclose(float(out["charge_mw"].iloc[1]), 0.0)
+    assert np.isclose(float(out["da_new_bid_fixed_by_gate"].iloc[0]), 0.0)
+    assert np.isclose(float(out["da_new_bid_fixed_by_gate"].iloc[1]), 1.0)
+
+
+def test_fast_gate_blocks_new_bcm_but_preserves_fixed_reserve_lockbook() -> None:
+    df, col = _tiny_backtest_df(hours=2)
+    bt = _mk_backtester("canonical_economic")
+    ts0 = pd.to_datetime(df[col.timestamp].iloc[0], utc=True)
+    avail = DecisionAvailability(
+        fast_gated_decisions_enabled=True,
+        decision_timestamp_utc=pd.Timestamp("2026-01-01T09:00:00Z"),
+        decision_timestamp_local="2026-01-01T10:00:00+01:00",
+        can_submit_new_da=True,
+        can_submit_new_bcm=False,
+        can_submit_new_bem=True,
+        can_use_id_recourse=True,
+        da_gate_hour_local=11,
+        bcm_bid_hour_local=8,
+    )
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=10.0,
+        soc_end_min_target=None,
+        fixed_reserve_obligation={ts0: (1.0, 0.0)},
+        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
+        decision_availability=avail,
+    )
+    assert np.isclose(float(out["reserve_pos_mw"].iloc[0]), 1.0)
+    assert np.isclose(float(out["reserve_pos_mw"].iloc[1]), 0.0)
+    assert np.isclose(float(out["bcm_new_bid_fixed_by_gate"].iloc[0]), 0.0)
+    assert np.isclose(float(out["bcm_new_bid_fixed_by_gate"].iloc[1]), 1.0)
 
 
 def test_simulation_forecast_loader_applies_negative_target_quantile_flip(tmp_path: Path) -> None:
