@@ -4941,6 +4941,6 @@ def test_daily_metrics_include_component_pnl_columns() -> None:
     row = daily_df.iloc[0]
     assert float(row["da_pnl_eur"]) == pytest.approx(70.0)
     assert float(row["id_recourse_pnl_eur"]) == pytest.approx(15.0)
-    assert float(row["bcm_pnl_eur"]) == pytest.approx(9.0)
+    assert float(row["bcm_pnl_eur"]) == pytest.approx(11.0)
     assert float(row["bem_pnl_eur"]) == pytest.approx(6.0)
     assert float(row["afrr_pnl_eur"]) == pytest.approx(16.0)

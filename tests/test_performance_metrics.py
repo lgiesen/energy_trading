@@ -177,6 +177,51 @@ def test_daily_metrics_reconcile_to_scenario():
     assert checks["daily_to_scenario_reconciliation_ok"] is True
 
 
+def test_offer_cost_is_reported_but_not_subtracted_from_settlement_pnl_reconciliation():
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2025-09-04T00:00:00Z", periods=1, freq="h", tz="UTC"),
+            "real_pnl_eur": [-153.72621966902076],
+            "real_revenue_da_eur": [0.0],
+            "real_cost_da_eur": [153.72621966902076],
+            "real_revenue_id_eur": [0.0],
+            "real_cost_id_eur": [0.0],
+            "real_revenue_capacity_eur": [0.0],
+            "real_revenue_activation_eur": [0.0],
+            "real_degradation_cost_eur": [0.0],
+            "real_aux_cost_eur": [0.0],
+            "real_transaction_cost_eur": [0.0],
+            "real_offer_cost_eur": [17.990632302902526],
+            "real_penalty_eur": [0.0],
+            "real_throughput_mwh": [0.0],
+        }
+    )
+    perf_df, _ = _build_performance_metrics(
+        hourly=hourly,
+        summary={
+            "realized_total_pnl_eur": 0.0,
+            "predicted_total_pnl_eur": 0.0,
+            "p_max_mw": 4.0,
+            "capacity_mwh": 20.0,
+            "terminal_soc_repair_cost_eur": 0.0,
+        },
+        args=_args(),
+        scenario_name="p30_p30",
+        scenario_bins=["p30"],
+        scenario_start_utc=None,
+        scenario_end_utc=None,
+    )
+    daily_df = _build_daily_performance_metrics(hourly=hourly, perf_row=perf_df.iloc[0])
+    checks = _validate_performance_metrics(perf_row=perf_df.iloc[0], daily_df=daily_df)
+    row = perf_df.iloc[0]
+    assert float(row["offer_cost_eur"]) == pytest.approx(17.990632302902526)
+    assert float(row["total_costs_eur"]) == pytest.approx(0.0)
+    assert float(row["net_revenue_reconciliation_error_eur"]) == pytest.approx(0.0, abs=1e-9)
+    assert checks["net_revenue_reconciliation_ok"] is True
+    assert checks["cost_reconciliation_ok"] is True
+    assert checks["daily_to_scenario_reconciliation_ok"] is True
+
+
 def test_performance_validation_allows_exact_negative_revenue_reconciliation():
     value = -153.72621966902076
     perf_row = pd.Series(

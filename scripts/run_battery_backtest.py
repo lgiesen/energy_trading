@@ -580,7 +580,9 @@ def _build_performance_metrics(
     gross_revenue_without_costs = da_gross_revenue + id_gross_revenue + afrr_capacity_revenue + afrr_activation_revenue
     gross_market_costs = da_gross_cost + id_gross_cost + afrr_activation_cost
     net_market_revenue_before_operational_costs = gross_revenue_without_costs - gross_market_costs
-    total_costs = realized_degradation_cost + realized_aux_cost + transaction_cost + offer_cost + penalty_cost + terminal_soc_repair_cost
+    # Offer cost is an optimizer/EV diagnostic. Realized settlement PnL does not
+    # subtract it, so it must not enter the net-revenue reconciliation formula.
+    total_costs = realized_degradation_cost + realized_aux_cost + transaction_cost + penalty_cost + terminal_soc_repair_cost
     reconciliation = realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs)
 
     da_bid_buy_mwh_total = float((_num_series(hourly, "real_submitted_da_buy_mw") * dt_h).sum())
@@ -822,7 +824,6 @@ def _build_daily_performance_metrics(
         pd.to_numeric(out["degradation_cost_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["aux_cost_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["transaction_cost_eur"], errors="coerce").fillna(0.0)
-        + pd.to_numeric(out["offer_cost_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["penalty_cost_eur"], errors="coerce").fillna(0.0)
     )
     out["da_pnl_eur"] = (
@@ -836,7 +837,6 @@ def _build_daily_performance_metrics(
     out["bcm_pnl_eur"] = (
         pd.to_numeric(out["afrr_capacity_revenue_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["bcm_linked_activation_revenue_eur"], errors="coerce").fillna(0.0)
-        - pd.to_numeric(out["offer_cost_eur"], errors="coerce").fillna(0.0)
     )
     out["bem_pnl_eur"] = pd.to_numeric(out["bem_activation_revenue_eur"], errors="coerce").fillna(0.0)
     out["afrr_pnl_eur"] = (
@@ -968,8 +968,8 @@ def _performance_reconciliation_specs() -> list[dict[str, object]]:
             "daily_col": "offer_cost_eur",
             "hourly_col": "real_offer_cost_eur",
             "checked_daily_to_scenario": True,
-            "checked_component_to_net": True,
-            "source_note": "Offer cost if tracked hourly",
+            "checked_component_to_net": False,
+            "source_note": "Offer cost diagnostic; not subtracted from realized settlement PnL",
         },
         {
             "metric": "penalty_cost_eur",
@@ -1098,7 +1098,7 @@ def _write_performance_metric_definitions(path: Path) -> None:
         {"field": "realized_net_revenue_eur_per_mw", "unit": "EUR/MW", "formula": "realized_net_revenue_eur / p_max_mw", "source_columns": ["realized_net_revenue_eur", "p_max_mw"], "kind": "derived"},
         {"field": "equivalent_full_cycles_total", "unit": "cycles", "formula": "throughput_mwh_total / (2 * capacity_mwh)", "source_columns": ["throughput_mwh_total", "capacity_mwh"], "kind": "battery"},
         {"field": "throughput_mwh_total", "unit": "MWh", "formula": "sum(real_throughput_mwh); real_throughput_mwh = abs(real_da_buy_mwh)+abs(real_da_sell_mwh)+abs(real_id_buy_mwh)+abs(real_id_sell_mwh)+abs(real_act_pos_mwh)+abs(real_act_neg_mwh)", "source_columns": THROUGHPUT_SOURCE_COLUMNS, "kind": "battery"},
-        {"field": "net_revenue_reconciliation_error_eur", "unit": "EUR", "formula": "realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs)", "source_columns": ["realized_net_revenue_eur", "gross_revenue_without_costs_eur", "gross_market_costs_eur", "total_costs_eur"], "kind": "validation"},
+        {"field": "net_revenue_reconciliation_error_eur", "unit": "EUR", "formula": "realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs); total_costs excludes offer_cost_eur because offer cost is not subtracted in settlement PnL", "source_columns": ["realized_net_revenue_eur", "gross_revenue_without_costs_eur", "gross_market_costs_eur", "total_costs_eur"], "kind": "validation"},
         {"field": "da_bid_buy_mwh_total", "unit": "MWh", "formula": "sum(real_submitted_da_buy_mw * dt_h)", "source_columns": ["real_submitted_da_buy_mw", "timestamp_utc"], "kind": "volume"},
         {"field": "bem_bid_pos_mwh_total", "unit": "MWh", "formula": "sum(real_bem_only_submitted_pos_mw * dt_h)", "source_columns": ["real_bem_only_submitted_pos_mw", "timestamp_utc"], "kind": "volume"},
     ]
@@ -1175,7 +1175,6 @@ def _validate_performance_metrics(
                 float(pd.to_numeric(pd.Series([perf_row.get("realized_degradation_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                 + float(pd.to_numeric(pd.Series([perf_row.get("realized_aux_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                 + float(pd.to_numeric(pd.Series([perf_row.get("transaction_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-                + float(pd.to_numeric(pd.Series([perf_row.get("offer_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                 + float(pd.to_numeric(pd.Series([perf_row.get("penalty_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                 + float(pd.to_numeric(pd.Series([perf_row.get("terminal_soc_repair_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
             )
@@ -3804,6 +3803,7 @@ def main() -> None:
                 hourly=outputs.hourly,
             )
             recon_debug_path = scenario_out_dir / "performance_metric_reconciliation_debug.csv"
+            recon_debug_path.parent.mkdir(parents=True, exist_ok=True)
             recon_debug_df.to_csv(recon_debug_path, index=False)
             perf_recon_debug_rows_all.append(recon_debug_df.assign(scenario_path=str(scenario_out_dir)))
             for k, v in checks.items():
