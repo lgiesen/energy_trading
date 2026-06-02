@@ -1090,6 +1090,29 @@ def test_bem_only_mode_is_explicit_optimizer() -> None:
     out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=2, reopt_step_hours=1, allowed_markets=("DA", "aFRR"))
     assert out.summary.get("bem_only_mode") == "explicit_optimizer"
     assert float(out.summary.get("bem_only_explicit_optimizer", 0.0)) == 1.0
+    assert out.summary.get("bem_only_mode") != "approx_reuse_reserve_volume"
+
+
+def test_summary_reports_base_and_resolved_id_modes() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=2,
+        reopt_step_hours=1,
+        allowed_markets=("DA",),
+        strategy_name="da_only",
+        id_recourse_mode="common",
+        strict_simulation_validity=False,
+    )
+    assert out.summary.get("base_strategy_id_mode") == "none"
+    assert out.summary.get("resolved_id_mode") == "technical_repair"
+    assert out.summary.get("id_recourse_mode") == "common"
+    assert float(out.summary.get("id_allowed", 0.0)) == 1.0
+    assert float(out.summary.get("id_technical_repair_enabled", 0.0)) == 1.0
+    assert float(out.summary.get("id_economic_enabled", 1.0)) == 0.0
 
 
 def test_comparable_benchmark_semantics_in_tiny_deterministic_case() -> None:

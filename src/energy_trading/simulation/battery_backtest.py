@@ -3545,7 +3545,8 @@ class BatteryBacktester:
         submitted_da_sell_price = float(np.mean(submitted_da_sell_prices)) if submitted_da_sell_prices else float("nan")
         # aFRR BEM (balancing energy market):
         # - with BCM obligation: activation eligibility comes from awarded BCM capacity
-        # - without BCM obligation: activation eligibility comes from submitted BEM volume
+        # - without BCM obligation: BEM-only uses explicit optimizer variables and
+        #   is settled separately from BCM-linked activation
         if ob_pos > 0.0 or ob_neg > 0.0:
             act_cap_res = cap_res
         else:
@@ -3655,8 +3656,8 @@ class BatteryBacktester:
         act_pos_accepted = bool(act_res.pos_accepted)
         act_neg_accepted = bool(act_res.neg_accepted)
         is_bcm_obligation_hour = bool((ob_pos > 0.0) or (ob_neg > 0.0))
-        # Approximate BEM-only mode: outside BCM obligation hours, submitted
-        # reserve volume is reused as activation-eligible BEM volume.
+        # BEM-only is reported as a separate activation stream whenever there is
+        # no BCM obligation for the delivery hour.
         bem_only_submitted_pos_mw = float(cap_res.submitted_pos_mw) if not is_bcm_obligation_hour else 0.0
         bem_only_submitted_neg_mw = float(cap_res.submitted_neg_mw) if not is_bcm_obligation_hour else 0.0
         bem_only_executed_pos_mw = float(res_pos_exec) if (not is_bcm_obligation_hour and act_pos_accepted) else 0.0
@@ -6706,6 +6707,8 @@ class BatteryBacktester:
             id_recourse_mode=id_recourse_mode,
         )
         self._id_recourse_mode = self._normalize_id_recourse_mode(id_recourse_mode)
+        run_strategy_permissions = self._strategy_permissions
+        run_id_recourse_mode = self._id_recourse_mode
         self._assert_valid_time_index(df, colmap.timestamp)
         def _run_isolated_path(
             *,
@@ -7503,6 +7506,11 @@ class BatteryBacktester:
             tol_mw=1e-6,
         )
 
+        base_strategy_permissions = (
+            self.strategy_permissions_from_name(strategy_name)
+            if strategy_name is not None
+            else self.strategy_permissions_from_allowed_markets(allowed_markets)
+        )
         summary = {
             "rows": float(len(hourly)),
             "input_row_count": float(len(df)),
@@ -7600,7 +7608,6 @@ class BatteryBacktester:
             "perfect_foresight_da_only_feasible": float(perfect_foresight_da_only_feasible),
             "realized_afrr_only_feasible": float(realized_afrr_only_feasible),
             "perfect_foresight_afrr_only_feasible": float(perfect_foresight_afrr_only_feasible),
-            "bem_only_mode": "approx_reuse_reserve_volume",
             "id_price_taker": 1.0,
             "id_price_mode": "synthetic_da_spread_price_taker",
             "id_spread": float(self.id_rescue_spread_eur_mwh),
@@ -7653,15 +7660,18 @@ class BatteryBacktester:
                 else 0.0
             ),
             "strategy": ",".join(sorted({str(m).strip().lower() for m in allowed_markets})),
-            "id_recourse_mode": str(getattr(self, "_id_recourse_mode", "common")),
-            "id_mode": str(self._strategy_permissions.id_mode),
-            "id_economic_enabled": float(self._strategy_permissions.allow_id_economic),
-            "id_technical_repair_enabled": float(self._strategy_permissions.allow_id_technical_repair),
-            "allow_da": float(self._strategy_permissions.allow_da),
-            "allow_id": float(self._strategy_permissions.allow_id),
-            "allow_bcm": float(self._strategy_permissions.allow_bcm),
-            "allow_bcm_activation_obligations": float(self._strategy_permissions.allow_bcm_activation_obligations),
-            "allow_bem_only": float(self._strategy_permissions.allow_bem_only),
+            "base_strategy_id_mode": str(base_strategy_permissions.id_mode),
+            "id_recourse_mode": str(run_id_recourse_mode),
+            "resolved_id_mode": str(run_strategy_permissions.id_mode),
+            "id_mode": str(run_strategy_permissions.id_mode),
+            "id_allowed": float(run_strategy_permissions.allow_id),
+            "id_economic_enabled": float(run_strategy_permissions.allow_id_economic),
+            "id_technical_repair_enabled": float(run_strategy_permissions.allow_id_technical_repair),
+            "allow_da": float(run_strategy_permissions.allow_da),
+            "allow_id": float(run_strategy_permissions.allow_id),
+            "allow_bcm": float(run_strategy_permissions.allow_bcm),
+            "allow_bcm_activation_obligations": float(run_strategy_permissions.allow_bcm_activation_obligations),
+            "allow_bem_only": float(run_strategy_permissions.allow_bem_only),
             "reserve_activation_headroom_h": float(self.reserve_activation_headroom_h),
             "bem_activation_headroom_h": float(self.bem_activation_headroom_h),
         }

@@ -590,6 +590,43 @@ def _check_bem_hourly(
     )
 
 
+def _check_revenue_split(
+    *,
+    strategy: str,
+    scenario: str,
+    path: Path,
+    hourly: pd.DataFrame,
+    tol: float,
+    violations: list[dict[str, Any]],
+) -> None:
+    required = {
+        "real_revenue_activation_eur",
+        "real_bcm_linked_activation_revenue_eur",
+        "real_bem_only_activation_revenue_eur",
+    }
+    if not required.issubset(hourly.columns):
+        return
+    total = _to_num_series(hourly, "real_revenue_activation_eur").fillna(0.0)
+    bcm = _to_num_series(hourly, "real_bcm_linked_activation_revenue_eur").fillna(0.0)
+    bem = _to_num_series(hourly, "real_bem_only_activation_revenue_eur").fillna(0.0)
+    err = (total - (bcm + bem)).abs()
+    max_err = float(err.max()) if len(err) else 0.0
+    if max_err > tol:
+        _add_violation(
+            violations,
+            severity="hard",
+            check_group="revenue_split",
+            check_name="activation_revenue_split_mismatch",
+            strategy=strategy,
+            scenario=scenario,
+            column="real_revenue_activation_eur",
+            value=max_err,
+            tolerance=tol,
+            message="Activation revenue must equal BCM-linked plus BEM-only activation revenue",
+            path=path,
+        )
+
+
 def _check_constraints(
     *,
     strategy: str,
@@ -827,6 +864,7 @@ def validate_scenario(
             violations=violations,
         )
     _check_bem_hourly(strategy=strategy, scenario=scenario, path=scenario_output_dir, hourly=hourly, summary=summary, tol=tolerance, violations=violations)
+    _check_revenue_split(strategy=strategy, scenario=scenario, path=scenario_output_dir, hourly=hourly, tol=tolerance, violations=violations)
     if check_accounting:
         _check_accounting(
             strategy=strategy,
@@ -855,11 +893,15 @@ def validate_scenario(
         "simulation_valid": summary.get("simulation_valid"),
         "thesis_reportable": summary.get("thesis_reportable"),
         "invalid_reason": summary.get("invalid_reason"),
+        "base_strategy_id_mode": summary.get("base_strategy_id_mode"),
         "id_recourse_mode": id_mode,
+        "resolved_id_mode": summary.get("resolved_id_mode", summary.get("id_mode")),
+        "id_allowed": summary.get("id_allowed"),
         **totals,
         "market_permission_ok": hard_violations == 0 or not bool(vdf.loc[vdf["check_group"].eq("market_permission") & vdf["severity"].eq("hard")].any(axis=None) if not vdf.empty else False),
         "id_recourse_ok": not bool(vdf.loc[vdf["check_group"].eq("id_recourse") & vdf["severity"].eq("hard")].any(axis=None) if not vdf.empty else False),
         "bcm_block_ok": not bool(vdf.loc[vdf["check_group"].eq("bcm_blocks") & vdf["severity"].eq("hard")].any(axis=None) if not vdf.empty else False),
+        "revenue_split_ok": not bool(vdf.loc[vdf["check_group"].eq("revenue_split") & vdf["severity"].eq("hard")].any(axis=None) if not vdf.empty else False),
         "constraints_ok": not bool(vdf.loc[vdf["check_group"].eq("constraints") & vdf["severity"].eq("hard")].any(axis=None) if not vdf.empty else False),
         "headroom_ok": not bool(vdf.loc[vdf["check_group"].eq("headroom") & vdf["severity"].eq("hard")].any(axis=None) if not vdf.empty else False),
         "accounting_ok": not bool(vdf.loc[vdf["check_group"].eq("accounting") & vdf["severity"].eq("hard")].any(axis=None) if not vdf.empty else False),
