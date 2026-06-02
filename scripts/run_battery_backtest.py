@@ -1889,14 +1889,15 @@ def _matches_model_key(path: Path, model_key: str) -> bool:
     if not model_key:
         return True
     mk = model_key.strip().lower()
-    name = path.name.lower()
-    if mk in {"xgb", "xgboost"}:
-        return re.search(r"(^|[^a-z0-9])(xgb|xgboost)([^a-z0-9]|$)", name) is not None
-    if mk == "tft":
-        return re.search(r"(^|[^a-z0-9])tft([^a-z0-9]|$)", name) is not None
-    if mk in {"linear", "rlqr"}:
-        return re.search(r"(^|[^a-z0-9])(linear|rlqr)([^a-z0-9]|$)", name) is not None
-    return re.search(rf"(^|[^a-z0-9]){re.escape(mk)}([^a-z0-9]|$)", name) is not None
+    full_path = str(path).lower()
+    token_patterns = {
+        "xgb": r"(^|[^a-z0-9])(xgb|xgboost)([^a-z0-9]|$)",
+        "tft": r"(^|[^a-z0-9])tft([^a-z0-9]|$)",
+        "linear": r"(^|[^a-z0-9])(linear|rlqr)([^a-z0-9]|$)",
+    }
+    families = {fam for fam, pat in token_patterns.items() if re.search(pat, full_path) is not None}
+    target_family = "xgb" if mk in {"xgb", "xgboost"} else "linear" if mk in {"linear", "rlqr"} else mk
+    return families == {target_family}
 
 
 def _normalize_model_choice(model: str) -> tuple[str, str]:
@@ -1977,29 +1978,26 @@ def _resolve_long_prediction_path(
     model_key: str,
 ) -> Path:
     p = Path(configured_path)
-    tried: list[Path] = []
-    if p.exists() and _matches_model_key(p, model_key):
-        return p
-    tried.append(p)
+    exact_candidates: list[Path] = []
+    fallback_scanned: list[Path] = []
+    fallback_rejected: list[Path] = []
 
-    explicit_candidates = [
-        manifest_dir / p,
-        manifest_dir / "predictions" / p.name,
-        manifest_dir.parent / "predictions" / p.name,
-    ]
-    if str(p).startswith("predictions/"):
-        explicit_candidates.append(manifest_dir / p)
-    seen_explicit: list[Path] = []
-    seen_keys: set[str] = set()
-    for cand in explicit_candidates:
+    def _append_exact(cand: Path) -> None:
         key = str(cand)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        seen_explicit.append(cand)
-    for cand in seen_explicit:
-        tried.append(cand)
-        if cand.exists() and _matches_model_key(cand, model_key):
+        if key not in {str(x) for x in exact_candidates}:
+            exact_candidates.append(cand)
+
+    if p.is_absolute():
+        _append_exact(p)
+    else:
+        _append_exact(p)
+        _append_exact(manifest_dir / p)
+        if str(p).startswith("predictions/"):
+            _append_exact(manifest_dir / p)
+        _append_exact(manifest_dir / "predictions" / p.name)
+
+    for cand in exact_candidates:
+        if cand.exists():
             return cand
 
     pred_dir = manifest_dir / "predictions"
@@ -2024,20 +2022,24 @@ def _resolve_long_prediction_path(
                 seen.add(key)
                 deduped.append(c)
             candidates = deduped
+    fallback_scanned = list(candidates)
     if model_key:
-        candidates = [c for c in candidates if _matches_model_key(c, model_key)]
+        filtered: list[Path] = []
+        for c in candidates:
+            if _matches_model_key(c, model_key):
+                filtered.append(c)
+            else:
+                fallback_rejected.append(c)
+        candidates = filtered
     if candidates:
         candidates = sorted(candidates, key=lambda c: _score_long_candidate(c, split=split), reverse=True)
         return candidates[0]
-
-    # Final explicit fallbacks by filename
-    for c in [manifest_dir / p.name, manifest_dir / "predictions" / p.name, manifest_dir.parent / "predictions" / p.name]:
-        tried.append(c)
-        if c.exists() and _matches_model_key(c, model_key):
-            return c
     raise FileNotFoundError(
         f"Could not resolve long prediction file for pred_col='{pred_col}', split='{split}', model_key='{model_key}'. "
-        f"Configured path: {p}. Tried: {[str(x) for x in tried]}"
+        f"manifest_path='{manifest_dir / 'manifest.json'}', manifest_dir='{manifest_dir}', configured_path='{p}', "
+        f"exact_candidates={[(str(c), c.exists()) for c in exact_candidates]}, "
+        f"fallback_glob_candidates={[str(c) for c in fallback_scanned]}, "
+        f"fallback_rejected_by_model_key={[str(c) for c in fallback_rejected]}"
     )
 
 
