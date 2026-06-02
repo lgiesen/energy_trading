@@ -21,7 +21,6 @@ if str(ROOT) not in sys.path:
 from energy_trading.simulation.battery_backtest import (  # noqa: E402
     BacktestColumnMap,
     BatteryBacktester,
-    DecisionAvailability,
     assign_bcm_capacity_block,
     canonicalize_market_frame,
     load_prediction_warehouse_long,
@@ -121,110 +120,32 @@ def _tiny_backtest_df(hours: int = 6) -> tuple[pd.DataFrame, BacktestColumnMap]:
     return pd.DataFrame(data), col
 
 
-def test_fast_gated_decision_availability_keeps_bem_hourly() -> None:
-    perms = BatteryBacktester.resolve_strategy_permissions(
-        strategy_name="multi",
-        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
-        id_recourse_mode="common",
-    )
-    avail = BatteryBacktester.decision_availability_for_strategy(
-        decision_timestamp_utc=pd.Timestamp("2026-01-01T09:00:00Z"),  # 10:00 Europe/Berlin
-        permissions=perms,
-        fast_gated_decisions=True,
-        da_bid_hour_local=11,
-        bcm_bid_hour_local=8,
-    )
-    assert avail.fast_gated_decisions_enabled
-    assert not avail.can_submit_new_da
-    assert not avail.can_submit_new_bcm
-    assert avail.can_submit_new_bem
-
-
-def test_fast_gated_decision_availability_allows_da_and_bcm_at_local_gates() -> None:
-    perms = BatteryBacktester.resolve_strategy_permissions(
-        strategy_name="multi",
-        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
-        id_recourse_mode="common",
-    )
-    da_avail = BatteryBacktester.decision_availability_for_strategy(
-        decision_timestamp_utc=pd.Timestamp("2026-01-01T10:00:00Z"),  # 11:00 Europe/Berlin
-        permissions=perms,
-        fast_gated_decisions=True,
-        da_bid_hour_local=11,
-        bcm_bid_hour_local=8,
-    )
-    bcm_avail = BatteryBacktester.decision_availability_for_strategy(
-        decision_timestamp_utc=pd.Timestamp("2026-01-01T07:00:00Z"),  # 08:00 Europe/Berlin
-        permissions=perms,
-        fast_gated_decisions=True,
-        da_bid_hour_local=11,
-        bcm_bid_hour_local=8,
-    )
-    assert da_avail.can_submit_new_da
-    assert not da_avail.can_submit_new_bcm
-    assert bcm_avail.can_submit_new_bcm
-    assert not bcm_avail.can_submit_new_da
-
-
-def test_fast_gate_blocks_new_da_but_preserves_fixed_da_lockbook() -> None:
-    df, col = _tiny_backtest_df(hours=2)
+def test_multi_optimizer_path_has_no_fast_gated_fields_and_keeps_normal_semantics() -> None:
+    df, col = _tiny_backtest_df(hours=8)
     bt = _mk_backtester("canonical_economic")
-    ts0 = pd.to_datetime(df[col.timestamp].iloc[0], utc=True)
-    avail = DecisionAvailability(
-        fast_gated_decisions_enabled=True,
-        decision_timestamp_utc=pd.Timestamp("2026-01-01T09:00:00Z"),
-        decision_timestamp_local="2026-01-01T10:00:00+01:00",
-        can_submit_new_da=False,
-        can_submit_new_bcm=True,
-        can_submit_new_bem=True,
-        can_use_id_recourse=True,
-        da_bid_hour_local=11,
-        bcm_bid_hour_local=8,
-    )
     out = bt.optimize_dispatch(
         df,
         col,
         soc_start=10.0,
         soc_end_min_target=None,
-        fixed_da_dispatch={ts0: (1.0, 0.0)},
         allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
-        decision_availability=avail,
     )
-    assert np.isclose(float(out["charge_mw"].iloc[0]), 1.0)
-    assert np.isclose(float(out["discharge_mw"].iloc[0]), 0.0)
-    assert np.isclose(float(out["charge_mw"].iloc[1]), 0.0)
-    assert np.isclose(float(out["da_new_bid_fixed_by_gate"].iloc[0]), 0.0)
-    assert np.isclose(float(out["da_new_bid_fixed_by_gate"].iloc[1]), 1.0)
-
-
-def test_fast_gate_blocks_new_bcm_but_preserves_fixed_reserve_lockbook() -> None:
-    df, col = _tiny_backtest_df(hours=2)
-    bt = _mk_backtester("canonical_economic")
-    ts0 = pd.to_datetime(df[col.timestamp].iloc[0], utc=True)
-    avail = DecisionAvailability(
-        fast_gated_decisions_enabled=True,
-        decision_timestamp_utc=pd.Timestamp("2026-01-01T09:00:00Z"),
-        decision_timestamp_local="2026-01-01T10:00:00+01:00",
-        can_submit_new_da=True,
-        can_submit_new_bcm=False,
-        can_submit_new_bem=True,
-        can_use_id_recourse=True,
-        da_bid_hour_local=11,
-        bcm_bid_hour_local=8,
-    )
-    out = bt.optimize_dispatch(
-        df,
-        col,
-        soc_start=10.0,
-        soc_end_min_target=None,
-        fixed_reserve_obligation={ts0: (1.0, 0.0)},
-        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
-        decision_availability=avail,
-    )
-    assert np.isclose(float(out["reserve_pos_mw"].iloc[0]), 1.0)
-    assert np.isclose(float(out["reserve_pos_mw"].iloc[1]), 0.0)
-    assert np.isclose(float(out["bcm_new_bid_fixed_by_gate"].iloc[0]), 0.0)
-    assert np.isclose(float(out["bcm_new_bid_fixed_by_gate"].iloc[1]), 1.0)
+    for c in [
+        "fast_gated_decisions_enabled",
+        "can_submit_new_da",
+        "can_submit_new_bcm",
+        "can_submit_new_bem",
+        "can_use_id_recourse",
+        "da_new_bid_fixed_by_gate",
+        "bcm_new_bid_fixed_by_gate",
+        "bem_new_bid_fixed_by_gate",
+        "da_ev_skipped_outside_gate",
+        "bcm_ev_skipped_outside_gate",
+    ]:
+        assert c not in out.columns
+    assert "bem_only_pos_mw" in out.columns
+    assert "reserve_pos_mw" in out.columns
+    assert "charge_mw" in out.columns
 
 
 def test_simulation_forecast_loader_applies_negative_target_quantile_flip(tmp_path: Path) -> None:
@@ -841,6 +762,188 @@ def test_aux_cost_subtracted_once_in_pnl() -> None:
         - float(m["penalty_eur"])
     )
     assert np.isclose(float(m["pnl_eur"]), expected_pnl), m
+
+
+def test_soc_mass_balance_audit_uses_settled_physical_columns_and_writes_debug(tmp_path: Path) -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-05-01T11:00:00Z")
+    soc_prev = 10.0
+    bt.soc_init = soc_prev
+
+    aux_mwh = 0.25
+    settled_charge_mw = 0.6421052631578947
+    delta_soc, _ = bt._calculate_soc_delta(
+        charge_mw=settled_charge_mw,
+        discharge_mw=0.0,
+        id_charge_mw=0.0,
+        id_discharge_mw=0.0,
+        act_pos_mwh=0.0,
+        act_neg_mwh=0.0,
+        aux_mwh=aux_mwh,
+        battery_specs={"eta_in": bt.eta_in, "eta_out": bt.eta_out},
+        dt_h=bt.dt_h,
+    )
+    got_soc = soc_prev + delta_soc
+    assert np.isclose(
+        bt._calculate_soc_delta(
+            charge_mw=0.0,
+            discharge_mw=0.0,
+            id_charge_mw=0.0,
+            id_discharge_mw=0.0,
+            act_pos_mwh=0.0,
+            act_neg_mwh=0.0,
+            aux_mwh=aux_mwh,
+            battery_specs={"eta_in": bt.eta_in, "eta_out": bt.eta_out},
+            dt_h=bt.dt_h,
+        )[0],
+        -0.25,
+    )
+
+    realized = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "real_soc_mwh": [got_soc],
+            "real_soc_start_mwh": [soc_prev],
+            "real_charge_mw": [settled_charge_mw],
+            "real_discharge_mw": [0.0],
+            "real_id_charge_mw": [0.0],
+            "real_id_discharge_mw": [0.0],
+            "real_act_pos_mwh": [0.0],
+            "real_act_neg_mwh": [0.0],
+            "real_aux_energy_mwh": [aux_mwh],
+            "real_pnl_eur": [0.0],
+        }
+    )
+    dispatch = pd.DataFrame({col.timestamp: [ts]})
+    df_input = pd.DataFrame({col.timestamp: [ts]})
+    bt._audit_backtest_results(realized=realized, dispatch=dispatch, df_input=df_input, colmap=col)
+
+    with pytest.raises(RuntimeError, match="missing columns for SoC mass-balance"):
+        bt._audit_backtest_results(
+            realized=realized.drop(columns=["real_aux_energy_mwh"]),
+            dispatch=dispatch,
+            df_input=df_input,
+            colmap=col,
+        )
+
+    debug_path = tmp_path / "backtest_soc_mass_balance_debug.csv"
+    bt._soc_mass_balance_debug_path = debug_path
+    bad = realized.copy()
+    bad["real_charge_mw"] = settled_charge_mw + 0.25 / bt.eta_in
+    with pytest.raises(RuntimeError, match="SoC mass-balance mismatch"):
+        bt._audit_backtest_results(realized=bad, dispatch=dispatch, df_input=df_input, colmap=col)
+    debug = pd.read_csv(debug_path)
+    assert debug_path.exists()
+    assert "formula_components" in debug.columns
+    assert np.isclose(float(debug.loc[debug["debug_row_role"] == "current", "soc_mismatch_mwh"].iloc[0]), 0.25)
+    assert "real_aux_power_mw" in debug.columns
+    assert "real_aux_state" in debug.columns
+    assert "da_bid_locked" in debug.columns
+
+
+def test_soc_mass_balance_audit_aux_energy_is_required() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-05-01T11:00:00Z")
+    bt.soc_init = 17.86
+
+    realized_ok = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "real_soc_mwh": [17.61],
+            "real_soc_start_mwh": [17.86],
+            "real_charge_mw": [0.0],
+            "real_discharge_mw": [0.0],
+            "real_id_charge_mw": [0.0],
+            "real_id_discharge_mw": [0.0],
+            "real_act_pos_mwh": [0.0],
+            "real_act_neg_mwh": [0.0],
+            "real_aux_energy_mwh": [0.25],
+            "real_pnl_eur": [0.0],
+        }
+    )
+    dispatch = pd.DataFrame({col.timestamp: [ts]})
+    df_input = pd.DataFrame({col.timestamp: [ts]})
+    bt._audit_backtest_results(realized=realized_ok, dispatch=dispatch, df_input=df_input, colmap=col)
+
+    realized_bad = realized_ok.copy()
+    realized_bad["real_aux_energy_mwh"] = 0.0
+    with pytest.raises(RuntimeError, match="SoC mass-balance mismatch"):
+        bt._audit_backtest_results(realized=realized_bad, dispatch=dispatch, df_input=df_input, colmap=col)
+
+
+def test_soc_mass_balance_audit_id_sell_grid_energy_visible_to_audit() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-05-01T11:00:00Z")
+    bt.soc_init = 18.0
+    id_sell_mwh = 0.2250079225
+    id_soc_drop_mwh = 0.25
+    bt.eta_out = float(np.sqrt(id_sell_mwh / id_soc_drop_mwh))
+    id_discharge_mw = id_sell_mwh / max(bt.eta_out * bt.dt_h, 1e-12)
+
+    realized_ok = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "real_soc_mwh": [17.61],
+            "real_soc_start_mwh": [18.0],
+            "real_charge_mw": [0.0],
+            "real_discharge_mw": [0.0],
+            "real_id_charge_mw": [0.0],
+            "real_id_discharge_mw": [id_discharge_mw],
+            "real_id_buy_mwh": [0.0],
+            "real_id_sell_mwh": [id_sell_mwh],
+            "real_act_pos_mwh": [0.0],
+            "real_act_neg_mwh": [0.0],
+            "real_aux_energy_mwh": [0.14],
+            "real_pnl_eur": [0.0],
+        }
+    )
+    dispatch = pd.DataFrame({col.timestamp: [ts]})
+    df_input = pd.DataFrame({col.timestamp: [ts]})
+    bt._audit_backtest_results(realized=realized_ok, dispatch=dispatch, df_input=df_input, colmap=col)
+
+    realized_bad = realized_ok.copy()
+    realized_bad["real_id_discharge_mw"] = 0.0
+    with pytest.raises(RuntimeError, match="SoC mass-balance mismatch"):
+        bt._audit_backtest_results(realized=realized_bad, dispatch=dispatch, df_input=df_input, colmap=col)
+
+
+def test_soc_mass_balance_audit_id_buy_grid_energy_visible_to_audit() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-05-01T12:00:00Z")
+    bt.soc_init = 10.0
+    id_buy_mwh = 0.25
+    id_charge_mw = id_buy_mwh * bt.eta_in / max(bt.dt_h, 1e-12)
+    expected_soc = 10.0 + bt.eta_in * id_charge_mw * bt.dt_h
+
+    realized_ok = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "real_soc_mwh": [expected_soc],
+            "real_soc_start_mwh": [10.0],
+            "real_charge_mw": [0.0],
+            "real_discharge_mw": [0.0],
+            "real_id_charge_mw": [id_charge_mw],
+            "real_id_discharge_mw": [0.0],
+            "real_id_buy_mwh": [id_buy_mwh],
+            "real_id_sell_mwh": [0.0],
+            "real_act_pos_mwh": [0.0],
+            "real_act_neg_mwh": [0.0],
+            "real_aux_energy_mwh": [0.0],
+            "real_pnl_eur": [0.0],
+        }
+    )
+    dispatch = pd.DataFrame({col.timestamp: [ts]})
+    df_input = pd.DataFrame({col.timestamp: [ts]})
+    bt._audit_backtest_results(realized=realized_ok, dispatch=dispatch, df_input=df_input, colmap=col)
+
+    realized_bad = realized_ok.copy()
+    realized_bad["real_id_charge_mw"] = 0.0
+    with pytest.raises(RuntimeError, match="SoC mass-balance mismatch"):
+        bt._audit_backtest_results(realized=realized_bad, dispatch=dispatch, df_input=df_input, colmap=col)
 
 
 def test_da_revenue_formula() -> None:

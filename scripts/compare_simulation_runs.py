@@ -45,8 +45,6 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> pd.DataFrame:
         "headroom_violation_count",
         "protected_soc_violation_count",
         "physical_soc_violation_count",
-        "da_new_bid_fixed_by_gate_count",
-        "bcm_new_bid_fixed_by_gate_count",
     ]
     for key in keys:
         b = _load_summary(base[key]) if key in base else {}

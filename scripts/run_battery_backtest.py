@@ -44,6 +44,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -2541,15 +2542,6 @@ def parse_args() -> argparse.Namespace:
         help="aFRR BCM bid submission hour in Europe/Berlin local time for D+1 capacity products (default: 8).",
     )
     p.add_argument(
-        "--fast-gated-decisions",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "If enabled, keep hourly rolling reoptimization for BEM/SoC feedback but only allow new DA bids "
-            "at --da-bid-hour-local and new BCM bids at --bcm-bid-hour-local. Existing lockbooks still settle."
-        ),
-    )
-    p.add_argument(
         "--da-gate-hour-utc",
         type=int,
         default=None,
@@ -3052,6 +3044,7 @@ def main() -> None:
             strict_simulation_validity=bool(args.strict_simulation_validity),
             simulation_schema_version=simulation_schema_version,
         )
+        backtester._soc_mass_balance_debug_path = scenario_out_dir / "backtest_soc_mass_balance_debug.csv"
 
         with _phase_watchdog("backtester_run"):
             outputs = backtester.run(
@@ -3070,10 +3063,9 @@ def main() -> None:
                 id_recourse_mode=resolved_id_recourse_mode,
                 strict_simulation_validity=bool(args.strict_simulation_validity),
                 enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
-                fast_gated_decisions=bool(args.fast_gated_decisions),
                 bcm_bid_hour_local=int(args.bcm_bid_hour_local),
             )
-        outputs.hourly = _ensure_hourly_throughput(outputs.hourly)
+        outputs = replace(outputs, hourly=_ensure_hourly_throughput(outputs.hourly))
 
         hourly_path = scenario_out_dir / "backtest_hourly.parquet"
         planned_ledger_path = scenario_out_dir / "planned_ledger.parquet"

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import pandas as pd
 
+from energy_trading.simulation.battery_backtest import BacktestOutputs
 from scripts.run_battery_backtest import (
     _build_daily_performance_metrics,
     _build_performance_reconciliation_debug,
     _build_performance_metrics,
     _compute_hourly_throughput_mwh,
+    _ensure_hourly_throughput,
     _validate_performance_metrics,
 )
 
@@ -110,6 +113,25 @@ def test_hourly_throughput_helper_reproduces_existing_formula_without_existing_c
     )
     assert throughput.tolist() == expected.tolist()
     assert float(throughput.sum()) == pytest.approx(float(expected.sum()))
+
+
+def test_frozen_backtest_outputs_hourly_throughput_uses_replace():
+    hourly = _hourly().drop(columns=["real_throughput_mwh"])
+    outputs = BacktestOutputs(
+        hourly=hourly,
+        monthly=pd.DataFrame(),
+        yearly=pd.DataFrame(),
+        plan_history=pd.DataFrame(),
+        volatility=pd.DataFrame(),
+        summary={},
+    )
+    with pytest.raises(FrozenInstanceError):
+        outputs.hourly = _ensure_hourly_throughput(outputs.hourly)
+
+    replaced = replace(outputs, hourly=_ensure_hourly_throughput(outputs.hourly))
+    assert "real_throughput_mwh" in replaced.hourly.columns
+    assert "real_throughput_mwh" not in outputs.hourly.columns
+    assert float(replaced.hourly["real_throughput_mwh"].sum()) > 0.0
 
 
 def test_performance_metrics_core_formulas():

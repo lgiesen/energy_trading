@@ -108,19 +108,6 @@ class StrategyPermissions:
         return self.id_mode == "economic"
 
 
-@dataclass(frozen=True)
-class DecisionAvailability:
-    fast_gated_decisions_enabled: bool
-    decision_timestamp_utc: pd.Timestamp | None
-    decision_timestamp_local: str
-    can_submit_new_da: bool
-    can_submit_new_bcm: bool
-    can_submit_new_bem: bool
-    can_use_id_recourse: bool
-    da_bid_hour_local: int
-    bcm_bid_hour_local: int
-
-
 ID_RECOURSE_MODES = {"common", "disabled", "afrr_obligation_only"}
 
 
@@ -694,6 +681,8 @@ class BatteryBacktester:
         self.milp_diag_time_limit_seconds = float(os.environ.get("BACKTEST_MILP_DIAG_TIME_LIMIT_S", "60.0"))
         # Per-run infeasibility diagnostics written by _write_infeasible_debug_dump.
         self._infeasible_debug_dumps: list[dict[str, str]] = []
+        self._soc_mass_balance_debug = pd.DataFrame()
+        self._soc_mass_balance_debug_path: Path | None = None
         self._strategy_permissions = StrategyPermissions(
             allow_da=True,
             id_mode="economic",
@@ -819,58 +808,6 @@ class BatteryBacktester:
             allow_bcm=perms.allow_bcm,
             allow_bcm_activation_obligations=perms.allow_bcm_activation_obligations,
             allow_bem_only=perms.allow_bem_only,
-        )
-
-    @staticmethod
-    def _local_hour_matches(ts_utc: pd.Timestamp | None, hour_local: int) -> bool:
-        if ts_utc is None or pd.isna(ts_utc):
-            return False
-        ts = pd.to_datetime(ts_utc, utc=True, errors="coerce")
-        if pd.isna(ts):
-            return False
-        ts_local = ts.tz_convert("Europe/Berlin")
-        return int(ts_local.hour) == int(hour_local) and int(ts_local.minute) == 0
-
-    @classmethod
-    def decision_availability_for_strategy(
-        cls,
-        *,
-        decision_timestamp_utc: pd.Timestamp | None,
-        permissions: StrategyPermissions,
-        fast_gated_decisions: bool,
-        da_bid_hour_local: int = 11,
-        bcm_bid_hour_local: int = 8,
-    ) -> DecisionAvailability:
-        ts = pd.to_datetime(decision_timestamp_utc, utc=True, errors="coerce")
-        if pd.isna(ts):
-            ts = None
-            ts_local = ""
-        else:
-            ts_local = ts.tz_convert("Europe/Berlin").isoformat()
-        if not bool(fast_gated_decisions):
-            return DecisionAvailability(
-                fast_gated_decisions_enabled=False,
-                decision_timestamp_utc=ts,
-                decision_timestamp_local=ts_local,
-                can_submit_new_da=bool(permissions.allow_da),
-                can_submit_new_bcm=bool(permissions.allow_bcm),
-                can_submit_new_bem=bool(permissions.allow_bem_only),
-                can_use_id_recourse=bool(permissions.allow_id),
-                da_bid_hour_local=int(da_bid_hour_local),
-                bcm_bid_hour_local=int(bcm_bid_hour_local),
-            )
-        return DecisionAvailability(
-            fast_gated_decisions_enabled=True,
-            decision_timestamp_utc=ts,
-            decision_timestamp_local=ts_local,
-            can_submit_new_da=bool(permissions.allow_da)
-            and cls._local_hour_matches(ts, int(da_bid_hour_local)),
-            can_submit_new_bcm=bool(permissions.allow_bcm)
-            and cls._local_hour_matches(ts, int(bcm_bid_hour_local)),
-            can_submit_new_bem=bool(permissions.allow_bem_only),
-            can_use_id_recourse=bool(permissions.allow_id),
-            da_bid_hour_local=int(da_bid_hour_local),
-            bcm_bid_hour_local=int(bcm_bid_hour_local),
         )
 
     @staticmethod
@@ -1293,7 +1230,6 @@ class BatteryBacktester:
         deterministic_reserve_settlement: bool = False,
         allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
         strict_input_validation: bool = False,
-        decision_availability: DecisionAvailability | None = None,
     ) -> pd.DataFrame:
         """Solve LP on predicted market signals to obtain hourly dispatch.
 
@@ -1317,18 +1253,6 @@ class BatteryBacktester:
         self._strategy_permissions = perms
         da_enabled = bool(perms.allow_da)
         afrr_enabled = bool(perms.allow_bcm or perms.allow_bem_only)
-        if decision_availability is None:
-            decision_availability = DecisionAvailability(
-                fast_gated_decisions_enabled=False,
-                decision_timestamp_utc=None,
-                decision_timestamp_local="",
-                can_submit_new_da=bool(da_enabled),
-                can_submit_new_bcm=bool(perms.allow_bcm),
-                can_submit_new_bem=bool(perms.allow_bem_only),
-                can_use_id_recourse=bool(perms.allow_id),
-                da_bid_hour_local=11,
-                bcm_bid_hour_local=int(self.afrr_bcm_bid_hour_local),
-            )
 
         p_da = self._finite_numeric_series(
             df,
@@ -2203,33 +2127,6 @@ class BatteryBacktester:
         ub[sl["rneg_bin"]] = afrr_units_max if perms.allow_bcm else 0.0
         ub[sl["bem_pos_bin"]] = afrr_units_max if perms.allow_bem_only else 0.0
         ub[sl["bem_neg_bin"]] = afrr_units_max if perms.allow_bem_only else 0.0
-        da_gate_fixed_mask = np.zeros(n, dtype=bool)
-        bcm_gate_fixed_mask = np.zeros(n, dtype=bool)
-        bem_gate_fixed_mask = np.zeros(n, dtype=bool)
-        if da_enabled and not bool(decision_availability.can_submit_new_da):
-            da_gate_fixed_mask = ~fixed_da_mask
-            for t in np.where(da_gate_fixed_mask)[0]:
-                ub[sl["ch"].start + int(t)] = 0.0
-                ub[sl["dis"].start + int(t)] = 0.0
-                c[sl["ch"].start + int(t)] = 0.0
-                c[sl["dis"].start + int(t)] = 0.0
-        if perms.allow_bcm and not bool(decision_availability.can_submit_new_bcm):
-            bcm_gate_fixed_mask = ~fixed_reserve_mask
-            for t in np.where(bcm_gate_fixed_mask)[0]:
-                ti = int(t)
-                for b in range(n_bins):
-                    rpos_i = sl["rpos_bin"].start + b * n + ti
-                    rneg_i = sl["rneg_bin"].start + b * n + ti
-                    ub[rpos_i] = 0.0
-                    ub[rneg_i] = 0.0
-                    c[rpos_i] = 0.0
-                    c[rneg_i] = 0.0
-        if perms.allow_bem_only and not bool(decision_availability.can_submit_new_bem):
-            bem_gate_fixed_mask = np.ones(n, dtype=bool)
-            ub[sl["bem_pos_bin"]] = 0.0
-            ub[sl["bem_neg_bin"]] = 0.0
-            c[sl["bem_pos_bin"]] = 0.0
-            c[sl["bem_neg_bin"]] = 0.0
         if self.aux_mode == "state_dependent":
             lb[sl["u"]] = max(0.0, self.aux_off_mw)
             ub[sl["u"]] = self.aux_peak_mw
@@ -2408,23 +2305,6 @@ class BatteryBacktester:
             "final_soc_shortfall_mwh": np.full(n, final_soc_shortfall_mwh, dtype=float),
             "ev_pacc_pos_fallback_used": pacc_pos_fallback_used,
             "ev_pacc_neg_fallback_used": pacc_neg_fallback_used,
-            "fast_gated_decisions_enabled": np.full(
-                n, float(bool(decision_availability.fast_gated_decisions_enabled)), dtype=float
-            ),
-            "decision_timestamp_local": np.full(
-                n, str(decision_availability.decision_timestamp_local), dtype=object
-            ),
-            "can_submit_new_da": np.full(n, float(bool(decision_availability.can_submit_new_da)), dtype=float),
-            "can_submit_new_bcm": np.full(n, float(bool(decision_availability.can_submit_new_bcm)), dtype=float),
-            "can_submit_new_bem": np.full(n, float(bool(decision_availability.can_submit_new_bem)), dtype=float),
-            "can_use_id_recourse": np.full(n, float(bool(decision_availability.can_use_id_recourse)), dtype=float),
-            "da_bid_hour_local": np.full(n, float(decision_availability.da_bid_hour_local), dtype=float),
-            "bcm_bid_hour_local": np.full(n, float(decision_availability.bcm_bid_hour_local), dtype=float),
-            "da_ev_skipped_outside_gate": da_gate_fixed_mask.astype(float),
-            "bcm_ev_skipped_outside_gate": bcm_gate_fixed_mask.astype(float),
-            "da_new_bid_fixed_by_gate": da_gate_fixed_mask.astype(float),
-            "bcm_new_bid_fixed_by_gate": bcm_gate_fixed_mask.astype(float),
-            "bem_new_bid_fixed_by_gate": bem_gate_fixed_mask.astype(float),
         }
         # Audit-grade hard-headroom diagnostics (optimizer-side, per hour).
         reserve_pos_mw = out["reserve_pos_mw"].to_numpy(dtype=float)
@@ -2540,7 +2420,7 @@ class BatteryBacktester:
         aux_mwh: float,
         battery_specs: dict[str, float],
         dt_h: float,
-    ) -> float:
+    ) -> tuple[float, dict[str, float]]:
         """Canonical battery physics delta on SoC (single source of truth)."""
         eta_in = float(battery_specs["eta_in"])
         eta_out = float(battery_specs["eta_out"])
@@ -2550,7 +2430,24 @@ class BatteryBacktester:
         # Internal charge/discharge energies.
         in_internal = (float(charge_mw) + float(id_charge_mw)) * float(dt_h) + act_neg_internal
         out_internal = (float(discharge_mw) + float(id_discharge_mw)) * float(dt_h) + act_pos_internal
-        return eta_in * in_internal - out_internal / max(eta_out, 1e-12) - float(aux_mwh)
+        delta_soc_mwh = eta_in * in_internal - out_internal / max(eta_out, 1e-12) - float(aux_mwh)
+        components = {
+            "act_pos_internal_mwh": float(act_pos_internal),
+            "act_neg_internal_mwh": float(act_neg_internal),
+            "charge_internal_mwh": float((float(charge_mw) + float(id_charge_mw)) * float(dt_h)),
+            "discharge_internal_mwh": float((float(discharge_mw) + float(id_discharge_mw)) * float(dt_h)),
+            "in_internal_mwh": float(in_internal),
+            "out_internal_mwh": float(out_internal),
+            "aux_energy_mwh": float(aux_mwh),
+            "eta_in": float(eta_in),
+            "eta_out": float(eta_out),
+            "dt_h": float(dt_h),
+        }
+        components["formula"] = (
+            "eta_in * ((charge_mw + id_charge_mw)*dt_h + act_neg_mwh*eta_in) - "
+            "((discharge_mw + id_discharge_mw)*dt_h + act_pos_mwh/eta_out)/eta_out - aux_mwh"
+        )
+        return float(delta_soc_mwh), components
 
     def _settle_one_hour(
         self,
@@ -2670,7 +2567,7 @@ class BatteryBacktester:
         aux_cost_eur = aux_mwh * float(da_price)
 
         # Keep SoC feasible by scaling in/out streams if needed.
-        delta = self._calculate_soc_delta(
+        delta, _soc_delta_components = self._calculate_soc_delta(
             charge_mw=da_charge,
             discharge_mw=da_discharge,
             id_charge_mw=id_charge,
@@ -2691,7 +2588,7 @@ class BatteryBacktester:
             da_dis_internal *= scale
             id_dis_internal *= scale
             act_pos_internal *= scale
-            delta = self._calculate_soc_delta(
+            delta, _soc_delta_components = self._calculate_soc_delta(
                 charge_mw=da_ch_internal / max(self.dt_h, 1e-12),
                 discharge_mw=da_dis_internal / max(self.dt_h, 1e-12),
                 id_charge_mw=id_ch_internal / max(self.dt_h, 1e-12),
@@ -2709,7 +2606,7 @@ class BatteryBacktester:
             da_ch_internal *= scale
             id_ch_internal *= scale
             act_neg_internal *= scale
-            delta = self._calculate_soc_delta(
+            delta, _soc_delta_components = self._calculate_soc_delta(
                 charge_mw=da_ch_internal / max(self.dt_h, 1e-12),
                 discharge_mw=da_dis_internal / max(self.dt_h, 1e-12),
                 id_charge_mw=id_ch_internal / max(self.dt_h, 1e-12),
@@ -2733,6 +2630,10 @@ class BatteryBacktester:
         id_buy_mwh = id_ch_internal / self.eta_in
         id_sell_mwh = id_dis_internal * self.eta_out
         id_repair_mwh = id_buy_mwh + id_sell_mwh
+        settled_charge_mw = da_ch_internal / max(self.dt_h, 1e-12)
+        settled_discharge_mw = da_dis_internal / max(self.dt_h, 1e-12)
+        settled_id_charge_mw = id_ch_internal / max(self.dt_h, 1e-12)
+        settled_id_discharge_mw = id_dis_internal / max(self.dt_h, 1e-12)
         act_pos_grid = act_pos_internal * self.eta_out
         act_neg_grid = act_neg_internal / self.eta_in
 
@@ -2932,8 +2833,10 @@ class BatteryBacktester:
             "requested_activation_revenue_eur": requested_activation_revenue_eur,
             "delivered_activation_revenue_eur": delivered_activation_revenue_eur,
             "missed_activation_revenue_eur": missed_activation_revenue_eur,
-            "id_charge_mw": id_charge,
-            "id_discharge_mw": id_discharge,
+            "charge_mw": settled_charge_mw,
+            "discharge_mw": settled_discharge_mw,
+            "id_charge_mw": settled_id_charge_mw,
+            "id_discharge_mw": settled_id_discharge_mw,
             "id_buy_mwh": id_buy_mwh,
             "id_sell_mwh": id_sell_mwh,
             "id_net_mwh": float(id_sell_mwh - id_buy_mwh),
@@ -4434,7 +4337,6 @@ class BatteryBacktester:
         id_recourse_mode: str = "common",
         run_mode: str = "advanced_ml",
         strict_simulation_validity: bool = True,
-        fast_gated_decisions: bool = True,
         bcm_bid_hour_local: int | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Rolling-horizon LP (re-optimized repeatedly with SoC state carryover)."""
@@ -4941,13 +4843,6 @@ class BatteryBacktester:
                 return out_ob
 
             snapshot_current_ts = pd.to_datetime(snapshot_ts, utc=True, errors="coerce") if forecast_warehouse else pd.to_datetime(window.iloc[0][colmap.timestamp], utc=True, errors="coerce")
-            decision_availability = self.decision_availability_for_strategy(
-                decision_timestamp_utc=snapshot_current_ts,
-                permissions=perms,
-                fast_gated_decisions=bool(fast_gated_decisions),
-                da_bid_hour_local=int(da_bid_hour_local),
-                bcm_bid_hour_local=int(bcm_bid_hour_effective),
-            )
             retry_ladder = [1.0]
             if self.disable_new_bcm_reserve_bids:
                 retry_ladder = [0.0]
@@ -4976,7 +4871,6 @@ class BatteryBacktester:
                         deterministic_reserve_settlement=deterministic_reserve_settlement,
                         allowed_markets=allowed_markets,
                         strict_input_validation=bool(forecast_warehouse is not None),
-                        decision_availability=decision_availability,
                     )
                     fixed_reserve_obligation = trial_ob
                     reserve_retry_succeeded = 1.0
@@ -5109,7 +5003,6 @@ class BatteryBacktester:
                             deterministic_reserve_settlement=deterministic_reserve_settlement,
                             allowed_markets=allowed_markets,
                             strict_input_validation=bool(forecast_warehouse is not None),
-                            decision_availability=decision_availability,
                         )
                         terminal_constraint_dropped = 1.0
                         plan["terminal_constraint_dropped"] = 1.0
@@ -5792,6 +5685,11 @@ class BatteryBacktester:
                 index=dispatch.index,
             )
             dispatch = pd.concat([dispatch, defaults_df], axis=1)
+        # Rebuild the dispatch selection after injecting defaults so settlement
+        # always receives the required plan/id/preclear columns.
+        dispatch_cols = list(
+            dict.fromkeys(dispatch_cols + [c for c in required_dispatch_defaults if c in dispatch.columns])
+        )
 
         if predicted_settlement and all(c in dispatch.columns for c in [da_col, cap_pos_col, cap_neg_col, act_pos_col, act_neg_col, rate_pos_col, rate_neg_col]):
             selected_cols = list(
@@ -5883,6 +5781,13 @@ class BatteryBacktester:
                         "Data loss! Canonical prices were overwritten or lost "
                         f"(pred_da_price bad before={before_bad}, after={after_bad})."
                     )
+        required_merged_dispatch_cols = [c for c in required_dispatch_defaults if c != colmap.timestamp]
+        missing_merged_dispatch_cols = [c for c in required_merged_dispatch_cols if c not in merged.columns]
+        if missing_merged_dispatch_cols:
+            raise ValueError(
+                "post-merge settlement schema: missing required default dispatch columns: "
+                f"{missing_merged_dispatch_cols}"
+            )
 
         # Expanded post-merge critical schema assertions.
         pred_critical_cols = [getattr(colmap, k) for k in CRITICAL_PRED_COL_KEYS]
@@ -6106,7 +6011,10 @@ class BatteryBacktester:
             m.update(act_split)
             # Keep generic activation revenue internally consistent with split components.
             m["revenue_activation_eur"] = float(act_split["activation_revenue_reconciled_eur"])
-            financial_results.append({colmap.timestamp: ts, **m, **clearing_rec})
+            # Settlement metrics are the canonical physical result for this
+            # row. Clearing metadata can contain pre-settlement ID intent with
+            # the same names, so it must not overwrite adjusted ID flows.
+            financial_results.append({colmap.timestamp: ts, **clearing_rec, **m})
 
         results_df = pd.DataFrame(financial_results)
         if results_df.empty:
@@ -6150,6 +6058,8 @@ class BatteryBacktester:
         )
         out.rename(columns={
             "pnl_eur": f"{kind}_pnl_eur",
+            "charge_mw": f"{kind}_charge_mw",
+            "discharge_mw": f"{kind}_discharge_mw",
             "da_buy_mwh": f"{kind}_da_buy_mwh",
             "da_sell_mwh": f"{kind}_da_sell_mwh",
             "id_charge_mw": f"{kind}_id_charge_mw",
@@ -6225,7 +6135,14 @@ class BatteryBacktester:
         }, inplace=True)
         # Enforce strict realized namespace contract for settlement outcomes.
         if kind == "real":
-            out.rename(columns={k: v for k, v in SETTLEMENT_RENAME_MAP_REAL.items() if k in out.columns}, inplace=True)
+            out.rename(
+                columns={
+                    k: v
+                    for k, v in SETTLEMENT_RENAME_MAP_REAL.items()
+                    if k in out.columns and v not in out.columns
+                },
+                inplace=True,
+            )
         return out
 
     def _settle_predicted_row(
@@ -6397,6 +6314,189 @@ class BatteryBacktester:
             "clearing_rec": cleared,
         }
 
+    def _calculate_realized_soc_delta_from_series(self, row: pd.Series) -> tuple[float, dict[str, object]]:
+        charge_mw = float(row["real_charge_mw"])
+        discharge_mw = float(row["real_discharge_mw"])
+        id_charge_mw = float(row.get("real_id_charge_mw", 0.0))
+        id_discharge_mw = float(row.get("real_id_discharge_mw", 0.0))
+        act_pos_mwh = float(row["real_act_pos_mwh"])
+        act_neg_mwh = float(row["real_act_neg_mwh"])
+        aux_mwh = float(row["real_aux_energy_mwh"])
+        components: dict[str, object] = {
+            "charge_mw": charge_mw,
+            "discharge_mw": discharge_mw,
+            "id_charge_mw": id_charge_mw,
+            "id_discharge_mw": id_discharge_mw,
+            "act_pos_mwh": act_pos_mwh,
+            "act_neg_mwh": act_neg_mwh,
+            "aux_mwh": aux_mwh,
+            "eta_in": float(self.eta_in),
+            "eta_out": float(self.eta_out),
+            "dt_h": float(self.dt_h),
+        }
+        delta_soc, components = self._calculate_soc_delta(
+            charge_mw=charge_mw,
+            discharge_mw=discharge_mw,
+            id_charge_mw=id_charge_mw,
+            id_discharge_mw=id_discharge_mw,
+            act_pos_mwh=act_pos_mwh,
+            act_neg_mwh=act_neg_mwh,
+            aux_mwh=aux_mwh,
+            battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+            dt_h=self.dt_h,
+        )
+        components["delta_soc_mwh"] = float(delta_soc)
+        id_buy_grid_mwh = float(row["real_id_buy_mwh"]) if "real_id_buy_mwh" in row.index else np.nan
+        id_sell_grid_mwh = float(row["real_id_sell_mwh"]) if "real_id_sell_mwh" in row.index else np.nan
+        components.update(
+            {
+                "id_buy_grid_mwh": float(id_buy_grid_mwh) if np.isfinite(id_buy_grid_mwh) else np.nan,
+                "id_sell_grid_mwh": float(id_sell_grid_mwh) if np.isfinite(id_sell_grid_mwh) else np.nan,
+                "id_buy_soc_effect_mwh": float(self.eta_in * id_charge_mw * self.dt_h),
+                "id_sell_soc_effect_mwh": float(-(id_discharge_mw * self.dt_h) / max(self.eta_out, 1e-12)),
+                "id_charge_source_column": "real_id_charge_mw",
+                "id_discharge_source_column": "real_id_discharge_mw",
+                "id_energy_convention": "grid_side",
+                "id_efficiency_applied_in_audit": 1.0,
+                "id_efficiency_applied_in_settlement": 1.0,
+            }
+        )
+        return float(delta_soc), components
+
+    def _write_soc_mass_balance_debug(
+        self,
+        *,
+        realized: pd.DataFrame,
+        idx: int,
+        timestamp_col: str,
+        previous_soc_mwh: float,
+        expected_soc_mwh: float,
+        got_soc_mwh: float,
+        formula_components: dict[str, object],
+    ) -> None:
+        # Include requested audit-relevant fields, including canonical SoC drivers.
+        fields = [
+            timestamp_col,
+            "real_soc_mwh",
+            "real_soc_start_mwh",
+            "real_charge_mw",
+            "real_discharge_mw",
+            "real_id_charge_mw",
+            "real_id_discharge_mw",
+            "real_da_buy_mwh",
+            "real_da_sell_mwh",
+            "real_id_buy_mwh",
+            "real_id_sell_mwh",
+            "id_sell_soc_effect_mwh",
+            "id_buy_soc_effect_mwh",
+            "id_discharge_source_column",
+            "id_charge_source_column",
+            "id_energy_convention",
+            "id_efficiency_applied_in_audit",
+            "id_efficiency_applied_in_settlement",
+            "real_act_pos_mwh",
+            "real_act_neg_mwh",
+            "real_aux_power_mw",
+            "real_aux_state",
+            "real_aux_energy_mwh",
+            "real_bem_only_executed_pos_mwh",
+            "real_bem_only_executed_neg_mwh",
+            "real_bem_only_submitted_pos_mw",
+            "real_bem_only_submitted_neg_mw",
+            "real_executed_reserve_pos_mw",
+            "real_executed_reserve_neg_mw",
+            "real_fixed_reserve_obligation_pos_mw",
+            "real_fixed_reserve_obligation_neg_mw",
+            "real_awarded_capacity_pos_mw",
+            "real_awarded_capacity_neg_mw",
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "da_bid_locked",
+            "event_reopt_triggered",
+            "real_locked_reserve_pos_mw",
+            "real_locked_reserve_neg_mw",
+            "real_required_headroom_pos_mwh",
+            "real_required_headroom_neg_mwh",
+            "real_power_stack_pos_mw",
+            "real_power_stack_neg_mw",
+            "optimization_error_code",
+            "event_type",
+            "is_precleared",
+            "da_bid_hour_local",
+            "afrr_bcm_bid_hour_local",
+        ]
+
+        # Pull both canonical and non-prefixed variants so debug export is robust
+        # when upstream naming changed across code paths.
+        alias_map = {
+            "fixed_reserve_obligation_pos_mw": ["real_fixed_reserve_obligation_pos_mw", "fixed_reserve_obligation_pos_mw"],
+            "fixed_reserve_obligation_neg_mw": ["real_fixed_reserve_obligation_neg_mw", "fixed_reserve_obligation_neg_mw"],
+        }
+
+        rows: list[dict[str, object]] = []
+
+        def _read(src: pd.Series, name: str) -> object:
+            candidates = alias_map.get(name, [name])
+            for cname in candidates:
+                if cname in src.index:
+                    return src[cname]
+            base_name = name.replace("real_", "", 1)
+            if base_name in src.index:
+                return src[base_name]
+            if name == "optimization_error_code":
+                if "optimization_error_code" in src.index:
+                    return src["optimization_error_code"]
+                if "real_optimization_error_code" in src.index:
+                    return src["real_optimization_error_code"]
+            return np.nan
+
+        for role, row_idx in (("previous", idx - 1), ("current", idx)):
+            if row_idx < 0 or row_idx >= len(realized):
+                continue
+            src = realized.iloc[row_idx]
+            row: dict[str, object] = {"debug_row_role": role}
+            row_prefix = "current_" if role == "current" else "previous_"
+            for field in fields:
+                value = _read(src, timestamp_col) if field == timestamp_col else _read(src, field)
+                if isinstance(value, pd.Timestamp):
+                    value = value.isoformat()
+                row[field] = value
+            if role == "current":
+                row.update(
+                    {
+                        "previous_soc_mwh": float(previous_soc_mwh),
+                        "expected_soc_mwh": float(expected_soc_mwh),
+                        "got_soc_mwh": float(got_soc_mwh),
+                        "soc_mismatch_mwh": float(expected_soc_mwh - got_soc_mwh),
+                        "formula_components": json.dumps(formula_components, sort_keys=True),
+                    }
+                )
+                for key in (
+                    "id_sell_soc_effect_mwh",
+                    "id_buy_soc_effect_mwh",
+                    "id_discharge_source_column",
+                    "id_charge_source_column",
+                    "id_energy_convention",
+                    "id_efficiency_applied_in_audit",
+                    "id_efficiency_applied_in_settlement",
+                ):
+                    if key in formula_components:
+                        row[key] = formula_components[key]
+            else:
+                row.update({f"{row_prefix}{key}": np.nan for key in formula_components})
+
+            for key, value in formula_components.items():
+                if row.get(f"{row_prefix}{key}") is None or pd.isna(row.get(f"{row_prefix}{key}", np.nan)):
+                    row[f"{row_prefix}{key}"] = value
+            rows.append(row)
+        debug = pd.DataFrame(rows)
+        self._soc_mass_balance_debug = debug
+        path = getattr(self, "_soc_mass_balance_debug_path", None)
+        if path is not None:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            debug.to_csv(path, index=False)
+
     def _audit_backtest_results(
         self,
         *,
@@ -6455,30 +6555,23 @@ class BatteryBacktester:
                 raise RuntimeError(f"Backtest audit failed: non-finite values in '{c}'.")
 
         soc_prev = float(self.soc_init)
-        for r in realized.itertuples(index=False):
-            charge_mw = float(getattr(r, "real_charge_mw"))
-            discharge_mw = float(getattr(r, "real_discharge_mw"))
-            act_pos_grid = float(getattr(r, "real_act_pos_mwh"))
-            act_neg_grid = float(getattr(r, "real_act_neg_mwh"))
-            aux_mwh = float(getattr(r, "real_aux_energy_mwh"))
-            id_charge_mw = float(getattr(r, "real_id_charge_mw")) if hasattr(r, "real_id_charge_mw") else 0.0
-            id_discharge_mw = float(getattr(r, "real_id_discharge_mw")) if hasattr(r, "real_id_discharge_mw") else 0.0
-            delta_soc = self._calculate_soc_delta(
-                charge_mw=charge_mw,
-                discharge_mw=discharge_mw,
-                id_charge_mw=id_charge_mw,
-                id_discharge_mw=id_discharge_mw,
-                act_pos_mwh=act_pos_grid,
-                act_neg_mwh=act_neg_grid,
-                aux_mwh=aux_mwh,
-                battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
-                dt_h=self.dt_h,
-            )
+        for idx in range(len(realized)):
+            row = realized.iloc[idx]
+            delta_soc, formula_components = self._calculate_realized_soc_delta_from_series(row)
             theor_next = soc_prev + delta_soc
             theor_next = float(np.clip(theor_next, self.soc_min, self.soc_max))
-            got_next = float(getattr(r, "real_soc_mwh"))
+            got_next = float(row["real_soc_mwh"])
             if not np.isfinite(got_next) or abs(theor_next - got_next) > max(epsilon, 1e-6):
-                ts = pd.to_datetime(getattr(r, ts_col), utc=True, errors="coerce")
+                ts = pd.to_datetime(row[ts_col], utc=True, errors="coerce")
+                self._write_soc_mass_balance_debug(
+                    realized=realized,
+                    idx=idx,
+                    timestamp_col=ts_col,
+                    previous_soc_mwh=soc_prev,
+                    expected_soc_mwh=theor_next,
+                    got_soc_mwh=got_next,
+                    formula_components=formula_components,
+                )
                 raise RuntimeError(
                     "Backtest audit failed: SoC mass-balance mismatch at "
                     f"{ts} (expected={theor_next:.6f}, got={got_next:.6f})."
@@ -6693,7 +6786,6 @@ class BatteryBacktester:
         id_recourse_mode: str = "common",
         strict_simulation_validity: bool = True,
         enable_global_perfect_foresight: bool = False,
-        fast_gated_decisions: bool = True,
         bcm_bid_hour_local: int | None = None,
     ) -> BacktestOutputs:
         """Run optimization + predicted settlement + realized settlement."""
@@ -6738,7 +6830,6 @@ class BatteryBacktester:
                         id_recourse_mode=id_recourse_mode,
                         run_mode=("perfect_foresight" if is_perfect_foresight_local else "advanced_ml"),
                         strict_simulation_validity=bool(strict_simulation_validity),
-                        fast_gated_decisions=bool(fast_gated_decisions),
                         bcm_bid_hour_local=bcm_bid_hour_local,
                     )
                 else:
@@ -6851,7 +6942,6 @@ class BatteryBacktester:
                 id_recourse_mode=id_recourse_mode,
                 run_mode="advanced_ml",
                 strict_simulation_validity=bool(strict_simulation_validity),
-                fast_gated_decisions=bool(fast_gated_decisions),
                 bcm_bid_hour_local=bcm_bid_hour_local,
             )
         else:
@@ -7622,43 +7712,9 @@ class BatteryBacktester:
             "bcm_block_consistency_checked_columns": str(bcm_block_consistency.get("checked_columns", "[]")),
             "partial_bcm_block_at_start": float(bcm_block_consistency["partial_start"]),
             "partial_bcm_block_at_end": float(bcm_block_consistency["partial_end"]),
-            "fast_gated_decisions_enabled": float(bool(fast_gated_decisions)),
             "da_bid_hour_local": float(int(da_bid_hour_local)),
             "da_gate_hour_local": float(int(da_bid_hour_local)),
             "bcm_bid_hour_local": float(int(self.afrr_bcm_bid_hour_local if bcm_bid_hour_local is None else bcm_bid_hour_local)),
-            "da_new_bid_fixed_by_gate_count": float(
-                pd.to_numeric(
-                    hourly.get(
-                        "real_da_new_bid_fixed_by_gate",
-                        hourly.get("da_new_bid_fixed_by_gate", pd.Series(0.0, index=hourly.index)),
-                    ),
-                    errors="coerce",
-                ).fillna(0.0).sum()
-                if len(hourly)
-                else 0.0
-            ),
-            "bcm_new_bid_fixed_by_gate_count": float(
-                pd.to_numeric(
-                    hourly.get(
-                        "real_bcm_new_bid_fixed_by_gate",
-                        hourly.get("bcm_new_bid_fixed_by_gate", pd.Series(0.0, index=hourly.index)),
-                    ),
-                    errors="coerce",
-                ).fillna(0.0).sum()
-                if len(hourly)
-                else 0.0
-            ),
-            "bem_new_bid_fixed_by_gate_count": float(
-                pd.to_numeric(
-                    hourly.get(
-                        "real_bem_new_bid_fixed_by_gate",
-                        hourly.get("bem_new_bid_fixed_by_gate", pd.Series(0.0, index=hourly.index)),
-                    ),
-                    errors="coerce",
-                ).fillna(0.0).sum()
-                if len(hourly)
-                else 0.0
-            ),
             "strategy": ",".join(sorted({str(m).strip().lower() for m in allowed_markets})),
             "base_strategy_id_mode": str(base_strategy_permissions.id_mode),
             "id_recourse_mode": str(run_id_recourse_mode),
