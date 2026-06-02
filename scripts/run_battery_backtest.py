@@ -3098,6 +3098,7 @@ def main() -> None:
         afrr_bin_ev_audit_path = scenario_out_dir / "afrr_bid_bin_ev_audit.csv"
         afrr_bin_ev_audit_status_path = scenario_out_dir / "afrr_bid_bin_ev_audit_status.json"
         run_status_path = scenario_out_dir / "run_status.json"
+        output_write_started = time.monotonic()
 
         with _phase_watchdog("write_hourly"):
             outputs.hourly.to_parquet(hourly_path, index=False)
@@ -3664,6 +3665,7 @@ def main() -> None:
             "ev_audit_row_count": float(ev_audit_stats.get("ev_audit_row_count", 0.0)),
             "ev_audit_max_bcm_formula_error": float(ev_audit_stats.get("ev_audit_max_bcm_formula_error", 0.0)),
             "ev_audit_max_bem_formula_error": float(ev_audit_stats.get("ev_audit_max_bem_formula_error", 0.0)),
+            "output_write_seconds": 0.0,
         }
         defaulted_fields: list[str] = []
         for k, v in defaults.items():
@@ -3717,8 +3719,6 @@ def main() -> None:
         # Backward-compatible aliases.
         outputs.summary["required_fields_defaulted"] = json.dumps([])
         outputs.summary["required_fields_computed"] = json.dumps(sorted(required_fields))
-        with _phase_watchdog("write_summary_json"):
-            summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
         with _phase_watchdog("write_performance_metrics"):
             scenario_start_utc = pd.to_datetime(args.start, utc=True, errors="coerce") if args.start else None
             scenario_end_utc = pd.to_datetime(args.end, utc=True, errors="coerce") if args.end else None
@@ -3909,6 +3909,10 @@ def main() -> None:
                 pd.DataFrame(rows).to_csv(scenario_out_dir / "ev_summary.csv", index=False)
         with _phase_watchdog("plot_cumulative_pnl"):
             _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
+
+        outputs.summary["output_write_seconds"] = float(max(0.0, time.monotonic() - output_write_started))
+        with _phase_watchdog("write_summary_json"):
+            summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
 
         print(f"[OK] Battery backtest completed for scenario={scenario_name}.")
         ts_col = colmap.timestamp if colmap.timestamp in outputs.hourly.columns else None

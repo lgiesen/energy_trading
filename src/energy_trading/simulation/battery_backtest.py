@@ -683,6 +683,7 @@ class BatteryBacktester:
         self._infeasible_debug_dumps: list[dict[str, str]] = []
         self._soc_mass_balance_debug = pd.DataFrame()
         self._soc_mass_balance_debug_path: Path | None = None
+        self._runtime_profile: dict[str, float] = {}
         self._strategy_permissions = StrategyPermissions(
             allow_da=True,
             id_mode="economic",
@@ -4443,6 +4444,7 @@ class BatteryBacktester:
         progress_last_log = progress_start
         progress_last_i = -1
         progress_log_interval_s = 30.0
+        optimizer_step_seconds: list[float] = []
 
         def _log_progress(*, force: bool = False, note: str = "") -> None:
             nonlocal progress_last_log, progress_last_i
@@ -4855,6 +4857,7 @@ class BatteryBacktester:
 
             last_exc: RuntimeError | None = None
             plan = None
+            optimizer_step_started = time.monotonic()
             for att_idx, fac in enumerate(retry_ladder):
                 reserve_retry_attempts_used = float(att_idx + 1)
                 reserve_retry_final_factor = float(fac)
@@ -5042,6 +5045,7 @@ class BatteryBacktester:
                         plan["optimizer_fallback_used"] = 1.0
                         plan["terminal_constraint_dropped"] = float(terminal_constraint_dropped)
                         optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan"
+            optimizer_step_seconds.append(max(0.0, time.monotonic() - optimizer_step_started))
 
             snapshot_plan = plan.copy()
             if "terminal_constraint_dropped" not in snapshot_plan.columns:
@@ -5527,6 +5531,14 @@ class BatteryBacktester:
             decisions.append(take_for_output)
 
         if not decisions:
+            self._runtime_profile.update(
+                {
+                    "optimizer_steps": 0.0,
+                    "optimizer_total_seconds": 0.0,
+                    "optimizer_mean_seconds_per_step": 0.0,
+                    "optimizer_max_seconds_per_step": 0.0,
+                }
+            )
             empty_dispatch = pd.DataFrame(
                 columns=[
                     colmap.timestamp,
@@ -5576,6 +5588,20 @@ class BatteryBacktester:
         plan_out = pd.concat(plan_history, ignore_index=True) if plan_history else pd.DataFrame()
         if not plan_out.empty:
             plan_out = plan_out.sort_values(["snapshot_time_utc", "target_time_utc"]).reset_index(drop=True)
+        optimizer_total_seconds = float(sum(optimizer_step_seconds))
+        optimizer_steps = float(len(optimizer_step_seconds))
+        self._runtime_profile.update(
+            {
+                "optimizer_steps": optimizer_steps,
+                "optimizer_total_seconds": optimizer_total_seconds,
+                "optimizer_mean_seconds_per_step": (
+                    optimizer_total_seconds / optimizer_steps if optimizer_steps > 0.0 else 0.0
+                ),
+                "optimizer_max_seconds_per_step": (
+                    float(max(optimizer_step_seconds)) if optimizer_step_seconds else 0.0
+                ),
+            }
+        )
         return out, plan_out
 
     def settle_dispatch(
@@ -6789,9 +6815,18 @@ class BatteryBacktester:
         bcm_bid_hour_local: int | None = None,
     ) -> BacktestOutputs:
         """Run optimization + predicted settlement + realized settlement."""
+        run_started_monotonic = time.monotonic()
         if horizon_hours <= 0 or reopt_step_hours <= 0:
             raise ValueError("horizon_hours and reopt_step_hours must be > 0")
         self._infeasible_debug_dumps = []
+        self._runtime_profile = {
+            "optimizer_steps": 0.0,
+            "optimizer_total_seconds": 0.0,
+            "optimizer_mean_seconds_per_step": 0.0,
+            "optimizer_max_seconds_per_step": 0.0,
+            "settlement_predicted_seconds": 0.0,
+            "settlement_realized_seconds": 0.0,
+        }
         self._strategy_permissions = self.resolve_strategy_permissions(
             strategy_name=strategy_name,
             allowed_markets=allowed_markets,
@@ -6954,8 +6989,13 @@ class BatteryBacktester:
                 deterministic_reserve_settlement=False,
                 allowed_markets=allowed_markets,
             )
+        settlement_predicted_started = time.monotonic()
         with _phase_watchdog("settlement_predicted"):
             pred = self.settle_dispatch(df, dispatch, colmap, predicted_settlement=True)
+        self._runtime_profile["settlement_predicted_seconds"] = max(
+            0.0, time.monotonic() - settlement_predicted_started
+        )
+        settlement_realized_started = time.monotonic()
         with _phase_watchdog("settlement_realized"):
             real = self.settle_dispatch(
                 df,
@@ -6965,6 +7005,9 @@ class BatteryBacktester:
                 apply_market_clearing=True,
                 perfect_foresight_mode=False,
             )
+        self._runtime_profile["settlement_realized_seconds"] = max(
+            0.0, time.monotonic() - settlement_realized_started
+        )
         self._audit_backtest_results(realized=real, dispatch=dispatch, df_input=df, colmap=colmap)
 
         # Naive-24h benchmark run: y_t_hat := y_{t-24} for predicted market columns.
@@ -7730,6 +7773,21 @@ class BatteryBacktester:
             "allow_bem_only": float(run_strategy_permissions.allow_bem_only),
             "reserve_activation_headroom_h": float(self.reserve_activation_headroom_h),
             "bem_activation_headroom_h": float(self.bem_activation_headroom_h),
+            "optimizer_steps": float(self._runtime_profile.get("optimizer_steps", 0.0)),
+            "optimizer_total_seconds": float(self._runtime_profile.get("optimizer_total_seconds", 0.0)),
+            "optimizer_mean_seconds_per_step": float(
+                self._runtime_profile.get("optimizer_mean_seconds_per_step", 0.0)
+            ),
+            "optimizer_max_seconds_per_step": float(
+                self._runtime_profile.get("optimizer_max_seconds_per_step", 0.0)
+            ),
+            "settlement_predicted_seconds": float(
+                self._runtime_profile.get("settlement_predicted_seconds", 0.0)
+            ),
+            "settlement_realized_seconds": float(
+                self._runtime_profile.get("settlement_realized_seconds", 0.0)
+            ),
+            "milp_time_limit_seconds": float(self.milp_time_limit_seconds),
         }
         accepted_dumps, candidate_dumps = self._classify_infeasible_debug_dumps(
             self._infeasible_debug_dumps,
@@ -9008,9 +9066,20 @@ class BatteryBacktester:
             ("infeasible_debug_dump_paths", []),
             ("infeasible_debug_dump_timestamps", []),
             ("first_infeasible_timestamp_utc", ""),
+            ("backtester_run_seconds", 0.0),
+            ("optimizer_steps", 0.0),
+            ("optimizer_total_seconds", 0.0),
+            ("optimizer_mean_seconds_per_step", 0.0),
+            ("optimizer_max_seconds_per_step", 0.0),
+            ("settlement_predicted_seconds", 0.0),
+            ("settlement_realized_seconds", 0.0),
+            ("output_write_seconds", 0.0),
+            ("milp_time_limit_seconds", float(self.milp_time_limit_seconds)),
         ]:
             if k not in summary or summary[k] is None:
                 summary[k] = v
+
+        summary["backtester_run_seconds"] = float(max(0.0, time.monotonic() - run_started_monotonic))
 
         return BacktestOutputs(
             hourly=hourly,
