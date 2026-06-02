@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import os
@@ -28,6 +29,10 @@ from energy_trading.config import MODEL_SPECS  # noqa: E402
 from energy_trading.simulation.bid_builder import AFRRCapacityBid  # noqa: E402
 from energy_trading.simulation.market_clearing import MarketClearingEngine  # noqa: E402
 from scripts.run_battery_backtest import (  # noqa: E402
+    _build_daily_performance_metrics,
+    _build_performance_metrics,
+    _build_performance_reconciliation_debug,
+    _validate_performance_metrics,
     _build_optimization_infeasibility_attribution,
     _prepare_scenario_output_dir,
     _resolve_final_soc_policy,
@@ -277,7 +282,11 @@ def test_afrr_only_bcm_block_constant_bem_hourly_not_forced_block_constant() -> 
         assert float(pd.to_numeric(g["reserve_pos_mw"], errors="coerce").max() - pd.to_numeric(g["reserve_pos_mw"], errors="coerce").min()) <= 1e-6
         assert float(pd.to_numeric(g["reserve_neg_mw"], errors="coerce").max() - pd.to_numeric(g["reserve_neg_mw"], errors="coerce").min()) <= 1e-6
     # BEM stays hourly; not constrained to block equality.
-    assert float(pd.to_numeric(out["bem_only_pos_mw"], errors="coerce").max() - pd.to_numeric(out["bem_only_pos_mw"], errors="coerce").min()) >= 0.0
+    bem_spread = float(
+        pd.to_numeric(out["bem_only_pos_mw"], errors="coerce").max()
+        - pd.to_numeric(out["bem_only_pos_mw"], errors="coerce").min()
+    )
+    assert bem_spread > 1e-6
 
 
 def test_bcm_block_consistency_check_detects_hourly_variation() -> None:
@@ -287,10 +296,10 @@ def test_bcm_block_consistency_check_detects_hourly_variation() -> None:
     hourly = pd.DataFrame(
         {
             col.timestamp: ts,
-            "real_submitted_afrr_pos_mw": [1.0, 1.0, 0.0, 0.0],
-            "real_submitted_afrr_neg_mw": [0.0, 0.0, 0.0, 0.0],
-            "real_executed_reserve_pos_mw": [1.0, 0.0, 0.0, 0.0],
-            "real_executed_reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "real_submitted_bcm_capacity_pos_mw": [1.0, 1.0, 0.0, 0.0],
+            "real_submitted_bcm_capacity_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "real_executed_bcm_capacity_pos_mw": [1.0, 0.0, 0.0, 0.0],
+            "real_executed_bcm_capacity_neg_mw": [0.0, 0.0, 0.0, 0.0],
         }
     )
     res = bt._compute_bcm_block_consistency(
@@ -301,6 +310,31 @@ def test_bcm_block_consistency_check_detects_hourly_variation() -> None:
     )
     assert float(res["pass"]) == 0.0
     assert float(res["violation_count"]) > 0.0
+
+
+def test_bcm_block_consistency_ignores_mixed_afrr_hourly_columns_when_explicit_bcm_constant() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-05-01T00:00:00Z", periods=4, freq="h")
+    hourly = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            # Explicit BCM columns are block-consistent.
+            "real_submitted_bcm_capacity_pos_mw": [2.0, 2.0, 2.0, 2.0],
+            "real_submitted_bcm_capacity_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            # Mixed diagnostics can vary hourly and must not invalidate BCM block consistency.
+            "real_submitted_afrr_pos_mw": [2.0, 2.0, 0.0, 0.0],
+            "real_submitted_afrr_neg_mw": [0.0, 1.0, 0.0, 1.0],
+        }
+    )
+    res = bt._compute_bcm_block_consistency(
+        hourly=hourly,
+        timestamp_col=col.timestamp,
+        bcm_enabled=True,
+        tol_mw=1e-6,
+    )
+    assert float(res["pass"]) == 1.0
+    assert float(res["violation_count"]) == 0.0
 
 
 def test_simulation_forecast_loader_missing_p50_fails_by_default(tmp_path: Path) -> None:
@@ -4441,3 +4475,180 @@ def test_protected_soc_violation_with_obligation_still_invalidates() -> None:
     )
     assert float(res["obligation_headroom_pos_active"]) > 0.5
     assert float(res["protected_soc_violation_pos_mwh"]) > 0.0
+
+
+def _perf_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        model_key="xgb",
+        run_manifest="artifacts/model_runs/latest_xgboost.json",
+        split="test",
+        trading_strategy="multi",
+        id_recourse_mode="none",
+        da_quantile_role="mid",
+    )
+
+
+def test_daily_to_scenario_reconciliation_uses_hourly_real_pnl() -> None:
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=24, freq="h")
+    hourly = pd.DataFrame({"timestamp_utc": ts, "real_pnl_eur": [10.0] * 24})
+    summary = {
+        "realized_total_pnl_eur": 9999.0,  # intentionally wrong; hourly must be source-of-truth
+        "predicted_total_pnl_eur": 0.0,
+        "p_max_mw": 10.0,
+        "capacity_mwh": 20.0,
+    }
+    perf_df, _ = _build_performance_metrics(
+        hourly=hourly,
+        summary=summary,
+        args=_perf_args(),
+        scenario_name="p50_p50",
+        scenario_bins=["p50", "p50"],
+        scenario_start_utc=None,
+        scenario_end_utc=None,
+    )
+    daily_df = _build_daily_performance_metrics(hourly=hourly, perf_row=perf_df.iloc[0])
+    checks = _validate_performance_metrics(perf_row=perf_df.iloc[0], daily_df=daily_df)
+    assert float(perf_df.iloc[0]["realized_net_revenue_eur"]) == pytest.approx(240.0)
+    assert float(pd.to_numeric(daily_df["net_revenue_eur"], errors="coerce").sum()) == pytest.approx(240.0)
+    assert bool(checks["daily_to_scenario_reconciliation_ok"])
+
+
+def test_component_to_net_reconciliation_passes_for_consistent_hourly_components() -> None:
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=1, freq="h")
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "real_revenue_da_eur": [100.0],
+            "real_cost_da_eur": [0.0],
+            "real_revenue_id_eur": [0.0],
+            "real_cost_id_eur": [5.0],
+            "real_revenue_capacity_eur": [20.0],
+            "real_revenue_activation_eur": [10.0],
+            "real_degradation_cost_eur": [2.0],
+            "real_penalty_eur": [3.0],
+            "real_aux_cost_eur": [1.0],
+            "real_transaction_cost_eur": [0.0],
+            "real_offer_cost_eur": [0.0],
+            "real_pnl_eur": [119.0],
+        }
+    )
+    summary = {"realized_total_pnl_eur": 0.0, "predicted_total_pnl_eur": 0.0, "p_max_mw": 10.0, "capacity_mwh": 20.0}
+    perf_df, _ = _build_performance_metrics(
+        hourly=hourly,
+        summary=summary,
+        args=_perf_args(),
+        scenario_name="p50_p50",
+        scenario_bins=["p50", "p50"],
+        scenario_start_utc=None,
+        scenario_end_utc=None,
+    )
+    assert float(perf_df.iloc[0]["net_revenue_reconciliation_error_eur"]) == pytest.approx(0.0, abs=1e-9)
+    assert float(perf_df.iloc[0]["realized_net_revenue_eur"]) == pytest.approx(119.0, abs=1e-9)
+
+
+def test_reconciliation_debug_exposes_daily_vs_scenario_mismatch() -> None:
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=4, freq="h")
+    hourly = pd.DataFrame({"timestamp_utc": ts, "real_pnl_eur": [10.0, 10.0, 10.0, 10.0]})
+    perf_row = pd.Series({"realized_net_revenue_eur": 40.0, "da_gross_revenue_eur": 0.0})
+    daily_df = pd.DataFrame({"date_utc": ["2026-01-01"], "net_revenue_eur": [25.0]})
+    dbg = _build_performance_reconciliation_debug(
+        scenario="p50_p50",
+        perf_row=perf_row,
+        daily_df=daily_df,
+        hourly=hourly,
+    )
+    row = dbg.loc[dbg["metric"] == "realized_net_revenue_eur"].iloc[0]
+    assert float(row["scenario_minus_daily"]) == pytest.approx(15.0)
+    assert float(row["scenario_minus_hourly"]) == pytest.approx(0.0)
+
+
+def test_reconciliation_debug_marks_checked_and_skipped_metrics() -> None:
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=1, freq="h")
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "real_pnl_eur": [10.0],
+            "real_transaction_cost_eur": [2.0],
+        }
+    )
+    perf_row = pd.Series(
+        {
+            "realized_net_revenue_eur": 10.0,
+            "transaction_cost_eur": 2.0,
+            "terminal_soc_repair_cost_eur": 7.0,
+        }
+    )
+    daily_df = pd.DataFrame(
+        {
+            "date_utc": ["2026-01-01"],
+            "net_revenue_eur": [10.0],
+            "transaction_cost_eur": [2.0],
+            "terminal_soc_repair_cost_eur": [0.0],
+        }
+    )
+    dbg = _build_performance_reconciliation_debug(
+        scenario="p50_p50",
+        perf_row=perf_row,
+        daily_df=daily_df,
+        hourly=hourly,
+    )
+    net_row = dbg.loc[dbg["metric"] == "realized_net_revenue_eur"].iloc[0]
+    term_row = dbg.loc[dbg["metric"] == "terminal_soc_repair_cost_eur"].iloc[0]
+    assert bool(net_row["checked_daily_to_scenario"]) is True
+    assert float(net_row["daily_abs_error"]) == pytest.approx(0.0)
+    assert bool(term_row["checked_daily_to_scenario"]) is False
+    assert term_row["skipped_reason"] == "not_checked_in_daily_to_scenario_reconciliation"
+
+
+def test_daily_to_scenario_max_uses_checked_rows_only() -> None:
+    perf_row = pd.Series(
+        {
+            "realized_net_revenue_eur": 40.0,
+            "transaction_cost_eur": 3.0,
+            "terminal_soc_repair_cost_eur": 45.056,
+            "net_revenue_reconciliation_error_eur": 0.0,
+            "total_costs_eur": 3.0,
+            "realized_degradation_cost_eur": 0.0,
+            "realized_aux_cost_eur": 0.0,
+            "offer_cost_eur": 0.0,
+            "penalty_cost_eur": 0.0,
+        }
+    )
+    daily_df = pd.DataFrame(
+        {
+            "date_utc": ["2026-01-01"],
+            "net_revenue_eur": [40.0],
+            "transaction_cost_eur": [3.0],
+            "terminal_soc_repair_cost_eur": [0.0],
+        }
+    )
+    checks = _validate_performance_metrics(perf_row=perf_row, daily_df=daily_df)
+    assert checks["daily_to_scenario_reconciliation_ok"] is True
+    assert float(checks["daily_to_scenario_error_max_abs"]) == pytest.approx(0.0)
+
+
+def test_daily_metrics_include_component_pnl_columns() -> None:
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=1, freq="h")
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "real_revenue_da_eur": [100.0],
+            "real_cost_da_eur": [30.0],
+            "real_revenue_id_eur": [20.0],
+            "real_cost_id_eur": [5.0],
+            "real_revenue_capacity_eur": [7.0],
+            "real_revenue_activation_eur": [9.0],
+            "real_bcm_linked_activation_revenue_eur": [4.0],
+            "real_bem_only_activation_revenue_eur": [6.0],
+            "real_offer_cost_eur": [2.0],
+            "real_pnl_eur": [101.0],
+        }
+    )
+    perf_row = pd.Series({"simulation_valid": 1.0, "thesis_reportable": 1.0, "invalid_reason": ""})
+    daily_df = _build_daily_performance_metrics(hourly=hourly, perf_row=perf_row)
+    row = daily_df.iloc[0]
+    assert float(row["da_pnl_eur"]) == pytest.approx(70.0)
+    assert float(row["id_recourse_pnl_eur"]) == pytest.approx(15.0)
+    assert float(row["bcm_pnl_eur"]) == pytest.approx(9.0)
+    assert float(row["bem_pnl_eur"]) == pytest.approx(6.0)
+    assert float(row["afrr_pnl_eur"]) == pytest.approx(16.0)

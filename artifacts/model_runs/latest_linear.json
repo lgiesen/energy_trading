@@ -1,7 +1,7 @@
 {
-  "run_id": "linear_20260526_223836",
-  "manifest_path": "linear_20260526_223836/manifest.json",
-  "manifest_path_abs": "linear_20260526_223836/manifest.json",
-  "updated_at_utc": "2026-05-26T22:55:01.235908+00:00",
+  "run_id": "linear_20260531_092342",
+  "manifest_path": "linear_20260531_092342/manifest.json",
+  "manifest_path_abs": "linear_20260531_092342/manifest.json",
+  "updated_at_utc": "2026-06-02T04:13:43.165629+00:00",
   "model_type": "linear"
 }

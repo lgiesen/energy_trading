@@ -472,22 +472,53 @@ def _build_performance_metrics(
         cap_mwh = float("nan")
         warnings.append("missing_or_invalid:capacity_mwh")
 
-    realized_net = float(pd.to_numeric(pd.Series([summary.get("realized_total_pnl_eur", np.nan)]), errors="coerce").iloc[0])
+    def _hourly_sum(name: str) -> float:
+        if name not in hourly.columns:
+            return float("nan")
+        return float(pd.to_numeric(hourly[name], errors="coerce").fillna(0.0).sum())
+
+    realized_net = _hourly_sum("real_pnl_eur")
+    if not np.isfinite(realized_net):
+        realized_net = float(pd.to_numeric(pd.Series([summary.get("realized_total_pnl_eur", np.nan)]), errors="coerce").iloc[0])
     predicted_net = float(pd.to_numeric(pd.Series([summary.get("predicted_total_pnl_eur", np.nan)]), errors="coerce").iloc[0])
 
-    da_gross_revenue = float(pd.to_numeric(pd.Series([summary.get("total_da_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    da_gross_cost = float(pd.to_numeric(pd.Series([summary.get("total_da_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    id_gross_revenue = float(pd.to_numeric(pd.Series([summary.get("total_id_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    id_gross_cost = float(pd.to_numeric(pd.Series([summary.get("total_id_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    bcm_capacity_revenue = float(pd.to_numeric(pd.Series([summary.get("total_afrr_capacity_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    bcm_linked_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_bcm_linked_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    bem_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_bem_only_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    da_gross_revenue = _hourly_sum("real_revenue_da_eur")
+    if not np.isfinite(da_gross_revenue):
+        da_gross_revenue = float(pd.to_numeric(pd.Series([summary.get("total_da_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    da_gross_cost = _hourly_sum("real_cost_da_eur")
+    if not np.isfinite(da_gross_cost):
+        da_gross_cost = float(pd.to_numeric(pd.Series([summary.get("total_da_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    id_gross_revenue = _hourly_sum("real_revenue_id_eur")
+    if not np.isfinite(id_gross_revenue):
+        id_gross_revenue = float(pd.to_numeric(pd.Series([summary.get("total_id_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    id_gross_cost = _hourly_sum("real_cost_id_eur")
+    if not np.isfinite(id_gross_cost):
+        id_gross_cost = float(pd.to_numeric(pd.Series([summary.get("total_id_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    bcm_capacity_revenue = _hourly_sum("real_revenue_capacity_eur")
+    if not np.isfinite(bcm_capacity_revenue):
+        bcm_capacity_revenue = float(pd.to_numeric(pd.Series([summary.get("total_afrr_capacity_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    bcm_linked_activation_revenue = _hourly_sum("real_bcm_linked_activation_revenue_eur")
+    if not np.isfinite(bcm_linked_activation_revenue):
+        bcm_linked_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_bcm_linked_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    bem_activation_revenue = _hourly_sum("real_bem_only_activation_revenue_eur")
+    if not np.isfinite(bem_activation_revenue):
+        bem_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_bem_only_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
 
-    realized_degradation_cost = float(pd.to_numeric(pd.Series([summary.get("total_degradation_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    realized_aux_cost = float(pd.to_numeric(pd.Series([summary.get("total_auxiliary_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    transaction_cost = float(pd.to_numeric(pd.Series([summary.get("total_transaction_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    offer_cost = float(pd.to_numeric(pd.Series([summary.get("total_offer_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-    penalty_cost = float(pd.to_numeric(pd.Series([summary.get("total_penalty_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    realized_degradation_cost = _hourly_sum("real_degradation_cost_eur")
+    if not np.isfinite(realized_degradation_cost):
+        realized_degradation_cost = float(pd.to_numeric(pd.Series([summary.get("total_degradation_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    realized_aux_cost = _hourly_sum("real_aux_cost_eur")
+    if not np.isfinite(realized_aux_cost):
+        realized_aux_cost = float(pd.to_numeric(pd.Series([summary.get("total_auxiliary_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    transaction_cost = _hourly_sum("real_transaction_cost_eur")
+    if not np.isfinite(transaction_cost):
+        transaction_cost = float(pd.to_numeric(pd.Series([summary.get("total_transaction_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    offer_cost = _hourly_sum("real_offer_cost_eur")
+    if not np.isfinite(offer_cost):
+        offer_cost = float(pd.to_numeric(pd.Series([summary.get("total_offer_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    penalty_cost = _hourly_sum("real_penalty_eur")
+    if not np.isfinite(penalty_cost):
+        penalty_cost = float(pd.to_numeric(pd.Series([summary.get("total_penalty_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
     terminal_soc_repair_cost = float(pd.to_numeric(pd.Series([summary.get("terminal_soc_repair_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
 
     da_net = da_gross_revenue - da_gross_cost
@@ -497,7 +528,9 @@ def _build_performance_metrics(
     bem_activation_cost = 0.0
     bem_net = bem_activation_revenue - bem_activation_cost
     afrr_capacity_revenue = bcm_capacity_revenue
-    afrr_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_afrr_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    afrr_activation_revenue = _hourly_sum("real_revenue_activation_eur")
+    if not np.isfinite(afrr_activation_revenue):
+        afrr_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_afrr_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
     afrr_activation_cost = 0.0
     afrr_total_net_revenue = afrr_capacity_revenue + afrr_activation_revenue - afrr_activation_cost
 
@@ -705,12 +738,13 @@ def _build_daily_performance_metrics(
             "id_gross_cost_eur": grp["real_cost_id_eur"].sum() if "real_cost_id_eur" in d.columns else 0.0,
             "afrr_capacity_revenue_eur": grp["real_revenue_capacity_eur"].sum() if "real_revenue_capacity_eur" in d.columns else 0.0,
             "afrr_activation_revenue_eur": grp["real_revenue_activation_eur"].sum() if "real_revenue_activation_eur" in d.columns else 0.0,
+            "bcm_linked_activation_revenue_eur": grp["real_bcm_linked_activation_revenue_eur"].sum() if "real_bcm_linked_activation_revenue_eur" in d.columns else 0.0,
             "bem_activation_revenue_eur": grp["real_bem_only_activation_revenue_eur"].sum() if "real_bem_only_activation_revenue_eur" in d.columns else 0.0,
             "degradation_cost_eur": grp["real_degradation_cost_eur"].sum() if "real_degradation_cost_eur" in d.columns else 0.0,
             "aux_cost_eur": grp["real_aux_cost_eur"].sum() if "real_aux_cost_eur" in d.columns else 0.0,
             "transaction_cost_eur": grp["real_transaction_cost_eur"].sum() if "real_transaction_cost_eur" in d.columns else 0.0,
             "penalty_cost_eur": grp["real_penalty_eur"].sum() if "real_penalty_eur" in d.columns else 0.0,
-            "offer_cost_eur": 0.0,
+            "offer_cost_eur": grp["real_offer_cost_eur"].sum() if "real_offer_cost_eur" in d.columns else 0.0,
             "terminal_soc_repair_cost_eur": 0.0,
             "net_revenue_eur": grp["real_pnl_eur"].sum() if "real_pnl_eur" in d.columns else 0.0,
             "da_bid_buy_mwh": (grp["real_submitted_da_buy_mw"].sum() * dt_h) if "real_submitted_da_buy_mw" in d.columns else 0.0,
@@ -747,7 +781,26 @@ def _build_daily_performance_metrics(
         pd.to_numeric(out["degradation_cost_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["aux_cost_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["transaction_cost_eur"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["offer_cost_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["penalty_cost_eur"], errors="coerce").fillna(0.0)
+    )
+    out["da_pnl_eur"] = (
+        pd.to_numeric(out["da_gross_revenue_eur"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(out["da_gross_cost_eur"], errors="coerce").fillna(0.0)
+    )
+    out["id_recourse_pnl_eur"] = (
+        pd.to_numeric(out["id_gross_revenue_eur"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(out["id_gross_cost_eur"], errors="coerce").fillna(0.0)
+    )
+    out["bcm_pnl_eur"] = (
+        pd.to_numeric(out["afrr_capacity_revenue_eur"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["bcm_linked_activation_revenue_eur"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(out["offer_cost_eur"], errors="coerce").fillna(0.0)
+    )
+    out["bem_pnl_eur"] = pd.to_numeric(out["bem_activation_revenue_eur"], errors="coerce").fillna(0.0)
+    out["afrr_pnl_eur"] = (
+        pd.to_numeric(out["afrr_capacity_revenue_eur"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["afrr_activation_revenue_eur"], errors="coerce").fillna(0.0)
     )
     out["has_fallback_hour"] = pd.to_numeric(out["fallback_hours"], errors="coerce").fillna(0.0) > 0.0
     out["has_non_ok_optimization_hour"] = (
@@ -756,6 +809,245 @@ def _build_daily_performance_metrics(
         else False
     )
     return out
+
+
+def _performance_reconciliation_specs() -> list[dict[str, object]]:
+    return [
+        {
+            "metric": "realized_net_revenue_eur",
+            "scenario_col": "realized_net_revenue_eur",
+            "daily_col": "net_revenue_eur",
+            "hourly_col": "real_pnl_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "hourly real_pnl_eur is the canonical realized net source",
+        },
+        {
+            "metric": "da_gross_revenue_eur",
+            "scenario_col": "da_gross_revenue_eur",
+            "daily_col": "da_gross_revenue_eur",
+            "hourly_col": "real_revenue_da_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "DA realized gross revenue",
+        },
+        {
+            "metric": "da_gross_cost_eur",
+            "scenario_col": "da_gross_cost_eur",
+            "daily_col": "da_gross_cost_eur",
+            "hourly_col": "real_cost_da_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "DA realized gross cost",
+        },
+        {
+            "metric": "id_gross_revenue_eur",
+            "scenario_col": "id_gross_revenue_eur",
+            "daily_col": "id_gross_revenue_eur",
+            "hourly_col": "real_revenue_id_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "ID realized gross revenue",
+        },
+        {
+            "metric": "id_gross_cost_eur",
+            "scenario_col": "id_gross_cost_eur",
+            "daily_col": "id_gross_cost_eur",
+            "hourly_col": "real_cost_id_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "ID realized gross cost",
+        },
+        {
+            "metric": "bcm_capacity_revenue_eur",
+            "scenario_col": "bcm_capacity_revenue_eur",
+            "daily_col": "afrr_capacity_revenue_eur",
+            "hourly_col": "real_revenue_capacity_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "BCM capacity revenue is daily aFRR capacity revenue",
+        },
+        {
+            "metric": "bcm_linked_activation_revenue_eur",
+            "scenario_col": "bcm_linked_activation_revenue_eur",
+            "daily_col": "bcm_linked_activation_revenue_eur",
+            "hourly_col": "real_bcm_linked_activation_revenue_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "BCM-linked activation revenue tracked separately from BEM-only activation",
+        },
+        {
+            "metric": "afrr_activation_revenue_eur",
+            "scenario_col": "afrr_activation_revenue_eur",
+            "daily_col": "afrr_activation_revenue_eur",
+            "hourly_col": "real_revenue_activation_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "Total realized activation revenue",
+        },
+        {
+            "metric": "bem_activation_revenue_eur",
+            "scenario_col": "bem_activation_revenue_eur",
+            "daily_col": "bem_activation_revenue_eur",
+            "hourly_col": "real_bem_only_activation_revenue_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "BEM-only activation revenue",
+        },
+        {
+            "metric": "realized_degradation_cost_eur",
+            "scenario_col": "realized_degradation_cost_eur",
+            "daily_col": "degradation_cost_eur",
+            "hourly_col": "real_degradation_cost_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "Operational degradation cost",
+        },
+        {
+            "metric": "realized_aux_cost_eur",
+            "scenario_col": "realized_aux_cost_eur",
+            "daily_col": "aux_cost_eur",
+            "hourly_col": "real_aux_cost_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "Auxiliary energy cost",
+        },
+        {
+            "metric": "transaction_cost_eur",
+            "scenario_col": "transaction_cost_eur",
+            "daily_col": "transaction_cost_eur",
+            "hourly_col": "real_transaction_cost_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "Transaction cost",
+        },
+        {
+            "metric": "offer_cost_eur",
+            "scenario_col": "offer_cost_eur",
+            "daily_col": "offer_cost_eur",
+            "hourly_col": "real_offer_cost_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "Offer cost if tracked hourly",
+        },
+        {
+            "metric": "penalty_cost_eur",
+            "scenario_col": "penalty_cost_eur",
+            "daily_col": "penalty_cost_eur",
+            "hourly_col": "real_penalty_eur",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": True,
+            "source_note": "Penalty cost",
+        },
+        {
+            "metric": "terminal_soc_repair_cost_eur",
+            "scenario_col": "terminal_soc_repair_cost_eur",
+            "daily_col": "terminal_soc_repair_cost_eur",
+            "hourly_col": "",
+            "checked_daily_to_scenario": False,
+            "checked_component_to_net": True,
+            "source_note": "Scenario-level terminal adjustment; not allocated across days in strict reconciliation",
+        },
+        {
+            "metric": "da_bid_buy_mwh_total",
+            "scenario_col": "da_bid_buy_mwh_total",
+            "daily_col": "da_bid_buy_mwh",
+            "hourly_col": "",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Daily sums are the canonical additive check for submitted DA buy volume",
+        },
+        {
+            "metric": "da_bid_sell_mwh_total",
+            "scenario_col": "da_bid_sell_mwh_total",
+            "daily_col": "da_bid_sell_mwh",
+            "hourly_col": "",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Daily sums are the canonical additive check for submitted DA sell volume",
+        },
+        {
+            "metric": "da_realized_buy_mwh_total",
+            "scenario_col": "da_realized_buy_mwh_total",
+            "daily_col": "da_realized_buy_mwh",
+            "hourly_col": "real_da_buy_mwh",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Realized DA buy volume",
+        },
+        {
+            "metric": "da_realized_sell_mwh_total",
+            "scenario_col": "da_realized_sell_mwh_total",
+            "daily_col": "da_realized_sell_mwh",
+            "hourly_col": "real_da_sell_mwh",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Realized DA sell volume",
+        },
+        {
+            "metric": "bem_bid_pos_mwh_total",
+            "scenario_col": "bem_bid_pos_mwh_total",
+            "daily_col": "bem_bid_pos_mwh",
+            "hourly_col": "",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Daily sums are the canonical additive check for submitted BEM positive volume",
+        },
+        {
+            "metric": "bem_bid_neg_mwh_total",
+            "scenario_col": "bem_bid_neg_mwh_total",
+            "daily_col": "bem_bid_neg_mwh",
+            "hourly_col": "",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Daily sums are the canonical additive check for submitted BEM negative volume",
+        },
+        {
+            "metric": "bem_realized_pos_mwh_total",
+            "scenario_col": "bem_realized_pos_mwh_total",
+            "daily_col": "bem_realized_pos_mwh",
+            "hourly_col": "real_bem_only_executed_pos_mwh",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Realized BEM positive volume",
+        },
+        {
+            "metric": "bem_realized_neg_mwh_total",
+            "scenario_col": "bem_realized_neg_mwh_total",
+            "daily_col": "bem_realized_neg_mwh",
+            "hourly_col": "real_bem_only_executed_neg_mwh",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Realized BEM negative volume",
+        },
+        {
+            "metric": "id_buy_mwh_total",
+            "scenario_col": "id_buy_mwh_total",
+            "daily_col": "id_buy_mwh",
+            "hourly_col": "real_id_buy_mwh",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Realized ID buy volume",
+        },
+        {
+            "metric": "id_sell_mwh_total",
+            "scenario_col": "id_sell_mwh_total",
+            "daily_col": "id_sell_mwh",
+            "hourly_col": "real_id_sell_mwh",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Realized ID sell volume",
+        },
+        {
+            "metric": "throughput_mwh_total",
+            "scenario_col": "throughput_mwh_total",
+            "daily_col": "throughput_mwh",
+            "hourly_col": "real_throughput_mwh",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "Battery throughput volume",
+        },
+    ]
 
 
 def _write_performance_metric_definitions(path: Path) -> None:
@@ -769,6 +1061,60 @@ def _write_performance_metric_definitions(path: Path) -> None:
         {"field": "bem_bid_pos_mwh_total", "unit": "MWh", "formula": "sum(real_bem_only_submitted_pos_mw * dt_h)", "source_columns": ["real_bem_only_submitted_pos_mw", "timestamp_utc"], "kind": "volume"},
     ]
     path.write_text(json.dumps(defs, indent=2), encoding="utf-8")
+
+
+def _build_bcm_block_consistency_violations(
+    *,
+    hourly: pd.DataFrame,
+    summary: dict[str, object],
+    scenario_name: str,
+    strategy: str,
+    tol_mw: float = 1e-6,
+) -> pd.DataFrame:
+    if "bcm_capacity_block_id" not in hourly.columns:
+        return pd.DataFrame()
+    checked_cols_raw = str(summary.get("bcm_block_consistency_checked_columns", "[]") or "[]")
+    try:
+        checked_cols = [str(c) for c in json.loads(checked_cols_raw)]
+    except Exception:
+        checked_cols = []
+    if not checked_cols:
+        return pd.DataFrame()
+    rows: list[dict[str, object]] = []
+    grp = hourly.groupby("bcm_capacity_block_id", dropna=False)
+    for block_id, g in grp:
+        part_start = float(pd.to_numeric(g.get("bcm_capacity_block_partial_start", 0.0), errors="coerce").fillna(0.0).max())
+        part_end = float(pd.to_numeric(g.get("bcm_capacity_block_partial_end", 0.0), errors="coerce").fillna(0.0).max())
+        for c in checked_cols:
+            if c not in g.columns:
+                continue
+            s = pd.to_numeric(g[c], errors="coerce").fillna(0.0)
+            smin = float(s.min()) if len(s) else 0.0
+            smax = float(s.max()) if len(s) else 0.0
+            spread = float(smax - smin)
+            if spread <= tol_mw:
+                continue
+            sem = "bcm_capacity" if "bcm_capacity" in c else ("mixed_afrr" if "afrr" in c else "unknown")
+            for _, r in g.iterrows():
+                rows.append(
+                    {
+                        "scenario": scenario_name,
+                        "strategy": strategy,
+                        "bcm_capacity_block_id": block_id,
+                        "timestamp_utc": r.get("timestamp_utc"),
+                        "bcm_capacity_block_hour_index": r.get("bcm_capacity_block_hour_index"),
+                        "column_name": c,
+                        "value": float(pd.to_numeric(pd.Series([r.get(c, 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                        "block_min": smin,
+                        "block_max": smax,
+                        "spread_mw": spread,
+                        "partial_start": part_start,
+                        "partial_end": part_end,
+                        "column_semantics": sem,
+                        "suspected_cause": "intra_block_variation_in_bcm_capacity_column",
+                    }
+                )
+    return pd.DataFrame(rows)
 
 
 def _validate_performance_metrics(
@@ -800,40 +1146,85 @@ def _validate_performance_metrics(
         return checks
 
     daily_error_max = 0.0
-    additive_map = {
-        "realized_net_revenue_eur": "net_revenue_eur",
-        "da_gross_revenue_eur": "da_gross_revenue_eur",
-        "da_gross_cost_eur": "da_gross_cost_eur",
-        "id_gross_revenue_eur": "id_gross_revenue_eur",
-        "id_gross_cost_eur": "id_gross_cost_eur",
-        "bcm_capacity_revenue_eur": "afrr_capacity_revenue_eur",
-        "bem_activation_revenue_eur": "bem_activation_revenue_eur",
-        "realized_degradation_cost_eur": "degradation_cost_eur",
-        "realized_aux_cost_eur": "aux_cost_eur",
-        "transaction_cost_eur": "transaction_cost_eur",
-        "penalty_cost_eur": "penalty_cost_eur",
-        "da_bid_buy_mwh_total": "da_bid_buy_mwh",
-        "da_bid_sell_mwh_total": "da_bid_sell_mwh",
-        "da_realized_buy_mwh_total": "da_realized_buy_mwh",
-        "da_realized_sell_mwh_total": "da_realized_sell_mwh",
-        "bem_bid_pos_mwh_total": "bem_bid_pos_mwh",
-        "bem_bid_neg_mwh_total": "bem_bid_neg_mwh",
-        "bem_realized_pos_mwh_total": "bem_realized_pos_mwh",
-        "bem_realized_neg_mwh_total": "bem_realized_neg_mwh",
-        "id_buy_mwh_total": "id_buy_mwh",
-        "id_sell_mwh_total": "id_sell_mwh",
-        "throughput_mwh_total": "throughput_mwh",
-    }
-    for scenario_col, daily_col in additive_map.items():
-        if daily_col not in daily_df.columns:
+    for spec in _performance_reconciliation_specs():
+        if not bool(spec.get("checked_daily_to_scenario", False)):
+            continue
+        scenario_col = str(spec.get("scenario_col", ""))
+        daily_col = str(spec.get("daily_col", ""))
+        if not scenario_col or not daily_col or daily_col not in daily_df.columns:
             continue
         scen_v = float(pd.to_numeric(pd.Series([perf_row.get(scenario_col, np.nan)]), errors="coerce").iloc[0])
+        if not np.isfinite(scen_v):
+            continue
         day_v = float(pd.to_numeric(daily_df[daily_col], errors="coerce").fillna(0.0).sum())
-        if np.isfinite(scen_v):
-            daily_error_max = max(daily_error_max, abs(scen_v - day_v))
+        if not np.isfinite(day_v):
+            continue
+        daily_error_max = max(daily_error_max, abs(scen_v - day_v))
     checks["daily_to_scenario_reconciliation_ok"] = bool(daily_error_max <= tolerance)
     checks["daily_to_scenario_error_max_abs"] = float(daily_error_max)
     return checks
+
+
+def _build_performance_reconciliation_debug(
+    *,
+    scenario: str,
+    perf_row: pd.Series,
+    daily_df: pd.DataFrame,
+    hourly: pd.DataFrame,
+) -> pd.DataFrame:
+    def _sum_hourly(col: str) -> float:
+        if col not in hourly.columns:
+            return float("nan")
+        return float(pd.to_numeric(hourly[col], errors="coerce").fillna(0.0).sum())
+
+    def _sum_daily(col: str) -> float:
+        if col not in daily_df.columns:
+            return float("nan")
+        return float(pd.to_numeric(daily_df[col], errors="coerce").fillna(0.0).sum())
+
+    rows: list[dict[str, object]] = []
+    for spec in _performance_reconciliation_specs():
+        scen_col = str(spec.get("scenario_col", ""))
+        daily_col = str(spec.get("daily_col", ""))
+        hourly_col = str(spec.get("hourly_col", ""))
+        scen_v = float(pd.to_numeric(pd.Series([perf_row.get(scen_col, np.nan)]), errors="coerce").iloc[0])
+        daily_v = _sum_daily(daily_col)
+        hourly_v = _sum_hourly(hourly_col)
+        daily_err = scen_v - daily_v if np.isfinite(scen_v) and np.isfinite(daily_v) else float("nan")
+        hourly_err = scen_v - hourly_v if np.isfinite(scen_v) and np.isfinite(hourly_v) else float("nan")
+        skipped_reason = ""
+        if not bool(spec.get("checked_daily_to_scenario", False)):
+            skipped_reason = "not_checked_in_daily_to_scenario_reconciliation"
+        elif not daily_col:
+            skipped_reason = "missing_daily_column_mapping"
+        elif daily_col not in daily_df.columns:
+            skipped_reason = "daily_column_not_present"
+        elif not np.isfinite(scen_v):
+            skipped_reason = "scenario_value_non_finite"
+        elif not np.isfinite(daily_v):
+            skipped_reason = "daily_sum_non_finite"
+        rows.append(
+            {
+                "scenario": scenario,
+                "metric": str(spec.get("metric", scen_col)),
+                "scenario_col": scen_col,
+                "daily_col": daily_col,
+                "hourly_col": hourly_col,
+                "scenario_value": scen_v,
+                "daily_sum_value": daily_v,
+                "hourly_sum_value": hourly_v,
+                "scenario_minus_daily": daily_err,
+                "scenario_minus_hourly": hourly_err,
+                "hourly_minus_daily": hourly_v - daily_v if np.isfinite(hourly_v) and np.isfinite(daily_v) else float("nan"),
+                "daily_abs_error": abs(daily_err) if np.isfinite(daily_err) else float("nan"),
+                "hourly_abs_error": abs(hourly_err) if np.isfinite(hourly_err) else float("nan"),
+                "checked_daily_to_scenario": bool(spec.get("checked_daily_to_scenario", False)),
+                "checked_component_to_net": bool(spec.get("checked_component_to_net", False)),
+                "skipped_reason": skipped_reason,
+                "source_note": str(spec.get("source_note", "")),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _resolve_final_soc_policy(
@@ -2321,6 +2712,7 @@ def main() -> None:
     sweep_rows: list[dict[str, object]] = []
     perf_rows_all: list[pd.DataFrame] = []
     daily_perf_rows_all: list[pd.DataFrame] = []
+    perf_recon_debug_rows_all: list[pd.DataFrame] = []
     resolved_id_mode = str(args.id_mode).strip().lower()
     resolved_id_recourse_mode = str(args.id_recourse_mode).strip().lower()
     if (
@@ -2414,6 +2806,7 @@ def main() -> None:
         reserve_commitment_debug_path = scenario_out_dir / "reserve_commitment_debug.csv"
         invalid_headroom_debug_path = scenario_out_dir / "invalid_headroom_debug.csv"
         optimization_failure_debug_path = scenario_out_dir / "optimization_failure_debug.csv"
+        bcm_block_consistency_violations_path = scenario_out_dir / "bcm_block_consistency_violations.csv"
         protected_soc_forensics_path = scenario_out_dir / "protected_soc_forensics.csv"
         optimization_infeasibility_attribution_path = scenario_out_dir / "optimization_infeasibility_attribution.csv"
         afrr_bin_ev_audit_path = scenario_out_dir / "afrr_bid_bin_ev_audit.csv"
@@ -2517,6 +2910,17 @@ def main() -> None:
         # Debug exports for strict-simulation diagnostics / traceability.
         h = outputs.hourly.copy()
         with _phase_watchdog("write_debug_exports"):
+            bcm_ok = float(pd.to_numeric(pd.Series([outputs.summary.get("bcm_block_consistency_check_pass", 1.0)]), errors="coerce").fillna(1.0).iloc[0]) >= 0.5
+            if not bcm_ok:
+                bcm_viol = _build_bcm_block_consistency_violations(
+                    hourly=h,
+                    summary=outputs.summary,
+                    scenario_name=str(scenario_name),
+                    strategy=str(args.trading_strategy),
+                    tol_mw=1e-6,
+                )
+                if not bcm_viol.empty:
+                    bcm_viol.to_csv(bcm_block_consistency_violations_path, index=False)
             reserve_debug_cols = [
                 colmap.timestamp,
                 "reserve_commitment_id",
@@ -3043,15 +3447,42 @@ def main() -> None:
             )
             daily_df = _build_daily_performance_metrics(hourly=outputs.hourly, perf_row=perf_df.iloc[0])
             checks = _validate_performance_metrics(perf_row=perf_df.iloc[0], daily_df=daily_df)
+            recon_debug_df = _build_performance_reconciliation_debug(
+                scenario=str(scenario_name),
+                perf_row=perf_df.iloc[0],
+                daily_df=daily_df,
+                hourly=outputs.hourly,
+            )
+            recon_debug_path = scenario_out_dir / "performance_metric_reconciliation_debug.csv"
+            recon_debug_df.to_csv(recon_debug_path, index=False)
+            perf_recon_debug_rows_all.append(recon_debug_df.assign(scenario_path=str(scenario_out_dir)))
             for k, v in checks.items():
                 perf_df[k] = [v]
             if bool(args.strict_simulation_validity) and not all(
                 bool(checks.get(k, True))
                 for k in ["net_revenue_reconciliation_ok", "cost_reconciliation_ok", "daily_to_scenario_reconciliation_ok"]
             ):
+                top_row = None
+                if not recon_debug_df.empty:
+                    _tmp = recon_debug_df.loc[
+                        pd.to_numeric(recon_debug_df.get("checked_daily_to_scenario", False), errors="coerce").fillna(0.0) >= 0.5
+                    ].copy()
+                    _tmp["daily_abs_error"] = pd.to_numeric(_tmp.get("daily_abs_error", np.nan), errors="coerce")
+                    _tmp = _tmp.loc[_tmp["daily_abs_error"].notna()].sort_values("daily_abs_error", ascending=False)
+                    if len(_tmp) > 0:
+                        top_row = _tmp.iloc[0].to_dict()
                 raise RuntimeError(
                     "Performance metric reconciliation failed in strict mode: "
-                    f"{json.dumps(checks, sort_keys=True)}"
+                    f"{json.dumps(checks, sort_keys=True)}; "
+                    f"scenario={scenario_name}; "
+                    f"offending_metric={'' if top_row is None else top_row.get('metric', '')}; "
+                    f"scenario_col={'' if top_row is None else top_row.get('scenario_col', '')}; "
+                    f"daily_col={'' if top_row is None else top_row.get('daily_col', '')}; "
+                    f"scenario_value={'' if top_row is None else top_row.get('scenario_value', '')}; "
+                    f"daily_sum={'' if top_row is None else top_row.get('daily_sum_value', '')}; "
+                    f"hourly_sum={'' if top_row is None else top_row.get('hourly_sum_value', '')}; "
+                    f"daily_abs_error={'' if top_row is None else top_row.get('daily_abs_error', '')}; "
+                    f"debug_path={recon_debug_path}"
                 )
             perf_df.to_csv(performance_csv_path, index=False)
             performance_json_path.write_text(perf_df.to_json(orient="records", indent=2), encoding="utf-8")
@@ -3382,6 +3813,11 @@ def main() -> None:
         daily_all_csv = out_dir / "daily_performance_metrics_all_scenarios.csv"
         daily_all.to_csv(daily_all_csv, index=False)
         print(f"[OK] Daily performance metrics (all scenarios): {daily_all_csv}")
+    if perf_recon_debug_rows_all:
+        recon_all = pd.concat(perf_recon_debug_rows_all, ignore_index=True, sort=False)
+        recon_all_csv = out_dir / "performance_metric_reconciliation_debug_all.csv"
+        recon_all.to_csv(recon_all_csv, index=False)
+        print(f"[OK] Performance reconciliation debug (all scenarios): {recon_all_csv}")
     _write_performance_metric_definitions(out_dir / "performance_metric_definitions.json")
 
     # Strategy overview across separate runs (multi / da_only / afrr_only).

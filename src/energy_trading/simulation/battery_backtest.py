@@ -224,6 +224,8 @@ SETTLEMENT_NUMERIC_COLS = (
     "submitted_da_sell_price_eur_mwh",
     "submitted_afrr_pos_mw",
     "submitted_afrr_neg_mw",
+    "submitted_bcm_capacity_pos_mw",
+    "submitted_bcm_capacity_neg_mw",
     "desired_bem_only_pos_mw",
     "desired_bem_only_neg_mw",
     "safe_bem_only_pos_mw",
@@ -250,6 +252,8 @@ SETTLEMENT_NUMERIC_COLS = (
     "executed_discharge_mw",
     "executed_reserve_pos_mw",
     "executed_reserve_neg_mw",
+    "executed_bcm_capacity_pos_mw",
+    "executed_bcm_capacity_neg_mw",
     "bem_only_executed_pos_mw",
     "bem_only_executed_neg_mw",
     "bem_only_executed_pos_mwh",
@@ -3573,6 +3577,8 @@ class BatteryBacktester:
             "submitted_da_sell_price_eur_mwh": submitted_da_sell_price,
             "submitted_afrr_pos_mw": float(cap_res.submitted_pos_mw),
             "submitted_afrr_neg_mw": float(cap_res.submitted_neg_mw),
+            "submitted_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
+            "submitted_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
             "afrr_bcm_auction_cleared": float((ob_pos > 0.0) or (ob_neg > 0.0)),
             "fixed_reserve_obligation_pos_mw": float(ob_pos),
             "fixed_reserve_obligation_neg_mw": float(ob_neg),
@@ -3589,6 +3595,8 @@ class BatteryBacktester:
             "executed_discharge_mw": dis_exec,
             "executed_reserve_pos_mw": res_pos_exec,
             "executed_reserve_neg_mw": res_neg_exec,
+            "executed_bcm_capacity_pos_mw": float(res_pos_exec if is_bcm_obligation_hour else 0.0),
+            "executed_bcm_capacity_neg_mw": float(res_neg_exec if is_bcm_obligation_hour else 0.0),
             "settlement_cap_bid_price_pos_eur_mw": float(cap_bid_pos_settlement),
             "settlement_cap_bid_price_neg_eur_mw": float(cap_bid_neg_settlement),
             "executed_rate_pos": rate_pos_exec,
@@ -6367,15 +6375,33 @@ class BatteryBacktester:
                 "violation_max_mw": 0.0,
                 "partial_start": partial_start,
                 "partial_end": partial_end,
+                "checked_columns": "[]",
             }
-        cols = [c for c in ["real_submitted_afrr_pos_mw", "real_submitted_afrr_neg_mw", "real_executed_reserve_pos_mw", "real_executed_reserve_neg_mw"] if c in hourly.columns]
+        preferred_cols = [
+            "real_submitted_bcm_capacity_pos_mw",
+            "real_submitted_bcm_capacity_neg_mw",
+            "real_executed_bcm_capacity_pos_mw",
+            "real_executed_bcm_capacity_neg_mw",
+            "submitted_bcm_capacity_pos_mw",
+            "submitted_bcm_capacity_neg_mw",
+            "executed_bcm_capacity_pos_mw",
+            "executed_bcm_capacity_neg_mw",
+        ]
+        fallback_cols = [
+            "real_executed_reserve_pos_mw",
+            "real_executed_reserve_neg_mw",
+        ]
+        cols = [c for c in preferred_cols if c in hourly.columns]
+        if not cols:
+            cols = [c for c in fallback_cols if c in hourly.columns]
         if not cols:
             return {
-                "pass": 1.0,
-                "violation_count": 0.0,
+                "pass": 0.0 if bcm_enabled else 1.0,
+                "violation_count": 1.0 if bcm_enabled else 0.0,
                 "violation_max_mw": 0.0,
                 "partial_start": partial_start,
                 "partial_end": partial_end,
+                "checked_columns": "[]",
             }
         tmp = pd.concat([hourly.reset_index(drop=True), bi.reset_index(drop=True)], axis=1)
         tmp = tmp.loc[:, ~tmp.columns.duplicated()]
@@ -6394,6 +6420,7 @@ class BatteryBacktester:
             "violation_max_mw": float(violation_max),
             "partial_start": partial_start,
             "partial_end": partial_end,
+            "checked_columns": json.dumps(cols),
         }
 
     def _validate_strategy_isolation_outputs(
@@ -7427,6 +7454,7 @@ class BatteryBacktester:
             "bcm_block_consistency_check_pass": float(bcm_block_consistency["pass"]),
             "bcm_block_consistency_violation_count": float(bcm_block_consistency["violation_count"]),
             "bcm_block_consistency_violation_max_mw": float(bcm_block_consistency["violation_max_mw"]),
+            "bcm_block_consistency_checked_columns": str(bcm_block_consistency.get("checked_columns", "[]")),
             "partial_bcm_block_at_start": float(bcm_block_consistency["partial_start"]),
             "partial_bcm_block_at_end": float(bcm_block_consistency["partial_end"]),
             "strategy": ",".join(sorted({str(m).strip().lower() for m in allowed_markets})),
@@ -8649,6 +8677,7 @@ class BatteryBacktester:
             ("bcm_block_consistency_check_pass", 1.0),
             ("bcm_block_consistency_violation_count", 0.0),
             ("bcm_block_consistency_violation_max_mw", 0.0),
+            ("bcm_block_consistency_checked_columns", "[]"),
             ("partial_bcm_block_at_start", 0.0),
             ("partial_bcm_block_at_end", 0.0),
             ("benchmark_same_rules_gate_consistent", 1.0),

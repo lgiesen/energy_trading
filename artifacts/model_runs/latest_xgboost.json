@@ -1,7 +1,191 @@
 {
   "run_id": "xgb_20260530_151122",
-  "manifest_path": "xgb_20260530_151122/manifest.json",
-  "manifest_path_abs": "xgb_20260530_151122/manifest.json",
-  "updated_at_utc": "2026-05-30T21:39:46.532128+00:00",
-  "model_type": "xgboost"
+  "created_at_utc": "2026-05-30T21:39:46.527584+00:00",
+  "training": {
+    "context_path": "training_run_context.json",
+    "data_integrity_report_path": "data_integrity_report.json",
+    "prediction_output_quality_report_path": "prediction_output_quality_report.json",
+    "model_type": "xgboost",
+    "model_name": "xgboost_v1",
+    "git_commit": "35b770f5096019b4f629babb71f62fc502401823",
+    "hpo_mode": "artifact_map",
+    "hpo_artifacts_by_target": {
+      "target_da_price": "../../hpo/xgb_optuna_da_target_da_price.json",
+      "target_afrr_activation_price_vwap_pos": "../../hpo/xgb_optuna_afrr_target_afrr_activation_price_vwap_pos.json",
+      "target_afrr_activation_price_vwap_neg": "../../hpo/xgb_optuna_afrr_target_afrr_activation_price_vwap_neg.json",
+      "target_afrr_activation_rate_pos": "../../hpo/xgb_optuna_afrr_target_afrr_activation_rate_pos.json",
+      "target_afrr_activation_rate_neg": "../../hpo/xgb_optuna_afrr_target_afrr_activation_rate_neg.json",
+      "target_afrr_capacity_price_pos": "../../hpo/xgb_optuna_afrr_target_afrr_capacity_price_pos.json",
+      "target_afrr_capacity_price_neg": "../../hpo/xgb_optuna_afrr_target_afrr_capacity_price_neg.json"
+    },
+    "hpo_best_params_by_target": {
+      "target_da_price": {
+        "max_depth": 5,
+        "learning_rate": 0.05868933433155559,
+        "subsample": 0.8791076333113237,
+        "colsample_bytree": 0.704892313942555,
+        "min_child_weight": 37.371715132914744,
+        "reg_alpha": 7.795881834630687,
+        "reg_lambda": 12.485169173094128
+      },
+      "target_afrr_activation_price_vwap_pos": {
+        "max_depth": 3,
+        "learning_rate": 0.11732236227536805,
+        "subsample": 0.6518553047208211,
+        "colsample_bytree": 0.9324921342667956,
+        "min_child_weight": 28.658838754501936,
+        "reg_alpha": 2.48738735483582,
+        "reg_lambda": 5.141043553052045
+      },
+      "target_afrr_activation_price_vwap_neg": {
+        "max_depth": 5,
+        "learning_rate": 0.06933194256075136,
+        "subsample": 0.781149383519893,
+        "colsample_bytree": 0.7281562929814338,
+        "min_child_weight": 20.275371561972207,
+        "reg_alpha": 8.616813424906525,
+        "reg_lambda": 15.177500001819311
+      },
+      "target_afrr_activation_rate_pos": {
+        "max_depth": 4,
+        "learning_rate": 0.07276125831102105,
+        "subsample": 0.874363591797931,
+        "colsample_bytree": 0.6488959568893398,
+        "min_child_weight": 25.63577805191206,
+        "reg_alpha": 8.398164821972737,
+        "reg_lambda": 14.280810165905116
+      },
+      "target_afrr_activation_rate_neg": {
+        "max_depth": 5,
+        "learning_rate": 0.034222102115642555,
+        "subsample": 0.8714865051656087,
+        "colsample_bytree": 0.7211563657028119,
+        "min_child_weight": 33.9710525978501,
+        "reg_alpha": 21.54274852892082,
+        "reg_lambda": 9.533659839831751
+      },
+      "target_afrr_capacity_price_pos": {
+        "max_depth": 4,
+        "learning_rate": 0.04937365474285192,
+        "subsample": 0.9570838222784516,
+        "colsample_bytree": 0.8980758870160722,
+        "min_child_weight": 21.53543451716412,
+        "reg_alpha": 5.441908961126886,
+        "reg_lambda": 21.875256584656917
+      },
+      "target_afrr_capacity_price_neg": {
+        "max_depth": 6,
+        "learning_rate": 0.042564552174878166,
+        "subsample": 0.8991090508590257,
+        "colsample_bytree": 0.8940167025267748,
+        "min_child_weight": 34.31738637810735,
+        "reg_alpha": 10.782046296473936,
+        "reg_lambda": 78.92081332930798
+      }
+    },
+    "hpo_selection_metric_by_target": {
+      "target_da_price": "pinball_mean",
+      "target_afrr_activation_price_vwap_pos": "pinball_mean",
+      "target_afrr_activation_price_vwap_neg": "pinball_mean",
+      "target_afrr_activation_rate_pos": "pinball_mean",
+      "target_afrr_activation_rate_neg": "pinball_mean",
+      "target_afrr_capacity_price_pos": "pinball_mean",
+      "target_afrr_capacity_price_neg": "pinball_mean"
+    }
+  },
+  "bundles": {
+    "afrr": {
+      "model_paths": [
+        "models/xgboost_afrr_afrr_activation_price_vwap_pos_model.joblib",
+        "models/xgboost_afrr_afrr_activation_price_vwap_neg_model.joblib",
+        "models/xgboost_afrr_afrr_activation_rate_pos_model.joblib",
+        "models/xgboost_afrr_afrr_activation_rate_neg_model.joblib",
+        "models/xgboost_afrr_afrr_capacity_price_pos_model.joblib",
+        "models/xgboost_afrr_afrr_capacity_price_neg_model.joblib"
+      ],
+      "metrics_paths": [
+        "metrics/xgboost_afrr_afrr_activation_price_vwap_pos_metrics.json",
+        "metrics/xgboost_afrr_afrr_activation_price_vwap_neg_metrics.json",
+        "metrics/xgboost_afrr_afrr_activation_rate_pos_metrics.json",
+        "metrics/xgboost_afrr_afrr_activation_rate_neg_metrics.json",
+        "metrics/xgboost_afrr_afrr_capacity_price_pos_metrics.json",
+        "metrics/xgboost_afrr_afrr_capacity_price_neg_metrics.json"
+      ],
+      "predictions": {
+        "val": "predictions/afrr_val.parquet",
+        "test": "predictions/afrr_test.parquet"
+      },
+      "predictions_long": {
+        "val": {
+          "pred_afrr_activation_price_pos": "predictions/xgboost_afrr_afrr_activation_price_vwap_pos_val_pred_afrr_activation_price_pos_long.parquet",
+          "pred_afrr_activation_price_neg": "predictions/xgboost_afrr_afrr_activation_price_vwap_neg_val_pred_afrr_activation_price_neg_long.parquet",
+          "pred_afrr_activation_rate_pos": "predictions/xgboost_afrr_afrr_activation_rate_pos_val_pred_afrr_activation_rate_pos_long.parquet",
+          "pred_afrr_activation_rate_neg": "predictions/xgboost_afrr_afrr_activation_rate_neg_val_pred_afrr_activation_rate_neg_long.parquet",
+          "pred_afrr_capacity_price_pos": "predictions/xgboost_afrr_afrr_capacity_price_pos_val_pred_afrr_capacity_price_pos_long.parquet",
+          "pred_afrr_capacity_price_neg": "predictions/xgboost_afrr_afrr_capacity_price_neg_val_pred_afrr_capacity_price_neg_long.parquet"
+        },
+        "test": {
+          "pred_afrr_activation_price_pos": "predictions/xgboost_afrr_afrr_activation_price_vwap_pos_test_pred_afrr_activation_price_pos_long.parquet",
+          "pred_afrr_activation_price_neg": "predictions/xgboost_afrr_afrr_activation_price_vwap_neg_test_pred_afrr_activation_price_neg_long.parquet",
+          "pred_afrr_activation_rate_pos": "predictions/xgboost_afrr_afrr_activation_rate_pos_test_pred_afrr_activation_rate_pos_long.parquet",
+          "pred_afrr_activation_rate_neg": "predictions/xgboost_afrr_afrr_activation_rate_neg_test_pred_afrr_activation_rate_neg_long.parquet",
+          "pred_afrr_capacity_price_pos": "predictions/xgboost_afrr_afrr_capacity_price_pos_test_pred_afrr_capacity_price_pos_long.parquet",
+          "pred_afrr_capacity_price_neg": "predictions/xgboost_afrr_afrr_capacity_price_neg_test_pred_afrr_capacity_price_neg_long.parquet"
+        }
+      },
+      "prediction_columns": [
+        "pred_afrr_capacity_price_pos",
+        "pred_afrr_capacity_price_neg",
+        "pred_afrr_activation_price_pos",
+        "pred_afrr_activation_price_neg",
+        "pred_afrr_activation_rate_pos",
+        "pred_afrr_activation_rate_neg"
+      ],
+      "target_columns": [
+        "target_afrr_activation_price_vwap_pos",
+        "target_afrr_activation_price_vwap_neg",
+        "target_afrr_activation_rate_pos",
+        "target_afrr_activation_rate_neg",
+        "target_afrr_capacity_price_pos",
+        "target_afrr_capacity_price_neg"
+      ]
+    },
+    "da": {
+      "model_path": "models/xgboost_da_model.joblib",
+      "metrics_path": "metrics/xgboost_da_metrics.json",
+      "predictions": {
+        "val": "predictions/xgboost_da_val.parquet",
+        "test": "predictions/xgboost_da_test.parquet"
+      },
+      "predictions_long": {
+        "val": {
+          "pred_da_price": "predictions/xgboost_da_val_pred_da_price_long.parquet"
+        },
+        "test": {
+          "pred_da_price": "predictions/xgboost_da_test_pred_da_price_long.parquet"
+        }
+      },
+      "prediction_columns": [
+        "pred_da_price"
+      ],
+      "target_columns": [
+        "target_da_price"
+      ]
+    }
+  },
+  "ground_truth": {
+    "default_path": "../../../data/features/all_data_features.parquet"
+  },
+  "simulation": {
+    "default_split": "test",
+    "canonical_economic_targets": [
+      "pred_afrr_activation_price_neg"
+    ],
+    "transformed_targets": [
+      "pred_afrr_activation_price_neg"
+    ]
+  },
+  "target_value_mode": {
+    "pred_afrr_activation_price_neg": "canonical_economic"
+  }
 }
