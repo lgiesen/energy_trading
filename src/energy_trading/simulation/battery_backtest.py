@@ -20,7 +20,7 @@ Programmatic usage:
         use_rolling_horizon=True,
         horizon_hours=48,
         reopt_step_hours=1,
-        da_gate_hour_cet=11,
+        da_bid_hour_local=11,
         soc_feedback_mode="realized",
     )
 """
@@ -117,7 +117,7 @@ class DecisionAvailability:
     can_submit_new_bcm: bool
     can_submit_new_bem: bool
     can_use_id_recourse: bool
-    da_gate_hour_local: int
+    da_bid_hour_local: int
     bcm_bid_hour_local: int
 
 
@@ -615,9 +615,14 @@ class BatteryBacktester:
         self.final_soc_mode = str(MODEL_SPECS.get("final_soc_mode", "terminal_repair")).strip().lower()
         if self.final_soc_mode not in {"terminal_repair", "hard"}:
             self.final_soc_mode = "terminal_repair"
-        # Single source of truth for aFRR BCM gate hour (CET/CEST local clock).
-        # The perfect_foresight branch must use the same gate hour.
-        self.afrr_bcm_gate_hour_cet = int(MODEL_SPECS.get("afrr_bcm_gate_hour_cet", 8))
+        # Single source of truth for aFRR BCM bid submission hour (CET/CEST local clock).
+        # The perfect_foresight branch must use the same local submission hour.
+        self.afrr_bcm_bid_hour_local = int(
+            MODEL_SPECS.get(
+                "afrr_bcm_bid_hour_local",
+                MODEL_SPECS.get("afrr_bcm_gate_hour_cet", 8),
+            )
+        )
         self.da_bid_granularity_mw = float(MARKET_SPECS.get("da_bid_granularity", 0.1))
         self.afrr_bid_granularity_mw = float(MARKET_SPECS.get("afrr_bid_granularity", 1.0))
         # Backward-compatible alias used by some helper paths.
@@ -833,7 +838,7 @@ class BatteryBacktester:
         decision_timestamp_utc: pd.Timestamp | None,
         permissions: StrategyPermissions,
         fast_gated_decisions: bool,
-        da_gate_hour_local: int = 11,
+        da_bid_hour_local: int = 11,
         bcm_bid_hour_local: int = 8,
     ) -> DecisionAvailability:
         ts = pd.to_datetime(decision_timestamp_utc, utc=True, errors="coerce")
@@ -851,7 +856,7 @@ class BatteryBacktester:
                 can_submit_new_bcm=bool(permissions.allow_bcm),
                 can_submit_new_bem=bool(permissions.allow_bem_only),
                 can_use_id_recourse=bool(permissions.allow_id),
-                da_gate_hour_local=int(da_gate_hour_local),
+                da_bid_hour_local=int(da_bid_hour_local),
                 bcm_bid_hour_local=int(bcm_bid_hour_local),
             )
         return DecisionAvailability(
@@ -859,12 +864,12 @@ class BatteryBacktester:
             decision_timestamp_utc=ts,
             decision_timestamp_local=ts_local,
             can_submit_new_da=bool(permissions.allow_da)
-            and cls._local_hour_matches(ts, int(da_gate_hour_local)),
+            and cls._local_hour_matches(ts, int(da_bid_hour_local)),
             can_submit_new_bcm=bool(permissions.allow_bcm)
             and cls._local_hour_matches(ts, int(bcm_bid_hour_local)),
             can_submit_new_bem=bool(permissions.allow_bem_only),
             can_use_id_recourse=bool(permissions.allow_id),
-            da_gate_hour_local=int(da_gate_hour_local),
+            da_bid_hour_local=int(da_bid_hour_local),
             bcm_bid_hour_local=int(bcm_bid_hour_local),
         )
 
@@ -1321,8 +1326,8 @@ class BatteryBacktester:
                 can_submit_new_bcm=bool(perms.allow_bcm),
                 can_submit_new_bem=bool(perms.allow_bem_only),
                 can_use_id_recourse=bool(perms.allow_id),
-                da_gate_hour_local=11,
-                bcm_bid_hour_local=int(self.afrr_bcm_gate_hour_cet),
+                da_bid_hour_local=11,
+                bcm_bid_hour_local=int(self.afrr_bcm_bid_hour_local),
             )
 
         p_da = self._finite_numeric_series(
@@ -2413,7 +2418,7 @@ class BatteryBacktester:
             "can_submit_new_bcm": np.full(n, float(bool(decision_availability.can_submit_new_bcm)), dtype=float),
             "can_submit_new_bem": np.full(n, float(bool(decision_availability.can_submit_new_bem)), dtype=float),
             "can_use_id_recourse": np.full(n, float(bool(decision_availability.can_use_id_recourse)), dtype=float),
-            "da_gate_hour_local": np.full(n, float(decision_availability.da_gate_hour_local), dtype=float),
+            "da_bid_hour_local": np.full(n, float(decision_availability.da_bid_hour_local), dtype=float),
             "bcm_bid_hour_local": np.full(n, float(decision_availability.bcm_bid_hour_local), dtype=float),
             "da_ev_skipped_outside_gate": da_gate_fixed_mask.astype(float),
             "bcm_ev_skipped_outside_gate": bcm_gate_fixed_mask.astype(float),
@@ -3753,7 +3758,7 @@ class BatteryBacktester:
         }
 
     @staticmethod
-    def _is_gate_hour_cet(ts_utc: pd.Timestamp, hour_cet: int) -> bool:
+    def _is_local_bid_hour(ts_utc: pd.Timestamp, hour_cet: int) -> bool:
         if pd.isna(ts_utc):
             return False
         ts_cet = ts_utc.tz_convert("Europe/Berlin")
@@ -3778,8 +3783,8 @@ class BatteryBacktester:
             lock_source_snapshot_utc = {}
         # aFRR BCM (balancing capacity market) gate closure:
         # single configured gate hour for both realized/model and benchmark paths.
-        afrr_bcm_gate_hour_cet = int(self.afrr_bcm_gate_hour_cet)
-        if not self._is_gate_hour_cet(snapshot_ts, afrr_bcm_gate_hour_cet):
+        afrr_bcm_bid_hour_local = int(self.afrr_bcm_bid_hour_local)
+        if not self._is_local_bid_hour(snapshot_ts, afrr_bcm_bid_hour_local):
             return {"triggered": 0.0, "rejected_mw_total": 0.0}
         if snapshot_plan.empty:
             return {"triggered": 0.0, "rejected_mw_total": 0.0}
@@ -4417,7 +4422,7 @@ class BatteryBacktester:
         horizon_hours: int = 48,
         reopt_step_hours: int = 1,
         forecast_warehouse: dict[str, pd.DataFrame] | None = None,
-        da_gate_hour_cet: int = 11,
+        da_bid_hour_local: int = 11,
         soc_feedback_mode: str = "realized",
         enforce_final_soc_min: bool = True,
         deterministic_reserve_settlement: bool = False,
@@ -4428,7 +4433,7 @@ class BatteryBacktester:
         id_recourse_mode: str = "common",
         run_mode: str = "advanced_ml",
         strict_simulation_validity: bool = True,
-        fast_gated_decisions: bool = False,
+        fast_gated_decisions: bool = True,
         bcm_bid_hour_local: int | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Rolling-horizon LP (re-optimized repeatedly with SoC state carryover)."""
@@ -4447,8 +4452,8 @@ class BatteryBacktester:
         self._strategy_permissions = perms
         da_enabled = bool(perms.allow_da)
         afrr_enabled = bool(perms.allow_bcm or perms.allow_bem_only)
-        bcm_bid_hour_effective = int(self.afrr_bcm_gate_hour_cet if bcm_bid_hour_local is None else bcm_bid_hour_local)
-        self.afrr_bcm_gate_hour_cet = int(bcm_bid_hour_effective)
+        bcm_bid_hour_effective = int(self.afrr_bcm_bid_hour_local if bcm_bid_hour_local is None else bcm_bid_hour_local)
+        self.afrr_bcm_bid_hour_local = int(bcm_bid_hour_effective)
         if df.empty:
             empty_dispatch = pd.DataFrame(
                 columns=[
@@ -4939,7 +4944,7 @@ class BatteryBacktester:
                 decision_timestamp_utc=snapshot_current_ts,
                 permissions=perms,
                 fast_gated_decisions=bool(fast_gated_decisions),
-                da_gate_hour_local=int(da_gate_hour_cet),
+                da_bid_hour_local=int(da_bid_hour_local),
                 bcm_bid_hour_local=int(bcm_bid_hour_effective),
             )
             retry_ladder = [1.0]
@@ -5182,11 +5187,11 @@ class BatteryBacktester:
                 reserve_retry_infeasible_after_zero_reserve
             )
             snapshot_ts_current = pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True, errors="coerce")
-            afrr_bcm_gate_hour_cet = int(self.afrr_bcm_gate_hour_cet)
+            afrr_bcm_bid_hour_local = int(self.afrr_bcm_bid_hour_local)
             is_afrr_gate_now = bool(
-                perms.allow_bcm and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, afrr_bcm_gate_hour_cet)
+                perms.allow_bcm and pd.notna(snapshot_ts_current) and self._is_local_bid_hour(snapshot_ts_current, afrr_bcm_bid_hour_local)
             )
-            is_da_gate_now = bool(da_enabled and pd.notna(snapshot_ts_current) and self._is_gate_hour_cet(snapshot_ts_current, da_gate_hour_cet))
+            is_da_gate_now = bool(da_enabled and pd.notna(snapshot_ts_current) and self._is_local_bid_hour(snapshot_ts_current, da_bid_hour_local))
             if is_afrr_gate_now and is_da_gate_now:
                 snapshot_plan["milp_event_type"] = "afrr_bcm_auction+da_auction"
             elif is_afrr_gate_now:
@@ -5244,7 +5249,7 @@ class BatteryBacktester:
                 continue
 
             # Lock-in DA bids at gate closure for next UTC day (24 hours).
-            if da_enabled and pd.notna(snapshot_plan["snapshot_time_utc"].iloc[0]) and self._is_gate_hour_cet(pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True), da_gate_hour_cet):
+            if da_enabled and pd.notna(snapshot_plan["snapshot_time_utc"].iloc[0]) and self._is_local_bid_hour(pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True), da_bid_hour_local):
                 snapshot_ts_effective = pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True)
                 next_day = (snapshot_ts_effective + pd.Timedelta(days=1)).normalize()
                 day_end = next_day + pd.Timedelta(hours=23)
@@ -6678,7 +6683,7 @@ class BatteryBacktester:
         horizon_hours: int = 48,
         reopt_step_hours: int = 1,
         forecast_warehouse: dict[str, pd.DataFrame] | None = None,
-        da_gate_hour_cet: int = 11,
+        da_bid_hour_local: int = 11,
         soc_feedback_mode: str = "realized",
         enforce_final_soc_min: bool = True,
         allowed_markets: list[str] | tuple[str, ...] | set[str] = ("DA", "aFRR"),
@@ -6687,7 +6692,7 @@ class BatteryBacktester:
         id_recourse_mode: str = "common",
         strict_simulation_validity: bool = True,
         enable_global_perfect_foresight: bool = False,
-        fast_gated_decisions: bool = False,
+        fast_gated_decisions: bool = True,
         bcm_bid_hour_local: int | None = None,
     ) -> BacktestOutputs:
         """Run optimization + predicted settlement + realized settlement."""
@@ -6719,7 +6724,7 @@ class BatteryBacktester:
                         colmap,
                         horizon_hours=horizon_hours,
                         reopt_step_hours=reopt_step_hours,
-                        da_gate_hour_cet=da_gate_hour_cet,
+                        da_bid_hour_local=da_bid_hour_local,
                         soc_feedback_mode=soc_feedback_mode,
                         enforce_final_soc_min=enforce_final_soc_min,
                         deterministic_reserve_settlement=deterministic_local,
@@ -6833,7 +6838,7 @@ class BatteryBacktester:
                 horizon_hours=horizon_hours,
                 reopt_step_hours=reopt_step_hours,
                 forecast_warehouse=forecast_warehouse,
-                da_gate_hour_cet=da_gate_hour_cet,
+                da_bid_hour_local=da_bid_hour_local,
                 soc_feedback_mode=soc_feedback_mode,
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
@@ -6897,7 +6902,7 @@ class BatteryBacktester:
                 colmap,
                 horizon_hours=horizon_hours,
                 reopt_step_hours=reopt_step_hours,
-                da_gate_hour_cet=da_gate_hour_cet,
+                da_bid_hour_local=da_bid_hour_local,
                 soc_feedback_mode=soc_feedback_mode,
                 enforce_final_soc_min=enforce_final_soc_min,
                 deterministic_reserve_settlement=False,
@@ -6974,7 +6979,7 @@ class BatteryBacktester:
                     colmap,
                     horizon_hours=horizon_hours,
                     reopt_step_hours=reopt_step_hours,
-                    da_gate_hour_cet=da_gate_hour_cet,
+                    da_bid_hour_local=da_bid_hour_local,
                     soc_feedback_mode=soc_feedback_mode,
                     enforce_final_soc_min=enforce_final_soc_min,
                     deterministic_reserve_settlement=True,
@@ -7029,7 +7034,7 @@ class BatteryBacktester:
                     colmap,
                     horizon_hours=horizon_hours,
                     reopt_step_hours=reopt_step_hours,
-                    da_gate_hour_cet=da_gate_hour_cet,
+                    da_bid_hour_local=da_bid_hour_local,
                     soc_feedback_mode=soc_feedback_mode,
                     enforce_final_soc_min=enforce_final_soc_min,
                     deterministic_reserve_settlement=False,
@@ -7611,20 +7616,39 @@ class BatteryBacktester:
             "partial_bcm_block_at_start": float(bcm_block_consistency["partial_start"]),
             "partial_bcm_block_at_end": float(bcm_block_consistency["partial_end"]),
             "fast_gated_decisions_enabled": float(bool(fast_gated_decisions)),
-            "da_gate_hour_local": float(int(da_gate_hour_cet)),
-            "bcm_bid_hour_local": float(int(self.afrr_bcm_gate_hour_cet if bcm_bid_hour_local is None else bcm_bid_hour_local)),
+            "da_bid_hour_local": float(int(da_bid_hour_local)),
+            "da_gate_hour_local": float(int(da_bid_hour_local)),
+            "bcm_bid_hour_local": float(int(self.afrr_bcm_bid_hour_local if bcm_bid_hour_local is None else bcm_bid_hour_local)),
             "da_new_bid_fixed_by_gate_count": float(
-                pd.to_numeric(hourly.get("real_da_new_bid_fixed_by_gate", hourly.get("da_new_bid_fixed_by_gate", 0.0)), errors="coerce").fillna(0.0).sum()
+                pd.to_numeric(
+                    hourly.get(
+                        "real_da_new_bid_fixed_by_gate",
+                        hourly.get("da_new_bid_fixed_by_gate", pd.Series(0.0, index=hourly.index)),
+                    ),
+                    errors="coerce",
+                ).fillna(0.0).sum()
                 if len(hourly)
                 else 0.0
             ),
             "bcm_new_bid_fixed_by_gate_count": float(
-                pd.to_numeric(hourly.get("real_bcm_new_bid_fixed_by_gate", hourly.get("bcm_new_bid_fixed_by_gate", 0.0)), errors="coerce").fillna(0.0).sum()
+                pd.to_numeric(
+                    hourly.get(
+                        "real_bcm_new_bid_fixed_by_gate",
+                        hourly.get("bcm_new_bid_fixed_by_gate", pd.Series(0.0, index=hourly.index)),
+                    ),
+                    errors="coerce",
+                ).fillna(0.0).sum()
                 if len(hourly)
                 else 0.0
             ),
             "bem_new_bid_fixed_by_gate_count": float(
-                pd.to_numeric(hourly.get("real_bem_new_bid_fixed_by_gate", hourly.get("bem_new_bid_fixed_by_gate", 0.0)), errors="coerce").fillna(0.0).sum()
+                pd.to_numeric(
+                    hourly.get(
+                        "real_bem_new_bid_fixed_by_gate",
+                        hourly.get("bem_new_bid_fixed_by_gate", pd.Series(0.0, index=hourly.index)),
+                    ),
+                    errors="coerce",
+                ).fillna(0.0).sum()
                 if len(hourly)
                 else 0.0
             ),
@@ -8788,8 +8812,10 @@ class BatteryBacktester:
             summary["reserve_retry_succeeded"] = 0.0
             summary["new_reserve_bids_zeroed_by_retry"] = 0.0
             summary["reserve_retry_infeasible_after_zero_reserve"] = 0.0
-        summary["afrr_bcm_gate_hour_cet_model"] = float(self.afrr_bcm_gate_hour_cet)
-        summary["afrr_bcm_gate_hour_cet_benchmark"] = float(self.afrr_bcm_gate_hour_cet)
+        summary["afrr_bcm_bid_hour_local_model"] = float(self.afrr_bcm_bid_hour_local)
+        summary["afrr_bcm_bid_hour_local_benchmark"] = float(self.afrr_bcm_bid_hour_local)
+        summary["afrr_bcm_gate_hour_cet_model"] = float(self.afrr_bcm_bid_hour_local)
+        summary["afrr_bcm_gate_hour_cet_benchmark"] = float(self.afrr_bcm_bid_hour_local)
         summary["benchmark_same_rules_gate_consistent"] = 1.0
         summary["fallback_is_repair_optimization"] = 0.0
         for k, v in [
@@ -8840,6 +8866,8 @@ class BatteryBacktester:
             ("disable_new_bcm_reserve_bids", 0.0),
             ("new_reserve_bids_zeroed_by_retry", 0.0),
             ("reserve_retry_infeasible_after_zero_reserve", 0.0),
+            ("afrr_bcm_bid_hour_local_model", 8.0),
+            ("afrr_bcm_bid_hour_local_benchmark", 8.0),
             ("afrr_bcm_gate_hour_cet_model", 8.0),
             ("afrr_bcm_gate_hour_cet_benchmark", 8.0),
             ("bcm_block_constraint_enabled", 0.0),

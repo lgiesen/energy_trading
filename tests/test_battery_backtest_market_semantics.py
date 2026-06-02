@@ -131,7 +131,7 @@ def test_fast_gated_decision_availability_keeps_bem_hourly() -> None:
         decision_timestamp_utc=pd.Timestamp("2026-01-01T09:00:00Z"),  # 10:00 Europe/Berlin
         permissions=perms,
         fast_gated_decisions=True,
-        da_gate_hour_local=11,
+        da_bid_hour_local=11,
         bcm_bid_hour_local=8,
     )
     assert avail.fast_gated_decisions_enabled
@@ -150,14 +150,14 @@ def test_fast_gated_decision_availability_allows_da_and_bcm_at_local_gates() -> 
         decision_timestamp_utc=pd.Timestamp("2026-01-01T10:00:00Z"),  # 11:00 Europe/Berlin
         permissions=perms,
         fast_gated_decisions=True,
-        da_gate_hour_local=11,
+        da_bid_hour_local=11,
         bcm_bid_hour_local=8,
     )
     bcm_avail = BatteryBacktester.decision_availability_for_strategy(
         decision_timestamp_utc=pd.Timestamp("2026-01-01T07:00:00Z"),  # 08:00 Europe/Berlin
         permissions=perms,
         fast_gated_decisions=True,
-        da_gate_hour_local=11,
+        da_bid_hour_local=11,
         bcm_bid_hour_local=8,
     )
     assert da_avail.can_submit_new_da
@@ -178,7 +178,7 @@ def test_fast_gate_blocks_new_da_but_preserves_fixed_da_lockbook() -> None:
         can_submit_new_bcm=True,
         can_submit_new_bem=True,
         can_use_id_recourse=True,
-        da_gate_hour_local=11,
+        da_bid_hour_local=11,
         bcm_bid_hour_local=8,
     )
     out = bt.optimize_dispatch(
@@ -209,7 +209,7 @@ def test_fast_gate_blocks_new_bcm_but_preserves_fixed_reserve_lockbook() -> None
         can_submit_new_bcm=False,
         can_submit_new_bem=True,
         can_use_id_recourse=True,
-        da_gate_hour_local=11,
+        da_bid_hour_local=11,
         bcm_bid_hour_local=8,
     )
     out = bt.optimize_dispatch(
@@ -2626,8 +2626,8 @@ def test_summary_never_omits_required_validity_fields() -> None:
         "precommit_safe_pos_mw_avg",
         "precommit_safe_neg_mw_avg",
         "fallback_is_repair_optimization",
-        "afrr_bcm_gate_hour_cet_model",
-        "afrr_bcm_gate_hour_cet_benchmark",
+        "afrr_bcm_bid_hour_local_model",
+        "afrr_bcm_bid_hour_local_benchmark",
         "benchmark_same_rules_gate_consistent",
         "benchmark_is_global_upper_bound",
         "final_soc_handling_mode",
@@ -3094,8 +3094,8 @@ def test_same_rules_benchmark_uses_same_bcm_gate() -> None:
     bt = _mk_backtester()
     df, col = _tiny_backtest_df(hours=10)
     out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
-    assert float(out.summary.get("afrr_bcm_gate_hour_cet_model", -1.0)) == float(
-        out.summary.get("afrr_bcm_gate_hour_cet_benchmark", -2.0)
+    assert float(out.summary.get("afrr_bcm_bid_hour_local_model", -1.0)) == float(
+        out.summary.get("afrr_bcm_bid_hour_local_benchmark", -2.0)
     )
     assert float(out.summary.get("benchmark_same_rules_gate_consistent", 0.0)) == 1.0
 
@@ -4597,7 +4597,7 @@ def _perf_args() -> argparse.Namespace:
 
 def test_daily_to_scenario_reconciliation_uses_hourly_real_pnl() -> None:
     ts = pd.date_range("2026-01-01T00:00:00Z", periods=24, freq="h")
-    hourly = pd.DataFrame({"timestamp_utc": ts, "real_pnl_eur": [10.0] * 24})
+    hourly = pd.DataFrame({"timestamp_utc": ts, "real_pnl_eur": [10.0] * 24, "real_throughput_mwh": [0.0] * 24})
     summary = {
         "realized_total_pnl_eur": 9999.0,  # intentionally wrong; hourly must be source-of-truth
         "predicted_total_pnl_eur": 0.0,
@@ -4637,6 +4637,7 @@ def test_component_to_net_reconciliation_passes_for_consistent_hourly_components
             "real_transaction_cost_eur": [0.0],
             "real_offer_cost_eur": [0.0],
             "real_pnl_eur": [119.0],
+            "real_throughput_mwh": [0.0],
         }
     )
     summary = {"realized_total_pnl_eur": 0.0, "predicted_total_pnl_eur": 0.0, "p_max_mw": 10.0, "capacity_mwh": 20.0}
@@ -4749,6 +4750,7 @@ def test_daily_metrics_include_component_pnl_columns() -> None:
             "real_bem_only_activation_revenue_eur": [6.0],
             "real_offer_cost_eur": [2.0],
             "real_pnl_eur": [101.0],
+            "real_throughput_mwh": [0.0],
         }
     )
     perf_row = pd.Series({"simulation_valid": 1.0, "thesis_reportable": 1.0, "invalid_reason": ""})

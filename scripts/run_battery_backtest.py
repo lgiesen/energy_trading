@@ -2527,24 +2527,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--horizon-hours", type=int, default=48, help="Rolling-horizon window length in hours.")
     p.add_argument("--reopt-step-hours", type=int, default=1, help="Re-optimization step in hours.")
     p.add_argument(
+        "--da-bid-hour-local",
         "--da-gate-hour-cet",
+        dest="da_bid_hour_local",
         type=int,
         default=11,
-        help="Day-Ahead gate-closure hour in Europe/Berlin local time used for locking next-day DA bids (default: 11).",
+        help="Day-Ahead bid submission hour in Europe/Berlin local time used for locking next-day DA bids (default: 11).",
     )
     p.add_argument(
         "--bcm-bid-hour-local",
         type=int,
         default=8,
-        help="aFRR BCM bid/gate hour in Europe/Berlin local time for D+1 capacity products (default: 8).",
+        help="aFRR BCM bid submission hour in Europe/Berlin local time for D+1 capacity products (default: 8).",
     )
     p.add_argument(
         "--fast-gated-decisions",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "If enabled, keep hourly rolling reoptimization for BEM/SoC feedback but only allow new DA bids "
-            "at --da-gate-hour-cet and new BCM bids at --bcm-bid-hour-local. Existing lockbooks still settle."
+            "at --da-bid-hour-local and new BCM bids at --bcm-bid-hour-local. Existing lockbooks still settle."
         ),
     )
     p.add_argument(
@@ -2972,6 +2974,7 @@ def main() -> None:
     if MODEL_SPECS["max_reserve_bid_mw"] is not None and float(MODEL_SPECS["max_reserve_bid_mw"]) < 0.0:
         raise ValueError("--max-reserve-bid-mw must be >= 0.")
     MODEL_SPECS["disable_new_bcm_reserve_bids"] = bool(args.disable_new_bcm_reserve_bids)
+    MODEL_SPECS["afrr_bcm_bid_hour_local"] = int(args.bcm_bid_hour_local)
     MODEL_SPECS["afrr_bcm_gate_hour_cet"] = int(args.bcm_bid_hour_local)
     MODEL_SPECS["bem_only_headroom_safety_mwh"] = float(args.bem_only_headroom_safety_mwh)
     if float(MODEL_SPECS["bem_only_headroom_safety_mwh"]) < 0.0:
@@ -3058,7 +3061,7 @@ def main() -> None:
                 horizon_hours=args.horizon_hours,
                 reopt_step_hours=args.reopt_step_hours,
                 forecast_warehouse=scenario_warehouse,
-                da_gate_hour_cet=args.da_gate_hour_cet if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
+                da_bid_hour_local=args.da_bid_hour_local if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
                 soc_feedback_mode=args.soc_feedback_mode,
                 enforce_final_soc_min=enforce_final_soc_min,
                 allowed_markets=allowed_markets,
