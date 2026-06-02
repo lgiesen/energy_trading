@@ -3047,6 +3047,12 @@ def main() -> None:
             simulation_schema_version=simulation_schema_version,
         )
         backtester._soc_mass_balance_debug_path = scenario_out_dir / "backtest_soc_mass_balance_debug.csv"
+        backtester._hard_final_soc_debug_path = scenario_out_dir / "hard_final_soc_infeasibility_debug.csv"
+        backtester._hard_final_soc_debug_context = {
+            "scenario": str(scenario_name),
+            "model": str(args.model_key),
+            "strategy": str(args.trading_strategy),
+        }
 
         with _phase_watchdog("backtester_run"):
             outputs = backtester.run(

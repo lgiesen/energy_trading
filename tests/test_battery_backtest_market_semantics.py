@@ -3335,6 +3335,45 @@ def test_hard_mode_final_soc_slack_not_used() -> None:
     assert float(out.summary.get("final_soc_slack_used_mwh", 0.0)) <= 1e-9
 
 
+def test_rolling_final_soc_target_only_applies_at_global_end() -> None:
+    assert BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=True,
+        window_end=12,
+        total_rows=24,
+        soc_min=2.0,
+        soc_target_end=10.0,
+    ) == pytest.approx(2.0)
+    assert BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=True,
+        window_end=24,
+        total_rows=24,
+        soc_min=2.0,
+        soc_target_end=10.0,
+    ) == pytest.approx(10.0)
+    assert BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=False,
+        window_end=24,
+        total_rows=24,
+        soc_min=2.0,
+        soc_target_end=10.0,
+    ) is None
+
+
+def test_hard_final_soc_false_infeasible_classification_when_safe_hold_feasible() -> None:
+    assert BatteryBacktester._classify_hard_final_soc_infeasibility(
+        current_soc_mwh=13.6,
+        final_soc_target_mwh=10.0,
+        rolling_window_contains_global_end=True,
+        safe_hold_feasible=True,
+    ) == "hard_final_soc_false_infeasible"
+    assert BatteryBacktester._classify_hard_final_soc_infeasibility(
+        current_soc_mwh=9.36,
+        final_soc_target_mwh=10.0,
+        rolling_window_contains_global_end=True,
+        safe_hold_feasible=False,
+    ) == "terminal_soc_conflict"
+
+
 def test_hard_mode_reaches_target_when_feasible() -> None:
     bt = _mk_backtester()
     bt.final_soc_mode = "hard"

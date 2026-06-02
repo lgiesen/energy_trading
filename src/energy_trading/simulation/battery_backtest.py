@@ -683,6 +683,9 @@ class BatteryBacktester:
         self._infeasible_debug_dumps: list[dict[str, str]] = []
         self._soc_mass_balance_debug = pd.DataFrame()
         self._soc_mass_balance_debug_path: Path | None = None
+        self._hard_final_soc_debug_path: Path | None = None
+        self._hard_final_soc_debug_rows: list[dict[str, object]] = []
+        self._hard_final_soc_debug_context: dict[str, str] = {}
         self._runtime_profile: dict[str, float] = {}
         self._strategy_permissions = StrategyPermissions(
             allow_da=True,
@@ -1217,6 +1220,37 @@ class BatteryBacktester:
             if pd.notna(val):
                 qmap[q / 100.0] = float(val)
         return qmap
+
+    @staticmethod
+    def _rolling_final_soc_min_target(
+        *,
+        enforce_final_soc_min: bool,
+        window_end: int,
+        total_rows: int,
+        soc_min: float,
+        soc_target_end: float,
+    ) -> float | None:
+        """Return the SoC lower bound for the local rolling window end."""
+        if not bool(enforce_final_soc_min):
+            return None
+        return float(soc_target_end) if int(window_end) == int(total_rows) else float(soc_min)
+
+    @staticmethod
+    def _classify_hard_final_soc_infeasibility(
+        *,
+        current_soc_mwh: float,
+        final_soc_target_mwh: float,
+        rolling_window_contains_global_end: bool,
+        safe_hold_feasible: bool,
+    ) -> str:
+        """Separate real terminal pressure from solver/formulation false infeasibility."""
+        if not bool(rolling_window_contains_global_end):
+            return "rolling_window_nonterminal_infeasible"
+        if bool(safe_hold_feasible):
+            return "hard_final_soc_false_infeasible"
+        if float(current_soc_mwh) + 1e-9 < float(final_soc_target_mwh):
+            return "terminal_soc_conflict"
+        return "hard_final_soc_infeasible"
 
     def optimize_dispatch(
         self,
@@ -4795,10 +4829,14 @@ class BatteryBacktester:
             # - Final global window: enforce configured terminal target SoC.
             # Terminal valuation in objective governs economic carry-over behavior.
             enforce_end = None
-            if enforce_final_soc_min:
-                enforce_end_min = self.soc_target_end if (w_end == n) else self.soc_min
-            else:
-                enforce_end_min = None
+            rolling_window_contains_global_end = bool(w_end == n)
+            enforce_end_min = self._rolling_final_soc_min_target(
+                enforce_final_soc_min=bool(enforce_final_soc_min),
+                window_end=int(w_end),
+                total_rows=int(n),
+                soc_min=float(self.soc_min),
+                soc_target_end=float(self.soc_target_end),
+            )
             optimization_fallback = "none"
             optimization_error = ""
             terminal_constraint_dropped = 0.0
@@ -4983,6 +5021,117 @@ class BatteryBacktester:
                     avail_pos = max(0.0, float(soc) - float(self.soc_min))
                     avail_neg = max(0.0, float(self.soc_max) - float(soc))
                     return (avail_pos + 1e-9 < req_pos) or (avail_neg + 1e-9 < req_neg)
+
+                def _hard_final_soc_safe_hold_diagnostic(root_cause: str) -> dict[str, object]:
+                    ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+                    safe_soc = float(soc)
+                    min_safe_soc = float(safe_soc)
+                    max_safe_soc = float(safe_soc)
+                    expected_aux_losses = 0.0
+                    fixed_da_charge_mwh = 0.0
+                    fixed_da_discharge_mwh = 0.0
+                    fixed_reserve_pos_mw = 0.0
+                    fixed_reserve_neg_mw = 0.0
+                    rate_pos_series = pd.to_numeric(
+                        window.get(colmap.pred_afrr_activation_rate_pos, 0.0), errors="coerce"
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    rate_neg_series = pd.to_numeric(
+                        window.get(colmap.pred_afrr_activation_rate_neg, 0.0), errors="coerce"
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    for j, tsw in enumerate(ts_vals):
+                        if pd.isna(tsw):
+                            continue
+                        ch_mw, dis_mw = (0.0, 0.0)
+                        if tsw in da_lockbook:
+                            ch_mw, dis_mw = self._normalize_da_bid(*da_lockbook[tsw])
+                        ob_pos, ob_neg = fixed_reserve_obligation.get(tsw, (0.0, 0.0))
+                        ob_pos = self.bid_builder._qfloor(
+                            max(0.0, float(ob_pos)),
+                            self.afrr_bid_granularity_mw,
+                        )
+                        ob_neg = self.bid_builder._qfloor(
+                            max(0.0, float(ob_neg)),
+                            self.afrr_bid_granularity_mw,
+                        )
+                        rate_pos = float(rate_pos_series[j] if j < len(rate_pos_series) else 0.0)
+                        rate_neg = float(rate_neg_series[j] if j < len(rate_neg_series) else 0.0)
+                        aux_power_mw, _ = self._state_aux_power_mw(
+                            charge_mw=float(ch_mw),
+                            discharge_mw=float(dis_mw),
+                            reserve_pos_mw=float(ob_pos),
+                            reserve_neg_mw=float(ob_neg),
+                            act_pos_rate=rate_pos,
+                            act_neg_rate=rate_neg,
+                            id_charge_mw=0.0,
+                            id_discharge_mw=0.0,
+                        )
+                        aux_mwh = max(0.0, float(aux_power_mw) * float(self.dt_h))
+                        act_pos_mwh = max(0.0, float(ob_pos) * rate_pos * float(self.dt_h))
+                        act_neg_mwh = max(0.0, float(ob_neg) * rate_neg * float(self.dt_h))
+                        delta, _ = self._calculate_soc_delta(
+                            charge_mw=float(ch_mw),
+                            discharge_mw=float(dis_mw),
+                            id_charge_mw=0.0,
+                            id_discharge_mw=0.0,
+                            act_pos_mwh=float(act_pos_mwh),
+                            act_neg_mwh=float(act_neg_mwh),
+                            aux_mwh=float(aux_mwh),
+                            battery_specs=BATTERY_SPECS,
+                            dt_h=float(self.dt_h),
+                        )
+                        safe_soc += float(delta)
+                        min_safe_soc = min(min_safe_soc, float(safe_soc))
+                        max_safe_soc = max(max_safe_soc, float(safe_soc))
+                        expected_aux_losses += float(aux_mwh)
+                        fixed_da_charge_mwh += float(ch_mw) * float(self.dt_h)
+                        fixed_da_discharge_mwh += float(dis_mw) * float(self.dt_h)
+                        fixed_reserve_pos_mw += float(ob_pos)
+                        fixed_reserve_neg_mw += float(ob_neg)
+                    final_pressure = max(0.0, float(self.soc_target_end) - float(soc))
+                    safe_hold_feasible = (
+                        min_safe_soc + 1e-9 >= float(self.soc_min)
+                        and max_safe_soc <= float(self.soc_max) + 1e-9
+                        and (
+                            (not rolling_window_contains_global_end)
+                            or safe_soc + 1e-9 >= float(self.soc_target_end)
+                        )
+                    )
+                    classification = self._classify_hard_final_soc_infeasibility(
+                        current_soc_mwh=float(soc),
+                        final_soc_target_mwh=float(self.soc_target_end),
+                        rolling_window_contains_global_end=rolling_window_contains_global_end,
+                        safe_hold_feasible=bool(safe_hold_feasible),
+                    )
+                    first_ts = pd.to_datetime(window.iloc[0][colmap.timestamp], utc=True, errors="coerce")
+                    last_ts = pd.to_datetime(window.iloc[-1][colmap.timestamp], utc=True, errors="coerce")
+                    return {
+                        "timestamp_utc": str(first_ts) if pd.notna(first_ts) else "",
+                        "scenario": str(self._hard_final_soc_debug_context.get("scenario", "")),
+                        "model": str(self._hard_final_soc_debug_context.get("model", "")),
+                        "strategy": str(
+                            self._hard_final_soc_debug_context.get("strategy", strategy_name or "")
+                        ),
+                        "rolling_window_start_utc": str(first_ts) if pd.notna(first_ts) else "",
+                        "rolling_window_end_utc": str(last_ts) if pd.notna(last_ts) else "",
+                        "rolling_window_contains_global_end": float(rolling_window_contains_global_end),
+                        "current_soc_mwh": float(soc),
+                        "soc_start_mwh": float(soc),
+                        "soc_end_min_target_mwh": float(enforce_end_min) if enforce_end_min is not None else np.nan,
+                        "final_soc_target_mwh": float(self.soc_target_end),
+                        "final_soc_pressure_mwh": float(final_pressure),
+                        "safe_hold_terminal_soc_mwh": float(safe_soc),
+                        "safe_hold_min_soc_mwh": float(min_safe_soc),
+                        "safe_hold_max_soc_mwh": float(max_safe_soc),
+                        "safe_hold_feasible": float(safe_hold_feasible),
+                        "fixed_reserve_obligation_pos_mw": float(fixed_reserve_pos_mw),
+                        "fixed_reserve_obligation_neg_mw": float(fixed_reserve_neg_mw),
+                        "fixed_da_charge_mwh_in_window": float(fixed_da_charge_mwh),
+                        "fixed_da_discharge_mwh_in_window": float(fixed_da_discharge_mwh),
+                        "expected_auxiliary_losses_mwh": float(expected_aux_losses),
+                        "solver_status": root_cause,
+                        "solver_message": str(optimization_error),
+                        "root_cause_classification": str(classification),
+                    }
                 # If terminal SoC floor conflicts with already locked reserve obligations,
                 # keep reserve obligations and retry without terminal minimum first.
                 allow_terminal_drop_retry = not (
@@ -5033,7 +5182,16 @@ class BatteryBacktester:
                             optimization_fallback = "reserve_infeasible"
                         else:
                             if bool(strict_simulation_validity) and str(self.final_soc_mode) == "hard":
-                                optimization_fallback = "hard_final_soc_infeasible"
+                                debug_row = _hard_final_soc_safe_hold_diagnostic(
+                                    root_cause="milp_infeasible"
+                                )
+                                self._hard_final_soc_debug_rows.append(debug_row)
+                                optimization_fallback = str(
+                                    debug_row.get(
+                                        "root_cause_classification",
+                                        "hard_final_soc_infeasible",
+                                    )
+                                )
                             else:
                                 optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan_under_infeasible_soft_final_soc"
                     else:
@@ -6819,6 +6977,7 @@ class BatteryBacktester:
         if horizon_hours <= 0 or reopt_step_hours <= 0:
             raise ValueError("horizon_hours and reopt_step_hours must be > 0")
         self._infeasible_debug_dumps = []
+        self._hard_final_soc_debug_rows = []
         self._runtime_profile = {
             "optimizer_steps": 0.0,
             "optimizer_total_seconds": 0.0,
@@ -9080,6 +9239,15 @@ class BatteryBacktester:
                 summary[k] = v
 
         summary["backtester_run_seconds"] = float(max(0.0, time.monotonic() - run_started_monotonic))
+        if self._hard_final_soc_debug_rows and self._hard_final_soc_debug_path is not None:
+            try:
+                self._hard_final_soc_debug_path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(self._hard_final_soc_debug_rows).to_csv(
+                    self._hard_final_soc_debug_path,
+                    index=False,
+                )
+            except Exception as exc:
+                print(f"[WARN] failed to write hard final SoC debug: {exc}")
 
         return BacktestOutputs(
             hourly=hourly,
