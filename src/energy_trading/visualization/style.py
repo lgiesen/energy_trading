@@ -45,16 +45,31 @@ GEO_SEQUENTIAL_BLUE: Dict[str, str] = {
 
 # Functional thesis palette (minimalist, high-contrast roles).
 THESIS_PALETTE: Dict[str, str] = {
-    "primary": "#226E9C", # 34, 110, 156
-    "secondary": "#d9b98d", # 217, 185, 141
-    "tertiary": "#7C1D6F", # 124, 29, 111
-    "neutral_dark": "#333333", # 51, 51, 51
+    "primary": "#226E9C",  # 34, 110, 156
+    "secondary": "#d9b98d",  # 217, 185, 141
+    "tertiary": "#7C1D6F",  # 124, 29, 111
+    "neutral_dark": "#333333",  # 51, 51, 51
+}
+
+# Fixed semantic mapping for thesis figures.
+MODEL_COLOR_MAP: Dict[str, str] = {
+    "truth": THESIS_PALETTE["neutral_dark"],
+    "linear": THESIS_PALETTE["secondary"],
+    "xgb": THESIS_PALETTE["primary"],
+    "tft": THESIS_PALETTE["tertiary"],
 }
 
 
 def get_color(role: str, default: str = "#333333") -> str:
     """Return a semantic color for the given role, fallback to default."""
     return THESIS_PALETTE.get(role, default)
+
+
+def get_model_color(model_name: str, default: str | None = None) -> str:
+    """Return the fixed thesis color for a model/truth series."""
+    key = str(model_name).strip().lower()
+    fallback = default if default is not None else THESIS_PALETTE["neutral_dark"]
+    return MODEL_COLOR_MAP.get(key, fallback)
 
 
 def apply_geo_style() -> None:

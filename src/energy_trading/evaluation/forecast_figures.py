@@ -10,13 +10,44 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from energy_trading.visualization.style import THESIS_PALETTE, apply_geo_style
+from energy_trading.visualization.style import THESIS_PALETTE, apply_geo_style, get_model_color
 
 
 @dataclass
 class FigureGenerationResult:
     generated_files: list[Path]
     example_window_report: pd.DataFrame
+
+
+def _series_color(name: str) -> str:
+    return get_model_color(name)
+
+
+def example_lead_for_target(target: str) -> int | None:
+    target_s = str(target)
+    if target_s == "pred_da_price":
+        return 24
+    if target_s in {"pred_afrr_capacity_price_pos", "pred_afrr_capacity_price_neg"}:
+        return 24
+    if target_s in {
+        "pred_afrr_activation_price_pos",
+        "pred_afrr_activation_price_neg",
+        "pred_afrr_activation_rate_pos",
+        "pred_afrr_activation_rate_neg",
+    }:
+        return 1
+    return None
+
+
+def _filter_example_lead(df: pd.DataFrame, target: str) -> tuple[pd.DataFrame, int | None]:
+    if "lead_time_h" not in df.columns:
+        return df.copy(), None
+    desired = example_lead_for_target(target)
+    if desired is None:
+        return df.copy(), None
+    lead = pd.to_numeric(df["lead_time_h"], errors="coerce")
+    filtered = df.loc[lead.eq(float(desired))].copy()
+    return (filtered if not filtered.empty else df.copy()), desired
 
 
 def _ensure_dir(path: Path) -> None:
@@ -101,7 +132,13 @@ def plot_leadtime_metric_comparison(by_lead: pd.DataFrame, figures_dir: Path, dp
         for metric in ["mae_p50", "mean_pinball", "approx_crps"]:
             fig, ax = plt.subplots(figsize=(10, 5))
             for model, mg in tg.groupby("model"):
-                ax.plot(mg["lead_time_h"], mg[metric], marker="o", label=model)
+                ax.plot(
+                    mg["lead_time_h"],
+                    mg[metric],
+                    marker="o",
+                    label=model,
+                    color=_series_color(str(model)),
+                )
             ax.set_title(f"{metric} by lead | {split} | {target}")
             ax.set_xlabel("lead_time_h")
             ax.set_ylabel(metric)
@@ -120,7 +157,13 @@ def plot_calibration_curve(calibration: pd.DataFrame, figures_dir: Path, dpi: in
         fig, ax = plt.subplots(figsize=(7, 6))
         for model, mg in tg.groupby("model"):
             mg = mg.sort_values("quantile")
-            ax.plot(mg["quantile"], mg["empirical_coverage"], marker="o", label=model)
+            ax.plot(
+                mg["quantile"],
+                mg["empirical_coverage"],
+                marker="o",
+                label=model,
+                color=_series_color(str(model)),
+            )
         ax.plot([0, 1], [0, 1], linestyle="--", color=THESIS_PALETTE["neutral_dark"], label="perfect")
         ax.set_title(f"Calibration | {split} | {target}")
         ax.set_xlabel("nominal quantile")
@@ -145,7 +188,13 @@ def plot_coverage_and_width_by_lead(by_lead: pd.DataFrame, figures_dir: Path, dp
                 continue
             fig, ax = plt.subplots(figsize=(10, 5))
             for model, mg in tg.groupby("model"):
-                ax.plot(mg["lead_time_h"], mg[metric], marker="o", label=model)
+                ax.plot(
+                    mg["lead_time_h"],
+                    mg[metric],
+                    marker="o",
+                    label=model,
+                    color=_series_color(str(model)),
+                )
             ax.set_title(f"{metric} by lead | {split} | {target}")
             ax.set_xlabel("lead_time_h")
             ax.set_ylabel(metric)
@@ -162,19 +211,58 @@ def plot_forecast_band_example(df: pd.DataFrame, figures_dir: Path, dpi: int, ex
     if window.empty:
         return None
     window = window.sort_values("target_time_utc")
+    model = str(window["model"].iloc[0])
+    target = str(window["target"].iloc[0])
+    split = str(window["split"].iloc[0])
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(window["target_time_utc"], window["y_true"], label="truth", color=THESIS_PALETTE["neutral_dark"])
-    ax.plot(window["target_time_utc"], window["p50"], label="p50", color=THESIS_PALETTE["primary"])
+    ax.plot(window["target_time_utc"], window["y_true"], label="truth", color=_series_color("truth"))
+    ax.plot(window["target_time_utc"], window["p50"], label="p50", color=_series_color(model))
     if {"p10", "p90"}.issubset(window.columns):
         ax.fill_between(window["target_time_utc"], window["p10"], window["p90"], alpha=0.2, color=THESIS_PALETTE["secondary"], label="p10-p90")
     if {"p30", "p70"}.issubset(window.columns):
         ax.fill_between(window["target_time_utc"], window["p30"], window["p70"], alpha=0.25, color=THESIS_PALETTE["tertiary"], label="p30-p70")
-    model = str(window["model"].iloc[0])
-    target = str(window["target"].iloc[0])
-    split = str(window["split"].iloc[0])
     ax.set_title(f"{example_type} | {split} | {target} | {model}")
     ax.legend()
     p = figures_dir / split / target / model / f"{example_type}_forecast_band.png"
+    _save_fig(fig, p, dpi)
+    return p
+
+
+def plot_typical_week_model_comparison(
+    df: pd.DataFrame,
+    figures_dir: Path,
+    dpi: int,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    selected_lead_h: int | None,
+) -> Path | None:
+    window = df.loc[(df["target_time_utc"] >= start) & (df["target_time_utc"] <= end)].copy()
+    if window.empty:
+        return None
+    window = window.sort_values("target_time_utc")
+    split = str(window["split"].iloc[0])
+    target = str(window["target"].iloc[0])
+    truth = (
+        window[["target_time_utc", "y_true"]]
+        .drop_duplicates(subset=["target_time_utc"])
+        .sort_values("target_time_utc")
+    )
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(truth["target_time_utc"], truth["y_true"], label="truth", color=_series_color("truth"), linewidth=2.0)
+    for model, mg in window.groupby("model"):
+        mg = mg.sort_values("target_time_utc")
+        ax.plot(
+            mg["target_time_utc"],
+            mg["p50"],
+            label=f"{model} p50",
+            color=_series_color(str(model)),
+        )
+    lead_txt = "unknown" if selected_lead_h is None else str(int(selected_lead_h))
+    ax.set_title(f"typical_week | {split} | {target} | lead={lead_txt}h")
+    ax.set_xlabel("day")
+    ax.set_ylabel(target)
+    ax.legend()
+    p = figures_dir / split / target / "typical_week_p50_model_comparison.png"
     _save_fig(fig, p, dpi)
     return p
 
@@ -187,7 +275,7 @@ def plot_tail_event_scatter(df: pd.DataFrame, figures_dir: Path, dpi: int) -> li
         q90 = float(np.nanquantile(g["y_true"].to_numpy(dtype=float), 0.9))
         mask = g["y_true"] >= q90
         fig, ax = plt.subplots(figsize=(6, 6))
-        ax.scatter(g["y_true"], g["p50"], s=10, alpha=0.5, color=THESIS_PALETTE["neutral_dark"])
+        ax.scatter(g["y_true"], g["p50"], s=10, alpha=0.5, color=_series_color(str(model)))
         ax.scatter(g.loc[mask, "y_true"], g.loc[mask, "p50"], s=16, alpha=0.8, color=THESIS_PALETTE["tertiary"])
         ax.set_xlabel("true value")
         ax.set_ylabel("p50 forecast")
@@ -263,7 +351,13 @@ def plot_volatility_diagnostics(df: pd.DataFrame, figures_dir: Path, dpi: int) -
             rows.append({"model": r["model"], "split": split, "target": target, "volatility_bucket": r["volatility_bucket"], "n": int(r["n"]), "mae_p50": float(r["mae_p50"]), "rmse_p50": float(r["rmse_p50"]), "mean_pinball": float(r["mean_pinball"]), "coverage_p10_p90": np.nan, "interval_width_p10_p90": np.nan})
         fig, ax = plt.subplots(figsize=(10, 4))
         for model, mg in agg.groupby("model"):
-            ax.plot(mg["volatility_bucket"], mg["mae_p50"], marker="o", label=model)
+            ax.plot(
+                mg["volatility_bucket"],
+                mg["mae_p50"],
+                marker="o",
+                label=model,
+                color=_series_color(str(model)),
+            )
         ax.set_title(f"Error by volatility bucket | {split} | {target}")
         ax.set_xlabel("volatility bucket")
         ax.set_ylabel("mae_p50")
@@ -292,6 +386,9 @@ def generate_forecast_benchmark_figures(
     config: dict[str, Any],
 ) -> FigureGenerationResult:
     apply_geo_style()
+    _ensure_dir(figures_dir)
+    _ensure_dir(diagnostics_dir)
+    _ensure_dir(figures_dir.parent / "metrics")
     fig_cfg = config.get("figures", {})
     make_cfg = fig_cfg.get("make", {})
     dpi = int(fig_cfg.get("dpi", 150))
@@ -319,17 +416,42 @@ def generate_forecast_benchmark_figures(
 
     ex_rows: list[dict[str, Any]] = []
     if bool(make_cfg.get("forecast_bands", True)):
+        for (split, target), g_target in joined_df.groupby(["split", "target"]):
+            g_target_example, selected_lead_h = _filter_example_lead(g_target, str(target))
+            st, en, _meta = select_typical_week(g_target_example, window_days=window_days, min_coverage=min_coverage)
+            out = plot_typical_week_model_comparison(
+                g_target_example,
+                figures_dir,
+                dpi,
+                st,
+                en,
+                selected_lead_h,
+            )
+            if out is not None:
+                generated.append(out)
         for (model, split, target), g in joined_df.groupby(["model", "split", "target"]):
+            g_example, selected_lead_h = _filter_example_lead(g, str(target))
             for ex_type, selector in [
                 ("typical_week", select_typical_week),
                 ("high_volatility_week", select_high_volatility_week),
                 ("spike_week", select_spike_week),
             ]:
-                st, en, meta = selector(g, window_days=window_days, min_coverage=min_coverage)
-                out = plot_forecast_band_example(g, figures_dir, dpi, ex_type, st, en)
+                st, en, meta = selector(g_example, window_days=window_days, min_coverage=min_coverage)
+                out = plot_forecast_band_example(g_example, figures_dir, dpi, ex_type, st, en)
                 if out is not None:
                     generated.append(out)
-                ex_rows.append({"model": model, "split": split, "target": target, "example_type": ex_type, "start_utc": str(st), "end_utc": str(en), **meta})
+                ex_rows.append(
+                    {
+                        "model": model,
+                        "split": split,
+                        "target": target,
+                        "example_type": ex_type,
+                        "start_utc": str(st),
+                        "end_utc": str(en),
+                        "selected_lead_h": selected_lead_h,
+                        **meta,
+                    }
+                )
 
     example_report = pd.DataFrame(ex_rows)
     if not example_report.empty:

@@ -31,6 +31,11 @@ from energy_trading.evaluation.forecast_metrics import (
     tail_event_metrics,
 )
 from energy_trading.evaluation.forecast_benchmark import run_benchmark
+from energy_trading.evaluation.forecast_figures import (
+    example_lead_for_target,
+    generate_forecast_benchmark_figures,
+)
+from energy_trading.visualization.style import THESIS_PALETTE, get_model_color
 
 
 def test_truth_mapping_resolves_canonical_columns_correctly() -> None:
@@ -361,6 +366,123 @@ def test_make_figures_creates_calibration_curve(tmp_path: Path) -> None:
 def test_make_figures_creates_forecast_band_examples(tmp_path: Path) -> None:
     out = _run_small_benchmark(tmp_path, make_figures=True)
     assert list((out / "figures" / "test" / "pred_da_price").glob("*/typical_week_forecast_band.png"))
+    assert (out / "figures" / "test" / "pred_da_price" / "typical_week_p50_model_comparison.png").exists()
+
+
+def test_thesis_palette_model_mapping_is_fixed() -> None:
+    assert get_model_color("truth") == THESIS_PALETTE["neutral_dark"]
+    assert get_model_color("linear") == THESIS_PALETTE["secondary"]
+    assert get_model_color("xgb") == THESIS_PALETTE["primary"]
+    assert get_model_color("tft") == THESIS_PALETTE["tertiary"]
+
+
+def test_example_lead_mapping_matches_expected_targets() -> None:
+    assert example_lead_for_target("pred_da_price") == 24
+    assert example_lead_for_target("pred_afrr_capacity_price_pos") == 24
+    assert example_lead_for_target("pred_afrr_capacity_price_neg") == 24
+    assert example_lead_for_target("pred_afrr_activation_price_pos") == 1
+    assert example_lead_for_target("pred_afrr_activation_price_neg") == 1
+    assert example_lead_for_target("pred_afrr_activation_rate_pos") == 1
+    assert example_lead_for_target("pred_afrr_activation_rate_neg") == 1
+
+
+def test_example_forecast_band_uses_target_specific_lead(tmp_path: Path) -> None:
+    ts = pd.date_range("2025-01-01", periods=24 * 8, freq="h", tz="UTC")
+    joined = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "model": "xgb",
+                    "split": "test",
+                    "target": "pred_da_price",
+                    "target_time_utc": ts,
+                    "lead_time_h": 24,
+                    "y_true": np.linspace(1.0, 2.0, len(ts)),
+                    "p10": np.linspace(0.0, 1.0, len(ts)),
+                    "p30": np.linspace(0.5, 1.5, len(ts)),
+                    "p50": np.linspace(1.0, 2.0, len(ts)),
+                    "p70": np.linspace(1.5, 2.5, len(ts)),
+                    "p90": np.linspace(2.0, 3.0, len(ts)),
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "model": "xgb",
+                    "split": "test",
+                    "target": "pred_da_price",
+                    "target_time_utc": ts,
+                    "lead_time_h": 1,
+                    "y_true": np.linspace(100.0, 101.0, len(ts)),
+                    "p10": np.linspace(99.0, 100.0, len(ts)),
+                    "p30": np.linspace(99.5, 100.5, len(ts)),
+                    "p50": np.linspace(100.0, 101.0, len(ts)),
+                    "p70": np.linspace(100.5, 101.5, len(ts)),
+                    "p90": np.linspace(101.0, 102.0, len(ts)),
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "model": "xgb",
+                    "split": "test",
+                    "target": "pred_afrr_activation_price_pos",
+                    "target_time_utc": ts,
+                    "lead_time_h": 1,
+                    "y_true": np.linspace(10.0, 11.0, len(ts)),
+                    "p10": np.linspace(9.0, 10.0, len(ts)),
+                    "p30": np.linspace(9.5, 10.5, len(ts)),
+                    "p50": np.linspace(10.0, 11.0, len(ts)),
+                    "p70": np.linspace(10.5, 11.5, len(ts)),
+                    "p90": np.linspace(11.0, 12.0, len(ts)),
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "model": "xgb",
+                    "split": "test",
+                    "target": "pred_afrr_activation_price_pos",
+                    "target_time_utc": ts,
+                    "lead_time_h": 24,
+                    "y_true": np.linspace(200.0, 201.0, len(ts)),
+                    "p10": np.linspace(199.0, 200.0, len(ts)),
+                    "p30": np.linspace(199.5, 200.5, len(ts)),
+                    "p50": np.linspace(200.0, 201.0, len(ts)),
+                    "p70": np.linspace(200.5, 201.5, len(ts)),
+                    "p90": np.linspace(201.0, 202.0, len(ts)),
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    by_lead = pd.DataFrame(
+        [
+            {"model": "xgb", "split": "test", "target": "pred_da_price", "lead_time_h": 24, "mae_p50": 1.0, "mean_pinball": 1.0, "approx_crps": 1.0, "coverage_p10_p90": 0.8, "interval_width_p10_p90": 2.0},
+            {"model": "xgb", "split": "test", "target": "pred_afrr_activation_price_pos", "lead_time_h": 1, "mae_p50": 1.0, "mean_pinball": 1.0, "approx_crps": 1.0, "coverage_p10_p90": 0.8, "interval_width_p10_p90": 2.0},
+        ]
+    )
+    calibration = pd.DataFrame(
+        [
+            {"model": "xgb", "split": "test", "target": "pred_da_price", "quantile": 0.1, "empirical_coverage": 0.1},
+            {"model": "xgb", "split": "test", "target": "pred_afrr_activation_price_pos", "quantile": 0.1, "empirical_coverage": 0.1},
+        ]
+    )
+    out = tmp_path / "out"
+    (out / "metrics").mkdir(parents=True, exist_ok=True)
+    res = generate_forecast_benchmark_figures(
+        joined_df=joined,
+        by_lead=by_lead,
+        calibration=calibration,
+        figures_dir=out / "figures",
+        diagnostics_dir=out / "diagnostics",
+        config={"figures": {"enabled": True, "dpi": 150, "make": {"forecast_bands": True}, "example_windows": {"window_days": 7, "min_coverage": 0.8}}},
+    )
+    report = res.example_window_report
+    assert set(report["selected_lead_h"].dropna().astype(int)) == {1, 24}
+    da_rows = report.loc[report["target"] == "pred_da_price"]
+    act_rows = report.loc[report["target"] == "pred_afrr_activation_price_pos"]
+    assert set(da_rows["selected_lead_h"].dropna().astype(int)) == {24}
+    assert set(act_rows["selected_lead_h"].dropna().astype(int)) == {1}
+    assert (out / "figures" / "test" / "pred_da_price" / "typical_week_p50_model_comparison.png").exists()
+    assert (out / "figures" / "test" / "pred_afrr_activation_price_pos" / "typical_week_p50_model_comparison.png").exists()
 
 
 def test_make_figures_creates_tail_scatter(tmp_path: Path) -> None:
