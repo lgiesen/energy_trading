@@ -13,11 +13,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.run_battery_backtest import (  # noqa: E402
+    SIMULATION_EVAL_END_UTC,
+    SIMULATION_EVAL_START_UTC,
+    _forecast_coverage_report,
     _manifest_can_resolve_long_predictions,
     _matches_model_key,
     _normalize_model_choice,
     _plot_cumulative_pnl,
     _preflight_manifest_and_quantiles,
+    _resolve_simulation_eval_window,
     _resolve_long_prediction_path,
     _resolve_model_manifest,
     parse_args,
@@ -76,6 +80,91 @@ def test_cli_can_disable_default_global_perfect_foresight(monkeypatch: pytest.Mo
     monkeypatch.setattr(sys, "argv", ["run_battery_backtest.py", "--no-enable-global-perfect-foresight"])
     args = parse_args()
     assert args.enable_global_perfect_foresight is False
+
+
+def test_common_eval_window_clamps_requested_start_and_end() -> None:
+    info = _resolve_simulation_eval_window(
+        requested_start="2025-01-04T00:00:00Z",
+        requested_end="2026-03-01T00:00:00Z",
+    )
+    assert info["effective_start_utc"] == SIMULATION_EVAL_START_UTC.isoformat()
+    assert info["effective_end_utc"] == SIMULATION_EVAL_END_UTC.isoformat()
+    assert info["simulation_window_clamped"] == 1.0
+    assert "start_below_common_lower_bound" in str(info["simulation_window_clamp_reason"])
+    assert "end_above_common_upper_bound" in str(info["simulation_window_clamp_reason"])
+    assert info["simulation_window_hours"] == 8760.0
+    assert info["simulation_window_days"] == 365.0
+
+
+def test_common_eval_window_defaults_to_common_bounds() -> None:
+    info = _resolve_simulation_eval_window(requested_start=None, requested_end=None)
+    assert info["requested_start_utc"] == ""
+    assert info["requested_end_utc"] == ""
+    assert info["effective_start_utc"] == SIMULATION_EVAL_START_UTC.isoformat()
+    assert info["effective_end_utc"] == SIMULATION_EVAL_END_UTC.isoformat()
+    assert info["simulation_window_clamped"] == 0.0
+    assert info["simulation_window_hours"] == 8760.0
+    assert info["simulation_window_days"] == 365.0
+
+
+def test_common_eval_window_is_model_independent() -> None:
+    # The helper intentionally has no model-key branch; TFT, XGB, linear/RLQR,
+    # and future models use the same effective thesis window.
+    bounds = {
+        model: _resolve_simulation_eval_window(requested_start=None, requested_end=None)
+        for model in ["xgb", "tft", "linear", "rlqr", "future_model"]
+    }
+    assert {v["effective_start_utc"] for v in bounds.values()} == {SIMULATION_EVAL_START_UTC.isoformat()}
+    assert {v["effective_end_utc"] for v in bounds.values()} == {SIMULATION_EVAL_END_UTC.isoformat()}
+
+
+def test_forecast_coverage_ignores_missing_snapshots_before_clamped_window() -> None:
+    start = SIMULATION_EVAL_START_UTC
+    end = start + pd.Timedelta(hours=1)
+    rows = []
+    for snapshot in pd.date_range(start, end, freq="h", tz="UTC"):
+        for lead in [1, 2]:
+            rows.append(
+                {
+                    "snapshot_time_utc": snapshot,
+                    "target_time_utc": snapshot + pd.Timedelta(hours=lead),
+                    "lead_time_h": lead,
+                    "predicted_value": 1.0,
+                    "p50": 1.0,
+                }
+            )
+    report, summary = _forecast_coverage_report(
+        forecast_warehouse={"pred_da_price": pd.DataFrame(rows)},
+        effective_start_utc=start,
+        effective_end_utc=end,
+        horizon_hours=2,
+        expected_quantiles={"p50"},
+    )
+    assert summary["status"] == "ok"
+    assert int(report["missing_snapshot_count"].sum()) == 0
+
+
+def test_forecast_coverage_fails_missing_snapshot_inside_effective_window() -> None:
+    start = SIMULATION_EVAL_START_UTC
+    end = start + pd.Timedelta(hours=2)
+    rows = [
+        {
+            "snapshot_time_utc": start,
+            "target_time_utc": start + pd.Timedelta(hours=1),
+            "lead_time_h": 1,
+            "predicted_value": 1.0,
+            "p50": 1.0,
+        }
+    ]
+    _, summary = _forecast_coverage_report(
+        forecast_warehouse={"pred_da_price": pd.DataFrame(rows)},
+        effective_start_utc=start,
+        effective_end_utc=end,
+        horizon_hours=1,
+        expected_quantiles={"p50"},
+    )
+    assert summary["status"] == "missing_coverage"
+    assert summary["first_missing_snapshot"] == (start + pd.Timedelta(hours=1)).isoformat()
 
 
 def test_cumulative_pnl_plot_includes_validated_global_perfect_foresight(tmp_path: Path) -> None:
@@ -208,10 +297,10 @@ def test_error_message_lists_manifest_context_and_candidates(tmp_path: Path) -> 
     msg = str(exc.value)
     assert "resolved_manifest_path=" in msg
     assert "manifest_dir=" in msg
-    assert "configured path" in msg.lower() or "Configured path" in msg
+    assert "configured_path=" in msg
     assert "model_key=xgb" in msg
     assert "split=val" in msg
-    assert "Tried:" in msg
+    assert "exact_candidates=" in msg
 
 
 def test_end_to_end_manifest_preflight_smoke(tmp_path: Path) -> None:
@@ -231,14 +320,29 @@ def test_end_to_end_manifest_preflight_smoke(tmp_path: Path) -> None:
     )
 
 
-def test_model_tft_does_not_pick_xgb_file(tmp_path: Path) -> None:
+def test_exact_manifest_path_bypasses_model_token_filter(tmp_path: Path) -> None:
+    manifest_dir = tmp_path / "xgb_123"
+    pred_dir = manifest_dir / "predictions"
+    pred = pred_dir / "xgboost_da_val_pred_da_price_long.parquet"
+    _write_long_predictions(pred)
+    resolved = _resolve_long_prediction_path(
+        pred_col="pred_da_price",
+        configured_path="predictions/xgboost_da_val_pred_da_price_long.parquet",
+        manifest_dir=manifest_dir,
+        split="val",
+        model_key="tft",
+    )
+    assert resolved == pred
+
+
+def test_model_tft_fallback_does_not_pick_xgb_file(tmp_path: Path) -> None:
     manifest_dir = tmp_path / "xgb_123"
     pred_dir = manifest_dir / "predictions"
     _write_long_predictions(pred_dir / "xgboost_da_val_pred_da_price_long.parquet")
     with pytest.raises(FileNotFoundError):
         _resolve_long_prediction_path(
             pred_col="pred_da_price",
-            configured_path="predictions/xgboost_da_val_pred_da_price_long.parquet",
+            configured_path="predictions/missing_tft_da_val_pred_da_price_long.parquet",
             manifest_dir=manifest_dir,
             split="val",
             model_key="tft",

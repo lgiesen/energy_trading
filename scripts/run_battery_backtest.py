@@ -71,6 +71,70 @@ from energy_trading.visualization.style import apply_geo_style, get_backtest_lin
 
 
 INPUT_CACHE_SCHEMA_VERSION = "simulation_input_cache_v1"
+SIMULATION_EVAL_START_UTC = pd.Timestamp("2025-01-08T00:00:00Z")
+SIMULATION_EVAL_END_UTC = pd.Timestamp("2026-01-08T00:00:00Z")
+FORECAST_COVERAGE_SCHEMA_VERSION = "forecast_coverage_preflight_v1"
+
+
+def _to_utc_ts(value: object) -> pd.Timestamp | None:
+    if value is None or value == "":
+        return None
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return pd.Timestamp(ts)
+
+
+def _resolve_simulation_eval_window(
+    *,
+    requested_start: object | None,
+    requested_end: object | None,
+    clamp_enabled: bool = True,
+    lower_bound: pd.Timestamp = SIMULATION_EVAL_START_UTC,
+    upper_bound: pd.Timestamp = SIMULATION_EVAL_END_UTC,
+) -> dict[str, object]:
+    req_start = _to_utc_ts(requested_start)
+    req_end = _to_utc_ts(requested_end)
+    effective_start = req_start if req_start is not None else lower_bound
+    effective_end = req_end if req_end is not None else upper_bound
+    reasons: list[str] = []
+    warnings: list[str] = []
+    if bool(clamp_enabled):
+        if effective_start < lower_bound:
+            warnings.append(
+                "Requested start < common evaluation lower bound. "
+                f"Clamped start from {effective_start.isoformat()} to {lower_bound.isoformat()}"
+            )
+            effective_start = lower_bound
+            reasons.append("start_below_common_lower_bound")
+        if effective_end > upper_bound:
+            warnings.append(
+                "Requested end > common evaluation upper bound. "
+                f"Clamped end from {effective_end.isoformat()} to {upper_bound.isoformat()}"
+            )
+            effective_end = upper_bound
+            reasons.append("end_above_common_upper_bound")
+    if effective_start > effective_end:
+        raise ValueError(
+            "Effective simulation window is empty after applying bounds: "
+            f"effective_start={effective_start.isoformat()}, effective_end={effective_end.isoformat()}"
+        )
+    window_hours = (effective_end - effective_start).total_seconds() / 3600.0
+    return {
+        "requested_start_utc": req_start.isoformat() if req_start is not None else "",
+        "requested_end_utc": req_end.isoformat() if req_end is not None else "",
+        "effective_start": effective_start,
+        "effective_end": effective_end,
+        "effective_start_utc": effective_start.isoformat(),
+        "effective_end_utc": effective_end.isoformat(),
+        "simulation_window_clamped": float(bool(reasons)),
+        "simulation_window_clamp_reason": ",".join(reasons),
+        "simulation_common_lower_bound_utc": lower_bound.isoformat(),
+        "simulation_common_upper_bound_utc": upper_bound.isoformat(),
+        "simulation_window_days": float(window_hours / 24.0),
+        "simulation_window_hours": float(window_hours),
+        "warnings": warnings,
+    }
 
 
 def _file_fingerprint(path: str | Path) -> dict[str, object]:
@@ -2605,6 +2669,162 @@ def _preflight_manifest_and_quantiles(
         raise RuntimeError(msg)
 
 
+def _forecast_coverage_report(
+    *,
+    forecast_warehouse: dict[str, pd.DataFrame],
+    effective_start_utc: pd.Timestamp,
+    effective_end_utc: pd.Timestamp,
+    horizon_hours: int,
+    expected_quantiles: set[str],
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    expected_snapshots = pd.date_range(effective_start_utc, effective_end_utc, freq="h", tz="UTC", inclusive="left")
+    expected_leads = list(range(1, int(horizon_hours) + 1))
+    rows: list[dict[str, object]] = []
+    total_missing_snapshots = 0
+    total_missing_targets = 0
+    first_missing_snapshot: str = ""
+    expected_quantiles_norm = {str(q).lower() for q in expected_quantiles if str(q).strip()}
+    if not expected_quantiles_norm:
+        expected_quantiles_norm = {"p50"}
+
+    for pred_col, raw in sorted(forecast_warehouse.items()):
+        df = raw.copy()
+        for col in ["snapshot_time_utc", "target_time_utc"]:
+            if col not in df.columns:
+                df[col] = pd.NaT
+            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+        df["lead_time_h"] = pd.to_numeric(df.get("lead_time_h"), errors="coerce")
+        df = df.dropna(subset=["snapshot_time_utc", "target_time_utc", "lead_time_h"]).copy()
+        snap_values = pd.DatetimeIndex(df["snapshot_time_utc"].dropna().drop_duplicates().sort_values())
+        min_snapshot = snap_values.min().isoformat() if len(snap_values) else ""
+        max_snapshot = snap_values.max().isoformat() if len(snap_values) else ""
+        target_values = pd.DatetimeIndex(df["target_time_utc"].dropna().drop_duplicates().sort_values())
+        min_target = target_values.min().isoformat() if len(target_values) else ""
+        max_target = target_values.max().isoformat() if len(target_values) else ""
+        available_snapshots = set(snap_values)
+        missing_snapshots = [ts for ts in expected_snapshots if ts not in available_snapshots]
+        if missing_snapshots and not first_missing_snapshot:
+            first_missing_snapshot = missing_snapshots[0].isoformat()
+        total_missing_snapshots += len(missing_snapshots)
+        missing_quantiles = sorted(q for q in expected_quantiles_norm if q not in df.columns)
+
+        missing_targets: list[str] = []
+        if not missing_quantiles:
+            available_pairs = set(
+                zip(
+                    pd.to_datetime(df["snapshot_time_utc"], utc=True, errors="coerce"),
+                    pd.to_numeric(df["lead_time_h"], errors="coerce").astype("Int64"),
+                    pd.to_datetime(df["target_time_utc"], utc=True, errors="coerce"),
+                )
+            )
+            for snap in expected_snapshots:
+                if snap in missing_snapshots:
+                    continue
+                for lead in expected_leads:
+                    target = snap + pd.Timedelta(hours=int(lead))
+                    if (snap, int(lead), target) not in available_pairs:
+                        missing_targets.append(f"{snap.isoformat()}+h{lead}->{target.isoformat()}")
+                        if len(missing_targets) >= 20:
+                            break
+                if len(missing_targets) >= 20:
+                    break
+        total_missing_targets += len(missing_targets)
+        nearby_available = []
+        if missing_snapshots and len(snap_values):
+            first = missing_snapshots[0]
+            near = snap_values[(snap_values >= first - pd.Timedelta(hours=6)) & (snap_values <= first + pd.Timedelta(hours=6))]
+            nearby_available = [ts.isoformat() for ts in near[:12]]
+        status = "ok"
+        if missing_quantiles or missing_snapshots or missing_targets:
+            status = "missing_coverage"
+        rows.append(
+            {
+                "schema_version": FORECAST_COVERAGE_SCHEMA_VERSION,
+                "prediction_column": pred_col,
+                "effective_start_utc": effective_start_utc.isoformat(),
+                "effective_end_utc": effective_end_utc.isoformat(),
+                "interval_semantics": "[start,end)",
+                "horizon_hours": int(horizon_hours),
+                "expected_snapshot_count": int(len(expected_snapshots)),
+                "available_snapshot_count": int(len(available_snapshots)),
+                "missing_snapshot_count": int(len(missing_snapshots)),
+                "first_missing_snapshot": missing_snapshots[0].isoformat() if missing_snapshots else "",
+                "nearby_available_snapshots": json.dumps(nearby_available),
+                "missing_targets_count_sampled": int(len(missing_targets)),
+                "missing_targets_sample": json.dumps(missing_targets[:20]),
+                "affected_prediction_columns": json.dumps([pred_col] if status != "ok" else []),
+                "missing_quantile_columns": json.dumps(missing_quantiles),
+                "min_snapshot_utc": min_snapshot,
+                "max_snapshot_utc": max_snapshot,
+                "min_target_utc": min_target,
+                "max_target_utc": max_target,
+                "status": status,
+            }
+        )
+    report_df = pd.DataFrame(rows)
+    summary = {
+        "schema_version": FORECAST_COVERAGE_SCHEMA_VERSION,
+        "effective_start_utc": effective_start_utc.isoformat(),
+        "effective_end_utc": effective_end_utc.isoformat(),
+        "interval_semantics": "[start,end)",
+        "horizon_hours": int(horizon_hours),
+        "status": "ok" if not rows or (report_df["status"] == "ok").all() else "missing_coverage",
+        "missing_snapshot_count": int(total_missing_snapshots),
+        "missing_targets_count_sampled": int(total_missing_targets),
+        "first_missing_snapshot": first_missing_snapshot,
+        "rows": rows,
+    }
+    return report_df, summary
+
+
+def _write_forecast_coverage_report(
+    *,
+    out_dir: Path,
+    report_df: pd.DataFrame,
+    report_summary: dict[str, object],
+) -> tuple[Path, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "forecast_coverage_report.csv"
+    json_path = out_dir / "forecast_coverage_report.json"
+    report_df.to_csv(csv_path, index=False)
+    json_path.write_text(json.dumps(report_summary, indent=2, default=str), encoding="utf-8")
+    return csv_path, json_path
+
+
+def _preflight_forecast_coverage(
+    *,
+    forecast_warehouse: dict[str, pd.DataFrame] | None,
+    out_dir: Path,
+    effective_start_utc: pd.Timestamp,
+    effective_end_utc: pd.Timestamp,
+    horizon_hours: int,
+    expected_quantiles: set[str],
+) -> tuple[Path | None, Path | None, dict[str, object]]:
+    if not forecast_warehouse:
+        return None, None, {"status": "skipped_no_long_forecast_warehouse"}
+    report_df, report_summary = _forecast_coverage_report(
+        forecast_warehouse=forecast_warehouse,
+        effective_start_utc=effective_start_utc,
+        effective_end_utc=effective_end_utc,
+        horizon_hours=horizon_hours,
+        expected_quantiles=expected_quantiles,
+    )
+    csv_path, json_path = _write_forecast_coverage_report(
+        out_dir=out_dir,
+        report_df=report_df,
+        report_summary=report_summary,
+    )
+    if str(report_summary.get("status")) != "ok":
+        raise RuntimeError(
+            "Forecast coverage preflight failed inside the effective simulation window. "
+            f"report_csv={csv_path}, report_json={json_path}, "
+            f"first_missing_snapshot={report_summary.get('first_missing_snapshot', '')}, "
+            f"missing_snapshot_count={report_summary.get('missing_snapshot_count', 0)}, "
+            f"missing_targets_count_sampled={report_summary.get('missing_targets_count_sampled', 0)}"
+        )
+    return csv_path, json_path, report_summary
+
+
 def _resolve_bundle_prediction_path(
     *,
     configured_path: str | Path,
@@ -2823,6 +3043,15 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--start", default=None, help="Optional UTC start filter.")
     p.add_argument("--end", default=None, help="Optional UTC end filter.")
+    p.add_argument(
+        "--disable-common-eval-window-clamp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Disable common thesis simulation evaluation-window clamp. "
+            "By default simulations use [2025-01-08T00:00:00Z, 2026-01-08T00:00:00Z)."
+        ),
+    )
     p.add_argument("--horizon-hours", type=int, default=48, help="Rolling-horizon window length in hours.")
     p.add_argument("--reopt-step-hours", type=int, default=1, help="Re-optimization step in hours.")
     p.add_argument(
@@ -3083,6 +3312,24 @@ def main() -> None:
     run_started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     simulation_schema_version = "v2_strict_validity_debugdump"
     required_summary_fields_version = "v2_required_debugdump_fields"
+    eval_window = _resolve_simulation_eval_window(
+        requested_start=args.start,
+        requested_end=args.end,
+        clamp_enabled=not bool(args.disable_common_eval_window_clamp),
+    )
+    effective_start_utc = eval_window["effective_start"]
+    effective_end_utc = eval_window["effective_end"]
+    assert isinstance(effective_start_utc, pd.Timestamp)
+    assert isinstance(effective_end_utc, pd.Timestamp)
+    for warning in eval_window.get("warnings", []):
+        print(f"[WARN] {warning}")
+    print(
+        "[INFO] Simulation evaluation window: "
+        f"requested_start={eval_window['requested_start_utc'] or '<default>'}, "
+        f"requested_end={eval_window['requested_end_utc'] or '<default>'}, "
+        f"effective_start={eval_window['effective_start_utc']}, "
+        f"effective_end={eval_window['effective_end_utc']}"
+    )
     run_id: str | None = args.run_id.strip() or None
     model_arg = str(getattr(args, "model", "") or "").strip()
     model_key_arg = str(args.model_key or "").strip()
@@ -3261,10 +3508,16 @@ def main() -> None:
                 coverage_max=coverage_max,
             )
             print(f"[INFO] Simulation input cache written: {input_cache_path}")
-    if args.start:
-        df = df[df[colmap.timestamp] >= pd.to_datetime(args.start, utc=True)].copy()
-    if args.end:
-        df = df[df[colmap.timestamp] <= pd.to_datetime(args.end, utc=True)].copy()
+    forecast_coverage_report_csv, forecast_coverage_report_json, forecast_coverage_summary = _preflight_forecast_coverage(
+        forecast_warehouse=forecast_warehouse,
+        out_dir=out_dir,
+        effective_start_utc=effective_start_utc,
+        effective_end_utc=effective_end_utc,
+        horizon_hours=int(args.horizon_hours),
+        expected_quantiles=required_quantiles,
+    )
+    df = df[df[colmap.timestamp] >= effective_start_utc].copy()
+    df = df[df[colmap.timestamp] < effective_end_utc].copy()
     if df.empty:
         raise ValueError("No rows after timestamp filtering.")
     scenarios: list[tuple[str, dict[str, pd.DataFrame] | None, list[str]]] = [
@@ -4005,6 +4258,21 @@ def main() -> None:
             "input_cache_used": float(bool(input_cache_used)),
             "input_cache_path": str(input_cache_path),
             "input_cache_schema_version": INPUT_CACHE_SCHEMA_VERSION,
+            "requested_start_utc": str(eval_window["requested_start_utc"]),
+            "requested_end_utc": str(eval_window["requested_end_utc"]),
+            "effective_start_utc": str(eval_window["effective_start_utc"]),
+            "effective_end_utc": str(eval_window["effective_end_utc"]),
+            "simulation_window_clamped": float(eval_window["simulation_window_clamped"]),
+            "simulation_window_clamp_reason": str(eval_window["simulation_window_clamp_reason"]),
+            "simulation_common_lower_bound_utc": str(eval_window["simulation_common_lower_bound_utc"]),
+            "simulation_common_upper_bound_utc": str(eval_window["simulation_common_upper_bound_utc"]),
+            "simulation_window_days": float(eval_window["simulation_window_days"]),
+            "simulation_window_hours": float(eval_window["simulation_window_hours"]),
+            "simulation_window_interval_semantics": "[start,end)",
+            "common_eval_window_clamp_enabled": float(not bool(args.disable_common_eval_window_clamp)),
+            "forecast_coverage_report_path": str(forecast_coverage_report_csv or ""),
+            "forecast_coverage_report_json_path": str(forecast_coverage_report_json or ""),
+            "forecast_coverage_status": str(forecast_coverage_summary.get("status", "")),
             "infeasible_debug_dump_count": 0.0,
             "accepted_path_infeasible_debug_dump_count": 0.0,
             "candidate_infeasible_debug_dump_count": 0.0,
@@ -4113,8 +4381,8 @@ def main() -> None:
         outputs.summary["required_fields_defaulted"] = json.dumps([])
         outputs.summary["required_fields_computed"] = json.dumps(sorted(required_fields))
         with _phase_watchdog("write_performance_metrics"):
-            scenario_start_utc = pd.to_datetime(args.start, utc=True, errors="coerce") if args.start else None
-            scenario_end_utc = pd.to_datetime(args.end, utc=True, errors="coerce") if args.end else None
+            scenario_start_utc = effective_start_utc
+            scenario_end_utc = effective_end_utc
             perf_df, _ = _build_performance_metrics(
                 hourly=outputs.hourly,
                 summary=outputs.summary,
