@@ -54,7 +54,13 @@ class MarketClearingEngine:
         *,
         true_cap_pos: float,
         true_cap_neg: float,
+        true_act_pos: float | None = None,
+        true_act_neg: float | None = None,
+        clearing_price_basis: str = "capacity_price",
     ) -> AFRRCapacityClearingResult:
+        basis = str(clearing_price_basis or "capacity_price").strip().lower()
+        if basis not in {"capacity_price", "activation_price"}:
+            raise ValueError(f"Unsupported aFRR capacity clearing_price_basis={clearing_price_basis!r}")
         submitted_pos = 0.0
         submitted_neg = 0.0
         awarded_pos = 0.0
@@ -62,11 +68,22 @@ class MarketClearingEngine:
         for b in bids:
             if b.side == "pos":
                 submitted_pos += b.quantity_mw
-                if float(b.capacity_price_eur_mw) <= float(true_cap_pos):
+                if basis == "activation_price":
+                    clears = float(b.energy_price_eur_mwh) <= float(0.0 if true_act_pos is None else true_act_pos)
+                else:
+                    clears = float(b.capacity_price_eur_mw) <= float(true_cap_pos)
+                if clears:
                     awarded_pos += b.quantity_mw
             elif b.side == "neg":
                 submitted_neg += b.quantity_mw
-                if float(b.capacity_price_eur_mw) <= float(true_cap_neg):
+                if basis == "activation_price":
+                    if self.forecast_value_mode == "canonical_economic":
+                        clears = float(b.energy_price_eur_mwh) <= float(0.0 if true_act_neg is None else true_act_neg)
+                    else:
+                        clears = float(b.energy_price_eur_mwh) >= float(0.0 if true_act_neg is None else true_act_neg)
+                else:
+                    clears = float(b.capacity_price_eur_mw) <= float(true_cap_neg)
+                if clears:
                     awarded_neg += b.quantity_mw
         return AFRRCapacityClearingResult(
             submitted_pos_mw=float(submitted_pos),

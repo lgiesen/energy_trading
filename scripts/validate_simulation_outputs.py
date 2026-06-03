@@ -74,6 +74,13 @@ def _read_hourly(scenario_dir: Path) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _max_hourly_numeric(hourly: pd.DataFrame, column: str) -> float:
+    if hourly.empty or column not in hourly.columns:
+        return float("nan")
+    vals = pd.to_numeric(hourly[column], errors="coerce").dropna()
+    return float(vals.max()) if not vals.empty else float("nan")
+
+
 def _is_verified_global_upper_bound(summary: dict[str, object]) -> float:
     for key in (
         "global_pf_verified_upper_bound",
@@ -216,11 +223,19 @@ def _collect(root: Path) -> pd.DataFrame:
         if not s:
             continue
         scenario_dir = summary_path.parent
+        hourly = _read_hourly(scenario_dir)
+        scenario_name = str(s.get("scenario", scenario_dir.name))
+        strategy_name = str(s.get("trading_strategy", scenario_dir.parent.name if scenario_dir.parent != root else ""))
+        model_name = str(s.get("model_key", s.get("model", "")))
         rows.append(
             {
+                "summary_file_path": str(summary_path),
                 "scenario_path": str(scenario_dir),
-                "scenario": scenario_dir.name,
-                "trading_strategy": scenario_dir.parent.name if scenario_dir.parent != root else "",
+                "model": model_name,
+                "strategy": strategy_name,
+                "quantile_pair": scenario_name,
+                "scenario": scenario_name,
+                "trading_strategy": strategy_name,
                 "simulation_valid": s.get("simulation_valid"),
                 "thesis_reportable": s.get("thesis_reportable"),
                 "invalid_reason": s.get("invalid_reason"),
@@ -269,7 +284,16 @@ def _collect(root: Path) -> pd.DataFrame:
                 "terminal_soc_net_adjustment_eur": s.get("terminal_soc_net_adjustment_eur", s.get("terminal_soc_adjustment_eur")),
                 "benchmark_same_rules_gate_consistent": s.get("benchmark_same_rules_gate_consistent"),
                 "global_perfect_foresight_available": s.get("global_perfect_foresight_available"),
+                "global_pf_available": s.get("global_pf_available", s.get("global_perfect_foresight_available")),
                 "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": s.get("global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"),
+                "global_pf_verified_upper_bound": s.get("global_pf_verified_upper_bound"),
+                "global_pf_same_market_rules": s.get("global_pf_same_market_rules"),
+                "global_pf_realized_path_incumbent_eur": s.get("global_pf_realized_path_incumbent_eur"),
+                "global_pf_solution_eur": s.get("global_pf_solution_eur"),
+                "global_pf_minus_realized_incumbent_eur": s.get("global_pf_minus_realized_incumbent_eur"),
+                "global_pf_component_gap_json": s.get("global_pf_component_gap_json"),
+                "global_pf_failure_reason": s.get("global_pf_failure_reason"),
+                "global_pf_solver_status": s.get("global_pf_solver_status"),
                 "realized_exceeds_global_perfect_foresight": s.get("realized_exceeds_global_perfect_foresight"),
                 "global_perfect_foresight_dominance_check_pass": s.get("global_perfect_foresight_dominance_check_pass"),
                 "global_perfect_foresight_validation_status": s.get("global_perfect_foresight_validation_status"),
@@ -282,6 +306,10 @@ def _collect(root: Path) -> pd.DataFrame:
                     "perfect_foresight_total_pnl_eur",
                     None,
                 ),
+                "max_real_power_stack_charge_mw": _max_hourly_numeric(hourly, "real_power_stack_charge_mw"),
+                "max_real_power_stack_discharge_mw": _max_hourly_numeric(hourly, "real_power_stack_discharge_mw"),
+                "max_real_power_violation_charge_mw": _max_hourly_numeric(hourly, "real_power_violation_charge_mw"),
+                "max_real_power_violation_discharge_mw": _max_hourly_numeric(hourly, "real_power_violation_discharge_mw"),
             }
         )
     return pd.DataFrame(rows)
@@ -378,9 +406,19 @@ def main() -> None:
         "candidate_infeasible_debug_dump_count",
         "output_was_cleaned",
         "global_perfect_foresight_available",
+        "global_pf_available",
         "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
+        "global_pf_verified_upper_bound",
+        "global_pf_same_market_rules",
+        "global_pf_realized_path_incumbent_eur",
+        "global_pf_solution_eur",
+        "global_pf_minus_realized_incumbent_eur",
         "realized_exceeds_global_perfect_foresight",
         "global_perfect_foresight_dominance_check_pass",
+        "max_real_power_stack_charge_mw",
+        "max_real_power_stack_discharge_mw",
+        "max_real_power_violation_charge_mw",
+        "max_real_power_violation_discharge_mw",
         "id_economic_enabled",
         "id_technical_repair_enabled",
         "total_id_revenue_eur",
@@ -475,6 +513,8 @@ def main() -> None:
         & (df.get("benchmark_same_rules_gate_consistent", 0.0).fillna(0.0) >= 0.5)
         & (df.get("global_perfect_foresight_dominance_check_pass", 0.0).fillna(0.0) >= 0.5)
         & (df.get("accepted_path_infeasible_debug_dump_count", 0.0).fillna(0.0) <= 0.5)
+        & (df.get("max_real_power_violation_charge_mw", 0.0).fillna(0.0) <= 1e-9)
+        & (df.get("max_real_power_violation_discharge_mw", 0.0).fillna(0.0) <= 1e-9)
         & (required_fields_check_pass)
         & (~non_ok_codes)
     )

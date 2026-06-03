@@ -301,6 +301,52 @@ def test_canonical_neg_activation_bid_price_and_clearing_use_positive_provider_v
     assert clearing.executed_rate_neg == pytest.approx(1.0)
 
 
+def test_bcm_preselection_clears_on_activation_price_not_capacity_price() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bid = AFRRCapacityBid(
+        ts=pd.Timestamp("2026-01-01T00:00:00Z"),
+        side="pos",
+        quantity_mw=1.0,
+        capacity_price_eur_mw=9999.0,
+        energy_price_eur_mwh=50.0,
+    )
+
+    res = bt.market_clearing_engine.clear_afrr_capacity(
+        [bid],
+        true_cap_pos=0.0,
+        true_cap_neg=0.0,
+        true_act_pos=60.0,
+        true_act_neg=0.0,
+        clearing_price_basis="activation_price",
+    )
+
+    assert res.pos_awarded is True
+    assert res.awarded_pos_mw == pytest.approx(1.0)
+
+
+def test_bcm_preselection_rejects_expensive_activation_bid_even_if_capacity_price_low() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bid = AFRRCapacityBid(
+        ts=pd.Timestamp("2026-01-01T00:00:00Z"),
+        side="pos",
+        quantity_mw=1.0,
+        capacity_price_eur_mw=0.0,
+        energy_price_eur_mwh=70.0,
+    )
+
+    res = bt.market_clearing_engine.clear_afrr_capacity(
+        [bid],
+        true_cap_pos=9999.0,
+        true_cap_neg=0.0,
+        true_act_pos=60.0,
+        true_act_neg=0.0,
+        clearing_price_basis="activation_price",
+    )
+
+    assert res.pos_awarded is False
+    assert res.awarded_pos_mw == pytest.approx(0.0)
+
+
 def test_raw_signed_neg_activation_bid_price_and_clearing_keep_legacy_sign() -> None:
     bt = _mk_backtester("raw_signed")
     bt.bid_builder.afrr_energy_bid_strategy = "forecast"
@@ -401,9 +447,9 @@ def test_bem_neg_uses_neg_side_execution_probability() -> None:
     bt.afrr_quantile_bins = ["p30", "p50", "p70"]
     bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
     df, col = _tiny_df(hours=2)
-    # Force asymmetric p_acc fallback: remove negative capacity quantile columns only.
+    # Force asymmetric p_acc fallback: remove negative activation-price quantile columns only.
     for q in bt.afrr_quantile_bins:
-        df = df.drop(columns=[f"{col.pred_afrr_capacity_price_neg}_{q}"])
+        df = df.drop(columns=[f"{col.pred_afrr_activation_price_neg}_{q}"])
     out = bt.optimize_dispatch(df, col, strict_input_validation=False)
     p_pos = float(out.iloc[0]["ev_bem_bin_0_p_exec_pos"])
     p_neg = float(out.iloc[0]["ev_bem_bin_0_p_exec_neg"])
@@ -411,13 +457,13 @@ def test_bem_neg_uses_neg_side_execution_probability() -> None:
     assert float(pd.to_numeric(out["ev_pacc_neg_fallback_used"], errors="coerce").fillna(0.0).max()) > 0.0
 
 
-def test_strict_missing_active_capacity_quantile_fails() -> None:
+def test_strict_missing_active_activation_price_quantile_fails() -> None:
     bt = _mk_backtester()
     bt.afrr_quantile_bins = ["p30", "p50", "p70"]
     bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
     df, col = _tiny_df(hours=2)
-    df = df.drop(columns=[f"{col.pred_afrr_capacity_price_pos}_p70"])
-    with pytest.raises(ValueError, match="Missing required aFRR capacity quantile-bin inputs in strict mode"):
+    df = df.drop(columns=[f"{col.pred_afrr_activation_price_pos}_p70"])
+    with pytest.raises(ValueError, match="Missing required aFRR activation-price/rate quantile-bin inputs"):
         bt.optimize_dispatch(df, col, strict_input_validation=True)
 
 
@@ -426,7 +472,7 @@ def test_strict_nonfinite_active_bin_fails() -> None:
     bt.afrr_quantile_bins = ["p30", "p50", "p70"]
     bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
     df, col = _tiny_df(hours=2)
-    df.loc[0, f"{col.pred_afrr_capacity_price_pos}_p70"] = np.nan
+    df.loc[0, f"{col.pred_afrr_activation_price_pos}_p70"] = np.nan
     with pytest.raises(ValueError):
         bt.optimize_dispatch(df, col, strict_input_validation=True)
 
@@ -439,6 +485,7 @@ def test_ev_coefficient_matches_component_formula() -> None:
     out = bt.optimize_dispatch(df, col, strict_input_validation=True)
     row = out.iloc[0]
     b = 1  # p50 bin
+    assert float(row[f"ev_bcm_expected_capacity_revenue_pos_bin_{b}"]) == pytest.approx(0.0)
     bcm_ev = (
         float(row[f"ev_bcm_expected_capacity_revenue_pos_bin_{b}"])
         + float(row[f"ev_bcm_expected_activation_revenue_pos_bin_{b}"])

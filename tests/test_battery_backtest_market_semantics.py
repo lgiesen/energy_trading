@@ -2104,6 +2104,109 @@ def test_bem_neg_is_clipped_by_residual_charge_stack_with_bcm_and_da() -> None:
     assert str(guard["bem_only_headroom_guard_reason"]) == "power_stack_cap"
 
 
+def test_bem_neg_zero_when_locked_bcm_neg_uses_full_charge_stack() -> None:
+    bt = _mk_backtester("canonical_economic")
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=0.0,
+        desired_bem_only_neg_mw=10.0,
+        soc_start_mwh=10.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=10.0,
+        pred_act_pos=0.0,
+        pred_act_neg=100.0,
+    )
+    assert float(guard["submitted_bem_only_neg_mw"]) == pytest.approx(0.0)
+    assert float(guard["bem_only_power_stack_charge_residual_mw"]) == pytest.approx(0.0)
+    assert str(guard["bem_only_headroom_guard_reason"]) == "power_stack_cap"
+
+
+def test_bem_neg_uses_residual_charge_stack_after_partial_bcm_neg() -> None:
+    bt = _mk_backtester("canonical_economic")
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=0.0,
+        desired_bem_only_neg_mw=4.0,
+        soc_start_mwh=10.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=6.0,
+        pred_act_pos=0.0,
+        pred_act_neg=100.0,
+    )
+    stack = bt._compute_canonical_power_stack(
+        bcm_neg_obligation_mw=6.0,
+        bem_neg_mw=float(guard["submitted_bem_only_neg_mw"]),
+    )
+    assert float(guard["submitted_bem_only_neg_mw"]) == pytest.approx(4.0)
+    assert float(stack["charge_stack_mw"]) == pytest.approx(10.0)
+    assert float(stack["charge_stack_violation_mw"]) == pytest.approx(0.0)
+
+
+def test_bem_neg_clipped_when_partial_bcm_neg_leaves_less_residual_power() -> None:
+    bt = _mk_backtester("canonical_economic")
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=0.0,
+        desired_bem_only_neg_mw=5.0,
+        soc_start_mwh=10.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=6.0,
+        pred_act_pos=0.0,
+        pred_act_neg=100.0,
+    )
+    stack = bt._compute_canonical_power_stack(
+        bcm_neg_obligation_mw=6.0,
+        bem_neg_mw=float(guard["submitted_bem_only_neg_mw"]),
+    )
+    assert float(guard["submitted_bem_only_neg_mw"]) == pytest.approx(4.0)
+    assert str(guard["bem_only_headroom_guard_reason"]) == "power_stack_cap"
+    assert float(stack["charge_stack_mw"]) == pytest.approx(10.0)
+    assert float(stack["charge_stack_violation_mw"]) == pytest.approx(0.0)
+
+
+def test_optimizer_clips_independent_bem_neg_against_locked_bcm_neg() -> None:
+    bt = _mk_backtester("canonical_economic")
+    df, col = _one_hour_pred_df(
+        da=0.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos=0.0,
+        act_neg=1000.0,
+        rate_pos=0.0,
+        rate_neg=1.0,
+    )
+    ts = pd.to_datetime(df[col.timestamp].iloc[0], utc=True)
+    perms = StrategyPermissions(
+        allow_da=False,
+        id_mode="none",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=True,
+    )
+    out_full = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=10.0,
+        soc_end_min_target=None,
+        fixed_reserve_obligation={ts: (0.0, 10.0)},
+        allowed_markets=("aFRR", "BCM", "BEM"),
+        strategy_permissions=perms,
+    )
+    assert float(out_full["reserve_neg_mw"].iloc[0]) == pytest.approx(10.0)
+    assert float(out_full["bem_only_neg_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(out_full["power_stack_neg_mw"].iloc[0]) <= bt.p_max_mw + 1e-9
+
+    out_partial = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=10.0,
+        soc_end_min_target=None,
+        fixed_reserve_obligation={ts: (0.0, 6.0)},
+        allowed_markets=("aFRR", "BCM", "BEM"),
+        strategy_permissions=perms,
+    )
+    assert float(out_partial["reserve_neg_mw"].iloc[0]) == pytest.approx(6.0)
+    assert float(out_partial["bem_only_neg_mw"].iloc[0]) <= 4.0 + 1e-9
+    assert float(out_partial["power_stack_neg_mw"].iloc[0]) <= bt.p_max_mw + 1e-9
+
+
 def test_settlement_exports_canonical_power_stack_diagnostics() -> None:
     bt = _mk_backtester()
     _soc_next, out = bt._settle_one_hour(
@@ -3999,6 +4102,108 @@ def test_optimizer_id_is_in_power_stack() -> None:
         out["id_charge_mw"].to_numpy(dtype=float),
         atol=1e-6,
     )
+
+
+def test_technical_id_price_uses_da_not_activation_price() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _, m = bt._settle_one_hour(
+        soc=10.0,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=10_000.0,
+        act_neg_price=10_000.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=1.0,
+        id_discharge_mw=0.0,
+        id_recourse_reason_hint="terminal_soc_recovery",
+    )
+    assert float(m["id_buy_price_eur_mwh"]) == pytest.approx(50.0 + bt.id_rescue_spread_eur_mwh)
+    assert float(m["id_sell_price_eur_mwh"]) == pytest.approx(50.0 - bt.id_rescue_spread_eur_mwh)
+    assert m["id_price_source"] == "da_price_plus_spread"
+    assert float(m["id_da_reference_price_eur_mwh"]) == pytest.approx(50.0)
+    assert float(m["id_price_uses_activation_price"]) == pytest.approx(0.0)
+
+
+def test_technical_id_settlement_soc_uses_grid_mwh_times_eta_once() -> None:
+    bt = _mk_backtester()
+    soc0 = 10.0
+    soc1, m = bt._settle_one_hour(
+        soc=soc0,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=1.0,
+        id_discharge_mw=0.0,
+        id_recourse_reason_hint="terminal_soc_recovery",
+    )
+    expected = soc0 + bt.eta_in * float(m["id_buy_mwh"]) - float(m["aux_energy_mwh"])
+    assert float(m["id_buy_mwh"]) == pytest.approx(1.0 * bt.dt_h)
+    assert soc1 == pytest.approx(expected)
+
+
+def test_terminal_id_recovery_sizes_grid_buy_from_internal_shortfall_and_losses() -> None:
+    bt = _mk_backtester()
+    internal_shortfall = 0.16
+    remaining_losses = 0.04
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=9.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=10.0 - internal_shortfall,
+        remaining_known_losses_mwh=remaining_losses,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+    expected_internal = internal_shortfall + remaining_losses
+    assert reason == "terminal_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert id_charge * bt.dt_h == pytest.approx(expected_internal / bt.eta_in)
+    assert diag["terminal_soc_id_recourse_needed_internal_mwh"] == pytest.approx(expected_internal)
+    assert diag["terminal_soc_id_recourse_scheduled_grid_mwh"] == pytest.approx(expected_internal / bt.eta_in)
+    assert diag["terminal_soc_id_recourse_scheduled_internal_mwh"] == pytest.approx(expected_internal)
+
+
+def test_terminal_id_recovery_projection_updates_between_calls() -> None:
+    bt = _mk_backtester()
+    bt._plan_id_rescue_for_next_hour(
+        soc_next=9.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=9.8,
+    )
+    first = dict(bt._last_id_rescue_plan_diagnostics)
+    bt._plan_id_rescue_for_next_hour(
+        soc_next=9.3,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=9.95,
+    )
+    second = dict(bt._last_id_rescue_plan_diagnostics)
+    assert first["projected_terminal_soc_without_new_id_mwh"] == pytest.approx(9.8)
+    assert second["projected_terminal_soc_without_new_id_mwh"] == pytest.approx(9.95)
+    assert second["terminal_soc_id_recourse_needed_internal_mwh"] < first["terminal_soc_id_recourse_needed_internal_mwh"]
 
 
 def test_bcm_only_common_technical_id_passes_strategy_isolation() -> None:

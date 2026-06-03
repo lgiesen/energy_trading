@@ -11,11 +11,15 @@ from scripts import validate_simulation_outputs as validate_outputs
 def _write_scenario(
     root: Path,
     *,
+    strategy: str = "multi",
+    scenario: str = "p50_p50",
     realized: float = 100.0,
     rolling: float = 120.0,
     global_pf: float = 150.0,
     global_available: float = 1.0,
     global_verified: float = 1.0,
+    global_component_gap: dict[str, object] | None = None,
+    global_pf_failure_reason: str = "none",
     afrr: float = 30.0,
     bcm: float = 20.0,
     bem: float = 10.0,
@@ -23,12 +27,24 @@ def _write_scenario(
     hourly_bcm: float = 20.0,
     hourly_bem: float = 10.0,
     include_bcm_bem_same_hour_mwh: bool = False,
+    max_charge_stack: float = 8.0,
+    max_discharge_stack: float = 7.0,
+    max_charge_violation: float = 0.0,
+    max_discharge_violation: float = 0.0,
 ) -> Path:
-    scen = root / "multi" / "p50_p50"
+    scen = root / strategy / scenario
     scen.mkdir(parents=True, exist_ok=True)
+    component_gap_payload = global_component_gap or {
+        "bcm_capacity_revenue": {
+            "realized_eur": bcm,
+            "global_pf_eur": bcm + 10.0,
+            "global_pf_minus_realized_eur": 10.0,
+        }
+    }
     summary = {
         "model_key": "xgb",
-        "trading_strategy": "multi",
+        "trading_strategy": strategy,
+        "scenario": scenario,
         "simulation_valid": 1.0,
         "thesis_reportable": 1.0,
         "invalid_reason": "",
@@ -37,6 +53,12 @@ def _write_scenario(
         "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": global_pf,
         "global_perfect_foresight_available": global_available,
         "global_pf_verified_upper_bound": global_verified,
+        "global_pf_same_market_rules": global_verified,
+        "global_pf_realized_path_incumbent_eur": realized,
+        "global_pf_solution_eur": global_pf,
+        "global_pf_minus_realized_incumbent_eur": global_pf - realized,
+        "global_pf_component_gap_json": json.dumps(component_gap_payload, sort_keys=True),
+        "global_pf_failure_reason": global_pf_failure_reason,
         "activation_split_reconciliation_error_max": abs(hourly_activation - hourly_bcm - hourly_bem),
     }
     (scen / "backtest_summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -53,6 +75,10 @@ def _write_scenario(
         "real_revenue_activation_eur": [hourly_activation],
         "real_bcm_linked_activation_revenue_eur": [hourly_bcm],
         "real_bem_only_activation_revenue_eur": [hourly_bem],
+        "real_power_stack_charge_mw": [max_charge_stack],
+        "real_power_stack_discharge_mw": [max_discharge_stack],
+        "real_power_violation_charge_mw": [max_charge_violation],
+        "real_power_violation_discharge_mw": [max_discharge_violation],
     }
     if include_bcm_bem_same_hour_mwh:
         hourly.update(
@@ -150,3 +176,84 @@ def test_bcm_and_bem_same_hour_activation_split_is_source_revenue_based(tmp_path
     row = _report(tmp_path)
     assert float(row["activation_split_pass"]) == 1.0
     assert float(row["afrr_decomposition_pass"]) == 1.0
+
+
+def test_validation_collect_reports_exact_summary_paths_and_power_stack(tmp_path: Path) -> None:
+    first = _write_scenario(
+        tmp_path,
+        strategy="multi",
+        scenario="p50_p50",
+        max_charge_stack=10.0,
+        max_discharge_stack=9.5,
+        max_charge_violation=0.0,
+        max_discharge_violation=0.0,
+    )
+    second = _write_scenario(
+        tmp_path,
+        strategy="bcm_only",
+        scenario="p10_p10",
+        realized=80.0,
+        rolling=90.0,
+        global_pf=100.0,
+        max_charge_stack=8.0,
+        max_discharge_stack=10.0,
+        max_charge_violation=0.0,
+        max_discharge_violation=0.25,
+    )
+    other_root = tmp_path.parent / f"{tmp_path.name}_other"
+    _write_scenario(other_root, strategy="multi", scenario="p90_p90")
+
+    df = validate_outputs._collect(tmp_path).sort_values("quantile_pair").reset_index(drop=True)
+
+    assert set(df["summary_file_path"]) == {
+        str(first / "backtest_summary.json"),
+        str(second / "backtest_summary.json"),
+    }
+    assert set(df["quantile_pair"]) == {"p10_p10", "p50_p50"}
+    assert set(df["strategy"]) == {"bcm_only", "multi"}
+    assert float(df.loc[df["quantile_pair"].eq("p50_p50"), "max_real_power_stack_charge_mw"].iloc[0]) == 10.0
+    assert float(df.loc[df["quantile_pair"].eq("p10_p10"), "max_real_power_violation_discharge_mw"].iloc[0]) == 0.25
+
+
+def test_validation_collect_surfaces_global_pf_component_gap(tmp_path: Path) -> None:
+    gap = {
+        "bcm_capacity_revenue": {
+            "realized_eur": 100.0,
+            "global_pf_eur": 0.0,
+            "global_pf_minus_realized_eur": -100.0,
+        }
+    }
+    _write_scenario(
+        tmp_path,
+        realized=150.0,
+        rolling=140.0,
+        global_pf=120.0,
+        global_verified=0.0,
+        global_component_gap=gap,
+        global_pf_failure_reason="below_realized_incumbent",
+    )
+
+    row = validate_outputs._collect(tmp_path).iloc[0]
+    parsed = json.loads(str(row["global_pf_component_gap_json"]))
+
+    assert str(row["global_pf_failure_reason"]) == "below_realized_incumbent"
+    assert float(row["global_pf_minus_realized_incumbent_eur"]) == -30.0
+    assert parsed["bcm_capacity_revenue"]["global_pf_minus_realized_eur"] == -100.0
+
+
+def test_clean_power_stack_still_fails_pnl_report_when_global_pf_unverified(tmp_path: Path) -> None:
+    _write_scenario(
+        tmp_path,
+        realized=100.0,
+        rolling=120.0,
+        global_pf=150.0,
+        global_available=1.0,
+        global_verified=0.0,
+        max_charge_violation=0.0,
+        max_discharge_violation=0.0,
+    )
+
+    row = _report(tmp_path, require_pnl=True, require_afrr=False)
+
+    assert float(row["pnl_hierarchy_pass"]) == 0.0
+    assert "global_pf_unverified" in str(row["invalid_reason_added"])

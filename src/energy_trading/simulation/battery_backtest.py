@@ -1506,8 +1506,14 @@ class BatteryBacktester:
                 min_soc = min(min_soc, float(soc))
                 max_soc = max(max_soc, float(soc))
                 aux_total += float(aux_mwh)
-                power_violation_pos = max(power_violation_pos, max(0.0, float(dis_mw) + ob_pos - float(self.p_max_mw)))
-                power_violation_neg = max(power_violation_neg, max(0.0, float(ch_mw) + ob_neg - float(self.p_max_mw)))
+                stack = self._compute_canonical_power_stack(
+                    da_charge_mw=float(ch_mw),
+                    da_discharge_mw=float(dis_mw),
+                    bcm_pos_obligation_mw=float(ob_pos),
+                    bcm_neg_obligation_mw=float(ob_neg),
+                )
+                power_violation_pos = max(power_violation_pos, float(stack["discharge_stack_violation_mw"]))
+                power_violation_neg = max(power_violation_neg, float(stack["charge_stack_violation_mw"]))
                 if ob_pos > 1e-9:
                     protected_min = (
                         float(self.soc_min)
@@ -1821,7 +1827,7 @@ class BatteryBacktester:
                 id_discharge = 0.0
                 if soc_now < protected_min - 1e-9 and id_allowed:
                     need = protected_min - soc_now
-                    stack_without_id = self._compute_power_stack_components(
+                    stack_without_id = self._compute_canonical_power_stack(
                         da_charge_mw=ch_mw,
                         da_discharge_mw=dis_mw,
                         id_buy_mw=0.0,
@@ -1840,7 +1846,7 @@ class BatteryBacktester:
                     soc_now += id_charge * float(self.dt_h) * float(self.eta_in)
                 if soc_now > protected_max + 1e-9 and id_allowed:
                     need = soc_now - protected_max
-                    stack_without_id = self._compute_power_stack_components(
+                    stack_without_id = self._compute_canonical_power_stack(
                         da_charge_mw=ch_mw,
                         da_discharge_mw=dis_mw,
                         id_buy_mw=0.0,
@@ -1855,7 +1861,7 @@ class BatteryBacktester:
                         need * max(float(self.eta_out), 1e-12) / max(float(self.dt_h), 1e-12),
                     )
                     soc_now -= id_discharge * float(self.dt_h) / max(float(self.eta_out), 1e-12)
-                stack = self._compute_power_stack_components(
+                stack = self._compute_canonical_power_stack(
                     da_charge_mw=ch_mw,
                     da_discharge_mw=dis_mw,
                     id_buy_mw=id_charge,
@@ -2290,7 +2296,7 @@ class BatteryBacktester:
         if strict_input_validation and missing_bin_cols:
             uniq = sorted(set(missing_bin_cols))
             raise ValueError(
-                "Missing required aFRR quantile-bin inputs in strict mode. "
+                "Missing required aFRR activation-price/rate quantile-bin inputs in strict mode. "
                 f"missing_columns={uniq[:40]}"
             )
         # Non-strict fallback remains explicit and deterministic.
@@ -2327,10 +2333,10 @@ class BatteryBacktester:
                 f"Fix data pipeline. bad_columns={bad_inputs}"
             )
 
-        # Dynamic quantile bidding:
-        # - regular mode: bin price = predicted quantile value, p_acc = 1-q
-        # - deterministic/perfect_foresight mode: collapse uncertainty, use point capacity
-        #   prices for every bin and set p_acc=1.0.
+        # BCM is modeled as a day-ahead activation-price preselection for BEM:
+        # bids are activation/energy prices, not capacity-price offers. The old
+        # variable names are kept for API compatibility, but these bin prices
+        # are activation bid prices and carry no capacity remuneration.
         p_acc_cap_pos = np.zeros((n, n_bins), dtype=float)
         p_acc_cap_neg = np.zeros((n, n_bins), dtype=float)
         cap_price_pos_by_bin = np.zeros((n, n_bins), dtype=float)
@@ -2338,18 +2344,18 @@ class BatteryBacktester:
         pacc_pos_fallback_used = np.zeros(n, dtype=float)
         pacc_neg_fallback_used = np.zeros(n, dtype=float)
         if deterministic_reserve_settlement:
-            base_cap_pos = self._finite_numeric_series(
+            base_act_pos = self._finite_numeric_series(
                 df,
-                colmap.pred_afrr_capacity_price_pos,
-                fallback_cols=[colmap.pred_afrr_capacity_price_neg],
+                colmap.pred_afrr_activation_price_pos,
+                fallback_cols=[colmap.pred_afrr_activation_price_neg],
                 default=0.0,
                 strict_non_null=True,
                 allow_temporal_fill=False,
             ).to_numpy(dtype=float)
-            base_cap_neg = self._finite_numeric_series(
+            base_act_neg = self._finite_numeric_series(
                 df,
-                colmap.pred_afrr_capacity_price_neg,
-                fallback_cols=[colmap.pred_afrr_capacity_price_pos],
+                colmap.pred_afrr_activation_price_neg,
+                fallback_cols=[colmap.pred_afrr_activation_price_pos],
                 default=0.0,
                 strict_non_null=True,
                 allow_temporal_fill=False,
@@ -2357,12 +2363,12 @@ class BatteryBacktester:
             for b in range(n_bins):
                 p_acc_cap_pos[:, b] = 1.0
                 p_acc_cap_neg[:, b] = 1.0
-                cap_price_pos_by_bin[:, b] = base_cap_pos
-                cap_price_neg_by_bin[:, b] = base_cap_neg
+                cap_price_pos_by_bin[:, b] = base_act_pos
+                cap_price_neg_by_bin[:, b] = base_act_neg
         else:
             fallback_decay = 0.7
-            pos_quant_cols = [f"{colmap.pred_afrr_capacity_price_pos}_{q}" for q in self.afrr_quantile_bins]
-            neg_quant_cols = [f"{colmap.pred_afrr_capacity_price_neg}_{q}" for q in self.afrr_quantile_bins]
+            pos_quant_cols = [f"{colmap.pred_afrr_activation_price_pos}_{q}" for q in self.afrr_quantile_bins]
+            neg_quant_cols = [f"{colmap.pred_afrr_activation_price_neg}_{q}" for q in self.afrr_quantile_bins]
             pos_quant_struct_missing = any(c not in df.columns for c in pos_quant_cols)
             neg_quant_struct_missing = any(c not in df.columns for c in neg_quant_cols)
             if strict_input_validation and (pos_quant_struct_missing or neg_quant_struct_missing):
@@ -2372,7 +2378,7 @@ class BatteryBacktester:
                 if neg_quant_struct_missing:
                     missing_cap_cols.extend([c for c in neg_quant_cols if c not in df.columns])
                 raise ValueError(
-                    "Missing required aFRR capacity quantile-bin inputs in strict mode. "
+                    "Missing required aFRR activation-price quantile-bin inputs for BCM in strict mode. "
                     f"missing_columns={sorted(set(missing_cap_cols))}"
                 )
 
@@ -2381,8 +2387,8 @@ class BatteryBacktester:
                 pacc_const = max(0.0, min(1.0, 1.0 - q_level))
                 p_acc_cap_pos[:, b] = pacc_const
                 p_acc_cap_neg[:, b] = pacc_const
-                c_pos = f"{colmap.pred_afrr_capacity_price_pos}_{qcol}"
-                c_neg = f"{colmap.pred_afrr_capacity_price_neg}_{qcol}"
+                c_pos = f"{colmap.pred_afrr_activation_price_pos}_{qcol}"
+                c_neg = f"{colmap.pred_afrr_activation_price_neg}_{qcol}"
                 if c_pos in df.columns:
                     cap_price_pos_by_bin[:, b] = pd.to_numeric(df[c_pos], errors="coerce").to_numpy(dtype=float)
                 else:
@@ -2394,14 +2400,22 @@ class BatteryBacktester:
 
             mid_pos = self._finite_numeric_series(
                 df,
-                f"{colmap.pred_afrr_capacity_price_pos}_p50",
-                fallback_cols=[colmap.pred_afrr_capacity_price_pos, f"{colmap.pred_afrr_capacity_price_neg}_p50", colmap.pred_afrr_capacity_price_neg],
+                f"{colmap.pred_afrr_activation_price_pos}_p50",
+                fallback_cols=[
+                    colmap.pred_afrr_activation_price_pos,
+                    f"{colmap.pred_afrr_activation_price_neg}_p50",
+                    colmap.pred_afrr_activation_price_neg,
+                ],
                 default=0.0,
             ).to_numpy(dtype=float)
             mid_neg = self._finite_numeric_series(
                 df,
-                f"{colmap.pred_afrr_capacity_price_neg}_p50",
-                fallback_cols=[colmap.pred_afrr_capacity_price_neg, f"{colmap.pred_afrr_capacity_price_pos}_p50", colmap.pred_afrr_capacity_price_pos],
+                f"{colmap.pred_afrr_activation_price_neg}_p50",
+                fallback_cols=[
+                    colmap.pred_afrr_activation_price_neg,
+                    f"{colmap.pred_afrr_activation_price_pos}_p50",
+                    colmap.pred_afrr_activation_price_pos,
+                ],
                 default=0.0,
             ).to_numpy(dtype=float)
             mid_bin = self.afrr_quantile_bins.index("p50") if "p50" in self.afrr_quantile_bins else n_bins // 2
@@ -2415,7 +2429,7 @@ class BatteryBacktester:
                         p_acc_cap_pos[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
                 elif not have_pos:
                     raise ValueError(
-                        "NaN detected in aFRR positive quantile capacity prices although quantile columns "
+                        "NaN detected in aFRR positive activation-price quantiles although quantile columns "
                         "exist. Fallback is only allowed for structurally missing quantile columns."
                     )
                 if neg_quant_struct_missing:
@@ -2425,7 +2439,7 @@ class BatteryBacktester:
                         p_acc_cap_neg[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
                 elif not have_neg:
                     raise ValueError(
-                        "NaN detected in aFRR negative quantile capacity prices although quantile columns "
+                        "NaN detected in aFRR negative activation-price quantiles although quantile columns "
                         "exist. Fallback is only allowed for structurally missing quantile columns."
                     )
 
@@ -2539,8 +2553,8 @@ class BatteryBacktester:
                 )
                 * p_da
             )
-            bcm_cap_rev_pos = p_acc_cap_pos[:, b] * cap_price_pos_by_bin[:, b]
-            bcm_cap_rev_neg = p_acc_cap_neg[:, b] * cap_price_neg_by_bin[:, b]
+            bcm_cap_rev_pos = np.zeros(n, dtype=float)
+            bcm_cap_rev_neg = np.zeros(n, dtype=float)
             bcm_act_margin_pos = (
                 act_price_pos_by_bin[:, b]
                 - self.trans_eur_mwh
@@ -3359,6 +3373,7 @@ class BatteryBacktester:
             else np.zeros(n, dtype=float)
         )
         terminal_id_internal_mwh = self.eta_in * id_charge_mw * self.dt_h
+        terminal_id_grid_mwh = id_charge_mw * self.dt_h
         id_reason = np.where(
             id_charge_mw > 1e-9,
             np.where(terminal_need > 1e-9, "terminal_soc_recovery", "protected_soc_recovery"),
@@ -3387,9 +3402,17 @@ class BatteryBacktester:
                 "projected_terminal_soc_without_id_mwh": projected_terminal_without_id,
                 "projected_terminal_soc_with_id_mwh": soc_lp,
                 "terminal_soc_id_recourse_needed_mwh": terminal_need,
-                "terminal_soc_id_recourse_scheduled_mwh": terminal_id_internal_mwh,
+                "terminal_soc_id_recourse_scheduled_mwh": terminal_id_grid_mwh,
+                "terminal_soc_id_recourse_scheduled_grid_mwh": terminal_id_grid_mwh,
+                "terminal_soc_id_recourse_scheduled_internal_mwh": terminal_id_internal_mwh,
                 "terminal_soc_id_recourse_cost_eur": id_charge_mw * self.dt_h * id_buy_price,
                 "id_recourse_reason": id_reason,
+                "id_price_source": np.full(n, "da_price_plus_spread", dtype=object),
+                "id_da_reference_price_eur_mwh": p_da,
+                "id_spread_eur_mwh": np.full(n, float(self.id_rescue_spread_eur_mwh), dtype=float),
+                "id_buy_price_eur_mwh": id_buy_price,
+                "id_sell_price_eur_mwh": id_sell_price,
+                "id_price_uses_activation_price": np.zeros(n, dtype=float),
                 "reserve_activation_headroom_h": np.full(n, self.reserve_activation_headroom_h, dtype=float),
                 "bem_activation_headroom_h": np.full(n, self.bem_activation_headroom_h, dtype=float),
             }
@@ -3639,7 +3662,7 @@ class BatteryBacktester:
         da_discharge = float(discharge if da_discharge_mw is None else da_discharge_mw)
         id_charge = max(0.0, float(id_charge_mw))
         id_discharge = max(0.0, float(id_discharge_mw))
-        stack_without_id = self._compute_power_stack_components(
+        stack_without_id = self._compute_canonical_power_stack(
             da_charge_mw=da_charge,
             da_discharge_mw=da_discharge,
             id_buy_mw=0.0,
@@ -3671,7 +3694,7 @@ class BatteryBacktester:
                     min(
                         add_id_charge_mw,
                         float(
-                            self._compute_power_stack_components(
+                            self._compute_canonical_power_stack(
                                 da_charge_mw=da_charge,
                                 da_discharge_mw=da_discharge,
                                 id_buy_mw=id_charge,
@@ -3692,7 +3715,7 @@ class BatteryBacktester:
                     min(
                         add_id_discharge_mw,
                         float(
-                            self._compute_power_stack_components(
+                            self._compute_canonical_power_stack(
                                 da_charge_mw=da_charge,
                                 da_discharge_mw=da_discharge,
                                 id_buy_mw=0.0,
@@ -3792,14 +3815,16 @@ class BatteryBacktester:
         # Settlement cashflows.
         da_buy_grid = da_ch_internal / self.eta_in
         da_sell_grid = da_dis_internal * self.eta_out
-        id_buy_mwh = id_ch_internal / self.eta_in
-        id_sell_mwh = id_dis_internal * self.eta_out
+        # ID setpoints are grid-side MW. Therefore realized ID MWh are grid-side
+        # volumes and SoC changes by eta_in * buy_mwh / sell_mwh / eta_out.
+        id_buy_mwh = id_ch_internal
+        id_sell_mwh = id_dis_internal
         id_repair_mwh = id_buy_mwh + id_sell_mwh
         settled_charge_mw = da_ch_internal / max(self.dt_h, 1e-12)
         settled_discharge_mw = da_dis_internal / max(self.dt_h, 1e-12)
         settled_id_charge_mw = id_ch_internal / max(self.dt_h, 1e-12)
         settled_id_discharge_mw = id_dis_internal / max(self.dt_h, 1e-12)
-        final_stack = self._compute_power_stack_components(
+        final_stack = self._compute_canonical_power_stack(
             da_charge_mw=settled_charge_mw,
             da_discharge_mw=settled_discharge_mw,
             id_buy_mw=settled_id_charge_mw,
@@ -3856,7 +3881,7 @@ class BatteryBacktester:
             (self.soc_max - soc_for_capacity)
             / max(self.eta_in * self.reserve_activation_headroom_h, 1e-12),
         )
-        stack_without_reserve = self._compute_power_stack_components(
+        stack_without_reserve = self._compute_canonical_power_stack(
             da_charge_mw=da_charge,
             da_discharge_mw=da_discharge,
             id_buy_mw=id_charge,
@@ -3871,16 +3896,12 @@ class BatteryBacktester:
         delivered_capacity_pos_mw = max(0.0, reserve_pos - missed_capacity_pos_mw)
         delivered_capacity_neg_mw = max(0.0, reserve_neg - missed_capacity_neg_mw)
 
-        # Capacity remuneration must follow pay-as-bid:
-        # awarded_MW * submitted_capacity_bid_price * dt_h.
+        # BCM is modeled as a day-ahead activation-price preselection for BEM,
+        # not as a capacity-remunerated product. Awarded BCM MW only create
+        # activation eligibility; revenue is paid later on delivered activation.
         cap_pos_settlement = float(cap_pos if cap_bid_pos is None else cap_bid_pos)
         cap_neg_settlement = float(cap_neg if cap_bid_neg is None else cap_bid_neg)
-        # Capacity remuneration is paid for awarded capacity (market award),
-        # not for physically activated energy. Non-delivery is handled via penalties.
-        rev_cap = (
-            reserve_pos * cap_pos_settlement * self.dt_h
-            + reserve_neg * cap_neg_settlement * self.dt_h
-        )
+        rev_cap = 0.0
 
         # Activation revenue is paid on delivered activation energy. We still avoid
         # double counting by not adding synthetic internal energy replacement costs
@@ -4035,6 +4056,10 @@ class BatteryBacktester:
             "power_stack_bcm_pos_mw": float(stack_components["bcm_pos_obligation_mw"]),
             "id_buy_price_eur_mwh": float(id_buy_price_eur_mwh),
             "id_sell_price_eur_mwh": float(id_sell_price_eur_mwh),
+            "id_price_source": "da_price_plus_spread",
+            "id_da_reference_price_eur_mwh": float(da_price),
+            "id_spread_eur_mwh": float(self.id_rescue_spread_eur_mwh),
+            "id_price_uses_activation_price": 0.0,
             "revenue_id_eur": revenue_id_eur,
             "cost_id_eur": cost_id_eur,
             "id_revenue_eur": revenue_id_eur,
@@ -4152,11 +4177,34 @@ class BatteryBacktester:
         reserve_neg_next_mw: float,
         da_charge_next_mw: float,
         da_discharge_next_mw: float,
+        terminal_soc_target_mwh: float | None = None,
+        projected_terminal_soc_without_new_id_mwh: float | None = None,
+        remaining_known_losses_mwh: float = 0.0,
+        terminal_soc_safety_margin_mwh: float = 0.0,
     ) -> tuple[float, float, str]:
         """Compute ID rescue setpoints decided at t for execution in t+1."""
         id_charge = 0.0
         id_discharge = 0.0
         reason = "none"
+        self._last_id_rescue_plan_diagnostics = {
+            "terminal_soc_projection_base_soc_mwh": float(soc_next),
+            "terminal_soc_projection_remaining_losses_mwh": float(max(0.0, remaining_known_losses_mwh)),
+            "terminal_soc_projection_existing_scheduled_id_mwh": 0.0,
+            "projected_terminal_soc_without_new_id_mwh": float(
+                soc_next
+                if projected_terminal_soc_without_new_id_mwh is None
+                else projected_terminal_soc_without_new_id_mwh
+            ),
+            "projected_terminal_soc_with_new_id_mwh": float(
+                soc_next
+                if projected_terminal_soc_without_new_id_mwh is None
+                else projected_terminal_soc_without_new_id_mwh
+            ),
+            "terminal_soc_id_recourse_needed_internal_mwh": 0.0,
+            "terminal_soc_id_recourse_scheduled_grid_mwh": 0.0,
+            "terminal_soc_id_recourse_scheduled_internal_mwh": 0.0,
+            "terminal_soc_not_recoverable_with_id": 0.0,
+        }
         req_soc_min_for_pos = (
             self.soc_min
             + (max(0.0, reserve_pos_next_mw) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
@@ -4172,7 +4220,7 @@ class BatteryBacktester:
             needed_internal_charge_mwh = soc_gap_up / max(self.eta_in, 1e-12)
             needed_charge_mw = needed_internal_charge_mwh / max(self.dt_h, 1e-12)
             residual_charge_mw = float(
-                self._compute_power_stack_components(
+                self._compute_canonical_power_stack(
                     da_charge_mw=da_charge_next_mw,
                     da_discharge_mw=da_discharge_next_mw,
                     bcm_neg_obligation_mw=reserve_neg_next_mw,
@@ -4186,7 +4234,7 @@ class BatteryBacktester:
             needed_internal_discharge_mwh = soc_gap_down * self.eta_out
             needed_discharge_mw = needed_internal_discharge_mwh / max(self.dt_h, 1e-12)
             residual_discharge_mw = float(
-                self._compute_power_stack_components(
+                self._compute_canonical_power_stack(
                     da_charge_mw=da_charge_next_mw,
                     da_discharge_mw=da_discharge_next_mw,
                     bcm_neg_obligation_mw=reserve_neg_next_mw,
@@ -4195,6 +4243,56 @@ class BatteryBacktester:
             )
             id_discharge = max(0.0, min(needed_discharge_mw, residual_discharge_mw))
             reason = "afrr_headroom_repair" if reserve_neg_next_mw > 1e-12 else "soc_max_repair"
+        if (
+            terminal_soc_target_mwh is not None
+            and np.isfinite(float(terminal_soc_target_mwh))
+            and id_discharge <= 1e-12
+        ):
+            projected_without = float(
+                soc_next
+                if projected_terminal_soc_without_new_id_mwh is None
+                else projected_terminal_soc_without_new_id_mwh
+            )
+            terminal_need_internal = max(
+                0.0,
+                float(terminal_soc_target_mwh)
+                + max(0.0, float(remaining_known_losses_mwh))
+                + max(0.0, float(terminal_soc_safety_margin_mwh))
+                - projected_without,
+            )
+            if terminal_need_internal > 1e-9:
+                residual_charge_mw = float(
+                    self._compute_canonical_power_stack(
+                        da_charge_mw=da_charge_next_mw,
+                        da_discharge_mw=da_discharge_next_mw,
+                        id_buy_mw=id_charge,
+                        id_sell_mw=0.0,
+                        bcm_neg_obligation_mw=reserve_neg_next_mw,
+                        bcm_pos_obligation_mw=reserve_pos_next_mw,
+                    )["charge_residual_mw"]
+                )
+                room_to_soc_max_internal = max(0.0, self.soc_max - float(soc_next))
+                sched_internal = min(
+                    terminal_need_internal,
+                    room_to_soc_max_internal,
+                    max(0.0, residual_charge_mw) * self.dt_h * max(self.eta_in, 1e-12),
+                )
+                add_id_charge_mw = sched_internal / max(self.eta_in * self.dt_h, 1e-12)
+                id_charge += max(0.0, add_id_charge_mw)
+                reason = "terminal_soc_recovery"
+                self._last_id_rescue_plan_diagnostics.update(
+                    {
+                        "terminal_soc_id_recourse_needed_internal_mwh": float(terminal_need_internal),
+                        "terminal_soc_id_recourse_scheduled_grid_mwh": float(
+                            max(0.0, add_id_charge_mw) * self.dt_h
+                        ),
+                        "terminal_soc_id_recourse_scheduled_internal_mwh": float(sched_internal),
+                        "projected_terminal_soc_with_new_id_mwh": float(projected_without + sched_internal),
+                        "terminal_soc_not_recoverable_with_id": float(
+                            sched_internal + 1e-9 < terminal_need_internal
+                        ),
+                    }
+                )
         return float(id_charge), float(id_discharge), str(reason)
 
     def _apply_bem_only_submission_guard(
@@ -4239,7 +4337,7 @@ class BatteryBacktester:
             (protected_soc_max_mwh - soc_start - self.bem_only_headroom_safety_mwh)
             / max(self.eta_in * self.bem_activation_headroom_h, 1e-12),
         )
-        residual_stack = self._compute_power_stack_components(
+        residual_stack = self._compute_canonical_power_stack(
             da_charge_mw=da_charge_mw,
             da_discharge_mw=da_discharge_mw,
             id_buy_mw=id_charge_mw,
@@ -5302,12 +5400,20 @@ class BatteryBacktester:
                         return pd.to_numeric(src_blk[name], errors="coerce").fillna(0.0)
                     return pd.Series(0.0, index=src_blk.index, dtype=float)
 
-                pred_cap_pos_blk = float(_src_series(colmap.pred_afrr_capacity_price_pos).mean())
-                pred_cap_neg_blk = float(_src_series(colmap.pred_afrr_capacity_price_neg).mean())
-                if not np.isfinite(pred_cap_pos_blk):
-                    pred_cap_pos_blk = 0.0
-                if not np.isfinite(pred_cap_neg_blk):
-                    pred_cap_neg_blk = 0.0
+                pred_act_pos_blk = float(_src_series(colmap.pred_afrr_activation_price_pos).mean())
+                pred_act_neg_blk = float(_src_series(colmap.pred_afrr_activation_price_neg).mean())
+                pred_rate_pos_blk = float(_src_series(colmap.pred_afrr_activation_rate_pos).mean())
+                pred_rate_neg_blk = float(_src_series(colmap.pred_afrr_activation_rate_neg).mean())
+                if not np.isfinite(pred_act_pos_blk):
+                    pred_act_pos_blk = 0.0
+                if not np.isfinite(pred_act_neg_blk):
+                    pred_act_neg_blk = 0.0
+                if not np.isfinite(pred_rate_pos_blk):
+                    pred_rate_pos_blk = 0.0
+                if not np.isfinite(pred_rate_neg_blk):
+                    pred_rate_neg_blk = 0.0
+                pred_rate_pos_blk = float(np.clip(pred_rate_pos_blk, 0.0, 1.0))
+                pred_rate_neg_blk = float(np.clip(pred_rate_neg_blk, 0.0, 1.0))
                 pred_da_blk = _src_series(colmap.pred_da_price)
                 recharge_price_eur_mwh = float(max(0.0, float(pred_da_blk.mean()) if len(pred_da_blk) else 0.0))
                 opp_price_eur_mwh = float(max(0.0, float(pred_da_blk.quantile(0.75)) if len(pred_da_blk) else recharge_price_eur_mwh))
@@ -5338,9 +5444,20 @@ class BatteryBacktester:
                     reserved_headroom_mwh_block * opp_price_eur_mwh
                 )
                 block_hours = float(len(blk) * self.dt_h)
+                act_value_neg_blk = float(self._neg_activation_provider_value(pred_act_neg_blk))
+                bcm_margin_pos_blk = float(
+                    pred_act_pos_blk
+                    - self.trans_eur_mwh
+                    - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
+                )
+                bcm_margin_neg_blk = float(
+                    act_value_neg_blk
+                    - self.trans_eur_mwh
+                    - (self.deg_eur_mwh * self.eta_in)
+                )
                 expected_capacity_ev_eur = float(
-                    float(offered_pos) * pred_cap_pos_blk * block_hours
-                    + float(offered_neg) * pred_cap_neg_blk * block_hours
+                    float(offered_pos) * pred_rate_pos_blk * bcm_margin_pos_blk * block_hours
+                    + float(offered_neg) * pred_rate_neg_blk * bcm_margin_neg_blk * block_hours
                 )
                 precommit_net_capacity_ev_after_headroom_cost_eur = float(
                     expected_capacity_ev_eur
@@ -5909,18 +6026,27 @@ class BatteryBacktester:
         source: pd.DataFrame,
         colmap: BacktestColumnMap,
     ):
-        """Isolated aFRR capacity auction: submitted bids vs realized clearing prices."""
+        """BCM preselection auction: submitted activation-price bids vs realized activation prices."""
         sblk = source.reindex(ts_idx).copy()
         true_cap_pos = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_pos), errors="coerce").mean())
         true_cap_neg = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_neg), errors="coerce").mean())
+        true_act_pos = float(pd.to_numeric(sblk.get(colmap.true_afrr_activation_price_pos), errors="coerce").mean())
+        true_act_neg = float(pd.to_numeric(sblk.get(colmap.true_afrr_activation_price_neg), errors="coerce").mean())
         if not np.isfinite(true_cap_pos):
             true_cap_pos = 0.0
         if not np.isfinite(true_cap_neg):
             true_cap_neg = 0.0
+        if not np.isfinite(true_act_pos):
+            true_act_pos = 0.0
+        if not np.isfinite(true_act_neg):
+            true_act_neg = 0.0
         return self.market_clearing_engine.clear_afrr_capacity(
             cap_bids,
             true_cap_pos=true_cap_pos,
             true_cap_neg=true_cap_neg,
+            true_act_pos=true_act_pos,
+            true_act_neg=true_act_neg,
+            clearing_price_basis="activation_price",
         )
 
     def optimize_dispatch_rolling(
@@ -7531,9 +7657,11 @@ class BatteryBacktester:
                 )
                 clearing_records[-1]["pending_id_charge_mw"] = float(pending_id_charge_mw)
                 clearing_records[-1]["pending_id_discharge_mw"] = float(pending_id_discharge_mw)
-                clearing_records[-1]["pending_id_buy_mwh"] = float(pending_id_charge_mw * self.dt_h / max(self.eta_in, 1e-12))
-                clearing_records[-1]["pending_id_sell_mwh"] = float(pending_id_discharge_mw * self.dt_h * self.eta_out)
+                clearing_records[-1]["pending_id_buy_mwh"] = float(pending_id_charge_mw * self.dt_h)
+                clearing_records[-1]["pending_id_sell_mwh"] = float(pending_id_discharge_mw * self.dt_h)
                 clearing_records[-1]["pending_id_recourse_reason"] = str(pending_id_reason)
+                for diag_key, diag_value in getattr(self, "_last_id_rescue_plan_diagnostics", {}).items():
+                    clearing_records[-1][diag_key] = diag_value
                 executed_soc_vals.append(float(executed_s))
                 shock_sources: list[str] = []
                 if float(cleared.get("submitted_da_buy_mw", 0.0)) > 0 and not bool(cleared.get("da_buy_accepted", 0.0)):
@@ -7563,17 +7691,59 @@ class BatteryBacktester:
                     next_ob_neg = float(afrr_cap_neg_lockbook.get(next_ts, 0.0)) if pd.notna(next_ts) else 0.0
                     reserve_pos_next = max(next_reserve_pos_plan, next_ob_pos)
                     reserve_neg_next = max(next_reserve_neg_plan, next_ob_neg)
+                    projected_terminal_without_new_id = float(executed_s)
+                    remaining_known_losses_mwh = 0.0
+                    for fut_idx in range(next_idx, len(take)):
+                        fut = take.iloc[fut_idx]
+                        fut_ts = pd.to_datetime(fut[colmap.timestamp], utc=True, errors="coerce")
+                        fut_charge = float(pd.to_numeric(pd.Series([fut.get("charge_mw", 0.0)]), errors="coerce").iloc[0])
+                        fut_discharge = float(pd.to_numeric(pd.Series([fut.get("discharge_mw", 0.0)]), errors="coerce").iloc[0])
+                        fut_res_pos = max(
+                            float(pd.to_numeric(pd.Series([fut.get("reserve_pos_mw", 0.0)]), errors="coerce").iloc[0]),
+                            float(afrr_cap_pos_lockbook.get(fut_ts, 0.0)) if pd.notna(fut_ts) else 0.0,
+                        )
+                        fut_res_neg = max(
+                            float(pd.to_numeric(pd.Series([fut.get("reserve_neg_mw", 0.0)]), errors="coerce").iloc[0]),
+                            float(afrr_cap_neg_lockbook.get(fut_ts, 0.0)) if pd.notna(fut_ts) else 0.0,
+                        )
+                        fut_rate_pos = float(pd.to_numeric(pd.Series([fut.get(colmap.true_afrr_activation_rate_pos, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                        fut_rate_neg = float(pd.to_numeric(pd.Series([fut.get(colmap.true_afrr_activation_rate_neg, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                        fut_aux_power = float(pd.to_numeric(pd.Series([fut.get("aux_power_mw", self.aux_off_mw)]), errors="coerce").fillna(self.aux_off_mw).iloc[0])
+                        fut_aux_mwh = max(0.0, fut_aux_power) * self.dt_h
+                        remaining_known_losses_mwh += fut_aux_mwh
+                        delta, _ = self._calculate_soc_delta(
+                            charge_mw=fut_charge,
+                            discharge_mw=fut_discharge,
+                            id_charge_mw=0.0,
+                            id_discharge_mw=0.0,
+                            act_pos_mwh=max(0.0, fut_rate_pos) * fut_res_pos * self.dt_h,
+                            act_neg_mwh=max(0.0, fut_rate_neg) * fut_res_neg * self.dt_h,
+                            aux_mwh=0.0,
+                            battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                            dt_h=self.dt_h,
+                        )
+                        projected_terminal_without_new_id = float(
+                            np.clip(projected_terminal_without_new_id + delta, self.soc_min, self.soc_max)
+                        )
                     pending_id_charge_mw, pending_id_discharge_mw, pending_id_reason = self._plan_id_rescue_for_next_hour(
                         soc_next=float(executed_s),
                         reserve_pos_next_mw=reserve_pos_next,
                         reserve_neg_next_mw=reserve_neg_next,
                         da_charge_next_mw=next_da_charge,
                         da_discharge_next_mw=next_da_discharge,
+                        terminal_soc_target_mwh=(
+                            float(self.soc_target_end)
+                            if str(self.final_soc_mode) == "hard"
+                            else None
+                        ),
+                        projected_terminal_soc_without_new_id_mwh=projected_terminal_without_new_id,
+                        remaining_known_losses_mwh=remaining_known_losses_mwh,
                     )
                 else:
                     pending_id_charge_mw = 0.0
                     pending_id_discharge_mw = 0.0
                     pending_id_reason = "none"
+                    self._last_id_rescue_plan_diagnostics = {}
                 soc = float(executed_s)
                 i += 1
                 _log_progress()
@@ -10184,6 +10354,10 @@ class BatteryBacktester:
                 summary[f"{prefix}_{k}"] = float(v)
         def _safe_ratio(num: float, den: float) -> float:
             return float(num / den) if abs(float(den)) > 1e-12 else float("nan")
+        def _hourly_num(col: str, default: float = 0.0) -> pd.Series:
+            if col in hourly.columns:
+                return pd.to_numeric(hourly[col], errors="coerce").fillna(float(default))
+            return pd.Series(float(default), index=hourly.index, dtype="float64")
         summary["realized_vs_perfect_foresight_ratio_multi_market"] = _safe_ratio(
             float(summary["realized_total_pnl_eur"]),
             float(summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]),
@@ -10213,23 +10387,28 @@ class BatteryBacktester:
         summary["total_id_revenue_eur"] = float(hourly["real_revenue_id_eur"].sum()) if "real_revenue_id_eur" in hourly.columns else 0.0
         summary["total_id_cost_eur"] = float(hourly["real_cost_id_eur"].sum()) if "real_cost_id_eur" in hourly.columns else 0.0
         summary["total_id_pnl_eur"] = float(summary["total_id_revenue_eur"] - summary["total_id_cost_eur"])
-        summary["total_id_buy_mwh"] = float(pd.to_numeric(hourly.get("real_id_buy_mwh", 0.0), errors="coerce").fillna(0.0).sum())
-        summary["total_id_sell_mwh"] = float(pd.to_numeric(hourly.get("real_id_sell_mwh", 0.0), errors="coerce").fillna(0.0).sum())
+        summary["total_id_buy_mwh"] = float(_hourly_num("real_id_buy_mwh").sum())
+        summary["total_id_sell_mwh"] = float(_hourly_num("real_id_sell_mwh").sum())
         summary["total_id_net_mwh"] = float(summary["total_id_sell_mwh"] - summary["total_id_buy_mwh"])
+        summary["total_id_abs_mwh"] = float(abs(summary["total_id_buy_mwh"]) + abs(summary["total_id_sell_mwh"]))
+        summary["id_buy_mwh_total"] = float(summary["total_id_buy_mwh"])
+        summary["id_sell_mwh_total"] = float(summary["total_id_sell_mwh"])
+        summary["id_net_mwh_total"] = float(summary["total_id_net_mwh"])
+        summary["id_abs_mwh_total"] = float(summary["total_id_abs_mwh"])
         summary["id_repair_mwh_total"] = float(
-            pd.to_numeric(hourly.get("real_id_repair_mwh", 0.0), errors="coerce").fillna(0.0).sum()
+            _hourly_num("real_id_repair_mwh").sum()
         )
         summary["id_repair_cost_eur_total"] = float(
-            pd.to_numeric(hourly.get("real_id_repair_cost_eur", 0.0), errors="coerce").fillna(0.0).sum()
+            _hourly_num("real_id_repair_cost_eur").sum()
         )
         summary["id_economic_mwh_total"] = float(
-            pd.to_numeric(hourly.get("real_id_economic_mwh", 0.0), errors="coerce").fillna(0.0).sum()
+            _hourly_num("real_id_economic_mwh").sum()
         )
         summary["id_economic_pnl_eur_total"] = float(
-            pd.to_numeric(hourly.get("real_id_economic_pnl_eur", 0.0), errors="coerce").fillna(0.0).sum()
+            _hourly_num("real_id_economic_pnl_eur").sum()
         )
         summary["id_technical_repair_pnl_eur_total"] = float(
-            pd.to_numeric(hourly.get("real_id_technical_repair_pnl_eur", 0.0), errors="coerce").fillna(0.0).sum()
+            _hourly_num("real_id_technical_repair_pnl_eur").sum()
         )
         if "real_id_recourse_reason" in hourly.columns:
             reason_counts = hourly["real_id_recourse_reason"].fillna("none").astype(str).str.strip().str.lower().value_counts().to_dict()
@@ -10237,14 +10416,14 @@ class BatteryBacktester:
             reason_counts = {}
         summary["id_recourse_events_total"] = float(
             (
-                pd.to_numeric(hourly.get("real_id_buy_mwh", 0.0), errors="coerce").fillna(0.0).abs()
-                + pd.to_numeric(hourly.get("real_id_sell_mwh", 0.0), errors="coerce").fillna(0.0).abs()
+                _hourly_num("real_id_buy_mwh").abs()
+                + _hourly_num("real_id_sell_mwh").abs()
             ).gt(1e-12).sum()
         )
         summary["id_recourse_events_by_reason"] = json.dumps(reason_counts, ensure_ascii=False, sort_keys=True)
         summary["id_recourse_share_hours"] = float(summary["id_recourse_events_total"] / max(len(hourly), 1))
-        id_buy_mwh = pd.to_numeric(hourly.get("real_id_buy_mwh", 0.0), errors="coerce").fillna(0.0)
-        id_sell_mwh = pd.to_numeric(hourly.get("real_id_sell_mwh", 0.0), errors="coerce").fillna(0.0)
+        id_buy_mwh = _hourly_num("real_id_buy_mwh")
+        id_sell_mwh = _hourly_num("real_id_sell_mwh")
         id_reason_series = (
             hourly["real_id_recourse_reason"].fillna("none").astype(str).str.strip().str.lower()
             if "real_id_recourse_reason" in hourly.columns
@@ -10252,8 +10431,7 @@ class BatteryBacktester:
         )
         summary["terminal_soc_recovery_id_mwh"] = float(id_buy_mwh.loc[id_reason_series.eq("terminal_soc_recovery")].sum())
         summary["terminal_soc_recovery_id_cost_eur"] = float(
-            pd.to_numeric(hourly.get("real_cost_id_eur", 0.0), errors="coerce")
-            .fillna(0.0)
+            _hourly_num("real_cost_id_eur")
             .loc[id_reason_series.eq("terminal_soc_recovery")]
             .sum()
         )
