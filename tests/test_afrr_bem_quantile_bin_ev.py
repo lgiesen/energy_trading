@@ -187,6 +187,80 @@ def test_raw_signed_neg_activation_price_is_negated_once_in_optimizer_ev() -> No
     assert float(row["ev_bem_neg_coef_bin_0_eur_per_mw"]) == pytest.approx(500.0)
 
 
+def test_optimizer_and_settlement_agree_on_canonical_neg_activation_value() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _zero_activation_costs(bt)
+    bt.afrr_quantile_bins = ["p50"]
+    bt.afrr_quantile_prob = {"p50": 0.5}
+    df, col = _tiny_df(hours=2)
+    df[col.pred_afrr_capacity_price_neg] = 0.0
+    df[f"{col.pred_afrr_capacity_price_neg}_p50"] = 0.0
+    df[col.pred_afrr_activation_price_neg] = 100.0
+    df[f"{col.pred_afrr_activation_price_neg}_p50"] = 100.0
+    df[col.pred_afrr_activation_rate_neg] = 1.0
+    df[f"{col.pred_afrr_activation_rate_neg}_p50"] = 1.0
+
+    out = bt.optimize_dispatch(df, col, strict_input_validation=True)
+    row = out.iloc[0]
+    optimizer_expected_revenue_per_mw = float(row["ev_bcm_expected_activation_revenue_neg_bin_0"])
+
+    _, settlement = bt._settle_one_hour(
+        soc=bt.soc_min,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=1.0,
+        da_price=0.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=100.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.5,
+        cap_bid_pos=0.0,
+        cap_bid_neg=0.0,
+    )
+
+    assert optimizer_expected_revenue_per_mw == pytest.approx(50.0)
+    delivered_neg_mwh = float(settlement["delivered_activation_neg_mwh"])
+    assert delivered_neg_mwh > 0.0
+    assert float(settlement["revenue_activation_eur"]) == pytest.approx(delivered_neg_mwh * 100.0)
+    assert float(settlement["revenue_activation_eur"]) > 0.0
+
+
+def test_ev_audit_reconciles_canonical_negative_activation_terms() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _zero_activation_costs(bt)
+    bt.afrr_quantile_bins = ["p50"]
+    bt.afrr_quantile_prob = {"p50": 0.5}
+    df, col = _tiny_df(hours=2)
+    df[col.pred_afrr_capacity_price_neg] = 0.0
+    df[f"{col.pred_afrr_capacity_price_neg}_p50"] = 0.0
+    df[col.pred_afrr_activation_price_neg] = 100.0
+    df[f"{col.pred_afrr_activation_price_neg}_p50"] = 100.0
+    df[col.pred_afrr_activation_rate_neg] = 1.0
+    df[f"{col.pred_afrr_activation_rate_neg}_p50"] = 1.0
+
+    out = bt.optimize_dispatch(df, col, strict_input_validation=True)
+    out = out.rename(columns={col.timestamp: "timestamp_utc"})
+    audit = _build_afrr_bin_ev_audit(
+        hourly=out,
+        scenario_name="x",
+        trading_strategy="multi",
+        active_bins=["p50"],
+        backtester=bt,
+        timestamp_col="timestamp_utc",
+    )
+    neg = audit.loc[audit["direction"].astype(str).eq("neg")].copy()
+    assert not neg.empty
+    assert float(neg["activation_margin"].min()) == pytest.approx(100.0)
+    assert float(neg["expected_activation_revenue"].min()) == pytest.approx(50.0)
+
+    stats = _validate_afrr_bin_ev_audit(audit, tol=1e-6)
+    assert float(stats["ev_audit_max_bcm_formula_error"]) <= 1e-6
+    assert float(stats["ev_audit_max_bem_formula_error"]) <= 1e-6
+
+
 def test_canonical_neg_activation_bid_price_and_clearing_use_positive_provider_value() -> None:
     bt = _mk_backtester("canonical_economic")
     bt.bid_builder.afrr_energy_bid_strategy = "forecast"
@@ -265,6 +339,34 @@ def test_raw_signed_neg_activation_bid_price_and_clearing_keep_legacy_sign() -> 
     )
     assert clearing.neg_accepted is True
     assert clearing.executed_rate_neg == pytest.approx(1.0)
+
+
+def test_naive_24h_replaces_quantile_columns_not_only_base_predictions() -> None:
+    col = BacktestColumnMap()
+    n = 26
+    df = pd.DataFrame(
+        {
+            col.timestamp: pd.date_range("2026-01-01T00:00:00Z", periods=n, freq="h"),
+            col.true_afrr_activation_price_neg: np.arange(n, dtype=float) + 100.0,
+            col.pred_afrr_activation_price_neg: np.full(n, 1000.0),
+            f"{col.pred_afrr_activation_price_neg}_p50": np.full(n, 2000.0),
+            f"{col.pred_afrr_activation_price_neg}_p90": np.full(n, 3000.0),
+            col.true_afrr_activation_rate_neg: np.linspace(0.0, 1.0, n),
+            col.pred_afrr_activation_rate_neg: np.full(n, 0.9),
+            f"{col.pred_afrr_activation_rate_neg}_p50": np.full(n, 0.8),
+        }
+    )
+
+    out = BatteryBacktester._apply_naive_24h_predictions(df, col)
+
+    assert float(out.loc[24, col.pred_afrr_activation_price_neg]) == pytest.approx(100.0)
+    assert float(out.loc[24, f"{col.pred_afrr_activation_price_neg}_p50"]) == pytest.approx(100.0)
+    assert float(out.loc[24, f"{col.pred_afrr_activation_price_neg}_p90"]) == pytest.approx(100.0)
+    assert float(out.loc[25, f"{col.pred_afrr_activation_price_neg}_p50"]) == pytest.approx(101.0)
+    assert float(out.loc[24, col.pred_afrr_activation_rate_neg]) == pytest.approx(0.0)
+    assert float(out.loc[24, f"{col.pred_afrr_activation_rate_neg}_p50"]) == pytest.approx(0.0)
+    # No 24h history is available for the first rows, so the existing forecast fallback remains.
+    assert float(out.loc[0, f"{col.pred_afrr_activation_price_neg}_p50"]) == pytest.approx(2000.0)
 
 
 def test_bcm_same_q_uses_bin_specific_activation_inputs() -> None:

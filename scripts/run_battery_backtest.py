@@ -619,7 +619,10 @@ def _build_performance_metrics(
     net_market_revenue_before_operational_costs = gross_revenue_without_costs - gross_market_costs
     # Offer cost is an optimizer/EV diagnostic. Realized settlement PnL does not
     # subtract it, so it must not enter the net-revenue reconciliation formula.
-    total_costs = realized_degradation_cost + realized_aux_cost + transaction_cost + penalty_cost + terminal_soc_repair_cost
+    # Operational realized PnL is sourced from hourly real_pnl_eur. Terminal SoC
+    # repair/value diagnostics are exported separately and are not subtracted
+    # from hourly settlement PnL in hard-final-SoC thesis runs.
+    total_costs = realized_degradation_cost + realized_aux_cost + transaction_cost + penalty_cost
     reconciliation = realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs)
 
     da_bid_buy_mwh_total = float((_num_series(hourly, "real_submitted_da_buy_mw") * dt_h).sum())
@@ -1135,7 +1138,7 @@ def _write_performance_metric_definitions(path: Path) -> None:
         {"field": "realized_net_revenue_eur_per_mw", "unit": "EUR/MW", "formula": "realized_net_revenue_eur / p_max_mw", "source_columns": ["realized_net_revenue_eur", "p_max_mw"], "kind": "derived"},
         {"field": "equivalent_full_cycles_total", "unit": "cycles", "formula": "throughput_mwh_total / (2 * capacity_mwh)", "source_columns": ["throughput_mwh_total", "capacity_mwh"], "kind": "battery"},
         {"field": "throughput_mwh_total", "unit": "MWh", "formula": "sum(real_throughput_mwh); real_throughput_mwh = abs(real_da_buy_mwh)+abs(real_da_sell_mwh)+abs(real_id_buy_mwh)+abs(real_id_sell_mwh)+abs(real_act_pos_mwh)+abs(real_act_neg_mwh)", "source_columns": THROUGHPUT_SOURCE_COLUMNS, "kind": "battery"},
-        {"field": "net_revenue_reconciliation_error_eur", "unit": "EUR", "formula": "realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs); total_costs excludes offer_cost_eur because offer cost is not subtracted in settlement PnL", "source_columns": ["realized_net_revenue_eur", "gross_revenue_without_costs_eur", "gross_market_costs_eur", "total_costs_eur"], "kind": "validation"},
+        {"field": "net_revenue_reconciliation_error_eur", "unit": "EUR", "formula": "realized_net - (gross_revenue_without_costs - gross_market_costs - total_costs); total_costs excludes offer_cost_eur and terminal_soc_repair_cost_eur because they are not subtracted in hourly settlement PnL", "source_columns": ["realized_net_revenue_eur", "gross_revenue_without_costs_eur", "gross_market_costs_eur", "total_costs_eur"], "kind": "validation"},
         {"field": "da_bid_buy_mwh_total", "unit": "MWh", "formula": "sum(real_submitted_da_buy_mw * dt_h)", "source_columns": ["real_submitted_da_buy_mw", "timestamp_utc"], "kind": "volume"},
         {"field": "bem_bid_pos_mwh_total", "unit": "MWh", "formula": "sum(real_bem_only_submitted_pos_mw * dt_h)", "source_columns": ["real_bem_only_submitted_pos_mw", "timestamp_utc"], "kind": "volume"},
     ]
@@ -1213,7 +1216,6 @@ def _validate_performance_metrics(
                 + float(pd.to_numeric(pd.Series([perf_row.get("realized_aux_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                 + float(pd.to_numeric(pd.Series([perf_row.get("transaction_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                 + float(pd.to_numeric(pd.Series([perf_row.get("penalty_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-                + float(pd.to_numeric(pd.Series([perf_row.get("terminal_soc_repair_cost_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
             )
         )
         <= tolerance
@@ -3192,6 +3194,7 @@ def main() -> None:
         perfect_foresight_paradox_path = scenario_out_dir / "perfect_foresight_paradox_hours.csv"
         pnl_plot_path = scenario_out_dir / "backtest_cumulative_pnl.png"
         reserve_commitment_debug_path = scenario_out_dir / "reserve_commitment_debug.csv"
+        da_precommit_debug_path = scenario_out_dir / "da_precommit_debug.csv"
         invalid_headroom_debug_path = scenario_out_dir / "invalid_headroom_debug.csv"
         optimization_failure_debug_path = scenario_out_dir / "optimization_failure_debug.csv"
         bcm_block_consistency_violations_path = scenario_out_dir / "bcm_block_consistency_violations.csv"
@@ -3541,6 +3544,21 @@ def main() -> None:
                         out_df.at[i, "bem_only_dispatch_mw_between_commit_and_delivery"] = float(bem_disp.loc[mask].sum())
                         out_df.at[i, "aux_energy_mwh_between_commit_and_delivery"] = float(aux_e.loc[mask].sum())
                 out_df.to_csv(reserve_commitment_debug_path, index=False)
+
+            da_debug_cols = [c for c in h.columns if c.startswith("da_precommit_")]
+            if da_debug_cols:
+                da_debug = h[[colmap.timestamp, *da_debug_cols]].copy()
+                da_debug = da_debug.loc[da_debug[da_debug_cols].notna().any(axis=1)].copy()
+                if not da_debug.empty:
+                    da_debug["scenario"] = str(scenario_name)
+                    da_debug.rename(
+                        columns={
+                            c: c.replace("da_precommit_da_", "da_").replace("da_precommit_", "")
+                            for c in da_debug_cols
+                        },
+                        inplace=True,
+                    )
+                    da_debug.to_csv(da_precommit_debug_path, index=False)
 
             hv_pos = pd.to_numeric(h.get("real_headroom_violation_pos_mwh", h.get("headroom_violation_pos_mwh", 0.0)), errors="coerce").fillna(0.0)
             hv_neg = pd.to_numeric(h.get("real_headroom_violation_neg_mwh", h.get("headroom_violation_neg_mwh", 0.0)), errors="coerce").fillna(0.0)

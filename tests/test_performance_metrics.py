@@ -36,7 +36,7 @@ def _hourly() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "timestamp_utc": ts,
-            "real_pnl_eur": [50.0, 60.0, 40.0, 50.0],
+            "real_pnl_eur": [57.0, 60.0, 40.0, 50.0],
             "real_submitted_da_buy_mw": [1.0, 0.0, 0.0, 1.0],
             "real_submitted_da_sell_mw": [0.0, 1.0, 1.0, 0.0],
             "real_da_buy_mwh": [1.0, 0.0, 0.0, 1.0],
@@ -75,7 +75,7 @@ def _hourly() -> pd.DataFrame:
 
 def _summary() -> dict[str, object]:
     return {
-        "realized_total_pnl_eur": 200.0,
+        "realized_total_pnl_eur": 207.0,
         "predicted_total_pnl_eur": 180.0,
         "p_max_mw": 4.0,
         "capacity_mwh": 20.0,
@@ -92,7 +92,7 @@ def _summary() -> dict[str, object]:
         "total_transaction_cost_eur": 1.0,
         "total_offer_cost_eur": 0.0,
         "total_penalty_cost_eur": 0.0,
-        "terminal_soc_repair_cost_eur": 7.0,
+        "terminal_soc_repair_cost_eur": 0.0,
         "simulation_valid": 1.0,
         "thesis_reportable": 1.0,
         "invalid_reason": "",
@@ -148,9 +148,9 @@ def test_performance_metrics_core_formulas():
         scenario_end_utc=None,
     )
     row = perf_df.iloc[0]
-    assert row["realized_net_revenue_eur"] == 200.0
-    assert row["realized_net_revenue_eur_per_mw"] == 50.0
-    assert row["total_costs_eur"] == 14.0
+    assert row["realized_net_revenue_eur"] == 207.0
+    assert row["realized_net_revenue_eur_per_mw"] == 51.75
+    assert row["total_costs_eur"] == 7.0
     assert row["throughput_mwh_total"] == 8.0
     assert row["equivalent_full_cycles_total"] == 0.2
     assert row["da_bid_buy_mwh_total"] == 2.0
@@ -220,6 +220,54 @@ def test_offer_cost_is_reported_but_not_subtracted_from_settlement_pnl_reconcili
     assert checks["net_revenue_reconciliation_ok"] is True
     assert checks["cost_reconciliation_ok"] is True
     assert checks["daily_to_scenario_reconciliation_ok"] is True
+
+
+def test_terminal_soc_repair_cost_is_reported_but_not_subtracted_from_operational_pnl_reconciliation():
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2025-09-04T23:00:00Z", periods=1, freq="h", tz="UTC"),
+            "real_pnl_eur": [-5.612890088941258],
+            "real_revenue_da_eur": [0.0],
+            "real_cost_da_eur": [0.0],
+            "real_revenue_id_eur": [0.0],
+            "real_cost_id_eur": [0.0],
+            "real_revenue_capacity_eur": [0.0],
+            "real_revenue_activation_eur": [10.74385188310444],
+            "real_bcm_linked_activation_revenue_eur": [0.551159601603],
+            "real_bem_only_activation_revenue_eur": [10.192692281501],
+            "real_degradation_cost_eur": [0.150976361768],
+            "real_aux_cost_eur": [16.1994],
+            "real_transaction_cost_eur": [0.006365610278],
+            "real_offer_cost_eur": [0.0],
+            "real_penalty_eur": [0.0],
+            "real_throughput_mwh": [0.006365610278],
+        }
+    )
+    terminal_repair = 16.548822406254786
+    perf_df, _ = _build_performance_metrics(
+        hourly=hourly,
+        summary={
+            "realized_total_pnl_eur": 0.0,
+            "predicted_total_pnl_eur": 0.0,
+            "p_max_mw": 4.0,
+            "capacity_mwh": 20.0,
+            "terminal_soc_repair_cost_eur": terminal_repair,
+        },
+        args=_args(),
+        scenario_name="p50_p50",
+        scenario_bins=["p50"],
+        scenario_start_utc=None,
+        scenario_end_utc=None,
+    )
+    daily_df = _build_daily_performance_metrics(hourly=hourly, perf_row=perf_df.iloc[0])
+    checks = _validate_performance_metrics(perf_row=perf_df.iloc[0], daily_df=daily_df)
+    row = perf_df.iloc[0]
+
+    assert float(row["terminal_soc_repair_cost_eur"]) == pytest.approx(terminal_repair)
+    assert float(row["total_costs_eur"]) == pytest.approx(16.356741971768 + 0.0, abs=1e-9)
+    assert float(row["net_revenue_reconciliation_error_eur"]) == pytest.approx(0.0, abs=1e-9)
+    assert checks["net_revenue_reconciliation_ok"] is True
+    assert checks["cost_reconciliation_ok"] is True
 
 
 def test_performance_validation_allows_exact_negative_revenue_reconciliation():

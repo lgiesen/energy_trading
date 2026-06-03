@@ -3390,6 +3390,147 @@ def test_hard_final_soc_false_infeasible_classification_when_safe_hold_feasible(
         rolling_window_contains_global_end=True,
         safe_hold_feasible=False,
     ) == "terminal_soc_conflict"
+    assert BatteryBacktester._classify_hard_final_soc_infeasibility(
+        current_soc_mwh=9.0,
+        final_soc_target_mwh=10.0,
+        rolling_window_contains_global_end=False,
+        safe_hold_feasible=False,
+        fixed_da_charge_mwh=5.0,
+        fixed_da_discharge_mwh=6.0,
+        fixed_reserve_pos_mw=0.0,
+        fixed_reserve_neg_mw=0.0,
+    ) == "locked_da_commitment_infeasible"
+
+
+def _da_lock_rows(
+    *,
+    hours: int,
+    soc_start: float,
+    charge_mw: float = 0.0,
+    discharge_mw: float = 0.0,
+) -> pd.DataFrame:
+    col = BacktestColumnMap()
+    ts = pd.date_range("2026-01-02T00:00:00Z", periods=hours, freq="h")
+    return pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            "charge_mw": [charge_mw] * hours,
+            "discharge_mw": [discharge_mw] * hours,
+            "soc_start_lp_mwh": [soc_start] * hours,
+            col.pred_afrr_activation_rate_pos: [0.0] * hours,
+            col.pred_afrr_activation_rate_neg: [0.0] * hours,
+        }
+    )
+
+
+def test_da_precommit_accepts_full_schedule_when_feasible() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    rows = _da_lock_rows(hours=2, soc_start=10.0, charge_mw=1.0)
+    schedule, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+    assert schedule
+    assert all(np.isclose(ch, 1.0) and np.isclose(dis, 0.0) for ch, dis in schedule.values())
+    assert audit
+    assert all(float(r["da_retry_factor_selected"]) == pytest.approx(1.0) for r in audit)
+    assert all(float(r["feasibility_pass"]) == pytest.approx(1.0) for r in audit)
+
+
+def test_da_precommit_reduces_infeasible_schedule_when_smaller_schedule_feasible() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    rows = _da_lock_rows(hours=4, soc_start=7.0, discharge_mw=3.0)
+    schedule, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=7.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+    factor = float(audit[0]["da_retry_factor_selected"])
+    assert 0.0 < factor < 1.0
+    assert any(dis > 0.0 for _, dis in schedule.values())
+    assert all(float(r["feasibility_pass"]) == pytest.approx(1.0) for r in audit)
+    assert all(float(r["da_accepted_sell_mw"]) <= float(r["da_candidate_sell_mw"]) for r in audit)
+
+
+def test_da_precommit_zeroes_when_no_nonzero_schedule_feasible() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    rows = _da_lock_rows(hours=1, soc_start=bt.soc_min + 0.05, discharge_mw=10.0)
+    schedule, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=bt.soc_min + 0.05,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+    assert all(ch == pytest.approx(0.0) and dis == pytest.approx(0.0) for ch, dis in schedule.values())
+    assert all(float(r["da_zeroed_all_bids"]) == pytest.approx(1.0) for r in audit)
+    assert all(str(r["da_zero_reason"]) == "no_nonzero_feasible_da_schedule" for r in audit)
+
+
+def test_technical_id_terminal_recovery_in_optimizer() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=4)
+    df[col.pred_da_price] = 100.0
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=5.0,
+        soc_end_min_target=8.0,
+        allowed_markets=("ID",),
+    )
+    assert "id_charge_mw" in out.columns
+    assert float(out["id_charge_mw"].sum()) > 0.0
+    assert float(out["soc_lp_mwh"].iloc[-1]) >= 8.0 - 1e-6
+    assert "terminal_soc_recovery" in set(out["id_recourse_reason"].astype(str))
+    assert float(out["terminal_soc_id_recourse_cost_eur"].sum()) > 0.0
+
+
+def test_technical_id_not_used_for_arbitrage_without_technical_need() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=3)
+    df[col.pred_da_price] = 5_000.0
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=10.0,
+        soc_end_min_target=None,
+        allowed_markets=("ID",),
+    )
+    assert float(out["id_charge_mw"].abs().sum()) == pytest.approx(0.0)
+    assert float(out["id_discharge_mw"].abs().sum()) == pytest.approx(0.0)
+
+
+def test_optimizer_id_is_in_power_stack() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=2)
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=2.1,
+        soc_end_min_target=10.0,
+        allowed_markets=("ID",),
+    )
+    assert "power_stack_neg_mw" in out.columns
+    assert float(out["power_stack_neg_mw"].max()) <= bt.p_max_mw + 1e-6
+    assert np.allclose(
+        out["power_stack_neg_mw"].to_numpy(dtype=float),
+        out["id_charge_mw"].to_numpy(dtype=float),
+        atol=1e-6,
+    )
 
 
 def test_hard_mode_reaches_target_when_feasible() -> None:
