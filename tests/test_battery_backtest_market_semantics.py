@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 from energy_trading.simulation.battery_backtest import (  # noqa: E402
     BacktestColumnMap,
     BatteryBacktester,
+    StrategyPermissions,
     assign_bcm_capacity_block,
     canonicalize_market_frame,
     load_prediction_warehouse_long,
@@ -3533,6 +3534,142 @@ def test_optimizer_id_is_in_power_stack() -> None:
     )
 
 
+def test_bcm_only_common_technical_id_passes_strategy_isolation() -> None:
+    bt = _mk_backtester()
+    hourly = pd.DataFrame(
+        {
+            "real_id_charge_mw": [1.0],
+            "real_id_discharge_mw": [0.0],
+            "real_pending_id_charge_mw": [0.0],
+            "real_pending_id_discharge_mw": [0.0],
+            "real_id_trade_type": ["technical_repair"],
+            "real_id_repair_reason": ["terminal_soc_recovery"],
+            "real_id_recourse_reason": ["terminal_soc_recovery"],
+        }
+    )
+    perms = bt.resolve_strategy_permissions(
+        strategy_name="bcm_only",
+        allowed_markets=("aFRR", "BCM"),
+        id_recourse_mode="common",
+    )
+    assert perms.id_mode == "technical_repair"
+    bt._validate_strategy_isolation_outputs(
+        hourly=hourly,
+        allowed_markets=("aFRR", "BCM"),
+        strategy_permissions=perms,
+        strategy_name="bcm_only",
+        id_recourse_mode="common",
+    )
+
+
+def test_da_only_disabled_id_activity_fails_strategy_isolation() -> None:
+    bt = _mk_backtester()
+    hourly = pd.DataFrame(
+        {
+            "real_id_charge_mw": [1.0],
+            "real_id_discharge_mw": [0.0],
+            "real_pending_id_charge_mw": [0.0],
+            "real_pending_id_discharge_mw": [0.0],
+            "real_id_trade_type": ["technical_repair"],
+            "real_id_recourse_reason": ["terminal_soc_recovery"],
+        }
+    )
+    perms = bt.resolve_strategy_permissions(
+        strategy_name="da_only",
+        allowed_markets=("DA",),
+        id_recourse_mode="disabled",
+    )
+    assert perms.id_mode == "none"
+    with pytest.raises(RuntimeError, match="resolved_id_mode=none"):
+        bt._validate_strategy_isolation_outputs(
+            hourly=hourly,
+            allowed_markets=("DA",),
+            strategy_permissions=perms,
+            strategy_name="da_only",
+            id_recourse_mode="disabled",
+        )
+
+
+def test_technical_repair_mode_rejects_economic_id_trade_type() -> None:
+    bt = _mk_backtester()
+    hourly = pd.DataFrame(
+        {
+            "real_id_charge_mw": [1.0],
+            "real_id_discharge_mw": [0.0],
+            "real_pending_id_charge_mw": [0.0],
+            "real_pending_id_discharge_mw": [0.0],
+            "real_id_trade_type": ["economic"],
+            "real_id_repair_reason": ["arbitrage"],
+            "real_id_recourse_reason": ["arbitrage"],
+        }
+    )
+    perms = bt.resolve_strategy_permissions(
+        strategy_name="bcm_only",
+        allowed_markets=("aFRR", "BCM"),
+        id_recourse_mode="common",
+    )
+    with pytest.raises(RuntimeError, match="non-technical ID trade type"):
+        bt._validate_strategy_isolation_outputs(
+            hourly=hourly,
+            allowed_markets=("aFRR", "BCM"),
+            strategy_permissions=perms,
+            strategy_name="bcm_only",
+            id_recourse_mode="common",
+        )
+
+
+def test_multi_common_recourse_resolves_technical_id_consistently() -> None:
+    bt = _mk_backtester()
+    hourly = pd.DataFrame(
+        {
+            "real_id_charge_mw": [0.5],
+            "real_id_discharge_mw": [0.0],
+            "real_pending_id_charge_mw": [0.0],
+            "real_pending_id_discharge_mw": [0.0],
+            "real_id_trade_type": ["technical_repair"],
+            "real_id_repair_reason": ["protected_soc_recovery"],
+            "real_id_recourse_reason": ["protected_soc_recovery"],
+        }
+    )
+    perms = bt.resolve_strategy_permissions(
+        strategy_name="multi",
+        allowed_markets=("DA", "aFRR"),
+        id_recourse_mode="common",
+    )
+    assert perms.id_mode == "technical_repair"
+    bt._validate_strategy_isolation_outputs(
+        hourly=hourly,
+        allowed_markets=("DA", "aFRR"),
+        strategy_permissions=perms,
+        strategy_name="multi",
+        id_recourse_mode="common",
+    )
+
+
+def test_optimize_dispatch_keeps_resolved_technical_id_when_id_in_allowed_markets() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    df, col = _tiny_backtest_df(hours=3)
+    perms = StrategyPermissions(
+        allow_da=False,
+        id_mode="technical_repair",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=False,
+    )
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=5.0,
+        soc_end_min_target=8.0,
+        allowed_markets=("aFRR", "BCM", "ID"),
+        strategy_permissions=perms,
+    )
+    assert bt._strategy_permissions.id_mode == "technical_repair"
+    assert float(out["id_charge_mw"].sum()) > 0.0
+    assert "terminal_soc_recovery" in set(out.loc[out["id_charge_mw"] > 1e-9, "id_recourse_reason"].astype(str))
+
+
 def test_hard_mode_reaches_target_when_feasible() -> None:
     bt = _mk_backtester()
     bt.final_soc_mode = "hard"
@@ -3756,13 +3893,58 @@ def test_global_perfect_foresight_bem_only_plan_mapping() -> None:
     assert "global_perfect_foresight_settlement_rows" in s
 
 
+def test_global_perfect_foresight_same_rules_candidate_fields() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=4,
+        reopt_step_hours=1,
+        enable_global_perfect_foresight=True,
+    )
+    s = out.summary
+    assert "global_hindsight_same_rules_upper_bound_total_pnl_eur" in s
+    assert "realized_path_pnl_under_global_upper_bound_rules_eur" in s
+    assert "global_pf_verified_upper_bound" in s
+    assert "global_pf_upper_bound_gap_eur" in s
+    assert "global_pf_below_realized_incumbent" in s
+    assert str(s.get("global_perfect_foresight_capacity_bid_semantics")) == "same_rules_hindsight_candidate"
+    if float(s.get("global_perfect_foresight_available", 0.0)) >= 0.5:
+        assert np.isclose(
+            float(s["global_hindsight_same_rules_upper_bound_total_pnl_eur"]),
+            float(s["comparable_rolling_perfect_foresight_same_rules_market_pnl_eur"]),
+            atol=1e-6,
+        )
+        assert float(s["global_pf_verified_upper_bound"]) in {0.0, 1.0}
+        assert float(s["global_perfect_foresight_dominance_check_pass"]) == float(
+            s["global_pf_verified_upper_bound"]
+        )
+
+
+def test_same_rules_rolling_pf_dominance_fields_present() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=8)
+    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1)
+    s = out.summary
+    assert "same_rules_rolling_pf_total_pnl_eur" in s
+    assert "same_rules_rolling_pf_dominates_realized" in s
+    assert "same_rules_rolling_pf_gap_eur" in s
+    assert "same_rules_rolling_pf_verified_oracle" in s
+
+
 def test_global_perfect_foresight_available_only_after_scope_validation() -> None:
     bt = _mk_backtester()
     df, col = _tiny_backtest_df(hours=8)
     out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, enable_global_perfect_foresight=True)
     s = out.summary
     if float(s.get("global_perfect_foresight_available", 0.0)) >= 0.5:
-        assert str(s.get("global_perfect_foresight_validation_status", "")) == "available_scope_validated"
+        assert str(s.get("global_perfect_foresight_validation_status", "")) in {
+            "verified_same_rules_dominates_realized",
+            "global_pf_below_realized_incumbent",
+            "global_pf_unverified",
+        }
         assert float(s.get("global_perfect_foresight_dispatch_rows", 0.0)) > 0.0
         assert float(s.get("global_perfect_foresight_settlement_rows", 0.0)) > 0.0
     else:

@@ -10,15 +10,6 @@ from .metrics import (
     summarize_probabilistic_interval_metrics,
     winkler_score,
 )
-from .shared_evaluator import (
-    EvalMetadata,
-    append_canonical_metrics_parquet,
-    append_canonical_predictions_parquet,
-    compute_shared_metrics,
-    log_metrics_tensorboard_canonical,
-    metrics_to_canonical_rows,
-    predictions_to_canonical_df,
-)
 
 __all__ = [
     "compute_forecast_metrics",
@@ -37,3 +28,21 @@ __all__ = [
     "append_canonical_predictions_parquet",
     "log_metrics_tensorboard_canonical",
 ]
+
+_SHARED_EVALUATOR_EXPORTS = {
+    "EvalMetadata",
+    "append_canonical_metrics_parquet",
+    "append_canonical_predictions_parquet",
+    "compute_shared_metrics",
+    "log_metrics_tensorboard_canonical",
+    "metrics_to_canonical_rows",
+    "predictions_to_canonical_df",
+}
+
+
+def __getattr__(name: str):
+    if name in _SHARED_EVALUATOR_EXPORTS:
+        from . import shared_evaluator
+
+        return getattr(shared_evaluator, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
