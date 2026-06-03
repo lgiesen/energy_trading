@@ -673,6 +673,10 @@ class BatteryBacktester:
         self._neg_activation_sign_diagnostic_emitted = False
         self.id_buy_price_cap_eur_mwh = float(MARKET_SPECS.get("id_buy_price_cap_eur_mwh", 3000.0))
         self.id_sell_price_floor_eur_mwh = float(MARKET_SPECS.get("id_sell_price_floor_eur_mwh", -500.0))
+        self.terminal_id_recovery_safety_mwh = max(
+            0.0,
+            float(MODEL_SPECS.get("terminal_id_recovery_safety_mwh", 0.10)),
+        )
         # MILP runtime controls:
         # - default execution is bounded and robust for rolling simulation
         # - diagnostic mode can be enabled to inspect HiGHS solver behavior
@@ -1319,10 +1323,10 @@ class BatteryBacktester:
         accepted_mask = pd.Series(False, index=hourly.index)
         if "real_optimization_error_code" in hourly.columns:
             ec = hourly["real_optimization_error_code"].fillna("ok").astype(str).str.strip().str.lower()
-            accepted_mask |= ~ec.isin(["ok", "ok_deterministic_noop", "none", ""])
+            accepted_mask |= ~ec.isin(["ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""])
         elif "optimization_error_code" in hourly.columns:
             ec = hourly["optimization_error_code"].fillna("ok").astype(str).str.strip().str.lower()
-            accepted_mask |= ~ec.isin(["ok", "ok_deterministic_noop", "none", ""])
+            accepted_mask |= ~ec.isin(["ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""])
         if "real_optimization_fallback" in hourly.columns:
             fb = hourly["real_optimization_fallback"].fillna("none").astype(str).str.strip().str.lower()
             accepted_mask |= fb.ne("none")
@@ -1644,6 +1648,7 @@ class BatteryBacktester:
                 "terminal_soc_feasible": 1.0,
                 "id_recourse_needed_mwh": 0.0,
                 "id_recourse_cost_eur": 0.0,
+                "id_recourse_reason": "none",
                 "reduced_due_to_reserve_feasibility": 0.0,
                 "reduced_due_to_terminal_soc": 0.0,
                 "selection_is_causal": 1.0,
@@ -1713,6 +1718,7 @@ class BatteryBacktester:
                 "terminal_soc_feasible": 0.0,
                 "id_recourse_needed_mwh": np.nan,
                 "id_recourse_cost_eur": np.nan,
+                "id_recourse_reason": "none",
                 "reduced_due_to_reserve_feasibility": 0.0,
                 "reduced_due_to_terminal_soc": 0.0,
                 "selection_is_causal": 1.0,
@@ -1785,6 +1791,7 @@ class BatteryBacktester:
             terminal_violation = 0.0
             terminal_required = False
             id_allowed = bool((strategy_permissions or self._strategy_permissions).allow_id_technical_repair)
+            id_recourse_reason = "none"
             ts_vals_local = pd.to_datetime(rows[colmap.timestamp], utc=True, errors="coerce")
             for i, tsu in enumerate(ts_vals_local):
                 if pd.isna(tsu):
@@ -1844,6 +1851,11 @@ class BatteryBacktester:
                     id_recourse_mwh += id_charge * float(self.dt_h)
                     id_recourse_cost += id_charge * float(self.dt_h) * max(0.0, float(getattr(self, "id_buy_price_cap_eur_mwh", 0.0)))
                     soc_now += id_charge * float(self.dt_h) * float(self.eta_in)
+                    id_recourse_reason = (
+                        "reserve_obligation_recovery"
+                        if (ob_pos > 1e-9 or ob_neg > 1e-9)
+                        else "protected_soc_recovery"
+                    )
                 if soc_now > protected_max + 1e-9 and id_allowed:
                     need = soc_now - protected_max
                     stack_without_id = self._compute_canonical_power_stack(
@@ -1861,6 +1873,11 @@ class BatteryBacktester:
                         need * max(float(self.eta_out), 1e-12) / max(float(self.dt_h), 1e-12),
                     )
                     soc_now -= id_discharge * float(self.dt_h) / max(float(self.eta_out), 1e-12)
+                    id_recourse_reason = (
+                        "reserve_obligation_recovery"
+                        if (ob_pos > 1e-9 or ob_neg > 1e-9)
+                        else "protected_soc_recovery"
+                    )
                 stack = self._compute_canonical_power_stack(
                     da_charge_mw=ch_mw,
                     da_discharge_mw=dis_mw,
@@ -1899,6 +1916,65 @@ class BatteryBacktester:
                 expected_aux_losses += aux_mwh
                 act_pos_mwh = max(0.0, ob_pos * max(0.0, min(1.0, rate_pos)) * float(self.dt_h))
                 act_neg_mwh = max(0.0, ob_neg * max(0.0, min(1.0, rate_neg)) * float(self.dt_h))
+                delta_preview, _ = self._calculate_soc_delta(
+                    charge_mw=float(ch_mw),
+                    discharge_mw=float(dis_mw),
+                    id_charge_mw=float(id_charge),
+                    id_discharge_mw=float(id_discharge),
+                    act_pos_mwh=float(act_pos_mwh),
+                    act_neg_mwh=float(act_neg_mwh),
+                    aux_mwh=float(aux_mwh),
+                    battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                    dt_h=float(self.dt_h),
+                )
+                projected_next_soc = float(soc_now + delta_preview)
+                if projected_next_soc < float(self.soc_min) - 1e-9 and id_allowed:
+                    # Negative reserve obligations can be physically feasible at
+                    # current SoC but still drain below soc_min after auxiliary
+                    # losses. Precommit must schedule technical ID early or
+                    # reject/derate the candidate before it enters the lockbook.
+                    stack_with_existing_id = self._compute_canonical_power_stack(
+                        da_charge_mw=ch_mw,
+                        da_discharge_mw=dis_mw,
+                        id_buy_mw=id_charge,
+                        id_sell_mw=id_discharge,
+                        bem_neg_mw=bem_neg,
+                        bem_pos_mw=bem_pos,
+                        bcm_neg_obligation_mw=ob_neg,
+                        bcm_pos_obligation_mw=ob_pos,
+                    )
+                    residual_charge = max(0.0, float(stack_with_existing_id["charge_residual_mw"]))
+                    room_grid_mwh = max(0.0, float(self.soc_max) - float(soc_now)) / max(float(self.eta_in), 1e-12)
+                    need_internal = float(self.soc_min) - projected_next_soc
+                    add_id_charge = min(
+                        residual_charge,
+                        room_grid_mwh / max(float(self.dt_h), 1e-12),
+                        need_internal / max(float(self.eta_in) * float(self.dt_h), 1e-12),
+                    )
+                    if add_id_charge > 1e-9:
+                        id_charge += float(add_id_charge)
+                        id_recourse_mwh += float(add_id_charge) * float(self.dt_h)
+                        id_recourse_cost += (
+                            float(add_id_charge)
+                            * float(self.dt_h)
+                            * max(0.0, float(getattr(self, "id_buy_price_cap_eur_mwh", 0.0)))
+                        )
+                        id_recourse_reason = (
+                            "reserve_obligation_recovery"
+                            if (ob_pos > 1e-9 or ob_neg > 1e-9)
+                            else "protected_soc_recovery"
+                        )
+                        aux_power_mw, _ = self._state_aux_power_mw(
+                            charge_mw=float(ch_mw),
+                            discharge_mw=float(dis_mw),
+                            reserve_pos_mw=float(ob_pos),
+                            reserve_neg_mw=float(ob_neg),
+                            act_pos_rate=float(rate_pos),
+                            act_neg_rate=float(rate_neg),
+                            id_charge_mw=float(id_charge),
+                            id_discharge_mw=float(id_discharge),
+                        )
+                        aux_mwh = max(0.0, float(aux_power_mw) * float(self.dt_h))
                 delta, _ = self._calculate_soc_delta(
                     charge_mw=float(ch_mw),
                     discharge_mw=float(dis_mw),
@@ -1953,6 +2029,7 @@ class BatteryBacktester:
                 "terminal_soc_feasible": float(terminal_violation <= 1e-9),
                 "id_recourse_needed_mwh": float(id_recourse_mwh),
                 "id_recourse_cost_eur": float(id_recourse_cost),
+                "id_recourse_reason": str(id_recourse_reason),
                 "reduced_due_to_reserve_feasibility": float(factor < 0.999),
                 "reduced_due_to_terminal_soc": float(terminal_violation > 1e-9),
                 "reduced_due_to_power": float(power_violation_pos > 1e-9 or power_violation_neg > 1e-9),
@@ -1977,6 +2054,7 @@ class BatteryBacktester:
             "terminal_soc_feasible": 0.0,
             "id_recourse_needed_mwh": np.nan,
             "id_recourse_cost_eur": np.nan,
+            "id_recourse_reason": "none",
             "reduced_due_to_reserve_feasibility": 0.0,
             "reduced_due_to_terminal_soc": 0.0,
             "selection_is_causal": 1.0,
@@ -5639,6 +5717,9 @@ class BatteryBacktester:
                         precommit_audit_by_ts.setdefault("precommit_id_recourse_cost_eur", {})[tsu] = float(
                             bcm_precommit_stats.get("id_recourse_cost_eur", 0.0)
                         )
+                        precommit_audit_by_ts.setdefault("precommit_id_recourse_reason", {})[tsu] = str(
+                            bcm_precommit_stats.get("id_recourse_reason", "none")
+                        )
                         for diag_name in (
                             "reduced_due_to_power",
                             "reduced_due_to_soc",
@@ -5689,6 +5770,9 @@ class BatteryBacktester:
                         )
                         precommit_audit_by_ts.setdefault("bcm_precommit_id_recourse_cost_eur", {})[tsu] = float(
                             bcm_precommit_stats.get("id_recourse_cost_eur", 0.0)
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_id_recourse_reason", {})[tsu] = str(
+                            bcm_precommit_stats.get("id_recourse_reason", "none")
                         )
                         for diag_name in (
                             "reduced_due_to_power",
@@ -6933,6 +7017,192 @@ class BatteryBacktester:
                         hold["reserve_neg_bin_0_mw"] = hold["reserve_neg_mw"]
                     return _fill_zero_ev(hold)
 
+                def _terminal_recovery_fallback_with_id() -> tuple[pd.DataFrame | None, dict[str, object]]:
+                    """Deterministic technical-ID fallback for final-window solver failures only."""
+                    diagnostics: dict[str, object] = {
+                        "terminal_recovery_fallback_attempted": 1.0,
+                        "terminal_recovery_fallback_success": 0.0,
+                        "terminal_recovery_fallback_reason": "not_evaluated",
+                        "terminal_recovery_fallback_grid_buy_mwh": 0.0,
+                        "terminal_recovery_fallback_internal_gain_mwh": 0.0,
+                        "terminal_recovery_fallback_aux_mwh": 0.0,
+                        "terminal_recovery_fallback_final_soc_mwh": float(soc),
+                    }
+                    if not (
+                        bool(rolling_window_contains_global_end)
+                        and str(self.final_soc_mode) == "hard"
+                        and bool(perms.allow_id_technical_repair)
+                    ):
+                        diagnostics["terminal_recovery_fallback_reason"] = "not_final_hard_or_id_disabled"
+                        return None, diagnostics
+
+                    hold = _safe_hold_with_obligations()
+                    hold["charge_mw"] = 0.0
+                    hold["discharge_mw"] = 0.0
+                    hold["id_charge_mw"] = 0.0
+                    hold["id_discharge_mw"] = 0.0
+                    hold["id_recourse_reason"] = "none"
+                    hold["terminal_soc_recovery_solver_fallback"] = 1.0
+                    hold["terminal_soc_not_recoverable_after_solver_failure"] = 0.0
+                    hold["terminal_recovery_fallback_grid_buy_mwh"] = 0.0
+                    hold["terminal_recovery_fallback_internal_gain_mwh"] = 0.0
+                    hold["terminal_recovery_fallback_aux_mwh"] = 0.0
+
+                    ts_vals = pd.to_datetime(hold[colmap.timestamp], utc=True, errors="coerce")
+                    rate_pos_series = pd.to_numeric(
+                        window.get(colmap.pred_afrr_activation_rate_pos, 0.0), errors="coerce"
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    rate_neg_series = pd.to_numeric(
+                        window.get(colmap.pred_afrr_activation_rate_neg, 0.0), errors="coerce"
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    da_price_series = self._finite_numeric_series(
+                        window,
+                        colmap.pred_da_price,
+                        fallback_cols=[colmap.true_da_price],
+                        default=0.0,
+                    ).to_numpy(dtype=float)
+
+                    def _project_no_new_id(start_soc: float, start_idx: int) -> tuple[float, float]:
+                        proj = float(start_soc)
+                        aux_total = 0.0
+                        for jj in range(start_idx, len(hold)):
+                            ob_pos = float(hold["reserve_pos_mw"].iloc[jj])
+                            ob_neg = float(hold["reserve_neg_mw"].iloc[jj])
+                            rate_pos = float(rate_pos_series[jj] if jj < len(rate_pos_series) else 0.0)
+                            rate_neg = float(rate_neg_series[jj] if jj < len(rate_neg_series) else 0.0)
+                            aux_power, _ = self._state_aux_power_mw(
+                                charge_mw=0.0,
+                                discharge_mw=0.0,
+                                reserve_pos_mw=ob_pos,
+                                reserve_neg_mw=ob_neg,
+                                act_pos_rate=rate_pos,
+                                act_neg_rate=rate_neg,
+                                id_charge_mw=0.0,
+                                id_discharge_mw=0.0,
+                            )
+                            aux_mwh = max(0.0, float(aux_power) * float(self.dt_h))
+                            aux_total += aux_mwh
+                            act_pos_mwh = max(0.0, ob_pos * rate_pos * float(self.dt_h))
+                            act_neg_mwh = max(0.0, ob_neg * rate_neg * float(self.dt_h))
+                            delta, _ = self._calculate_soc_delta(
+                                charge_mw=0.0,
+                                discharge_mw=0.0,
+                                id_charge_mw=0.0,
+                                id_discharge_mw=0.0,
+                                act_pos_mwh=act_pos_mwh,
+                                act_neg_mwh=act_neg_mwh,
+                                aux_mwh=aux_mwh,
+                                battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                                dt_h=self.dt_h,
+                            )
+                            proj = float(np.clip(proj + delta, self.soc_min, self.soc_max))
+                        return proj, aux_total
+
+                    soc_sim = float(soc)
+                    total_grid_buy = 0.0
+                    total_internal_gain = 0.0
+                    total_aux = 0.0
+                    for jj in range(len(hold)):
+                        projected_terminal_no_id, remaining_aux_no_id = _project_no_new_id(soc_sim, jj)
+                        need_internal = max(0.0, float(self.soc_target_end) - projected_terminal_no_id)
+                        ob_pos = float(hold["reserve_pos_mw"].iloc[jj])
+                        ob_neg = float(hold["reserve_neg_mw"].iloc[jj])
+                        stack = self._compute_canonical_power_stack(
+                            da_charge_mw=0.0,
+                            da_discharge_mw=0.0,
+                            id_buy_mw=0.0,
+                            id_sell_mw=0.0,
+                            bcm_pos_obligation_mw=ob_pos,
+                            bcm_neg_obligation_mw=ob_neg,
+                        )
+                        residual_charge_mw = max(0.0, float(stack["charge_residual_mw"]))
+                        room_grid_mwh = max(0.0, float(self.soc_max) - soc_sim) / max(self.eta_in, 1e-12)
+                        id_mw = 0.0
+                        aux_mwh = 0.0
+                        if need_internal > 1e-9 and residual_charge_mw > 1e-9 and room_grid_mwh > 1e-9:
+                            initial_grid_need = need_internal / max(self.eta_in, 1e-12)
+                            tentative_mw = min(residual_charge_mw, room_grid_mwh / max(self.dt_h, 1e-12), initial_grid_need / max(self.dt_h, 1e-12))
+                            # ID charging itself can change auxiliary state; account for it once.
+                            aux_power, _ = self._state_aux_power_mw(
+                                charge_mw=0.0,
+                                discharge_mw=0.0,
+                                reserve_pos_mw=ob_pos,
+                                reserve_neg_mw=ob_neg,
+                                act_pos_rate=float(rate_pos_series[jj] if jj < len(rate_pos_series) else 0.0),
+                                act_neg_rate=float(rate_neg_series[jj] if jj < len(rate_neg_series) else 0.0),
+                                id_charge_mw=float(tentative_mw),
+                                id_discharge_mw=0.0,
+                            )
+                            aux_mwh = max(0.0, float(aux_power) * float(self.dt_h))
+                            grid_need_with_aux = (need_internal + aux_mwh) / max(self.eta_in, 1e-12)
+                            id_mw = min(
+                                residual_charge_mw,
+                                room_grid_mwh / max(self.dt_h, 1e-12),
+                                grid_need_with_aux / max(self.dt_h, 1e-12),
+                            )
+                            aux_power, _ = self._state_aux_power_mw(
+                                charge_mw=0.0,
+                                discharge_mw=0.0,
+                                reserve_pos_mw=ob_pos,
+                                reserve_neg_mw=ob_neg,
+                                act_pos_rate=float(rate_pos_series[jj] if jj < len(rate_pos_series) else 0.0),
+                                act_neg_rate=float(rate_neg_series[jj] if jj < len(rate_neg_series) else 0.0),
+                                id_charge_mw=float(id_mw),
+                                id_discharge_mw=0.0,
+                            )
+                            aux_mwh = max(0.0, float(aux_power) * float(self.dt_h))
+
+                        rate_pos = float(rate_pos_series[jj] if jj < len(rate_pos_series) else 0.0)
+                        rate_neg = float(rate_neg_series[jj] if jj < len(rate_neg_series) else 0.0)
+                        act_pos_mwh = max(0.0, ob_pos * rate_pos * float(self.dt_h))
+                        act_neg_mwh = max(0.0, ob_neg * rate_neg * float(self.dt_h))
+                        delta, _ = self._calculate_soc_delta(
+                            charge_mw=0.0,
+                            discharge_mw=0.0,
+                            id_charge_mw=float(id_mw),
+                            id_discharge_mw=0.0,
+                            act_pos_mwh=act_pos_mwh,
+                            act_neg_mwh=act_neg_mwh,
+                            aux_mwh=aux_mwh,
+                            battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                            dt_h=self.dt_h,
+                        )
+                        soc_sim = float(np.clip(soc_sim + delta, self.soc_min, self.soc_max))
+                        hold.iloc[jj, hold.columns.get_loc("soc_lp_mwh")] = soc_sim
+                        hold.iloc[jj, hold.columns.get_loc("id_charge_mw")] = float(id_mw)
+                        hold.iloc[jj, hold.columns.get_loc("terminal_recovery_fallback_grid_buy_mwh")] = float(id_mw * self.dt_h)
+                        hold.iloc[jj, hold.columns.get_loc("terminal_recovery_fallback_internal_gain_mwh")] = float(id_mw * self.dt_h * self.eta_in)
+                        hold.iloc[jj, hold.columns.get_loc("terminal_recovery_fallback_aux_mwh")] = float(aux_mwh)
+                        if id_mw > 1e-9:
+                            hold.iloc[jj, hold.columns.get_loc("id_recourse_reason")] = "terminal_soc_recovery_solver_fallback"
+                            total_grid_buy += float(id_mw * self.dt_h)
+                            total_internal_gain += float(id_mw * self.dt_h * self.eta_in)
+                        total_aux += float(aux_mwh)
+
+                    shortfall = max(0.0, float(self.soc_target_end) - soc_sim)
+                    hold["final_soc_shortfall_mwh"] = shortfall
+                    diagnostics.update(
+                        {
+                            "terminal_recovery_fallback_grid_buy_mwh": float(total_grid_buy),
+                            "terminal_recovery_fallback_internal_gain_mwh": float(total_internal_gain),
+                            "terminal_recovery_fallback_aux_mwh": float(total_aux),
+                            "terminal_recovery_fallback_final_soc_mwh": float(soc_sim),
+                            "terminal_recovery_fallback_remaining_aux_no_id_mwh": float(remaining_aux_no_id if len(hold) else 0.0),
+                        }
+                    )
+                    if shortfall <= 1e-6:
+                        diagnostics["terminal_recovery_fallback_success"] = 1.0
+                        diagnostics["terminal_recovery_fallback_reason"] = "recovered_terminal_soc_with_technical_id"
+                        hold["optimizer_fallback_used"] = 0.0
+                        hold["optimization_error_code"] = "ok_terminal_recovery_fallback"
+                        hold["objective_unavailable_due_to_solver_failure"] = 1.0
+                        hold["predicted_objective_eur"] = np.nan
+                        return _fill_zero_ev(hold), diagnostics
+
+                    diagnostics["terminal_recovery_fallback_reason"] = "terminal_soc_not_recoverable_after_solver_failure"
+                    hold["terminal_soc_not_recoverable_after_solver_failure"] = 1.0
+                    return None, diagnostics
+
                 def _has_headroom_violation_now() -> bool:
                     if not has_fixed_reserve_obligation:
                         return False
@@ -7095,7 +7365,16 @@ class BatteryBacktester:
                     pass
                 if plan is None:
                     if recoverable_solver_failure:
-                        if bool(noop_proof.get("allowed", False)):
+                        terminal_recovery_plan, terminal_recovery_diag = _terminal_recovery_fallback_with_id()
+                        if terminal_recovery_plan is not None:
+                            plan = terminal_recovery_plan
+                            for k, v in terminal_recovery_diag.items():
+                                plan[k] = v
+                            optimization_fallback = "none"
+                            optimization_error = ""
+                            optimization_status_code = "ok_terminal_recovery_fallback"
+                            reserve_retry_succeeded = 1.0
+                        elif bool(noop_proof.get("allowed", False)):
                             plan = _deterministic_noop_plan("solver_failed_but_noop_proof_passed")
                             for k, v in noop_proof.items():
                                 if k in {"allowed", "blocked_reason"}:
@@ -7114,6 +7393,8 @@ class BatteryBacktester:
                             plan["terminal_constraint_dropped"] = float(terminal_constraint_dropped)
                             plan["deterministic_noop_allowed"] = 0.0
                             plan["deterministic_noop_blocked_reason"] = str(noop_proof.get("blocked_reason", "unknown"))
+                            for k, v in terminal_recovery_diag.items():
+                                plan[k] = v
                             optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan_under_solver_not_set"
                     elif enforce_end_min is not None:
                         # In strict hard mode we do not drop the terminal target.
@@ -11371,7 +11652,7 @@ class BatteryBacktester:
             else:
                 ec = pd.Series(dtype=str)
             if len(ec) > 0:
-                fb_like = ec[~ec.isin(["", "ok", "ok_deterministic_noop", "none"])]
+                fb_like = ec[~ec.isin(["", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none"])]
                 if not fb_like.empty:
                     fb_counts = fb_like.value_counts(dropna=False).to_dict()
                     summary["fallback_mode_counts"] = json.dumps(
@@ -11408,14 +11689,14 @@ class BatteryBacktester:
         optimization_non_ok = float(False)
         if opt_codes_series is not None:
             optimization_non_ok = float(
-                (~opt_codes_series.isin(["ok", "ok_deterministic_noop", "none", ""])).any()
+                (~opt_codes_series.isin(["ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""])).any()
             )
         if float(summary.get("accepted_path_infeasible_debug_dump_count", 0.0)) > 0.5 and not str(
             summary.get("first_infeasible_timestamp_utc", "")
         ).strip():
             if opt_codes_series is not None:
                 bad_idx = opt_codes_series[
-                    ~opt_codes_series.isin(["ok", "ok_deterministic_noop", "none", ""])
+                    ~opt_codes_series.isin(["ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""])
                 ].index
                 if len(bad_idx) > 0:
                     ts_bad = pd.to_datetime(hourly.loc[bad_idx, colmap.timestamp], utc=True, errors="coerce").dropna()
@@ -11442,6 +11723,20 @@ class BatteryBacktester:
             )
             reserve_infeasible_hours = float(reserve_infeasible_mask.sum())
         summary["reserve_infeasible_hours"] = float(reserve_infeasible_hours)
+        if "solver_retry_attempt_count" in hourly.columns:
+            solver_retry_attempts = pd.to_numeric(
+                hourly["solver_retry_attempt_count"], errors="coerce"
+            ).fillna(0.0)
+            summary["solver_retry_used"] = float(solver_retry_attempts.gt(1.0).any())
+        else:
+            summary["solver_retry_used"] = 0.0
+        if "solver_retry_success" in hourly.columns:
+            solver_retry_success = pd.to_numeric(
+                hourly["solver_retry_success"], errors="coerce"
+            ).fillna(0.0)
+            summary["solver_retry_success"] = float(solver_retry_success.gt(0.5).any())
+        else:
+            summary["solver_retry_success"] = 0.0
         invalid_reasons: list[str] = []
         if reserve_infeasible_hours > 0:
             invalid_reasons.append("reserve_infeasible")
@@ -11520,7 +11815,8 @@ class BatteryBacktester:
         if "optimization_error_code" in hourly.columns:
             drv = np.full(len(hourly), "none", dtype=object)
             if infeasibility_driver != "none":
-                mask_bad = hourly["optimization_error_code"].fillna("ok").astype(str).str.lower().ne("ok")
+                ok_codes = {"ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""}
+                mask_bad = ~hourly["optimization_error_code"].fillna("ok").astype(str).str.lower().isin(ok_codes)
                 drv = np.where(mask_bad.to_numpy(dtype=bool), infeasibility_driver, drv)
             hourly["infeasibility_driver"] = drv
         summary["thesis_reportable"] = float(
@@ -11618,6 +11914,8 @@ class BatteryBacktester:
             ("reserve_retry_attempts_used", 0.0),
             ("reserve_retry_final_factor", 1.0),
             ("reserve_retry_succeeded", 0.0),
+            ("solver_retry_used", 0.0),
+            ("solver_retry_success", 0.0),
             ("disable_new_bcm_reserve_bids", 0.0),
             ("new_reserve_bids_zeroed_by_retry", 0.0),
             ("reserve_retry_infeasible_after_zero_reserve", 0.0),

@@ -3342,6 +3342,15 @@ def main() -> None:
         allow_terminal_soc_repair_in_strict=bool(args.allow_terminal_soc_repair_in_strict),
     )
     backtester = BatteryBacktester()
+    if (
+        bool(args.strict_simulation_validity)
+        and str(args.final_soc_mode).strip().lower() == "hard"
+        and float(getattr(backtester, "milp_time_limit_seconds", 30.0)) < 30.0
+    ):
+        print(
+            "[WARN] BACKTEST_MILP_TIME_LIMIT_S is below 30s for strict hard-final-SoC mode; "
+            "solver Not Set statuses are more likely. Recommended thesis default: 30s or higher."
+        )
     sweep_rows: list[dict[str, object]] = []
     perf_rows_all: list[pd.DataFrame] = []
     daily_perf_rows_all: list[pd.DataFrame] = []

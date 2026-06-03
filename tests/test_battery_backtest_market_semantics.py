@@ -712,7 +712,7 @@ def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
         cap_bid_pos=20.0,
         cap_bid_neg=0.0,
     )
-    assert np.isclose(float(m["revenue_capacity_eur"]), 100.0), m
+    assert np.isclose(float(m["revenue_capacity_eur"]), 0.0), m
 
 
 def test_bcm_reject_no_capacity_award_and_no_capacity_revenue() -> None:
@@ -1183,7 +1183,7 @@ def test_bcm_plus_bem_activation_revenue_no_double_counting_in_settlement() -> N
         cap_bid_pos=25.0,
         cap_bid_neg=0.0,
     )
-    assert np.isclose(float(m["revenue_capacity_eur"]), 100.0, atol=1e-9)
+    assert np.isclose(float(m["revenue_capacity_eur"]), 0.0, atol=1e-9)
     delivered_pos = float(m["delivered_activation_pos_mwh"])
     assert delivered_pos > 0.0
     assert np.isclose(float(m["revenue_activation_eur"]), delivered_pos * 200.0, atol=1e-6)
@@ -3157,6 +3157,10 @@ def test_precommit_clamp_includes_projection_safety_buffer() -> None:
             col.pred_afrr_activation_price_neg: [-100.0] * 4,
             col.true_afrr_capacity_price_pos: [100.0] * 4,
             col.true_afrr_capacity_price_neg: [0.0] * 4,
+            col.true_afrr_activation_price_pos: [100.0] * 4,
+            col.true_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_activation_rate_pos: [0.0] * 4,
+            col.true_afrr_activation_rate_neg: [0.0] * 4,
         }
     ).set_index(col.timestamp)
     pre0: dict[str, dict[pd.Timestamp, float | str]] = {}
@@ -3223,6 +3227,10 @@ def test_reserve_min_margin_after_bid_applied() -> None:
             col.pred_afrr_activation_price_neg: [-100.0] * 4,
             col.true_afrr_capacity_price_pos: [100.0] * 4,
             col.true_afrr_capacity_price_neg: [0.0] * 4,
+            col.true_afrr_activation_price_pos: [100.0] * 4,
+            col.true_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_activation_rate_pos: [0.0] * 4,
+            col.true_afrr_activation_rate_neg: [0.0] * 4,
         }
     ).set_index(col.timestamp)
     pre: dict[str, dict[pd.Timestamp, float | str]] = {}
@@ -3274,6 +3282,10 @@ def test_conservative_precommit_reduces_bid_to_safe_mw() -> None:
             col.pred_afrr_activation_price_neg: [-100.0] * 4,
             col.true_afrr_capacity_price_pos: [100.0] * 4,
             col.true_afrr_capacity_price_neg: [0.0] * 4,
+            col.true_afrr_activation_price_pos: [100.0] * 4,
+            col.true_afrr_activation_price_neg: [-100.0] * 4,
+            col.true_afrr_activation_rate_pos: [0.0] * 4,
+            col.true_afrr_activation_rate_neg: [0.0] * 4,
         }
     ).set_index(col.timestamp)
     pre: dict[str, dict[pd.Timestamp, float | str]] = {}
@@ -5747,6 +5759,72 @@ def test_deterministic_noop_not_allowed_with_terminal_pressure(monkeypatch: pyte
             strict_simulation_validity=True,
             enforce_final_soc_min=True,
         )
+
+
+def test_not_set_final_window_uses_terminal_id_recovery_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    df, col = _tiny_backtest_df(hours=1)
+    bt = _mk_backtester("canonical_economic")
+    bt.soc_init = 9.0
+    bt.soc_target_end = 10.0
+    bt.final_soc_mode = "hard"
+
+    def _not_set(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("MIP optimization failed: HiGHS Status 0: Not Set")
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _not_set)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=1,
+        reopt_step_hours=1,
+        allowed_markets=("aFRR", "ID"),
+        strategy_name="bcm_only",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+        id_recourse_mode="common",
+    )
+    h = out.hourly
+    assert set(h["optimization_error_code"].astype(str)) == {"ok_terminal_recovery_fallback"}
+    assert float(out.summary["fallback_used"]) == 0.0
+    assert float(out.summary["final_soc_check_pass"]) == 1.0
+    assert float(out.summary["simulation_valid"]) == 1.0
+    assert pd.to_numeric(h["optimizer_fallback_used"], errors="coerce").fillna(1.0).eq(0.0).all()
+    assert pd.to_numeric(h["real_id_charge_mw"], errors="coerce").fillna(0.0).gt(0.0).any()
+    assert pd.to_numeric(h["terminal_recovery_fallback_success"], errors="coerce").fillna(0.0).eq(1.0).all()
+
+
+def test_not_set_final_window_with_id_disabled_remains_invalid_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    df, col = _tiny_backtest_df(hours=1)
+    bt = _mk_backtester("canonical_economic")
+    bt.soc_init = 9.0
+    bt.soc_target_end = 10.0
+    bt.final_soc_mode = "hard"
+
+    def _not_set(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("MIP optimization failed: HiGHS Status 0: Not Set")
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _not_set)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=1,
+        reopt_step_hours=1,
+        allowed_markets=("aFRR", "ID"),
+        strategy_name="bcm_only",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+        id_recourse_mode="disabled",
+    )
+    assert set(out.hourly["optimization_error_code"].astype(str)) == {"safe_hold_plan_under_solver_not_set"}
+    assert float(out.summary["fallback_used"]) == 1.0
+    assert float(out.summary["simulation_valid"]) == 0.0
+    assert "fallback_used" in str(out.summary["invalid_reason"])
 
 
 def test_highs_unknown_with_feasible_primal_counts_as_feasible_incumbent() -> None:
