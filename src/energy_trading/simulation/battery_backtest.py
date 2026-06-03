@@ -226,6 +226,26 @@ SETTLEMENT_NUMERIC_COLS = (
     "submitted_afrr_neg_mw",
     "submitted_bcm_capacity_pos_mw",
     "submitted_bcm_capacity_neg_mw",
+    "bcm_allowed",
+    "bcm_ev_pos",
+    "bcm_ev_neg",
+    "bcm_candidate_pos_mw",
+    "bcm_candidate_neg_mw",
+    "bcm_precommit_feasibility_pass",
+    "bcm_precommit_candidate_pos_mw",
+    "bcm_precommit_candidate_neg_mw",
+    "bcm_precommit_locked_pos_mw",
+    "bcm_precommit_locked_neg_mw",
+    "bcm_activation_bid_price_pos",
+    "bcm_activation_bid_price_neg",
+    "true_activation_price_pos",
+    "true_activation_price_neg",
+    "bcm_true_activation_price_pos",
+    "bcm_true_activation_price_neg",
+    "bcm_cleared_pos",
+    "bcm_cleared_neg",
+    "bcm_locked_pos_mw",
+    "bcm_locked_neg_mw",
     "desired_bem_only_pos_mw",
     "desired_bem_only_neg_mw",
     "safe_bem_only_pos_mw",
@@ -292,6 +312,7 @@ SETTLEMENT_NUMERIC_COLS = (
     "terminal_soc_id_recourse_scheduled_grid_mwh",
     "terminal_soc_id_recourse_scheduled_internal_mwh",
     "terminal_soc_id_recovery_safety_mwh",
+    "terminal_soc_projection_id_extra_aux_losses_mwh",
     "terminal_soc_recovery_iteration_count",
     "terminal_soc_recovery_feasible",
     "terminal_soc_not_recoverable_with_id",
@@ -306,6 +327,8 @@ SETTLEMENT_NUMERIC_COLS = (
 SETTLEMENT_METADATA_COLS = (
     "da_buy_reason",
     "da_sell_reason",
+    "bcm_zero_reason",
+    "bcm_precommit_zero_reason",
     "bem_only_headroom_guard_reason",
     "id_mode",
     "id_recourse_mode",
@@ -510,6 +533,36 @@ def canonicalize_market_frame(
 
 class BatteryBacktester:
     """Linear-programming dispatch optimizer + realized settlement engine."""
+
+    @staticmethod
+    def _select_global_pf_incumbent(
+        candidates: dict[str, tuple[float, bool, pd.DataFrame]]
+    ) -> dict[str, object]:
+        """Select the highest-PnL feasible global-PF incumbent."""
+        priority = {"solver": 0, "no_market": 1, "realized_path": 2}
+        feasible: list[tuple[str, float, pd.DataFrame]] = []
+        for name, (value, is_feasible, frame) in candidates.items():
+            value_f = float(value)
+            if bool(is_feasible) and np.isfinite(value_f):
+                feasible.append((str(name), value_f, frame))
+        if not feasible:
+            return {
+                "selected": "none",
+                "value": float("nan"),
+                "frame": pd.DataFrame(),
+                "verified": 0.0,
+                "failure_reason": "no_feasible_incumbent",
+                "selection_reason": "no_feasible_incumbent",
+            }
+        selected, value, frame = max(feasible, key=lambda item: (item[1], -priority.get(item[0], 99)))
+        return {
+            "selected": selected,
+            "value": float(value),
+            "frame": frame,
+            "verified": 1.0,
+            "failure_reason": "none",
+            "selection_reason": f"{selected}_has_highest_feasible_pnl",
+        }
 
     def __init__(self) -> None:
         dt = float(MODEL_SPECS["time_step_hours"])
@@ -3513,6 +3566,11 @@ class BatteryBacktester:
                 "id_price_uses_activation_price": np.zeros(n, dtype=float),
                 "reserve_activation_headroom_h": np.full(n, self.reserve_activation_headroom_h, dtype=float),
                 "bem_activation_headroom_h": np.full(n, self.bem_activation_headroom_h, dtype=float),
+                "bcm_allowed": np.full(n, float(perms.allow_bcm), dtype=float),
+                "bcm_ev_pos": np.nanmax(rpos_coef_by_bin, axis=1) if n_bins else np.zeros(n, dtype=float),
+                "bcm_ev_neg": np.nanmax(rneg_coef_by_bin, axis=1) if n_bins else np.zeros(n, dtype=float),
+                "bcm_candidate_pos_mw": reserve_pos_mw,
+                "bcm_candidate_neg_mw": reserve_neg_mw,
             }
         )
         if "optimizer_required_input_imputed_count" in df.columns:
@@ -4373,8 +4431,8 @@ class BatteryBacktester:
         )
         projection_diag = self._project_terminal_soc_with_known_flows(
             current_soc_mwh=float(soc_next),
-            fixed_future_charge_mwh=max(0.0, projected_raw - float(soc_next)),
-            fixed_future_discharge_mwh=max(0.0, float(soc_next) - projected_raw),
+            fixed_future_charge_mwh=max(0.0, projected_raw - float(soc_next)) / max(float(self.eta_in), 1e-12),
+            fixed_future_discharge_mwh=max(0.0, float(soc_next) - projected_raw) * max(float(self.eta_out), 1e-12),
             remaining_aux_losses_mwh=max(0.0, remaining_known_losses_mwh),
             existing_scheduled_id_internal_mwh=0.0,
         )
@@ -4436,7 +4494,8 @@ class BatteryBacktester:
             and np.isfinite(float(terminal_soc_target_mwh))
             and id_discharge <= 1e-12
         ):
-            projected_without = float(projection_diag["projected_terminal_soc_without_new_id_mwh"])
+            projected_without_base = float(projection_diag["projected_terminal_soc_without_new_id_mwh"])
+            projected_without = float(projected_without_base)
             terminal_need_internal = max(
                 0.0,
                 float(terminal_soc_target_mwh)
@@ -4444,29 +4503,64 @@ class BatteryBacktester:
                 - projected_without,
             )
             if terminal_need_internal > 1e-9:
-                residual_charge_mw = float(
-                    self._compute_canonical_power_stack(
-                        da_charge_mw=da_charge_next_mw,
-                        da_discharge_mw=da_discharge_next_mw,
-                        id_buy_mw=id_charge,
-                        id_sell_mw=0.0,
-                        bcm_neg_obligation_mw=reserve_neg_next_mw,
-                        bcm_pos_obligation_mw=reserve_pos_next_mw,
-                    )["charge_residual_mw"]
+                recovery_diag: dict[str, float | str] = {}
+                add_id_charge_mw = 0.0
+                extra_aux_mwh = 0.0
+                aux_no_id_mw, _ = self._state_aux_power_mw(
+                    charge_mw=max(0.0, float(da_charge_next_mw)),
+                    discharge_mw=max(0.0, float(da_discharge_next_mw)),
+                    reserve_pos_mw=max(0.0, float(reserve_pos_next_mw)),
+                    reserve_neg_mw=max(0.0, float(reserve_neg_next_mw)),
+                    act_pos_rate=0.0,
+                    act_neg_rate=0.0,
+                    id_charge_mw=0.0,
+                    id_discharge_mw=0.0,
                 )
-                recovery_diag = self._schedule_terminal_id_recovery(
-                    projected_terminal_soc_without_new_id_mwh=projected_without,
-                    current_soc_mwh=float(soc_next),
-                    terminal_soc_target_mwh=float(terminal_soc_target_mwh),
-                    residual_charge_mw=residual_charge_mw,
-                    terminal_soc_safety_margin_mwh=float(terminal_soc_safety_margin_mwh),
-                )
-                sched_internal = float(recovery_diag["terminal_soc_id_recourse_scheduled_internal_mwh"])
-                add_id_charge_mw = float(recovery_diag["terminal_soc_id_recourse_scheduled_grid_mwh"]) / max(
-                    self.dt_h, 1e-12
-                )
+                for iteration in range(1, 5):
+                    residual_charge_mw = float(
+                        self._compute_canonical_power_stack(
+                            da_charge_mw=da_charge_next_mw,
+                            da_discharge_mw=da_discharge_next_mw,
+                            id_buy_mw=id_charge,
+                            id_sell_mw=0.0,
+                            bcm_neg_obligation_mw=reserve_neg_next_mw,
+                            bcm_pos_obligation_mw=reserve_pos_next_mw,
+                        )["charge_residual_mw"]
+                    )
+                    recovery_diag = self._schedule_terminal_id_recovery(
+                        projected_terminal_soc_without_new_id_mwh=projected_without,
+                        current_soc_mwh=float(soc_next),
+                        terminal_soc_target_mwh=float(terminal_soc_target_mwh),
+                        residual_charge_mw=residual_charge_mw,
+                        terminal_soc_safety_margin_mwh=float(terminal_soc_safety_margin_mwh),
+                    )
+                    add_id_charge_mw = float(recovery_diag["terminal_soc_id_recourse_scheduled_grid_mwh"]) / max(
+                        self.dt_h, 1e-12
+                    )
+                    aux_with_id_mw, _ = self._state_aux_power_mw(
+                        charge_mw=max(0.0, float(da_charge_next_mw)),
+                        discharge_mw=max(0.0, float(da_discharge_next_mw)),
+                        reserve_pos_mw=max(0.0, float(reserve_pos_next_mw)),
+                        reserve_neg_mw=max(0.0, float(reserve_neg_next_mw)),
+                        act_pos_rate=0.0,
+                        act_neg_rate=0.0,
+                        id_charge_mw=float(id_charge + add_id_charge_mw),
+                        id_discharge_mw=0.0,
+                    )
+                    new_extra_aux_mwh = max(0.0, float(aux_with_id_mw) - float(aux_no_id_mw)) * float(self.dt_h)
+                    adjusted_projected_without = float(projected_without_base - new_extra_aux_mwh)
+                    recovery_diag["terminal_soc_recovery_iteration_count"] = float(iteration)
+                    recovery_diag["terminal_soc_projection_id_extra_aux_losses_mwh"] = float(new_extra_aux_mwh)
+                    if abs(new_extra_aux_mwh - extra_aux_mwh) <= 1e-9:
+                        break
+                    extra_aux_mwh = float(new_extra_aux_mwh)
+                    projected_without = adjusted_projected_without
                 id_charge += max(0.0, add_id_charge_mw)
-                reason = "terminal_soc_recovery"
+                reason = (
+                    "terminal_soc_recovery"
+                    if float(recovery_diag.get("terminal_soc_recovery_feasible", 0.0)) >= 0.5
+                    else "terminal_soc_not_recoverable_with_id"
+                )
                 self._last_id_rescue_plan_diagnostics.update(recovery_diag)
         return float(id_charge), float(id_discharge), str(reason)
 
@@ -5168,6 +5262,22 @@ class BatteryBacktester:
             if v is not None and np.isfinite(v)
         ]
         mean_energy_price = float(np.mean(energy_prices)) if energy_prices else float("nan")
+        bcm_activation_bid_price_pos = float(
+            np.mean([float(b.energy_price_eur_mwh) for b in bcm_cap_bids if b.side == "pos"])
+        ) if any(b.side == "pos" for b in bcm_cap_bids) else 0.0
+        bcm_activation_bid_price_neg = float(
+            np.mean([float(b.energy_price_eur_mwh) for b in bcm_cap_bids if b.side == "neg"])
+        ) if any(b.side == "neg" for b in bcm_cap_bids) else 0.0
+        if not allow_bcm:
+            bcm_zero_reason = "bcm_disabled"
+        elif (ob_pos > 1e-12 or ob_neg > 1e-12) and (bcm_source_pos_mw <= 1e-12 and bcm_source_neg_mw <= 1e-12):
+            bcm_zero_reason = "clearing_failed"
+        elif ob_pos <= 1e-12 and ob_neg <= 1e-12 and res_pos_plan <= 1e-12 and res_neg_plan <= 1e-12:
+            bcm_zero_reason = "negative_bcm_ev"
+        elif ob_pos <= 1e-12 and ob_neg <= 1e-12:
+            bcm_zero_reason = "outside_bcm_gate"
+        else:
+            bcm_zero_reason = "none"
 
         return {
             "plan_charge_mw": ch_plan,
@@ -5217,6 +5327,18 @@ class BatteryBacktester:
             "submitted_afrr_neg_mw": float(cap_res.submitted_neg_mw),
             "submitted_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
             "submitted_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "bcm_allowed": float(allow_bcm),
+            "bcm_activation_bid_price_pos": float(bcm_activation_bid_price_pos),
+            "bcm_activation_bid_price_neg": float(bcm_activation_bid_price_neg),
+            "true_activation_price_pos": float(true_act_pos),
+            "true_activation_price_neg": float(true_act_neg),
+            "bcm_true_activation_price_pos": float(true_act_pos),
+            "bcm_true_activation_price_neg": float(true_act_neg),
+            "bcm_cleared_pos": float(bcm_source_pos_mw > 1e-12),
+            "bcm_cleared_neg": float(bcm_source_neg_mw > 1e-12),
+            "bcm_locked_pos_mw": float(ob_pos),
+            "bcm_locked_neg_mw": float(ob_neg),
+            "bcm_zero_reason": bcm_zero_reason,
             "afrr_bcm_auction_cleared": float((ob_pos > 0.0) or (ob_neg > 0.0)),
             "fixed_reserve_obligation_pos_mw": float(ob_pos),
             "fixed_reserve_obligation_neg_mw": float(ob_neg),
@@ -10059,6 +10181,7 @@ class BatteryBacktester:
                         id_recourse_mode=id_recourse_mode,
                         run_mode="perfect_foresight",
                         strict_simulation_validity=bool(strict_simulation_validity),
+                        bcm_bid_hour_local=bcm_bid_hour_local,
                     )
                 else:
                     perfect_foresight_dispatch = self.optimize_dispatch(
@@ -10128,6 +10251,7 @@ class BatteryBacktester:
                         id_recourse_mode=id_recourse_mode,
                         run_mode="perfect_foresight",
                         strict_simulation_validity=bool(strict_simulation_validity),
+                        bcm_bid_hour_local=bcm_bid_hour_local,
                     )
                 else:
                     perfect_foresight_cmp_dispatch = self.optimize_dispatch(
@@ -10179,11 +10303,16 @@ class BatteryBacktester:
         global_perfect_foresight_bem_only_included = 0.0
         global_perfect_foresight_pnl_reconciliation_error_eur = float("nan")
         global_perfect_foresight_available_flag = 0.0
+        global_pf_solver_solution_eur = float("nan")
         global_pf_no_trade_incumbent_eur = float("nan")
+        global_pf_realized_path_incumbent_eur = float("nan")
         global_pf_no_trade_final_soc_mwh = float("nan")
         global_pf_no_trade_terminal_shortfall_mwh = float("nan")
         global_pf_no_trade_id_buy_mwh = 0.0
         global_pf_selected_incumbent = "none"
+        global_pf_incumbent_selection_reason = "disabled"
+        global_pf_selected_final_soc_mwh = float("nan")
+        global_pf_selected_terminal_shortfall_mwh = float("nan")
         global_pf_candidate_terminal_shortfall_mwh = float("nan")
         da_true_for_global_pf = self._finite_numeric_series(
             perfect_foresight_df,
@@ -10196,13 +10325,9 @@ class BatteryBacktester:
             float(da_true_for_global_pf.iloc[-1]) if len(da_true_for_global_pf) else 0.0,
         )
         if enable_global_perfect_foresight:
-            # Verified thesis upper-bound candidate: reuse the comparable
-            # same-rules hindsight path instead of the old deterministic
-            # full-horizon branch. The old branch changed reserve/BEM settlement
-            # semantics and could fall below realized PnL, so it cannot verify
-            # an upper-bound gate.
             no_trade_real, no_trade_diag = _build_no_market_terminal_id_incumbent(perfect_foresight_df)
             no_trade_global = _rename_realized_frame(no_trade_real, "global_perfect_foresight")
+            no_trade_feasible = float(no_trade_diag.get("feasible", 0.0)) >= 0.5
             global_pf_no_trade_final_soc_mwh = float(no_trade_diag.get("final_soc_mwh", float("nan")))
             global_pf_no_trade_terminal_shortfall_mwh = float(no_trade_diag.get("terminal_shortfall_mwh", float("nan")))
             global_pf_no_trade_id_buy_mwh = float(no_trade_diag.get("id_buy_mwh", 0.0))
@@ -10211,108 +10336,106 @@ class BatteryBacktester:
                 "global_perfect_foresight",
                 terminal_price_for_global_pf,
             )
-            if rolling_pf_cmp_available < 0.5:
-                global_pf_solver_status = rolling_pf_cmp_solver_status
-                global_perfect_foresight_validation_status = "global_pf_solver_failed"
-                pf_failure_reason = pf_failure_reason or f"global_pf_solver_failed:{global_pf_solver_status}"
-                if float(no_trade_diag.get("feasible", 0.0)) >= 0.5:
-                    global_perfect_foresight_real = no_trade_global
-                    global_pf_selected_incumbent = "no_trade_terminal_id"
-                    global_perfect_foresight_available_flag = 1.0
-                    global_pf_solver_status = f"{global_pf_solver_status}_pf_failed_no_trade_incumbent"
-                    global_perfect_foresight_validation_status = "verified_no_trade_incumbent_pf_solver_failed"
-                else:
-                    global_perfect_foresight_real = _empty_pf_frame("global_perfect_foresight")
-            else:
+
+            solver_global = _empty_pf_frame("global_perfect_foresight")
+            solver_feasible = False
+            if rolling_pf_cmp_available >= 0.5:
                 global_pf_solver_status = "ok"
                 global_perfect_foresight_dispatch_rows = float(len(perfect_foresight_cmp_dispatch))
                 global_perfect_foresight_bem_only_included = float(
                     ("plan_bem_only_pos_mw" in perfect_foresight_cmp_dispatch.columns)
                     and ("plan_bem_only_neg_mw" in perfect_foresight_cmp_dispatch.columns)
                 )
-                global_perfect_foresight_real = perfect_foresight_cmp_real.rename(
+                solver_global = perfect_foresight_cmp_real.rename(
                     columns={
                         c: c.replace("pf_", "global_perfect_foresight_", 1)
                         for c in perfect_foresight_cmp_real.columns
                         if c.startswith("pf_")
                     }
                 )
-                global_perfect_foresight_settlement_rows = float(len(global_perfect_foresight_real))
-                global_perfect_foresight_real = global_perfect_foresight_real.rename(
+                solver_global = solver_global.rename(
                     columns={
                         c: c.replace("real_", "global_perfect_foresight_", 1)
-                        for c in global_perfect_foresight_real.columns
+                        for c in solver_global.columns
                         if c.startswith("real_")
                     }
                 )
-                candidate_global = global_perfect_foresight_real
-                candidate_soc_vals = (
-                    pd.to_numeric(candidate_global["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
-                    if "global_perfect_foresight_soc_mwh" in candidate_global.columns
+                solver_soc_vals = (
+                    pd.to_numeric(solver_global["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
+                    if "global_perfect_foresight_soc_mwh" in solver_global.columns
                     else pd.Series(dtype=float)
                 )
-                candidate_final_soc = (
-                    float(candidate_soc_vals.iloc[-1]) if not candidate_soc_vals.empty else float(self.soc_init)
-                )
+                solver_final_soc = float(solver_soc_vals.iloc[-1]) if not solver_soc_vals.empty else float(self.soc_init)
                 global_pf_candidate_terminal_shortfall_mwh = max(
                     0.0,
-                    float(self.soc_target_end) - float(candidate_final_soc),
+                    float(self.soc_target_end) - float(solver_final_soc),
                 )
-                candidate_total = _pnl_total_for_realized_frame(
-                    candidate_global,
+                global_pf_solver_solution_eur = _pnl_total_for_realized_frame(
+                    solver_global,
                     "global_perfect_foresight",
                     terminal_price_for_global_pf,
                 )
-                no_trade_feasible = float(no_trade_diag.get("feasible", 0.0)) >= 0.5
-                if global_pf_candidate_terminal_shortfall_mwh > 1e-6 and no_trade_feasible:
-                    global_perfect_foresight_real = no_trade_global
-                    global_pf_selected_incumbent = "no_trade_terminal_id"
-                    global_perfect_foresight_validation_status = "verified_no_trade_incumbent_pf_terminal_shortfall"
-                elif no_trade_feasible and np.isfinite(global_pf_no_trade_incumbent_eur) and (
-                    (not np.isfinite(candidate_total))
-                    or global_pf_no_trade_incumbent_eur > candidate_total + 1e-6
-                ):
-                    global_perfect_foresight_real = no_trade_global
-                    global_pf_selected_incumbent = "no_trade_terminal_id"
-                    global_perfect_foresight_validation_status = "verified_no_trade_incumbent_dominates_pf_candidate"
-                else:
-                    global_pf_selected_incumbent = "perfect_foresight_candidate"
-                    global_perfect_foresight_validation_status = "computed_unverified"
-                realized_global = _rename_realized_frame(real, "global_perfect_foresight")
-                realized_incumbent_total = _pnl_total_for_realized_frame(
-                    realized_global,
-                    "global_perfect_foresight",
-                    terminal_price_for_global_pf,
+                solver_feasible = bool(
+                    len(solver_global) == len(df)
+                    and np.isfinite(global_pf_solver_solution_eur)
+                    and global_pf_candidate_terminal_shortfall_mwh <= 1e-6
                 )
-                realized_global_soc = (
-                    pd.to_numeric(realized_global["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
-                    if "global_perfect_foresight_soc_mwh" in realized_global.columns
-                    else pd.Series(dtype=float)
-                )
-                realized_global_terminal_feasible = (
-                    (not realized_global_soc.empty)
-                    and float(realized_global_soc.iloc[-1]) + 1e-6 >= float(self.soc_target_end)
-                )
-                selected_total = _pnl_total_for_realized_frame(
-                    global_perfect_foresight_real,
-                    "global_perfect_foresight",
-                    terminal_price_for_global_pf,
-                )
-                if realized_global_terminal_feasible and np.isfinite(realized_incumbent_total) and (
-                    (not np.isfinite(selected_total))
-                    or realized_incumbent_total > selected_total + 1e-6
-                ):
-                    global_perfect_foresight_real = realized_global
-                    global_pf_selected_incumbent = "realized_path"
+            else:
+                global_pf_solver_status = rolling_pf_cmp_solver_status
+                pf_failure_reason = pf_failure_reason or f"global_pf_solver_failed:{global_pf_solver_status}"
+
+            realized_global = _rename_realized_frame(real, "global_perfect_foresight")
+            global_pf_realized_path_incumbent_eur = _pnl_total_for_realized_frame(
+                realized_global,
+                "global_perfect_foresight",
+                terminal_price_for_global_pf,
+            )
+            realized_global_feasible = bool(
+                len(realized_global) == len(df)
+                and np.isfinite(global_pf_realized_path_incumbent_eur)
+            )
+
+            selection = self._select_global_pf_incumbent(
+                {
+                    "solver": (global_pf_solver_solution_eur, solver_feasible, solver_global),
+                    "no_market": (global_pf_no_trade_incumbent_eur, no_trade_feasible, no_trade_global),
+                    "realized_path": (global_pf_realized_path_incumbent_eur, realized_global_feasible, realized_global),
+                }
+            )
+            global_pf_selected_incumbent = str(selection["selected"])
+            global_pf_incumbent_selection_reason = str(selection["selection_reason"])
+            global_perfect_foresight_real = selection["frame"] if isinstance(selection["frame"], pd.DataFrame) else pd.DataFrame()
+            global_perfect_foresight_available_flag = float(selection["verified"])
+            global_perfect_foresight_settlement_rows = float(len(global_perfect_foresight_real))
+
+            selected_soc_vals = (
+                pd.to_numeric(global_perfect_foresight_real["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
+                if "global_perfect_foresight_soc_mwh" in global_perfect_foresight_real.columns
+                else pd.Series(dtype=float)
+            )
+            global_pf_selected_final_soc_mwh = (
+                float(selected_soc_vals.iloc[-1]) if not selected_soc_vals.empty else float("nan")
+            )
+            global_pf_selected_terminal_shortfall_mwh = (
+                max(0.0, float(self.soc_target_end) - float(global_pf_selected_final_soc_mwh))
+                if np.isfinite(global_pf_selected_final_soc_mwh)
+                else float("nan")
+            )
+
+            if global_perfect_foresight_available_flag >= 0.5:
+                if global_pf_selected_incumbent == "solver":
+                    global_perfect_foresight_validation_status = "verified_solver_incumbent"
+                elif global_pf_selected_incumbent == "no_market":
+                    global_perfect_foresight_validation_status = "verified_no_market_incumbent"
+                elif global_pf_selected_incumbent == "realized_path":
                     global_perfect_foresight_validation_status = "verified_realized_path_incumbent"
-                global_perfect_foresight_settlement_rows = float(len(global_perfect_foresight_real))
-                if global_perfect_foresight_dispatch_rows > 0 and global_perfect_foresight_settlement_rows == float(len(df)):
-                    global_perfect_foresight_available_flag = 1.0
-                    if global_perfect_foresight_validation_status == "computed_unverified":
-                        global_perfect_foresight_validation_status = "available_same_rules_candidate"
                 else:
-                    global_perfect_foresight_available_flag = 0.0
-                    global_perfect_foresight_validation_status = "disabled_scope_mismatch"
+                    global_perfect_foresight_validation_status = "verified_incumbent"
+            else:
+                global_perfect_foresight_real = _empty_pf_frame("global_perfect_foresight")
+                global_perfect_foresight_validation_status = "no_feasible_incumbent"
+                pf_failure_reason = pf_failure_reason or "global_pf_no_feasible_incumbent"
+
 
         # Legacy isolated-market retrospective accounting removed.
         realized_da_only_feasible = True
@@ -10654,7 +10777,11 @@ class BatteryBacktester:
             np.isfinite(same_rules_rolling_pf_gap_eur)
             and same_rules_rolling_pf_gap_eur >= -eps_global_perfect_foresight
         )
-        realized_path_pnl_under_global_upper_bound_rules_eur = float(real_pnl_total)
+        realized_path_pnl_under_global_upper_bound_rules_eur = (
+            float(global_pf_realized_path_incumbent_eur)
+            if enable_global_perfect_foresight and np.isfinite(global_pf_realized_path_incumbent_eur)
+            else float(real_pnl_total)
+        )
         global_pf_upper_bound_gap_eur = (
             float(global_perfect_foresight_pnl_total - realized_path_pnl_under_global_upper_bound_rules_eur)
             if np.isfinite(global_perfect_foresight_pnl_total)
@@ -10677,7 +10804,8 @@ class BatteryBacktester:
             if str(global_perfect_foresight_validation_status) == "global_pf_solver_failed":
                 global_perfect_foresight_validation_status = "global_pf_solver_failed"
             elif global_pf_verified_upper_bound >= 0.5:
-                global_perfect_foresight_validation_status = "verified_same_rules_dominates_realized"
+                if not str(global_perfect_foresight_validation_status).startswith("verified_"):
+                    global_perfect_foresight_validation_status = "verified_same_rules_dominates_realized"
             elif global_pf_below_realized_incumbent >= 0.5:
                 global_perfect_foresight_validation_status = "global_pf_below_realized_incumbent"
             elif global_perfect_foresight_available_flag < 0.5:
@@ -10796,11 +10924,22 @@ class BatteryBacktester:
             "global_pf_verified": float(global_pf_verified_upper_bound),
             "global_pf_upper_bound_gap_eur": float(global_pf_upper_bound_gap_eur),
             "global_pf_below_realized_incumbent": float(global_pf_below_realized_incumbent),
+            "global_pf_solver_solution_eur": float(global_pf_solver_solution_eur),
             "global_pf_no_trade_incumbent_eur": float(global_pf_no_trade_incumbent_eur),
+            "global_pf_no_market_incumbent_eur": float(global_pf_no_trade_incumbent_eur),
+            "global_pf_realized_path_incumbent_eur": float(global_pf_realized_path_incumbent_eur),
+            "global_pf_minus_no_market_incumbent_eur": (
+                float(global_perfect_foresight_pnl_total - global_pf_no_trade_incumbent_eur)
+                if np.isfinite(global_perfect_foresight_pnl_total) and np.isfinite(global_pf_no_trade_incumbent_eur)
+                else float("nan")
+            ),
             "global_pf_no_trade_final_soc_mwh": float(global_pf_no_trade_final_soc_mwh),
             "global_pf_no_trade_terminal_shortfall_mwh": float(global_pf_no_trade_terminal_shortfall_mwh),
             "global_pf_no_trade_id_buy_mwh": float(global_pf_no_trade_id_buy_mwh),
             "global_pf_selected_incumbent": str(global_pf_selected_incumbent),
+            "global_pf_selected_final_soc_mwh": float(global_pf_selected_final_soc_mwh),
+            "global_pf_selected_terminal_shortfall_mwh": float(global_pf_selected_terminal_shortfall_mwh),
+            "global_pf_incumbent_selection_reason": str(global_pf_incumbent_selection_reason),
             "global_pf_candidate_terminal_shortfall_mwh": float(global_pf_candidate_terminal_shortfall_mwh),
             "global_hindsight_perfect_foresight_is_global_upper_bound": 0.0,
             "global_perfect_foresight_available": float(global_perfect_foresight_available_flag),
@@ -11218,11 +11357,20 @@ class BatteryBacktester:
             and str(global_perfect_foresight_validation_status) != "global_pf_solver_failed"
         )
         summary["global_pf_realized_path_incumbent_eur"] = float(realized_path_pnl_under_global_upper_bound_rules_eur)
-        summary["global_pf_solution_eur"] = float(global_perfect_foresight_pnl_total)
+        summary["global_pf_solution_eur"] = float(global_pf_solver_solution_eur)
+        summary["global_pf_solver_solution_eur"] = float(global_pf_solver_solution_eur)
+        summary["global_pf_no_market_incumbent_eur"] = float(global_pf_no_trade_incumbent_eur)
+        summary["global_pf_minus_no_market_incumbent_eur"] = (
+            float(global_perfect_foresight_pnl_total - global_pf_no_trade_incumbent_eur)
+            if np.isfinite(global_perfect_foresight_pnl_total) and np.isfinite(global_pf_no_trade_incumbent_eur)
+            else float("nan")
+        )
         summary["global_pf_minus_realized_incumbent_eur"] = float(global_pf_upper_bound_gap_eur)
         global_pf_failure_reason = "none"
         if enable_global_perfect_foresight:
-            if str(global_perfect_foresight_validation_status) == "global_pf_solver_failed":
+            if str(global_perfect_foresight_validation_status) == "no_feasible_incumbent":
+                global_pf_failure_reason = "no_feasible_incumbent"
+            elif str(global_perfect_foresight_validation_status) == "global_pf_solver_failed":
                 global_pf_failure_reason = "solver_failed"
             elif global_perfect_foresight_available_flag < 0.5:
                 global_pf_failure_reason = "unavailable"
@@ -12387,11 +12535,18 @@ class BatteryBacktester:
             ("global_pf_verified", 0.0),
             ("global_pf_upper_bound_gap_eur", float("nan")),
             ("global_pf_below_realized_incumbent", 0.0),
+            ("global_pf_solver_solution_eur", float("nan")),
             ("global_pf_no_trade_incumbent_eur", float("nan")),
+            ("global_pf_no_market_incumbent_eur", float("nan")),
+            ("global_pf_realized_path_incumbent_eur", float("nan")),
+            ("global_pf_minus_no_market_incumbent_eur", float("nan")),
             ("global_pf_no_trade_final_soc_mwh", float("nan")),
             ("global_pf_no_trade_terminal_shortfall_mwh", float("nan")),
             ("global_pf_no_trade_id_buy_mwh", 0.0),
             ("global_pf_selected_incumbent", "none"),
+            ("global_pf_selected_final_soc_mwh", float("nan")),
+            ("global_pf_selected_terminal_shortfall_mwh", float("nan")),
+            ("global_pf_incumbent_selection_reason", "disabled"),
             ("global_pf_candidate_terminal_shortfall_mwh", float("nan")),
             ("global_hindsight_perfect_foresight_is_global_upper_bound", 0.0),
             ("global_perfect_foresight_capacity_bid_semantics", "hindsight_pay_as_bid_upper_bound"),

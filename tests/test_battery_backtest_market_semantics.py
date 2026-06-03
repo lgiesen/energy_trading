@@ -50,6 +50,45 @@ def _mk_backtester(forecast_value_mode: str = "raw_signed") -> BatteryBacktester
     return BatteryBacktester()
 
 
+def test_terminal_id_recovery_converts_internal_shortfall_to_grid_mwh() -> None:
+    bt = _mk_backtester()
+    diag = bt._schedule_terminal_id_recovery(
+        projected_terminal_soc_without_new_id_mwh=9.0,
+        current_soc_mwh=9.0,
+        terminal_soc_target_mwh=10.0,
+        residual_charge_mw=10.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    assert float(diag["terminal_soc_id_recourse_needed_internal_mwh"]) == pytest.approx(1.0)
+    assert float(diag["terminal_soc_id_recourse_scheduled_grid_mwh"]) == pytest.approx(1.0 / bt.eta_in)
+    assert float(diag["terminal_soc_id_recourse_scheduled_internal_mwh"]) == pytest.approx(1.0)
+    assert float(diag["terminal_soc_recovery_feasible"]) == 1.0
+
+
+def test_terminal_id_recovery_planner_includes_incremental_auxiliary_loss() -> None:
+    bt = _mk_backtester()
+    bt.aux_mode = "state_dependent"
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.25
+    id_charge_mw, id_discharge_mw, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=10.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=9.95,
+        remaining_known_losses_mwh=0.05,
+        terminal_soc_safety_margin_mwh=0.10,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+    assert id_discharge_mw == pytest.approx(0.0)
+    assert id_charge_mw > 0.0
+    assert reason == "terminal_soc_recovery"
+    assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(0.25)
+    assert float(diag["projected_terminal_soc_with_new_id_mwh"]) >= 10.10 - 1e-9
+
+
 def _one_hour_pred_df(
     *,
     da: float,
@@ -4282,7 +4321,11 @@ def test_terminal_id_recovery_sizes_grid_buy_from_internal_shortfall_and_losses(
         remaining_known_losses_mwh=remaining_losses,
     )
     diag = bt._last_id_rescue_plan_diagnostics
-    expected_internal = internal_shortfall + remaining_losses
+    expected_internal = (
+        internal_shortfall
+        + remaining_losses
+        + float(diag.get("terminal_soc_projection_id_extra_aux_losses_mwh", 0.0))
+    )
     assert reason == "terminal_soc_recovery"
     assert id_discharge == pytest.approx(0.0)
     assert id_charge * bt.dt_h == pytest.approx(expected_internal / bt.eta_in)
@@ -4305,10 +4348,11 @@ def test_terminal_id_recovery_includes_safety_margin() -> None:
         terminal_soc_safety_margin_mwh=0.10,
     )
     diag = bt._last_id_rescue_plan_diagnostics
+    expected_internal = 0.15 + float(diag.get("terminal_soc_projection_id_extra_aux_losses_mwh", 0.0))
     assert reason == "terminal_soc_recovery"
     assert id_discharge == pytest.approx(0.0)
-    assert id_charge * bt.dt_h == pytest.approx(0.15 / bt.eta_in)
-    assert diag["terminal_soc_id_recourse_needed_internal_mwh"] == pytest.approx(0.15)
+    assert id_charge * bt.dt_h == pytest.approx(expected_internal / bt.eta_in)
+    assert diag["terminal_soc_id_recourse_needed_internal_mwh"] == pytest.approx(expected_internal)
 
 
 def test_terminal_id_recovery_projection_updates_between_calls() -> None:
@@ -4727,6 +4771,86 @@ def test_global_perfect_foresight_same_rules_candidate_fields() -> None:
         )
 
 
+def test_perfect_foresight_bcm_participates_and_exports_same_rules_columns() -> None:
+    col = BacktestColumnMap()
+    hours = 36
+    ts = pd.date_range("2025-09-01T00:00:00Z", periods=hours, freq="h")
+    df = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [0.0] * hours,
+            "pred_da_price_p05": [0.0] * hours,
+            "pred_da_price_p10": [0.0] * hours,
+            "pred_da_price_p90": [0.0] * hours,
+            "pred_da_price_p95": [0.0] * hours,
+            col.pred_afrr_capacity_price_pos: [0.0] * hours,
+            col.pred_afrr_capacity_price_neg: [0.0] * hours,
+            col.pred_afrr_activation_price_pos: [1000.0] * hours,
+            col.pred_afrr_activation_price_neg: [1000.0] * hours,
+            col.pred_afrr_activation_rate_pos: [1.0] * hours,
+            col.pred_afrr_activation_rate_neg: [1.0] * hours,
+            col.true_da_price: [0.0] * hours,
+            col.true_afrr_capacity_price_pos: [0.0] * hours,
+            col.true_afrr_capacity_price_neg: [0.0] * hours,
+            col.true_afrr_activation_price_pos: [1000.0] * hours,
+            col.true_afrr_activation_price_neg: [1000.0] * hours,
+            col.true_afrr_activation_rate_pos: [1.0] * hours,
+            col.true_afrr_activation_rate_neg: [1.0] * hours,
+        }
+    )
+    for pref, val in [
+        (col.pred_afrr_capacity_price_pos, 0.0),
+        (col.pred_afrr_capacity_price_neg, 0.0),
+        (col.pred_afrr_activation_price_pos, 1000.0),
+        (col.pred_afrr_activation_price_neg, 1000.0),
+        (col.pred_afrr_activation_rate_pos, 1.0),
+        (col.pred_afrr_activation_rate_neg, 1.0),
+    ]:
+        for q in ["p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"]:
+            df[f"{pref}_{q}"] = val
+
+    bt = _mk_backtester("canonical_economic")
+    bt.reserve_feasibility_mode = "normal"
+    bt.enable_reserve_retry_ladder = False
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=30,
+        reopt_step_hours=1,
+        allowed_markets=("aFRR", "BCM"),
+        strategy_name="bcm_only",
+        id_recourse_mode="common",
+        enable_global_perfect_foresight=True,
+        bcm_bid_hour_local=8,
+    )
+    h = out.hourly
+    for prefix in ["real", "perfect_foresight", "global_perfect_foresight"]:
+        assert f"{prefix}_submitted_bcm_capacity_pos_mw" in h.columns
+        assert f"{prefix}_submitted_bcm_capacity_neg_mw" in h.columns
+        assert f"{prefix}_bcm_activation_bid_price_pos" in h.columns
+        assert f"{prefix}_bcm_true_activation_price_pos" in h.columns
+        assert f"{prefix}_bcm_precommit_feasibility_pass" in h.columns
+        assert f"{prefix}_bcm_precommit_zero_reason" in h.columns
+        assert f"{prefix}_bcm_zero_reason" in h.columns
+    assert (
+        pd.to_numeric(h["perfect_foresight_submitted_bcm_capacity_pos_mw"], errors="coerce").fillna(0.0).sum()
+        + pd.to_numeric(h["perfect_foresight_submitted_bcm_capacity_neg_mw"], errors="coerce").fillna(0.0).sum()
+    ) > 0.0
+    if float(out.summary.get("global_perfect_foresight_available", 0.0)) >= 0.5:
+        assert (
+            pd.to_numeric(h["global_perfect_foresight_submitted_bcm_capacity_pos_mw"], errors="coerce").fillna(0.0).sum()
+            + pd.to_numeric(h["global_perfect_foresight_submitted_bcm_capacity_neg_mw"], errors="coerce").fillna(0.0).sum()
+        ) > 0.0
+    pf_zero = (
+        pd.to_numeric(h["pf_submitted_bcm_capacity_pos_mw"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(h["pf_submitted_bcm_capacity_neg_mw"], errors="coerce").fillna(0.0)
+    ) <= 1e-12
+    if bool(pf_zero.any()):
+        reasons = h.loc[pf_zero, "pf_bcm_zero_reason"].fillna("").astype(str).str.strip()
+        assert bool((reasons != "").all())
+
+
 def test_global_pf_selects_no_trade_incumbent_when_pf_candidate_misses_terminal_soc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4770,7 +4894,7 @@ def test_global_pf_selects_no_trade_incumbent_when_pf_candidate_misses_terminal_
         enable_global_perfect_foresight=True,
     )
     s = out.summary
-    assert str(s["global_pf_selected_incumbent"]) == "no_trade_terminal_id"
+    assert str(s["global_pf_selected_incumbent"]) == "no_market"
     assert float(s["global_pf_candidate_terminal_shortfall_mwh"]) > 0.0
     assert float(s["global_pf_no_trade_terminal_shortfall_mwh"]) <= 1e-6
     assert float(s["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]) >= float(
@@ -4788,6 +4912,50 @@ def test_global_pf_selects_no_trade_incumbent_when_pf_candidate_misses_terminal_
         h["global_perfect_foresight_terminal_soc_recovery_iteration_count"],
         errors="coerce",
     ).fillna(0.0).max() >= 1.0
+
+
+def test_global_pf_incumbent_selector_chooses_no_market_over_solver() -> None:
+    frames = {
+        "solver": pd.DataFrame({"x": [1]}),
+        "no_market": pd.DataFrame({"x": [2]}),
+        "realized_path": pd.DataFrame({"x": [3]}),
+    }
+    selected = BatteryBacktester._select_global_pf_incumbent(
+        {
+            "solver": (10.0, True, frames["solver"]),
+            "no_market": (12.0, True, frames["no_market"]),
+            "realized_path": (11.0, True, frames["realized_path"]),
+        }
+    )
+    assert selected["selected"] == "no_market"
+    assert float(selected["value"]) == 12.0
+    assert selected["frame"].equals(frames["no_market"])
+    assert float(selected["verified"]) == 1.0
+
+
+def test_global_pf_incumbent_selector_chooses_realized_path_over_solver() -> None:
+    selected = BatteryBacktester._select_global_pf_incumbent(
+        {
+            "solver": (10.0, True, pd.DataFrame({"x": [1]})),
+            "no_market": (9.0, True, pd.DataFrame({"x": [2]})),
+            "realized_path": (13.0, True, pd.DataFrame({"x": [3]})),
+        }
+    )
+    assert selected["selected"] == "realized_path"
+    assert float(selected["value"]) == 13.0
+
+
+def test_global_pf_incumbent_selector_reports_no_feasible_incumbent() -> None:
+    selected = BatteryBacktester._select_global_pf_incumbent(
+        {
+            "solver": (float("nan"), False, pd.DataFrame()),
+            "no_market": (1.0, False, pd.DataFrame()),
+            "realized_path": (2.0, False, pd.DataFrame()),
+        }
+    )
+    assert selected["selected"] == "none"
+    assert float(selected["verified"]) == 0.0
+    assert selected["failure_reason"] == "no_feasible_incumbent"
 
 
 def test_same_rules_rolling_pf_dominance_fields_present() -> None:
@@ -4809,6 +4977,9 @@ def test_global_perfect_foresight_available_only_after_scope_validation() -> Non
     if float(s.get("global_perfect_foresight_available", 0.0)) >= 0.5:
         assert str(s.get("global_perfect_foresight_validation_status", "")) in {
             "verified_same_rules_dominates_realized",
+            "verified_solver_incumbent",
+            "verified_no_market_incumbent",
+            "verified_realized_path_incumbent",
             "global_pf_below_realized_incumbent",
             "global_pf_unverified",
         }
