@@ -226,6 +226,8 @@ SETTLEMENT_NUMERIC_COLS = (
     "submitted_afrr_neg_mw",
     "submitted_bcm_capacity_pos_mw",
     "submitted_bcm_capacity_neg_mw",
+    "locked_bcm_capacity_pos_mw",
+    "locked_bcm_capacity_neg_mw",
     "bcm_allowed",
     "bcm_ev_pos",
     "bcm_ev_neg",
@@ -1713,6 +1715,9 @@ class BatteryBacktester:
                 "projected_terminal_soc_mwh": np.nan,
                 "power_stack_pos_max_mw": 0.0,
                 "power_stack_neg_max_mw": 0.0,
+                "expected_aux_losses_mwh": 0.0,
+                "required_headroom_pos_mwh": 0.0,
+                "required_headroom_neg_mwh": 0.0,
                 "terminal_soc_feasible": 1.0,
                 "id_recourse_needed_mwh": 0.0,
                 "id_recourse_cost_eur": 0.0,
@@ -1783,6 +1788,9 @@ class BatteryBacktester:
                 "projected_terminal_soc_mwh": np.nan,
                 "power_stack_pos_max_mw": np.nan,
                 "power_stack_neg_max_mw": np.nan,
+                "expected_aux_losses_mwh": np.nan,
+                "required_headroom_pos_mwh": np.nan,
+                "required_headroom_neg_mwh": np.nan,
                 "terminal_soc_feasible": 0.0,
                 "id_recourse_needed_mwh": np.nan,
                 "id_recourse_cost_eur": np.nan,
@@ -1855,6 +1863,8 @@ class BatteryBacktester:
             power_stack_pos_max = 0.0
             power_stack_neg_max = 0.0
             headroom_violation = 0.0
+            required_headroom_pos_max = 0.0
+            required_headroom_neg_max = 0.0
             soc_violation = 0.0
             terminal_violation = 0.0
             terminal_required = False
@@ -1883,20 +1893,28 @@ class BatteryBacktester:
                 protected_min = float(self.soc_min)
                 protected_max = float(self.soc_max)
                 if ob_pos > 1e-9:
+                    req_pos = (
+                        ob_pos * float(self.reserve_activation_headroom_h) / max(float(self.eta_out), 1e-12)
+                        + float(self.reserve_headroom_safety_mwh)
+                        + float(self.reserve_soc_projection_safety_mwh)
+                    )
+                    required_headroom_pos_max = max(required_headroom_pos_max, float(req_pos))
                     protected_min = max(
                         protected_min,
                         float(self.soc_min)
-                        + ob_pos * float(self.reserve_activation_headroom_h) / max(float(self.eta_out), 1e-12)
-                        + float(self.reserve_headroom_safety_mwh)
-                        + float(self.reserve_soc_projection_safety_mwh),
+                        + req_pos,
                     )
                 if ob_neg > 1e-9:
+                    req_neg = (
+                        ob_neg * float(self.reserve_activation_headroom_h) * float(self.eta_in)
+                        + float(self.reserve_headroom_safety_mwh)
+                        + float(self.reserve_soc_projection_safety_mwh)
+                    )
+                    required_headroom_neg_max = max(required_headroom_neg_max, float(req_neg))
                     protected_max = min(
                         protected_max,
                         float(self.soc_max)
-                        - ob_neg * float(self.reserve_activation_headroom_h) * float(self.eta_in)
-                        - float(self.reserve_headroom_safety_mwh)
-                        - float(self.reserve_soc_projection_safety_mwh),
+                        - req_neg,
                     )
                 id_charge = 0.0
                 id_discharge = 0.0
@@ -2094,6 +2112,9 @@ class BatteryBacktester:
                 "projected_terminal_soc_mwh": float(soc_now),
                 "power_stack_pos_max_mw": float(power_stack_pos_max),
                 "power_stack_neg_max_mw": float(power_stack_neg_max),
+                "expected_aux_losses_mwh": float(expected_aux_losses),
+                "required_headroom_pos_mwh": float(required_headroom_pos_max),
+                "required_headroom_neg_mwh": float(required_headroom_neg_max),
                 "terminal_soc_feasible": float(terminal_violation <= 1e-9),
                 "id_recourse_needed_mwh": float(id_recourse_mwh),
                 "id_recourse_cost_eur": float(id_recourse_cost),
@@ -5327,6 +5348,8 @@ class BatteryBacktester:
             "submitted_afrr_neg_mw": float(cap_res.submitted_neg_mw),
             "submitted_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
             "submitted_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "locked_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
+            "locked_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
             "bcm_allowed": float(allow_bcm),
             "bcm_activation_bid_price_pos": float(bcm_activation_bid_price_pos),
             "bcm_activation_bid_price_neg": float(bcm_activation_bid_price_neg),
@@ -5360,8 +5383,11 @@ class BatteryBacktester:
             "executed_discharge_mw": dis_exec,
             "executed_reserve_pos_mw": res_pos_exec,
             "executed_reserve_neg_mw": res_neg_exec,
-            "executed_bcm_capacity_pos_mw": float(res_pos_exec if is_bcm_obligation_hour else 0.0),
-            "executed_bcm_capacity_neg_mw": float(res_neg_exec if is_bcm_obligation_hour else 0.0),
+            # BCM capacity MW is the already locked/awarded product capacity.
+            # Activation clearing belongs in *_activation_mwh/revenue fields and
+            # must not create varying capacity-MW values within a 4h block.
+            "executed_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
+            "executed_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
             "settlement_cap_bid_price_pos_eur_mw": float(cap_bid_pos_settlement),
             "settlement_cap_bid_price_neg_eur_mw": float(cap_bid_neg_settlement),
             "executed_rate_pos": rate_pos_exec,
@@ -5978,6 +6004,15 @@ class BatteryBacktester:
                         precommit_audit_by_ts.setdefault("bcm_precommit_power_stack_neg_max_mw", {})[tsu] = float(
                             bcm_precommit_stats.get("power_stack_neg_max_mw", np.nan)
                         )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_expected_aux_losses_mwh", {})[tsu] = float(
+                            bcm_precommit_stats.get("expected_aux_losses_mwh", np.nan)
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_required_headroom_pos_mwh", {})[tsu] = float(
+                            bcm_precommit_stats.get("required_headroom_pos_mwh", np.nan)
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_required_headroom_neg_mwh", {})[tsu] = float(
+                            bcm_precommit_stats.get("required_headroom_neg_mwh", np.nan)
+                        )
                         precommit_audit_by_ts.setdefault("bcm_precommit_projected_terminal_soc_mwh", {})[tsu] = float(
                             bcm_precommit_stats.get("projected_terminal_soc_mwh", np.nan)
                         )
@@ -6217,6 +6252,15 @@ class BatteryBacktester:
                     )
                     precommit_audit_by_ts.setdefault("bcm_precommit_power_stack_neg_max_mw", {})[tsu] = float(
                         bcm_precommit_stats.get("power_stack_neg_max_mw", np.nan)
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_expected_aux_losses_mwh", {})[tsu] = float(
+                        bcm_precommit_stats.get("expected_aux_losses_mwh", np.nan)
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_required_headroom_pos_mwh", {})[tsu] = float(
+                        bcm_precommit_stats.get("required_headroom_pos_mwh", np.nan)
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_required_headroom_neg_mwh", {})[tsu] = float(
+                        bcm_precommit_stats.get("required_headroom_neg_mwh", np.nan)
                     )
                     precommit_audit_by_ts.setdefault("bcm_precommit_terminal_soc_feasible", {})[tsu] = float(
                         bcm_precommit_stats.get("terminal_soc_feasible", 0.0)
@@ -7929,6 +7973,9 @@ class BatteryBacktester:
                 "bcm_precommit_projected_terminal_soc_mwh",
                 "bcm_precommit_power_stack_pos_max_mw",
                 "bcm_precommit_power_stack_neg_max_mw",
+                "bcm_precommit_expected_aux_losses_mwh",
+                "bcm_precommit_required_headroom_pos_mwh",
+                "bcm_precommit_required_headroom_neg_mwh",
                 "bcm_precommit_terminal_soc_feasible",
                 "bcm_precommit_id_recourse_needed_mwh",
                 "bcm_precommit_id_recourse_cost_eur",
@@ -9508,20 +9555,18 @@ class BatteryBacktester:
         preferred_cols = [
             "real_submitted_bcm_capacity_pos_mw",
             "real_submitted_bcm_capacity_neg_mw",
+            "real_locked_bcm_capacity_pos_mw",
+            "real_locked_bcm_capacity_neg_mw",
             "real_executed_bcm_capacity_pos_mw",
             "real_executed_bcm_capacity_neg_mw",
             "submitted_bcm_capacity_pos_mw",
             "submitted_bcm_capacity_neg_mw",
+            "locked_bcm_capacity_pos_mw",
+            "locked_bcm_capacity_neg_mw",
             "executed_bcm_capacity_pos_mw",
             "executed_bcm_capacity_neg_mw",
         ]
-        fallback_cols = [
-            "real_executed_reserve_pos_mw",
-            "real_executed_reserve_neg_mw",
-        ]
         cols = [c for c in preferred_cols if c in hourly.columns]
-        if not cols:
-            cols = [c for c in fallback_cols if c in hourly.columns]
         if not cols:
             return {
                 "pass": 0.0 if bcm_enabled else 1.0,

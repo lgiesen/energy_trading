@@ -334,8 +334,18 @@ def _suspected_infeasibility_driver_from_row(row: pd.Series) -> tuple[str, str]:
     solver_msg = str(row.get("solver_message", "") or "").lower()
     opt_code = str(row.get("optimization_error_code", "") or "").lower()
     fallback_mode = str(row.get("fallback_mode", "") or "").lower()
-    locked_pos = _f("locked_reserve_pos_mw")
-    locked_neg = _f("locked_reserve_neg_mw")
+    locked_pos = max(
+        _f("locked_reserve_pos_mw"),
+        _f("fixed_reserve_obligation_pos_mw"),
+        _f("bcm_pos_obligation_mw"),
+        _f("real_bcm_locked_pos_mw"),
+    )
+    locked_neg = max(
+        _f("locked_reserve_neg_mw"),
+        _f("fixed_reserve_obligation_neg_mw"),
+        _f("bcm_neg_obligation_mw"),
+        _f("real_bcm_locked_neg_mw"),
+    )
     new_pos = _f("new_submitted_reserve_pos_mw")
     new_neg = _f("new_submitted_reserve_neg_mw")
     pviol_pos = _f("power_violation_pos_mw")

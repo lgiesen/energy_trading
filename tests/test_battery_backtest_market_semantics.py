@@ -405,6 +405,33 @@ def test_bcm_block_consistency_ignores_mixed_afrr_hourly_columns_when_explicit_b
     assert float(res["violation_count"]) == 0.0
 
 
+def test_bcm_block_consistency_ignores_activation_mwh_and_revenue_variation() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-05-01T00:00:00Z", periods=4, freq="h")
+    hourly = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "real_submitted_bcm_capacity_pos_mw": [3.0, 3.0, 3.0, 3.0],
+            "real_locked_bcm_capacity_pos_mw": [3.0, 3.0, 3.0, 3.0],
+            "real_executed_bcm_capacity_pos_mw": [3.0, 3.0, 3.0, 3.0],
+            "real_submitted_bcm_capacity_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "real_locked_bcm_capacity_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "real_executed_bcm_capacity_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "real_bcm_linked_pos_activation_mwh": [0.0, 1.5, 0.0, 2.0],
+            "real_bcm_linked_activation_revenue_eur": [0.0, 150.0, 0.0, 200.0],
+        }
+    )
+    res = bt._compute_bcm_block_consistency(
+        hourly=hourly,
+        timestamp_col=col.timestamp,
+        bcm_enabled=True,
+        tol_mw=1e-6,
+    )
+    assert float(res["pass"]) == 1.0
+    assert "activation" not in str(res["checked_columns"])
+
+
 def test_simulation_forecast_loader_missing_p50_fails_by_default(tmp_path: Path) -> None:
     p = tmp_path / "missing_p50.parquet"
     pd.DataFrame(
@@ -752,6 +779,126 @@ def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
         cap_bid_neg=0.0,
     )
     assert np.isclose(float(m["revenue_capacity_eur"]), 0.0), m
+
+
+def test_bcm_capacity_mw_not_created_by_activation_without_locked_capacity() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=False,
+        id_mode="technical_repair",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=True,
+    )
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T08:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=0.0,
+        planned_bem_only_neg_mw=7.0,
+        pred_da_price=50.0,
+        true_da_price=50.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=100.0,
+        true_act_neg=100.0,
+        true_rate_pos=0.0,
+        true_rate_neg=1.0,
+        pred_rate_pos=0.0,
+        pred_rate_neg=1.0,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+    )
+    assert float(out["executed_bcm_capacity_neg_mw"]) == pytest.approx(0.0)
+    assert float(out["submitted_bcm_capacity_neg_mw"]) == pytest.approx(0.0)
+    assert float(out["locked_bcm_capacity_neg_mw"]) == pytest.approx(0.0)
+    assert float(out["bem_only_executed_neg_mwh"]) > 0.0
+
+
+def test_bcm_executed_capacity_equals_locked_capacity_not_activation() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=False,
+        id_mode="technical_repair",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=False,
+    )
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T08:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        pred_da_price=50.0,
+        true_da_price=50.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=100.0,
+        true_act_neg=100.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.5,
+        pred_rate_pos=0.0,
+        pred_rate_neg=0.5,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=8.0,
+    )
+    assert float(out["executed_bcm_capacity_neg_mw"]) == pytest.approx(8.0)
+    assert float(out["locked_bcm_capacity_neg_mw"]) == pytest.approx(8.0)
+    assert float(out["bcm_linked_neg_activation_mwh"]) == pytest.approx(4.0 * bt.dt_h)
+
+
+def test_bcm_simultaneous_pos_neg_capacity_requires_both_locked_sides() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=False,
+        id_mode="technical_repair",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=False,
+    )
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T08:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        pred_da_price=50.0,
+        true_da_price=50.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=100.0,
+        true_act_neg=100.0,
+        true_rate_pos=1.0,
+        true_rate_neg=1.0,
+        pred_rate_pos=1.0,
+        pred_rate_neg=1.0,
+        obligation_pos_mw=3.0,
+        obligation_neg_mw=8.0,
+    )
+    assert float(out["submitted_bcm_capacity_pos_mw"]) == pytest.approx(3.0)
+    assert float(out["locked_bcm_capacity_pos_mw"]) == pytest.approx(3.0)
+    assert float(out["executed_bcm_capacity_pos_mw"]) == pytest.approx(3.0)
+    assert float(out["submitted_bcm_capacity_neg_mw"]) == pytest.approx(8.0)
+    assert float(out["locked_bcm_capacity_neg_mw"]) == pytest.approx(8.0)
+    assert float(out["executed_bcm_capacity_neg_mw"]) == pytest.approx(8.0)
 
 
 def test_bcm_reject_no_capacity_award_and_no_capacity_revenue() -> None:
@@ -5943,6 +6090,24 @@ def test_driver_existing_lockbook_obligation_infeasible() -> None:
     )
     d, _ = _suspected_infeasibility_driver_from_row(row)
     assert d == "existing_lockbook_obligation_infeasible"
+
+
+def test_driver_fixed_reserve_obligation_infeasible() -> None:
+    row = pd.Series(
+        {
+            "optimization_error_code": "rolling_window_nonterminal_infeasible",
+            "fallback_mode": "safe_hold_plan",
+            "new_submitted_reserve_pos_mw": 0.0,
+            "new_submitted_reserve_neg_mw": 0.0,
+            "fixed_reserve_obligation_pos_mw": 9.0,
+            "fixed_reserve_obligation_neg_mw": 0.0,
+            "locked_reserve_pos_mw": 0.0,
+            "locked_reserve_neg_mw": 0.0,
+        }
+    )
+    d, detail = _suspected_infeasibility_driver_from_row(row)
+    assert d == "existing_lockbook_obligation_infeasible"
+    assert "locked_only_pos=9.0000" in detail
 
 
 def test_driver_protected_soc_violation() -> None:
