@@ -2632,6 +2632,106 @@ def test_bcm_precommit_selector_uses_first_feasible_retry_factor(monkeypatch: py
     assert stats["reduced_due_to_reserve_feasibility"] == 1.0
 
 
+def test_bcm_precommit_records_id_recourse_for_auxiliary_soc_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    bt.enable_reserve_retry_ladder = True
+    bt.reserve_retry_ladder = [1.0, 0.0]
+    bt.aux_mode = "state_dependent"
+    bt.aux_peak_mw = 1.0
+    bt.aux_standby_mw = 1.0
+    bt.aux_afrr_active_mw = 1.0
+    bt.aux_trading_mw = 1.0
+    col = BacktestColumnMap()
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=2, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [0.0] * 2,
+            "reserve_neg_mw": [1.0] * 2,
+            "soc_start_lp_mwh": [bt.soc_min + 0.05] * 2,
+            "charge_mw": [0.0] * 2,
+            "discharge_mw": [0.0] * 2,
+            "bem_only_pos_mw": [0.0] * 2,
+            "bem_only_neg_mw": [0.0] * 2,
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.true_afrr_capacity_price_pos: [0.0] * 2,
+            col.true_afrr_capacity_price_neg: [100.0] * 2,
+            col.pred_afrr_activation_rate_pos: [0.0] * 2,
+            col.pred_afrr_activation_rate_neg: [0.0] * 2,
+        }
+    ).set_index(col.timestamp)
+
+    def fake_clear(*, cap_bids, ts_idx, source, colmap):  # type: ignore[no-untyped-def]
+        raise AssertionError("realized clearing must not be used for BCM precommit selection")
+
+    def fake_formulate(*, blk, source, colmap, snapshot_ts, offered_pos, offered_neg, is_perfect_foresight=False):  # type: ignore[no-untyped-def]
+        ts = pd.to_datetime(blk["target_time_utc"].iloc[0], utc=True)
+        bids = []
+        if offered_neg > 0.0:
+            bids.append(
+                AFRRCapacityBid(
+                    ts=ts,
+                    side="neg",
+                    quantity_mw=float(offered_neg),
+                    capacity_price_eur_mw=0.0,
+                    energy_price_eur_mwh=0.0,
+                )
+            )
+        return bids, pd.to_datetime(blk["target_time_utc"], utc=True)
+
+    def feasible_plan(df, colmap, **kwargs):  # type: ignore[no-untyped-def]
+        return pd.DataFrame(
+            {
+                colmap.timestamp: pd.to_datetime(df[colmap.timestamp], utc=True),
+                "soc_lp_mwh": [bt.soc_min + 0.2] * len(df),
+                "id_charge_mw": [0.0] * len(df),
+                "terminal_soc_id_recourse_cost_eur": [0.0] * len(df),
+                "power_stack_pos_mw": [0.0] * len(df),
+                "power_stack_neg_mw": [1.0] * len(df),
+                "slack_pos_mw": [0.0] * len(df),
+                "slack_neg_mw": [0.0] * len(df),
+                "slack_soc_min_mwh": [0.0] * len(df),
+                "slack_soc_max_mwh": [0.0] * len(df),
+            }
+        )
+
+    monkeypatch.setattr(bt, "_clear_afrr_capacity_block_against_truth", fake_clear)
+    monkeypatch.setattr(bt, "_formulate_afrr_capacity_block_bids", fake_formulate)
+    monkeypatch.setattr(bt, "optimize_dispatch", feasible_plan)
+
+    offered_pos, offered_neg, cap_res, _bids, stats = bt._select_feasible_bcm_lock_candidate(
+        blk=snap,
+        snapshot_plan=snap,
+        source=source,
+        colmap=col,
+        snapshot_ts=pd.Timestamp("2025-05-01 06:00:00+00:00"),
+        offered_pos_mw=0.0,
+        offered_neg_mw=1.0,
+        lock_pos={},
+        lock_neg={},
+        da_lockbook={},
+        strategy_permissions=StrategyPermissions(False, "technical_repair", True, True, False),
+        optimizer_allowed_markets=("aFRR", "ID"),
+        horizon_hours=2,
+    )
+
+    assert offered_pos == 0.0
+    assert offered_neg == 1.0
+    assert cap_res is None
+    assert stats["feasibility_pass"] == 1.0
+    assert float(stats["id_recourse_needed_mwh"]) > 0.0
+    assert stats["id_recourse_reason"] == "reserve_obligation_recovery"
+    assert stats["selection_is_causal"] == 1.0
+    assert stats["realized_clearing_used_for_selection"] == 0.0
+
+
 def test_bcm_precommit_selector_selects_full_factor_when_full_award_feasible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4191,6 +4291,26 @@ def test_terminal_id_recovery_sizes_grid_buy_from_internal_shortfall_and_losses(
     assert diag["terminal_soc_id_recourse_scheduled_internal_mwh"] == pytest.approx(expected_internal)
 
 
+def test_terminal_id_recovery_includes_safety_margin() -> None:
+    bt = _mk_backtester()
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=9.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=9.95,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.10,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+    assert reason == "terminal_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert id_charge * bt.dt_h == pytest.approx(0.15 / bt.eta_in)
+    assert diag["terminal_soc_id_recourse_needed_internal_mwh"] == pytest.approx(0.15)
+
+
 def test_terminal_id_recovery_projection_updates_between_calls() -> None:
     bt = _mk_backtester()
     bt._plan_id_rescue_for_next_hour(
@@ -4605,6 +4725,69 @@ def test_global_perfect_foresight_same_rules_candidate_fields() -> None:
         assert float(s["global_perfect_foresight_dominance_check_pass"]) == float(
             s["global_pf_verified_upper_bound"]
         )
+
+
+def test_global_pf_selects_no_trade_incumbent_when_pf_candidate_misses_terminal_soc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester("canonical_economic")
+    df, col = _tiny_backtest_df(hours=3)
+    original = bt.optimize_dispatch_rolling
+
+    def _wrapped(path_df, colmap, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if kwargs.get("run_mode") == "perfect_foresight":
+            ts = pd.to_datetime(path_df[colmap.timestamp], utc=True)
+            return pd.DataFrame(
+                {
+                    colmap.timestamp: ts,
+                    "charge_mw": [0.0] * len(path_df),
+                    "discharge_mw": [0.0] * len(path_df),
+                    "reserve_pos_mw": [0.0] * len(path_df),
+                    "reserve_neg_mw": [0.0] * len(path_df),
+                    "bem_only_pos_mw": [0.0] * len(path_df),
+                    "bem_only_neg_mw": [0.0] * len(path_df),
+                    "id_charge_mw": [0.0] * len(path_df),
+                    "id_discharge_mw": [0.0, 0.0, 1.0],
+                    "id_recourse_reason": ["none", "none", "upper_soc_relief"],
+                    "optimization_error_code": ["ok"] * len(path_df),
+                    "optimizer_fallback_used": [0.0] * len(path_df),
+                }
+            ), pd.DataFrame()
+        return original(path_df, colmap, *args, **kwargs)
+
+    monkeypatch.setattr(bt, "optimize_dispatch_rolling", _wrapped)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=3,
+        reopt_step_hours=1,
+        allowed_markets=("aFRR", "ID"),
+        strategy_name="bcm_only",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+        id_recourse_mode="common",
+        enable_global_perfect_foresight=True,
+    )
+    s = out.summary
+    assert str(s["global_pf_selected_incumbent"]) == "no_trade_terminal_id"
+    assert float(s["global_pf_candidate_terminal_shortfall_mwh"]) > 0.0
+    assert float(s["global_pf_no_trade_terminal_shortfall_mwh"]) <= 1e-6
+    assert float(s["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]) >= float(
+        s["global_pf_no_trade_incumbent_eur"]
+    ) - 1e-6
+    assert float(s["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]) >= float(
+        s["realized_total_pnl_eur"]
+    ) - 1e-6
+    assert float(s["global_pf_verified_upper_bound"]) == 1.0
+    h = out.hourly
+    assert float(pd.to_numeric(h["global_perfect_foresight_soc_mwh"], errors="coerce").iloc[-1]) >= (
+        bt.soc_target_end - 1e-6
+    )
+    assert pd.to_numeric(
+        h["global_perfect_foresight_terminal_soc_recovery_iteration_count"],
+        errors="coerce",
+    ).fillna(0.0).max() >= 1.0
 
 
 def test_same_rules_rolling_pf_dominance_fields_present() -> None:
