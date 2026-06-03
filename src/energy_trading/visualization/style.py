@@ -48,6 +48,8 @@ THESIS_PALETTE: Dict[str, str] = {
     "primary": "#226E9C",  # 34, 110, 156
     "secondary": "#d9b98d",  # 217, 185, 141
     "tertiary": "#7C1D6F",  # 124, 29, 111
+    "perfect_foresight": "#2E7D32",  # green
+    "naive": "#7A7A7A",  # gray
     "neutral_dark": "#333333",  # 51, 51, 51
 }
 
@@ -57,6 +59,24 @@ MODEL_COLOR_MAP: Dict[str, str] = {
     "linear": THESIS_PALETTE["secondary"],
     "xgb": THESIS_PALETTE["primary"],
     "tft": THESIS_PALETTE["tertiary"],
+}
+
+# Fixed semantic styling for backtest benchmark paths.
+BACKTEST_LINE_STYLES: Dict[str, Dict[str, object]] = {
+    "model": {"color": THESIS_PALETTE["primary"], "linestyle": "-", "linewidth": 2.2},
+    "naive": {"color": THESIS_PALETTE["naive"], "linestyle": "-", "linewidth": 2.0},
+    "rolling_perfect_foresight": {
+        "color": THESIS_PALETTE["perfect_foresight"],
+        "linestyle": ":",
+        "marker": ".",
+        "markevery": 12,
+        "linewidth": 2.0,
+    },
+    "global_hindsight_perfect_foresight": {
+        "color": THESIS_PALETTE["perfect_foresight"],
+        "linestyle": "--",
+        "linewidth": 2.2,
+    },
 }
 
 
@@ -70,6 +90,12 @@ def get_model_color(model_name: str, default: str | None = None) -> str:
     key = str(model_name).strip().lower()
     fallback = default if default is not None else THESIS_PALETTE["neutral_dark"]
     return MODEL_COLOR_MAP.get(key, fallback)
+
+
+def get_backtest_line_style(series_name: str) -> Dict[str, object]:
+    """Return fixed thesis style kwargs for cumulative backtest lines."""
+    key = str(series_name).strip().lower()
+    return dict(BACKTEST_LINE_STYLES.get(key, {"color": THESIS_PALETTE["neutral_dark"], "linestyle": "-"}))
 
 
 def apply_geo_style() -> None:
@@ -87,6 +113,8 @@ def apply_geo_style() -> None:
         THESIS_PALETTE["primary"],
         THESIS_PALETTE["secondary"],
         THESIS_PALETTE["tertiary"],
+        THESIS_PALETTE["perfect_foresight"],
+        THESIS_PALETTE["naive"],
         THESIS_PALETTE["neutral_dark"],
     ]
 

@@ -16,11 +16,13 @@ from scripts.run_battery_backtest import (  # noqa: E402
     _manifest_can_resolve_long_predictions,
     _matches_model_key,
     _normalize_model_choice,
+    _plot_cumulative_pnl,
     _preflight_manifest_and_quantiles,
     _resolve_long_prediction_path,
     _resolve_model_manifest,
     parse_args,
 )
+from energy_trading.visualization.style import THESIS_PALETTE, get_backtest_line_style  # noqa: E402
 
 
 def _write_long_predictions(path: Path) -> None:
@@ -67,6 +69,42 @@ def test_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.strict_simulation_validity is True
     assert args.final_soc_mode == "hard"
     assert args.clean_output is True
+    assert args.enable_global_perfect_foresight is True
+
+
+def test_cli_can_disable_default_global_perfect_foresight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_battery_backtest.py", "--no-enable-global-perfect-foresight"])
+    args = parse_args()
+    assert args.enable_global_perfect_foresight is False
+
+
+def test_cumulative_pnl_plot_includes_validated_global_perfect_foresight(tmp_path: Path) -> None:
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2025-05-01T00:00:00Z", periods=3, freq="h", tz="UTC"),
+            "real_pnl_eur": [1.0, 2.0, 3.0],
+            "naive_pnl_eur": [0.5, 1.0, 1.5],
+            "perfect_foresight_pnl_eur": [1.5, 2.5, 3.5],
+            "global_perfect_foresight_pnl_eur": [2.0, 3.0, 4.0],
+        }
+    )
+    out = tmp_path / "cum_pnl.png"
+    _plot_cumulative_pnl(
+        hourly,
+        "timestamp_utc",
+        out,
+        summary={"global_perfect_foresight_available": 1.0},
+    )
+    assert out.exists()
+    assert out.with_suffix(".pdf").exists()
+
+
+def test_cumulative_pnl_uses_thesis_benchmark_styles() -> None:
+    assert get_backtest_line_style("naive")["color"] == THESIS_PALETTE["naive"]
+    assert get_backtest_line_style("rolling_perfect_foresight")["color"] == THESIS_PALETTE["perfect_foresight"]
+    assert get_backtest_line_style("rolling_perfect_foresight")["linestyle"] == ":"
+    assert get_backtest_line_style("global_hindsight_perfect_foresight")["color"] == THESIS_PALETTE["perfect_foresight"]
+    assert get_backtest_line_style("global_hindsight_perfect_foresight")["linestyle"] == "--"
 
 
 def test_latest_pointer_resolution(tmp_path: Path) -> None:

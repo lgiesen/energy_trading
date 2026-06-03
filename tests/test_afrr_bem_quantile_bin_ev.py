@@ -15,11 +15,21 @@ if str(SRC) not in sys.path:
 from energy_trading.simulation.battery_backtest import BacktestColumnMap, BatteryBacktester  # noqa: E402
 from energy_trading.config import MODEL_SPECS  # noqa: E402
 from scripts.run_battery_backtest import _build_afrr_bin_ev_audit, _validate_afrr_bin_ev_audit  # noqa: E402
+from energy_trading.simulation.bid_builder import AFRRCapacityBid  # noqa: E402
+from energy_trading.simulation.market_clearing import AFRRCapacityClearingResult  # noqa: E402
 
 
-def _mk_backtester() -> BatteryBacktester:
-    MODEL_SPECS["forecast_value_mode"] = "canonical_economic"
+def _mk_backtester(forecast_value_mode: str = "canonical_economic") -> BatteryBacktester:
+    MODEL_SPECS["forecast_value_mode"] = forecast_value_mode
     return BatteryBacktester()
+
+
+def _zero_activation_costs(bt: BatteryBacktester) -> None:
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.afrr_offer_cost_eur_mw_h = 0.0
 
 
 def _tiny_df(hours: int = 4) -> tuple[pd.DataFrame, BacktestColumnMap]:
@@ -87,6 +97,174 @@ def test_optimize_dispatch_emits_bem_per_bin_outputs() -> None:
         assert f"afrr_bin_{b}_quantile" in out.columns
         assert f"afrr_bin_{b}_cap_price_pos" in out.columns
         assert f"afrr_bin_{b}_cap_price_neg" in out.columns
+
+
+def test_optimize_dispatch_emits_semantic_quantile_bin_aliases() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30", "p50", "p70"]
+    bt.afrr_quantile_prob = {q: 1.0 - float(q[1:]) / 100.0 for q in bt.afrr_quantile_bins}
+    df, col = _tiny_df(hours=2)
+    out = bt.optimize_dispatch(df, col, strict_input_validation=True)
+
+    expected_aliases = [
+        ("reserve_pos_bin_0_mw", "bcm_p30_reserve_pos_mw"),
+        ("reserve_neg_bin_0_mw", "bcm_p30_reserve_neg_mw"),
+        ("bem_pos_bin_0_mw", "bem_p30_pos_mw"),
+        ("bem_neg_bin_0_mw", "bem_p30_neg_mw"),
+        ("afrr_bin_0_cap_price_pos", "afrr_p30_cap_price_pos"),
+        ("ev_rpos_coef_bin_0_eur_per_mw", "bcm_p30_reserve_pos_coef_eur_per_mw"),
+        ("ev_bem_pos_coef_bin_0_eur_per_mw", "bem_p30_pos_coef_eur_per_mw"),
+        ("ev_bcm_expected_capacity_revenue_pos_bin_0", "bcm_p30_expected_capacity_revenue_pos"),
+        ("ev_bem_expected_activation_revenue_pos_bin_0", "bem_p30_expected_activation_revenue_pos"),
+        ("ev_bem_bin_0_p_exec_pos", "bem_p30_p_exec_pos"),
+    ]
+    for old_col, alias_col in expected_aliases:
+        assert old_col in out.columns
+        assert alias_col in out.columns
+        assert np.allclose(
+            pd.to_numeric(out[old_col], errors="coerce").fillna(0.0),
+            pd.to_numeric(out[alias_col], errors="coerce").fillna(0.0),
+        )
+
+
+def test_quantile_bin_aliases_support_namespaced_settlement_columns() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30"]
+    frame = pd.DataFrame(
+        {
+            "real_submitted_afrr_pos_bin_0_mw": [1.25],
+            "real_executed_afrr_act_neg_bin_0_mw": [0.5],
+            "pred_submitted_afrr_neg_bin_0_price_eur_mw": [42.0],
+        }
+    )
+    out = bt._add_quantile_bin_alias_columns(frame)
+    assert float(out["real_bcm_p30_submitted_pos_mw"].iloc[0]) == pytest.approx(1.25)
+    assert float(out["real_bcm_p30_executed_act_neg_mw"].iloc[0]) == pytest.approx(0.5)
+    assert float(out["pred_bcm_p30_submitted_neg_price_eur_mw"].iloc[0]) == pytest.approx(42.0)
+
+
+def test_canonical_neg_activation_value_is_not_subtracted_in_optimizer_ev() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _zero_activation_costs(bt)
+    bt.afrr_quantile_bins = ["p50"]
+    bt.afrr_quantile_prob = {"p50": 0.5}
+    df, col = _tiny_df(hours=2)
+    df[col.pred_afrr_capacity_price_neg] = 0.0
+    df[f"{col.pred_afrr_capacity_price_neg}_p50"] = 0.0
+    df[col.pred_afrr_activation_price_neg] = 1000.0
+    df[f"{col.pred_afrr_activation_price_neg}_p50"] = 1000.0
+    df[col.pred_afrr_activation_rate_neg] = 1.0
+    df[f"{col.pred_afrr_activation_rate_neg}_p50"] = 1.0
+
+    out = bt.optimize_dispatch(df, col, strict_input_validation=True)
+    row = out.iloc[0]
+
+    assert float(row["ev_bcm_activation_margin_neg_bin_0"]) == pytest.approx(1000.0)
+    assert float(row["ev_bem_activation_margin_neg_bin_0"]) == pytest.approx(1000.0)
+    assert float(row["ev_bcm_expected_activation_revenue_neg_bin_0"]) == pytest.approx(500.0)
+    assert float(row["ev_bem_neg_coef_bin_0_eur_per_mw"]) == pytest.approx(500.0)
+
+
+def test_raw_signed_neg_activation_price_is_negated_once_in_optimizer_ev() -> None:
+    bt = _mk_backtester("raw_signed")
+    _zero_activation_costs(bt)
+    bt.afrr_quantile_bins = ["p50"]
+    bt.afrr_quantile_prob = {"p50": 0.5}
+    df, col = _tiny_df(hours=2)
+    df[col.pred_afrr_capacity_price_neg] = 0.0
+    df[f"{col.pred_afrr_capacity_price_neg}_p50"] = 0.0
+    df[col.pred_afrr_activation_price_neg] = -1000.0
+    df[f"{col.pred_afrr_activation_price_neg}_p50"] = -1000.0
+    df[col.pred_afrr_activation_rate_neg] = 1.0
+    df[f"{col.pred_afrr_activation_rate_neg}_p50"] = 1.0
+
+    out = bt.optimize_dispatch(df, col, strict_input_validation=True)
+    row = out.iloc[0]
+
+    assert float(row["ev_bcm_activation_margin_neg_bin_0"]) == pytest.approx(1000.0)
+    assert float(row["ev_bem_activation_margin_neg_bin_0"]) == pytest.approx(1000.0)
+    assert float(row["ev_bcm_expected_activation_revenue_neg_bin_0"]) == pytest.approx(500.0)
+    assert float(row["ev_bem_neg_coef_bin_0_eur_per_mw"]) == pytest.approx(500.0)
+
+
+def test_canonical_neg_activation_bid_price_and_clearing_use_positive_provider_value() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.bid_builder.afrr_energy_bid_strategy = "forecast"
+    bid_price = bt.bid_builder.dynamic_afrr_energy_price(
+        side="neg",
+        pred_act_price=1000.0,
+        soc_now_mwh=(bt.soc_min + bt.soc_max) / 2.0,
+        soc_min_mwh=bt.soc_min,
+        soc_max_mwh=bt.soc_max,
+        obligation_mw=0.0,
+    )
+    assert bid_price == pytest.approx(1000.0)
+
+    clearing = bt.market_clearing_engine.clear_afrr_activation(
+        [
+            AFRRCapacityBid(
+                ts=pd.Timestamp("2026-01-01T00:00:00Z"),
+                side="neg",
+                quantity_mw=1.0,
+                capacity_price_eur_mw=0.0,
+                energy_price_eur_mwh=bid_price,
+            )
+        ],
+        AFRRCapacityClearingResult(
+            submitted_pos_mw=0.0,
+            submitted_neg_mw=1.0,
+            awarded_pos_mw=0.0,
+            awarded_neg_mw=1.0,
+            pos_awarded=False,
+            neg_awarded=True,
+        ),
+        true_act_pos=0.0,
+        true_act_neg=1000.0,
+        true_rate_pos=0.0,
+        true_rate_neg=1.0,
+    )
+    assert clearing.neg_accepted is True
+    assert clearing.executed_rate_neg == pytest.approx(1.0)
+
+
+def test_raw_signed_neg_activation_bid_price_and_clearing_keep_legacy_sign() -> None:
+    bt = _mk_backtester("raw_signed")
+    bt.bid_builder.afrr_energy_bid_strategy = "forecast"
+    bid_price = bt.bid_builder.dynamic_afrr_energy_price(
+        side="neg",
+        pred_act_price=-1000.0,
+        soc_now_mwh=(bt.soc_min + bt.soc_max) / 2.0,
+        soc_min_mwh=bt.soc_min,
+        soc_max_mwh=bt.soc_max,
+        obligation_mw=0.0,
+    )
+    assert bid_price == pytest.approx(-1000.0)
+
+    clearing = bt.market_clearing_engine.clear_afrr_activation(
+        [
+            AFRRCapacityBid(
+                ts=pd.Timestamp("2026-01-01T00:00:00Z"),
+                side="neg",
+                quantity_mw=1.0,
+                capacity_price_eur_mw=0.0,
+                energy_price_eur_mwh=bid_price,
+            )
+        ],
+        AFRRCapacityClearingResult(
+            submitted_pos_mw=0.0,
+            submitted_neg_mw=1.0,
+            awarded_pos_mw=0.0,
+            awarded_neg_mw=1.0,
+            pos_awarded=False,
+            neg_awarded=True,
+        ),
+        true_act_pos=0.0,
+        true_act_neg=-1000.0,
+        true_rate_pos=0.0,
+        true_rate_neg=1.0,
+    )
+    assert clearing.neg_accepted is True
+    assert clearing.executed_rate_neg == pytest.approx(1.0)
 
 
 def test_bcm_same_q_uses_bin_specific_activation_inputs() -> None:

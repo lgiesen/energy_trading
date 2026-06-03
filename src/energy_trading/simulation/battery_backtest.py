@@ -636,6 +636,9 @@ class BatteryBacktester:
         self.da_execution_mode = str(MARKET_SPECS.get("da_execution_mode", "price_taker"))
         self.da_bid_fail_fast_debug = bool(MARKET_SPECS.get("da_bid_fail_fast_debug", False))
         self.da_link_to_awarded_afrr = bool(MARKET_SPECS.get("da_link_to_awarded_afrr", True))
+        self.forecast_value_mode = str(MODEL_SPECS.get("forecast_value_mode", "canonical_economic")).strip().lower()
+        if self.forecast_value_mode not in {"canonical_economic", "raw_signed"}:
+            self.forecast_value_mode = "canonical_economic"
         self.bid_pricing_policy = BidPricingPolicy(
             cap_risk_lambda=float(MARKET_SPECS.get("afrr_capacity_bid_risk_lambda", 0.2)),
             act_risk_lambda=float(MARKET_SPECS.get("afrr_activation_bid_risk_lambda", 0.2)),
@@ -660,14 +663,13 @@ class BatteryBacktester:
             da_sell_limit_quantile=str(MARKET_SPECS.get("da_sell_limit_quantile", "p10")),
             afrr_energy_bid_strategy=str(MARKET_SPECS.get("afrr_energy_bid_strategy", "forecast")),
             link_da_to_awarded_afrr=self.da_link_to_awarded_afrr,
+            forecast_value_mode=self.forecast_value_mode,
         )
         self.market_clearing_engine = MarketClearingEngine(
             da_mode_default=self.da_execution_mode,
+            forecast_value_mode=self.forecast_value_mode,
         )
         self.id_rescue_spread_eur_mwh = float(MARKET_SPECS.get("id_rescue_spread_eur_mwh", 30.0))
-        self.forecast_value_mode = str(MODEL_SPECS.get("forecast_value_mode", "canonical_economic")).strip().lower()
-        if self.forecast_value_mode not in {"canonical_economic", "raw_signed"}:
-            self.forecast_value_mode = "canonical_economic"
         self._neg_activation_sign_diagnostic_emitted = False
         self.id_buy_price_cap_eur_mwh = float(MARKET_SPECS.get("id_buy_price_cap_eur_mwh", 3000.0))
         self.id_sell_price_floor_eur_mwh = float(MARKET_SPECS.get("id_sell_price_floor_eur_mwh", -500.0))
@@ -1049,6 +1051,17 @@ class BatteryBacktester:
         out["slack_obligation_pos"] = slice(s, s + n); s += n
         out["slack_obligation_neg"] = slice(s, s + n); s += n
         return out
+
+    def _neg_activation_provider_value(self, price_eur_mwh: np.ndarray | float) -> np.ndarray | float:
+        """Return NEG activation price on the provider-value scale used in EV/PnL.
+
+        Canonical economic forecasts/truth already store NEG activation as a
+        positive provider revenue. Raw signed legacy data stores it as a
+        negative market price and must be negated before profit calculations.
+        """
+        if self.forecast_value_mode == "canonical_economic":
+            return price_eur_mwh
+        return -price_eur_mwh
 
     def _guarded_merge(
         self,
@@ -1646,8 +1659,9 @@ class BatteryBacktester:
                 - self.trans_eur_mwh
                 - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
             )
+            act_value_neg = self._neg_activation_provider_value(act_price_neg_by_bin[:, b])
             bcm_act_margin_neg = (
-                -act_price_neg_by_bin[:, b]
+                act_value_neg
                 - self.trans_eur_mwh
                 - (self.deg_eur_mwh * self.eta_in)
             )
@@ -1684,7 +1698,7 @@ class BatteryBacktester:
                 - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
             )
             bem_act_margin_neg = (
-                -act_price_neg_by_bin[:, b]
+                act_value_neg
                 - self.trans_eur_mwh
                 - (self.deg_eur_mwh * self.eta_in)
             )
@@ -2440,7 +2454,94 @@ class BatteryBacktester:
             extra_cols[f"ev_bem_activation_margin_pos_bin_{b}"] = bem_activation_margin_pos_by_bin[:, b]
             extra_cols[f"ev_bem_activation_margin_neg_bin_{b}"] = bem_activation_margin_neg_by_bin[:, b]
         out = pd.concat([out, pd.DataFrame(extra_cols, index=out.index)], axis=1)
+        out = self._add_quantile_bin_alias_columns(out)
         out["predicted_objective_eur"] = -sol.fun
+        return out
+
+    @staticmethod
+    def _semantic_quantile_label(q: object) -> str:
+        label = str(q).strip().lower().replace("-", "_")
+        if not label:
+            return "punknown"
+        if label[0].isdigit():
+            label = f"p{label}"
+        return "".join(ch for ch in label if ch.isalnum() or ch == "_")
+
+    def _add_quantile_bin_alias_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Add thesis-readable quantile-bin aliases while keeping legacy bin_N columns.
+
+        The optimizer keeps positional bin columns for backward compatibility.
+        These aliases make the economic meaning explicit, e.g. bin_0 -> p50
+        becomes bcm_p50_reserve_pos_mw / bem_p50_pos_mw.
+        """
+        out = frame.copy()
+        alias_data: dict[str, pd.Series] = {}
+        for b, q in enumerate(self.afrr_quantile_bins):
+            q_label = self._semantic_quantile_label(q)
+            aliases = {
+                f"afrr_bin_{b}_cap_price_pos": f"afrr_{q_label}_cap_price_pos",
+                f"afrr_bin_{b}_cap_price_neg": f"afrr_{q_label}_cap_price_neg",
+                f"reserve_pos_bin_{b}_mw": f"bcm_{q_label}_reserve_pos_mw",
+                f"reserve_neg_bin_{b}_mw": f"bcm_{q_label}_reserve_neg_mw",
+                f"bem_pos_bin_{b}_mw": f"bem_{q_label}_pos_mw",
+                f"bem_neg_bin_{b}_mw": f"bem_{q_label}_neg_mw",
+                f"ev_pacc_pos_bin_{b}": f"bcm_{q_label}_p_accept_pos",
+                f"ev_pacc_neg_bin_{b}": f"bcm_{q_label}_p_accept_neg",
+                f"ev_expected_act_share_pos_bin_{b}": f"bcm_{q_label}_expected_act_share_pos",
+                f"ev_expected_act_share_neg_bin_{b}": f"bcm_{q_label}_expected_act_share_neg",
+                f"ev_afrr_bin_{b}_act_price_pos": f"afrr_{q_label}_act_price_pos",
+                f"ev_afrr_bin_{b}_act_price_neg": f"afrr_{q_label}_act_price_neg",
+                f"ev_afrr_bin_{b}_act_rate_pos": f"afrr_{q_label}_act_rate_pos",
+                f"ev_afrr_bin_{b}_act_rate_neg": f"afrr_{q_label}_act_rate_neg",
+                f"ev_bem_bin_{b}_act_price_pos": f"bem_{q_label}_act_price_pos",
+                f"ev_bem_bin_{b}_act_price_neg": f"bem_{q_label}_act_price_neg",
+                f"ev_bem_bin_{b}_act_rate_pos": f"bem_{q_label}_act_rate_pos",
+                f"ev_bem_bin_{b}_act_rate_neg": f"bem_{q_label}_act_rate_neg",
+                f"ev_bem_bin_{b}_p_exec_pos": f"bem_{q_label}_p_exec_pos",
+                f"ev_bem_bin_{b}_p_exec_neg": f"bem_{q_label}_p_exec_neg",
+                f"ev_bem_pos_coef_bin_{b}_eur_per_mw": f"bem_{q_label}_pos_coef_eur_per_mw",
+                f"ev_bem_neg_coef_bin_{b}_eur_per_mw": f"bem_{q_label}_neg_coef_eur_per_mw",
+                f"ev_rpos_coef_bin_{b}_eur_per_mw": f"bcm_{q_label}_reserve_pos_coef_eur_per_mw",
+                f"ev_rneg_coef_bin_{b}_eur_per_mw": f"bcm_{q_label}_reserve_neg_coef_eur_per_mw",
+                f"ev_bcm_expected_capacity_revenue_pos_bin_{b}": f"bcm_{q_label}_expected_capacity_revenue_pos",
+                f"ev_bcm_expected_capacity_revenue_neg_bin_{b}": f"bcm_{q_label}_expected_capacity_revenue_neg",
+                f"ev_bcm_expected_activation_revenue_pos_bin_{b}": f"bcm_{q_label}_expected_activation_revenue_pos",
+                f"ev_bcm_expected_activation_revenue_neg_bin_{b}": f"bcm_{q_label}_expected_activation_revenue_neg",
+                f"ev_bcm_expected_aux_cost_pos_bin_{b}": f"bcm_{q_label}_expected_aux_cost_pos",
+                f"ev_bcm_expected_aux_cost_neg_bin_{b}": f"bcm_{q_label}_expected_aux_cost_neg",
+                f"ev_bcm_offer_cost_bin_{b}": f"bcm_{q_label}_offer_cost",
+                f"ev_bcm_activation_margin_pos_bin_{b}": f"bcm_{q_label}_activation_margin_pos",
+                f"ev_bcm_activation_margin_neg_bin_{b}": f"bcm_{q_label}_activation_margin_neg",
+                f"ev_bem_expected_activation_revenue_pos_bin_{b}": f"bem_{q_label}_expected_activation_revenue_pos",
+                f"ev_bem_expected_activation_revenue_neg_bin_{b}": f"bem_{q_label}_expected_activation_revenue_neg",
+                f"ev_bem_expected_aux_cost_pos_bin_{b}": f"bem_{q_label}_expected_aux_cost_pos",
+                f"ev_bem_expected_aux_cost_neg_bin_{b}": f"bem_{q_label}_expected_aux_cost_neg",
+                f"ev_bem_activation_margin_pos_bin_{b}": f"bem_{q_label}_activation_margin_pos",
+                f"ev_bem_activation_margin_neg_bin_{b}": f"bem_{q_label}_activation_margin_neg",
+            }
+            for old_col, new_col in aliases.items():
+                if old_col in out.columns and new_col not in out.columns and new_col not in alias_data:
+                    alias_data[new_col] = out[old_col]
+            clearing_aliases = {
+                f"afrr_bin_{b}_quantile": f"bcm_{q_label}_quantile",
+                f"afrr_bin_{b}_quantile_level": f"bcm_{q_label}_quantile_level",
+                f"submitted_afrr_pos_bin_{b}_mw": f"bcm_{q_label}_submitted_pos_mw",
+                f"submitted_afrr_neg_bin_{b}_mw": f"bcm_{q_label}_submitted_neg_mw",
+                f"submitted_afrr_pos_bin_{b}_price_eur_mw": f"bcm_{q_label}_submitted_pos_price_eur_mw",
+                f"submitted_afrr_neg_bin_{b}_price_eur_mw": f"bcm_{q_label}_submitted_neg_price_eur_mw",
+                f"executed_afrr_act_pos_bin_{b}_mw": f"bcm_{q_label}_executed_act_pos_mw",
+                f"executed_afrr_act_neg_bin_{b}_mw": f"bcm_{q_label}_executed_act_neg_mw",
+                f"executed_afrr_act_pos_bin_{b}_price_eur_mwh": f"bcm_{q_label}_executed_act_pos_price_eur_mwh",
+                f"executed_afrr_act_neg_bin_{b}_price_eur_mwh": f"bcm_{q_label}_executed_act_neg_price_eur_mwh",
+            }
+            for namespace in ("", "pred_", "real_", "naive_", "perfect_foresight_", "pf_", "global_perfect_foresight_"):
+                for old_col, new_col in clearing_aliases.items():
+                    old_name = f"{namespace}{old_col}"
+                    new_name = f"{namespace}{new_col}"
+                    if old_name in out.columns and new_name not in out.columns and new_name not in alias_data:
+                        alias_data[new_name] = out[old_name]
+        if alias_data:
+            out = pd.concat([out, pd.DataFrame(alias_data, index=out.index)], axis=1)
         return out
 
     @staticmethod
@@ -3054,7 +3155,7 @@ class BatteryBacktester:
             guard_reason = "disabled_by_config"
         if self.disallow_simultaneous_bem_only_pos_neg and desired_pos > 1e-12 and desired_neg > 1e-12:
             pos_ev = float(pred_act_pos) * desired_pos
-            neg_ev = -float(pred_act_neg) * desired_neg
+            neg_ev = float(self._neg_activation_provider_value(float(pred_act_neg))) * desired_neg
             if pos_ev >= neg_ev:
                 desired_neg = 0.0
             else:
@@ -4813,6 +4914,8 @@ class BatteryBacktester:
                     for c in (
                         f"reserve_pos_bin_{b}_mw",
                         f"reserve_neg_bin_{b}_mw",
+                        f"bem_pos_bin_{b}_mw",
+                        f"bem_neg_bin_{b}_mw",
                         f"ev_pacc_pos_bin_{b}",
                         f"ev_pacc_neg_bin_{b}",
                         f"ev_expected_act_share_pos_bin_{b}",
@@ -4822,7 +4925,7 @@ class BatteryBacktester:
                     ):
                         if c not in out.columns:
                             out[c] = 0.0
-                return out
+                return self._add_quantile_bin_alias_columns(out)
 
             # Terminal SoC floor policy:
             # - Intermediate rolling windows: only enforce physical minimum SoC.
@@ -6327,6 +6430,7 @@ class BatteryBacktester:
                 },
                 inplace=True,
             )
+        out = self._add_quantile_bin_alias_columns(out)
         return out
 
     def _settle_predicted_row(

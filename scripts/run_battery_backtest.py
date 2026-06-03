@@ -65,6 +65,7 @@ from energy_trading.simulation.battery_backtest import (
     BacktestColumnMap, BatteryBacktester, PhaseTimeoutError,
     canonicalize_market_frame, load_and_align_market_data,
     load_prediction_warehouse_long)
+from energy_trading.visualization.style import apply_geo_style, get_backtest_line_style
 
 
 def _series_from_candidates(
@@ -296,7 +297,13 @@ def _phase_watchdog(phase: str):
         print(f"[PHASE] END {phase} | elapsed={dt:.2f}s")
 
 
-def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> None:
+def _plot_cumulative_pnl(
+    hourly: pd.DataFrame,
+    ts_col: str,
+    out_path: Path,
+    *,
+    summary: dict[str, object] | None = None,
+) -> None:
     if hourly.empty:
         return
     d = hourly.copy()
@@ -308,11 +315,41 @@ def _plot_cumulative_pnl(hourly: pd.DataFrame, ts_col: str, out_path: Path) -> N
     d["model_cum_pnl_eur"] = pd.to_numeric(d["real_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
     d["naive_cum_pnl_eur"] = pd.to_numeric(d["naive_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
     d["perfect_foresight_cum_pnl_eur"] = pd.to_numeric(d["perfect_foresight_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
+    show_global_pf = False
+    if "global_perfect_foresight_pnl_eur" in d.columns:
+        global_pnl = pd.to_numeric(d["global_perfect_foresight_pnl_eur"], errors="coerce")
+        if summary is None:
+            show_global_pf = bool(global_pnl.notna().any())
+        else:
+            available = float(
+                pd.to_numeric(
+                    pd.Series([summary.get("global_perfect_foresight_available", 0.0)]),
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .iloc[0]
+            )
+            show_global_pf = bool(available >= 0.5 and global_pnl.notna().any())
+        if show_global_pf:
+            d["global_perfect_foresight_cum_pnl_eur"] = global_pnl.fillna(0.0).cumsum()
 
+    apply_geo_style()
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(d[ts_col], d["model_cum_pnl_eur"], label="Model", linewidth=2)
-    ax.plot(d[ts_col], d["naive_cum_pnl_eur"], label="Naive 24h", linewidth=2)
-    ax.plot(d[ts_col], d["perfect_foresight_cum_pnl_eur"], label="RollingPerfectForesightSameRules", linewidth=2)
+    ax.plot(d[ts_col], d["model_cum_pnl_eur"], label="Model", **get_backtest_line_style("model"))
+    ax.plot(d[ts_col], d["naive_cum_pnl_eur"], label="Naive 24h", **get_backtest_line_style("naive"))
+    ax.plot(
+        d[ts_col],
+        d["perfect_foresight_cum_pnl_eur"],
+        label="RollingPerfectForesightSameRules",
+        **get_backtest_line_style("rolling_perfect_foresight"),
+    )
+    if show_global_pf:
+        ax.plot(
+            d[ts_col],
+            d["global_perfect_foresight_cum_pnl_eur"],
+            label="GlobalHindsightPerfectForesight",
+            **get_backtest_line_style("global_hindsight_perfect_foresight"),
+        )
     ax.set_title("Cumulative PnL Contribution")
     ax.set_xlabel("Time (UTC)")
     ax.set_ylabel("Cumulative PnL [EUR]")
@@ -2782,11 +2819,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--enable-global-perfect_foresight",
+        "--enable-global-perfect-foresight",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Enable global_hindsight_perfect_foresight_upper_bound computation. "
-            "Disabled by default until perfect_foresight scope/validation is explicitly verified."
+            "Enabled by default for thesis runs; use --no-enable-global-perfect-foresight "
+            "for faster debug runs."
         ),
     )
     p.add_argument(
@@ -3220,6 +3259,7 @@ def main() -> None:
             "event_reopt_rejected_mw_total", "predicted_objective_eur"
         ] if c in outputs.hourly.columns]
         planned_cols.extend([c for c in outputs.hourly.columns if c.startswith("afrr_bin_")])
+        planned_cols.extend([c for c in outputs.hourly.columns if c.startswith(("afrr_p", "bcm_p", "bem_p"))])
         planned_cols.extend([c for c in outputs.hourly.columns if c.startswith("submitted_afrr_")])
         planned_cols.extend([c for c in outputs.hourly.columns if c.startswith("executed_afrr_")])
         with _phase_watchdog("write_planned_ledger"):
@@ -3881,6 +3921,9 @@ def main() -> None:
                     "PnL Summary",
                     f"realized_total_pnl_eur={_fmt_summary_val('realized_total_pnl_eur')}",
                     f"rolling_perfect_foresight_same_rules_total_pnl_eur={_fmt_summary_val('rolling_perfect_foresight_same_rules_total_pnl_eur')}",
+                    f"global_hindsight_perfect_foresight_upper_bound_total_pnl_eur={_fmt_summary_val('global_hindsight_perfect_foresight_upper_bound_total_pnl_eur')}",
+                    f"global_perfect_foresight_available={_fmt_summary_val('global_perfect_foresight_available')}",
+                    f"global_perfect_foresight_validation_status={outputs.summary.get('global_perfect_foresight_validation_status', '')}",
                 ]) + "\n",
                 encoding="utf-8",
             )
@@ -3970,7 +4013,12 @@ def main() -> None:
                         )
                 pd.DataFrame(rows).to_csv(scenario_out_dir / "ev_summary.csv", index=False)
         with _phase_watchdog("plot_cumulative_pnl"):
-            _plot_cumulative_pnl(outputs.hourly, colmap.timestamp, pnl_plot_path)
+            _plot_cumulative_pnl(
+                outputs.hourly,
+                colmap.timestamp,
+                pnl_plot_path,
+                summary=outputs.summary,
+            )
 
         outputs.summary["output_write_seconds"] = float(max(0.0, time.monotonic() - output_write_started))
         with _phase_watchdog("write_summary_json"):

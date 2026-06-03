@@ -41,8 +41,12 @@ class MarketClearingEngine:
         self,
         *,
         da_mode_default: str = "price_taker",
+        forecast_value_mode: str = "canonical_economic",
     ) -> None:
         self.da_mode_default = str(da_mode_default)
+        self.forecast_value_mode = str(forecast_value_mode).strip().lower()
+        if self.forecast_value_mode not in {"canonical_economic", "raw_signed"}:
+            self.forecast_value_mode = "canonical_economic"
 
     def clear_afrr_capacity(
         self,
@@ -147,7 +151,11 @@ class MarketClearingEngine:
                 if float(b.energy_price_eur_mwh) <= float(true_act_pos):
                     pos_ok = True
             elif b.side == "neg" and cap_res.neg_awarded:
-                if float(b.energy_price_eur_mwh) >= float(true_act_neg):
+                if self.forecast_value_mode == "canonical_economic":
+                    neg_clears = float(b.energy_price_eur_mwh) <= float(true_act_neg)
+                else:
+                    neg_clears = float(b.energy_price_eur_mwh) >= float(true_act_neg)
+                if neg_clears:
                     neg_ok = True
         return AFRRActivationClearingResult(
             executed_rate_pos=float(true_rate_pos) if pos_ok else 0.0,
@@ -155,4 +163,3 @@ class MarketClearingEngine:
             pos_accepted=bool(pos_ok),
             neg_accepted=bool(neg_ok),
         )
-

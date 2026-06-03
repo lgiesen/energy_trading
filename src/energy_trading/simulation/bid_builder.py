@@ -99,6 +99,7 @@ class BidBuilder:
         da_sell_limit_quantile: str = "p10",
         afrr_energy_bid_strategy: str = "forecast",
         link_da_to_awarded_afrr: bool = True,
+        forecast_value_mode: str = "canonical_economic",
     ) -> None:
         self.pricing = pricing_policy
         self.da_step_mw = float(da_step_mw)
@@ -117,6 +118,38 @@ class BidBuilder:
         self.da_sell_limit_quantile = str(da_sell_limit_quantile).lower()
         self.afrr_energy_bid_strategy = afrr_energy_bid_strategy
         self.link_da_to_awarded_afrr = bool(link_da_to_awarded_afrr)
+        self.forecast_value_mode = str(forecast_value_mode).strip().lower()
+        if self.forecast_value_mode not in {"canonical_economic", "raw_signed"}:
+            self.forecast_value_mode = "canonical_economic"
+
+    def _energy_price(
+        self,
+        *,
+        side: str,
+        pred: float,
+        q10: float | None = None,
+        q50: float | None = None,
+        q90: float | None = None,
+    ) -> float:
+        if side == "pos" or self.forecast_value_mode == "raw_signed":
+            return self.pricing.energy_price(
+                side=side,
+                pred=float(pred),
+                mc_pos=self.mc_pos,
+                mc_neg=self.mc_neg,
+                q10=q10,
+                q50=q50,
+                q90=q90,
+            )
+        center = self.pricing._center(float(pred), q50)
+        spread = self.pricing._spread(q10, q90)
+        return max(float(self.mc_neg), center - self.pricing.act_risk_lambda * spread)
+
+    def _neg_out_of_merit_price(self) -> float:
+        return 9999.0 if self.forecast_value_mode == "canonical_economic" else -9999.0
+
+    def _neg_marginal_cost_price(self) -> float:
+        return float(self.mc_neg) if self.forecast_value_mode == "canonical_economic" else -float(self.mc_neg)
 
     def _qfloor(self, x: float, step: float) -> float:
         if x <= 0.0:
@@ -159,11 +192,9 @@ class BidBuilder:
                     # bid at forecast/true capacity price to both clear and keep
                     # economically consistent remuneration.
                     capacity_price_eur_mw=cap_bid_pos,
-                    energy_price_eur_mwh=self.pricing.energy_price(
+                    energy_price_eur_mwh=self._energy_price(
                         side="pos",
                         pred=float(pred_act_pos),
-                        mc_pos=self.mc_pos,
-                        mc_neg=self.mc_neg,
                     ),
                 )
             )
@@ -180,11 +211,9 @@ class BidBuilder:
                     side="neg",
                     quantity_mw=q_neg,
                     capacity_price_eur_mw=cap_bid_neg,
-                    energy_price_eur_mwh=self.pricing.energy_price(
+                    energy_price_eur_mwh=self._energy_price(
                         side="neg",
                         pred=float(pred_act_neg),
-                        mc_pos=self.mc_pos,
-                        mc_neg=self.mc_neg,
                     ),
                 )
             )
@@ -220,25 +249,25 @@ class BidBuilder:
             required_headroom_mwh = ob * dt * self.eta_in
             available_headroom_mwh = max(0.0, float(soc_max_mwh) - float(soc_now_mwh))
             if available_headroom_mwh + 1e-9 < required_headroom_mwh:
-                return -9999.0
+                return self._neg_out_of_merit_price()
 
         if is_perfect_foresight and true_act_price is not None and math.isfinite(float(true_act_price)):
             # Oracle still avoids knowingly uneconomic activation prices.
             if side == "pos":
                 return max(float(self.mc_pos), float(true_act_price))
+            if self.forecast_value_mode == "canonical_economic":
+                return max(float(self.mc_neg), float(true_act_price))
             return min(float(true_act_price), -float(self.mc_neg))
 
         strategy = str(self.afrr_energy_bid_strategy).lower().strip()
         if strategy == "forecast":
             base = float(pred_act_price)
         elif strategy == "marginal_cost":
-            base = float(self.mc_pos if side == "pos" else -self.mc_neg)
+            base = float(self.mc_pos if side == "pos" else self._neg_marginal_cost_price())
         else:  # hybrid
-            base = self.pricing.energy_price(
+            base = self._energy_price(
                 side=side,
                 pred=float(pred_act_price),
-                mc_pos=self.mc_pos,
-                mc_neg=self.mc_neg,
                 q10=q10,
                 q50=q50,
                 q90=q90,
