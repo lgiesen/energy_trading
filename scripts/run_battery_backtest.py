@@ -35,8 +35,10 @@ Usage (manual files):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import pickle
 import re
 import shutil
 import signal
@@ -66,6 +68,151 @@ from energy_trading.simulation.battery_backtest import (
     canonicalize_market_frame, load_and_align_market_data,
     load_prediction_warehouse_long)
 from energy_trading.visualization.style import apply_geo_style, get_backtest_line_style
+
+
+INPUT_CACHE_SCHEMA_VERSION = "simulation_input_cache_v1"
+
+
+def _file_fingerprint(path: str | Path) -> dict[str, object]:
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "exists": False, "mtime_ns": None, "size": None}
+    st = p.stat()
+    return {"path": str(p.resolve()), "exists": True, "mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)}
+
+
+def _input_cache_key(*, model_key: str, split: str, manifest_path: Path | None, prediction_files: Iterable[str | Path], truth_file: str | Path, forecast_value_mode: str) -> str:
+    payload = {
+        "schema": INPUT_CACHE_SCHEMA_VERSION,
+        "model_key": str(model_key),
+        "split": str(split),
+        "manifest": _file_fingerprint(manifest_path) if manifest_path else None,
+        "prediction_files": [_file_fingerprint(p) for p in sorted([str(p) for p in prediction_files])],
+        "truth_file": _file_fingerprint(truth_file),
+        "forecast_value_mode": str(forecast_value_mode),
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _input_cache_path(cache_key: str) -> Path:
+    return REPO_ROOT / "artifacts" / "simulation_input_cache" / f"{cache_key}.pkl"
+
+
+def _load_input_cache(cache_path: Path) -> tuple[pd.DataFrame, dict[str, pd.DataFrame] | None, pd.Timestamp | None, pd.Timestamp | None] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("rb") as fh:
+            payload = pickle.load(fh)
+        if payload.get("schema") != INPUT_CACHE_SCHEMA_VERSION:
+            return None
+        return payload["df"], payload.get("forecast_warehouse"), payload.get("coverage_min"), payload.get("coverage_max")
+    except Exception:
+        return None
+
+
+def _write_input_cache(
+    cache_path: Path,
+    *,
+    df: pd.DataFrame,
+    forecast_warehouse: dict[str, pd.DataFrame] | None,
+    coverage_min: pd.Timestamp | None,
+    coverage_max: pd.Timestamp | None,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("wb") as fh:
+        pickle.dump(
+            {
+                "schema": INPUT_CACHE_SCHEMA_VERSION,
+                "df": df,
+                "forecast_warehouse": forecast_warehouse,
+                "coverage_min": coverage_min,
+                "coverage_max": coverage_max,
+            },
+            fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+
+def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, timestamp_col: str) -> pd.DataFrame:
+    if str(output_detail).strip().lower() == "debug":
+        return hourly
+    exact = {
+        timestamp_col,
+        "timestamp_utc",
+        "real_soc_start_mwh",
+        "real_soc_mwh",
+        "real_pnl_eur",
+        "real_revenue_da_eur",
+        "real_cost_da_eur",
+        "real_da_buy_mwh",
+        "real_da_sell_mwh",
+        "real_revenue_capacity_eur",
+        "real_revenue_activation_eur",
+        "real_bcm_linked_activation_revenue_eur",
+        "real_bem_only_activation_revenue_eur",
+        "real_bcm_linked_pos_activation_mwh",
+        "real_bcm_linked_neg_activation_mwh",
+        "real_bem_only_pos_activation_mwh",
+        "real_bem_only_neg_activation_mwh",
+        "real_activation_split_reconciliation_error_eur",
+        "real_submitted_afrr_pos_mw",
+        "real_submitted_afrr_neg_mw",
+        "real_executed_reserve_pos_mw",
+        "real_executed_reserve_neg_mw",
+        "real_fixed_reserve_obligation_pos_mw",
+        "real_fixed_reserve_obligation_neg_mw",
+        "real_bem_only_submitted_pos_mw",
+        "real_bem_only_submitted_neg_mw",
+        "real_bem_only_executed_pos_mwh",
+        "real_bem_only_executed_neg_mwh",
+        "real_id_buy_mwh",
+        "real_id_sell_mwh",
+        "real_revenue_id_eur",
+        "real_cost_id_eur",
+        "real_id_recourse_reason",
+        "real_id_trade_type",
+        "real_degradation_cost_eur",
+        "real_aux_cost_eur",
+        "real_transaction_cost_eur",
+        "real_penalty_eur",
+        "real_missed_capacity_mw",
+        "real_missed_capacity_pos_mw",
+        "real_missed_capacity_neg_mw",
+        "real_missed_activation_mwh",
+        "real_required_headroom_pos_mwh",
+        "real_required_headroom_neg_mwh",
+        "real_headroom_violation_pos_mwh",
+        "real_headroom_violation_neg_mwh",
+        "physical_soc_min_mwh",
+        "physical_soc_max_mwh",
+        "protected_soc_min_mwh",
+        "protected_soc_max_mwh",
+        "real_protected_soc_min_mwh",
+        "real_protected_soc_max_mwh",
+        "real_protected_soc_violation_pos_mwh",
+        "real_protected_soc_violation_neg_mwh",
+        "optimization_error_code",
+        "optimization_fallback",
+        "optimizer_fallback_used",
+        "is_fallback_hour",
+        "real_throughput_mwh",
+        "perfect_foresight_pnl_eur",
+        "global_hindsight_perfect_foresight_pnl_eur",
+    }
+    prefixes = (
+        "real_da_",
+        "real_id_",
+        "real_bcm_",
+        "real_bem_",
+        "real_headroom_",
+        "real_power_",
+        "final_soc_",
+        "pnl_reconciliation_",
+    )
+    cols = [c for c in hourly.columns if c in exact or c.startswith(prefixes)]
+    return hourly.loc[:, list(dict.fromkeys(cols))].copy()
 
 
 def _series_from_candidates(
@@ -605,14 +752,19 @@ def _build_performance_metrics(
     id_net = id_gross_revenue - id_gross_cost
     bcm_offer_cost = offer_cost
     bcm_strategy_total_revenue = bcm_capacity_revenue + bcm_linked_activation_revenue
+    bcm_total_revenue = bcm_strategy_total_revenue
     bem_activation_cost = 0.0
     bem_net = bem_activation_revenue - bem_activation_cost
+    bem_total_revenue = bem_activation_revenue
     afrr_capacity_revenue = bcm_capacity_revenue
     afrr_activation_revenue = _hourly_sum("real_revenue_activation_eur")
     if not np.isfinite(afrr_activation_revenue):
         afrr_activation_revenue = float(pd.to_numeric(pd.Series([summary.get("total_afrr_activation_revenue_eur", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
     afrr_activation_cost = 0.0
     afrr_total_net_revenue = afrr_capacity_revenue + afrr_activation_revenue - afrr_activation_cost
+    bcm_bem_activation_split_reconciliation_error = (
+        afrr_activation_revenue - bcm_linked_activation_revenue - bem_activation_revenue
+    )
 
     gross_revenue_without_costs = da_gross_revenue + id_gross_revenue + afrr_capacity_revenue + afrr_activation_revenue
     gross_market_costs = da_gross_cost + id_gross_cost + afrr_activation_cost
@@ -669,7 +821,10 @@ def _build_performance_metrics(
         "id_gross_cost_eur",
         "bcm_capacity_revenue_eur",
         "bcm_linked_activation_revenue_eur",
+        "bcm_total_revenue_eur",
         "bem_activation_revenue_eur",
+        "bem_total_revenue_eur",
+        "bcm_bem_activation_split_reconciliation_error_eur",
         "realized_degradation_cost_eur",
         "realized_aux_cost_eur",
         "transaction_cost_eur",
@@ -725,15 +880,28 @@ def _build_performance_metrics(
         "id_net_revenue_eur": id_net,
         "bcm_capacity_revenue_eur": bcm_capacity_revenue,
         "bcm_offer_cost_eur": bcm_offer_cost,
+        "bcm_activation_revenue_eur": bcm_linked_activation_revenue,
         "bcm_linked_activation_revenue_eur": bcm_linked_activation_revenue,
         "bcm_strategy_total_revenue_eur": bcm_strategy_total_revenue,
+        "bcm_total_revenue_eur": bcm_total_revenue,
+        "bcm_revenue_before_shared_costs_eur": bcm_total_revenue,
         "bem_activation_revenue_eur": bem_activation_revenue,
         "bem_activation_cost_eur": bem_activation_cost,
         "bem_net_revenue_eur": bem_net,
+        "bem_total_revenue_eur": bem_total_revenue,
+        "bem_revenue_before_shared_costs_eur": bem_total_revenue,
         "afrr_capacity_revenue_eur": afrr_capacity_revenue,
         "afrr_activation_revenue_eur": afrr_activation_revenue,
         "afrr_activation_cost_eur": afrr_activation_cost,
         "afrr_total_net_revenue_eur": afrr_total_net_revenue,
+        "bcm_bem_activation_split_reconciliation_error_eur": bcm_bem_activation_split_reconciliation_error,
+        "market_revenue_split_method": "source_mwh",
+        "market_cost_allocation_method": "shared_operational_costs_not_allocated_to_bcm_or_bem",
+        "annualized_bcm_capacity_revenue_eur": bcm_capacity_revenue * annualization_factor,
+        "annualized_bcm_activation_revenue_eur": bcm_linked_activation_revenue * annualization_factor,
+        "annualized_bcm_total_revenue_eur": bcm_total_revenue * annualization_factor,
+        "annualized_bem_activation_revenue_eur": bem_activation_revenue * annualization_factor,
+        "annualized_bem_total_revenue_eur": bem_total_revenue * annualization_factor,
         "gross_revenue_without_costs_eur": gross_revenue_without_costs,
         "gross_market_costs_eur": gross_market_costs,
         "net_market_revenue_before_operational_costs_eur": net_market_revenue_before_operational_costs,
@@ -879,6 +1047,20 @@ def _build_daily_performance_metrics(
         + pd.to_numeric(out["bcm_linked_activation_revenue_eur"], errors="coerce").fillna(0.0)
     )
     out["bem_pnl_eur"] = pd.to_numeric(out["bem_activation_revenue_eur"], errors="coerce").fillna(0.0)
+    out["bcm_activation_revenue_eur"] = pd.to_numeric(
+        out["bcm_linked_activation_revenue_eur"], errors="coerce"
+    ).fillna(0.0)
+    out["bcm_total_revenue_eur"] = out["bcm_pnl_eur"]
+    out["bcm_revenue_before_shared_costs_eur"] = out["bcm_total_revenue_eur"]
+    out["bem_total_revenue_eur"] = out["bem_pnl_eur"]
+    out["bem_revenue_before_shared_costs_eur"] = out["bem_total_revenue_eur"]
+    out["bcm_bem_activation_split_reconciliation_error_eur"] = (
+        pd.to_numeric(out["afrr_activation_revenue_eur"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(out["bcm_linked_activation_revenue_eur"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(out["bem_activation_revenue_eur"], errors="coerce").fillna(0.0)
+    )
+    out["market_revenue_split_method"] = "source_mwh"
+    out["market_cost_allocation_method"] = "shared_operational_costs_not_allocated_to_bcm_or_bem"
     out["afrr_pnl_eur"] = (
         pd.to_numeric(out["afrr_capacity_revenue_eur"], errors="coerce").fillna(0.0)
         + pd.to_numeric(out["afrr_activation_revenue_eur"], errors="coerce").fillna(0.0)
@@ -958,6 +1140,15 @@ def _performance_reconciliation_specs() -> list[dict[str, object]]:
             "source_note": "BCM-linked activation revenue tracked separately from BEM-only activation",
         },
         {
+            "metric": "bcm_total_revenue_eur",
+            "scenario_col": "bcm_total_revenue_eur",
+            "daily_col": "bcm_total_revenue_eur",
+            "hourly_col": "",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "BCM market revenue = capacity revenue + BCM-linked activation revenue; shared costs are not allocated",
+        },
+        {
             "metric": "afrr_activation_revenue_eur",
             "scenario_col": "afrr_activation_revenue_eur",
             "daily_col": "afrr_activation_revenue_eur",
@@ -974,6 +1165,15 @@ def _performance_reconciliation_specs() -> list[dict[str, object]]:
             "checked_daily_to_scenario": True,
             "checked_component_to_net": True,
             "source_note": "BEM-only activation revenue",
+        },
+        {
+            "metric": "bem_total_revenue_eur",
+            "scenario_col": "bem_total_revenue_eur",
+            "daily_col": "bem_total_revenue_eur",
+            "hourly_col": "",
+            "checked_daily_to_scenario": True,
+            "checked_component_to_net": False,
+            "source_note": "BEM market revenue = BEM-only activation revenue; shared costs are not allocated",
         },
         {
             "metric": "realized_degradation_cost_eur",
@@ -2840,6 +3040,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Export per-bin BCM/BEM EV audit CSV from optimizer hourly outputs.",
     )
+    p.add_argument(
+        "--output-detail",
+        choices=["thesis", "debug"],
+        default="debug",
+        help="Hourly output width. debug preserves all columns; thesis writes only essential validation/report columns.",
+    )
+    p.add_argument(
+        "--debug-dumps",
+        choices=["accepted_only", "all", "none"],
+        default="all",
+        help="Infeasible MILP matrix dump policy. accepted_only suppresses candidate .npz dumps but keeps counters.",
+    )
+    p.add_argument(
+        "--use-input-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reuse cached joined/canonicalized model/split input when cache key matches.",
+    )
+    p.add_argument(
+        "--refresh-input-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Rebuild input cache even if a matching cache file exists.",
+    )
     return p.parse_args()
 
 
@@ -2919,8 +3143,13 @@ def main() -> None:
     forecast_warehouse: dict[str, pd.DataFrame] | None = None
     coverage_min: pd.Timestamp | None = None
     coverage_max: pd.Timestamp | None = None
+    df: pd.DataFrame | None = None
+    input_cache_used = False
+    input_cache_path = ""
 
     if not predictions_path:
+        if not ground_truth_path:
+            ground_truth_path = str(_resolve_existing_file(payload["ground_truth"]["default_path"], manifest_dir=manifest_dir))
         da_long = payload.get("bundles", {}).get("da", {}).get("predictions_long", {}).get(args.split, {})
         afrr_long = payload.get("bundles", {}).get("afrr", {}).get("predictions_long", {}).get(args.split, {})
         long_map = {**da_long, **afrr_long}
@@ -2931,22 +3160,38 @@ def main() -> None:
                 split=args.split,
                 model_key=args.model_key.strip(),
             )
-            forecast_warehouse = load_prediction_warehouse_long(
-                resolved_long_map,
-                target_value_modes=target_value_modes,
-                allow_p50_materialization_from_predicted_value=bool(args.allow_p50_from_predicted_value),
+            cache_key = _input_cache_key(
+                model_key=str(args.model_key),
+                split=str(args.split),
+                manifest_path=manifest_path,
+                prediction_files=resolved_long_map.values(),
+                truth_file=ground_truth_path,
+                forecast_value_mode=str(args.forecast_value_mode),
             )
-            print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
-            cov_min_list: list[pd.Timestamp] = []
-            cov_max_list: list[pd.Timestamp] = []
-            for wdf in forecast_warehouse.values():
-                t = pd.to_datetime(wdf["target_time_utc"], utc=True, errors="coerce").dropna()
-                if not t.empty:
-                    cov_min_list.append(t.min())
-                    cov_max_list.append(t.max())
-            if cov_min_list and cov_max_list:
-                coverage_min = min(cov_min_list)
-                coverage_max = max(cov_max_list)
+            cache_path = _input_cache_path(cache_key)
+            input_cache_path = str(cache_path)
+            cached = None if bool(args.refresh_input_cache) or not bool(args.use_input_cache) else _load_input_cache(cache_path)
+            if cached is not None:
+                df, forecast_warehouse, coverage_min, coverage_max = cached
+                input_cache_used = True
+                print(f"[INFO] Simulation input cache hit: {cache_path}")
+            else:
+                forecast_warehouse = load_prediction_warehouse_long(
+                    resolved_long_map,
+                    target_value_modes=target_value_modes,
+                    allow_p50_materialization_from_predicted_value=bool(args.allow_p50_from_predicted_value),
+                )
+                print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
+                cov_min_list: list[pd.Timestamp] = []
+                cov_max_list: list[pd.Timestamp] = []
+                for wdf in forecast_warehouse.values():
+                    t = pd.to_datetime(wdf["target_time_utc"], utc=True, errors="coerce").dropna()
+                    if not t.empty:
+                        cov_min_list.append(t.min())
+                        cov_max_list.append(t.max())
+                if cov_min_list and cov_max_list:
+                    coverage_min = min(cov_min_list)
+                    coverage_max = max(cov_max_list)
         else:
             da_pred = _resolve_bundle_prediction_path(
                 configured_path=payload["bundles"]["da"]["predictions"][args.split],
@@ -2966,9 +3211,6 @@ def main() -> None:
             backtest_table = da_df.merge(afrr_df, on="timestamp_utc", how="inner")
             backtest_table.to_parquet(predictions_path, index=False)
             print(f"[INFO] Backtest table created: {predictions_path}")
-
-        if not ground_truth_path:
-            ground_truth_path = str(_resolve_existing_file(payload["ground_truth"]["default_path"], manifest_dir=manifest_dir))
 
     if not ground_truth_path:
         raise ValueError("Either provide --predictions and --ground-truth, or use --run-manifest.")
@@ -2994,14 +3236,14 @@ def main() -> None:
     )
     colmap = _apply_fallback_column_map(pred_preview, truth_preview, colmap_in)
 
-    if predictions_path:
+    if df is None and predictions_path:
         df = load_and_align_market_data(
             predictions_path,
             ground_truth_path,
             colmap,
             target_value_modes=target_value_modes,
         )
-    else:
+    elif df is None:
         df = truth_preview.copy()
         if colmap.timestamp not in df.columns and isinstance(df.index, pd.DatetimeIndex):
             df[colmap.timestamp] = df.index
@@ -3010,6 +3252,15 @@ def main() -> None:
         df = canonicalize_market_frame(df, colmap=colmap, target_value_modes=target_value_modes)
         if forecast_warehouse and coverage_min is not None and coverage_max is not None:
             df = df[(df[colmap.timestamp] >= coverage_min) & (df[colmap.timestamp] <= coverage_max)].copy()
+        if bool(args.use_input_cache) and input_cache_path and not input_cache_used:
+            _write_input_cache(
+                Path(input_cache_path),
+                df=df,
+                forecast_warehouse=forecast_warehouse,
+                coverage_min=coverage_min,
+                coverage_max=coverage_max,
+            )
+            print(f"[INFO] Simulation input cache written: {input_cache_path}")
     if args.start:
         df = df[df[colmap.timestamp] >= pd.to_datetime(args.start, utc=True)].copy()
     if args.end:
@@ -3083,6 +3334,7 @@ def main() -> None:
     )
     MODEL_SPECS["forecast_value_mode"] = str(args.forecast_value_mode).strip().lower()
     MODEL_SPECS["final_soc_mode"] = str(args.final_soc_mode)
+    MODEL_SPECS["debug_dumps"] = str(args.debug_dumps).strip().lower()
     enforce_final_soc_min = _resolve_final_soc_policy(
         strict_simulation_validity=bool(args.strict_simulation_validity),
         final_soc_mode=str(args.final_soc_mode),
@@ -3146,6 +3398,7 @@ def main() -> None:
         )
         backtester._soc_mass_balance_debug_path = scenario_out_dir / "backtest_soc_mass_balance_debug.csv"
         backtester._hard_final_soc_debug_path = scenario_out_dir / "hard_final_soc_infeasibility_debug.csv"
+        backtester._solver_failure_diagnostics_path = scenario_out_dir / "solver_failure_diagnostics.csv"
         backtester._hard_final_soc_debug_context = {
             "scenario": str(scenario_name),
             "model": str(args.model_key),
@@ -3206,7 +3459,12 @@ def main() -> None:
         output_write_started = time.monotonic()
 
         with _phase_watchdog("write_hourly"):
-            outputs.hourly.to_parquet(hourly_path, index=False)
+            hourly_to_write = _select_hourly_output_columns(
+                outputs.hourly,
+                output_detail=str(args.output_detail),
+                timestamp_col=colmap.timestamp,
+            )
+            hourly_to_write.to_parquet(hourly_path, index=False)
         ev_audit_stats = {
             "ev_audit_row_count": 0.0,
             "ev_audit_max_bcm_formula_error": 0.0,
@@ -3733,6 +3991,11 @@ def main() -> None:
             "strict_simulation_validity": float(bool(args.strict_simulation_validity)),
             "command_line_args": json.dumps(vars(args), sort_keys=True, default=str),
             "output_was_cleaned": float(output_was_cleaned),
+            "output_detail": str(args.output_detail),
+            "debug_dumps": str(args.debug_dumps),
+            "input_cache_used": float(bool(input_cache_used)),
+            "input_cache_path": str(input_cache_path),
+            "input_cache_schema_version": INPUT_CACHE_SCHEMA_VERSION,
             "infeasible_debug_dump_count": 0.0,
             "accepted_path_infeasible_debug_dump_count": 0.0,
             "candidate_infeasible_debug_dump_count": 0.0,

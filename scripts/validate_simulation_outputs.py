@@ -7,6 +7,10 @@ from pathlib import Path
 import pandas as pd
 
 
+ACCOUNTING_TOL_EUR = 1e-6
+PNL_HIERARCHY_TOL_EUR = 1e-4
+
+
 def _is_missing_required_value(v: object) -> bool:
     if isinstance(v, list):
         return False
@@ -20,6 +24,189 @@ def _read_summary(path: Path) -> dict[str, object]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _safe_float(v: object, default: float = float("nan")) -> float:
+    try:
+        out = float(pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0])
+    except Exception:
+        return default
+    return out if pd.notna(out) else default
+
+
+def _read_first_record(path_csv: Path, path_json: Path) -> dict[str, object]:
+    if path_csv.exists():
+        try:
+            df = pd.read_csv(path_csv)
+            if not df.empty:
+                return dict(df.iloc[0].to_dict())
+        except Exception:
+            return {}
+    if path_json.exists():
+        try:
+            obj = json.loads(path_json.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if isinstance(obj, list) and obj:
+            return dict(obj[0]) if isinstance(obj[0], dict) else {}
+        if isinstance(obj, dict):
+            for key in ("records", "data", "rows"):
+                val = obj.get(key)
+                if isinstance(val, list) and val and isinstance(val[0], dict):
+                    return dict(val[0])
+            return dict(obj)
+    return {}
+
+
+def _read_hourly(scenario_dir: Path) -> pd.DataFrame:
+    parquet_path = scenario_dir / "backtest_hourly.parquet"
+    csv_path = scenario_dir / "backtest_hourly.csv"
+    if parquet_path.exists():
+        try:
+            return pd.read_parquet(parquet_path)
+        except Exception:
+            return pd.DataFrame()
+    if csv_path.exists():
+        try:
+            return pd.read_csv(csv_path)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _is_verified_global_upper_bound(summary: dict[str, object]) -> float:
+    for key in (
+        "global_pf_verified_upper_bound",
+        "global_hindsight_perfect_foresight_is_global_upper_bound",
+        "global_perfect_foresight_is_upper_bound",
+    ):
+        if key in summary:
+            return 1.0 if _safe_float(summary.get(key), 0.0) >= 0.5 else 0.0
+    status = str(summary.get("global_perfect_foresight_validation_status", "")).strip().lower()
+    if "verified" in status and "unverified" not in status and "disabled" not in status:
+        return 1.0
+    return 0.0
+
+
+def _scenario_invalid_reason(existing: object, added: list[str]) -> str:
+    parts = [p.strip() for p in str(existing or "").split(",") if p.strip()]
+    for reason in added:
+        if reason and reason not in parts:
+            parts.append(reason)
+    return ",".join(parts)
+
+
+def _build_pnl_validation_report(
+    df: pd.DataFrame,
+    *,
+    pnl_tolerance: float = PNL_HIERARCHY_TOL_EUR,
+    accounting_tolerance: float = ACCOUNTING_TOL_EUR,
+    require_pnl_hierarchy: bool = False,
+    require_afrr_decomposition: bool = False,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for _, rec in df.iterrows():
+        scenario_dir = Path(str(rec.get("scenario_path", "")))
+        summary = _read_summary(scenario_dir / "backtest_summary.json")
+        perf = _read_first_record(scenario_dir / "performance_metrics.csv", scenario_dir / "performance_metrics.json")
+        hourly = _read_hourly(scenario_dir)
+
+        realized = _safe_float(summary.get("realized_total_pnl_eur", rec.get("realized_total_pnl_eur")))
+        rolling = _safe_float(
+            summary.get(
+                "comparable_rolling_perfect_foresight_same_rules_market_pnl_eur",
+                summary.get(
+                    "comparable_perfect_foresight_market_pnl_eur",
+                    summary.get(
+                        "rolling_perfect_foresight_same_rules_total_pnl_eur",
+                        rec.get("rolling_perfect_foresight_same_rules_total_pnl_eur"),
+                    ),
+                ),
+            )
+        )
+        global_pf = _safe_float(
+            summary.get(
+                "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
+                rec.get("global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"),
+            )
+        )
+        global_available = 1.0 if _safe_float(summary.get("global_perfect_foresight_available", 0.0), 0.0) >= 0.5 else 0.0
+        global_verified = _is_verified_global_upper_bound(summary)
+
+        invalid_reasons: list[str] = []
+        realized_minus_rolling = realized - rolling if pd.notna(realized) and pd.notna(rolling) else float("nan")
+        rolling_minus_global = rolling - global_pf if pd.notna(rolling) and pd.notna(global_pf) else float("nan")
+        realized_minus_global = realized - global_pf if pd.notna(realized) and pd.notna(global_pf) else float("nan")
+
+        realized_le_rolling = bool(pd.notna(realized_minus_rolling) and realized_minus_rolling <= pnl_tolerance)
+        global_checks_available = bool(global_available >= 0.5 and global_verified >= 0.5 and pd.notna(global_pf))
+        rolling_le_global = True
+        realized_le_global = True
+        if require_pnl_hierarchy:
+            if not realized_le_rolling:
+                invalid_reasons.append("realized_exceeds_rolling_perfect_foresight")
+            if global_available < 0.5:
+                invalid_reasons.append("global_pf_unavailable")
+            if global_available >= 0.5 and global_verified < 0.5:
+                invalid_reasons.append("global_pf_unverified")
+            if global_checks_available:
+                rolling_le_global = bool(pd.notna(rolling_minus_global) and rolling_minus_global <= pnl_tolerance)
+                realized_le_global = bool(pd.notna(realized_minus_global) and realized_minus_global <= pnl_tolerance)
+                if not rolling_le_global:
+                    invalid_reasons.append("rolling_pf_exceeds_global_perfect_foresight")
+                if not realized_le_global:
+                    invalid_reasons.append("realized_exceeds_global_perfect_foresight")
+        pnl_hierarchy_pass = bool(realized_le_rolling and (not require_pnl_hierarchy or (global_checks_available and rolling_le_global and realized_le_global)))
+
+        afrr = _safe_float(perf.get("afrr_total_net_revenue_eur"))
+        bcm = _safe_float(perf.get("bcm_strategy_total_revenue_eur", perf.get("bcm_total_revenue_eur")))
+        bem = _safe_float(perf.get("bem_net_revenue_eur", perf.get("bem_total_revenue_eur")))
+        afrr_error = afrr - bcm - bem if pd.notna(afrr) and pd.notna(bcm) and pd.notna(bem) else float("nan")
+        afrr_decomposition_pass = bool(pd.notna(afrr_error) and abs(afrr_error) <= accounting_tolerance)
+        if require_afrr_decomposition and not afrr_decomposition_pass:
+            invalid_reasons.append("afrr_decomposition_mismatch")
+
+        max_activation_split_error = _safe_float(summary.get("activation_split_reconciliation_error_max"))
+        if not hourly.empty and {"real_revenue_activation_eur", "real_bcm_linked_activation_revenue_eur", "real_bem_only_activation_revenue_eur"}.issubset(hourly.columns):
+            split_err = (
+                pd.to_numeric(hourly["real_revenue_activation_eur"], errors="coerce").fillna(0.0)
+                - pd.to_numeric(hourly["real_bcm_linked_activation_revenue_eur"], errors="coerce").fillna(0.0)
+                - pd.to_numeric(hourly["real_bem_only_activation_revenue_eur"], errors="coerce").fillna(0.0)
+            ).abs()
+            max_activation_split_error = float(split_err.max()) if len(split_err) else 0.0
+        activation_split_pass = bool(pd.notna(max_activation_split_error) and max_activation_split_error <= accounting_tolerance)
+        if require_afrr_decomposition and not activation_split_pass:
+            invalid_reasons.append("activation_split_mismatch")
+
+        rows.append(
+            {
+                "scenario_path": str(scenario_dir),
+                "model": summary.get("model_key", rec.get("model", "")),
+                "strategy": summary.get("trading_strategy", rec.get("trading_strategy", "")),
+                "quantile_pair": rec.get("scenario", scenario_dir.name),
+                "simulation_valid": rec.get("simulation_valid"),
+                "thesis_reportable": rec.get("thesis_reportable"),
+                "realized_total_pnl_eur": realized,
+                "comparable_rolling_pf_eur": rolling,
+                "global_hindsight_pf_eur": global_pf,
+                "realized_minus_rolling_pf_eur": realized_minus_rolling,
+                "rolling_pf_minus_global_pf_eur": rolling_minus_global,
+                "realized_minus_global_pf_eur": realized_minus_global,
+                "global_pf_available": global_available,
+                "global_pf_verified_upper_bound": global_verified,
+                "pnl_hierarchy_pass": float(pnl_hierarchy_pass),
+                "afrr_total_net_revenue_eur": afrr,
+                "bcm_strategy_total_revenue_eur": bcm,
+                "bem_net_revenue_eur": bem,
+                "afrr_decomposition_error_eur": afrr_error,
+                "afrr_decomposition_pass": float(afrr_decomposition_pass),
+                "activation_split_pass": float(activation_split_pass),
+                "max_activation_split_error_eur": max_activation_split_error,
+                "invalid_reason_added": ",".join(invalid_reasons),
+                "invalid_reason_with_added": _scenario_invalid_reason(rec.get("invalid_reason", ""), invalid_reasons),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _collect(root: Path) -> pd.DataFrame:
@@ -141,9 +328,17 @@ def _invalid_by_reason(df: pd.DataFrame) -> dict[str, int]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Validate simulation output directories from backtest_summary.json files.")
-    ap.add_argument("output_dir", help="Root simulation output directory (contains strategy/scenario subfolders).")
+    ap.add_argument("output_dir", nargs="?", default="", help="Root simulation output directory (contains strategy/scenario subfolders).")
+    ap.add_argument("--root", default="", help="Root simulation output directory. Alias for positional output_dir.")
     ap.add_argument("--out-csv", default="", help="Optional CSV output path for per-scenario validation table.")
     ap.add_argument("--out-json", default="", help="Optional JSON output path for aggregate validation stats.")
+    ap.add_argument("--pnl-report-csv", default="", help="Optional CSV path for strict PnL/aFRR validation report.")
+    ap.add_argument("--pnl-report-json", default="", help="Optional JSON path for strict PnL/aFRR validation report.")
+    ap.add_argument("--require-reportable", action="store_true", help="Fail unless all scenarios are simulation_valid and thesis_reportable.")
+    ap.add_argument("--require-pnl-hierarchy", action="store_true", help="Fail on realized/PF/global-PF PnL hierarchy violations.")
+    ap.add_argument("--require-afrr-decomposition", action="store_true", help="Fail on aFRR BCM/BEM revenue decomposition mismatches.")
+    ap.add_argument("--pnl-tolerance-eur", type=float, default=PNL_HIERARCHY_TOL_EUR, help="Tolerance for cumulative PnL hierarchy checks.")
+    ap.add_argument("--accounting-tolerance-eur", type=float, default=ACCOUNTING_TOL_EUR, help="Tolerance for exact accounting/aFRR split checks.")
     ap.add_argument(
         "--allow-stale",
         action="store_true",
@@ -151,7 +346,10 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    root = Path(args.output_dir)
+    output_dir = args.root or args.output_dir
+    if not output_dir:
+        ap.error("Provide output_dir or --root.")
+    root = Path(output_dir)
     if not root.exists():
         raise FileNotFoundError(f"Output dir not found: {root}")
 
@@ -311,6 +509,25 @@ def main() -> None:
     df["debug_dump_check_pass"] = debug_dump_check_pass.astype(float)
     df["parser_thesis_valid"] = thesis_rule.astype(float)
 
+    pnl_report_df = _build_pnl_validation_report(
+        df,
+        pnl_tolerance=float(args.pnl_tolerance_eur),
+        accounting_tolerance=float(args.accounting_tolerance_eur),
+        require_pnl_hierarchy=bool(args.require_pnl_hierarchy),
+        require_afrr_decomposition=bool(args.require_afrr_decomposition),
+    )
+    if not pnl_report_df.empty:
+        if bool(args.require_pnl_hierarchy):
+            hierarchy_ok = pnl_report_df["pnl_hierarchy_pass"].astype(float) >= 0.5
+            thesis_rule &= hierarchy_ok.to_numpy(dtype=bool)
+        if bool(args.require_afrr_decomposition):
+            afrr_ok = (
+                (pnl_report_df["afrr_decomposition_pass"].astype(float) >= 0.5)
+                & (pnl_report_df["activation_split_pass"].astype(float) >= 0.5)
+            )
+            thesis_rule &= afrr_ok.to_numpy(dtype=bool)
+        df["parser_thesis_valid"] = thesis_rule.astype(float)
+
     total = int(len(df))
     valid = int((df["simulation_valid"] >= 0.5).sum()) if "simulation_valid" in df.columns else 0
     thesis = int((df["thesis_reportable"] >= 0.5).sum()) if "thesis_reportable" in df.columns else 0
@@ -344,6 +561,10 @@ def main() -> None:
         by_reason["critical_required_fields_defaulted"] = int((critical_defaulted_count > 0).sum())
     if (optional_defaulted_count > 0).any():
         by_reason["optional_fields_defaulted"] = int((optional_defaulted_count > 0).sum())
+    if not pnl_report_df.empty:
+        for txt in pnl_report_df.get("invalid_reason_added", pd.Series("", index=pnl_report_df.index)).fillna("").astype(str):
+            for reason in [r.strip() for r in txt.split(",") if r.strip()]:
+                by_reason[reason] = by_reason.get(reason, 0) + 1
 
     consistency_errors: list[str] = []
     if total != (valid + invalid):
@@ -410,6 +631,16 @@ def main() -> None:
             ),
             encoding="utf-8",
         )
+    pnl_csv = Path(args.pnl_report_csv) if args.pnl_report_csv else root / "pnl_validation_report.csv"
+    pnl_json = Path(args.pnl_report_json) if args.pnl_report_json else root / "pnl_validation_report.json"
+    if not pnl_report_df.empty:
+        pnl_csv.parent.mkdir(parents=True, exist_ok=True)
+        pnl_report_df.to_csv(pnl_csv, index=False)
+        pnl_json.parent.mkdir(parents=True, exist_ok=True)
+        pnl_json.write_text(
+            json.dumps(pnl_report_df.to_dict(orient="records"), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
     if consistency_errors:
         raise SystemExit(
             "Validation consistency failure: " + "; ".join(consistency_errors)
@@ -420,6 +651,44 @@ def main() -> None:
             "Missing required fields: "
             f"{missing_flat}. This indicates stale artifacts or outdated runner. Re-run with --clean-output."
         )
+    strict_failures: list[str] = []
+    if args.require_reportable:
+        bad = df.loc[
+            (df.get("simulation_valid", 0.0).fillna(0.0) < 0.5)
+            | (df.get("thesis_reportable", 0.0).fillna(0.0) < 0.5)
+            | (df.get("parser_thesis_valid", 0.0).fillna(0.0) < 0.5)
+        ]
+        if not bad.empty:
+            strict_failures.append(f"non_reportable_scenarios={len(bad)}")
+    if args.require_pnl_hierarchy and not pnl_report_df.empty:
+        bad = pnl_report_df.loc[pnl_report_df["pnl_hierarchy_pass"].astype(float) < 0.5]
+        if not bad.empty:
+            reasons = sorted(
+                {
+                    r.strip()
+                    for txt in bad["invalid_reason_added"].fillna("").astype(str)
+                    for r in txt.split(",")
+                    if r.strip()
+                }
+            )
+            strict_failures.append(f"pnl_hierarchy_failed={len(bad)} reasons={reasons}")
+    if args.require_afrr_decomposition and not pnl_report_df.empty:
+        bad = pnl_report_df.loc[
+            (pnl_report_df["afrr_decomposition_pass"].astype(float) < 0.5)
+            | (pnl_report_df["activation_split_pass"].astype(float) < 0.5)
+        ]
+        if not bad.empty:
+            reasons = sorted(
+                {
+                    r.strip()
+                    for txt in bad["invalid_reason_added"].fillna("").astype(str)
+                    for r in txt.split(",")
+                    if r.strip()
+                }
+            )
+            strict_failures.append(f"afrr_decomposition_failed={len(bad)} reasons={reasons}")
+    if strict_failures:
+        raise SystemExit("Strict simulation validation failed: " + "; ".join(strict_failures))
 
 
 if __name__ == "__main__":

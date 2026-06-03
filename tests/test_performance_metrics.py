@@ -62,7 +62,7 @@ def _hourly() -> pd.DataFrame:
             "real_revenue_capacity_eur": [15.0, 15.0, 15.0, 15.0],
             "real_revenue_activation_eur": [6.0, 6.0, 6.0, 6.0],
             "real_bcm_linked_activation_revenue_eur": [3.0, 3.0, 3.0, 3.0],
-            "real_bem_only_activation_revenue_eur": [2.0, 2.0, 2.0, 2.0],
+            "real_bem_only_activation_revenue_eur": [3.0, 3.0, 3.0, 3.0],
             "real_degradation_cost_eur": [1.0, 1.0, 1.0, 1.0],
             "real_aux_cost_eur": [0.5, 0.5, 0.5, 0.5],
             "real_transaction_cost_eur": [0.25, 0.25, 0.25, 0.25],
@@ -86,7 +86,7 @@ def _summary() -> dict[str, object]:
         "total_afrr_capacity_revenue_eur": 60.0,
         "total_afrr_activation_revenue_eur": 24.0,
         "total_bcm_linked_activation_revenue_eur": 12.0,
-        "total_bem_only_activation_revenue_eur": 8.0,
+        "total_bem_only_activation_revenue_eur": 12.0,
         "total_degradation_cost_eur": 4.0,
         "total_auxiliary_cost_eur": 2.0,
         "total_transaction_cost_eur": 1.0,
@@ -155,6 +155,13 @@ def test_performance_metrics_core_formulas():
     assert row["equivalent_full_cycles_total"] == 0.2
     assert row["da_bid_buy_mwh_total"] == 2.0
     assert row["bem_bid_pos_mwh_total"] == 1.0
+    assert row["bcm_activation_revenue_eur"] == 12.0
+    assert row["bcm_total_revenue_eur"] == 72.0
+    assert row["bem_total_revenue_eur"] == 12.0
+    assert row["bcm_revenue_before_shared_costs_eur"] == 72.0
+    assert row["bem_revenue_before_shared_costs_eur"] == 12.0
+    assert row["bcm_bem_activation_split_reconciliation_error_eur"] == 0.0
+    assert row["market_revenue_split_method"] == "source_mwh"
     assert abs(float(row["net_revenue_reconciliation_error_eur"])) < 1e-9
 
 
@@ -175,6 +182,11 @@ def test_daily_metrics_reconcile_to_scenario():
     assert checks["net_revenue_reconciliation_ok"] is True
     assert checks["cost_reconciliation_ok"] is True
     assert checks["daily_to_scenario_reconciliation_ok"] is True
+    daily_row = daily_df.iloc[0]
+    assert daily_row["bcm_activation_revenue_eur"] == 12.0
+    assert daily_row["bcm_total_revenue_eur"] == 72.0
+    assert daily_row["bem_total_revenue_eur"] == 12.0
+    assert daily_row["bcm_bem_activation_split_reconciliation_error_eur"] == 0.0
 
 
 def test_offer_cost_is_reported_but_not_subtracted_from_settlement_pnl_reconciliation():

@@ -28,7 +28,7 @@ from energy_trading.simulation.battery_backtest import (  # noqa: E402
 )
 from energy_trading.config import MODEL_SPECS  # noqa: E402
 from energy_trading.simulation.bid_builder import AFRRCapacityBid  # noqa: E402
-from energy_trading.simulation.market_clearing import MarketClearingEngine  # noqa: E402
+from energy_trading.simulation.market_clearing import AFRRCapacityClearingResult, MarketClearingEngine  # noqa: E402
 from scripts.run_battery_backtest import (  # noqa: E402
     _build_daily_performance_metrics,
     _build_performance_metrics,
@@ -1740,6 +1740,99 @@ def test_bem_only_positive_revenue_decomposition() -> None:
     assert np.isclose(comp["activation_revenue_reconciled_eur"], 1400.0)
 
 
+def test_bcm_obligation_only_activation_is_bcm_linked() -> None:
+    bt = _mk_backtester("canonical_economic")
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=4.0,
+        delivered_neg_mwh=0.0,
+        bem_only_pos_mwh=0.0,
+        bem_only_neg_mwh=0.0,
+        act_pos_price_eur_mwh=100.0,
+        act_neg_price_eur_mwh=0.0,
+        bcm_linked_pos_mwh=4.0,
+        bcm_linked_neg_mwh=0.0,
+    )
+    assert np.isclose(comp["bcm_linked_pos_activation_mwh"], 4.0)
+    assert np.isclose(comp["bem_only_pos_activation_mwh"], 0.0)
+    assert np.isclose(comp["bcm_linked_activation_revenue_eur"], 400.0)
+    assert np.isclose(comp["bem_only_activation_revenue_eur"], 0.0)
+
+
+def test_bcm_and_bem_same_hour_split_by_source_mwh() -> None:
+    bt = _mk_backtester("canonical_economic")
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=5.0,
+        delivered_neg_mwh=0.0,
+        bem_only_pos_mwh=3.0,
+        bem_only_neg_mwh=0.0,
+        act_pos_price_eur_mwh=100.0,
+        act_neg_price_eur_mwh=0.0,
+        bcm_linked_pos_mwh=2.0,
+        bcm_linked_neg_mwh=0.0,
+    )
+    assert comp["activation_split_method"] == "source_mwh"
+    assert np.isclose(comp["bcm_linked_pos_activation_mwh"], 2.0)
+    assert np.isclose(comp["bem_only_pos_activation_mwh"], 3.0)
+    assert np.isclose(comp["bcm_linked_activation_revenue_eur"], 200.0)
+    assert np.isclose(comp["bem_only_activation_revenue_eur"], 300.0)
+    assert np.isclose(
+        comp["activation_revenue_reconciled_eur"],
+        comp["bcm_linked_activation_revenue_eur"] + comp["bem_only_activation_revenue_eur"],
+    )
+
+
+def test_canonical_negative_activation_positive_for_bcm_and_bem_sources() -> None:
+    bt = _mk_backtester("canonical_economic")
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=0.0,
+        delivered_neg_mwh=5.0,
+        bem_only_pos_mwh=0.0,
+        bem_only_neg_mwh=3.0,
+        act_pos_price_eur_mwh=0.0,
+        act_neg_price_eur_mwh=1000.0,
+        bcm_linked_pos_mwh=0.0,
+        bcm_linked_neg_mwh=2.0,
+    )
+    assert np.isclose(comp["bcm_linked_neg_activation_revenue_eur"], 2000.0)
+    assert np.isclose(comp["bem_only_neg_activation_revenue_eur"], 3000.0)
+    assert np.isclose(comp["activation_revenue_reconciled_eur"], 5000.0)
+
+
+def test_market_clearing_keeps_bem_only_active_during_bcm_obligation() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt._strategy_permissions = bt.strategy_permissions_from_name("afrr_only")
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2025-05-02T00:00:00Z"),
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=3.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=100.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=100.0,
+        pred_act_pos=10.0,
+        true_act_pos=100.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=0.5,
+        true_rate_neg=0.0,
+        pred_rate_pos=0.5,
+        pred_rate_neg=0.0,
+        soc_now=12.0,
+        obligation_pos_mw=2.0,
+        obligation_neg_mw=0.0,
+    )
+    assert float(out["bem_only_submitted_pos_mw"]) > 0.0
+    assert float(out["bem_only_executed_pos_mwh"]) > 0.0
+    assert float(out["bcm_linked_pos_activation_mwh"]) > 0.0
+    assert out["activation_split_method"] == "source_mwh"
+
+
 def test_split_activation_revenue_components_raw_signed_neg_price() -> None:
     bt = _mk_backtester("raw_signed")
     comp = bt._split_activation_revenue_components(
@@ -2212,6 +2305,241 @@ def test_bcm_precommitment_reduces_infeasible_bid() -> None:
     # 2 MWh headroom with 0.5h/eta_out implies <4 MW feasible.
     assert len(lock_pos) == 4
     assert max(lock_pos.values()) <= 4.0 + 1e-9
+
+
+def test_bcm_precommit_selector_uses_first_feasible_retry_factor(monkeypatch: pytest.MonkeyPatch) -> None:
+    bt = _mk_backtester()
+    bt.enable_reserve_retry_ladder = True
+    bt.reserve_retry_ladder = [1.0, 0.5, 0.0]
+    col = BacktestColumnMap()
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [10.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [10.0] * 4,
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+
+    def fake_clear(*, cap_bids, ts_idx, source, colmap):  # type: ignore[no-untyped-def]
+        raise AssertionError("realized clearing must not be used for BCM precommit retry selection")
+
+    def fake_formulate(*, blk, source, colmap, snapshot_ts, offered_pos, offered_neg, is_perfect_foresight=False):  # type: ignore[no-untyped-def]
+        ts = pd.to_datetime(blk["target_time_utc"].iloc[0], utc=True)
+        bids = []
+        if offered_pos > 0.0:
+            bids.append(AFRRCapacityBid(ts=ts, side="pos", quantity_mw=float(offered_pos), capacity_price_eur_mw=0.0, energy_price_eur_mwh=0.0))
+        if offered_neg > 0.0:
+            bids.append(AFRRCapacityBid(ts=ts, side="neg", quantity_mw=float(offered_neg), capacity_price_eur_mw=0.0, energy_price_eur_mwh=0.0))
+        return bids, pd.to_datetime(blk["target_time_utc"], utc=True)
+
+    def fake_optimize(df, colmap, **kwargs):  # type: ignore[no-untyped-def]
+        fixed = kwargs["fixed_reserve_obligation"]
+        max_pos = max((v[0] for v in fixed.values()), default=0.0)
+        if max_pos > 5.0:
+            raise RuntimeError("existing lockbook obligation infeasible")
+        return pd.DataFrame(
+            {
+                colmap.timestamp: pd.to_datetime(df[colmap.timestamp], utc=True),
+                "soc_lp_mwh": [10.0] * len(df),
+                "slack_pos_mw": [0.0] * len(df),
+                "slack_neg_mw": [0.0] * len(df),
+                "slack_soc_min_mwh": [0.0] * len(df),
+                "slack_soc_max_mwh": [0.0] * len(df),
+            }
+        )
+
+    monkeypatch.setattr(bt, "_clear_afrr_capacity_block_against_truth", fake_clear)
+    monkeypatch.setattr(bt, "_formulate_afrr_capacity_block_bids", fake_formulate)
+    monkeypatch.setattr(bt, "optimize_dispatch", fake_optimize)
+
+    offered_pos, offered_neg, cap_res, _bids, stats = bt._select_feasible_bcm_lock_candidate(
+        blk=snap,
+        snapshot_plan=snap,
+        source=source,
+        colmap=col,
+        snapshot_ts=pd.Timestamp("2025-05-01 06:00:00+00:00"),
+        offered_pos_mw=10.0,
+        offered_neg_mw=0.0,
+        lock_pos={},
+        lock_neg={},
+        da_lockbook={},
+        strategy_permissions=StrategyPermissions(False, "technical_repair", True, True, False),
+        optimizer_allowed_markets=("aFRR", "ID"),
+        horizon_hours=4,
+    )
+
+    assert offered_pos == 5.0
+    assert offered_neg == 0.0
+    assert cap_res is None
+    assert stats["feasibility_pass"] == 1.0
+    assert stats["retry_factor_selected"] == 0.5
+    assert stats["retry_factor_selected_before_clearing"] == 0.5
+    assert stats["selection_is_causal"] == 1.0
+    assert stats["full_award_feasibility_checked"] == 1.0
+    assert stats["realized_clearing_used_for_selection"] == 0.0
+    assert stats["reduced_due_to_reserve_feasibility"] == 1.0
+
+
+def test_bcm_precommit_selector_selects_full_factor_when_full_award_feasible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    bt.enable_reserve_retry_ladder = True
+    bt.reserve_retry_ladder = [1.0, 0.5, 0.0]
+    col = BacktestColumnMap()
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [10.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [10.0] * 4,
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+
+    def fake_clear(*, cap_bids, ts_idx, source, colmap):  # type: ignore[no-untyped-def]
+        raise AssertionError("realized clearing must happen after retry factor selection")
+
+    def fake_formulate(*, blk, source, colmap, snapshot_ts, offered_pos, offered_neg, is_perfect_foresight=False):  # type: ignore[no-untyped-def]
+        ts = pd.to_datetime(blk["target_time_utc"].iloc[0], utc=True)
+        bids = []
+        if offered_pos > 0.0:
+            bids.append(AFRRCapacityBid(ts=ts, side="pos", quantity_mw=float(offered_pos), capacity_price_eur_mw=0.0, energy_price_eur_mwh=0.0))
+        return bids, pd.to_datetime(blk["target_time_utc"], utc=True)
+
+    def always_feasible(df, colmap, **kwargs):  # type: ignore[no-untyped-def]
+        fixed = kwargs["fixed_reserve_obligation"]
+        assert max((v[0] for v in fixed.values()), default=0.0) == pytest.approx(10.0)
+        return pd.DataFrame(
+            {
+                colmap.timestamp: pd.to_datetime(df[colmap.timestamp], utc=True),
+                "soc_lp_mwh": [12.0] * len(df),
+                "slack_pos_mw": [0.0] * len(df),
+                "slack_neg_mw": [0.0] * len(df),
+                "slack_soc_min_mwh": [0.0] * len(df),
+                "slack_soc_max_mwh": [0.0] * len(df),
+            }
+        )
+
+    monkeypatch.setattr(bt, "_clear_afrr_capacity_block_against_truth", fake_clear)
+    monkeypatch.setattr(bt, "_formulate_afrr_capacity_block_bids", fake_formulate)
+    monkeypatch.setattr(bt, "optimize_dispatch", always_feasible)
+
+    offered_pos, offered_neg, cap_res, _bids, stats = bt._select_feasible_bcm_lock_candidate(
+        blk=snap,
+        snapshot_plan=snap,
+        source=source,
+        colmap=col,
+        snapshot_ts=pd.Timestamp("2025-05-01 06:00:00+00:00"),
+        offered_pos_mw=10.0,
+        offered_neg_mw=0.0,
+        lock_pos={},
+        lock_neg={},
+        da_lockbook={},
+        strategy_permissions=StrategyPermissions(False, "technical_repair", True, True, False),
+        optimizer_allowed_markets=("aFRR", "ID"),
+        horizon_hours=4,
+    )
+
+    assert offered_pos == 10.0
+    assert offered_neg == 0.0
+    assert cap_res is None
+    assert stats["retry_factor_selected"] == 1.0
+    assert stats["retry_factor_selected_before_clearing"] == 1.0
+    assert stats["selection_is_causal"] == 1.0
+    assert stats["full_award_feasibility_checked"] == 1.0
+    assert stats["realized_clearing_used_for_selection"] == 0.0
+
+
+def test_bcm_precommit_selector_locks_zero_only_when_no_nonzero_feasible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    bt.enable_reserve_retry_ladder = True
+    bt.reserve_retry_ladder = [1.0, 0.5, 0.0]
+    col = BacktestColumnMap()
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [10.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [10.0] * 4,
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+
+    def fake_clear(*, cap_bids, ts_idx, source, colmap):  # type: ignore[no-untyped-def]
+        raise AssertionError("realized clearing must not be used for BCM precommit retry selection")
+
+    def fake_formulate(*, blk, source, colmap, snapshot_ts, offered_pos, offered_neg, is_perfect_foresight=False):  # type: ignore[no-untyped-def]
+        ts = pd.to_datetime(blk["target_time_utc"].iloc[0], utc=True)
+        bids = []
+        if offered_pos > 0.0:
+            bids.append(AFRRCapacityBid(ts=ts, side="pos", quantity_mw=float(offered_pos), capacity_price_eur_mw=0.0, energy_price_eur_mwh=0.0))
+        return bids, pd.to_datetime(blk["target_time_utc"], utc=True)
+
+    def always_infeasible(df, colmap, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("terminal_soc_not_recoverable_even_with_id")
+
+    monkeypatch.setattr(bt, "_clear_afrr_capacity_block_against_truth", fake_clear)
+    monkeypatch.setattr(bt, "_formulate_afrr_capacity_block_bids", fake_formulate)
+    monkeypatch.setattr(bt, "optimize_dispatch", always_infeasible)
+
+    offered_pos, offered_neg, cap_res, _bids, stats = bt._select_feasible_bcm_lock_candidate(
+        blk=snap,
+        snapshot_plan=snap,
+        source=source,
+        colmap=col,
+        snapshot_ts=pd.Timestamp("2025-05-01 06:00:00+00:00"),
+        offered_pos_mw=10.0,
+        offered_neg_mw=0.0,
+        lock_pos={},
+        lock_neg={},
+        da_lockbook={},
+        strategy_permissions=StrategyPermissions(False, "technical_repair", True, True, False),
+        optimizer_allowed_markets=("aFRR", "ID"),
+        horizon_hours=4,
+    )
+
+    assert offered_pos == 0.0
+    assert offered_neg == 0.0
+    assert cap_res is None
+    assert stats["retry_factor_selected"] == 0.0
+    assert stats["retry_factor_selected_before_clearing"] == 0.0
+    assert stats["selection_is_causal"] == 1.0
+    assert stats["full_award_feasibility_checked"] == 1.0
+    assert stats["realized_clearing_used_for_selection"] == 0.0
+    assert stats["zero_reason"] in {
+        "not_awarded_or_zero_candidate",
+        "terminal_soc_not_recoverable_even_with_id",
+        "no_nonzero_feasible_bcm_bid",
+    }
 
 
 def test_precommit_includes_aux_losses() -> None:
@@ -4973,6 +5301,120 @@ def test_no_new_bcm_keeps_existing_lockbook_obligations() -> None:
 
 def test_fallback_still_not_reportable() -> None:
     test_fallback_never_reportable()
+
+
+def test_non_actionable_hour_uses_deterministic_noop_not_solver(monkeypatch: pytest.MonkeyPatch) -> None:
+    df, col = _tiny_backtest_df(hours=3)
+    bt = _mk_backtester("canonical_economic")
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("solver should not be called for deterministic no-op hour")
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _boom)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=3,
+        reopt_step_hours=1,
+        allowed_markets=("aFRR",),
+        strategy_name="bcm_only",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+    )
+    codes = set(out.hourly["optimization_error_code"].astype(str))
+    assert codes == {"ok_deterministic_noop"}
+    assert float(out.summary["fallback_used"]) == 0.0
+    assert float(out.summary["simulation_valid"]) == 1.0
+    assert pd.to_numeric(out.hourly["deterministic_noop_used"], errors="coerce").eq(1.0).all()
+    assert pd.to_numeric(out.hourly["optimizer_fallback_used"], errors="coerce").eq(0.0).all()
+    assert pd.to_numeric(out.hourly["deterministic_noop_allowed"], errors="coerce").eq(1.0).all()
+    assert pd.to_numeric(out.hourly["noop_no_market_action_available"], errors="coerce").eq(1.0).all()
+
+
+def test_deterministic_noop_not_allowed_when_bem_available() -> None:
+    df, col = _tiny_backtest_df(hours=3)
+    bt = _mk_backtester("canonical_economic")
+    calls = {"n": 0}
+    original = bt.optimize_dispatch
+
+    def _wrapped(*args, **kwargs):  # noqa: ANN002, ANN003
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    bt.optimize_dispatch = _wrapped  # type: ignore[method-assign]
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=3,
+        reopt_step_hours=1,
+        allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
+        strategy_name="multi",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+    )
+    assert calls["n"] > 0
+    assert "ok_deterministic_noop" not in set(out.hourly["optimization_error_code"].astype(str))
+    assert pd.to_numeric(out.hourly["deterministic_noop_used"], errors="coerce").fillna(0.0).eq(0.0).all()
+
+
+def test_deterministic_noop_not_allowed_at_bcm_bid_hour(monkeypatch: pytest.MonkeyPatch) -> None:
+    df, col = _tiny_backtest_df(hours=2)
+    df[col.timestamp] = pd.date_range("2026-01-01T07:00:00Z", periods=2, freq="h")
+    bt = _mk_backtester("canonical_economic")
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("forced bcm gate solver path")
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _boom)
+    with pytest.raises(RuntimeError, match="forced bcm gate solver path"):
+        bt.run(
+            df,
+            col,
+            use_rolling_horizon=True,
+            horizon_hours=2,
+            reopt_step_hours=1,
+            allowed_markets=("aFRR",),
+            strategy_name="bcm_only",
+            strict_simulation_validity=True,
+            enforce_final_soc_min=True,
+        )
+
+
+def test_deterministic_noop_not_allowed_with_terminal_pressure(monkeypatch: pytest.MonkeyPatch) -> None:
+    df, col = _tiny_backtest_df(hours=2)
+    bt = _mk_backtester("canonical_economic")
+    bt.soc_target_end = 12.0
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("forced solver path")
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _boom)
+    with pytest.raises(RuntimeError, match="forced solver path"):
+        bt.run(
+            df,
+            col,
+            use_rolling_horizon=True,
+            horizon_hours=2,
+            reopt_step_hours=1,
+            allowed_markets=("aFRR",),
+            strategy_name="bcm_only",
+            strict_simulation_validity=True,
+            enforce_final_soc_min=True,
+        )
+
+
+def test_highs_unknown_with_feasible_primal_counts_as_feasible_incumbent() -> None:
+    class _Sol:
+        status = 15
+        message = (
+            "The HiGHS status code was not recognized. "
+            "(HiGHS Status 15: model_status is Unknown; primal_status is Feasible)"
+        )
+        x = np.array([0.0])
+
+    assert BatteryBacktester._has_feasible_incumbent_result(_Sol())
 
 
 def test_no_obligation_protected_soc_equals_physical_bounds() -> None:
