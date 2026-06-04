@@ -778,7 +778,62 @@ def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
         cap_bid_pos=20.0,
         cap_bid_neg=0.0,
     )
-    assert np.isclose(float(m["revenue_capacity_eur"]), 0.0), m
+    assert np.isclose(float(m["revenue_capacity_eur"]), 5.0 * 20.0 * bt.dt_h), m
+    assert np.isclose(float(m["bcm_capacity_revenue_eur"]), 5.0 * 20.0 * bt.dt_h), m
+
+
+def test_bcm_capacity_and_linked_activation_revenue_are_separate() -> None:
+    bt = _mk_backtester("canonical_economic")
+    capacity_revenue = 0.0
+    activation_revenue = 0.0
+    gross_revenue = 0.0
+
+    for i in range(4):
+        rate_neg = (2.0 * bt.eta_in / 3.0) if i == 1 else 0.0
+        _, m = bt._settle_one_hour(
+            soc=bt.soc_init,
+            charge=0.0,
+            discharge=0.0,
+            reserve_pos=0.0,
+            reserve_neg=3.0,
+            da_price=0.0,
+            cap_pos=0.0,
+            cap_neg=0.0,
+            act_pos_price=0.0,
+            act_neg_price=1200.0,
+            act_pos_rate=0.0,
+            act_neg_rate=rate_neg,
+            cap_bid_pos=0.0,
+            cap_bid_neg=50.0,
+        )
+        capacity_revenue += float(m["bcm_capacity_revenue_eur"])
+        activation_revenue += float(m["revenue_activation_eur"])
+        gross_revenue += float(m["bcm_capacity_revenue_eur"]) + float(m["revenue_activation_eur"])
+
+    assert capacity_revenue == pytest.approx(3.0 * 50.0 * 4.0)
+    assert activation_revenue == pytest.approx(2.0 * 1200.0)
+    assert gross_revenue == pytest.approx(3000.0)
+
+
+def test_bcm_ev_capacity_term_uses_capacity_price_per_mw() -> None:
+    bt = _mk_backtester("canonical_economic")
+    df, col = _one_hour_pred_df(
+        da=0.0,
+        cap_pos=50.0,
+        cap_neg=60.0,
+        act_pos=0.0,
+        act_neg=0.0,
+        rate_pos=0.0,
+        rate_neg=0.0,
+    )
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR", "BCM"),
+        deterministic_reserve_settlement=True,
+    )
+    assert float(out["ev_bcm_expected_capacity_revenue_pos_bin_0"].iloc[0]) == pytest.approx(50.0 * bt.dt_h)
+    assert float(out["ev_bcm_expected_capacity_revenue_neg_bin_0"].iloc[0]) == pytest.approx(60.0 * bt.dt_h)
 
 
 def test_bcm_capacity_mw_not_created_by_activation_without_locked_capacity() -> None:
@@ -1369,7 +1424,7 @@ def test_bcm_plus_bem_activation_revenue_no_double_counting_in_settlement() -> N
         cap_bid_pos=25.0,
         cap_bid_neg=0.0,
     )
-    assert np.isclose(float(m["revenue_capacity_eur"]), 0.0, atol=1e-9)
+    assert np.isclose(float(m["revenue_capacity_eur"]), 4.0 * 25.0 * bt.dt_h, atol=1e-9)
     delivered_pos = float(m["delivered_activation_pos_mwh"])
     assert delivered_pos > 0.0
     assert np.isclose(float(m["revenue_activation_eur"]), delivered_pos * 200.0, atol=1e-6)
@@ -2036,7 +2091,7 @@ def test_market_clearing_keeps_bem_only_active_during_bcm_obligation() -> None:
     assert out["activation_split_method"] == "source_mwh"
 
 
-def test_split_activation_revenue_components_raw_signed_neg_price() -> None:
+def test_split_activation_revenue_components_uses_neg_provider_value_directly() -> None:
     bt = _mk_backtester("raw_signed")
     comp = bt._split_activation_revenue_components(
         delivered_pos_mwh=0.0,
@@ -2044,11 +2099,17 @@ def test_split_activation_revenue_components_raw_signed_neg_price() -> None:
         bem_only_pos_mwh=0.0,
         bem_only_neg_mwh=10.0,
         act_pos_price_eur_mwh=0.0,
-        act_neg_price_eur_mwh=-1000.0,
+        act_neg_price_eur_mwh=1000.0,
     )
     assert np.isclose(comp["bem_only_activation_revenue_eur"], 10000.0)
     assert np.isclose(comp["bcm_linked_activation_revenue_eur"], 0.0)
     assert np.isclose(comp["activation_revenue_reconciled_eur"], 10000.0)
+
+
+def test_neg_activation_provider_value_is_not_sign_flipped() -> None:
+    bt = _mk_backtester("raw_signed")
+    assert float(bt._neg_activation_provider_value(1000.0)) == pytest.approx(1000.0)
+    assert float(bt._neg_activation_provider_value(60.0)) == pytest.approx(60.0)
 
 
 def test_split_activation_revenue_components_canonical_neg_positive_value() -> None:
@@ -2225,6 +2286,60 @@ def test_id_is_price_taker() -> None:
     assert np.isclose(float(m["id_buy_price_eur_mwh"]), min(bt.id_buy_price_cap_eur_mwh, 100.0 + bt.id_rescue_spread_eur_mwh))
     assert np.isclose(float(m["id_sell_price_eur_mwh"]), max(bt.id_sell_price_floor_eur_mwh, 100.0 - bt.id_rescue_spread_eur_mwh))
     assert float(m["id_buy_price_eur_mwh"]) >= float(m["id_sell_price_eur_mwh"]) - 1e-12
+
+
+def test_id_price_taker_handles_negative_da_prices() -> None:
+    bt = _mk_backtester()
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_init,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=-50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=1.0,
+        id_discharge_mw=1.0,
+    )
+    assert float(m["id_buy_price_eur_mwh"]) == pytest.approx(-50.0 + bt.id_rescue_spread_eur_mwh)
+    assert float(m["id_sell_price_eur_mwh"]) == pytest.approx(-50.0 - bt.id_rescue_spread_eur_mwh)
+    assert float(m["id_price_uses_activation_price"]) == pytest.approx(0.0)
+
+
+def test_terminal_soc_recovery_reason_cannot_execute_id_sell() -> None:
+    bt = _mk_backtester()
+    bt._strategy_permissions = bt.resolve_strategy_permissions(
+        strategy_name="da_only",
+        allowed_markets=("DA", "ID"),
+        id_recourse_mode="common",
+    )
+    soc0 = 12.0
+    soc1, m = bt._settle_one_hour(
+        soc=soc0,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=0.0,
+        id_discharge_mw=5.0,
+        id_recourse_reason_hint="terminal_soc_recovery",
+    )
+    assert float(m["terminal_soc_recovery_id_sell_suppressed"]) == pytest.approx(1.0)
+    assert float(m["id_sell_mwh"]) == pytest.approx(0.0)
+    assert str(m["id_recourse_reason"]) == "none"
+    assert soc1 >= soc0 - float(m["aux_energy_mwh"]) - 1e-9
 
 
 def test_technical_id_buy_is_clipped_by_residual_charge_power_after_reserve() -> None:
@@ -2816,6 +2931,104 @@ def test_bcm_precommit_selector_uses_first_feasible_retry_factor(monkeypatch: py
     assert stats["full_award_feasibility_checked"] == 1.0
     assert stats["realized_clearing_used_for_selection"] == 0.0
     assert stats["reduced_due_to_reserve_feasibility"] == 1.0
+
+
+def test_bcm_precommit_derates_terminal_soc_infeasible_bid_before_lockbook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.final_soc_mode = "hard"
+    bt.enable_reserve_retry_ladder = True
+    bt.reserve_retry_ladder = [1.0, 0.5, 0.0]
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.reserve_power_safety_mw = 0.0
+    col = BacktestColumnMap()
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [2.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "soc_start_lp_mwh": [15.4] * 4,
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_activation_rate_pos: [1.0] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+
+    def fake_clear(*, cap_bids, ts_idx, source, colmap):  # type: ignore[no-untyped-def]
+        raise AssertionError("realized clearing must not be used for BCM precommit retry selection")
+
+    def fake_formulate(*, blk, source, colmap, snapshot_ts, offered_pos, offered_neg, is_perfect_foresight=False):  # type: ignore[no-untyped-def]
+        ts = pd.to_datetime(blk["target_time_utc"].iloc[0], utc=True)
+        bids = []
+        if offered_pos > 0.0:
+            bids.append(
+                AFRRCapacityBid(
+                    ts=ts,
+                    side="pos",
+                    quantity_mw=float(offered_pos),
+                    capacity_price_eur_mw=0.0,
+                    energy_price_eur_mwh=0.0,
+                )
+            )
+        return bids, pd.to_datetime(blk["target_time_utc"], utc=True)
+
+    def fake_optimize(df, colmap, **kwargs):  # type: ignore[no-untyped-def]
+        fixed = kwargs["fixed_reserve_obligation"]
+        max_pos = max((v[0] for v in fixed.values()), default=0.0)
+        assert max_pos <= 1.0 + 1e-9
+        return pd.DataFrame(
+            {
+                colmap.timestamp: pd.to_datetime(df[colmap.timestamp], utc=True),
+                "soc_lp_mwh": [10.1] * len(df),
+                "slack_pos_mw": [0.0] * len(df),
+                "slack_neg_mw": [0.0] * len(df),
+                "slack_soc_min_mwh": [0.0] * len(df),
+                "slack_soc_max_mwh": [0.0] * len(df),
+            }
+        )
+
+    monkeypatch.setattr(bt, "_clear_afrr_capacity_block_against_truth", fake_clear)
+    monkeypatch.setattr(bt, "_formulate_afrr_capacity_block_bids", fake_formulate)
+    monkeypatch.setattr(bt, "optimize_dispatch", fake_optimize)
+
+    offered_pos, offered_neg, cap_res, _bids, stats = bt._select_feasible_bcm_lock_candidate(
+        blk=snap,
+        snapshot_plan=snap,
+        source=source,
+        colmap=col,
+        snapshot_ts=pd.Timestamp("2025-05-01 06:00:00+00:00"),
+        offered_pos_mw=2.0,
+        offered_neg_mw=0.0,
+        lock_pos={},
+        lock_neg={},
+        da_lockbook={},
+        strategy_permissions=StrategyPermissions(False, "technical_repair", True, True, False),
+        optimizer_allowed_markets=("aFRR", "ID"),
+        horizon_hours=4,
+    )
+
+    assert offered_pos == pytest.approx(1.0)
+    assert offered_neg == pytest.approx(0.0)
+    assert cap_res is None
+    assert 0.0 < float(stats["retry_factor_selected"]) < 1.0
+    assert float(stats["retry_factor_selected_before_clearing"]) == pytest.approx(
+        float(stats["retry_factor_selected"])
+    )
+    assert float(stats["margin_before_derate_mwh"]) < 0.0
+    assert float(stats["margin_after_derate_mwh"]) >= 0.0
+    assert float(stats["terminal_soc_shortfall_mwh"]) == pytest.approx(0.0)
+    assert str(stats["zero_reason"]) == "none"
+    assert str(stats["zero_reason"]) != "reserve_retry_ladder_pending_feasibility"
 
 
 def test_bcm_precommit_records_id_recourse_for_auxiliary_soc_drift(
@@ -4479,6 +4692,26 @@ def test_terminal_id_recovery_sizes_grid_buy_from_internal_shortfall_and_losses(
     assert diag["terminal_soc_id_recourse_needed_internal_mwh"] == pytest.approx(expected_internal)
     assert diag["terminal_soc_id_recourse_scheduled_grid_mwh"] == pytest.approx(expected_internal / bt.eta_in)
     assert diag["terminal_soc_id_recourse_scheduled_internal_mwh"] == pytest.approx(expected_internal)
+
+
+def test_terminal_id_recovery_sizes_for_future_fixed_da_discharge() -> None:
+    bt = _mk_backtester()
+    projection = bt._project_terminal_soc_with_known_flows(
+        current_soc_mwh=12.0,
+        fixed_future_discharge_mwh=3.0,
+        remaining_aux_losses_mwh=0.25,
+    )
+    recovery = bt._schedule_terminal_id_recovery(
+        projected_terminal_soc_without_new_id_mwh=float(projection["projected_terminal_soc_without_new_id_mwh"]),
+        current_soc_mwh=12.0,
+        terminal_soc_target_mwh=10.0,
+        residual_charge_mw=10.0,
+    )
+    assert float(projection["terminal_soc_projection_fixed_future_discharge_mwh"]) == pytest.approx(3.0)
+    assert float(recovery["projected_terminal_soc_with_new_id_mwh"]) >= 10.0 - 1e-9
+    assert float(recovery["terminal_soc_id_recourse_scheduled_grid_mwh"]) == pytest.approx(
+        float(recovery["terminal_soc_id_recourse_needed_internal_mwh"]) / bt.eta_in
+    )
 
 
 def test_terminal_id_recovery_includes_safety_margin() -> None:
@@ -6358,7 +6591,7 @@ def test_highs_unknown_with_feasible_primal_counts_as_feasible_incumbent() -> No
     assert BatteryBacktester._has_feasible_incumbent_result(_Sol())
 
 
-def test_perfect_foresight_unknown_feasible_failure_does_not_abort_summary() -> None:
+def test_rolling_pf_solver_error_selects_feasible_no_market_incumbent() -> None:
     df, col = _tiny_backtest_df(hours=3)
     bt = _mk_backtester("canonical_economic")
     original = bt.optimize_dispatch_rolling
@@ -6385,14 +6618,52 @@ def test_perfect_foresight_unknown_feasible_failure_does_not_abort_summary() -> 
         enable_global_perfect_foresight=True,
     )
     s = out.summary
-    assert float(s["rolling_pf_available"]) == 0.0
+    assert float(s["rolling_pf_available"]) == 1.0
     assert str(s["rolling_pf_solver_status"]) == "unknown_feasible"
-    assert float(s["rolling_pf_verified"]) == 0.0
-    assert float(s["global_pf_verified_upper_bound"]) == 0.0
-    assert str(s["global_pf_solver_status"]) == "unknown_feasible"
-    assert "rolling_pf_solver_failed" in str(s["invalid_reason"])
-    assert "global_pf_solver_failed" in str(s["invalid_reason"])
-    assert np.isnan(float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+    assert "HiGHS Status 15" in str(s["rolling_pf_solver_message"])
+    assert float(s["rolling_pf_verified"]) == 1.0
+    assert float(s["rolling_pf_verified_upper_bound"]) == 1.0
+    assert str(s["rolling_pf_selected_incumbent"]) == "no_market"
+    assert float(s["rolling_pf_no_market_incumbent_eur"]) == pytest.approx(0.0)
+    assert float(s["rolling_pf_no_market_terminal_shortfall_mwh"]) <= 1e-6
+    assert float(s["global_pf_verified_upper_bound"]) == 1.0
+    assert "rolling_pf_solver_failed" not in str(s["invalid_reason"])
+    assert np.isfinite(float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+
+
+def test_rolling_pf_solver_error_selects_feasible_incumbent_without_invalidating() -> None:
+    df, col = _tiny_backtest_df(hours=3)
+    df[col.true_da_price] = [100.0, 100.0, 100.0]
+    df[col.pred_da_price] = [100.0, 100.0, 100.0]
+    for q in ["p05", "p10", "p90", "p95"]:
+        df[f"{col.pred_da_price}_{q}"] = [100.0, 100.0, 100.0]
+    bt = _mk_backtester("canonical_economic")
+    original = bt.optimize_dispatch_rolling
+
+    def _wrapped(*args, **kwargs):  # noqa: ANN002, ANN003
+        if kwargs.get("run_mode") == "perfect_foresight":
+            raise RuntimeError("MIP optimization failed: (HiGHS Status 0: Error)")
+        return original(*args, **kwargs)
+
+    bt.optimize_dispatch_rolling = _wrapped  # type: ignore[method-assign]
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=3,
+        reopt_step_hours=1,
+        allowed_markets=("DA",),
+        strategy_name="da_only",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+        enable_global_perfect_foresight=False,
+    )
+    s = out.summary
+    assert str(s["rolling_pf_solver_status"]) == "solver_failed"
+    assert float(s["rolling_pf_available"]) == 1.0
+    assert float(s["rolling_pf_verified_upper_bound"]) == 1.0
+    assert str(s["rolling_pf_selected_incumbent"]) in {"no_market", "realized_path"}
+    assert "rolling_pf_solver_failed" not in str(s["invalid_reason"])
 
 
 def test_no_obligation_protected_soc_equals_physical_bounds() -> None:
