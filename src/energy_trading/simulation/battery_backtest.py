@@ -1326,10 +1326,15 @@ class BatteryBacktester:
         """Return NEG activation price on the provider-value scale used in EV/PnL.
 
         NEG activation forecasts/truth are interpreted as provider-value
-        revenues throughout simulation. Legacy raw-signed settlement is no
-        longer supported in the optimizer economics.
+        revenues throughout simulation. Raw-signed negative activation prices
+        are converted exactly once via -raw; already-positive provider values
+        pass through unchanged.
         """
-        return price_eur_mwh
+        arr = np.asarray(price_eur_mwh, dtype=float)
+        out = np.where(arr < 0.0, -arr, arr)
+        if np.isscalar(price_eur_mwh):
+            return float(out)
+        return out
 
     def _guarded_merge(
         self,
@@ -2605,7 +2610,7 @@ class BatteryBacktester:
         if strict_input_validation and missing_bin_cols:
             uniq = sorted(set(missing_bin_cols))
             raise ValueError(
-                "Missing required aFRR activation-price/rate quantile-bin inputs in strict mode. "
+                "Missing required aFRR quantile-bin inputs in strict mode: activation-price/rate "
                 f"missing_columns={uniq[:40]}"
             )
         # Non-strict fallback remains explicit and deterministic.
@@ -4434,20 +4439,25 @@ class BatteryBacktester:
         # double counting by not adding synthetic internal energy replacement costs
         # here; replenishment economics are reflected through subsequent DA/ID trades.
         # NEG (downward) price is represented as positive provider value.
-        requested_activation_revenue_eur = act_pos_grid_req * act_pos_price + act_neg_grid_req * act_neg_price
-        delivered_activation_revenue_eur = act_pos_grid * act_pos_price + act_neg_grid * act_neg_price
+        act_neg_provider_value = float(self._neg_activation_provider_value(float(act_neg_price)))
+        requested_activation_revenue_eur = (
+            act_pos_grid_req * act_pos_price + act_neg_grid_req * act_neg_provider_value
+        )
+        delivered_activation_revenue_eur = (
+            act_pos_grid * act_pos_price + act_neg_grid * act_neg_provider_value
+        )
         missed_activation_revenue_eur = max(0.0, requested_activation_revenue_eur - delivered_activation_revenue_eur)
         rev_act = float(delivered_activation_revenue_eur)
         if not self._neg_activation_sign_diagnostic_emitted:
-            zero_volume_revenue = 0.0 * float(act_neg_price)
+            zero_volume_revenue = 0.0 * float(act_neg_provider_value)
             if abs(zero_volume_revenue) > 1e-12:
                 raise AssertionError(
                     "NEG activation sign diagnostic failed: volume=0 must imply zero NEG activation revenue."
                 )
-            neg_cashflow = float(act_neg_grid) * float(act_neg_price)
+            neg_cashflow = float(act_neg_grid) * float(act_neg_provider_value)
             if (
                 float(act_neg_grid) > 1e-12
-                and float(act_neg_price) > 0.0
+                and float(act_neg_provider_value) > 0.0
                 and neg_cashflow <= 0.0
             ):
                 raise AssertionError(
@@ -4455,7 +4465,7 @@ class BatteryBacktester:
                 )
             print(
                 "[DIAG] NEG activation sign check: "
-                f"volume_mwh={float(act_neg_grid):.6f}, price_eur_mwh={float(act_neg_price):.6f}, "
+                f"volume_mwh={float(act_neg_grid):.6f}, price_eur_mwh={float(act_neg_provider_value):.6f}, "
                 f"provider_cashflow_eur={neg_cashflow:.6f}, mode={self.forecast_value_mode}"
             )
             self._neg_activation_sign_diagnostic_emitted = True
@@ -4479,7 +4489,7 @@ class BatteryBacktester:
         missed_activation_pos_mwh = max(0.0, act_pos_grid_req - act_pos_grid)
         missed_activation_neg_mwh = max(0.0, act_neg_grid_req - act_neg_grid)
         penalty_activation_basis_pos_eur_mwh = abs(float(act_pos_price))
-        penalty_activation_basis_neg_eur_mwh = abs(float(act_neg_price))
+        penalty_activation_basis_neg_eur_mwh = abs(float(act_neg_provider_value))
         penalty_activation_pos_eur = missed_activation_pos_mwh * penalty_activation_basis_pos_eur_mwh
         penalty_activation_neg_eur = missed_activation_neg_mwh * penalty_activation_basis_neg_eur_mwh
         penalty_activation_eur = penalty_activation_pos_eur + penalty_activation_neg_eur
@@ -4651,7 +4661,7 @@ class BatteryBacktester:
         b_pos = max(0.0, float(bem_only_pos_mwh))
         b_neg = max(0.0, float(bem_only_neg_mwh))
         p_pos = float(act_pos_price_eur_mwh)
-        p_neg = float(act_neg_price_eur_mwh)
+        p_neg = float(self._neg_activation_provider_value(float(act_neg_price_eur_mwh)))
 
         # Clamp BEM-only delivered share to total delivered activation.
         b_pos = min(b_pos, d_pos)
@@ -5629,13 +5639,14 @@ class BatteryBacktester:
         bem_only_executed_neg_mwh = float(bem_only_executed_neg_mw * rate_neg_exec * self.dt_h)
         bcm_linked_pos_activation_mwh = float(bcm_source_pos_mw * rate_pos_exec * self.dt_h)
         bcm_linked_neg_activation_mwh = float(bcm_source_neg_mw * rate_neg_exec * self.dt_h)
+        true_act_neg_provider_value = float(self._neg_activation_provider_value(float(true_act_neg)))
         bem_only_pos_activation_revenue_eur = float(bem_only_executed_pos_mwh * true_act_pos)
-        bem_only_neg_activation_revenue_eur = float(bem_only_executed_neg_mwh * true_act_neg)
+        bem_only_neg_activation_revenue_eur = float(bem_only_executed_neg_mwh * true_act_neg_provider_value)
         bem_only_activation_revenue_eur = float(
             bem_only_pos_activation_revenue_eur + bem_only_neg_activation_revenue_eur
         )
         bcm_linked_pos_activation_revenue_eur = float(bcm_linked_pos_activation_mwh * true_act_pos)
-        bcm_linked_neg_activation_revenue_eur = float(bcm_linked_neg_activation_mwh * true_act_neg)
+        bcm_linked_neg_activation_revenue_eur = float(bcm_linked_neg_activation_mwh * true_act_neg_provider_value)
         bcm_linked_activation_revenue_eur = float(
             bcm_linked_pos_activation_revenue_eur + bcm_linked_neg_activation_revenue_eur
         )
@@ -11056,6 +11067,7 @@ class BatteryBacktester:
             )
         else:
             perfect_foresight_cmp_real = _empty_pf_frame("pf")
+        perfect_foresight_cmp_solver_real = perfect_foresight_cmp_real.copy()
         rolling_cmp_selection = _select_rolling_pf_incumbent(
             prefix="pf",
             solver_frame=perfect_foresight_cmp_real,
@@ -11099,6 +11111,11 @@ class BatteryBacktester:
         global_pf_selected_final_soc_mwh = float("nan")
         global_pf_selected_terminal_shortfall_mwh = float("nan")
         global_pf_candidate_terminal_shortfall_mwh = float("nan")
+        global_pf_solver_feasible = 0.0
+        global_pf_solver_rejection_reason = "disabled"
+        global_pf_solver_terminal_shortfall_mwh = float("nan")
+        global_pf_no_market_feasible = 0.0
+        global_pf_realized_path_feasible = 0.0
         da_true_for_global_pf = self._finite_numeric_series(
             perfect_foresight_df,
             colmap.true_da_price,
@@ -11110,9 +11127,64 @@ class BatteryBacktester:
             float(da_true_for_global_pf.iloc[-1]) if len(da_true_for_global_pf) else 0.0,
         )
         if enable_global_perfect_foresight:
+            expected_global_pf_ts = pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce").reset_index(drop=True)
+
+            def _validate_global_pf_candidate(
+                frame: pd.DataFrame,
+                *,
+                prefix: str,
+                value_eur: float,
+                require_ok_codes: bool,
+            ) -> tuple[bool, str, float]:
+                if frame is None or frame.empty:
+                    return False, "empty_frame", float("nan")
+                if colmap.timestamp not in frame.columns:
+                    return False, "missing_timestamp", float("nan")
+                candidate_ts = pd.to_datetime(frame[colmap.timestamp], utc=True, errors="coerce").reset_index(drop=True)
+                if len(candidate_ts) != len(expected_global_pf_ts) or not candidate_ts.equals(expected_global_pf_ts):
+                    return False, "timestamp_index_mismatch", float("nan")
+                soc_col = f"{prefix}_soc_mwh"
+                if soc_col not in frame.columns:
+                    return False, "missing_soc", float("nan")
+                soc_vals = pd.to_numeric(frame[soc_col], errors="coerce")
+                if soc_vals.isna().any():
+                    return False, "nonfinite_soc", float("nan")
+                soc_min_violation = float((float(self.soc_min) - soc_vals).clip(lower=0.0).max())
+                soc_max_violation = float((soc_vals - float(self.soc_max)).clip(lower=0.0).max())
+                terminal_shortfall = max(0.0, float(self.soc_target_end) - float(soc_vals.iloc[-1]))
+                if soc_min_violation > 1e-6:
+                    return False, "soc_min_violation", terminal_shortfall
+                if soc_max_violation > 1e-6:
+                    return False, "soc_max_violation", terminal_shortfall
+                if terminal_shortfall > 1e-6:
+                    return False, "terminal_soc_shortfall", terminal_shortfall
+                for c in (
+                    f"{prefix}_power_violation_charge_mw",
+                    f"{prefix}_power_violation_discharge_mw",
+                    f"{prefix}_power_violation_neg_mw",
+                    f"{prefix}_power_violation_pos_mw",
+                ):
+                    if c in frame.columns:
+                        max_violation = float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).clip(lower=0.0).max())
+                        if max_violation > 1e-6:
+                            return False, "power_bounds_violation", terminal_shortfall
+                fallback_col = f"{prefix}_optimizer_fallback_used"
+                if fallback_col in frame.columns:
+                    fallback_used = float(pd.to_numeric(frame[fallback_col], errors="coerce").fillna(0.0).max())
+                    if fallback_used > 0.5:
+                        return False, "fallback_used", terminal_shortfall
+                code_col = f"{prefix}_optimization_error_code"
+                if require_ok_codes and code_col in frame.columns:
+                    codes = frame[code_col].fillna("ok").astype(str).str.strip().str.lower()
+                    bad_codes = codes[~codes.isin({"", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"})]
+                    if not bad_codes.empty:
+                        return False, "non_ok_optimization_code", terminal_shortfall
+                if not np.isfinite(float(value_eur)):
+                    return False, "nonfinite_value", terminal_shortfall
+                return True, "none", terminal_shortfall
+
             no_trade_real, no_trade_diag = _build_no_market_terminal_id_incumbent(perfect_foresight_df)
             no_trade_global = _rename_realized_frame(no_trade_real, "global_perfect_foresight")
-            no_trade_feasible = float(no_trade_diag.get("feasible", 0.0)) >= 0.5
             global_pf_no_trade_final_soc_mwh = float(no_trade_diag.get("final_soc_mwh", float("nan")))
             global_pf_no_trade_terminal_shortfall_mwh = float(no_trade_diag.get("terminal_shortfall_mwh", float("nan")))
             global_pf_no_trade_id_buy_mwh = float(no_trade_diag.get("id_buy_mwh", 0.0))
@@ -11121,6 +11193,14 @@ class BatteryBacktester:
                 "global_perfect_foresight",
                 terminal_price_for_global_pf,
             )
+            no_trade_valid, no_trade_rejection_reason, _no_trade_shortfall_checked = _validate_global_pf_candidate(
+                no_trade_global,
+                prefix="global_perfect_foresight",
+                value_eur=global_pf_no_trade_incumbent_eur,
+                require_ok_codes=False,
+            )
+            no_trade_feasible = bool(float(no_trade_diag.get("feasible", 0.0)) >= 0.5 and no_trade_valid)
+            global_pf_no_market_feasible = float(no_trade_feasible)
 
             solver_global = _empty_pf_frame("global_perfect_foresight")
             solver_feasible = False
@@ -11131,10 +11211,15 @@ class BatteryBacktester:
                     ("plan_bem_only_pos_mw" in perfect_foresight_cmp_dispatch.columns)
                     and ("plan_bem_only_neg_mw" in perfect_foresight_cmp_dispatch.columns)
                 )
-                solver_global = perfect_foresight_cmp_real.rename(
+                # Use the raw comparable PF solver candidate here. The
+                # rolling-PF frame may already have been replaced by a
+                # no-market or realized-path incumbent, and relabeling that
+                # selected incumbent as "solver" makes global PF feasibility
+                # checks too weak.
+                solver_global = perfect_foresight_cmp_solver_real.rename(
                     columns={
                         c: c.replace("pf_", "global_perfect_foresight_", 1)
-                        for c in perfect_foresight_cmp_real.columns
+                        for c in perfect_foresight_cmp_solver_real.columns
                         if c.startswith("pf_")
                     }
                 )
@@ -11155,19 +11240,25 @@ class BatteryBacktester:
                     0.0,
                     float(self.soc_target_end) - float(solver_final_soc),
                 )
+                global_pf_solver_terminal_shortfall_mwh = float(global_pf_candidate_terminal_shortfall_mwh)
                 global_pf_solver_solution_eur = _pnl_total_for_realized_frame(
                     solver_global,
                     "global_perfect_foresight",
                     terminal_price_for_global_pf,
                 )
-                solver_feasible = bool(
-                    len(solver_global) == len(df)
-                    and np.isfinite(global_pf_solver_solution_eur)
-                    and global_pf_candidate_terminal_shortfall_mwh <= 1e-6
+                solver_feasible, global_pf_solver_rejection_reason, global_pf_solver_terminal_shortfall_mwh = (
+                    _validate_global_pf_candidate(
+                        solver_global,
+                        prefix="global_perfect_foresight",
+                        value_eur=global_pf_solver_solution_eur,
+                        require_ok_codes=True,
+                    )
                 )
+                global_pf_solver_feasible = float(solver_feasible)
             else:
                 global_pf_solver_status = rolling_pf_cmp_solver_status
                 pf_failure_reason = pf_failure_reason or f"global_pf_solver_failed:{global_pf_solver_status}"
+                global_pf_solver_rejection_reason = f"solver_unavailable:{global_pf_solver_status}"
 
             realized_global = _rename_realized_frame(real, "global_perfect_foresight")
             global_pf_realized_path_incumbent_eur = _pnl_total_for_realized_frame(
@@ -11175,10 +11266,15 @@ class BatteryBacktester:
                 "global_perfect_foresight",
                 terminal_price_for_global_pf,
             )
-            realized_global_feasible = bool(
-                len(realized_global) == len(df)
-                and np.isfinite(global_pf_realized_path_incumbent_eur)
+            realized_global_feasible, _realized_rejection_reason, _realized_shortfall_checked = (
+                _validate_global_pf_candidate(
+                    realized_global,
+                    prefix="global_perfect_foresight",
+                    value_eur=global_pf_realized_path_incumbent_eur,
+                    require_ok_codes=False,
+                )
             )
+            global_pf_realized_path_feasible = float(realized_global_feasible)
 
             selection = self._select_global_pf_incumbent(
                 {
@@ -11242,6 +11338,8 @@ class BatteryBacktester:
 
         def _merge_unique(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
             """Merge while dropping overlapping non-key columns from right."""
+            if right is None or right.empty:
+                return left
             if colmap.timestamp not in left.columns or colmap.timestamp not in right.columns:
                 raise ValueError(f"_merge_unique requires '{colmap.timestamp}' in both frames.")
             right_cols = [colmap.timestamp] + [
@@ -11284,6 +11382,10 @@ class BatteryBacktester:
             hourly["naive_cashflow_eur"] = hourly["naive_net_cashflow_eur"]
         else:
             hourly["naive_cashflow_eur"] = hourly["naive_pnl_eur"] + hourly.get("naive_degradation_cost_eur", 0.0)
+        if "perfect_foresight_pnl_eur" not in hourly.columns:
+            hourly["perfect_foresight_pnl_eur"] = np.nan
+        if "perfect_foresight_degradation_cost_eur" not in hourly.columns:
+            hourly["perfect_foresight_degradation_cost_eur"] = np.nan
         if "perfect_foresight_net_cashflow_eur" in hourly.columns:
             hourly["perfect_foresight_cashflow_eur"] = hourly["perfect_foresight_net_cashflow_eur"]
         else:
@@ -11718,6 +11820,11 @@ class BatteryBacktester:
             "global_pf_available": float(global_perfect_foresight_available_flag),
             "global_pf_solver_status": str(global_pf_solver_status),
             "global_pf_verified": float(global_pf_verified_upper_bound),
+            "global_pf_solver_feasible": float(global_pf_solver_feasible),
+            "global_pf_solver_rejection_reason": str(global_pf_solver_rejection_reason),
+            "global_pf_solver_terminal_shortfall_mwh": float(global_pf_solver_terminal_shortfall_mwh),
+            "global_pf_no_market_feasible": float(global_pf_no_market_feasible),
+            "global_pf_realized_path_feasible": float(global_pf_realized_path_feasible),
             "global_pf_upper_bound_gap_eur": float(global_pf_upper_bound_gap_eur),
             "global_pf_below_realized_incumbent": float(global_pf_below_realized_incumbent),
             "global_pf_solver_solution_eur": float(global_pf_solver_solution_eur),
@@ -12082,15 +12189,15 @@ class BatteryBacktester:
         )
 
         # Oracle component decomposition / balance check (same settlement accounting identity).
-        summary["perfect_foresight_total_da_revenue_eur"] = float(hourly["perfect_foresight_revenue_da_eur"].sum())
-        summary["perfect_foresight_total_da_cost_eur"] = float(hourly["perfect_foresight_cost_da_eur"].sum())
-        summary["perfect_foresight_total_afrr_capacity_revenue_eur"] = float(hourly["perfect_foresight_revenue_capacity_eur"].sum())
-        summary["perfect_foresight_total_afrr_activation_revenue_eur"] = float(hourly["perfect_foresight_revenue_activation_eur"].sum())
-        summary["perfect_foresight_total_bcm_linked_activation_revenue_eur"] = float(
-            pd.to_numeric(hourly.get("perfect_foresight_bcm_linked_activation_revenue_eur", 0.0), errors="coerce").fillna(0.0).sum()
+        summary["perfect_foresight_total_da_revenue_eur"] = _sum_col_zero("perfect_foresight_revenue_da_eur")
+        summary["perfect_foresight_total_da_cost_eur"] = _sum_col_zero("perfect_foresight_cost_da_eur")
+        summary["perfect_foresight_total_afrr_capacity_revenue_eur"] = _sum_col_zero("perfect_foresight_revenue_capacity_eur")
+        summary["perfect_foresight_total_afrr_activation_revenue_eur"] = _sum_col_zero("perfect_foresight_revenue_activation_eur")
+        summary["perfect_foresight_total_bcm_linked_activation_revenue_eur"] = _sum_col_zero(
+            "perfect_foresight_bcm_linked_activation_revenue_eur"
         )
-        summary["perfect_foresight_total_bem_only_activation_revenue_eur"] = float(
-            pd.to_numeric(hourly.get("perfect_foresight_bem_only_activation_revenue_eur", 0.0), errors="coerce").fillna(0.0).sum()
+        summary["perfect_foresight_total_bem_only_activation_revenue_eur"] = _sum_col_zero(
+            "perfect_foresight_bem_only_activation_revenue_eur"
         )
         summary["perfect_foresight_total_bcm_revenue_eur"] = float(
             summary["perfect_foresight_total_afrr_capacity_revenue_eur"]
@@ -12104,12 +12211,12 @@ class BatteryBacktester:
             - summary["perfect_foresight_total_bcm_linked_activation_revenue_eur"]
             - summary["perfect_foresight_total_bem_only_activation_revenue_eur"]
         )
-        summary["perfect_foresight_total_id_revenue_eur"] = float(hourly["perfect_foresight_revenue_id_eur"].sum()) if "perfect_foresight_revenue_id_eur" in hourly.columns else 0.0
-        summary["perfect_foresight_total_id_cost_eur"] = float(hourly["perfect_foresight_cost_id_eur"].sum()) if "perfect_foresight_cost_id_eur" in hourly.columns else 0.0
-        summary["perfect_foresight_total_degradation_cost_eur"] = float(hourly["perfect_foresight_degradation_cost_eur"].sum())
-        summary["perfect_foresight_total_transaction_cost_eur"] = float(hourly["perfect_foresight_transaction_cost_eur"].sum())
-        summary["perfect_foresight_total_auxiliary_cost_eur"] = float(hourly["perfect_foresight_aux_cost_eur"].sum()) if "perfect_foresight_aux_cost_eur" in hourly.columns else 0.0
-        summary["perfect_foresight_total_penalty_cost_eur"] = float(hourly["perfect_foresight_penalty_eur"].sum()) if "perfect_foresight_penalty_eur" in hourly.columns else 0.0
+        summary["perfect_foresight_total_id_revenue_eur"] = _sum_col_zero("perfect_foresight_revenue_id_eur")
+        summary["perfect_foresight_total_id_cost_eur"] = _sum_col_zero("perfect_foresight_cost_id_eur")
+        summary["perfect_foresight_total_degradation_cost_eur"] = _sum_col_zero("perfect_foresight_degradation_cost_eur")
+        summary["perfect_foresight_total_transaction_cost_eur"] = _sum_col_zero("perfect_foresight_transaction_cost_eur")
+        summary["perfect_foresight_total_auxiliary_cost_eur"] = _sum_col_zero("perfect_foresight_aux_cost_eur")
+        summary["perfect_foresight_total_penalty_cost_eur"] = _sum_col_zero("perfect_foresight_penalty_eur")
         perfect_foresight_pnl_components_rhs = (
             summary["perfect_foresight_total_da_revenue_eur"]
             + summary["perfect_foresight_total_id_revenue_eur"]
