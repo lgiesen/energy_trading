@@ -518,17 +518,23 @@ def main() -> None:
         & (required_fields_check_pass)
         & (~non_ok_codes)
     )
-    strategy_series = df.get("trading_strategy", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
+    strategy_series = (
+        df.get("trading_strategy", pd.Series("", index=df.index))
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({"da_only": "da", "afrr_only": "afrr", "bcm_only": "bcm", "bem_only": "bem"})
+    )
     id_mode_series = df.get("id_mode", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
     id_recourse_mode_series = df.get("id_recourse_mode", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
     id_abs_mwh = (
         df.get("total_id_revenue_eur", 0.0).fillna(0.0).abs()
         + df.get("total_id_cost_eur", 0.0).fillna(0.0).abs()
     )
-    baseline_mask = strategy_series.isin({"da_only", "afrr_only", "bcm_only", "bem_only"})
-    da_only_mask = strategy_series.eq("da_only")
+    baseline_mask = strategy_series.isin({"da", "afrr", "bcm", "bem"})
+    da_only_mask = strategy_series.eq("da")
     # Baseline contamination guard:
-    # - da_only: no ID activity at all.
+    # - da: no ID activity at all.
     # - other baselines: no economic ID mode; technical-repair-only allowed.
     invalid_id_policy = (
         (da_only_mask & (id_abs_mwh > 1e-9))

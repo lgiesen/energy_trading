@@ -1803,11 +1803,12 @@ def _build_afrr_bin_ev_audit(
 ) -> pd.DataFrame:
     h_ev = hourly.copy()
     strategy = str(trading_strategy).strip().lower()
+    strategy = BatteryBacktester.normalize_strategy_name(strategy)
     expected_by_strategy = {
-        "da_only": {"BCM": False, "BEM": False},
-        "bcm_only": {"BCM": True, "BEM": False},
-        "bem_only": {"BCM": False, "BEM": True},
-        "afrr_only": {"BCM": True, "BEM": True},
+        "da": {"BCM": False, "BEM": False},
+        "bcm": {"BCM": True, "BEM": False},
+        "bem": {"BCM": False, "BEM": True},
+        "afrr": {"BCM": True, "BEM": True},
         "multi": {"BCM": True, "BEM": True},
     }
     expected = expected_by_strategy.get(strategy, {"BCM": True, "BEM": True})
@@ -3127,9 +3128,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--trading-strategy",
-        choices=["multi", "da_only", "afrr_only", "bcm_only", "bem_only"],
+        choices=["multi", "da", "afrr", "bcm", "bem"],
         default="multi",
-        help="Strategy isolation mode: multi, da_only, afrr_only, bcm_only, bem_only.",
+        help="Strategy isolation mode: multi, da, afrr, bcm, bem.",
     )
     p.add_argument(
         "--id-mode",
@@ -3143,7 +3144,7 @@ def parse_args() -> argparse.Namespace:
         default="common",
         help=(
             "ID recourse policy: common (all strategies), disabled (none), "
-            "afrr_obligation_only (no ID for da_only)."
+            "afrr_obligation_only (no ID for da)."
         ),
     )
     p.add_argument(
@@ -3308,6 +3309,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.trading_strategy = BatteryBacktester.normalize_strategy_name(args.trading_strategy)
     if bool(args.print_validity_first_preset):
         print("validity_first_preset:")
         print("  reserve_soc_projection_safety_mwh: 2.0")
@@ -3630,13 +3632,13 @@ def main() -> None:
             "Use --allow-economic-id-in-baseline only for explicit robustness variants."
         )
 
-    if args.trading_strategy == "da_only":
+    if args.trading_strategy == "da":
         allowed_markets = ("DA",)
-    elif args.trading_strategy == "afrr_only":
+    elif args.trading_strategy == "afrr":
         allowed_markets = ("aFRR", "BCM", "BEM")
-    elif args.trading_strategy == "bcm_only":
+    elif args.trading_strategy == "bcm":
         allowed_markets = ("aFRR", "BCM")
-    elif args.trading_strategy == "bem_only":
+    elif args.trading_strategy == "bem":
         allowed_markets = ("aFRR", "BEM")
     else:
         allowed_markets = ("DA", "aFRR", "ID", "BCM", "BEM")
@@ -4788,7 +4790,7 @@ def main() -> None:
         print(f"[OK] Performance reconciliation debug (all scenarios): {recon_all_csv}")
     _write_performance_metric_definitions(out_dir / "performance_metric_definitions.json")
 
-    # Strategy overview across separate runs (multi / da_only / afrr_only).
+    # Strategy overview across separate runs (multi / da / afrr).
     if sweep_rows:
         overview_row = pd.DataFrame(sweep_rows)
         overview_csv = out_dir / "strategy_overview.csv"

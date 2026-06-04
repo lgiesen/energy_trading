@@ -520,7 +520,7 @@ def test_ev_audit_builder_no_quantile_col_uses_active_bins() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=h,
         scenario_name="x",
-        trading_strategy="da_only",
+        trading_strategy="da",
         active_bins=["p50"],
         backtester=bt,
         timestamp_col="timestamp_utc",
@@ -559,7 +559,7 @@ def test_ev_audit_da_only_skips_afrr_components() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=h,
         scenario_name="x",
-        trading_strategy="da_only",
+        trading_strategy="da",
         active_bins=["p50"],
         backtester=bt,
         timestamp_col="timestamp_utc",
@@ -568,7 +568,7 @@ def test_ev_audit_da_only_skips_afrr_components() -> None:
     assert audit.empty
     assert status.get("components_skipped", {}).get("BCM") == "inactive_for_strategy"
     assert status.get("components_skipped", {}).get("BEM") == "inactive_for_strategy"
-    stats = _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="da_only")
+    stats = _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="da")
     assert float(stats["ev_audit_row_count"]) == 0.0
 
 
@@ -585,7 +585,7 @@ def test_ev_audit_bcm_only_requires_bcm_columns() -> None:
         _build_afrr_bin_ev_audit(
             hourly=h,
             scenario_name="x",
-            trading_strategy="bcm_only",
+            trading_strategy="bcm",
             active_bins=["p50"],
             backtester=bt,
             timestamp_col="timestamp_utc",
@@ -606,7 +606,7 @@ def test_ev_audit_bem_only_requires_bem_columns() -> None:
         _build_afrr_bin_ev_audit(
             hourly=h,
             scenario_name="x",
-            trading_strategy="bem_only",
+            trading_strategy="bem",
             active_bins=["p50"],
             backtester=bt,
             timestamp_col="timestamp_utc",
@@ -624,13 +624,13 @@ def test_ev_audit_bcm_only_emits_only_bcm() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=out,
         scenario_name="x",
-        trading_strategy="bcm_only",
+        trading_strategy="bcm",
         active_bins=["p30", "p50", "p70"],
         backtester=bt,
         timestamp_col="timestamp_utc",
     )
     assert set(audit["market_component"].astype(str).unique()) == {"BCM"}
-    _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="bcm_only")
+    _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="bcm")
 
 
 def test_ev_audit_bem_only_emits_only_bem() -> None:
@@ -643,13 +643,13 @@ def test_ev_audit_bem_only_emits_only_bem() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=out,
         scenario_name="x",
-        trading_strategy="bem_only",
+        trading_strategy="bem",
         active_bins=["p30", "p50", "p70"],
         backtester=bt,
         timestamp_col="timestamp_utc",
     )
     assert set(audit["market_component"].astype(str).unique()) == {"BEM"}
-    _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="bem_only")
+    _validate_afrr_bin_ev_audit(audit, tol=1e-6, scenario_name="x", trading_strategy="bem")
 
 
 def test_ev_audit_validator_message_identifies_bad_component() -> None:
@@ -697,7 +697,7 @@ def test_afrr_only_zero_decision_missing_fields_are_skipped() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=h,
         scenario_name="p30_p70",
-        trading_strategy="afrr_only",
+        trading_strategy="afrr",
         active_bins=["p30"],
         backtester=bt,
         timestamp_col="timestamp_utc",
@@ -711,7 +711,7 @@ def test_afrr_only_zero_decision_missing_fields_are_skipped() -> None:
         audit,
         tol=1e-6,
         scenario_name="p30_p70",
-        trading_strategy="afrr_only",
+        trading_strategy="afrr",
         audit_path="mem.csv",
     )
     assert float(stats["ev_audit_max_bcm_formula_error"]) == 0.0
@@ -733,7 +733,7 @@ def test_bem_only_nan_selected_mw_is_treated_as_inactive_skipped() -> None:
     audit = _build_afrr_bin_ev_audit(
         hourly=h,
         scenario_name="p50_p50",
-        trading_strategy="bem_only",
+        trading_strategy="bem",
         active_bins=["p50"],
         backtester=bt,
         timestamp_col="timestamp_utc",
@@ -748,7 +748,7 @@ def test_bem_only_nan_selected_mw_is_treated_as_inactive_skipped() -> None:
         audit,
         tol=1e-6,
         scenario_name="p50_p50",
-        trading_strategy="bem_only",
+        trading_strategy="bem",
         audit_path="mem.csv",
     )
 
@@ -773,7 +773,7 @@ def test_afrr_only_active_selected_missing_fields_fail() -> None:
         _build_afrr_bin_ev_audit(
             hourly=h,
             scenario_name="p30_p70",
-            trading_strategy="afrr_only",
+            trading_strategy="afrr",
             active_bins=["p30"],
             backtester=bt,
             timestamp_col="timestamp_utc",
@@ -801,7 +801,7 @@ def test_ev_audit_selected_row_with_nonfinite_required_fields_fails_strict() -> 
         _build_afrr_bin_ev_audit(
             hourly=h,
             scenario_name="p50_p50",
-            trading_strategy="bem_only",
+            trading_strategy="bem",
             active_bins=["p50"],
             backtester=bt,
             timestamp_col="timestamp_utc",
@@ -832,7 +832,7 @@ def test_ev_audit_nonaccepted_row_with_nonfinite_required_fields_is_skipped() ->
     audit = _build_afrr_bin_ev_audit(
         hourly=h,
         scenario_name="p30_p30",
-        trading_strategy="bcm_only",
+        trading_strategy="bcm",
         active_bins=["p30"],
         backtester=bt,
         timestamp_col="timestamp_utc",

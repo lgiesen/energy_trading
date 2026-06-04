@@ -61,10 +61,10 @@ def _base_summary(**overrides: object) -> dict[str, object]:
 def test_default_id_mode_mapping() -> None:
     cls = BatteryBacktester
     assert cls.strategy_permissions_from_name("multi").id_mode == "economic"
-    assert cls.strategy_permissions_from_name("da_only").id_mode == "none"
-    assert cls.strategy_permissions_from_name("afrr_only").id_mode == "technical_repair"
-    assert cls.strategy_permissions_from_name("bcm_only").id_mode == "technical_repair"
-    assert cls.strategy_permissions_from_name("bem_only").id_mode == "technical_repair"
+    assert cls.strategy_permissions_from_name("da").id_mode == "none"
+    assert cls.strategy_permissions_from_name("afrr").id_mode == "technical_repair"
+    assert cls.strategy_permissions_from_name("bcm").id_mode == "technical_repair"
+    assert cls.strategy_permissions_from_name("bem").id_mode == "technical_repair"
 
 
 def test_unknown_id_mode_fails() -> None:
@@ -78,7 +78,7 @@ def test_unknown_id_mode_fails() -> None:
 
 def test_id_recourse_mode_common_allows_id_for_all_strategies() -> None:
     cls = BatteryBacktester
-    for strategy in ("multi", "da_only", "afrr_only", "bcm_only", "bem_only"):
+    for strategy in ("multi", "da", "afrr", "bcm", "bem"):
         perms = cls.resolve_strategy_permissions(
             strategy_name=strategy,
             allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
@@ -91,14 +91,14 @@ def test_id_recourse_mode_common_allows_id_for_all_strategies() -> None:
 def test_id_recourse_mode_afrr_obligation_only_blocks_da_only() -> None:
     cls = BatteryBacktester
     da_perms = cls.resolve_strategy_permissions(
-        strategy_name="da_only",
+        strategy_name="da",
         allowed_markets=("DA",),
         id_recourse_mode="afrr_obligation_only",
     )
     assert da_perms.id_mode == "none"
     assert not da_perms.allow_id
     afrr_perms = cls.resolve_strategy_permissions(
-        strategy_name="afrr_only",
+        strategy_name="afrr",
         allowed_markets=("aFRR", "BCM", "BEM"),
         id_recourse_mode="afrr_obligation_only",
     )
@@ -108,7 +108,7 @@ def test_id_recourse_mode_afrr_obligation_only_blocks_da_only() -> None:
 
 def test_id_recourse_mode_disabled_blocks_all_id() -> None:
     cls = BatteryBacktester
-    for strategy in ("multi", "da_only", "afrr_only", "bcm_only", "bem_only"):
+    for strategy in ("multi", "da", "afrr", "bcm", "bem"):
         perms = cls.resolve_strategy_permissions(
             strategy_name=strategy,
             allowed_markets=("DA", "aFRR", "ID", "BCM", "BEM"),
@@ -119,7 +119,7 @@ def test_id_recourse_mode_disabled_blocks_all_id() -> None:
 
 
 def test_validator_blocks_economic_id_in_baseline(tmp_path: Path) -> None:
-    scen = tmp_path / "da_only" / "p50_p50"
+    scen = tmp_path / "da" / "p50_p50"
     scen.mkdir(parents=True, exist_ok=True)
     payload = _base_summary(
         id_mode="economic",

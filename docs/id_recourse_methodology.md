@@ -11,11 +11,11 @@ This thesis implementation is **not** a full DA-ID-aFRR co-optimizer.
 ## Policy Modes
 
 - `id_recourse_mode=common`
-  - Technical ID recourse allowed for all strategies (`multi`, `da_only`, `afrr_only`, `bcm_only`, `bem_only`).
+  - Technical ID recourse allowed for all strategies (`multi`, `da`, `afrr`, `bcm`, `bem`).
 - `id_recourse_mode=disabled`
   - ID recourse fully disabled (no pending ID and no settled ID energy/PnL).
 - `id_recourse_mode=afrr_obligation_only`
-  - ID recourse disabled for `da_only`, enabled for aFRR-obligation strategies.
+  - ID recourse disabled for `da`, enabled for aFRR-obligation strategies.
 
 ## Why no ID-only baseline
 

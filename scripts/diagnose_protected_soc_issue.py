@@ -379,7 +379,7 @@ def diagnose_run(run_dir: Path, out_dir: Path) -> dict[str, Any]:
             for k, v in counts.items():
                 decision_lines.append(f"- {k}: {v}")
         if not att_df.empty:
-            bem_proven = bool((att_df["suspected_driver"].astype(str).str.contains("bem_only")).any())
+            bem_proven = bool((att_df["suspected_driver"].astype(str).str.contains(r"\bbem\b|bem_only", regex=True)).any())
             decision_lines.append("")
             decision_lines.append(f"BEM-only proven as cause: {'yes' if bem_proven else 'no'}")
             must_fix = len(invalid) > 0

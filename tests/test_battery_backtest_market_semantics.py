@@ -478,16 +478,16 @@ def test_strategy_permissions_enum() -> None:
     p = cls.strategy_permissions_from_name("multi")
     assert p.allow_da and p.allow_id and p.allow_bcm and p.allow_bem_only
     assert p.id_mode == "economic"
-    p = cls.strategy_permissions_from_name("da_only")
+    p = cls.strategy_permissions_from_name("da")
     assert p.allow_da and (not p.allow_id) and (not p.allow_bcm) and (not p.allow_bem_only)
     assert p.id_mode == "none"
-    p = cls.strategy_permissions_from_name("afrr_only")
+    p = cls.strategy_permissions_from_name("afrr")
     assert (not p.allow_da) and p.allow_id and p.allow_bcm and p.allow_bem_only
     assert p.id_mode == "technical_repair"
-    p = cls.strategy_permissions_from_name("bcm_only")
+    p = cls.strategy_permissions_from_name("bcm")
     assert (not p.allow_da) and p.allow_id and p.allow_bcm and (not p.allow_bem_only)
     assert p.id_mode == "technical_repair"
-    p = cls.strategy_permissions_from_name("bem_only")
+    p = cls.strategy_permissions_from_name("bem")
     assert (not p.allow_da) and p.allow_id and (not p.allow_bcm) and p.allow_bem_only
     assert p.id_mode == "technical_repair"
     with pytest.raises(ValueError):
@@ -834,6 +834,122 @@ def test_bcm_ev_capacity_term_uses_capacity_price_per_mw() -> None:
     )
     assert float(out["ev_bcm_expected_capacity_revenue_pos_bin_0"].iloc[0]) == pytest.approx(50.0 * bt.dt_h)
     assert float(out["ev_bcm_expected_capacity_revenue_neg_bin_0"].iloc[0]) == pytest.approx(60.0 * bt.dt_h)
+
+
+def test_bcm_bem_ev_probability_and_efficiency_conventions() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.trans_eur_mwh = 2.0
+    bt.deg_eur_mwh = 10.0
+    bt.eta_in = 0.9
+    bt.eta_out = 0.8
+    bt.afrr_offer_cost_eur_mw_h = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+
+    df, col = _one_hour_pred_df(
+        da=0.0,
+        cap_pos=100.0,
+        cap_neg=80.0,
+        act_pos=50.0,
+        act_neg=60.0,
+        rate_pos=0.2,
+        rate_neg=0.3,
+    )
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR", "BCM", "BEM"),
+        deterministic_reserve_settlement=False,
+    )
+    p50_bin = bt.afrr_quantile_bins.index("p50")
+    p_award = 0.5
+    dt = bt.dt_h
+    pos_cost_per_mwh = bt.trans_eur_mwh + bt.deg_eur_mwh / bt.eta_out
+    neg_cost_per_mwh = bt.trans_eur_mwh + bt.deg_eur_mwh * bt.eta_in
+
+    expected_bcm_capacity_pos = p_award * 100.0 * dt
+    expected_bcm_activation_pos = p_award * 0.2 * 50.0 * dt
+    expected_bcm_cost_pos = p_award * 0.2 * pos_cost_per_mwh * dt
+    expected_bcm_coef_pos = expected_bcm_capacity_pos + expected_bcm_activation_pos - expected_bcm_cost_pos
+
+    expected_bcm_capacity_neg = p_award * 80.0 * dt
+    expected_bcm_activation_neg = p_award * 0.3 * 60.0 * dt
+    expected_bcm_cost_neg = p_award * 0.3 * neg_cost_per_mwh * dt
+    expected_bcm_coef_neg = expected_bcm_capacity_neg + expected_bcm_activation_neg - expected_bcm_cost_neg
+
+    expected_bem_activation_pos = p_award * 0.2 * 50.0 * dt
+    expected_bem_cost_pos = p_award * 0.2 * pos_cost_per_mwh * dt
+    expected_bem_activation_neg = p_award * 0.3 * 60.0 * dt
+    expected_bem_cost_neg = p_award * 0.3 * neg_cost_per_mwh * dt
+
+    assert out["activation_rate_is_conditional"].iloc[0] == "conditional_on_award_or_execution"
+    assert out["ev_bcm_activation_rate_is_conditional"].iloc[0] == "conditional_on_award"
+    assert out["ev_bem_activation_rate_is_conditional"].iloc[0] == "conditional_on_execution"
+    assert float(out["acceptance_probability_applied_once"].iloc[0]) == pytest.approx(1.0)
+    assert float(out["execution_probability_applied_once"].iloc[0]) == pytest.approx(1.0)
+    assert float(out["ev_dt_h"].iloc[0]) == pytest.approx(1.0)
+    assert float(out["ev_bcm_product_duration_h"].iloc[0]) == pytest.approx(4.0)
+    assert float(out[f"ev_bcm_p_award_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(p_award)
+    assert float(out[f"ev_bem_p_exec_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(p_award)
+    assert float(out[f"ev_bcm_capacity_value_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bcm_capacity_pos
+    )
+    assert float(out[f"ev_bcm_capacity_value_neg_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bcm_capacity_neg
+    )
+    assert float(out[f"ev_bcm_activation_value_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bcm_activation_pos
+    )
+    assert float(out[f"ev_bcm_activation_value_neg_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bcm_activation_neg
+    )
+    assert float(out[f"ev_bcm_costs_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(expected_bcm_cost_pos)
+    assert float(out[f"ev_bcm_costs_neg_bin_{p50_bin}"].iloc[0]) == pytest.approx(expected_bcm_cost_neg)
+    assert float(out[f"ev_bcm_expected_costs_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bcm_cost_pos
+    )
+    assert float(out[f"ev_bcm_expected_costs_neg_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bcm_cost_neg
+    )
+    assert float(out[f"ev_rpos_coef_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
+        expected_bcm_coef_pos
+    )
+    assert float(out[f"ev_rneg_coef_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
+        expected_bcm_coef_neg
+    )
+    assert float(out[f"ev_bem_activation_value_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bem_activation_pos
+    )
+    assert float(out[f"ev_bem_activation_value_neg_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bem_activation_neg
+    )
+    assert float(out[f"ev_bem_costs_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(expected_bem_cost_pos)
+    assert float(out[f"ev_bem_costs_neg_bin_{p50_bin}"].iloc[0]) == pytest.approx(expected_bem_cost_neg)
+    assert float(out[f"ev_bem_expected_costs_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bem_cost_pos
+    )
+    assert float(out[f"ev_bem_expected_costs_neg_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_bem_cost_neg
+    )
+    assert float(out[f"ev_bem_pos_coef_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
+        expected_bem_activation_pos - expected_bem_cost_pos
+    )
+    assert float(out[f"ev_bem_neg_coef_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
+        expected_bem_activation_neg - expected_bem_cost_neg
+    )
+    objective_rebuild = (
+        float(out["ev_da_charge_eur"].iloc[0])
+        + float(out["ev_da_discharge_eur"].iloc[0])
+        + float(out["ev_afrr_pos_eur"].iloc[0])
+        + float(out["ev_afrr_neg_eur"].iloc[0])
+        + float(out["ev_bem_only_pos_eur"].iloc[0])
+        + float(out["ev_bem_only_neg_eur"].iloc[0])
+        - float(out["ev_slack_penalty_pos_eur"].iloc[0])
+        - float(out["ev_slack_penalty_neg_eur"].iloc[0])
+        + float(out["ev_terminal_soc_credit_eur"].iloc[0])
+    )
+    assert float(out["ev_objective_rebuild_eur"].iloc[0]) == pytest.approx(objective_rebuild)
 
 
 def test_bcm_capacity_mw_not_created_by_activation_without_locked_capacity() -> None:
@@ -1466,7 +1582,7 @@ def test_summary_reports_base_and_resolved_id_modes() -> None:
         horizon_hours=2,
         reopt_step_hours=1,
         allowed_markets=("DA",),
-        strategy_name="da_only",
+        strategy_name="da",
         id_recourse_mode="common",
         strict_simulation_validity=False,
     )
@@ -1543,7 +1659,7 @@ def test_bem_only_positive_activation_without_bcm_award_is_activation_revenue_on
 
 
 def test_bem_only_negative_activation_sign_without_bcm_award() -> None:
-    bt = _mk_backtester()
+    bt = _mk_backtester("canonical_economic")
     n_bins = len(bt.afrr_quantile_bins)
     out = bt._apply_market_clearing(
         target_time_utc=pd.Timestamp("2026-01-01T10:00:00Z"),
@@ -1562,8 +1678,8 @@ def test_bem_only_negative_activation_sign_without_bcm_award() -> None:
         true_cap_neg=0.0,
         pred_act_pos=10.0,
         true_act_pos=10.0,
-        pred_act_neg=-100.0,
-        true_act_neg=-1000.0,
+        pred_act_neg=100.0,
+        true_act_neg=1000.0,
         true_rate_pos=0.0,
         true_rate_neg=1.0,
         obligation_pos_mw=0.0,
@@ -1585,7 +1701,7 @@ def test_bem_only_negative_activation_sign_without_bcm_award() -> None:
         cap_pos=0.0,
         cap_neg=0.0,
         act_pos_price=10.0,
-        act_neg_price=-1000.0,
+        act_neg_price=1000.0,
         act_pos_rate=float(out["executed_rate_pos"]),
         act_neg_rate=float(out["executed_rate_neg"]),
         cap_bid_pos=0.0,
@@ -2058,7 +2174,7 @@ def test_canonical_negative_activation_positive_for_bcm_and_bem_sources() -> Non
 
 def test_market_clearing_keeps_bem_only_active_during_bcm_obligation() -> None:
     bt = _mk_backtester("canonical_economic")
-    bt._strategy_permissions = bt.strategy_permissions_from_name("afrr_only")
+    bt._strategy_permissions = bt.strategy_permissions_from_name("afrr")
     out = bt._apply_market_clearing(
         target_time_utc=pd.Timestamp("2025-05-02T00:00:00Z"),
         planned_charge_mw=0.0,
@@ -2314,7 +2430,7 @@ def test_id_price_taker_handles_negative_da_prices() -> None:
 def test_terminal_soc_recovery_reason_cannot_execute_id_sell() -> None:
     bt = _mk_backtester()
     bt._strategy_permissions = bt.resolve_strategy_permissions(
-        strategy_name="da_only",
+        strategy_name="da",
         allowed_markets=("DA", "ID"),
         id_recourse_mode="common",
     )
@@ -4776,7 +4892,7 @@ def test_bcm_only_common_technical_id_passes_strategy_isolation() -> None:
         }
     )
     perms = bt.resolve_strategy_permissions(
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         allowed_markets=("aFRR", "BCM"),
         id_recourse_mode="common",
     )
@@ -4785,7 +4901,7 @@ def test_bcm_only_common_technical_id_passes_strategy_isolation() -> None:
         hourly=hourly,
         allowed_markets=("aFRR", "BCM"),
         strategy_permissions=perms,
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         id_recourse_mode="common",
     )
 
@@ -4803,7 +4919,7 @@ def test_da_only_disabled_id_activity_fails_strategy_isolation() -> None:
         }
     )
     perms = bt.resolve_strategy_permissions(
-        strategy_name="da_only",
+        strategy_name="da",
         allowed_markets=("DA",),
         id_recourse_mode="disabled",
     )
@@ -4813,7 +4929,7 @@ def test_da_only_disabled_id_activity_fails_strategy_isolation() -> None:
             hourly=hourly,
             allowed_markets=("DA",),
             strategy_permissions=perms,
-            strategy_name="da_only",
+            strategy_name="da",
             id_recourse_mode="disabled",
         )
 
@@ -4832,7 +4948,7 @@ def test_technical_repair_mode_rejects_economic_id_trade_type() -> None:
         }
     )
     perms = bt.resolve_strategy_permissions(
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         allowed_markets=("aFRR", "BCM"),
         id_recourse_mode="common",
     )
@@ -4841,7 +4957,7 @@ def test_technical_repair_mode_rejects_economic_id_trade_type() -> None:
             hourly=hourly,
             allowed_markets=("aFRR", "BCM"),
             strategy_permissions=perms,
-            strategy_name="bcm_only",
+            strategy_name="bcm",
             id_recourse_mode="common",
         )
 
@@ -5199,7 +5315,7 @@ def test_perfect_foresight_bcm_participates_and_exports_same_rules_columns() -> 
         horizon_hours=30,
         reopt_step_hours=1,
         allowed_markets=("aFRR", "BCM"),
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         id_recourse_mode="common",
         enable_global_perfect_foresight=True,
         bcm_bid_hour_local=8,
@@ -5267,7 +5383,7 @@ def test_global_pf_selects_no_trade_incumbent_when_pf_candidate_misses_terminal_
         horizon_hours=3,
         reopt_step_hours=1,
         allowed_markets=("aFRR", "ID"),
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
         id_recourse_mode="common",
@@ -6426,7 +6542,7 @@ def test_non_actionable_hour_uses_deterministic_noop_not_solver(monkeypatch: pyt
         horizon_hours=3,
         reopt_step_hours=1,
         allowed_markets=("aFRR",),
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
     )
@@ -6484,7 +6600,7 @@ def test_deterministic_noop_not_allowed_at_bcm_bid_hour(monkeypatch: pytest.Monk
             horizon_hours=2,
             reopt_step_hours=1,
             allowed_markets=("aFRR",),
-            strategy_name="bcm_only",
+            strategy_name="bcm",
             strict_simulation_validity=True,
             enforce_final_soc_min=True,
         )
@@ -6507,7 +6623,7 @@ def test_deterministic_noop_not_allowed_with_terminal_pressure(monkeypatch: pyte
             horizon_hours=2,
             reopt_step_hours=1,
             allowed_markets=("aFRR",),
-            strategy_name="bcm_only",
+            strategy_name="bcm",
             strict_simulation_validity=True,
             enforce_final_soc_min=True,
         )
@@ -6533,7 +6649,7 @@ def test_not_set_final_window_uses_terminal_id_recovery_without_fallback(
         horizon_hours=1,
         reopt_step_hours=1,
         allowed_markets=("aFRR", "ID"),
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
         id_recourse_mode="common",
@@ -6568,7 +6684,7 @@ def test_not_set_final_window_with_id_disabled_remains_invalid_fallback(
         horizon_hours=1,
         reopt_step_hours=1,
         allowed_markets=("aFRR", "ID"),
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
         id_recourse_mode="disabled",
@@ -6612,7 +6728,7 @@ def test_rolling_pf_solver_error_selects_feasible_no_market_incumbent() -> None:
         horizon_hours=3,
         reopt_step_hours=1,
         allowed_markets=("aFRR",),
-        strategy_name="bcm_only",
+        strategy_name="bcm",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
         enable_global_perfect_foresight=True,
@@ -6653,7 +6769,7 @@ def test_rolling_pf_solver_error_selects_feasible_incumbent_without_invalidating
         horizon_hours=3,
         reopt_step_hours=1,
         allowed_markets=("DA",),
-        strategy_name="da_only",
+        strategy_name="da",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
         enable_global_perfect_foresight=False,

@@ -14,7 +14,7 @@ def _base_summary(strategy: str, **overrides: object) -> dict[str, object]:
         "simulation_valid": 1.0,
         "thesis_reportable": 1.0,
         "invalid_reason": "",
-        "base_strategy_id_mode": "none" if strategy == "da_only" else "technical_repair",
+        "base_strategy_id_mode": "none" if strategy == "da" else "technical_repair",
         "resolved_id_mode": "technical_repair",
         "id_mode": "technical_repair",
         "id_recourse_mode": "common",
@@ -136,7 +136,7 @@ def test_market_validator_valid_afrr_only_with_bcm_and_bem_passes(tmp_path: Path
     hourly["real_bem_only_activation_revenue_eur"] = [1.0, 2.0]
     hourly["real_revenue_activation_eur"] = [6.0, 7.0]
     hourly["real_pnl_eur"] = [6.0, 7.0]
-    scen = _write_scenario(tmp_path, strategy="afrr_only", scenario="p50_p50", hourly=hourly)
+    scen = _write_scenario(tmp_path, strategy="afrr", scenario="p50_p50", hourly=hourly)
     row, vdf = market_semantics.validate_scenario(scen)
     assert bool(row["thesis_semantics_ok"])
     assert vdf.empty
@@ -146,7 +146,7 @@ def test_market_validator_da_activity_forbidden_in_afrr_only_fails(tmp_path: Pat
     hourly = _base_hourly()
     hourly["real_da_buy_mwh"] = [1.0, 0.0]
     hourly["real_pnl_eur"] = [0.0, 0.0]
-    scen = _write_scenario(tmp_path, strategy="afrr_only", scenario="p50_p50", hourly=hourly)
+    scen = _write_scenario(tmp_path, strategy="afrr", scenario="p50_p50", hourly=hourly)
     _, vdf = market_semantics.validate_scenario(scen)
     assert "forbidden_da_quantity" in set(vdf["check_name"])
 
@@ -155,7 +155,7 @@ def test_market_validator_bcm_only_with_bem_activity_fails(tmp_path: Path) -> No
     hourly = _base_hourly()
     hourly["real_submitted_afrr_pos_mw"] = [1.0, 1.0]
     hourly["real_bem_only_submitted_pos_mw"] = [1.0, 0.0]
-    scen = _write_scenario(tmp_path, strategy="bcm_only", scenario="p50_p50", hourly=hourly)
+    scen = _write_scenario(tmp_path, strategy="bcm", scenario="p50_p50", hourly=hourly)
     _, vdf = market_semantics.validate_scenario(scen)
     assert "forbidden_bem_quantity" in set(vdf["check_name"])
 
@@ -163,7 +163,7 @@ def test_market_validator_bcm_only_with_bem_activity_fails(tmp_path: Path) -> No
 def test_market_validator_bem_only_with_bcm_activity_fails(tmp_path: Path) -> None:
     hourly = _base_hourly()
     hourly["real_submitted_afrr_pos_mw"] = [1.0, 1.0]
-    scen = _write_scenario(tmp_path, strategy="bem_only", scenario="p50_p50", hourly=hourly)
+    scen = _write_scenario(tmp_path, strategy="bem", scenario="p50_p50", hourly=hourly)
     _, vdf = market_semantics.validate_scenario(scen)
     assert "forbidden_bcm_quantity" in set(vdf["check_name"])
 
@@ -172,7 +172,7 @@ def test_market_validator_da_only_with_bcm_and_bem_activity_fails(tmp_path: Path
     hourly = _base_hourly()
     hourly["real_submitted_afrr_pos_mw"] = [1.0, 1.0]
     hourly["real_bem_only_submitted_pos_mw"] = [0.5, 0.0]
-    scen = _write_scenario(tmp_path, strategy="da_only", scenario="p50_p50", hourly=hourly)
+    scen = _write_scenario(tmp_path, strategy="da", scenario="p50_p50", hourly=hourly)
     _, vdf = market_semantics.validate_scenario(scen)
     assert "forbidden_bcm_quantity" in set(vdf["check_name"])
     assert "forbidden_bem_quantity" in set(vdf["check_name"])
@@ -220,7 +220,7 @@ def test_market_validator_bem_hourly_variation_does_not_fail_bcm_blocks(tmp_path
     hourly["real_submitted_afrr_pos_mw"] = [2.0, 2.0]
     hourly["real_executed_reserve_pos_mw"] = [2.0, 2.0]
     hourly["real_bem_only_submitted_pos_mw"] = [0.0, 1.0]
-    scen = _write_scenario(tmp_path, strategy="afrr_only", scenario="p50_p50", hourly=hourly)
+    scen = _write_scenario(tmp_path, strategy="afrr", scenario="p50_p50", hourly=hourly)
     row, vdf = market_semantics.validate_scenario(scen)
     assert bool(row["bcm_block_ok"])
     assert "bcm_intrablock_variation" not in set(vdf["check_name"])
@@ -229,7 +229,7 @@ def test_market_validator_bem_hourly_variation_does_not_fail_bcm_blocks(tmp_path
 def test_market_validator_bcm_block_variation_fails(tmp_path: Path) -> None:
     hourly = _base_hourly()
     hourly["real_submitted_afrr_pos_mw"] = [1.0, 2.0]
-    scen = _write_scenario(tmp_path, strategy="afrr_only", scenario="p50_p50", hourly=hourly)
+    scen = _write_scenario(tmp_path, strategy="afrr", scenario="p50_p50", hourly=hourly)
     _, vdf = market_semantics.validate_scenario(scen)
     assert "bcm_intrablock_variation" in set(vdf["check_name"])
 

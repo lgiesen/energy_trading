@@ -190,7 +190,7 @@ def test_validation_collect_reports_exact_summary_paths_and_power_stack(tmp_path
     )
     second = _write_scenario(
         tmp_path,
-        strategy="bcm_only",
+        strategy="bcm",
         scenario="p10_p10",
         realized=80.0,
         rolling=90.0,
@@ -210,7 +210,7 @@ def test_validation_collect_reports_exact_summary_paths_and_power_stack(tmp_path
         str(second / "backtest_summary.json"),
     }
     assert set(df["quantile_pair"]) == {"p10_p10", "p50_p50"}
-    assert set(df["strategy"]) == {"bcm_only", "multi"}
+    assert set(df["strategy"]) == {"bcm", "multi"}
     assert float(df.loc[df["quantile_pair"].eq("p50_p50"), "max_real_power_stack_charge_mw"].iloc[0]) == 10.0
     assert float(df.loc[df["quantile_pair"].eq("p10_p10"), "max_real_power_violation_discharge_mw"].iloc[0]) == 0.25
 

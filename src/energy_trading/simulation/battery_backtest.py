@@ -778,17 +778,28 @@ class BatteryBacktester:
         self._id_recourse_mode = "common"
 
     @staticmethod
+    def normalize_strategy_name(strategy: str | None) -> str:
+        s = str(strategy or "").strip().lower()
+        aliases = {
+            "da_only": "da",
+            "afrr_only": "afrr",
+            "bcm_only": "bcm",
+            "bem_only": "bem",
+        }
+        return aliases.get(s, s)
+
+    @staticmethod
     def strategy_permissions_from_name(strategy: str) -> StrategyPermissions:
-        s = str(strategy).strip().lower()
+        s = BatteryBacktester.normalize_strategy_name(strategy)
         if s == "multi":
             return StrategyPermissions(True, "economic", True, True, True)
-        if s == "da_only":
+        if s == "da":
             return StrategyPermissions(True, "none", False, False, False)
-        if s == "afrr_only":
+        if s == "afrr":
             return StrategyPermissions(False, "technical_repair", True, True, True)
-        if s == "bcm_only":
+        if s == "bcm":
             return StrategyPermissions(False, "technical_repair", True, True, False)
-        if s == "bem_only":
+        if s == "bem":
             return StrategyPermissions(False, "technical_repair", False, False, True)
         raise ValueError(f"Unknown trading strategy: {strategy}")
 
@@ -848,14 +859,14 @@ class BatteryBacktester:
         base_permissions: StrategyPermissions,
         id_recourse_mode: str,
     ) -> StrategyPermissions:
-        s = str(strategy_name or "").strip().lower()
+        s = cls.normalize_strategy_name(strategy_name)
         mode = cls._normalize_id_recourse_mode(id_recourse_mode)
         if mode == "disabled":
             id_mode = "none"
         elif mode == "common":
             id_mode = "technical_repair"
         else:  # afrr_obligation_only
-            id_mode = "none" if s == "da_only" else "technical_repair"
+            id_mode = "none" if s == "da" else "technical_repair"
         return StrategyPermissions(
             allow_da=base_permissions.allow_da,
             id_mode=id_mode,
@@ -2363,8 +2374,10 @@ class BatteryBacktester:
 
         aFRR reserve offers are optimized over bid-price bins using expected value.
         The LP decouples:
-        - p_acc_cap[j,t]: probability that capacity bid in bin j clears.
-        - r_act[t]: expected activation-rate conditional on awarded capacity.
+        - p_award[j,t]: probability that a BCM capacity bid in bin j is awarded.
+        - p_exec[j,t]: probability that a BEM-only energy bid in bin j is executed.
+        - r_act[t]: expected activated share conditional on award/execution.
+        The award/execution probability is applied exactly once in EV terms.
         """
         if df.empty:
             raise ValueError("optimize_dispatch received empty dataframe.")
@@ -2410,7 +2423,7 @@ class BatteryBacktester:
             allow_temporal_fill=not strict_input_validation,
             strict_non_null=strict_input_validation,
         ).to_numpy(dtype=float)
-        # Fallback acceptance-rate priors (used when no quantile-derived p_acc bins are available).
+        # Fallback acceptance-rate priors (used when no quantile-derived p_award bins are available).
         r_act_pos_base = self._clip_rate(
             self._finite_numeric_series(
                 df,
@@ -2550,8 +2563,8 @@ class BatteryBacktester:
         # BCM EV separates pay-as-bid capacity remuneration from linked
         # activation-energy remuneration. Capacity-price quantiles are optional;
         # if absent, use the point capacity forecast for all BCM bins.
-        p_acc_cap_pos = np.zeros((n, n_bins), dtype=float)
-        p_acc_cap_neg = np.zeros((n, n_bins), dtype=float)
+        p_award_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        p_award_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         cap_price_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         cap_price_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         pacc_pos_fallback_used = np.zeros(n, dtype=float)
@@ -2574,8 +2587,8 @@ class BatteryBacktester:
                 allow_temporal_fill=False,
             ).to_numpy(dtype=float)
             for b in range(n_bins):
-                p_acc_cap_pos[:, b] = 1.0
-                p_acc_cap_neg[:, b] = 1.0
+                p_award_pos_by_bin[:, b] = 1.0
+                p_award_neg_by_bin[:, b] = 1.0
                 cap_price_pos_by_bin[:, b] = base_cap_pos
                 cap_price_neg_by_bin[:, b] = base_cap_neg
         else:
@@ -2588,8 +2601,8 @@ class BatteryBacktester:
             for b, qcol in enumerate(self.afrr_quantile_bins):
                 q_level = float(qcol.replace("p", "")) / 100.0
                 pacc_const = max(0.0, min(1.0, 1.0 - q_level))
-                p_acc_cap_pos[:, b] = pacc_const
-                p_acc_cap_neg[:, b] = pacc_const
+                p_award_pos_by_bin[:, b] = pacc_const
+                p_award_neg_by_bin[:, b] = pacc_const
                 c_pos = f"{colmap.pred_afrr_capacity_price_pos}_{qcol}"
                 c_neg = f"{colmap.pred_afrr_capacity_price_neg}_{qcol}"
                 if c_pos in df.columns:
@@ -2629,7 +2642,7 @@ class BatteryBacktester:
                     pacc_pos_fallback_used[t] = 1.0
                     cap_price_pos_by_bin[t, :] = mid_pos[t]
                     for b in range(n_bins):
-                        p_acc_cap_pos[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
+                        p_award_pos_by_bin[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
                 elif not have_pos:
                     raise ValueError(
                         "NaN detected in aFRR positive capacity-price quantiles although quantile columns "
@@ -2639,7 +2652,7 @@ class BatteryBacktester:
                     pacc_neg_fallback_used[t] = 1.0
                     cap_price_neg_by_bin[t, :] = mid_neg[t]
                     for b in range(n_bins):
-                        p_acc_cap_neg[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
+                        p_award_neg_by_bin[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
                 elif not have_neg:
                     raise ValueError(
                         "NaN detected in aFRR negative capacity-price quantiles although quantile columns "
@@ -2712,6 +2725,10 @@ class BatteryBacktester:
         bcm_expected_capacity_revenue_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         bcm_expected_activation_revenue_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         bcm_expected_activation_revenue_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_activation_value_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_activation_value_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_costs_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_costs_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         bcm_expected_aux_cost_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         bcm_expected_aux_cost_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         bcm_offer_cost_by_bin = np.zeros((n, n_bins), dtype=float)
@@ -2719,27 +2736,32 @@ class BatteryBacktester:
         bcm_activation_margin_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_expected_activation_revenue_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_expected_activation_revenue_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_activation_value_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_activation_value_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_costs_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_costs_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_expected_aux_cost_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_expected_aux_cost_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_activation_margin_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_activation_margin_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         for b in range(n_bins):
-            # Correct EV split:
-            # 1) offer-side fixed availability cost (no p_acc multiplier)
-            # 2) activation/throughput terms scaled by expected activated share
-            #    exp_act = p_acc * expected_activation_rate
-            exp_act_pos = p_acc_cap_pos[:, b] * act_rate_pos_by_bin[:, b]
-            exp_act_neg = p_acc_cap_neg[:, b] * act_rate_neg_by_bin[:, b]
+            # EV convention:
+            # - BCM capacity value is p_award * submitted capacity bid price * dt.
+            # - Activation rates are conditional on award/execution.
+            # - Expected activation share = probability * conditional activation rate.
+            # - Probability is applied exactly once; diagnostics expose value/cost terms separately.
+            exp_act_pos = p_award_pos_by_bin[:, b] * act_rate_pos_by_bin[:, b]
+            exp_act_neg = p_award_neg_by_bin[:, b] * act_rate_neg_by_bin[:, b]
             offer_cost = self.afrr_offer_cost_eur_mw_h * self.dt_h
             # Expected aFRR auxiliary energy over reserve product window:
-            # hours_afrr_active = window_h * p_acc * activation_rate
-            # hours_afrr_standby = window_h * (p_acc - p_acc*activation_rate)
+            # hours_afrr_active = window_h * p_award * activation_rate
+            # hours_afrr_standby = window_h * (p_award - p_award*activation_rate)
             # reserve-MW scaling enters via per-MW equivalent hours:
             # hours_equiv_per_mw = window_h / P_max
             window_h = float(self.reserve_product_duration_h)
             afrr_hours_equiv_per_mw = window_h / max(self.p_max_mw, 1e-12)
-            standby_pos = np.maximum(0.0, p_acc_cap_pos[:, b] - exp_act_pos)
-            standby_neg = np.maximum(0.0, p_acc_cap_neg[:, b] - exp_act_neg)
+            standby_pos = np.maximum(0.0, p_award_pos_by_bin[:, b] - exp_act_pos)
+            standby_neg = np.maximum(0.0, p_award_neg_by_bin[:, b] - exp_act_neg)
             afrr_aux_cost_pos = (
                 afrr_hours_equiv_per_mw
                 * (
@@ -2756,37 +2778,55 @@ class BatteryBacktester:
                 )
                 * p_da
             )
-            bcm_cap_rev_pos = p_acc_cap_pos[:, b] * cap_price_pos_by_bin[:, b] * self.dt_h
-            bcm_cap_rev_neg = p_acc_cap_neg[:, b] * cap_price_neg_by_bin[:, b] * self.dt_h
+            bcm_cap_rev_pos = p_award_pos_by_bin[:, b] * cap_price_pos_by_bin[:, b] * self.dt_h
+            bcm_cap_rev_neg = p_award_neg_by_bin[:, b] * cap_price_neg_by_bin[:, b] * self.dt_h
+            act_value_neg = self._neg_activation_provider_value(act_price_neg_by_bin[:, b])
+            bcm_act_value_pos = exp_act_pos * act_price_pos_by_bin[:, b] * self.dt_h
+            bcm_act_value_neg = exp_act_neg * act_value_neg * self.dt_h
+            bcm_act_cost_pos = (
+                exp_act_pos
+                * (
+                    self.trans_eur_mwh
+                    + (self.deg_eur_mwh / max(self.eta_out, 1e-12))
+                )
+                * self.dt_h
+            )
+            bcm_act_cost_neg = (
+                exp_act_neg
+                * (
+                    self.trans_eur_mwh
+                    + (self.deg_eur_mwh * self.eta_in)
+                )
+                * self.dt_h
+            )
             bcm_act_margin_pos = (
                 act_price_pos_by_bin[:, b]
                 - self.trans_eur_mwh
                 - (self.deg_eur_mwh / max(self.eta_out, 1e-12))
             )
-            act_value_neg = self._neg_activation_provider_value(act_price_neg_by_bin[:, b])
             bcm_act_margin_neg = (
                 act_value_neg
                 - self.trans_eur_mwh
                 - (self.deg_eur_mwh * self.eta_in)
             )
-            bcm_act_rev_pos = exp_act_pos * bcm_act_margin_pos
-            bcm_act_rev_neg = exp_act_neg * bcm_act_margin_neg
+            bcm_act_rev_pos = bcm_act_value_pos - bcm_act_cost_pos
+            bcm_act_rev_neg = bcm_act_value_neg - bcm_act_cost_neg
+            bcm_total_cost_pos = offer_cost + bcm_act_cost_pos + afrr_aux_cost_pos
+            bcm_total_cost_neg = offer_cost + bcm_act_cost_neg + afrr_aux_cost_neg
             # aFRR EV terms:
-            # - capacity remuneration is expected via p_acc
-            # - activation remuneration/cost is expected via p_acc * act_rate
+            # - capacity remuneration is expected via p_award
+            # - activation remuneration/cost is expected via p_award * act_rate
             # - market price terms remain grid-side (no eta scaling)
             # - degradation is internal-throughput based (eta conversion kept)
             rpos_coef = (
                 bcm_cap_rev_pos
-                - offer_cost
-                + bcm_act_rev_pos
-                - afrr_aux_cost_pos
+                + bcm_act_value_pos
+                - bcm_total_cost_pos
             )
             rneg_coef = (
                 bcm_cap_rev_neg
-                - offer_cost
-                + bcm_act_rev_neg
-                - afrr_aux_cost_neg
+                + bcm_act_value_neg
+                - bcm_total_cost_neg
             )
             s_pos = sl["rpos_bin"].start + b * n
             s_neg = sl["rneg_bin"].start + b * n
@@ -2794,8 +2834,10 @@ class BatteryBacktester:
             rneg_coef_by_bin[:, b] = rneg_coef
             c[s_pos : s_pos + n] = -(rpos_coef * afrr_step)
             c[s_neg : s_neg + n] = -(rneg_coef * afrr_step)
-            bem_exec_prob_pos = p_acc_cap_pos[:, b]
-            bem_exec_prob_neg = p_acc_cap_neg[:, b]
+            # BEM-only uses the same quantile-derived probability heuristic as
+            # BCM award probability, but it represents execution probability.
+            bem_exec_prob_pos = p_award_pos_by_bin[:, b]
+            bem_exec_prob_neg = p_award_neg_by_bin[:, b]
             bem_act_margin_pos = (
                 act_price_pos_by_bin[:, b]
                 - self.trans_eur_mwh
@@ -2806,15 +2848,35 @@ class BatteryBacktester:
                 - self.trans_eur_mwh
                 - (self.deg_eur_mwh * self.eta_in)
             )
-            bem_pos_coef = (
+            bem_act_value_pos = (
                 bem_exec_prob_pos
                 * act_rate_pos_by_bin[:, b]
-                * bem_act_margin_pos
+                * act_price_pos_by_bin[:, b]
+                * self.dt_h
             )
-            bem_neg_coef = (
+            bem_act_value_neg = (
                 bem_exec_prob_neg
                 * act_rate_neg_by_bin[:, b]
-                * bem_act_margin_neg
+                * act_value_neg
+                * self.dt_h
+            )
+            bem_act_cost_pos = (
+                bem_exec_prob_pos
+                * act_rate_pos_by_bin[:, b]
+                * (
+                    self.trans_eur_mwh
+                    + (self.deg_eur_mwh / max(self.eta_out, 1e-12))
+                )
+                * self.dt_h
+            )
+            bem_act_cost_neg = (
+                bem_exec_prob_neg
+                * act_rate_neg_by_bin[:, b]
+                * (
+                    self.trans_eur_mwh
+                    + (self.deg_eur_mwh * self.eta_in)
+                )
+                * self.dt_h
             )
             # Expected BEM active auxiliary energy cost (no standby component).
             bem_aux_hours_equiv_per_mw = self.dt_h / max(self.p_max_mw, 1e-12)
@@ -2832,23 +2894,33 @@ class BatteryBacktester:
                 * self.aux_afrr_active_mw
                 * p_da
             )
-            bem_pos_coef -= bem_aux_cost_pos
-            bem_neg_coef -= bem_aux_cost_neg
+            bem_total_cost_pos = bem_act_cost_pos + bem_aux_cost_pos
+            bem_total_cost_neg = bem_act_cost_neg + bem_aux_cost_neg
+            bem_pos_coef = bem_act_value_pos - bem_total_cost_pos
+            bem_neg_coef = bem_act_value_neg - bem_total_cost_neg
             bcm_expected_capacity_revenue_pos_by_bin[:, b] = bcm_cap_rev_pos
             bcm_expected_capacity_revenue_neg_by_bin[:, b] = bcm_cap_rev_neg
             bcm_expected_activation_revenue_pos_by_bin[:, b] = bcm_act_rev_pos
             bcm_expected_activation_revenue_neg_by_bin[:, b] = bcm_act_rev_neg
+            bcm_activation_value_pos_by_bin[:, b] = bcm_act_value_pos
+            bcm_activation_value_neg_by_bin[:, b] = bcm_act_value_neg
+            bcm_costs_pos_by_bin[:, b] = bcm_total_cost_pos
+            bcm_costs_neg_by_bin[:, b] = bcm_total_cost_neg
             bcm_expected_aux_cost_pos_by_bin[:, b] = afrr_aux_cost_pos
             bcm_expected_aux_cost_neg_by_bin[:, b] = afrr_aux_cost_neg
             bcm_offer_cost_by_bin[:, b] = np.full(n, offer_cost, dtype=float)
             bcm_activation_margin_pos_by_bin[:, b] = bcm_act_margin_pos
             bcm_activation_margin_neg_by_bin[:, b] = bcm_act_margin_neg
             bem_expected_activation_revenue_pos_by_bin[:, b] = (
-                bem_exec_prob_pos * act_rate_pos_by_bin[:, b] * bem_act_margin_pos
+                bem_act_value_pos - bem_act_cost_pos
             )
             bem_expected_activation_revenue_neg_by_bin[:, b] = (
-                bem_exec_prob_neg * act_rate_neg_by_bin[:, b] * bem_act_margin_neg
+                bem_act_value_neg - bem_act_cost_neg
             )
+            bem_activation_value_pos_by_bin[:, b] = bem_act_value_pos
+            bem_activation_value_neg_by_bin[:, b] = bem_act_value_neg
+            bem_costs_pos_by_bin[:, b] = bem_total_cost_pos
+            bem_costs_neg_by_bin[:, b] = bem_total_cost_neg
             bem_expected_aux_cost_pos_by_bin[:, b] = bem_aux_cost_pos
             bem_expected_aux_cost_neg_by_bin[:, b] = bem_aux_cost_neg
             bem_activation_margin_pos_by_bin[:, b] = bem_act_margin_pos
@@ -2932,8 +3004,8 @@ class BatteryBacktester:
             row[sl["u"].start + t] = self.dt_h
             for b in range(n_bins):
                 # Base SoC drift on expected awarded-and-activated reserve.
-                exp_pos = p_acc_cap_pos[t, b] * act_rate_pos_by_bin[t, b]
-                exp_neg = p_acc_cap_neg[t, b] * act_rate_neg_by_bin[t, b]
+                exp_pos = p_award_pos_by_bin[t, b] * act_rate_pos_by_bin[t, b]
+                exp_neg = p_award_neg_by_bin[t, b] * act_rate_neg_by_bin[t, b]
                 row[sl["rpos_bin"].start + b * n + t] = (exp_pos / self.eta_out) * afrr_step
                 row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * exp_neg * afrr_step
             for b in range(n_bins):
@@ -3034,8 +3106,8 @@ class BatteryBacktester:
                 row = np.zeros(n_vars, dtype=float)
                 row[sl["u"].start + t] = -1.0
                 for b in range(n_bins):
-                    exp_pos = p_acc_cap_pos[t, b] * act_rate_pos_by_bin[t, b]
-                    exp_neg = p_acc_cap_neg[t, b] * act_rate_neg_by_bin[t, b]
+                    exp_pos = p_award_pos_by_bin[t, b] * act_rate_pos_by_bin[t, b]
+                    exp_neg = p_award_neg_by_bin[t, b] * act_rate_neg_by_bin[t, b]
                     row[sl["rpos_bin"].start + b * n + t] = (self.aux_afrr_active_mw / power_scale) * exp_pos * afrr_step
                     row[sl["rneg_bin"].start + b * n + t] = (self.aux_afrr_active_mw / power_scale) * exp_neg * afrr_step
                 a_ub.append(row)
@@ -3047,11 +3119,11 @@ class BatteryBacktester:
             # pos reserve needs discharge energy from SoC:
             # enforce a minimum 15-min-equivalent activation headroom floor via
             # max(r_act_p90, min_activation_headroom_fraction).
-            # soc_t - sum_b(p_acc_cap_pos[t,b] * max(r_act_pos_p90[t], r_floor) * reserve_bin[b,t] * dt / eta_out) >= soc_min
+            # soc_t - sum_b(p_award_pos_by_bin[t,b] * max(r_act_pos_p90[t], r_floor) * reserve_bin[b,t] * dt / eta_out) >= soc_min
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = -1.0
             for b in range(n_bins):
-                chance_pos = p_acc_cap_pos[t, b] * max(
+                chance_pos = p_award_pos_by_bin[t, b] * max(
                     float(r_act_pos_p90[t]),
                     float(self.min_activation_headroom_fraction),
                 )
@@ -3064,11 +3136,11 @@ class BatteryBacktester:
 
             # neg reserve needs charging headroom in SoC:
             # same activation headroom floor as positive direction.
-            # soc_t + sum_b(p_acc_cap_neg[t,b] * max(r_act_neg_p90[t], r_floor) * reserve_bin[b,t] * dt * eta_in) <= soc_max
+            # soc_t + sum_b(p_award_neg_by_bin[t,b] * max(r_act_neg_p90[t], r_floor) * reserve_bin[b,t] * dt * eta_in) <= soc_max
             row = np.zeros(n_vars, dtype=float)
             row[sl["soc"].start + t] = 1.0
             for b in range(n_bins):
-                chance_neg = p_acc_cap_neg[t, b] * max(
+                chance_neg = p_award_neg_by_bin[t, b] * max(
                     float(r_act_neg_p90[t]),
                     float(self.min_activation_headroom_fraction),
                 )
@@ -3632,6 +3704,21 @@ class BatteryBacktester:
                 "bcm_ev_neg": np.nanmax(rneg_coef_by_bin, axis=1) if n_bins else np.zeros(n, dtype=float),
                 "bcm_candidate_pos_mw": reserve_pos_mw,
                 "bcm_candidate_neg_mw": reserve_neg_mw,
+                "activation_rate_is_conditional": np.full(
+                    n, "conditional_on_award_or_execution", dtype=object
+                ),
+                "ev_bcm_activation_rate_is_conditional": np.full(
+                    n, "conditional_on_award", dtype=object
+                ),
+                "ev_bem_activation_rate_is_conditional": np.full(
+                    n, "conditional_on_execution", dtype=object
+                ),
+                "acceptance_probability_applied_once": np.ones(n, dtype=float),
+                "execution_probability_applied_once": np.ones(n, dtype=float),
+                "ev_dt_h": np.full(n, float(self.dt_h), dtype=float),
+                "ev_bcm_product_duration_h": np.full(
+                    n, float(self.reserve_product_duration_h), dtype=float
+                ),
             }
         )
         if "optimizer_required_input_imputed_count" in df.columns:
@@ -3660,10 +3747,10 @@ class BatteryBacktester:
             extra_cols[f"reserve_neg_bin_{b}_mw"] = reserve_neg_bin_mw[:, b]
             extra_cols[f"bem_pos_bin_{b}_mw"] = bem_pos_bin_mw[:, b]
             extra_cols[f"bem_neg_bin_{b}_mw"] = bem_neg_bin_mw[:, b]
-            extra_cols[f"ev_pacc_pos_bin_{b}"] = p_acc_cap_pos[:, b]
-            extra_cols[f"ev_pacc_neg_bin_{b}"] = p_acc_cap_neg[:, b]
-            extra_cols[f"ev_expected_act_share_pos_bin_{b}"] = p_acc_cap_pos[:, b] * act_rate_pos_by_bin[:, b]
-            extra_cols[f"ev_expected_act_share_neg_bin_{b}"] = p_acc_cap_neg[:, b] * act_rate_neg_by_bin[:, b]
+            extra_cols[f"ev_pacc_pos_bin_{b}"] = p_award_pos_by_bin[:, b]
+            extra_cols[f"ev_pacc_neg_bin_{b}"] = p_award_neg_by_bin[:, b]
+            extra_cols[f"ev_expected_act_share_pos_bin_{b}"] = p_award_pos_by_bin[:, b] * act_rate_pos_by_bin[:, b]
+            extra_cols[f"ev_expected_act_share_neg_bin_{b}"] = p_award_neg_by_bin[:, b] * act_rate_neg_by_bin[:, b]
             extra_cols[f"ev_afrr_bin_{b}_act_price_pos"] = act_price_pos_by_bin[:, b]
             extra_cols[f"ev_afrr_bin_{b}_act_price_neg"] = act_price_neg_by_bin[:, b]
             extra_cols[f"ev_afrr_bin_{b}_act_rate_pos"] = act_rate_pos_by_bin[:, b]
@@ -3672,12 +3759,30 @@ class BatteryBacktester:
             extra_cols[f"ev_bem_bin_{b}_act_price_neg"] = act_price_neg_by_bin[:, b]
             extra_cols[f"ev_bem_bin_{b}_act_rate_pos"] = act_rate_pos_by_bin[:, b]
             extra_cols[f"ev_bem_bin_{b}_act_rate_neg"] = act_rate_neg_by_bin[:, b]
-            extra_cols[f"ev_bem_bin_{b}_p_exec_pos"] = p_acc_cap_pos[:, b]
-            extra_cols[f"ev_bem_bin_{b}_p_exec_neg"] = p_acc_cap_neg[:, b]
+            extra_cols[f"ev_bem_bin_{b}_p_exec_pos"] = p_award_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_bin_{b}_p_exec_neg"] = p_award_neg_by_bin[:, b]
             extra_cols[f"ev_bem_pos_coef_bin_{b}_eur_per_mw"] = bem_pos_coef_by_bin[:, b]
             extra_cols[f"ev_bem_neg_coef_bin_{b}_eur_per_mw"] = bem_neg_coef_by_bin[:, b]
             extra_cols[f"ev_rpos_coef_bin_{b}_eur_per_mw"] = rpos_coef_by_bin[:, b]
             extra_cols[f"ev_rneg_coef_bin_{b}_eur_per_mw"] = rneg_coef_by_bin[:, b]
+            extra_cols[f"ev_bcm_p_award_pos_bin_{b}"] = p_award_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_p_award_neg_bin_{b}"] = p_award_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_p_exec_pos_bin_{b}"] = p_award_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_p_exec_neg_bin_{b}"] = p_award_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_capacity_value_pos_bin_{b}"] = bcm_expected_capacity_revenue_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_capacity_value_neg_bin_{b}"] = bcm_expected_capacity_revenue_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_activation_value_pos_bin_{b}"] = bcm_activation_value_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_activation_value_neg_bin_{b}"] = bcm_activation_value_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_costs_pos_bin_{b}"] = bcm_costs_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_costs_neg_bin_{b}"] = bcm_costs_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_costs_pos_bin_{b}"] = bcm_costs_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_expected_costs_neg_bin_{b}"] = bcm_costs_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_activation_value_pos_bin_{b}"] = bem_activation_value_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_activation_value_neg_bin_{b}"] = bem_activation_value_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_costs_pos_bin_{b}"] = bem_costs_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_costs_neg_bin_{b}"] = bem_costs_neg_by_bin[:, b]
+            extra_cols[f"ev_bem_expected_costs_pos_bin_{b}"] = bem_costs_pos_by_bin[:, b]
+            extra_cols[f"ev_bem_expected_costs_neg_bin_{b}"] = bem_costs_neg_by_bin[:, b]
             extra_cols[f"ev_bcm_expected_capacity_revenue_pos_bin_{b}"] = bcm_expected_capacity_revenue_pos_by_bin[:, b]
             extra_cols[f"ev_bcm_expected_capacity_revenue_neg_bin_{b}"] = bcm_expected_capacity_revenue_neg_by_bin[:, b]
             extra_cols[f"ev_bcm_expected_activation_revenue_pos_bin_{b}"] = bcm_expected_activation_revenue_pos_by_bin[:, b]
@@ -3752,6 +3857,24 @@ class BatteryBacktester:
                 f"ev_bem_neg_coef_bin_{b}_eur_per_mw": f"bem_{q_label}_neg_coef_eur_per_mw",
                 f"ev_rpos_coef_bin_{b}_eur_per_mw": f"bcm_{q_label}_reserve_pos_coef_eur_per_mw",
                 f"ev_rneg_coef_bin_{b}_eur_per_mw": f"bcm_{q_label}_reserve_neg_coef_eur_per_mw",
+                f"ev_bcm_p_award_pos_bin_{b}": f"bcm_{q_label}_p_award_pos",
+                f"ev_bcm_p_award_neg_bin_{b}": f"bcm_{q_label}_p_award_neg",
+                f"ev_bem_p_exec_pos_bin_{b}": f"bem_{q_label}_p_exec_pos_explicit",
+                f"ev_bem_p_exec_neg_bin_{b}": f"bem_{q_label}_p_exec_neg_explicit",
+                f"ev_bcm_capacity_value_pos_bin_{b}": f"bcm_{q_label}_capacity_value_pos",
+                f"ev_bcm_capacity_value_neg_bin_{b}": f"bcm_{q_label}_capacity_value_neg",
+                f"ev_bcm_activation_value_pos_bin_{b}": f"bcm_{q_label}_activation_value_pos",
+                f"ev_bcm_activation_value_neg_bin_{b}": f"bcm_{q_label}_activation_value_neg",
+                f"ev_bcm_costs_pos_bin_{b}": f"bcm_{q_label}_costs_pos",
+                f"ev_bcm_costs_neg_bin_{b}": f"bcm_{q_label}_costs_neg",
+                f"ev_bcm_expected_costs_pos_bin_{b}": f"bcm_{q_label}_expected_costs_pos",
+                f"ev_bcm_expected_costs_neg_bin_{b}": f"bcm_{q_label}_expected_costs_neg",
+                f"ev_bem_activation_value_pos_bin_{b}": f"bem_{q_label}_activation_value_pos",
+                f"ev_bem_activation_value_neg_bin_{b}": f"bem_{q_label}_activation_value_neg",
+                f"ev_bem_costs_pos_bin_{b}": f"bem_{q_label}_costs_pos",
+                f"ev_bem_costs_neg_bin_{b}": f"bem_{q_label}_costs_neg",
+                f"ev_bem_expected_costs_pos_bin_{b}": f"bem_{q_label}_expected_costs_pos",
+                f"ev_bem_expected_costs_neg_bin_{b}": f"bem_{q_label}_expected_costs_neg",
                 f"ev_bcm_expected_capacity_revenue_pos_bin_{b}": f"bcm_{q_label}_expected_capacity_revenue_pos",
                 f"ev_bcm_expected_capacity_revenue_neg_bin_{b}": f"bcm_{q_label}_expected_capacity_revenue_neg",
                 f"ev_bcm_expected_activation_revenue_pos_bin_{b}": f"bcm_{q_label}_expected_activation_revenue_pos",
@@ -7254,7 +7377,7 @@ class BatteryBacktester:
                     if ob_pos > 0.0 or ob_neg > 0.0:
                         fixed_reserve_obligation[tsw] = (ob_pos, ob_neg)
             else:
-                # Strategy purity guard: bem_only must not carry BCM lockbook obligations.
+                # Strategy purity guard: bem must not carry BCM lockbook obligations.
                 if bool(afrr_cap_pos_lockbook) or bool(afrr_cap_neg_lockbook):
                     raise RuntimeError(
                         "Strategy contamination: bcm lockbook obligations exist while BCM is disabled."
@@ -9859,7 +9982,7 @@ class BatteryBacktester:
             afrr_mag = self._sum_abs_present(hourly, afrr_cols)
             if afrr_mag > tol:
                 raise RuntimeError(
-                    "Strategy isolation check failed for da_only: non-zero aFRR activity detected "
+                    "Strategy isolation check failed for da: non-zero aFRR activity detected "
                     f"(abs-sum={afrr_mag:.6f})."
                 )
         elif (not perms.allow_da) and (perms.allow_bcm or perms.allow_bem_only):
@@ -9878,7 +10001,7 @@ class BatteryBacktester:
             da_mag = self._sum_abs_present(hourly, da_cols)
             if da_mag > tol:
                 raise RuntimeError(
-                    "Strategy isolation check failed for afrr_only: non-zero DA activity detected "
+                    "Strategy isolation check failed for afrr: non-zero DA activity detected "
                     f"(abs-sum={da_mag:.6f})."
                 )
         if not perms.allow_bem_only:

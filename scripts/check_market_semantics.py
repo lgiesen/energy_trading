@@ -227,14 +227,24 @@ def _infer_quantile(path: Path, summary: dict[str, Any], perf_row: dict[str, Any
     return path.name
 
 
+def _normalize_strategy_name(strategy: str | None) -> str:
+    s = str(strategy or "").strip().lower()
+    return {
+        "da_only": "da",
+        "afrr_only": "afrr",
+        "bcm_only": "bcm",
+        "bem_only": "bem",
+    }.get(s, s)
+
+
 def _infer_strategy(path: Path, summary: dict[str, Any], perf_row: dict[str, Any]) -> str:
     val = str(summary.get("trading_strategy") or perf_row.get("trading_strategy") or "").strip().lower()
     if val:
-        return val
+        return _normalize_strategy_name(val)
     parts = [p.lower() for p in path.parts]
-    for strategy in ("multi", "da_only", "afrr_only", "bcm_only", "bem_only"):
+    for strategy in ("multi", "da", "afrr", "bcm", "bem", "da_only", "afrr_only", "bcm_only", "bem_only"):
         if strategy in parts:
-            return strategy
+            return _normalize_strategy_name(strategy)
     return "unknown"
 
 
@@ -321,25 +331,25 @@ def _check_market_permissions(
                 path=path,
             )
 
-    if strategy == "da_only":
-        _hard("forbidden_bcm_quantity", "bcm_quantity_abs_total", totals["bcm_quantity_abs_total"], "da_only must not use BCM capacity markets")
-        _hard("forbidden_bem_quantity", "bem_quantity_abs_total", totals["bem_quantity_abs_total"], "da_only must not use BEM-only quantities")
-        _hard("forbidden_bcm_pnl", "bcm_pnl_abs_total", totals["bcm_pnl_abs_total"], "da_only must not earn BCM revenue")
-        _hard("forbidden_bem_pnl", "bem_pnl_abs_total", totals["bem_pnl_abs_total"], "da_only must not earn BEM revenue")
-        _hard("forbidden_afrr_pnl", "afrr_pnl_abs_total", totals["afrr_pnl_abs_total"], "da_only must not earn aFRR capacity/activation revenue")
-    elif strategy == "bcm_only":
-        _hard("forbidden_da_quantity", "da_quantity_abs_total", totals["da_quantity_abs_total"], "bcm_only must not use DA")
-        _hard("forbidden_da_pnl", "da_pnl_abs_total", totals["da_pnl_abs_total"], "bcm_only must not earn DA PnL")
-        _hard("forbidden_bem_quantity", "bem_quantity_abs_total", totals["bem_quantity_abs_total"], "bcm_only must not use discretionary BEM-only quantity")
-        _hard("forbidden_bem_pnl", "bem_pnl_abs_total", totals["bem_pnl_abs_total"], "bcm_only must not earn discretionary BEM-only PnL")
-    elif strategy == "bem_only":
-        _hard("forbidden_da_quantity", "da_quantity_abs_total", totals["da_quantity_abs_total"], "bem_only must not use DA")
-        _hard("forbidden_da_pnl", "da_pnl_abs_total", totals["da_pnl_abs_total"], "bem_only must not earn DA PnL")
-        _hard("forbidden_bcm_quantity", "bcm_quantity_abs_total", totals["bcm_quantity_abs_total"], "bem_only must not use BCM capacity")
-        _hard("forbidden_bcm_pnl", "bcm_pnl_abs_total", totals["bcm_pnl_abs_total"], "bem_only must not earn BCM capacity/linked activation revenue")
-    elif strategy == "afrr_only":
-        _hard("forbidden_da_quantity", "da_quantity_abs_total", totals["da_quantity_abs_total"], "afrr_only must not use DA")
-        _hard("forbidden_da_pnl", "da_pnl_abs_total", totals["da_pnl_abs_total"], "afrr_only must not earn DA PnL")
+    if strategy == "da":
+        _hard("forbidden_bcm_quantity", "bcm_quantity_abs_total", totals["bcm_quantity_abs_total"], "da must not use BCM capacity markets")
+        _hard("forbidden_bem_quantity", "bem_quantity_abs_total", totals["bem_quantity_abs_total"], "da must not use BEM-only quantities")
+        _hard("forbidden_bcm_pnl", "bcm_pnl_abs_total", totals["bcm_pnl_abs_total"], "da must not earn BCM revenue")
+        _hard("forbidden_bem_pnl", "bem_pnl_abs_total", totals["bem_pnl_abs_total"], "da must not earn BEM revenue")
+        _hard("forbidden_afrr_pnl", "afrr_pnl_abs_total", totals["afrr_pnl_abs_total"], "da must not earn aFRR capacity/activation revenue")
+    elif strategy == "bcm":
+        _hard("forbidden_da_quantity", "da_quantity_abs_total", totals["da_quantity_abs_total"], "bcm must not use DA")
+        _hard("forbidden_da_pnl", "da_pnl_abs_total", totals["da_pnl_abs_total"], "bcm must not earn DA PnL")
+        _hard("forbidden_bem_quantity", "bem_quantity_abs_total", totals["bem_quantity_abs_total"], "bcm must not use discretionary BEM-only quantity")
+        _hard("forbidden_bem_pnl", "bem_pnl_abs_total", totals["bem_pnl_abs_total"], "bcm must not earn discretionary BEM-only PnL")
+    elif strategy == "bem":
+        _hard("forbidden_da_quantity", "da_quantity_abs_total", totals["da_quantity_abs_total"], "bem must not use DA")
+        _hard("forbidden_da_pnl", "da_pnl_abs_total", totals["da_pnl_abs_total"], "bem must not earn DA PnL")
+        _hard("forbidden_bcm_quantity", "bcm_quantity_abs_total", totals["bcm_quantity_abs_total"], "bem must not use BCM capacity")
+        _hard("forbidden_bcm_pnl", "bcm_pnl_abs_total", totals["bcm_pnl_abs_total"], "bem must not earn BCM capacity/linked activation revenue")
+    elif strategy == "afrr":
+        _hard("forbidden_da_quantity", "da_quantity_abs_total", totals["da_quantity_abs_total"], "afrr must not use DA")
+        _hard("forbidden_da_pnl", "da_pnl_abs_total", totals["da_pnl_abs_total"], "afrr must not earn DA PnL")
 
 
 def _check_id_recourse(
@@ -388,18 +398,18 @@ def _check_id_recourse(
                 message="ID recourse disabled but nonzero ID activity detected",
                 path=path,
             )
-    if id_mode == "afrr_obligation_only" and strategy == "da_only" and totals["id_quantity_abs_total"] > tol:
+    if id_mode == "afrr_obligation_only" and strategy == "da" and totals["id_quantity_abs_total"] > tol:
         _add_violation(
             violations,
             severity=_severity(include_invalid, warn_only),
             check_group="id_recourse",
-            check_name="id_forbidden_for_da_only",
+            check_name="id_forbidden_for_da",
             strategy=strategy,
             scenario=scenario,
             column="id_quantity_abs_total",
             value=totals["id_quantity_abs_total"],
             tolerance=tol,
-            message="da_only must not use ID when id_recourse_mode=afrr_obligation_only",
+            message="da must not use ID when id_recourse_mode=afrr_obligation_only",
             path=path,
         )
 
@@ -490,7 +500,7 @@ def _check_bcm_blocks(
     tol: float,
     violations: list[dict[str, Any]],
 ) -> None:
-    bcm_enabled = strategy in {"bcm_only", "afrr_only", "multi"}
+    bcm_enabled = strategy in {"bcm", "afrr", "multi"}
     if not bcm_enabled:
         if totals["bcm_quantity_abs_total"] > tol or totals["bcm_pnl_abs_total"] > tol:
             _add_violation(

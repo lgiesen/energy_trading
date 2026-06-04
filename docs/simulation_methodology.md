@@ -110,21 +110,21 @@ and enters SoC dynamics with efficiency-adjusted energy terms.
 Supported strategy modes:
 
 - `multi`: DA + BCM + BEM enabled, `id_mode=economic` (technical repair also possible).
-- `da_only`: DA enabled, BCM/BEM disabled, default `id_mode=none`.
-- `afrr_only`: DA disabled, BCM + BEM enabled, default `id_mode=technical_repair`.
-- `bcm_only`: DA disabled, BCM enabled (including activation settlement from awarded reserve), BEM-only disabled, default `id_mode=technical_repair`.
-- `bem_only`: DA disabled, BCM disabled, standalone BEM enabled, default `id_mode=technical_repair`.
+- `da`: DA enabled, BCM/BEM disabled, default `id_mode=none`.
+- `afrr`: DA disabled, BCM + BEM enabled, default `id_mode=technical_repair`.
+- `bcm`: DA disabled, BCM enabled (including activation settlement from awarded reserve), BEM-only disabled, default `id_mode=technical_repair`.
+- `bem`: DA disabled, BCM disabled, standalone BEM enabled, default `id_mode=technical_repair`.
 
 Notes:
-- `bcm_only` is not capacity-only accounting; awarded capacity can still trigger activation settlement.
-- `bem_only` excludes BCM capacity awards and therefore excludes capacity revenue.
+- `bcm` is not capacity-only accounting; awarded capacity can still trigger activation settlement.
+- `bem` excludes BCM capacity awards and therefore excludes capacity revenue.
 - Baseline contamination guard: economic ID is blocked for non-`multi` strategies unless explicitly overridden for robustness runs.
 - Disabled markets are hard-gated in optimizer bounds and validated in settlement outputs.
 ## BCM vs BEM Product Granularity
 
 - BCM/aFRR capacity is modeled as a fixed 4-hour product in German market local time (`Europe/Berlin`): `00-04`, `04-08`, `08-12`, `12-16`, `16-20`, `20-24`.
 - BEM/aFRR balancing energy remains hourly.
-- `afrr_only` includes both:
+- `afrr` includes both:
   - block-based BCM capacity commitments
   - hourly BEM bids/activation
 - Partial first/last observed blocks are flagged via:
