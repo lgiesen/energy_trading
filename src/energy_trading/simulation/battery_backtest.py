@@ -47,7 +47,7 @@ from energy_trading.evaluation.forecast_postprocessing import (
     canonicalize_prediction_frame,
     canonicalize_truth_series,
 )
-from energy_trading.simulation.bid_builder import AFRRCapacityBid, BidBuilder, BidPricingPolicy
+from energy_trading.simulation.bid_builder import AFRRCapacityBid, BCMCapacityBid, BidBuilder, BidPricingPolicy
 from energy_trading.simulation.market_clearing import AFRRCapacityClearingResult, MarketClearingEngine
 
 
@@ -109,6 +109,88 @@ class StrategyPermissions:
 
 
 ID_RECOURSE_MODES = {"common", "disabled", "afrr_obligation_only"}
+
+
+def bcm_capacity_ev_eur(
+    *,
+    p_accept: float,
+    capacity_mw: float,
+    capacity_bid_price_eur_per_mw_h: float,
+    product_duration_h: float = 4.0,
+) -> float:
+    """Expected BCM/RLM capacity value for one product-level capacity bid."""
+    return float(
+        max(0.0, float(p_accept))
+        * max(0.0, float(capacity_mw))
+        * float(capacity_bid_price_eur_per_mw_h)
+        * float(product_duration_h)
+    )
+
+
+def bcm_capacity_revenue_eur(
+    *,
+    accepted_available_mw: float,
+    own_capacity_bid_price_eur_per_mw_h: float,
+    product_duration_h: float = 4.0,
+) -> float:
+    """Pay-as-bid BCM/RLM capacity settlement for one accepted product."""
+    return float(
+        max(0.0, float(accepted_available_mw))
+        * float(own_capacity_bid_price_eur_per_mw_h)
+        * float(product_duration_h)
+    )
+
+
+def bcm_capacity_hourly_revenue_decomposition_eur(
+    *,
+    accepted_available_mw: float,
+    own_capacity_bid_price_eur_per_mw_h: float,
+    product_start_utc: pd.Timestamp,
+    product_duration_h: int = 4,
+    dt_h: float = 1.0,
+) -> pd.Series:
+    """Hourly accounting decomposition of one accepted 4h BCM capacity product."""
+    start = pd.to_datetime(product_start_utc, utc=True)
+    idx = pd.date_range(start, periods=int(product_duration_h / dt_h), freq=pd.Timedelta(hours=float(dt_h)))
+    value = float(max(0.0, accepted_available_mw) * own_capacity_bid_price_eur_per_mw_h * dt_h)
+    return pd.Series([value] * len(idx), index=idx, dtype=float)
+
+
+def bcm_product_to_bem_mandatory_volume(
+    *,
+    accepted_capacity_mw: float,
+    product_start_utc: pd.Timestamp,
+    product_duration_h: int = 4,
+    resolution: str = "hourly",
+) -> pd.Series:
+    """Map accepted product-level BCM capacity to BEM availability intervals."""
+    start = pd.to_datetime(product_start_utc, utc=True)
+    if str(resolution).strip().lower() in {"quarter", "quarter_hour", "quarter-hour", "15min", "15m"}:
+        freq = "15min"
+        periods = int(product_duration_h * 4)
+    elif str(resolution).strip().lower() in {"hour", "hourly", "1h"}:
+        freq = "h"
+        periods = int(product_duration_h)
+    else:
+        raise ValueError(f"Unsupported BEM resolution={resolution!r}")
+    idx = pd.date_range(start, periods=periods, freq=freq)
+    return pd.Series([max(0.0, float(accepted_capacity_mw))] * periods, index=idx, dtype=float)
+
+
+def bcm_linked_bem_activation_ev_eur(
+    *,
+    accepted_capacity_mw: float,
+    activation_fraction: float,
+    interval_duration_h: float,
+    settlement_price_eur_per_mwh: float,
+) -> float:
+    """Activation value for BCM-linked BEM volume; capacity enters exactly once."""
+    activated_mwh = (
+        max(0.0, float(accepted_capacity_mw))
+        * max(0.0, float(activation_fraction))
+        * float(interval_duration_h)
+    )
+    return float(activated_mwh * float(settlement_price_eur_per_mwh))
 
 
 CANONICAL_PREDICTION_COLUMNS = [
@@ -1710,7 +1792,7 @@ class BatteryBacktester:
         horizon_hours: int = 48,
         global_end_utc: pd.Timestamp | None = None,
         is_perfect_foresight: bool = False,
-    ) -> tuple[float, float, AFRRCapacityClearingResult | None, list[AFRRCapacityBid], dict[str, float | str]]:
+    ) -> tuple[float, float, AFRRCapacityClearingResult | None, list[BCMCapacityBid], dict[str, float | str]]:
         """Select the largest causal BCM bid whose full-award lockbook remains optimizer-feasible."""
         base_pos = max(0.0, float(offered_pos_mw))
         base_neg = max(0.0, float(offered_neg_mw))
@@ -2181,7 +2263,7 @@ class BatteryBacktester:
             "retry_factor_selected_before_clearing": 0.0,
             "realized_clearing_used_for_selection": 0.0,
         }
-        zero_result: tuple[float, float, AFRRCapacityClearingResult | None, list[AFRRCapacityBid], dict[str, float | str]] | None = None
+        zero_result: tuple[float, float, AFRRCapacityClearingResult | None, list[BCMCapacityBid], dict[str, float | str]] | None = None
         first_candidate_stats: dict[str, float | str] | None = None
         for factor in ladder:
             trial_pos = float(self.bid_builder._qfloor(base_pos * float(factor), self.afrr_bid_granularity_mw))
@@ -2374,9 +2456,9 @@ class BatteryBacktester:
 
         aFRR reserve offers are optimized over bid-price bins using expected value.
         The LP decouples:
-        - p_award[j,t]: probability that a BCM capacity bid in bin j is awarded.
-        - p_exec[j,t]: probability that a BEM-only energy bid in bin j is executed.
-        - r_act[t]: expected activated share conditional on award/execution.
+        - p_award[j,k]: probability that a BCM capacity bid in bin j is awarded for 4h product k.
+        - p_exec[j,t]: probability that a BEM-only energy bid in bin j is executed for hour t.
+        - r_act[j,t]: expected activated share conditional on award/execution.
         The award/execution probability is applied exactly once in EV terms.
         """
         if df.empty:
@@ -2560,15 +2642,36 @@ class BatteryBacktester:
                 f"Fix data pipeline. bad_columns={bad_inputs}"
             )
 
-        # BCM EV separates pay-as-bid capacity remuneration from linked
-        # activation-energy remuneration. Capacity-price quantiles are optional;
-        # if absent, use the point capacity forecast for all BCM bins.
+        # BCM award probabilities are defined for each 4-hour BCM product.
+        # p_award is therefore block-constant across each product window for each bin,
+        # and applied once in expected-value terms.
+        block_info = assign_bcm_capacity_block(df[colmap.timestamp])
+        block_ids = block_info["bcm_capacity_block_id"].to_numpy(dtype=str)
+        unique_blocks = pd.unique(block_ids)
+
+        def _assign_block_constant(vals: np.ndarray) -> np.ndarray:
+            out = vals.copy()
+            for b in range(n_bins):
+                for blk in unique_blocks:
+                    idx = block_ids == blk
+                    if not np.any(idx):
+                        continue
+                    block_vals = out[idx, b]
+                    finite_vals = block_vals[np.isfinite(block_vals)]
+                    if finite_vals.size > 0:
+                        out[idx, b] = float(finite_vals[0])
+            return out
+
         p_award_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         p_award_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        pacc_pos_inputs = np.zeros((n, n_bins), dtype=float)
+        pacc_neg_inputs = np.zeros((n, n_bins), dtype=float)
         cap_price_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         cap_price_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         pacc_pos_fallback_used = np.zeros(n, dtype=float)
         pacc_neg_fallback_used = np.zeros(n, dtype=float)
+
+        # Default deterministic fallback: full award, point capacity prices.
         if deterministic_reserve_settlement:
             base_cap_pos = self._finite_numeric_series(
                 df,
@@ -2593,16 +2696,18 @@ class BatteryBacktester:
                 cap_price_neg_by_bin[:, b] = base_cap_neg
         else:
             fallback_decay = 0.7
+            mid_bin = self.afrr_quantile_bins.index("p50") if "p50" in self.afrr_quantile_bins else n_bins // 2
             pos_quant_cols = [f"{colmap.pred_afrr_capacity_price_pos}_{q}" for q in self.afrr_quantile_bins]
             neg_quant_cols = [f"{colmap.pred_afrr_capacity_price_neg}_{q}" for q in self.afrr_quantile_bins]
             pos_quant_struct_missing = any(c not in df.columns for c in pos_quant_cols)
             neg_quant_struct_missing = any(c not in df.columns for c in neg_quant_cols)
+            have_pacc_pos = all(f"pacc_pos_bin_{b}" in df.columns for b in range(n_bins))
+            have_pacc_neg = all(f"pacc_neg_bin_{b}" in df.columns for b in range(n_bins))
 
             for b, qcol in enumerate(self.afrr_quantile_bins):
                 q_level = float(qcol.replace("p", "")) / 100.0
-                pacc_const = max(0.0, min(1.0, 1.0 - q_level))
-                p_award_pos_by_bin[:, b] = pacc_const
-                p_award_neg_by_bin[:, b] = pacc_const
+                q_award = max(0.0, min(1.0, 1.0 - q_level))
+
                 c_pos = f"{colmap.pred_afrr_capacity_price_pos}_{qcol}"
                 c_neg = f"{colmap.pred_afrr_capacity_price_neg}_{qcol}"
                 if c_pos in df.columns:
@@ -2613,6 +2718,17 @@ class BatteryBacktester:
                     cap_price_neg_by_bin[:, b] = pd.to_numeric(df[c_neg], errors="coerce").to_numpy(dtype=float)
                 else:
                     cap_price_neg_by_bin[:, b] = np.nan
+
+                if have_pacc_pos:
+                    pacc_pos_inputs[:, b] = pd.to_numeric(df[f"pacc_pos_bin_{b}"], errors="coerce").to_numpy(dtype=float)
+                    p_award_pos_by_bin[:, b] = np.where(np.isfinite(pacc_pos_inputs[:, b]), pacc_pos_inputs[:, b], q_award)
+                else:
+                    p_award_pos_by_bin[:, b] = q_award
+                if have_pacc_neg:
+                    pacc_neg_inputs[:, b] = pd.to_numeric(df[f"pacc_neg_bin_{b}"], errors="coerce").to_numpy(dtype=float)
+                    p_award_neg_by_bin[:, b] = np.where(np.isfinite(pacc_neg_inputs[:, b]), pacc_neg_inputs[:, b], q_award)
+                else:
+                    p_award_neg_by_bin[:, b] = q_award
 
             mid_pos = self._finite_numeric_series(
                 df,
@@ -2634,30 +2750,57 @@ class BatteryBacktester:
                 ],
                 default=0.0,
             ).to_numpy(dtype=float)
-            mid_bin = self.afrr_quantile_bins.index("p50") if "p50" in self.afrr_quantile_bins else n_bins // 2
+
             for t in range(n):
-                have_pos = np.isfinite(cap_price_pos_by_bin[t, :]).all()
-                have_neg = np.isfinite(cap_price_neg_by_bin[t, :]).all()
+                pos_row_finite = np.isfinite(cap_price_pos_by_bin[t, :]).all()
+                neg_row_finite = np.isfinite(cap_price_neg_by_bin[t, :]).all()
                 if pos_quant_struct_missing:
                     pacc_pos_fallback_used[t] = 1.0
                     cap_price_pos_by_bin[t, :] = mid_pos[t]
                     for b in range(n_bins):
+                        q_level = float(self.afrr_quantile_bins[b].replace("p", "")) / 100.0
                         p_award_pos_by_bin[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
-                elif not have_pos:
+                    if have_pacc_pos:
+                        # keep provided p_acc when present for explicit input-driven EV
+                        p_award_pos_by_bin[t, :] = np.where(
+                            np.isfinite(pacc_pos_inputs[t, :]),
+                            pacc_pos_inputs[t, :],
+                            p_award_pos_by_bin[t, :],
+                        )
+                elif not pos_row_finite:
                     raise ValueError(
-                        "NaN detected in aFRR positive capacity-price quantiles although quantile columns "
-                        "exist. Fallback is only allowed for structurally missing quantile columns."
+                        "NaN detected in aFRR positive capacity-price quantiles although quantile columns exist. "
+                        "Fallback is only allowed for structurally missing quantile columns."
                     )
+
                 if neg_quant_struct_missing:
                     pacc_neg_fallback_used[t] = 1.0
                     cap_price_neg_by_bin[t, :] = mid_neg[t]
                     for b in range(n_bins):
+                        q_level = float(self.afrr_quantile_bins[b].replace("p", "")) / 100.0
                         p_award_neg_by_bin[t, b] = 0.5 * (fallback_decay ** abs(b - mid_bin))
-                elif not have_neg:
+                    if have_pacc_neg:
+                        p_award_neg_by_bin[t, :] = np.where(
+                            np.isfinite(pacc_neg_inputs[t, :]),
+                            pacc_neg_inputs[t, :],
+                            p_award_neg_by_bin[t, :],
+                        )
+                elif not neg_row_finite:
                     raise ValueError(
-                        "NaN detected in aFRR negative capacity-price quantiles although quantile columns "
-                        "exist. Fallback is only allowed for structurally missing quantile columns."
+                        "NaN detected in aFRR negative capacity-price quantiles although quantile columns exist. "
+                        "Fallback is only allowed for structurally missing quantile columns."
                     )
+
+        # Enforce 4h BCM product constancy for capacity bid prices and
+        # acceptance probabilities. Hourly rows are only an accounting
+        # decomposition after one product-level BCM bid clears.
+        cap_price_pos_by_bin = _assign_block_constant(cap_price_pos_by_bin)
+        cap_price_neg_by_bin = _assign_block_constant(cap_price_neg_by_bin)
+        p_award_pos_by_bin = _assign_block_constant(p_award_pos_by_bin)
+        p_award_neg_by_bin = _assign_block_constant(p_award_neg_by_bin)
+        for b in range(n_bins):
+            p_award_pos_by_bin[:, b] = np.clip(p_award_pos_by_bin[:, b], 0.0, 1.0)
+            p_award_neg_by_bin[:, b] = np.clip(p_award_neg_by_bin[:, b], 0.0, 1.0)
 
         c = np.zeros(n_vars, dtype=float)
 
@@ -2746,20 +2889,20 @@ class BatteryBacktester:
         bem_activation_margin_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         for b in range(n_bins):
             # EV convention:
-            # - BCM capacity value is p_award * submitted capacity bid price * dt.
+            # - BCM p_award is product-level; hourly coefficients sum to product EV
+            #   because reserve MW is constrained block-constant below.
             # - Activation rates are conditional on award/execution.
+            #   They are fractions/shares in [0, 1], not MW. The objective
+            #   coefficients below are EUR per MW, so the optimized reserve MW
+            #   multiplies activation value exactly once later.
             # - Expected activation share = probability * conditional activation rate.
             # - Probability is applied exactly once; diagnostics expose value/cost terms separately.
             exp_act_pos = p_award_pos_by_bin[:, b] * act_rate_pos_by_bin[:, b]
             exp_act_neg = p_award_neg_by_bin[:, b] * act_rate_neg_by_bin[:, b]
             offer_cost = self.afrr_offer_cost_eur_mw_h * self.dt_h
-            # Expected aFRR auxiliary energy over reserve product window:
-            # hours_afrr_active = window_h * p_award * activation_rate
-            # hours_afrr_standby = window_h * (p_award - p_award*activation_rate)
-            # reserve-MW scaling enters via per-MW equivalent hours:
-            # hours_equiv_per_mw = window_h / P_max
-            window_h = float(self.reserve_product_duration_h)
-            afrr_hours_equiv_per_mw = window_h / max(self.p_max_mw, 1e-12)
+            # Hourly BCM auxiliary energy per reserve MW. Product-level auxiliary
+            # EV is the sum of these hourly coefficients under block-constant MW.
+            afrr_hours_equiv_per_mw = self.dt_h / max(self.p_max_mw, 1e-12)
             standby_pos = np.maximum(0.0, p_award_pos_by_bin[:, b] - exp_act_pos)
             standby_neg = np.maximum(0.0, p_award_neg_by_bin[:, b] - exp_act_neg)
             afrr_aux_cost_pos = (
@@ -2931,6 +3074,17 @@ class BatteryBacktester:
             s_bem_neg = sl["bem_neg_bin"].start + b * n
             c[s_bem_pos : s_bem_pos + n] = -(bem_pos_coef * afrr_step)
             c[s_bem_neg : s_bem_neg + n] = -(bem_neg_coef * afrr_step)
+
+        bcm_product_coef_pos_by_bin = np.zeros_like(rpos_coef_by_bin)
+        bcm_product_coef_neg_by_bin = np.zeros_like(rneg_coef_by_bin)
+        for b in range(n_bins):
+            for blk in unique_blocks:
+                idx = block_ids == blk
+                if not np.any(idx):
+                    continue
+                bcm_product_coef_pos_by_bin[idx, b] = float(np.nansum(rpos_coef_by_bin[idx, b]))
+                bcm_product_coef_neg_by_bin[idx, b] = float(np.nansum(rneg_coef_by_bin[idx, b]))
+
         # Soft chance-constraint penalties (continuous non-delivery slack).
         # Make slack prohibitively expensive relative to capacity revenues so
         # solver prioritizes physical feasibility over speculative awards.
@@ -3767,6 +3921,12 @@ class BatteryBacktester:
             extra_cols[f"ev_rneg_coef_bin_{b}_eur_per_mw"] = rneg_coef_by_bin[:, b]
             extra_cols[f"ev_bcm_p_award_pos_bin_{b}"] = p_award_pos_by_bin[:, b]
             extra_cols[f"ev_bcm_p_award_neg_bin_{b}"] = p_award_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_capacity_bid_price_pos_bin_{b}_eur_per_mw_h"] = cap_price_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_capacity_bid_price_neg_bin_{b}_eur_per_mw_h"] = cap_price_neg_by_bin[:, b]
+            extra_cols[f"ev_bcm_activation_rate_is_fraction_bin_{b}"] = np.ones(n, dtype=float)
+            extra_cols[f"ev_bcm_activation_volume_multiplier_applied_once_bin_{b}"] = np.ones(n, dtype=float)
+            extra_cols[f"ev_bcm_product_coef_pos_bin_{b}_eur_per_mw"] = bcm_product_coef_pos_by_bin[:, b]
+            extra_cols[f"ev_bcm_product_coef_neg_bin_{b}_eur_per_mw"] = bcm_product_coef_neg_by_bin[:, b]
             extra_cols[f"ev_bem_p_exec_pos_bin_{b}"] = p_award_pos_by_bin[:, b]
             extra_cols[f"ev_bem_p_exec_neg_bin_{b}"] = p_award_neg_by_bin[:, b]
             extra_cols[f"ev_bcm_capacity_value_pos_bin_{b}"] = bcm_expected_capacity_revenue_pos_by_bin[:, b]
@@ -3859,6 +4019,12 @@ class BatteryBacktester:
                 f"ev_rneg_coef_bin_{b}_eur_per_mw": f"bcm_{q_label}_reserve_neg_coef_eur_per_mw",
                 f"ev_bcm_p_award_pos_bin_{b}": f"bcm_{q_label}_p_award_pos",
                 f"ev_bcm_p_award_neg_bin_{b}": f"bcm_{q_label}_p_award_neg",
+                f"ev_bcm_capacity_bid_price_pos_bin_{b}_eur_per_mw_h": f"bcm_{q_label}_capacity_bid_price_pos_eur_per_mw_h",
+                f"ev_bcm_capacity_bid_price_neg_bin_{b}_eur_per_mw_h": f"bcm_{q_label}_capacity_bid_price_neg_eur_per_mw_h",
+                f"ev_bcm_activation_rate_is_fraction_bin_{b}": f"bcm_{q_label}_activation_rate_is_fraction",
+                f"ev_bcm_activation_volume_multiplier_applied_once_bin_{b}": f"bcm_{q_label}_activation_volume_multiplier_applied_once",
+                f"ev_bcm_product_coef_pos_bin_{b}_eur_per_mw": f"bcm_{q_label}_product_coef_pos_eur_per_mw",
+                f"ev_bcm_product_coef_neg_bin_{b}_eur_per_mw": f"bcm_{q_label}_product_coef_neg_eur_per_mw",
                 f"ev_bem_p_exec_pos_bin_{b}": f"bem_{q_label}_p_exec_pos_explicit",
                 f"ev_bem_p_exec_neg_bin_{b}": f"bem_{q_label}_p_exec_neg_explicit",
                 f"ev_bcm_capacity_value_pos_bin_{b}": f"bcm_{q_label}_capacity_value_pos",
@@ -4250,15 +4416,19 @@ class BatteryBacktester:
         delivered_capacity_pos_mw = max(0.0, reserve_pos - missed_capacity_pos_mw)
         delivered_capacity_neg_mw = max(0.0, reserve_neg - missed_capacity_neg_mw)
 
-        # BCM capacity remuneration is pay-as-bid on awarded/locked capacity
-        # and is independent of whether activation is called. Activation energy
+        # BCM capacity remuneration is paid only on awarded/locked capacity,
+        # pay-as-bid, and independent of later BEM activation. Activation energy
         # revenue is settled separately below on delivered MWh.
         cap_pos_settlement = float(cap_pos if cap_bid_pos is None else cap_bid_pos)
         cap_neg_settlement = float(cap_neg if cap_bid_neg is None else cap_bid_neg)
         rev_cap_pos = float(delivered_capacity_pos_mw * cap_pos_settlement * self.dt_h)
         rev_cap_neg = float(delivered_capacity_neg_mw * cap_neg_settlement * self.dt_h)
         rev_cap = float(rev_cap_pos + rev_cap_neg)
-        cap_price_source = "submitted_pay_as_bid" if (cap_bid_pos is not None or cap_bid_neg is not None) else "truth_or_forecast_capacity_price"
+        cap_price_source = (
+            "submitted_capacity_bid_pay_as_bid"
+            if (cap_bid_pos is not None or cap_bid_neg is not None)
+            else "truth_or_forecast_capacity_price"
+        )
 
         # Activation revenue is paid on delivered activation energy. We still avoid
         # double counting by not adding synthetic internal energy replacement costs
@@ -4362,6 +4532,14 @@ class BatteryBacktester:
             "bcm_capacity_revenue_neg_eur": rev_cap_neg,
             "bcm_capacity_price_source": cap_price_source,
             "bcm_activation_price_source": "activation_clearing_or_truth_price",
+            "bcm_awarded_capacity_pos_mw": float(reserve_pos),
+            "bcm_awarded_capacity_neg_mw": float(reserve_neg),
+            "bcm_available_capacity_pos_mw": float(delivered_capacity_pos_mw),
+            "bcm_available_capacity_neg_mw": float(delivered_capacity_neg_mw),
+            "bcm_capacity_bid_price_pos_eur_per_mw_h": float(cap_pos_settlement),
+            "bcm_capacity_bid_price_neg_eur_per_mw_h": float(cap_neg_settlement),
+            "bcm_to_bem_energy_obligation_pos_mw": float(reserve_pos),
+            "bcm_to_bem_energy_obligation_neg_mw": float(reserve_neg),
             "revenue_activation_eur": rev_act,
             "transaction_cost_eur": trans_cost,
             "degradation_cost_eur": degr_cost,
@@ -4995,6 +5173,10 @@ class BatteryBacktester:
         ts = pd.to_datetime(target_time_utc, utc=True, errors="coerce")
         if pd.isna(ts):
             ts = pd.Timestamp("1970-01-01T00:00:00Z")
+        bcm_block_info = assign_bcm_capacity_block(pd.Series([ts]))
+        bcm_product_block_id = str(bcm_block_info["bcm_capacity_block_id"].iloc[0])
+        bem_delivery_hour_start_utc = pd.to_datetime(ts, utc=True)
+        bem_activation_price_decision_time_utc = bem_delivery_hour_start_utc - pd.Timedelta(hours=1)
 
         ob_pos = max(0.0, float(obligation_pos_mw)) if allow_bcm else 0.0
         ob_neg = max(0.0, float(obligation_neg_mw)) if allow_bcm else 0.0
@@ -5165,9 +5347,19 @@ class BatteryBacktester:
         else:
             # No BCM obligation for this delivery hour.
             # Explicit BEM-only participation uses independent planned BEM volumes.
+            # In the generic aFRR strategy, current-hour reserve variables cannot
+            # represent newly awarded BCM capacity unless a lockbook obligation
+            # exists. Treat the unawarded current-hour aFRR plan as free BEM
+            # volume so rejected/no-BCM capacity does not suppress BEM trading.
             cap_bids: list[AFRRCapacityBid] = []
-            q_pos = bem_q_pos
-            q_neg = bem_q_neg
+            free_bem_from_unawarded_reserve_pos = (
+                self.bid_builder._qfloor(float(res_pos_plan), self.afrr_step_mw) if allow_bem else 0.0
+            )
+            free_bem_from_unawarded_reserve_neg = (
+                self.bid_builder._qfloor(float(res_neg_plan), self.afrr_step_mw) if allow_bem else 0.0
+            )
+            q_pos = max(float(bem_q_pos), float(free_bem_from_unawarded_reserve_pos))
+            q_neg = max(float(bem_q_neg), float(free_bem_from_unawarded_reserve_neg))
             bin_payload["submitted_afrr_pos_bin_0_mw"] = float(q_pos)
             bin_payload["submitted_afrr_neg_bin_0_mw"] = float(q_neg)
             bin_payload["submitted_afrr_pos_bin_0_price_eur_mw"] = 0.0
@@ -5276,18 +5468,6 @@ class BatteryBacktester:
                     )
                 )
             cap_bids.extend(bem_cap_bids)
-        if ob_pos > 0.0 or ob_neg > 0.0:
-            bem_guard = self._apply_bem_only_submission_guard(
-                desired_bem_only_pos_mw=0.0,
-                desired_bem_only_neg_mw=0.0,
-                soc_start_mwh=float(soc_ref),
-                locked_reserve_pos_mw=float(ob_pos),
-                locked_reserve_neg_mw=float(ob_neg),
-                pred_act_pos=float(pred_act_pos),
-                pred_act_neg=float(pred_act_neg),
-                da_charge_mw=float(ch_plan),
-                da_discharge_mw=float(dis_plan),
-            )
         if allow_da:
             da_bids = self.bid_builder.build_da_bids_from_plan(
                 ts=ts,
@@ -5323,11 +5503,12 @@ class BatteryBacktester:
         submitted_da_buy_price = float(np.mean(submitted_da_buy_prices)) if submitted_da_buy_prices else float("nan")
         submitted_da_sell_price = float(np.mean(submitted_da_sell_prices)) if submitted_da_sell_prices else float("nan")
         # aFRR BEM (balancing energy market):
-        # - with BCM obligation: activation eligibility comes from awarded BCM capacity
-        # - without BCM obligation: BEM-only uses explicit optimizer variables and
-        #   is settled separately from BCM-linked activation
+        # - mandatory BEM activation bids are derived from already-awarded BCM capacity
+        # - free BEM-only bids are derived from explicit optimizer variables
+        # - activation clearing must use BEM activation bids, not BCM capacity bids
         bem_submitted_pos_mw = float(sum(float(b.quantity_mw) for b in bem_cap_bids if b.side == "pos"))
         bem_submitted_neg_mw = float(sum(float(b.quantity_mw) for b in bem_cap_bids if b.side == "neg"))
+        bem_activation_bids = list(bcm_cap_bids) + list(bem_cap_bids)
         act_cap_res = AFRRCapacityClearingResult(
             submitted_pos_mw=float(max(0.0, ob_pos) + bem_submitted_pos_mw),
             submitted_neg_mw=float(max(0.0, ob_neg) + bem_submitted_neg_mw),
@@ -5337,59 +5518,43 @@ class BatteryBacktester:
             neg_awarded=float(max(0.0, ob_neg) + bem_submitted_neg_mw) > 1e-12,
         )
         act_res = self.market_clearing_engine.clear_afrr_activation(
-            cap_bids,
+            bem_activation_bids,
             act_cap_res,
             true_act_pos=float(true_act_pos),
             true_act_neg=float(true_act_neg),
             true_rate_pos=float(true_rate_pos),
             true_rate_neg=float(true_rate_neg),
         )
-        # Pay-as-bid settlement price for awarded capacity (weighted by awarded MW).
-        def _weighted_awarded_bid_price(
-            *,
-            side: str,
-            awarded_mw: float,
-            true_cap_price: float,
-        ) -> float:
-            aw = max(0.0, float(awarded_mw))
-            if aw <= 1e-12:
-                return 0.0
-            side_bids = [b for b in cap_bids if b.side == side and float(b.quantity_mw) > 0.0]
-            if not side_bids:
-                return 0.0
-            accepted = [
-                b for b in side_bids if float(b.capacity_price_eur_mw) <= float(true_cap_price) + 1e-12
-            ]
-            accepted_qty = float(sum(float(b.quantity_mw) for b in accepted))
-            if accepted_qty + 1e-12 >= aw and accepted_qty > 1e-12:
-                num = float(sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in accepted))
-                return float(num / max(accepted_qty, 1e-12))
-            # Fallback for forced obligation awards (already-awarded lockbooks):
-            # settle with submitted bid price of the obligated bids.
-            sub_qty = float(sum(float(b.quantity_mw) for b in side_bids))
-            num = float(sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in side_bids))
-            return float(num / max(sub_qty, 1e-12))
-
         ch_exec = float(da_res.executed_buy_mw)
         dis_exec = float(da_res.executed_sell_mw)
         res_pos_exec = float(act_cap_res.awarded_pos_mw) if bool(act_res.pos_accepted) else float(max(0.0, ob_pos))
         res_neg_exec = float(act_cap_res.awarded_neg_mw) if bool(act_res.neg_accepted) else float(max(0.0, ob_neg))
-        # Capacity settlement must be pay-as-bid on awarded capacity.
-        cap_bid_pos_settlement = (
-            _weighted_awarded_bid_price(
-                side="pos",
-                awarded_mw=res_pos_exec,
-                true_cap_price=float(true_cap_pos),
+
+        def _mean_bcm_capacity_bid_price(side: str, awarded_mw: float) -> float:
+            if float(awarded_mw) <= 1e-12:
+                return 0.0
+            bids_for_side = [
+                b
+                for b in bcm_cap_bids
+                if b.side == side and float(b.quantity_mw) > 1e-12
+            ]
+            if not bids_for_side:
+                return 0.0
+            qty = float(sum(float(b.quantity_mw) for b in bids_for_side))
+            value = float(
+                sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in bids_for_side)
             )
+            return float(value / max(qty, 1e-12))
+
+        # BCM capacity remuneration is pay-as-bid on already awarded/locked MW.
+        # The activation price is only used later by BEM activation clearing.
+        cap_bid_pos_settlement = (
+            _mean_bcm_capacity_bid_price("pos", res_pos_exec)
             if ((ob_pos > 0.0 or ob_neg > 0.0) and res_pos_exec > 1e-12)
             else 0.0
         )
         cap_bid_neg_settlement = (
-            _weighted_awarded_bid_price(
-                side="neg",
-                awarded_mw=res_neg_exec,
-                true_cap_price=float(true_cap_neg),
-            )
+            _mean_bcm_capacity_bid_price("neg", res_neg_exec)
             if ((ob_pos > 0.0 or ob_neg > 0.0) and res_neg_exec > 1e-12)
             else 0.0
         )
@@ -5419,8 +5584,8 @@ class BatteryBacktester:
             p_pos = float(bin_payload.get(f"submitted_afrr_pos_bin_{b}_price_eur_mw", 0.0))
             p_neg = float(bin_payload.get(f"submitted_afrr_neg_bin_{b}_price_eur_mw", 0.0))
             if ob_pos > 0.0 or ob_neg > 0.0:
-                aw_pos = s_pos if (s_pos > 0.0 and p_pos <= float(true_cap_pos) + 1e-12) else 0.0
-                aw_neg = s_neg if (s_neg > 0.0 and p_neg <= float(true_cap_neg) + 1e-12) else 0.0
+                aw_pos = s_pos if (s_pos > 0.0 and bool(cap_res.pos_awarded)) else 0.0
+                aw_neg = s_neg if (s_neg > 0.0 and bool(cap_res.neg_awarded)) else 0.0
             else:
                 aw_pos = 0.0
                 aw_neg = 0.0
@@ -5447,6 +5612,14 @@ class BatteryBacktester:
         act_pos_accepted = bool(act_res.pos_accepted)
         act_neg_accepted = bool(act_res.neg_accepted)
         is_bcm_obligation_hour = bool((ob_pos > 0.0) or (ob_neg > 0.0))
+        if ob_pos > 1e-12 and ob_neg > 1e-12:
+            bcm_direction = "both"
+        elif ob_pos > 1e-12:
+            bcm_direction = "pos"
+        elif ob_neg > 1e-12:
+            bcm_direction = "neg"
+        else:
+            bcm_direction = "none"
         # BEM-only is a source-specific stream and may coexist with BCM obligations.
         bem_only_submitted_pos_mw = float(bem_submitted_pos_mw)
         bem_only_submitted_neg_mw = float(bem_submitted_neg_mw)
@@ -5456,6 +5629,25 @@ class BatteryBacktester:
         bem_only_executed_neg_mwh = float(bem_only_executed_neg_mw * rate_neg_exec * self.dt_h)
         bcm_linked_pos_activation_mwh = float(bcm_source_pos_mw * rate_pos_exec * self.dt_h)
         bcm_linked_neg_activation_mwh = float(bcm_source_neg_mw * rate_neg_exec * self.dt_h)
+        bem_only_pos_activation_revenue_eur = float(bem_only_executed_pos_mwh * true_act_pos)
+        bem_only_neg_activation_revenue_eur = float(bem_only_executed_neg_mwh * true_act_neg)
+        bem_only_activation_revenue_eur = float(
+            bem_only_pos_activation_revenue_eur + bem_only_neg_activation_revenue_eur
+        )
+        bcm_linked_pos_activation_revenue_eur = float(bcm_linked_pos_activation_mwh * true_act_pos)
+        bcm_linked_neg_activation_revenue_eur = float(bcm_linked_neg_activation_mwh * true_act_neg)
+        bcm_linked_activation_revenue_eur = float(
+            bcm_linked_pos_activation_revenue_eur + bcm_linked_neg_activation_revenue_eur
+        )
+        bem_pos_activation_mwh = float(bcm_linked_pos_activation_mwh + bem_only_executed_pos_mwh)
+        bem_neg_activation_mwh = float(bcm_linked_neg_activation_mwh + bem_only_executed_neg_mwh)
+        bem_activation_revenue_eur = float(
+            bcm_linked_activation_revenue_eur + bem_only_activation_revenue_eur
+        )
+        bem_total_bid_volume_pos_mw = float(max(0.0, ob_pos) + bem_only_submitted_pos_mw)
+        bem_total_bid_volume_neg_mw = float(max(0.0, ob_neg) + bem_only_submitted_neg_mw)
+        bem_total_bid_volume_mw = float(max(bem_total_bid_volume_pos_mw, bem_total_bid_volume_neg_mw))
+        has_bem_bid_volume = bool(bem_total_bid_volume_mw > 1e-12)
         energy_prices = [
             float(v)
             for v in (obligation_energy_pos, obligation_energy_neg)
@@ -5468,6 +5660,14 @@ class BatteryBacktester:
         bcm_activation_bid_price_neg = float(
             np.mean([float(b.energy_price_eur_mwh) for b in bcm_cap_bids if b.side == "neg"])
         ) if any(b.side == "neg" for b in bcm_cap_bids) else 0.0
+        bem_activation_bid_price_pos = float(
+            np.mean([float(b.energy_price_eur_mwh) for b in bem_activation_bids if b.side == "pos"])
+        ) if any(b.side == "pos" for b in bem_activation_bids) else 0.0
+        bem_activation_bid_price_neg = float(
+            np.mean([float(b.energy_price_eur_mwh) for b in bem_activation_bids if b.side == "neg"])
+        ) if any(b.side == "neg" for b in bem_activation_bids) else 0.0
+        bcm_capacity_bid_price_pos = _mean_bcm_capacity_bid_price("pos", ob_pos)
+        bcm_capacity_bid_price_neg = _mean_bcm_capacity_bid_price("neg", ob_neg)
         if not allow_bcm:
             bcm_zero_reason = "bcm_disabled"
         elif (ob_pos > 1e-12 or ob_neg > 1e-12) and (bcm_source_pos_mw <= 1e-12 and bcm_source_neg_mw <= 1e-12):
@@ -5502,6 +5702,9 @@ class BatteryBacktester:
             ),
             "submitted_bem_only_pos_mw": float(bem_guard.get("submitted_bem_only_pos_mw", 0.0)),
             "submitted_bem_only_neg_mw": float(bem_guard.get("submitted_bem_only_neg_mw", 0.0)),
+            "bem_free_volume_pos_mw": float(bem_only_submitted_pos_mw),
+            "bem_free_volume_neg_mw": float(bem_only_submitted_neg_mw),
+            "bem_free_volume_mw": float(max(bem_only_submitted_pos_mw, bem_only_submitted_neg_mw)),
             "bem_only_pos_reduced_by_headroom_mw": float(bem_guard.get("bem_only_pos_reduced_by_headroom_mw", 0.0)),
             "bem_only_neg_reduced_by_headroom_mw": float(bem_guard.get("bem_only_neg_reduced_by_headroom_mw", 0.0)),
             "bem_only_headroom_guard_applied": float(bem_guard.get("bem_only_headroom_guard_applied", 0.0)),
@@ -5527,11 +5730,47 @@ class BatteryBacktester:
             "submitted_afrr_neg_mw": float(cap_res.submitted_neg_mw),
             "submitted_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
             "submitted_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "bcm_product_block_id": bcm_product_block_id,
+            "bcm_direction": bcm_direction,
+            "bcm_submitted_capacity_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
+            "bcm_capacity_cutoff_price_pos_eur_per_mw_h": float(true_cap_pos),
+            "bcm_capacity_cutoff_price_neg_eur_per_mw_h": float(true_cap_neg),
+            "bcm_capacity_cutoff_price_eur_per_mw_h": float(
+                true_cap_pos if ob_pos > 1e-12 else (true_cap_neg if ob_neg > 1e-12 else 0.0)
+            ),
+            "bcm_capacity_price_unit": "eur_per_mw_h",
             "locked_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
             "locked_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
             "bcm_allowed": float(allow_bcm),
             "bcm_activation_bid_price_pos": float(bcm_activation_bid_price_pos),
             "bcm_activation_bid_price_neg": float(bcm_activation_bid_price_neg),
+            "bem_activation_bid_price_pos_eur_per_mwh": float(bem_activation_bid_price_pos),
+            "bem_activation_bid_price_neg_eur_per_mwh": float(bem_activation_bid_price_neg),
+            "bem_activation_bid_price_eur_per_mwh": float(
+                (
+                    bem_activation_bid_price_pos if (ob_pos > 1e-12 or bem_only_submitted_pos_mw > 1e-12)
+                    else (bem_activation_bid_price_neg if (ob_neg > 1e-12 or bem_only_submitted_neg_mw > 1e-12) else 0.0)
+                )
+                if has_bem_bid_volume
+                else 0.0
+            ),
+            "bem_activation_price_decision_time_utc": str(bem_activation_price_decision_time_utc.isoformat()) if has_bem_bid_volume else "",
+            "bem_delivery_hour_start_utc": str(bem_delivery_hour_start_utc.isoformat()) if has_bem_bid_volume else "",
+            "bem_clearing_price_pos_eur_per_mwh": float(true_act_pos),
+            "bem_clearing_price_neg_eur_per_mwh": float(true_act_neg),
+            "bem_energy_settlement_price_eur_per_mwh": float(
+                (
+                    true_act_pos if (ob_pos > 1e-12 or bem_only_submitted_pos_mw > 1e-12)
+                    else (true_act_neg if (ob_neg > 1e-12 or bem_only_submitted_neg_mw > 1e-12) else 0.0)
+                )
+                if has_bem_bid_volume
+                else 0.0
+            ),
+            "bcm_capacity_bid_price_pos_eur_per_mw_h": float(bcm_capacity_bid_price_pos),
+            "bcm_capacity_bid_price_neg_eur_per_mw_h": float(bcm_capacity_bid_price_neg),
+            "bcm_pay_as_bid_settlement_price_eur_per_mw_h": float(
+                bcm_capacity_bid_price_pos if ob_pos > 1e-12 else (bcm_capacity_bid_price_neg if ob_neg > 1e-12 else 0.0)
+            ),
             "true_activation_price_pos": float(true_act_pos),
             "true_activation_price_neg": float(true_act_neg),
             "bcm_true_activation_price_pos": float(true_act_pos),
@@ -5540,6 +5779,18 @@ class BatteryBacktester:
             "bcm_cleared_neg": float(bcm_source_neg_mw > 1e-12),
             "bcm_locked_pos_mw": float(ob_pos),
             "bcm_locked_neg_mw": float(ob_neg),
+            "bcm_awarded_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
+            "bcm_awarded_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "bcm_capacity_accepted_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
+            "bcm_available_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
+            "bcm_available_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "bcm_capacity_available_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
+            "bcm_to_bem_energy_obligation_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
+            "bcm_to_bem_energy_obligation_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "bcm_to_bem_mandatory_volume_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
+            "bcm_capacity_bid_has_activation_price": 0.0,
+            "bcm_clearing_uses_activation_price": 0.0,
+            "bcm_to_bem_activation_price_transferred": 0.0,
             "bcm_zero_reason": bcm_zero_reason,
             "afrr_bcm_auction_cleared": float((ob_pos > 0.0) or (ob_neg > 0.0)),
             "fixed_reserve_obligation_pos_mw": float(ob_pos),
@@ -5553,8 +5804,28 @@ class BatteryBacktester:
             "bem_only_executed_neg_mw": float(bem_only_executed_neg_mw),
             "bem_only_executed_pos_mwh": float(bem_only_executed_pos_mwh),
             "bem_only_executed_neg_mwh": float(bem_only_executed_neg_mwh),
+            "bem_only_pos_activation_revenue_eur": float(bem_only_pos_activation_revenue_eur),
+            "bem_only_neg_activation_revenue_eur": float(bem_only_neg_activation_revenue_eur),
+            "bem_only_activation_revenue_eur": float(bem_only_activation_revenue_eur),
+            "bem_free_pos_activation_mwh": float(bem_only_executed_pos_mwh),
+            "bem_free_neg_activation_mwh": float(bem_only_executed_neg_mwh),
+            "bem_free_activation_revenue_eur": float(bem_only_activation_revenue_eur),
+            "bem_total_bid_volume_pos_mw": float(bem_total_bid_volume_pos_mw),
+            "bem_total_bid_volume_neg_mw": float(bem_total_bid_volume_neg_mw),
+            "bem_total_bid_volume_mw": float(bem_total_bid_volume_mw),
+            "bem_pos_activation_mwh": float(bem_pos_activation_mwh),
+            "bem_neg_activation_mwh": float(bem_neg_activation_mwh),
+            "bem_activated_energy_pos_mwh": float(bem_pos_activation_mwh),
+            "bem_activated_energy_neg_mwh": float(bem_neg_activation_mwh),
+            "bem_activated_energy_mwh": float(
+                bem_pos_activation_mwh + bem_neg_activation_mwh
+            ),
+            "bem_activation_revenue_eur": float(bem_activation_revenue_eur),
             "bcm_linked_pos_activation_mwh": float(bcm_linked_pos_activation_mwh),
             "bcm_linked_neg_activation_mwh": float(bcm_linked_neg_activation_mwh),
+            "bcm_linked_pos_activation_revenue_eur": float(bcm_linked_pos_activation_revenue_eur),
+            "bcm_linked_neg_activation_revenue_eur": float(bcm_linked_neg_activation_revenue_eur),
+            "bcm_linked_activation_revenue_eur": float(bcm_linked_activation_revenue_eur),
             "bem_only_pos_activation_mwh": float(bem_only_executed_pos_mwh),
             "bem_only_neg_activation_mwh": float(bem_only_executed_neg_mwh),
             "activation_split_method": "source_mwh",
@@ -6292,30 +6563,29 @@ class BatteryBacktester:
                     source=source,
                     colmap=colmap,
                 )
-            e_pos = 0.0
-            e_neg = 0.0
+            # BCM/RLM capacity bids do not carry activation prices. BEM/RAM
+            # activation prices are assigned later per delivery hour at T-1h.
+            e_pos = float("nan")
+            e_neg = float("nan")
             block_start_utc = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce").min()
             block_end_utc = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce").max()
             reserve_product_block_id = f"{next_day_cet.date().isoformat()}_h{block_start:02d}-{block_end:02d}"
             reserve_commitment_id = (
                 f"{pd.to_datetime(snapshot_ts, utc=True, errors='coerce').isoformat()}|{reserve_product_block_id}"
             )
-            for b in cap_bids:
-                if b.side == "pos":
-                    e_pos = float(b.energy_price_eur_mwh)
-                elif b.side == "neg":
-                    e_neg = float(b.energy_price_eur_mwh)
-
             def _submitted_capacity_price_for_side(side: str, awarded_mw: float) -> float:
-                aw = max(0.0, float(awarded_mw))
-                if aw <= 1e-12:
+                if float(awarded_mw) <= 1e-12:
                     return 0.0
-                side_bids = [b for b in cap_bids if b.side == side and float(b.quantity_mw) > 0.0]
-                if not side_bids:
+                bids_for_side = [
+                    b for b in cap_bids if b.side == side and float(b.quantity_mw) > 1e-12
+                ]
+                if not bids_for_side:
                     return 0.0
-                qty = float(sum(float(b.quantity_mw) for b in side_bids))
-                num = float(sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in side_bids))
-                return float(num / max(qty, 1e-12))
+                qty = float(sum(float(b.quantity_mw) for b in bids_for_side))
+                value = float(
+                    sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in bids_for_side)
+                )
+                return float(value / max(qty, 1e-12))
 
             cap_price_pos_awarded = _submitted_capacity_price_for_side("pos", float(cap_res.awarded_pos_mw))
             cap_price_neg_awarded = _submitted_capacity_price_for_side("neg", float(cap_res.awarded_neg_mw))
@@ -6592,7 +6862,7 @@ class BatteryBacktester:
         offered_pos: float,
         offered_neg: float,
         is_perfect_foresight: bool = False,
-    ) -> tuple[list[AFRRCapacityBid], pd.Series]:
+    ) -> tuple[list[BCMCapacityBid], pd.Series]:
         """Build submitted aFRR capacity bids using forecast-side information only."""
         ts_idx = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce")
         sblk = source.reindex(ts_idx).copy()
@@ -6600,17 +6870,10 @@ class BatteryBacktester:
         # Forecast-side pricing inputs only (no realized capacity clearing prices).
         pred_cap_pos = float(pd.to_numeric(sblk.get(colmap.pred_afrr_capacity_price_pos), errors="coerce").mean())
         pred_cap_neg = float(pd.to_numeric(sblk.get(colmap.pred_afrr_capacity_price_neg), errors="coerce").mean())
-        pred_act_pos = float(pd.to_numeric(sblk.get(colmap.pred_afrr_activation_price_pos), errors="coerce").mean())
-        pred_act_neg = float(pd.to_numeric(sblk.get(colmap.pred_afrr_activation_price_neg), errors="coerce").mean())
-
         if not np.isfinite(pred_cap_pos):
             pred_cap_pos = 0.0
         if not np.isfinite(pred_cap_neg):
             pred_cap_neg = 0.0
-        if not np.isfinite(pred_act_pos):
-            pred_act_pos = 0.0
-        if not np.isfinite(pred_act_neg):
-            pred_act_neg = 0.0
 
         cap_bids = self.bid_builder.build_afrr_capacity_bids(
             ts=ts_idx.iloc[0] if len(ts_idx) else snapshot_ts,
@@ -6618,8 +6881,8 @@ class BatteryBacktester:
             reserve_neg_mw=offered_neg,
             pred_cap_pos=pred_cap_pos,
             pred_cap_neg=pred_cap_neg,
-            pred_act_pos=pred_act_pos,
-            pred_act_neg=pred_act_neg,
+            pred_act_pos=0.0,
+            pred_act_neg=0.0,
             is_perfect_foresight=is_perfect_foresight,
         )
         return cap_bids, ts_idx
@@ -6627,32 +6890,24 @@ class BatteryBacktester:
     def _clear_afrr_capacity_block_against_truth(
         self,
         *,
-        cap_bids: list[AFRRCapacityBid],
+        cap_bids: list[BCMCapacityBid],
         ts_idx: pd.Series,
         source: pd.DataFrame,
         colmap: BacktestColumnMap,
     ):
-        """BCM preselection auction: submitted activation-price bids vs realized activation prices."""
+        """BCM capacity auction: submitted capacity bids vs realized capacity prices."""
         sblk = source.reindex(ts_idx).copy()
         true_cap_pos = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_pos), errors="coerce").mean())
         true_cap_neg = float(pd.to_numeric(sblk.get(colmap.true_afrr_capacity_price_neg), errors="coerce").mean())
-        true_act_pos = float(pd.to_numeric(sblk.get(colmap.true_afrr_activation_price_pos), errors="coerce").mean())
-        true_act_neg = float(pd.to_numeric(sblk.get(colmap.true_afrr_activation_price_neg), errors="coerce").mean())
         if not np.isfinite(true_cap_pos):
             true_cap_pos = 0.0
         if not np.isfinite(true_cap_neg):
             true_cap_neg = 0.0
-        if not np.isfinite(true_act_pos):
-            true_act_pos = 0.0
-        if not np.isfinite(true_act_neg):
-            true_act_neg = 0.0
         return self.market_clearing_engine.clear_afrr_capacity(
             cap_bids,
             true_cap_pos=true_cap_pos,
             true_cap_neg=true_cap_neg,
-            true_act_pos=true_act_pos,
-            true_act_neg=true_act_neg,
-            clearing_price_basis="activation_price",
+            clearing_price_basis="capacity_price",
         )
 
     def optimize_dispatch_rolling(
@@ -9240,6 +9495,7 @@ class BatteryBacktester:
             m["bcm_linked_activation_revenue_eur"] = float(
                 act_split.get("bcm_linked_activation_revenue_eur", 0.0)
             )
+            m["bcm_linked_bem_activation_revenue_eur"] = float(m["bcm_linked_activation_revenue_eur"])
             m["bcm_total_revenue_eur"] = float(
                 m["bcm_capacity_revenue_eur"] + m["bcm_linked_activation_revenue_eur"]
             )

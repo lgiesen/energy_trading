@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from .bid_builder import AFRRCapacityBid, DABid
+from .bid_builder import AFRRCapacityBid, BCMCapacityBid, DABid
 
 
 @dataclass(frozen=True)
@@ -50,7 +50,7 @@ class MarketClearingEngine:
 
     def clear_afrr_capacity(
         self,
-        bids: Iterable[AFRRCapacityBid],
+        bids: Iterable[AFRRCapacityBid | BCMCapacityBid],
         *,
         true_cap_pos: float,
         true_cap_neg: float,
@@ -69,6 +69,8 @@ class MarketClearingEngine:
             if b.side == "pos":
                 submitted_pos += b.quantity_mw
                 if basis == "activation_price":
+                    if not hasattr(b, "energy_price_eur_mwh"):
+                        raise ValueError("activation_price clearing requires BEM activation bids with energy prices")
                     clears = float(b.energy_price_eur_mwh) <= float(0.0 if true_act_pos is None else true_act_pos)
                 else:
                     clears = float(b.capacity_price_eur_mw) <= float(true_cap_pos)
@@ -77,6 +79,8 @@ class MarketClearingEngine:
             elif b.side == "neg":
                 submitted_neg += b.quantity_mw
                 if basis == "activation_price":
+                    if not hasattr(b, "energy_price_eur_mwh"):
+                        raise ValueError("activation_price clearing requires BEM activation bids with energy prices")
                     if self.forecast_value_mode == "canonical_economic":
                         clears = float(b.energy_price_eur_mwh) <= float(0.0 if true_act_neg is None else true_act_neg)
                     else:

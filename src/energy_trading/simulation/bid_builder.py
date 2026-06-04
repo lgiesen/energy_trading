@@ -16,11 +16,21 @@ class DABid:
 
 
 @dataclass(frozen=True)
+class BCMCapacityBid:
+    ts: pd.Timestamp
+    side: str  # "pos" | "neg"
+    quantity_mw: float
+    capacity_price_eur_mw: float
+
+
+@dataclass(frozen=True)
 class AFRRCapacityBid:
     ts: pd.Timestamp
     side: str  # "pos" | "neg"
     quantity_mw: float
     capacity_price_eur_mw: float
+    # Later BEM activation bid price for the awarded capacity. BCM capacity
+    # clearing must use capacity_price_eur_mw, not this activation price.
     energy_price_eur_mwh: float
 
 
@@ -168,8 +178,8 @@ class BidBuilder:
         pred_act_pos: float,
         pred_act_neg: float,
         is_perfect_foresight: bool = False,
-    ) -> list[AFRRCapacityBid]:
-        bids: list[AFRRCapacityBid] = []
+    ) -> list[BCMCapacityBid]:
+        bids: list[BCMCapacityBid] = []
         q_pos = self._qfloor(float(reserve_pos_mw), self.afrr_step_mw)
         q_neg = self._qfloor(float(reserve_neg_mw), self.afrr_step_mw)
         if 0.0 < q_pos < self.afrr_min_bid_size_mw:
@@ -184,18 +194,11 @@ class BidBuilder:
             )
         if q_pos > 0.0:
             bids.append(
-                AFRRCapacityBid(
+                BCMCapacityBid(
                     ts=ts,
                     side="pos",
                     quantity_mw=q_pos,
-                    # Capacity is settled pay-as-bid: in perfect_foresight mode (pred=true),
-                    # bid at forecast/true capacity price to both clear and keep
-                    # economically consistent remuneration.
                     capacity_price_eur_mw=cap_bid_pos,
-                    energy_price_eur_mwh=self._energy_price(
-                        side="pos",
-                        pred=float(pred_act_pos),
-                    ),
                 )
             )
         if q_neg > 0.0:
@@ -206,15 +209,11 @@ class BidBuilder:
             )
         if q_neg > 0.0:
             bids.append(
-                AFRRCapacityBid(
+                BCMCapacityBid(
                     ts=ts,
                     side="neg",
                     quantity_mw=q_neg,
                     capacity_price_eur_mw=cap_bid_neg,
-                    energy_price_eur_mwh=self._energy_price(
-                        side="neg",
-                        pred=float(pred_act_neg),
-                    ),
                 )
             )
         return bids

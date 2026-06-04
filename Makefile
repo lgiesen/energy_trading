@@ -32,6 +32,7 @@ GRID_STRATEGIES ?= multi da afrr
 GRID_QUANTILE_PAIRS ?= $(SIM_QUANTILE_SWEEP_DEFAULT)
 GRID_SMOKE_HOURS ?= 24
 SIM_GRID_STAMP ?= $(shell date +%Y%m%d_%H%M%S)
+SIM_BACKTEST_DEFAULT_ARGS ?= --strict-simulation-validity --final-soc-mode hard --id-recourse-mode common --clean-output
 
 # Run IDs for training outputs (evaluated once per make invocation)
 RUN_ID_XGB := xgb_$(shell date +%Y%m%d_%H%M%S)
@@ -366,11 +367,12 @@ $($(1)_SIM_DONE): $$($(1)_MANIFEST)
 	fi; \
 	case "$$$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$$$SIM_HOURS' (manifest=$$($(1)_MANIFEST))"; exit 1;; esac; \
 	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=(sim_start+pd.Timedelta(days=int('$(SIM_SMOKE_DAYS)'))) if '$(IS_SMOKE_TEST)'=='1' else test_end;print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
-	for DA_ROLE in $(SIM_DA_ROLES); do \
-	  OUT_ROOT="artifacts/simulation_runs/default_$(2)_$(3)/$$$$DA_ROLE"; \
-	  echo "[SIM] model=$(2) run_id=$(3) manifest=$$($(1)_MANIFEST) horizon_hours=$$$$SIM_HOURS da_role=$$$$DA_ROLE start=$$$$SIM_START end=$$$$SIM_END out=$$$$OUT_ROOT"; \
-	  python3 scripts/run_battery_backtest.py \
-	    --run-manifest "$$($(1)_MANIFEST)" \
+	  for DA_ROLE in $(SIM_DA_ROLES); do \
+	    OUT_ROOT="artifacts/simulation_runs/default_$(2)_$(3)/$$$$DA_ROLE"; \
+	    echo "[SIM] model=$(2) run_id=$(3) manifest=$$($(1)_MANIFEST) horizon_hours=$$$$SIM_HOURS da_role=$$$$DA_ROLE start=$$$$SIM_START end=$$$$SIM_END out=$$$$OUT_ROOT"; \
+	    python3 scripts/run_battery_backtest.py \
+	      $(SIM_BACKTEST_DEFAULT_ARGS) \
+	      --run-manifest "$$($(1)_MANIFEST)" \
 	    --split test \
 	    --model-key $(2) \
 	    --horizon-hours "$$$$SIM_HOURS" \
@@ -414,6 +416,7 @@ sim-latest-xgb: ## Standalone simulation from artifacts/model_runs/latest_xgboos
 	for DA_ROLE in $(SIM_DA_ROLES); do \
 	  for STRAT in $(SIM_STRATEGIES); do \
 	    python3 scripts/run_battery_backtest.py \
+	      $(SIM_BACKTEST_DEFAULT_ARGS) \
 	      --run-manifest "$$MANIFEST_PATH" \
 	      --split test \
 	      --model-key xgboost \
@@ -450,6 +453,7 @@ sim-latest-linear: ## Standalone simulation from artifacts/model_runs/latest_lin
 	for DA_ROLE in $(SIM_DA_ROLES); do \
 	  for STRAT in $(SIM_STRATEGIES); do \
 	    python3 scripts/run_battery_backtest.py \
+	      $(SIM_BACKTEST_DEFAULT_ARGS) \
 	      --run-manifest "$$MANIFEST_PATH" \
 	      --split test \
 	      --model-key linear \
@@ -486,6 +490,7 @@ sim-latest-tft: ## Standalone simulation from artifacts/model_runs/latest_tft.js
 	for DA_ROLE in $(SIM_DA_ROLES); do \
 	  for STRAT in $(SIM_STRATEGIES); do \
 	    python3 scripts/run_battery_backtest.py \
+	      $(SIM_BACKTEST_DEFAULT_ARGS) \
 	      --run-manifest "$$MANIFEST_PATH" \
 	      --split test \
 	      --model-key tft \
@@ -518,6 +523,7 @@ sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs
 	      echo "[GRID] model=$$MODEL strategy=$$STRAT da_role=$$DA_ROLE out=$$OUT_ROOT"; \
 	      BACKTEST_MILP_TIME_LIMIT_S=300 BACKTEST_MILP_REL_GAP=1e-4 \
 	      ./.venv/bin/python -u scripts/run_battery_backtest.py \
+	        $(SIM_BACKTEST_DEFAULT_ARGS) \
 	        --run-manifest "$$MANIFEST" \
 	        --split test \
 	        --model-key "$$MODEL" \
@@ -546,6 +552,7 @@ sim-grid-smoke: ## Smoke grid: all models x strategies x DA roles x quantile pai
 	      echo "[GRID-SMOKE] model=$$MODEL strategy=$$STRAT da_role=$$DA_ROLE out=$$OUT_ROOT"; \
 	      BACKTEST_MILP_TIME_LIMIT_S=120 BACKTEST_MILP_REL_GAP=1e-4 \
 	      ./.venv/bin/python -u scripts/run_battery_backtest.py \
+	        $(SIM_BACKTEST_DEFAULT_ARGS) \
 	        --run-manifest "$$MANIFEST" \
 	        --split test \
 	        --model-key "$$MODEL" \
@@ -614,6 +621,7 @@ sim-hybrid: build-hybrid ## Simulate champion-by-target hybrid table
 	@OUT_USE="$(or $(HYBRID_OUT),artifacts/simulation_runs/hybrid/test/backtest_table_test.parquet)"; \
 	SPLIT_USE="$(or $(HYBRID_SPLIT),test)"; \
 	python3 scripts/run_battery_backtest.py \
+	  $(SIM_BACKTEST_DEFAULT_ARGS) \
 	  --predictions "$${OUT_USE}" \
 	  --ground-truth "$(HYBRID_GROUND_TRUTH)" \
 	  --split "$${SPLIT_USE}" \

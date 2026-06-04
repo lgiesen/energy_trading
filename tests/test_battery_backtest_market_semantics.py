@@ -23,11 +23,16 @@ from energy_trading.simulation.battery_backtest import (  # noqa: E402
     BatteryBacktester,
     StrategyPermissions,
     assign_bcm_capacity_block,
+    bcm_capacity_ev_eur,
+    bcm_capacity_hourly_revenue_decomposition_eur,
+    bcm_capacity_revenue_eur,
+    bcm_linked_bem_activation_ev_eur,
+    bcm_product_to_bem_mandatory_volume,
     canonicalize_market_frame,
     load_prediction_warehouse_long,
 )
 from energy_trading.config import MODEL_SPECS  # noqa: E402
-from energy_trading.simulation.bid_builder import AFRRCapacityBid  # noqa: E402
+from energy_trading.simulation.bid_builder import AFRRCapacityBid, BCMCapacityBid  # noqa: E402
 from energy_trading.simulation.market_clearing import AFRRCapacityClearingResult, MarketClearingEngine  # noqa: E402
 from scripts.run_battery_backtest import (  # noqa: E402
     _build_daily_performance_metrics,
@@ -48,6 +53,127 @@ from scripts import validate_simulation_outputs as validate_outputs  # noqa: E40
 def _mk_backtester(forecast_value_mode: str = "raw_signed") -> BatteryBacktester:
     MODEL_SPECS["forecast_value_mode"] = forecast_value_mode
     return BatteryBacktester()
+
+
+def test_bcm_capacity_toy_ev_arithmetic() -> None:
+    assert bcm_capacity_ev_eur(
+        p_accept=1.0,
+        capacity_mw=1.0,
+        capacity_bid_price_eur_per_mw_h=20.0,
+        product_duration_h=4.0,
+    ) == pytest.approx(80.0)
+    assert bcm_capacity_ev_eur(
+        p_accept=0.5,
+        capacity_mw=1.0,
+        capacity_bid_price_eur_per_mw_h=20.0,
+        product_duration_h=4.0,
+    ) == pytest.approx(40.0)
+
+
+def test_bcm_capacity_toy_hourly_decomposition_is_accounting_only() -> None:
+    hourly = bcm_capacity_hourly_revenue_decomposition_eur(
+        accepted_available_mw=1.0,
+        own_capacity_bid_price_eur_per_mw_h=20.0,
+        product_start_utc=pd.Timestamp("2026-01-01T16:00:00Z"),
+        product_duration_h=4,
+    )
+    assert list(hourly.index) == list(pd.date_range("2026-01-01T16:00:00Z", periods=4, freq="h"))
+    assert hourly.tolist() == pytest.approx([20.0, 20.0, 20.0, 20.0])
+    assert float(hourly.sum()) == pytest.approx(80.0)
+
+    mc = MarketClearingEngine()
+    bid = BCMCapacityBid(
+        ts=pd.Timestamp("2026-01-01T16:00:00Z"),
+        side="pos",
+        quantity_mw=1.0,
+        capacity_price_eur_mw=20.0,
+    )
+    accepted = mc.clear_afrr_capacity([bid], true_cap_pos=20.0, true_cap_neg=0.0)
+    rejected = mc.clear_afrr_capacity([bid], true_cap_pos=10.0, true_cap_neg=0.0)
+    assert float(accepted.awarded_pos_mw) == pytest.approx(1.0)
+    assert float(rejected.awarded_pos_mw) == pytest.approx(0.0)
+
+
+def test_bcm_capacity_toy_rejected_bid_zero_revenue_and_no_mandatory_bem() -> None:
+    mc = MarketClearingEngine()
+    bid = BCMCapacityBid(
+        ts=pd.Timestamp("2026-01-01T16:00:00Z"),
+        side="pos",
+        quantity_mw=1.0,
+        capacity_price_eur_mw=20.0,
+    )
+    result = mc.clear_afrr_capacity([bid], true_cap_pos=10.0, true_cap_neg=0.0)
+    mandatory = bcm_product_to_bem_mandatory_volume(
+        accepted_capacity_mw=float(result.awarded_pos_mw),
+        product_start_utc=pd.Timestamp("2026-01-01T16:00:00Z"),
+        resolution="hourly",
+    )
+    assert float(result.awarded_pos_mw) == pytest.approx(0.0)
+    assert bcm_capacity_revenue_eur(
+        accepted_available_mw=float(result.awarded_pos_mw),
+        own_capacity_bid_price_eur_per_mw_h=20.0,
+    ) == pytest.approx(0.0)
+    assert mandatory.tolist() == pytest.approx([0.0, 0.0, 0.0, 0.0])
+
+
+def test_bcm_product_mapping_toy_hourly_and_quarter_hourly() -> None:
+    hourly = bcm_product_to_bem_mandatory_volume(
+        accepted_capacity_mw=2.0,
+        product_start_utc=pd.Timestamp("2026-01-01T16:00:00Z"),
+        resolution="hourly",
+    )
+    quarters = bcm_product_to_bem_mandatory_volume(
+        accepted_capacity_mw=2.0,
+        product_start_utc=pd.Timestamp("2026-01-01T16:00:00Z"),
+        resolution="quarter_hour",
+    )
+    assert len(hourly) == 4
+    assert hourly.tolist() == pytest.approx([2.0, 2.0, 2.0, 2.0])
+    assert len(quarters) == 16
+    assert quarters.iloc[0] == pytest.approx(2.0)
+    assert quarters.iloc[-1] == pytest.approx(2.0)
+    assert quarters.index[0] == pd.Timestamp("2026-01-01T16:00:00Z")
+    assert quarters.index[-1] == pd.Timestamp("2026-01-01T19:45:00Z")
+
+
+def test_bcm_pay_as_bid_toy_never_uses_activation_or_cutoff_price() -> None:
+    own_bid_price = 20.0
+    activation_price = 1000.0
+    cutoff_price = 30.0
+    revenue = bcm_capacity_revenue_eur(
+        accepted_available_mw=1.0,
+        own_capacity_bid_price_eur_per_mw_h=own_bid_price,
+        product_duration_h=4.0,
+    )
+    assert revenue == pytest.approx(80.0)
+    assert revenue != pytest.approx(1.0 * activation_price * 4.0)
+    assert revenue != pytest.approx(1.0 * cutoff_price * 4.0)
+
+
+def test_bcm_linked_activation_toy_capacity_volume_enters_once() -> None:
+    ev = bcm_linked_bem_activation_ev_eur(
+        accepted_capacity_mw=2.0,
+        activation_fraction=0.25,
+        interval_duration_h=1.0,
+        settlement_price_eur_per_mwh=100.0,
+    )
+    assert ev == pytest.approx(2.0 * 0.25 * 1.0 * 100.0)
+    assert ev != pytest.approx(2.0 * 2.0 * 0.25 * 1.0 * 100.0)
+
+
+def test_bcm_product_toy_price_and_acceptance_probability_block_constant() -> None:
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2026-01-01T15:00:00Z", periods=4, freq="h"),
+            "p_cap_bid": [20.0, 20.0, 20.0, 20.0],
+            "p_accept": [0.5, 0.5, 0.5, 0.5],
+        }
+    )
+    block = assign_bcm_capacity_block(hourly["timestamp_utc"])
+    hourly["block"] = block["bcm_capacity_block_id"].astype(str).to_numpy()
+    assert hourly["block"].nunique() == 1
+    assert hourly.groupby("block")["p_cap_bid"].nunique().iloc[0] == 1
+    assert hourly.groupby("block")["p_accept"].nunique().iloc[0] == 1
 
 
 def test_terminal_id_recovery_converts_internal_shortfall_to_grid_mwh() -> None:
@@ -730,7 +856,7 @@ def test_simulation_forecast_loader_clips_activation_rates() -> None:
     assert np.isclose(float(out.loc[0, col.true_afrr_activation_rate_neg]), 0.0)
 
 
-def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
+def test_bcm_capacity_bid_award_then_pay_as_bid_capacity_revenue() -> None:
     bt = _mk_backtester()
     n_bins = len(bt.afrr_quantile_bins)
     out = bt._apply_market_clearing(
@@ -761,6 +887,12 @@ def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
     )
     assert np.isclose(float(out["executed_reserve_pos_mw"]), 5.0)
     assert np.isclose(float(out["settlement_cap_bid_price_pos_eur_mw"]), 20.0)
+    assert np.isclose(float(out["bcm_capacity_bid_price_pos_eur_per_mw_h"]), 20.0)
+    assert np.isclose(float(out["bcm_awarded_capacity_pos_mw"]), 5.0)
+    assert np.isclose(float(out["bcm_to_bem_energy_obligation_pos_mw"]), 5.0)
+    assert np.isclose(float(out["bcm_activation_bid_price_pos"]), 80.0)
+    assert np.isclose(float(out["bem_activation_bid_price_pos_eur_per_mwh"]), 80.0)
+    assert np.isclose(float(out["bem_clearing_price_pos_eur_per_mwh"]), 80.0)
 
     _, m = bt._settle_one_hour(
         soc=bt.soc_init,
@@ -780,6 +912,7 @@ def test_bcm_pay_as_bid_capacity_settlement_price_and_revenue() -> None:
     )
     assert np.isclose(float(m["revenue_capacity_eur"]), 5.0 * 20.0 * bt.dt_h), m
     assert np.isclose(float(m["bcm_capacity_revenue_eur"]), 5.0 * 20.0 * bt.dt_h), m
+    assert str(m["bcm_capacity_price_source"]) == "submitted_capacity_bid_pay_as_bid"
 
 
 def test_bcm_capacity_and_linked_activation_revenue_are_separate() -> None:
@@ -813,6 +946,33 @@ def test_bcm_capacity_and_linked_activation_revenue_are_separate() -> None:
     assert capacity_revenue == pytest.approx(3.0 * 50.0 * 4.0)
     assert activation_revenue == pytest.approx(2.0 * 1200.0)
     assert gross_revenue == pytest.approx(3000.0)
+
+
+def test_bcm_capacity_pay_as_bid_without_activation_is_paid_over_product() -> None:
+    bt = _mk_backtester("canonical_economic")
+    capacity_revenue = 0.0
+
+    for _ in range(4):
+        _, m = bt._settle_one_hour(
+            soc=bt.soc_init,
+            charge=0.0,
+            discharge=0.0,
+            reserve_pos=4.0,
+            reserve_neg=0.0,
+            da_price=0.0,
+            cap_pos=0.0,
+            cap_neg=0.0,
+            act_pos_price=1200.0,
+            act_neg_price=0.0,
+            act_pos_rate=0.0,
+            act_neg_rate=0.0,
+            cap_bid_pos=50.0,
+            cap_bid_neg=0.0,
+        )
+        capacity_revenue += float(m["bcm_capacity_revenue_eur"])
+        assert float(m["revenue_activation_eur"]) == pytest.approx(0.0)
+
+    assert capacity_revenue == pytest.approx(4.0 * 50.0 * 4.0)
 
 
 def test_bcm_ev_capacity_term_uses_capacity_price_per_mw() -> None:
@@ -937,6 +1097,184 @@ def test_bcm_bem_ev_probability_and_efficiency_conventions() -> None:
     )
     assert float(out[f"ev_bem_neg_coef_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
         expected_bem_activation_neg - expected_bem_cost_neg
+    )
+
+
+def test_bcm_p_award_is_block_constant_within_bcm_products() -> None:
+    bt = _mk_backtester("canonical_economic")
+    hours = 8
+    df, col = _tiny_backtest_df(hours=hours)
+
+    # Fill meaningful aFRR inputs so EV diagnostics are populated for all bins.
+    df[col.pred_afrr_capacity_price_pos] = [80.0] * hours
+    df[col.pred_afrr_capacity_price_neg] = [60.0] * hours
+    df[col.pred_afrr_activation_price_pos] = [100.0] * hours
+    df[col.pred_afrr_activation_price_neg] = [120.0] * hours
+    df[col.pred_afrr_activation_rate_pos] = [0.2] * hours
+    df[col.pred_afrr_activation_rate_neg] = [0.3] * hours
+    for q in bt.afrr_quantile_bins:
+        df[f"{col.pred_afrr_capacity_price_pos}_{q}"] = [80.0 + i for i in range(hours)]
+        df[f"{col.pred_afrr_capacity_price_neg}_{q}"] = [60.0 + i for i in range(hours)]
+        df[f"{col.pred_afrr_activation_price_pos}_{q}"] = [100.0] * hours
+        df[f"{col.pred_afrr_activation_price_neg}_{q}"] = [120.0] * hours
+        df[f"{col.pred_afrr_activation_rate_pos}_{q}"] = [0.2] * hours
+        df[f"{col.pred_afrr_activation_rate_neg}_{q}"] = [0.3] * hours
+
+    # Constant per actual 4h BCM product blocks, with at least two distinct products.
+    block_ids = assign_bcm_capacity_block(df[col.timestamp])["bcm_capacity_block_id"].to_numpy(dtype=str)
+    unique_blocks = pd.unique(block_ids)
+    assert len(unique_blocks) >= 2
+    for b in range(len(bt.afrr_quantile_bins)):
+        block0_prob = 0.25 + 0.01 * b
+        block1_prob = 0.65 + 0.01 * b
+        ppos = [block1_prob if blk == unique_blocks[1] else block0_prob for blk in block_ids]
+        pneg = [0.55 + 0.01 * b if blk == unique_blocks[1] else (0.15 + 0.01 * b) for blk in block_ids]
+        df[f"pacc_pos_bin_{b}"] = ppos
+        df[f"pacc_neg_bin_{b}"] = pneg
+
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR", "BCM", "BEM"),
+        deterministic_reserve_settlement=False,
+        strict_input_validation=False,
+    )
+    for b in range(len(bt.afrr_quantile_bins)):
+        pos_col = f"ev_bcm_p_award_pos_bin_{b}"
+        neg_col = f"ev_bcm_p_award_neg_bin_{b}"
+        hourly_pos_coef_col = f"ev_rpos_coef_bin_{b}_eur_per_mw"
+        hourly_neg_coef_col = f"ev_rneg_coef_bin_{b}_eur_per_mw"
+        product_pos_coef_col = f"ev_bcm_product_coef_pos_bin_{b}_eur_per_mw"
+        product_neg_coef_col = f"ev_bcm_product_coef_neg_bin_{b}_eur_per_mw"
+        cap_price_pos_col = f"ev_bcm_capacity_bid_price_pos_bin_{b}_eur_per_mw_h"
+        cap_price_neg_col = f"ev_bcm_capacity_bid_price_neg_bin_{b}_eur_per_mw_h"
+        assert pos_col in out.columns
+        assert neg_col in out.columns
+        assert cap_price_pos_col in out.columns
+        assert cap_price_neg_col in out.columns
+        assert product_pos_coef_col in out.columns
+        assert product_neg_coef_col in out.columns
+        out_blocked = out.copy()
+        out_blocked["_bcm_block"] = block_ids
+        by_block_pos = {}
+        by_block_neg = {}
+        for _, grp in out_blocked.groupby("_bcm_block"):
+            pvals = grp[pos_col].astype(float).to_numpy()
+            nvals = grp[neg_col].astype(float).to_numpy()
+            cap_pos_vals = grp[cap_price_pos_col].astype(float).to_numpy()
+            cap_neg_vals = grp[cap_price_neg_col].astype(float).to_numpy()
+            if len(pvals) > 1:
+                assert np.allclose(pvals, pvals[0])
+            if len(nvals) > 1:
+                assert np.allclose(nvals, nvals[0])
+            if len(cap_pos_vals) > 1:
+                assert np.allclose(cap_pos_vals, cap_pos_vals[0])
+            if len(cap_neg_vals) > 1:
+                assert np.allclose(cap_neg_vals, cap_neg_vals[0])
+            by_block_pos[grp["_bcm_block"].iloc[0]] = float(pvals[0])
+            by_block_neg[grp["_bcm_block"].iloc[0]] = float(nvals[0])
+            assert np.allclose(
+                grp[product_pos_coef_col].astype(float).to_numpy(),
+                float(grp[hourly_pos_coef_col].astype(float).sum()),
+            )
+            assert np.allclose(
+                grp[product_neg_coef_col].astype(float).to_numpy(),
+                float(grp[hourly_neg_coef_col].astype(float).sum()),
+            )
+
+        assert len(by_block_pos) >= 2
+        assert by_block_pos[unique_blocks[0]] != by_block_pos[unique_blocks[1]]
+        assert by_block_neg[unique_blocks[0]] != by_block_neg[unique_blocks[1]]
+
+
+def test_bcm_auxiliary_ev_is_not_multiplied_by_product_duration_twice() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.afrr_offer_cost_eur_mw_h = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.aux_standby_mw = 1.0
+    bt.aux_trading_mw = 0.0
+
+    df, col = _tiny_backtest_df(hours=4)
+    df[col.timestamp] = pd.date_range("2026-01-01T03:00:00Z", periods=4, freq="h")
+    df[col.pred_da_price] = [100.0] * 4
+    for q in bt.afrr_quantile_bins:
+        df[f"{col.pred_afrr_capacity_price_pos}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_capacity_price_neg}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_activation_price_pos}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_activation_price_neg}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_activation_rate_pos}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_activation_rate_neg}_{q}"] = [0.0] * 4
+    for b in range(len(bt.afrr_quantile_bins)):
+        df[f"pacc_pos_bin_{b}"] = [1.0] * 4
+        df[f"pacc_neg_bin_{b}"] = [1.0] * 4
+
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR", "BCM"),
+        deterministic_reserve_settlement=False,
+        strict_input_validation=False,
+    )
+    p50_bin = bt.afrr_quantile_bins.index("p50")
+    expected_hourly_aux_cost_per_mw = bt.dt_h / bt.p_max_mw * bt.aux_standby_mw * 100.0
+    expected_product_aux_cost_per_mw = 4.0 * expected_hourly_aux_cost_per_mw
+
+    assert float(out[f"ev_bcm_expected_aux_cost_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_hourly_aux_cost_per_mw
+    )
+    assert float(out[f"ev_rpos_coef_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
+        -expected_hourly_aux_cost_per_mw
+    )
+    assert float(out[f"ev_bcm_product_coef_pos_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
+        -expected_product_aux_cost_per_mw
+    )
+
+
+def test_bcm_linked_activation_ev_uses_activation_fraction_per_mw_once() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.afrr_offer_cost_eur_mw_h = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+
+    df, col = _tiny_backtest_df(hours=4)
+    df[col.timestamp] = pd.date_range("2026-01-01T03:00:00Z", periods=4, freq="h")
+    df[col.pred_da_price] = [0.0] * 4
+    df[col.pred_afrr_activation_price_pos] = [100.0] * 4
+    df[col.pred_afrr_activation_rate_pos] = [0.25] * 4
+    for q in bt.afrr_quantile_bins:
+        df[f"{col.pred_afrr_capacity_price_pos}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_capacity_price_neg}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_activation_price_pos}_{q}"] = [100.0] * 4
+        df[f"{col.pred_afrr_activation_price_neg}_{q}"] = [0.0] * 4
+        df[f"{col.pred_afrr_activation_rate_pos}_{q}"] = [0.25] * 4
+        df[f"{col.pred_afrr_activation_rate_neg}_{q}"] = [0.0] * 4
+    for b in range(len(bt.afrr_quantile_bins)):
+        df[f"pacc_pos_bin_{b}"] = [0.5] * 4
+        df[f"pacc_neg_bin_{b}"] = [0.0] * 4
+
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR", "BCM"),
+        deterministic_reserve_settlement=False,
+        strict_input_validation=False,
+    )
+    p50_bin = bt.afrr_quantile_bins.index("p50")
+    expected_hourly_activation_value_per_mw = 0.5 * 0.25 * 100.0 * bt.dt_h
+    expected_product_activation_value_per_mw = 4.0 * expected_hourly_activation_value_per_mw
+
+    assert float(out[f"ev_bcm_activation_rate_is_fraction_bin_{p50_bin}"].iloc[0]) == pytest.approx(1.0)
+    assert float(out[f"ev_bcm_activation_volume_multiplier_applied_once_bin_{p50_bin}"].iloc[0]) == pytest.approx(1.0)
+    assert float(out[f"ev_bcm_activation_value_pos_bin_{p50_bin}"].iloc[0]) == pytest.approx(
+        expected_hourly_activation_value_per_mw
+    )
+    assert float(out[f"ev_bcm_product_coef_pos_bin_{p50_bin}_eur_per_mw"].iloc[0]) == pytest.approx(
+        expected_product_activation_value_per_mw
     )
     objective_rebuild = (
         float(out["ev_da_charge_eur"].iloc[0])
@@ -1075,17 +1413,398 @@ def test_bcm_simultaneous_pos_neg_capacity_requires_both_locked_sides() -> None:
 def test_bcm_reject_no_capacity_award_and_no_capacity_revenue() -> None:
     mc = MarketClearingEngine()
     bids = [
-        AFRRCapacityBid(
+        BCMCapacityBid(
             ts=pd.Timestamp("2026-01-01T08:00:00Z"),
             side="pos",
             quantity_mw=5.0,
             capacity_price_eur_mw=200.0,
-            energy_price_eur_mwh=80.0,
         )
     ]
-    res = mc.clear_afrr_capacity(bids, true_cap_pos=100.0, true_cap_neg=0.0)
+    res = mc.clear_afrr_capacity(bids, true_cap_pos=100.0, true_cap_neg=0.0, true_act_pos=1000.0)
     assert np.isclose(float(res.awarded_pos_mw), 0.0)
     assert bool(res.pos_awarded) is False
+
+
+def test_bcm_capacity_award_does_not_require_activation_price() -> None:
+    mc = MarketClearingEngine()
+    bids = [
+        BCMCapacityBid(
+            ts=pd.Timestamp("2026-01-01T08:00:00Z"),
+            side="pos",
+            quantity_mw=4.0,
+            capacity_price_eur_mw=50.0,
+        )
+    ]
+    assert not hasattr(bids[0], "energy_price_eur_mwh")
+    res = mc.clear_afrr_capacity(bids, true_cap_pos=50.0, true_cap_neg=0.0)
+    assert float(res.awarded_pos_mw) == pytest.approx(4.0)
+    assert bool(res.pos_awarded) is True
+
+
+def test_bcm_bid_builder_constructs_capacity_only_bid_without_activation_price() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bids = bt.bid_builder.build_afrr_capacity_bids(
+        ts=pd.Timestamp("2026-01-01T16:00:00Z"),
+        reserve_pos_mw=1.0,
+        reserve_neg_mw=0.0,
+        pred_cap_pos=12.0,
+        pred_cap_neg=0.0,
+        pred_act_pos=9999.0,
+        pred_act_neg=9999.0,
+    )
+
+    assert len(bids) == 1
+    bid = bids[0]
+    assert isinstance(bid, BCMCapacityBid)
+    assert set(bid.__dataclass_fields__) == {"ts", "side", "quantity_mw", "capacity_price_eur_mw"}
+    assert not hasattr(bid, "energy_price_eur_mwh")
+
+
+def test_bcm_capacity_ev_diagnostic_does_not_use_activation_price() -> None:
+    bt = _mk_backtester("canonical_economic")
+    base, col = _tiny_backtest_df(hours=4)
+    base[col.pred_da_price] = [0.0] * 4
+    for q in bt.afrr_quantile_bins:
+        base[f"{col.pred_afrr_capacity_price_pos}_{q}"] = [12.0] * 4
+        base[f"{col.pred_afrr_capacity_price_neg}_{q}"] = [0.0] * 4
+        base[f"{col.pred_afrr_activation_rate_pos}_{q}"] = [0.2] * 4
+        base[f"{col.pred_afrr_activation_rate_neg}_{q}"] = [0.0] * 4
+    for b in range(len(bt.afrr_quantile_bins)):
+        base[f"pacc_pos_bin_{b}"] = [0.5] * 4
+        base[f"pacc_neg_bin_{b}"] = [0.0] * 4
+
+    low_act = base.copy()
+    high_act = base.copy()
+    low_act[col.pred_afrr_activation_price_pos] = [100.0] * 4
+    low_act[col.pred_afrr_activation_price_neg] = [0.0] * 4
+    high_act[col.pred_afrr_activation_price_pos] = [1000.0] * 4
+    high_act[col.pred_afrr_activation_price_neg] = [0.0] * 4
+    for q in bt.afrr_quantile_bins:
+        low_act[f"{col.pred_afrr_activation_price_pos}_{q}"] = [100.0] * 4
+        low_act[f"{col.pred_afrr_activation_price_neg}_{q}"] = [0.0] * 4
+        high_act[f"{col.pred_afrr_activation_price_pos}_{q}"] = [1000.0] * 4
+        high_act[f"{col.pred_afrr_activation_price_neg}_{q}"] = [0.0] * 4
+
+    out_low = bt.optimize_dispatch(
+        low_act,
+        col,
+        allowed_markets=("aFRR", "BCM"),
+        deterministic_reserve_settlement=False,
+        strict_input_validation=False,
+    )
+    out_high = bt.optimize_dispatch(
+        high_act,
+        col,
+        allowed_markets=("aFRR", "BCM"),
+        deterministic_reserve_settlement=False,
+        strict_input_validation=False,
+    )
+    p50_bin = bt.afrr_quantile_bins.index("p50")
+    cap_col = f"ev_bcm_capacity_value_pos_bin_{p50_bin}"
+    act_col = f"ev_bcm_activation_value_pos_bin_{p50_bin}"
+
+    assert float(out_low[cap_col].iloc[0]) == pytest.approx(float(out_high[cap_col].iloc[0]))
+    assert float(out_low[act_col].iloc[0]) != pytest.approx(float(out_high[act_col].iloc[0]))
+
+
+def test_bcm_capacity_price_controls_bcm_award_not_activation_price() -> None:
+    mc = MarketClearingEngine()
+    bids = [
+        BCMCapacityBid(
+            ts=pd.Timestamp("2026-01-01T08:00:00Z"),
+            side="pos",
+            quantity_mw=5.0,
+            capacity_price_eur_mw=9999.0,
+        )
+    ]
+    res = mc.clear_afrr_capacity(bids, true_cap_pos=1.0, true_cap_neg=0.0, true_act_pos=50.0)
+    assert np.isclose(float(res.awarded_pos_mw), 0.0)
+    assert bool(res.pos_awarded) is False
+
+
+def test_bcm_product_level_capacity_acceptance_rejects_whole_block_and_no_mandatory_bem() -> None:
+    bt = _mk_backtester("canonical_economic")
+    col = BacktestColumnMap()
+    ts_idx = pd.Series(pd.date_range("2026-01-01T16:00:00Z", periods=4, freq="h"))
+    source = pd.DataFrame(
+        {
+            col.true_afrr_capacity_price_pos: [14.0, 14.0, 14.0, 14.0],
+            col.true_afrr_capacity_price_neg: [0.0, 0.0, 0.0, 0.0],
+        },
+        index=pd.to_datetime(ts_idx, utc=True),
+    )
+    bids = [
+        BCMCapacityBid(
+            ts=ts_idx.iloc[0],
+            side="pos",
+            quantity_mw=1.0,
+            capacity_price_eur_mw=20.0,
+        )
+    ]
+
+    res = bt._clear_afrr_capacity_block_against_truth(
+        cap_bids=bids,
+        ts_idx=pd.to_datetime(ts_idx, utc=True),
+        source=source,
+        colmap=col,
+    )
+
+    assert float(res.awarded_pos_mw) == pytest.approx(0.0)
+    assert bool(res.pos_awarded) is False
+    assert float(res.awarded_pos_mw) == pytest.approx(0.0)
+
+    out = bt._apply_market_clearing(
+        target_time_utc=ts_idx.iloc[0],
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=0.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=50.0,
+        true_da_price=50.0,
+        pred_cap_pos=20.0,
+        true_cap_pos=14.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=150.0,
+        true_act_pos=180.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=1.0,
+        true_rate_neg=0.0,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+    )
+    assert float(out["bcm_capacity_accepted_mw"]) == pytest.approx(0.0)
+    assert float(out["bcm_to_bem_mandatory_volume_mw"]) == pytest.approx(0.0)
+    assert float(out["bem_total_bid_volume_mw"]) == pytest.approx(0.0)
+    assert str(out["bem_activation_price_decision_time_utc"]) == ""
+
+
+def test_bcm_product_level_capacity_acceptance_settles_pay_as_bid_not_cutoff() -> None:
+    bt = _mk_backtester("canonical_economic")
+    col = BacktestColumnMap()
+    ts_idx = pd.Series(pd.date_range("2026-01-01T16:00:00Z", periods=4, freq="h"))
+    source = pd.DataFrame(
+        {
+            col.true_afrr_capacity_price_pos: [14.0, 14.0, 14.0, 14.0],
+            col.true_afrr_capacity_price_neg: [0.0, 0.0, 0.0, 0.0],
+        },
+        index=pd.to_datetime(ts_idx, utc=True),
+    )
+    bids = [
+        BCMCapacityBid(
+            ts=ts_idx.iloc[0],
+            side="pos",
+            quantity_mw=1.0,
+            capacity_price_eur_mw=12.0,
+        )
+    ]
+    res = bt._clear_afrr_capacity_block_against_truth(
+        cap_bids=bids,
+        ts_idx=pd.to_datetime(ts_idx, utc=True),
+        source=source,
+        colmap=col,
+    )
+    assert float(res.awarded_pos_mw) == pytest.approx(1.0)
+
+    capacity_revenue = 0.0
+    for _ in range(4):
+        _, m = bt._settle_one_hour(
+            soc=bt.soc_init,
+            charge=0.0,
+            discharge=0.0,
+            reserve_pos=1.0,
+            reserve_neg=0.0,
+            da_price=0.0,
+            cap_pos=14.0,
+            cap_neg=0.0,
+            act_pos_price=180.0,
+            act_neg_price=0.0,
+            act_pos_rate=0.0,
+            act_neg_rate=0.0,
+            cap_bid_pos=12.0,
+            cap_bid_neg=0.0,
+        )
+        capacity_revenue += float(m["bcm_capacity_revenue_eur"])
+
+    assert capacity_revenue == pytest.approx(1.0 * 12.0 * 4.0)
+    assert capacity_revenue != pytest.approx(1.0 * 14.0 * 4.0)
+
+
+def test_rejected_bcm_energy_price_does_not_create_mandatory_bem() -> None:
+    bt = _mk_backtester("canonical_economic")
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T16:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=0.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=20.0,
+        true_cap_pos=14.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=150.0,
+        true_act_pos=180.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=1.0,
+        true_rate_neg=0.0,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+    )
+
+    assert float(out["bcm_to_bem_mandatory_volume_mw"]) == pytest.approx(0.0)
+    assert float(out["bem_total_bid_volume_mw"]) == pytest.approx(0.0)
+    assert float(out["bcm_capacity_available_mw"]) == pytest.approx(0.0)
+    assert str(out["bem_activation_price_decision_time_utc"]) == ""
+
+
+def test_accepted_bcm_creates_mandatory_bem_obligation_and_activation_price_is_bem_only() -> None:
+    bt = _mk_backtester("canonical_economic")
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T16:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=0.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=12.0,
+        true_cap_pos=14.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=150.0,
+        true_act_pos=180.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=0.5,
+        true_rate_neg=0.0,
+        obligation_pos_mw=1.0,
+        obligation_neg_mw=0.0,
+        obligation_capacity_price_pos=12.0,
+        obligation_energy_pos=150.0,
+    )
+
+    block_id = str(out["bcm_product_block_id"])
+    assert "T16:00:00" in block_id
+    assert "T20:00:00" in block_id
+    assert str(out["bcm_direction"]) == "pos"
+    assert float(out["bcm_capacity_bid_price_pos_eur_per_mw_h"]) == pytest.approx(12.0)
+    assert float(out["bcm_capacity_cutoff_price_pos_eur_per_mw_h"]) == pytest.approx(14.0)
+    assert float(out["bcm_to_bem_mandatory_volume_mw"]) == pytest.approx(1.0)
+    assert float(out["bem_total_bid_volume_mw"]) == pytest.approx(1.0)
+    assert float(out["bem_activation_bid_price_pos_eur_per_mwh"]) == pytest.approx(150.0)
+    assert float(out["bem_clearing_price_pos_eur_per_mwh"]) == pytest.approx(180.0)
+    assert str(out["bem_activation_price_decision_time_utc"]) == "2026-01-01T15:00:00+00:00"
+    assert str(out["bem_delivery_hour_start_utc"]) == "2026-01-01T16:00:00+00:00"
+    assert float(out["bcm_capacity_bid_has_activation_price"]) == pytest.approx(0.0)
+    assert float(out["bcm_to_bem_activation_price_transferred"]) == pytest.approx(0.0)
+    assert float(out["settlement_cap_bid_price_pos_eur_mw"]) == pytest.approx(12.0)
+
+    out_next_hour = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T17:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=0.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=12.0,
+        true_cap_pos=14.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=150.0,
+        true_act_pos=180.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=0.5,
+        true_rate_neg=0.0,
+        obligation_pos_mw=1.0,
+        obligation_neg_mw=0.0,
+        obligation_capacity_price_pos=12.0,
+    )
+    assert str(out_next_hour["bem_activation_price_decision_time_utc"]) == "2026-01-01T16:00:00+00:00"
+    assert str(out_next_hour["bem_delivery_hour_start_utc"]) == "2026-01-01T17:00:00+00:00"
+
+
+def test_free_bem_is_separate_from_rejected_bcm_capacity() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=False,
+        id_mode="technical_repair",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=True,
+    )
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T16:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=1.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=20.0,
+        true_cap_pos=14.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=150.0,
+        true_act_pos=180.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=1.0,
+        true_rate_neg=0.0,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=0.0,
+    )
+
+    assert float(out["bcm_to_bem_mandatory_volume_mw"]) == pytest.approx(0.0)
+    assert float(out["bem_free_volume_mw"]) == pytest.approx(1.0)
+    assert float(out["bem_total_bid_volume_mw"]) == pytest.approx(1.0)
+    assert float(out["settlement_cap_bid_price_pos_eur_mw"]) == pytest.approx(0.0)
+
+
+def test_bem_activation_settlement_uses_energy_settlement_price_not_bcm_capacity_price() -> None:
+    bt = _mk_backtester("canonical_economic")
+    _, m = bt._settle_one_hour(
+        soc=bt.soc_init,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=1.0,
+        reserve_neg=0.0,
+        da_price=0.0,
+        cap_pos=14.0,
+        cap_neg=0.0,
+        act_pos_price=180.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.5,
+        act_neg_rate=0.0,
+        cap_bid_pos=12.0,
+        cap_bid_neg=0.0,
+    )
+
+    delivered = float(m["delivered_activation_pos_mwh"])
+    assert delivered > 0.0
+    assert float(m["revenue_activation_eur"]) == pytest.approx(delivered * 180.0)
+    assert float(m["revenue_activation_eur"]) != pytest.approx(0.5 * 12.0)
+    assert float(m["revenue_activation_eur"]) != pytest.approx(0.5 * 14.0)
 
 
 def test_aux_cost_subtracted_once_in_pnl() -> None:
@@ -1635,7 +2354,24 @@ def test_bem_only_positive_activation_without_bcm_award_is_activation_revenue_on
     )
     assert np.isclose(float(out["afrr_bcm_auction_cleared"]), 0.0)
     assert np.isclose(float(out["settlement_cap_bid_price_pos_eur_mw"]), 0.0)
+    assert float(out["bcm_to_bem_mandatory_volume_mw"]) == pytest.approx(0.0)
+    assert float(out["bem_free_volume_mw"]) == pytest.approx(3.0)
+    assert float(out["bem_total_bid_volume_mw"]) == pytest.approx(
+        float(out["bcm_to_bem_mandatory_volume_mw"]) + float(out["bem_free_volume_mw"])
+    )
     assert float(out["bem_only_submitted_pos_mw"]) > 0.0
+    assert float(out["bem_only_executed_pos_mwh"]) > 0.0
+    assert float(out["bem_only_activation_revenue_eur"]) > 0.0
+    assert float(out["bem_activation_revenue_eur"]) == pytest.approx(
+        float(out["bem_only_activation_revenue_eur"])
+    )
+    assert float(out["bem_free_activation_revenue_eur"]) == pytest.approx(
+        float(out["bem_only_activation_revenue_eur"])
+    )
+    assert float(out["bem_pos_activation_mwh"]) == pytest.approx(
+        float(out["bem_only_pos_activation_mwh"])
+    )
+    assert float(out["bcm_linked_activation_revenue_eur"]) == pytest.approx(0.0)
     assert float(out["executed_reserve_pos_mw"]) > 0.0
     assert float(out["executed_rate_pos"]) > 0.0
     _, m = bt._settle_one_hour(
@@ -1853,9 +2589,13 @@ def test_bem_only_can_coexist_with_bcm_linked_activation_source_split() -> None:
         pred_cap_neg_bins_eur_mw=[0.0] * n_bins,
     )
     assert float(out["executed_reserve_pos_mw"]) >= 5.0 - 1e-9
+    assert float(out["bcm_to_bem_mandatory_volume_mw"]) == pytest.approx(5.0)
+    assert float(out["bem_free_volume_mw"]) == pytest.approx(3.0)
+    assert float(out["bem_total_bid_volume_mw"]) == pytest.approx(8.0)
     assert float(out["bem_only_submitted_pos_mw"]) == 3.0
     assert float(out["bcm_linked_pos_activation_mwh"]) == pytest.approx(5.0)
     assert float(out["bem_only_pos_activation_mwh"]) == pytest.approx(3.0)
+    assert float(out["bem_pos_activation_mwh"]) == pytest.approx(8.0)
     assert str(out["activation_split_method"]) == "source_mwh"
     delivered_pos_mwh = float(out["bcm_linked_pos_activation_mwh"]) + float(out["bem_only_pos_activation_mwh"])
     delivered_neg_mwh = float(out["bcm_linked_neg_activation_mwh"]) + float(out["bem_only_neg_activation_mwh"])
@@ -1871,6 +2611,10 @@ def test_bem_only_can_coexist_with_bcm_linked_activation_source_split() -> None:
     )
     assert float(comp["bcm_linked_activation_revenue_eur"]) == pytest.approx(500.0)
     assert float(comp["bem_only_activation_revenue_eur"]) == pytest.approx(300.0)
+    assert float(out["bem_activation_revenue_eur"]) == pytest.approx(
+        float(out["bcm_linked_activation_revenue_eur"])
+        + float(out["bem_only_activation_revenue_eur"])
+    )
 
 
 def test_bem_only_guard_keeps_forecast_values_unchanged() -> None:
