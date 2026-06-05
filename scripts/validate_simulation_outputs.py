@@ -9,6 +9,7 @@ import pandas as pd
 
 ACCOUNTING_TOL_EUR = 1e-6
 PNL_HIERARCHY_TOL_EUR = 1e-4
+PREDICTED_PLANNED_PNL_ALIAS_TOL_EUR = 1e-6
 
 
 def _is_missing_required_value(v: object) -> bool:
@@ -21,9 +22,34 @@ def _is_missing_required_value(v: object) -> bool:
 
 def _read_summary(path: Path) -> dict[str, object]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return _normalize_predicted_pnl_aliases(json.loads(path.read_text(encoding="utf-8")))
     except Exception:
         return {}
+
+
+def _normalize_predicted_pnl_aliases(summary: dict[str, object]) -> dict[str, object]:
+    out = dict(summary)
+    predicted_present = "predicted_total_pnl_eur" in out
+    planned_present = "planned_total_pnl_eur" in out
+    if not predicted_present and planned_present:
+        out["predicted_total_pnl_eur"] = out["planned_total_pnl_eur"]
+        out["predicted_total_pnl_eur_source"] = "legacy_planned_total_pnl_eur"
+        predicted_present = True
+    if predicted_present and not planned_present:
+        out["planned_total_pnl_eur"] = out["predicted_total_pnl_eur"]
+        out["planned_total_pnl_eur_is_legacy_alias"] = 1.0
+        return out
+    if predicted_present and planned_present:
+        pred = _safe_float(out.get("predicted_total_pnl_eur"))
+        planned = _safe_float(out.get("planned_total_pnl_eur"))
+        if pd.notna(pred) and pd.notna(planned) and abs(float(pred) - float(planned)) > PREDICTED_PLANNED_PNL_ALIAS_TOL_EUR:
+            out["predicted_planned_pnl_alias_consistency_ok"] = 0.0
+            out["predicted_planned_pnl_alias_error_eur"] = float(pred) - float(planned)
+        else:
+            out["predicted_planned_pnl_alias_consistency_ok"] = 1.0
+        out["planned_total_pnl_eur"] = out["predicted_total_pnl_eur"]
+        out["planned_total_pnl_eur_is_legacy_alias"] = 1.0
+    return out
 
 
 def _safe_float(v: object, default: float = float("nan")) -> float:
@@ -298,6 +324,12 @@ def _collect(root: Path) -> pd.DataFrame:
                 "global_perfect_foresight_dominance_check_pass": s.get("global_perfect_foresight_dominance_check_pass"),
                 "global_perfect_foresight_validation_status": s.get("global_perfect_foresight_validation_status"),
                 "realized_total_pnl_eur": s.get("realized_total_pnl_eur"),
+                "predicted_total_pnl_eur": s.get("predicted_total_pnl_eur"),
+                "planned_total_pnl_eur": s.get("planned_total_pnl_eur"),
+                "planned_total_pnl_eur_is_legacy_alias": s.get("planned_total_pnl_eur_is_legacy_alias"),
+                "predicted_total_pnl_eur_source": s.get("predicted_total_pnl_eur_source"),
+                "predicted_planned_pnl_alias_consistency_ok": s.get("predicted_planned_pnl_alias_consistency_ok"),
+                "predicted_planned_pnl_alias_error_eur": s.get("predicted_planned_pnl_alias_error_eur"),
                 "rolling_perfect_foresight_same_rules_total_pnl_eur": s.get(
                     "rolling_perfect_foresight_same_rules_total_pnl_eur",
                     s.get("perfect_foresight_total_pnl_eur"),

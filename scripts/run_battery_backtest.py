@@ -64,9 +64,14 @@ if str(SRC_DIR) not in sys.path:
 from energy_trading.config import MODEL_SPECS
 from energy_trading.simulation.battery_backtest import (
     AFRR_QUANTILE_BINS,
-    BacktestColumnMap, BatteryBacktester, PhaseTimeoutError,
-    canonicalize_market_frame, load_and_align_market_data,
-    load_prediction_warehouse_long)
+    BacktestColumnMap,
+    BatteryBacktester,
+    PhaseTimeoutError,
+    canonicalize_market_frame,
+    load_and_align_market_data,
+    load_prediction_warehouse_long,
+    normalize_predicted_pnl_aliases,
+)
 from energy_trading.visualization.style import apply_geo_style, get_backtest_line_style
 
 
@@ -750,6 +755,7 @@ def _build_performance_metrics(
     scenario_end_utc: pd.Timestamp | None,
 ) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
+    summary = normalize_predicted_pnl_aliases(summary)
     hourly = _ensure_hourly_throughput(hourly)
     dt_h = _infer_dt_hours(hourly)
     ts = pd.to_datetime(hourly.get("timestamp_utc", pd.Series(dtype="datetime64[ns, UTC]")), utc=True, errors="coerce")
@@ -4618,9 +4624,25 @@ def main() -> None:
             "- realized/comparable_rolling_perfect_foresight_same_rules_market: "
             f"{float(cmp_r):.2f} / {float(cmp_b):.2f}"
         )
+        realized_pnl = pd.to_numeric(
+            pd.Series([outputs.summary.get("realized_total_pnl_eur", float("nan"))]),
+            errors="coerce",
+        ).iloc[0]
+        naive_pnl = pd.to_numeric(
+            pd.Series([outputs.summary.get("naive_total_pnl_eur", float("nan"))]),
+            errors="coerce",
+        ).iloc[0]
+        model_vs_naive_ratio = (
+            float(realized_pnl) / float(naive_pnl)
+            if pd.notna(realized_pnl) and pd.notna(naive_pnl) and abs(float(naive_pnl)) > 1e-12
+            else float("nan")
+        )
+        print(f"- naive_realized_pnl_eur: {float(naive_pnl) if pd.notna(naive_pnl) else float('nan'):.2f}")
+        print(f"- model_realized_vs_naive_realized_ratio: {float(model_vs_naive_ratio):.4f}")
         # Warn on negative PnL in any reported optimization view.
         pnl_warn_fields = [
             ("Multi-market realized", "realized_total_pnl_eur"),
+            ("Naive realized", "naive_total_pnl_eur"),
             ("Multi-market rolling_perfect_foresight_same_rules", "rolling_perfect_foresight_same_rules_total_pnl_eur"),
             ("Multi-market global_hindsight_perfect_foresight_upper_bound", "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"),
         ]

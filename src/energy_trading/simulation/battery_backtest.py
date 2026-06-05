@@ -87,6 +87,41 @@ class BacktestOutputs:
     isolated_hourly: dict[str, pd.DataFrame] | None = None
 
 
+PREDICTED_PLANNED_PNL_ALIAS_TOL_EUR = 1e-6
+
+
+def normalize_predicted_pnl_aliases(
+    summary: dict[str, object],
+    *,
+    tolerance_eur: float = PREDICTED_PLANNED_PNL_ALIAS_TOL_EUR,
+) -> dict[str, object]:
+    """Use predicted_total_pnl_eur as canonical and planned_total_pnl_eur as a legacy alias."""
+    out = dict(summary)
+    predicted_present = "predicted_total_pnl_eur" in out
+    planned_present = "planned_total_pnl_eur" in out
+    if not predicted_present and planned_present:
+        out["predicted_total_pnl_eur"] = out["planned_total_pnl_eur"]
+        out["predicted_total_pnl_eur_source"] = "legacy_planned_total_pnl_eur"
+        predicted_present = True
+    if predicted_present and not planned_present:
+        out["planned_total_pnl_eur"] = out["predicted_total_pnl_eur"]
+        out["planned_total_pnl_eur_is_legacy_alias"] = 1.0
+        return out
+    if predicted_present and planned_present:
+        pred = pd.to_numeric(pd.Series([out.get("predicted_total_pnl_eur")]), errors="coerce").iloc[0]
+        planned = pd.to_numeric(pd.Series([out.get("planned_total_pnl_eur")]), errors="coerce").iloc[0]
+        if pd.notna(pred) and pd.notna(planned) and abs(float(pred) - float(planned)) > float(tolerance_eur):
+            raise ValueError(
+                "predicted_total_pnl_eur and planned_total_pnl_eur differ; "
+                f"predicted_total_pnl_eur={float(pred):.12g}, "
+                f"planned_total_pnl_eur={float(planned):.12g}, "
+                f"tolerance_eur={float(tolerance_eur):.12g}"
+            )
+        out["planned_total_pnl_eur"] = out["predicted_total_pnl_eur"]
+        out["planned_total_pnl_eur_is_legacy_alias"] = 1.0
+    return out
+
+
 @dataclass(frozen=True)
 class StrategyPermissions:
     allow_da: bool
@@ -648,6 +683,49 @@ class BatteryBacktester:
             "verified": 1.0,
             "failure_reason": "none",
             "selection_reason": f"{selected}_has_highest_feasible_pnl",
+        }
+
+    @staticmethod
+    def _timestamp_coverage_diagnostics(
+        expected_timestamps: pd.Series | pd.Index | list[object],
+        candidate_timestamps: pd.Series | pd.Index | list[object],
+    ) -> dict[str, object]:
+        """Compare timestamp coverage after canonical UTC normalization."""
+
+        def _normalized_unique_utc(
+            values: pd.Series | pd.Index | list[object],
+        ) -> tuple[pd.DatetimeIndex, int, int]:
+            parsed = pd.to_datetime(pd.Series(values), utc=True, errors="coerce").dropna()
+            idx = pd.DatetimeIndex(parsed).tz_convert("UTC")
+            duplicate_count = int(idx.duplicated().sum())
+            unique_idx = pd.DatetimeIndex(idx.drop_duplicates()).sort_values()
+            return unique_idx, int(len(idx)), duplicate_count
+
+        expected_idx, expected_rows, expected_duplicate_count = _normalized_unique_utc(expected_timestamps)
+        candidate_idx, actual_rows, actual_duplicate_count = _normalized_unique_utc(candidate_timestamps)
+        missing = expected_idx.difference(candidate_idx)
+        extra = candidate_idx.difference(expected_idx)
+        aligned = bool(
+            expected_rows == actual_rows
+            and expected_duplicate_count == 0
+            and actual_duplicate_count == 0
+            and len(missing) == 0
+            and len(extra) == 0
+        )
+        first_missing = missing[0].isoformat() if len(missing) else ""
+        first_extra = extra[0].isoformat() if len(extra) else ""
+        return {
+            "aligned": float(aligned),
+            "missing_timestamp_count": float(len(missing)),
+            "first_missing_timestamp_utc": str(first_missing),
+            "extra_timestamp_count": float(len(extra)),
+            "first_extra_timestamp_utc": str(first_extra),
+            "expected_rows": float(expected_rows),
+            "actual_rows": float(actual_rows),
+            "expected_row_count": float(expected_rows),
+            "actual_row_count": float(actual_rows),
+            "expected_duplicate_timestamp_count": float(expected_duplicate_count),
+            "actual_duplicate_timestamp_count": float(actual_duplicate_count),
         }
 
     def __init__(self) -> None:
@@ -1546,11 +1624,42 @@ class BatteryBacktester:
         total_rows: int,
         soc_min: float,
         soc_target_end: float,
+        p_max_mw: float | None = None,
+        eta_in: float | None = None,
+        dt_h: float = 1.0,
+        remaining_aux_loss_mwh_per_hour: float = 0.0,
+        terminal_soc_safety_margin_mwh: float = 0.0,
+        soc_max: float | None = None,
     ) -> float | None:
-        """Return the SoC lower bound for the local rolling window end."""
+        """Return the SoC lower bound for the local rolling window end.
+
+        Non-final windows use a recoverability floor: the horizon may end below
+        the final target only if the remaining hours can still recharge the
+        expected terminal shortfall with technical ID at residual full power.
+        """
         if not bool(enforce_final_soc_min):
             return None
-        return float(soc_target_end) if int(window_end) == int(total_rows) else float(soc_min)
+        if int(window_end) >= int(total_rows):
+            return float(soc_target_end)
+        if p_max_mw is None or eta_in is None:
+            return float(soc_min)
+        remaining_hours = max(0.0, float(int(total_rows) - int(window_end)) * float(dt_h))
+        max_future_internal_charge_mwh = (
+            remaining_hours
+            * max(0.0, float(p_max_mw))
+            * max(0.0, float(eta_in))
+        )
+        expected_remaining_aux_mwh = remaining_hours * max(0.0, float(remaining_aux_loss_mwh_per_hour))
+        required_recoverable_terminal_soc = (
+            float(soc_target_end)
+            + max(0.0, float(terminal_soc_safety_margin_mwh))
+            + expected_remaining_aux_mwh
+            - max_future_internal_charge_mwh
+        )
+        lower = max(float(soc_min), float(required_recoverable_terminal_soc))
+        if soc_max is not None and np.isfinite(float(soc_max)):
+            lower = min(lower, float(soc_max))
+        return float(lower)
 
     @staticmethod
     def _classify_hard_final_soc_infeasibility(
@@ -5001,10 +5110,29 @@ class BatteryBacktester:
                     adjusted_projected_without = float(projected_without_base - new_extra_aux_mwh)
                     recovery_diag["terminal_soc_recovery_iteration_count"] = float(iteration)
                     recovery_diag["terminal_soc_projection_id_extra_aux_losses_mwh"] = float(new_extra_aux_mwh)
+                    recovery_diag["projected_terminal_soc_with_new_id_before_aux_mwh"] = float(
+                        projected_without_base
+                        + float(recovery_diag.get("terminal_soc_id_recourse_scheduled_internal_mwh", 0.0))
+                    )
                     if abs(new_extra_aux_mwh - extra_aux_mwh) <= 1e-9:
                         break
                     extra_aux_mwh = float(new_extra_aux_mwh)
                     projected_without = adjusted_projected_without
+                post_aux_projected_without = float(projected_without_base - extra_aux_mwh)
+                scheduled_internal_mwh = float(
+                    recovery_diag.get("terminal_soc_id_recourse_scheduled_internal_mwh", 0.0)
+                )
+                post_aux_projected_with_id = float(post_aux_projected_without + scheduled_internal_mwh)
+                target_with_margin = float(terminal_soc_target_mwh) + max(0.0, float(terminal_soc_safety_margin_mwh))
+                post_aux_shortfall = max(0.0, target_with_margin - post_aux_projected_with_id)
+                if post_aux_shortfall > 1e-7:
+                    recovery_diag["terminal_soc_recovery_feasible"] = 0.0
+                    recovery_diag["terminal_soc_not_recoverable_with_id"] = 1.0
+                    if str(recovery_diag.get("terminal_soc_not_recoverable_reason", "none")) == "none":
+                        recovery_diag["terminal_soc_not_recoverable_reason"] = "post_aux_terminal_shortfall"
+                recovery_diag["projected_terminal_soc_without_new_id_mwh"] = float(post_aux_projected_without)
+                recovery_diag["projected_terminal_soc_with_new_id_mwh"] = float(post_aux_projected_with_id)
+                recovery_diag["terminal_soc_recovery_post_aux_shortfall_mwh"] = float(post_aux_shortfall)
                 id_charge += max(0.0, add_id_charge_mw)
                 reason = (
                     "terminal_soc_recovery"
@@ -6075,6 +6203,84 @@ class BatteryBacktester:
                 & (day_rows["target_time_cet"].dt.hour < block_end)
             ].copy()
             if blk.empty:
+                continue
+            full_block_start_local = next_day_cet + pd.Timedelta(hours=block_start)
+            full_block_end_local = next_day_cet + pd.Timedelta(hours=block_end)
+            full_block_start_utc = pd.to_datetime(full_block_start_local, utc=True, errors="coerce")
+            full_block_end_utc = pd.to_datetime(full_block_end_local, utc=True, errors="coerce")
+            sim_end_exclusive_utc = (
+                pd.to_datetime(global_end_utc, utc=True, errors="coerce") + pd.Timedelta(hours=float(self.dt_h))
+                if global_end_utc is not None and pd.notna(global_end_utc)
+                else pd.NaT
+            )
+            expected_block_targets = (
+                pd.date_range(
+                    full_block_start_utc,
+                    full_block_end_utc,
+                    freq=pd.Timedelta(hours=float(self.dt_h)),
+                    inclusive="left",
+                )
+                if pd.notna(full_block_start_utc) and pd.notna(full_block_end_utc)
+                else pd.DatetimeIndex([], tz="UTC")
+            )
+            present_targets = set(pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce").dropna())
+            full_product_inside_sim = (
+                pd.notna(sim_end_exclusive_utc)
+                and pd.notna(full_block_end_utc)
+                and full_block_end_utc <= sim_end_exclusive_utc + pd.Timedelta(microseconds=1)
+            )
+            full_product_present = bool(expected_block_targets.empty) or all(
+                pd.Timestamp(ts) in present_targets for ts in expected_block_targets
+            )
+            if not full_product_inside_sim or not full_product_present:
+                def _block_abs_mean(col: str) -> float:
+                    if col not in blk.columns:
+                        return 0.0
+                    return float(pd.to_numeric(blk[col], errors="coerce").fillna(0.0).abs().mean())
+
+                rejected_total += _block_abs_mean("reserve_pos_mw") + _block_abs_mean("reserve_neg_mw")
+                if precommit_audit_by_ts is not None:
+                    for _, blk_row in blk.iterrows():
+                        ts = blk_row["target_time_utc"]
+                        tsu = pd.to_datetime(ts, utc=True, errors="coerce")
+                        if pd.isna(tsu):
+                            continue
+                        reserve_pos_before = float(
+                            pd.to_numeric(pd.Series([blk_row.get("reserve_pos_mw", 0.0)]), errors="coerce")
+                            .fillna(0.0)
+                            .iloc[0]
+                        )
+                        reserve_neg_before = float(
+                            pd.to_numeric(pd.Series([blk_row.get("reserve_neg_mw", 0.0)]), errors="coerce")
+                            .fillna(0.0)
+                            .iloc[0]
+                        )
+                        precommit_audit_by_ts.setdefault("precommit_market", {})[tsu] = "BCM"
+                        precommit_audit_by_ts.setdefault("precommit_applied", {})[tsu] = 1.0
+                        precommit_audit_by_ts.setdefault("precommit_clamp_reason", {})[tsu] = "partial_product_or_sim_end"
+                        precommit_audit_by_ts.setdefault("precommit_reduction_reason", {})[tsu] = "partial_product_or_sim_end"
+                        precommit_audit_by_ts.setdefault("precommit_zero_reason", {})[tsu] = "partial_product_or_sim_end"
+                        precommit_audit_by_ts.setdefault("bcm_precommit_zero_reason", {})[tsu] = "partial_product_or_sim_end"
+                        precommit_audit_by_ts.setdefault("bcm_precommit_feasibility_driver", {})[tsu] = "partial_product_or_sim_end"
+                        precommit_audit_by_ts.setdefault("precommit_zeroed_due_to_margin", {})[tsu] = 1.0
+                        precommit_audit_by_ts.setdefault("precommit_feasibility_pass", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("bcm_precommit_feasibility_pass", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("reserve_retry_factor", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("bcm_precommit_retry_factor_selected", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("submitted_reserve_pos_mw_before_retry", {})[tsu] = reserve_pos_before
+                        precommit_audit_by_ts.setdefault("submitted_reserve_neg_mw_before_retry", {})[tsu] = reserve_neg_before
+                        precommit_audit_by_ts.setdefault("submitted_reserve_pos_mw_after_retry", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("submitted_reserve_neg_mw_after_retry", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("precommit_locked_pos_mw", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("precommit_locked_neg_mw", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("bcm_precommit_locked_pos_mw", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("bcm_precommit_locked_neg_mw", {})[tsu] = 0.0
+                        precommit_audit_by_ts.setdefault("reserve_delivery_start_utc", {})[tsu] = str(
+                            full_block_start_utc.isoformat() if pd.notna(full_block_start_utc) else ""
+                        )
+                        precommit_audit_by_ts.setdefault("reserve_delivery_end_utc", {})[tsu] = str(
+                            full_block_end_utc.isoformat() if pd.notna(full_block_end_utc) else ""
+                        )
                 continue
 
             offered_pos = self.bid_builder._qfloor(float(pd.to_numeric(blk["reserve_pos_mw"], errors="coerce").fillna(0.0).mean()), self.afrr_bid_granularity_mw)
@@ -7811,6 +8017,12 @@ class BatteryBacktester:
                 total_rows=int(n),
                 soc_min=float(self.soc_min),
                 soc_target_end=float(self.soc_target_end),
+                p_max_mw=float(self.p_max_mw),
+                eta_in=float(self.eta_in),
+                dt_h=float(self.dt_h),
+                remaining_aux_loss_mwh_per_hour=float(self.aux_standby_mw),
+                terminal_soc_safety_margin_mwh=float(self.terminal_id_recovery_safety_mwh),
+                soc_max=float(self.soc_max),
             )
             optimization_fallback = "none"
             optimization_status_code = "ok"
@@ -11312,6 +11524,14 @@ class BatteryBacktester:
         global_pf_no_market_rejection_reason = "disabled"
         global_pf_realized_path_feasible = 0.0
         global_pf_realized_path_rejection_reason = "disabled"
+        global_pf_realized_path_missing_timestamp_count = 0.0
+        global_pf_realized_path_first_missing_timestamp_utc = ""
+        global_pf_realized_path_extra_timestamp_count = 0.0
+        global_pf_realized_path_first_extra_timestamp_utc = ""
+        global_pf_realized_path_expected_rows = 0.0
+        global_pf_realized_path_actual_rows = 0.0
+        global_pf_realized_path_expected_row_count = 0.0
+        global_pf_realized_path_actual_row_count = 0.0
         da_true_for_global_pf = self._finite_numeric_series(
             perfect_foresight_df,
             colmap.true_da_price,
@@ -11323,11 +11543,29 @@ class BatteryBacktester:
             float(da_true_for_global_pf.iloc[-1]) if len(da_true_for_global_pf) else 0.0,
         )
         if enable_global_perfect_foresight:
-            expected_global_pf_ts = pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce").reset_index(drop=True)
+            expected_ts_source = real if isinstance(real, pd.DataFrame) and colmap.timestamp in real.columns else df
+            expected_global_pf_ts = pd.to_datetime(
+                expected_ts_source[colmap.timestamp],
+                utc=True,
+                errors="coerce",
+            ).reset_index(drop=True)
+            global_pf_candidate_timestamp_diagnostics: dict[str, dict[str, object]] = {}
+
+            def _missing_timestamp_reason(timestamp_diag: dict[str, object]) -> str:
+                return (
+                    "missing_timestamps:"
+                    f"missing_count={int(float(timestamp_diag.get('missing_timestamp_count', 0.0)))},"
+                    f"first_missing={timestamp_diag.get('first_missing_timestamp_utc', '')},"
+                    f"extra_count={int(float(timestamp_diag.get('extra_timestamp_count', 0.0)))},"
+                    f"first_extra={timestamp_diag.get('first_extra_timestamp_utc', '')},"
+                    f"expected_rows={int(float(timestamp_diag.get('expected_rows', timestamp_diag.get('expected_row_count', 0.0))))},"
+                    f"actual_rows={int(float(timestamp_diag.get('actual_rows', timestamp_diag.get('actual_row_count', 0.0))))}"
+                )
 
             def _validate_global_pf_candidate(
                 frame: pd.DataFrame,
                 *,
+                candidate_label: str,
                 prefix: str,
                 value_eur: float,
                 require_ok_codes: bool,
@@ -11335,10 +11573,12 @@ class BatteryBacktester:
                 if frame is None or frame.empty:
                     return False, "empty_candidate", float("nan")
                 if colmap.timestamp not in frame.columns:
-                    return False, "missing_timestamps", float("nan")
+                    return False, "missing_timestamps:timestamp_column_absent", float("nan")
                 candidate_ts = pd.to_datetime(frame[colmap.timestamp], utc=True, errors="coerce").reset_index(drop=True)
-                if len(candidate_ts) != len(expected_global_pf_ts) or not candidate_ts.equals(expected_global_pf_ts):
-                    return False, "missing_timestamps", float("nan")
+                timestamp_diag = self._timestamp_coverage_diagnostics(expected_global_pf_ts, candidate_ts)
+                global_pf_candidate_timestamp_diagnostics[str(candidate_label)] = timestamp_diag
+                if float(timestamp_diag.get("aligned", 0.0)) < 0.5:
+                    return False, _missing_timestamp_reason(timestamp_diag), float("nan")
                 soc_col = f"{prefix}_soc_mwh"
                 if soc_col not in frame.columns:
                     return False, "missing_soc", float("nan")
@@ -11411,6 +11651,7 @@ class BatteryBacktester:
             )
             no_trade_valid, no_trade_rejection_reason, _no_trade_shortfall_checked = _validate_global_pf_candidate(
                 no_trade_global,
+                candidate_label="no_market",
                 prefix="global_perfect_foresight",
                 value_eur=global_pf_no_trade_incumbent_eur,
                 require_ok_codes=False,
@@ -11466,6 +11707,7 @@ class BatteryBacktester:
                 solver_feasible, global_pf_solver_rejection_reason, global_pf_solver_terminal_shortfall_mwh = (
                     _validate_global_pf_candidate(
                         solver_global,
+                        candidate_label="solver",
                         prefix="global_perfect_foresight",
                         value_eur=global_pf_solver_solution_eur,
                         require_ok_codes=True,
@@ -11486,11 +11728,33 @@ class BatteryBacktester:
             realized_global_feasible, _realized_rejection_reason, _realized_shortfall_checked = (
                 _validate_global_pf_candidate(
                     realized_global,
+                    candidate_label="realized_path",
                     prefix="global_perfect_foresight",
                     value_eur=global_pf_realized_path_incumbent_eur,
                     require_ok_codes=False,
                 )
             )
+            realized_ts_diag = global_pf_candidate_timestamp_diagnostics.get("realized_path", {})
+            global_pf_realized_path_missing_timestamp_count = float(
+                realized_ts_diag.get("missing_timestamp_count", 0.0)
+            )
+            global_pf_realized_path_first_missing_timestamp_utc = str(
+                realized_ts_diag.get("first_missing_timestamp_utc", "")
+            )
+            global_pf_realized_path_extra_timestamp_count = float(
+                realized_ts_diag.get("extra_timestamp_count", 0.0)
+            )
+            global_pf_realized_path_first_extra_timestamp_utc = str(
+                realized_ts_diag.get("first_extra_timestamp_utc", "")
+            )
+            global_pf_realized_path_expected_rows = float(
+                realized_ts_diag.get("expected_rows", realized_ts_diag.get("expected_row_count", 0.0))
+            )
+            global_pf_realized_path_actual_rows = float(
+                realized_ts_diag.get("actual_rows", realized_ts_diag.get("actual_row_count", 0.0))
+            )
+            global_pf_realized_path_expected_row_count = float(global_pf_realized_path_expected_rows)
+            global_pf_realized_path_actual_row_count = float(global_pf_realized_path_actual_rows)
             global_pf_realized_path_feasible = float(realized_global_feasible)
             global_pf_realized_path_rejection_reason = (
                 "none" if realized_global_feasible else str(_realized_rejection_reason)
@@ -11589,6 +11853,22 @@ class BatteryBacktester:
         hourly["global_pf_solver_rejection_reason"] = str(global_pf_solver_rejection_reason)
         hourly["global_pf_no_market_rejection_reason"] = str(global_pf_no_market_rejection_reason)
         hourly["global_pf_realized_path_rejection_reason"] = str(global_pf_realized_path_rejection_reason)
+        hourly["global_pf_realized_path_missing_timestamp_count"] = float(
+            global_pf_realized_path_missing_timestamp_count
+        )
+        hourly["global_pf_realized_path_first_missing_timestamp_utc"] = str(
+            global_pf_realized_path_first_missing_timestamp_utc
+        )
+        hourly["global_pf_realized_path_extra_timestamp_count"] = float(
+            global_pf_realized_path_extra_timestamp_count
+        )
+        hourly["global_pf_realized_path_first_extra_timestamp_utc"] = str(
+            global_pf_realized_path_first_extra_timestamp_utc
+        )
+        hourly["global_pf_realized_path_expected_rows"] = float(global_pf_realized_path_expected_rows)
+        hourly["global_pf_realized_path_actual_rows"] = float(global_pf_realized_path_actual_rows)
+        hourly["global_pf_realized_path_expected_row_count"] = float(global_pf_realized_path_expected_row_count)
+        hourly["global_pf_realized_path_actual_row_count"] = float(global_pf_realized_path_actual_row_count)
         self._validate_strategy_isolation_outputs(
             hourly=hourly,
             allowed_markets=allowed_markets,
@@ -11998,7 +12278,6 @@ class BatteryBacktester:
                 else ""
             ),
             "dropped_initial_rows_due_to_forecast_target_alignment": float(max(0, len(df) - len(hourly))),
-            "planned_total_pnl_eur": float(pred_pnl_total),
             "predicted_total_pnl_eur": float(pred_pnl_total),
             "realized_total_pnl_eur": float(real_pnl_total),
             "naive_total_pnl_eur": float(naive_pnl_total),
@@ -12054,6 +12333,22 @@ class BatteryBacktester:
             "global_pf_no_market_rejection_reason": str(global_pf_no_market_rejection_reason),
             "global_pf_realized_path_feasible": float(global_pf_realized_path_feasible),
             "global_pf_realized_path_rejection_reason": str(global_pf_realized_path_rejection_reason),
+            "global_pf_realized_path_missing_timestamp_count": float(
+                global_pf_realized_path_missing_timestamp_count
+            ),
+            "global_pf_realized_path_first_missing_timestamp_utc": str(
+                global_pf_realized_path_first_missing_timestamp_utc
+            ),
+            "global_pf_realized_path_extra_timestamp_count": float(
+                global_pf_realized_path_extra_timestamp_count
+            ),
+            "global_pf_realized_path_first_extra_timestamp_utc": str(
+                global_pf_realized_path_first_extra_timestamp_utc
+            ),
+            "global_pf_realized_path_expected_rows": float(global_pf_realized_path_expected_rows),
+            "global_pf_realized_path_actual_rows": float(global_pf_realized_path_actual_rows),
+            "global_pf_realized_path_expected_row_count": float(global_pf_realized_path_expected_row_count),
+            "global_pf_realized_path_actual_row_count": float(global_pf_realized_path_actual_row_count),
             "global_pf_upper_bound_gap_eur": float(global_pf_upper_bound_gap_eur),
             "global_pf_below_realized_incumbent": float(global_pf_below_realized_incumbent),
             "global_pf_solver_solution_eur": float(global_pf_solver_solution_eur),
@@ -13682,6 +13977,14 @@ class BatteryBacktester:
             ("global_pf_solver_rejection_reason", "disabled"),
             ("global_pf_no_market_rejection_reason", "disabled"),
             ("global_pf_realized_path_rejection_reason", "disabled"),
+            ("global_pf_realized_path_missing_timestamp_count", 0.0),
+            ("global_pf_realized_path_first_missing_timestamp_utc", ""),
+            ("global_pf_realized_path_extra_timestamp_count", 0.0),
+            ("global_pf_realized_path_first_extra_timestamp_utc", ""),
+            ("global_pf_realized_path_expected_rows", 0.0),
+            ("global_pf_realized_path_actual_rows", 0.0),
+            ("global_pf_realized_path_expected_row_count", 0.0),
+            ("global_pf_realized_path_actual_row_count", 0.0),
             ("global_pf_upper_bound_gap_eur", float("nan")),
             ("global_pf_below_realized_incumbent", 0.0),
             ("global_pf_solver_solution_eur", float("nan")),
@@ -13766,6 +14069,7 @@ class BatteryBacktester:
             except Exception as exc:
                 print(f"[WARN] failed to write solver failure diagnostics: {exc}")
 
+        summary = normalize_predicted_pnl_aliases(summary)
         return BacktestOutputs(
             hourly=hourly,
             monthly=monthly,

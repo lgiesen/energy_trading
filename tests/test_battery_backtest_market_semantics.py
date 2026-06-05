@@ -30,6 +30,7 @@ from energy_trading.simulation.battery_backtest import (  # noqa: E402
     bcm_product_to_bem_mandatory_volume,
     canonicalize_market_frame,
     load_prediction_warehouse_long,
+    normalize_predicted_pnl_aliases,
 )
 from energy_trading.config import MODEL_SPECS  # noqa: E402
 from energy_trading.simulation.bid_builder import AFRRCapacityBid, BCMCapacityBid  # noqa: E402
@@ -301,6 +302,85 @@ def test_terminal_id_recovery_planner_includes_incremental_auxiliary_loss() -> N
     assert reason == "terminal_soc_recovery"
     assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(0.25)
     assert float(diag["projected_terminal_soc_with_new_id_mwh"]) >= 10.10 - 1e-9
+
+
+def test_terminal_id_recovery_sizes_final_hour_id_for_post_aux_soc() -> None:
+    bt = _mk_backtester()
+    bt.aux_mode = "state_dependent"
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.095
+    id_charge_mw, id_discharge_mw, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=8.337168,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=8.308269,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    assert id_discharge_mw == pytest.approx(0.0)
+    assert id_charge_mw > 0.0
+    assert reason == "terminal_soc_recovery"
+    assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(0.095)
+    assert float(diag["projected_terminal_soc_with_new_id_before_aux_mwh"]) >= 10.0 - 1e-9
+    assert float(diag["projected_terminal_soc_with_new_id_mwh"]) >= 10.0 - 1e-9
+    assert float(diag["terminal_soc_recovery_post_aux_shortfall_mwh"]) == pytest.approx(0.0)
+
+
+def test_global_pf_timestamp_coverage_normalizes_equivalent_utc_timestamps() -> None:
+    expected = pd.date_range("2025-01-08T01:00:00Z", periods=47, freq="h")
+    candidate = expected.tz_convert("Europe/Berlin").to_series(index=None).sample(frac=1.0, random_state=7).tolist()
+
+    diag = BatteryBacktester._timestamp_coverage_diagnostics(expected, candidate)
+
+    assert float(diag["aligned"]) == pytest.approx(1.0)
+    assert float(diag["missing_timestamp_count"]) == pytest.approx(0.0)
+    assert str(diag["first_missing_timestamp_utc"]) == ""
+    assert float(diag["extra_timestamp_count"]) == pytest.approx(0.0)
+    assert str(diag["first_extra_timestamp_utc"]) == ""
+    assert float(diag["expected_rows"]) == pytest.approx(47.0)
+    assert float(diag["actual_rows"]) == pytest.approx(47.0)
+    assert float(diag["expected_row_count"]) == pytest.approx(47.0)
+    assert float(diag["actual_row_count"]) == pytest.approx(47.0)
+
+
+def test_global_pf_timestamp_coverage_uses_evaluated_window_not_raw_input_window() -> None:
+    raw_effective_window = pd.date_range("2025-01-08T00:00:00Z", periods=48, freq="h")
+    evaluated_settlement_window = pd.date_range("2025-01-08T01:00:00Z", periods=47, freq="h")
+    candidate = evaluated_settlement_window.tz_convert("Europe/Berlin").to_list()
+
+    raw_diag = BatteryBacktester._timestamp_coverage_diagnostics(raw_effective_window, candidate)
+    evaluated_diag = BatteryBacktester._timestamp_coverage_diagnostics(evaluated_settlement_window, candidate)
+
+    assert float(raw_diag["aligned"]) == pytest.approx(0.0)
+    assert float(raw_diag["missing_timestamp_count"]) == pytest.approx(1.0)
+    assert str(raw_diag["first_missing_timestamp_utc"]) == "2025-01-08T00:00:00+00:00"
+    assert float(raw_diag["expected_rows"]) == pytest.approx(48.0)
+    assert float(raw_diag["actual_rows"]) == pytest.approx(47.0)
+
+    assert float(evaluated_diag["aligned"]) == pytest.approx(1.0)
+    assert float(evaluated_diag["missing_timestamp_count"]) == pytest.approx(0.0)
+    assert float(evaluated_diag["extra_timestamp_count"]) == pytest.approx(0.0)
+    assert float(evaluated_diag["expected_rows"]) == pytest.approx(47.0)
+    assert float(evaluated_diag["actual_rows"]) == pytest.approx(47.0)
+
+
+def test_global_pf_timestamp_coverage_reports_true_missing_timestamp() -> None:
+    expected = pd.date_range("2025-01-08T00:00:00Z", periods=3, freq="h")
+    candidate = expected[:2]
+
+    diag = BatteryBacktester._timestamp_coverage_diagnostics(expected, candidate)
+
+    assert float(diag["aligned"]) == pytest.approx(0.0)
+    assert float(diag["missing_timestamp_count"]) == pytest.approx(1.0)
+    assert str(diag["first_missing_timestamp_utc"]) == "2025-01-08T02:00:00+00:00"
+    assert float(diag["extra_timestamp_count"]) == pytest.approx(0.0)
+    assert float(diag["expected_row_count"]) == pytest.approx(3.0)
+    assert float(diag["actual_row_count"]) == pytest.approx(2.0)
 
 
 def _one_hour_pred_df(
@@ -3868,6 +3948,48 @@ def test_bcm_precommitment_reduces_infeasible_bid() -> None:
     assert max(lock_pos.values()) <= 4.0 + 1e-9
 
 
+def test_bcm_precommit_skips_partial_product_at_simulation_end() -> None:
+    bt = _mk_backtester()
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")  # 08:00 CEST BCM bid hour.
+    target_hours = pd.date_range("2025-05-02 18:00:00+00:00", periods=3, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [5.0, 5.0, 5.0],
+            "reserve_neg_mw": [2.0, 2.0, 2.0],
+            "soc_start_lp_mwh": [12.0, 12.0, 12.0],
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame({col.timestamp: target_hours}).set_index(col.timestamp)
+    lock_pos: dict[pd.Timestamp, float] = {}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    audit: dict[str, dict[pd.Timestamp, float | str]] = {}
+
+    stats = bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=audit,
+        is_perfect_foresight=False,
+        global_end_utc=pd.Timestamp("2025-05-02 20:00:00+00:00"),
+    )
+
+    assert stats["triggered"] == 1.0
+    assert lock_pos == {}
+    assert lock_neg == {}
+    assert set(audit["bcm_precommit_zero_reason"].values()) == {"partial_product_or_sim_end"}
+    assert set(audit["submitted_reserve_pos_mw_after_retry"].values()) == {0.0}
+    assert set(audit["submitted_reserve_neg_mw_after_retry"].values()) == {0.0}
+    assert set(audit["bcm_precommit_locked_pos_mw"].values()) == {0.0}
+    assert set(audit["bcm_precommit_locked_neg_mw"].values()) == {0.0}
+
+
 def test_bcm_precommit_selector_uses_first_feasible_retry_factor(monkeypatch: pytest.MonkeyPatch) -> None:
     bt = _mk_backtester()
     bt.enable_reserve_retry_ladder = True
@@ -5563,6 +5685,43 @@ def test_rolling_final_soc_target_only_applies_at_global_end() -> None:
     ) is None
 
 
+def test_rolling_final_soc_target_anticipates_latest_technical_id_recovery() -> None:
+    target = BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=True,
+        window_end=23,
+        total_rows=24,
+        soc_min=2.0,
+        soc_target_end=10.0,
+        p_max_mw=1.0,
+        eta_in=0.9487,
+        dt_h=1.0,
+        remaining_aux_loss_mwh_per_hour=0.04,
+        terminal_soc_safety_margin_mwh=0.10,
+        soc_max=18.0,
+    )
+
+    assert target == pytest.approx(10.0 + 0.10 + 0.04 - 1.0 * 0.9487)
+    assert target > 2.0
+
+
+def test_rolling_final_soc_recoverability_floor_stays_at_soc_min_when_time_is_sufficient() -> None:
+    target = BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=True,
+        window_end=12,
+        total_rows=24,
+        soc_min=2.0,
+        soc_target_end=10.0,
+        p_max_mw=10.0,
+        eta_in=0.9487,
+        dt_h=1.0,
+        remaining_aux_loss_mwh_per_hour=0.04,
+        terminal_soc_safety_margin_mwh=0.10,
+        soc_max=18.0,
+    )
+
+    assert target == pytest.approx(2.0)
+
+
 def test_hard_final_soc_false_infeasible_classification_when_safe_hold_feasible() -> None:
     assert BatteryBacktester._classify_hard_final_soc_infeasibility(
         current_soc_mwh=13.6,
@@ -6430,13 +6589,14 @@ def test_global_pf_incumbent_selector_chooses_no_market_over_solver() -> None:
 def test_global_pf_incumbent_selector_chooses_realized_path_over_solver() -> None:
     selected = BatteryBacktester._select_global_pf_incumbent(
         {
-            "solver": (10.0, True, pd.DataFrame({"x": [1]})),
-            "no_market": (9.0, True, pd.DataFrame({"x": [2]})),
-            "realized_path": (13.0, True, pd.DataFrame({"x": [3]})),
+            "solver": (0.0, True, pd.DataFrame({"x": [1]})),
+            "no_market": (0.0, True, pd.DataFrame({"x": [2]})),
+            "realized_path": (101.879744, True, pd.DataFrame({"x": [3]})),
         }
     )
     assert selected["selected"] == "realized_path"
-    assert float(selected["value"]) == 13.0
+    assert float(selected["value"]) == pytest.approx(101.879744)
+    assert float(selected["verified"]) == pytest.approx(1.0)
 
 
 def test_global_pf_incumbent_selector_reports_no_feasible_incumbent() -> None:
@@ -7998,6 +8158,68 @@ def _perf_args() -> argparse.Namespace:
         id_recourse_mode="none",
         da_quantile_role="mid",
     )
+
+
+def test_predicted_total_pnl_adds_planned_legacy_alias() -> None:
+    summary = normalize_predicted_pnl_aliases({"predicted_total_pnl_eur": 12.5})
+
+    assert float(summary["predicted_total_pnl_eur"]) == pytest.approx(12.5)
+    assert float(summary["planned_total_pnl_eur"]) == pytest.approx(12.5)
+    assert float(summary["planned_total_pnl_eur_is_legacy_alias"]) == pytest.approx(1.0)
+
+
+def test_legacy_planned_total_pnl_normalizes_to_predicted() -> None:
+    summary = normalize_predicted_pnl_aliases({"planned_total_pnl_eur": -3.25})
+
+    assert float(summary["predicted_total_pnl_eur"]) == pytest.approx(-3.25)
+    assert float(summary["planned_total_pnl_eur"]) == pytest.approx(-3.25)
+    assert summary["predicted_total_pnl_eur_source"] == "legacy_planned_total_pnl_eur"
+
+
+def test_predicted_planned_total_pnl_mismatch_raises() -> None:
+    with pytest.raises(ValueError, match="predicted_total_pnl_eur and planned_total_pnl_eur differ"):
+        normalize_predicted_pnl_aliases(
+            {
+                "predicted_total_pnl_eur": 1.0,
+                "planned_total_pnl_eur": 2.0,
+            }
+        )
+
+
+def test_validate_outputs_flags_predicted_planned_total_pnl_mismatch() -> None:
+    summary = validate_outputs._normalize_predicted_pnl_aliases(
+        {
+            "predicted_total_pnl_eur": 1.0,
+            "planned_total_pnl_eur": 2.0,
+        }
+    )
+
+    assert float(summary["predicted_planned_pnl_alias_consistency_ok"]) == pytest.approx(0.0)
+    assert float(summary["predicted_planned_pnl_alias_error_eur"]) == pytest.approx(-1.0)
+    assert float(summary["planned_total_pnl_eur"]) == pytest.approx(1.0)
+
+
+def test_performance_metrics_prefers_predicted_pnl_and_accepts_legacy_planned_alias() -> None:
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=1, freq="h")
+    hourly = pd.DataFrame({"timestamp_utc": ts, "real_pnl_eur": [0.0], "real_throughput_mwh": [0.0]})
+    summary = {
+        "realized_total_pnl_eur": 0.0,
+        "planned_total_pnl_eur": 42.0,
+        "p_max_mw": 10.0,
+        "capacity_mwh": 20.0,
+    }
+
+    perf_df, _ = _build_performance_metrics(
+        hourly=hourly,
+        summary=summary,
+        args=_perf_args(),
+        scenario_name="p50_p50",
+        scenario_bins=["p50", "p50"],
+        scenario_start_utc=None,
+        scenario_end_utc=None,
+    )
+
+    assert float(perf_df.iloc[0]["predicted_net_revenue_eur"]) == pytest.approx(42.0)
 
 
 def test_daily_to_scenario_reconciliation_uses_hourly_real_pnl() -> None:
