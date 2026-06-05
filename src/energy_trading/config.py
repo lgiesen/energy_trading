@@ -43,11 +43,29 @@ BATTERY_SPECS = {
     # Duty values are multipliers of aux_power_peak_mw.
     # Example: duty=0.95 means 95% of aux_power_peak_mw (not 0.95 MW absolute).
     "aux_power_mode": "state_dependent",  # "state_dependent" | "constant"
-    "aux_power_peak_mw": 0.20,  # Full-load auxiliary draw (cooling+BMS+PCS)
-    "aux_power_standby_duty": 0.20,  # 20% of peak aux when reserve-ready and idle
-    "aux_power_trading_duty": 0.70,  # 70% of peak aux during active DA/ID charging/discharging
-    "aux_power_afrr_active_duty": 0.95,  # 95% of peak aux during real aFRR activation
-    "aux_power_off_duty": 0.00,  # 0% of peak aux when fully off
+
+    # Source-derived for a 10 MW / 20 MWh, 2-hour Li-ion BESS:
+    # Aurecon/AEMO Table 9-1 gives operating auxiliary load = 0.95% of gross power.
+    # 10 MW * 0.0095 = 0.095 MW = 95 kW.
+    "aux_power_peak_mw": 0.095,
+
+    # Source-derived standby:
+    # Aurecon/AEMO Table 9-1 gives standby auxiliary load = 0.30% of gross power.
+    # 10 MW * 0.003 = 0.030 MW = 30 kW.
+    # As fraction of aux_power_peak_mw: 0.030 / 0.095 = 0.3158.
+    "aux_power_standby_duty": 0.316,
+
+    # Trading duty = full operating auxiliary load.
+    # This maps charging/discharging operation to the source's "operating" auxiliary load.
+    "aux_power_trading_duty": 1.00,
+
+    # aFRR active duty = full operating auxiliary load.
+    # Do not use a higher value unless you explicitly label it as a sensitivity assumption.
+    "aux_power_afrr_active_duty": 1.00,
+
+    # Use 0 only if "off duty" means no auxiliary cost allocated to market operation.
+    # Physically, an energized site would still have some parasitic load.
+    "aux_power_off_duty": 0.00,
 }
 BATTERY_SPECS["efficiency_rt"] = BATTERY_SPECS["efficiency_in"] * BATTERY_SPECS["efficiency_out"]
 

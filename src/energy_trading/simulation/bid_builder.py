@@ -66,9 +66,9 @@ class BidPricingPolicy:
         q50: float | None = None,
         q90: float | None = None,
     ) -> float:
-        center = self._center(pred, q50)
-        spread = self._spread(q10, q90)
-        return max(0.0, center - self.cap_risk_lambda * spread)
+        # BCM capacity bids are pay-as-bid forecast bids. Negative forecast
+        # capacity prices must remain possible instead of being floored to zero.
+        return float(pred)
 
     def energy_price(
         self,
@@ -131,6 +131,7 @@ class BidBuilder:
         self.forecast_value_mode = str(forecast_value_mode).strip().lower()
         if self.forecast_value_mode not in {"canonical_economic", "raw_signed"}:
             self.forecast_value_mode = "canonical_economic"
+        self.last_activation_price_guard_diagnostics: dict[str, float | str] = {}
 
     def _energy_price(
         self,
@@ -154,9 +155,6 @@ class BidBuilder:
         center = self.pricing._center(float(pred), q50)
         spread = self.pricing._spread(q10, q90)
         return max(float(self.mc_neg), center - self.pricing.act_risk_lambda * spread)
-
-    def _neg_out_of_merit_price(self) -> float:
-        return 9999.0 if self.forecast_value_mode == "canonical_economic" else -9999.0
 
     def _neg_marginal_cost_price(self) -> float:
         return float(self.mc_neg) if self.forecast_value_mode == "canonical_economic" else -float(self.mc_neg)
@@ -228,6 +226,7 @@ class BidBuilder:
         soc_max_mwh: float,
         obligation_mw: float = 0.0,
         delivery_duration_h: float = 1.0,
+        activation_headroom_h: float | None = None,
         q10: float | None = None,
         q50: float | None = None,
         q90: float | None = None,
@@ -235,20 +234,45 @@ class BidBuilder:
         true_act_price: float | None = None,
     ) -> float:
         """T-25 dynamic energy bid update based on latest forecast + current SoC."""
-        # Defensive bidding: if physical delivery capability is insufficient,
-        # bid out of merit order to avoid activation/default penalties.
+        # Keep the physical-headroom diagnostic visible, but do not alter the
+        # activation bid price here. Physical infeasibility must be handled by
+        # precommit/optimization feasibility checks, not by hard-coded prices.
         ob = max(0.0, float(obligation_mw))
-        dt = max(1e-12, float(delivery_duration_h))
+        headroom_h = (
+            float(delivery_duration_h)
+            if activation_headroom_h is None
+            else float(activation_headroom_h)
+        )
+        headroom_h = max(1e-12, headroom_h)
+        available_internal_mwh = max(0.0, float(soc_now_mwh) - float(soc_min_mwh))
+        available_headroom_mwh = max(0.0, float(soc_max_mwh) - float(soc_now_mwh))
+        required_internal_mwh = 0.0
+        required_headroom_mwh = 0.0
+        headroom_insufficient = False
+        reason = "none"
         if side == "pos":
-            required_internal_mwh = ob * dt / max(self.eta_out, 1e-12)
-            available_internal_mwh = max(0.0, float(soc_now_mwh) - float(soc_min_mwh))
+            required_internal_mwh = ob * headroom_h / max(self.eta_out, 1e-12)
             if available_internal_mwh + 1e-9 < required_internal_mwh:
-                return 9999.0
+                headroom_insufficient = True
+                reason = "insufficient_positive_activation_headroom"
         else:
-            required_headroom_mwh = ob * dt * self.eta_in
-            available_headroom_mwh = max(0.0, float(soc_max_mwh) - float(soc_now_mwh))
+            required_headroom_mwh = ob * headroom_h * self.eta_in
             if available_headroom_mwh + 1e-9 < required_headroom_mwh:
-                return self._neg_out_of_merit_price()
+                headroom_insufficient = True
+                reason = "insufficient_negative_activation_headroom"
+        self.last_activation_price_guard_diagnostics = {
+            "activation_price_guard_side": str(side),
+            "activation_price_guard_obligation_mw": float(ob),
+            "activation_price_guard_activation_headroom_h": float(headroom_h),
+            "activation_price_guard_projected_soc_mwh": float(soc_now_mwh),
+            "activation_price_guard_available_internal_mwh": float(available_internal_mwh),
+            "activation_price_guard_available_headroom_mwh": float(available_headroom_mwh),
+            "activation_price_guard_required_internal_mwh": float(required_internal_mwh),
+            "activation_price_guard_required_headroom_mwh": float(required_headroom_mwh),
+            "activation_price_guard_headroom_insufficient": float(headroom_insufficient),
+            "activation_price_guard_out_of_merit": 0.0,
+            "activation_price_guard_reason": str(reason),
+        }
 
         if is_perfect_foresight and true_act_price is not None and math.isfinite(float(true_act_price)):
             # Oracle still avoids knowingly uneconomic activation prices.

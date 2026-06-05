@@ -2902,21 +2902,27 @@ class BatteryBacktester:
         c[sl["dis"]] = -(dis_coef * da_step)
         id_buy_price = np.minimum(self.id_buy_price_cap_eur_mwh, p_da + float(self.id_rescue_spread_eur_mwh))
         id_sell_price = np.maximum(self.id_sell_price_floor_eur_mwh, p_da - float(self.id_rescue_spread_eur_mwh))
-        # Technical ID recourse is not a profit market. A large per-MWh penalty
-        # makes ID enter only to satisfy hard SoC/headroom/obligation constraints.
-        technical_id_penalty = max(
-            10_000.0,
-            float(self.final_soc_shortfall_penalty_eur_per_mwh),
-            float(self.imbalance_penalty_eur_mwh),
+        # Technical ID recourse is valid physical repair energy, not infeasibility
+        # slack. Price it with market energy + variable costs; keep large
+        # penalties on terminal/SoC/reserve slacks below. In technical-repair
+        # mode, do not let negative/positive ID prices create economic arbitrage:
+        # buy energy is never an objective profit, and sell revenue is ignored
+        # unless economic ID is explicitly enabled.
+        technical_id_penalty = 0.0
+        id_buy_objective_price = (
+            id_buy_price if perms.allow_id_economic else np.maximum(id_buy_price, 0.0)
+        )
+        id_sell_objective_price = (
+            id_sell_price if perms.allow_id_economic else np.minimum(id_sell_price, 0.0)
         )
         id_buy_coef = -(
-            id_buy_price
+            id_buy_objective_price
             + float(self.trans_eur_mwh)
             + float(self.deg_eur_mwh) * float(self.eta_in)
             + technical_id_penalty
         )
         id_sell_coef = (
-            id_sell_price
+            id_sell_objective_price
             - float(self.trans_eur_mwh)
             - float(self.deg_eur_mwh) / max(float(self.eta_out), 1e-12)
             - technical_id_penalty
@@ -3880,6 +3886,17 @@ class BatteryBacktester:
             np.where(terminal_need > 1e-9, "terminal_soc_recovery", "protected_soc_recovery"),
             np.where(id_discharge_mw > 1e-9, "upper_soc_relief", "none"),
         )
+        id_technical_repair_energy_cost_eur_per_mwh = (
+            id_buy_objective_price
+            + float(self.trans_eur_mwh)
+            + float(self.deg_eur_mwh) * float(self.eta_in)
+        )
+        effective_bcm_aux_recovery_cost_eur_per_mw = (
+            (float(self.aux_standby_mw) / max(float(self.reserve_max_mw), 1e-12))
+            * float(self.dt_h)
+            / max(float(self.eta_in), 1e-12)
+            * id_technical_repair_energy_cost_eur_per_mwh
+        )
         extra_cols.update(
             {
                 "required_headroom_pos_mwh": req_pos_mwh,
@@ -3913,6 +3930,9 @@ class BatteryBacktester:
                 "id_spread_eur_mwh": np.full(n, float(self.id_rescue_spread_eur_mwh), dtype=float),
                 "id_buy_price_eur_mwh": id_buy_price,
                 "id_sell_price_eur_mwh": id_sell_price,
+                "id_technical_repair_energy_cost_eur_per_mwh": id_technical_repair_energy_cost_eur_per_mwh,
+                "id_technical_repair_artificial_penalty_applied": np.zeros(n, dtype=float),
+                "effective_bcm_aux_recovery_cost_eur_per_mw": effective_bcm_aux_recovery_cost_eur_per_mw,
                 "id_price_uses_activation_price": np.zeros(n, dtype=float),
                 "reserve_activation_headroom_h": np.full(n, self.reserve_activation_headroom_h, dtype=float),
                 "bem_activation_headroom_h": np.full(n, self.bem_activation_headroom_h, dtype=float),
@@ -5293,6 +5313,40 @@ class BatteryBacktester:
             except Exception:
                 return float("nan")
 
+        activation_guard_diags: dict[str, dict[str, float | str]] = {}
+
+        def _dynamic_afrr_energy_price_with_guard(
+            *,
+            diag_key: str,
+            side: str,
+            pred_act_price: float,
+            obligation_mw: float,
+            activation_headroom_h: float,
+            q10: float | None,
+            q50: float | None,
+            q90: float | None,
+            true_act_price: float,
+        ) -> float:
+            price = self.bid_builder.dynamic_afrr_energy_price(
+                side=side,
+                pred_act_price=float(pred_act_price),
+                soc_now_mwh=soc_ref,
+                soc_min_mwh=self.soc_min,
+                soc_max_mwh=self.soc_max,
+                obligation_mw=float(obligation_mw),
+                delivery_duration_h=self.dt_h,
+                activation_headroom_h=float(activation_headroom_h),
+                q10=q10,
+                q50=q50,
+                q90=q90,
+                is_perfect_foresight=is_perfect_foresight,
+                true_act_price=float(true_act_price),
+            )
+            activation_guard_diags[diag_key] = dict(
+                getattr(self.bid_builder, "last_activation_price_guard_diagnostics", {})
+            )
+            return float(price)
+
         # Per-bin transparency payload (filled later with submitted/awarded/activated values).
         bin_payload: dict[str, float | str] = {}
         for b, q in enumerate(self.afrr_quantile_bins):
@@ -5351,18 +5405,15 @@ class BatteryBacktester:
                             )
                             else obligation_capacity_price_pos
                         ),
-                        energy_price_eur_mwh=self.bid_builder.dynamic_afrr_energy_price(
+                        energy_price_eur_mwh=_dynamic_afrr_energy_price_with_guard(
+                            diag_key="bcm_pos",
                             side="pos",
                             pred_act_price=float(pred_act_pos if not (obligation_energy_pos is not None and np.isfinite(obligation_energy_pos)) else obligation_energy_pos),
-                            soc_now_mwh=soc_ref,
-                            soc_min_mwh=self.soc_min,
-                            soc_max_mwh=self.soc_max,
                             obligation_mw=ob_pos,
-                            delivery_duration_h=self.dt_h,
+                            activation_headroom_h=self.reserve_activation_headroom_h,
                             q10=float(pred_act_pos_q10) if pred_act_pos_q10 is not None and np.isfinite(pred_act_pos_q10) else None,
                             q50=float(pred_act_pos_q50) if pred_act_pos_q50 is not None and np.isfinite(pred_act_pos_q50) else None,
                             q90=float(pred_act_pos_q90) if pred_act_pos_q90 is not None and np.isfinite(pred_act_pos_q90) else None,
-                            is_perfect_foresight=is_perfect_foresight,
                             true_act_price=float(true_act_pos),
                         ),
                     )
@@ -5381,18 +5432,15 @@ class BatteryBacktester:
                             )
                             else obligation_capacity_price_neg
                         ),
-                        energy_price_eur_mwh=self.bid_builder.dynamic_afrr_energy_price(
+                        energy_price_eur_mwh=_dynamic_afrr_energy_price_with_guard(
+                            diag_key="bcm_neg",
                             side="neg",
                             pred_act_price=float(pred_act_neg if not (obligation_energy_neg is not None and np.isfinite(obligation_energy_neg)) else obligation_energy_neg),
-                            soc_now_mwh=soc_ref,
-                            soc_min_mwh=self.soc_min,
-                            soc_max_mwh=self.soc_max,
                             obligation_mw=ob_neg,
-                            delivery_duration_h=self.dt_h,
+                            activation_headroom_h=self.reserve_activation_headroom_h,
                             q10=float(pred_act_neg_q10) if pred_act_neg_q10 is not None and np.isfinite(pred_act_neg_q10) else None,
                             q50=float(pred_act_neg_q50) if pred_act_neg_q50 is not None and np.isfinite(pred_act_neg_q50) else None,
                             q90=float(pred_act_neg_q90) if pred_act_neg_q90 is not None and np.isfinite(pred_act_neg_q90) else None,
-                            is_perfect_foresight=is_perfect_foresight,
                             true_act_price=float(true_act_neg),
                         ),
                     )
@@ -5470,18 +5518,15 @@ class BatteryBacktester:
                     side=b.side,
                     quantity_mw=b.quantity_mw,
                     capacity_price_eur_mw=b.capacity_price_eur_mw,
-                    energy_price_eur_mwh=self.bid_builder.dynamic_afrr_energy_price(
+                    energy_price_eur_mwh=_dynamic_afrr_energy_price_with_guard(
+                        diag_key=f"bem_{b.side}",
                         side=b.side,
                         pred_act_price=float(pred_act_pos if b.side == "pos" else pred_act_neg),
-                        soc_now_mwh=soc_ref,
-                        soc_min_mwh=self.soc_min,
-                        soc_max_mwh=self.soc_max,
                         obligation_mw=float(b.quantity_mw),
-                        delivery_duration_h=self.dt_h,
+                        activation_headroom_h=self.bem_activation_headroom_h,
                         q10=float(pred_act_pos_q10) if (b.side == "pos" and pred_act_pos_q10 is not None and np.isfinite(pred_act_pos_q10)) else (float(pred_act_neg_q10) if (b.side == "neg" and pred_act_neg_q10 is not None and np.isfinite(pred_act_neg_q10)) else None),
                         q50=float(pred_act_pos_q50) if (b.side == "pos" and pred_act_pos_q50 is not None and np.isfinite(pred_act_pos_q50)) else (float(pred_act_neg_q50) if (b.side == "neg" and pred_act_neg_q50 is not None and np.isfinite(pred_act_neg_q50)) else None),
                         q90=float(pred_act_pos_q90) if (b.side == "pos" and pred_act_pos_q90 is not None and np.isfinite(pred_act_pos_q90)) else (float(pred_act_neg_q90) if (b.side == "neg" and pred_act_neg_q90 is not None and np.isfinite(pred_act_neg_q90)) else None),
-                        is_perfect_foresight=is_perfect_foresight,
                         true_act_price=float(true_act_pos if b.side == "pos" else true_act_neg),
                     ),
                 )
@@ -5496,18 +5541,15 @@ class BatteryBacktester:
                         side="pos",
                         quantity_mw=float(bem_q_pos),
                         capacity_price_eur_mw=0.0,
-                        energy_price_eur_mwh=self.bid_builder.dynamic_afrr_energy_price(
+                        energy_price_eur_mwh=_dynamic_afrr_energy_price_with_guard(
+                            diag_key="bem_pos",
                             side="pos",
                             pred_act_price=float(pred_act_pos),
-                            soc_now_mwh=soc_ref,
-                            soc_min_mwh=self.soc_min,
-                            soc_max_mwh=self.soc_max,
                             obligation_mw=float(bem_q_pos),
-                            delivery_duration_h=self.dt_h,
+                            activation_headroom_h=self.bem_activation_headroom_h,
                             q10=float(pred_act_pos_q10) if pred_act_pos_q10 is not None and np.isfinite(pred_act_pos_q10) else None,
                             q50=float(pred_act_pos_q50) if pred_act_pos_q50 is not None and np.isfinite(pred_act_pos_q50) else None,
                             q90=float(pred_act_pos_q90) if pred_act_pos_q90 is not None and np.isfinite(pred_act_pos_q90) else None,
-                            is_perfect_foresight=is_perfect_foresight,
                             true_act_price=float(true_act_pos),
                         ),
                     )
@@ -5519,18 +5561,15 @@ class BatteryBacktester:
                         side="neg",
                         quantity_mw=float(bem_q_neg),
                         capacity_price_eur_mw=0.0,
-                        energy_price_eur_mwh=self.bid_builder.dynamic_afrr_energy_price(
+                        energy_price_eur_mwh=_dynamic_afrr_energy_price_with_guard(
+                            diag_key="bem_neg",
                             side="neg",
                             pred_act_price=float(pred_act_neg),
-                            soc_now_mwh=soc_ref,
-                            soc_min_mwh=self.soc_min,
-                            soc_max_mwh=self.soc_max,
                             obligation_mw=float(bem_q_neg),
-                            delivery_duration_h=self.dt_h,
+                            activation_headroom_h=self.bem_activation_headroom_h,
                             q10=float(pred_act_neg_q10) if pred_act_neg_q10 is not None and np.isfinite(pred_act_neg_q10) else None,
                             q50=float(pred_act_neg_q50) if pred_act_neg_q50 is not None and np.isfinite(pred_act_neg_q50) else None,
                             q90=float(pred_act_neg_q90) if pred_act_neg_q90 is not None and np.isfinite(pred_act_neg_q90) else None,
-                            is_perfect_foresight=is_perfect_foresight,
                             true_act_price=float(true_act_neg),
                         ),
                     )
@@ -5748,6 +5787,20 @@ class BatteryBacktester:
         else:
             bcm_zero_reason = "none"
 
+        def _guard_value(key: str, field: str, default: float | str) -> float | str:
+            diag = activation_guard_diags.get(key, {})
+            return diag.get(field, default)
+
+        active_guard_key = "none"
+        if ob_pos > 1e-12:
+            active_guard_key = "bcm_pos"
+        elif ob_neg > 1e-12:
+            active_guard_key = "bcm_neg"
+        elif bem_only_submitted_pos_mw > 1e-12:
+            active_guard_key = "bem_pos"
+        elif bem_only_submitted_neg_mw > 1e-12:
+            active_guard_key = "bem_neg"
+
         return {
             "plan_charge_mw": ch_plan,
             "plan_discharge_mw": dis_plan,
@@ -5813,6 +5866,38 @@ class BatteryBacktester:
             "bcm_allowed": float(allow_bcm),
             "bcm_activation_bid_price_pos": float(bcm_activation_bid_price_pos),
             "bcm_activation_bid_price_neg": float(bcm_activation_bid_price_neg),
+            "activation_price_guard_source": str(active_guard_key),
+            "activation_price_guard_side": str(_guard_value(active_guard_key, "activation_price_guard_side", "none")),
+            "activation_price_guard_obligation_mw": float(
+                _guard_value(active_guard_key, "activation_price_guard_obligation_mw", 0.0)
+            ),
+            "activation_price_guard_activation_headroom_h": float(
+                _guard_value(active_guard_key, "activation_price_guard_activation_headroom_h", 0.0)
+            ),
+            "activation_price_guard_projected_soc_mwh": float(
+                _guard_value(active_guard_key, "activation_price_guard_projected_soc_mwh", soc_ref)
+            ),
+            "activation_price_guard_available_internal_mwh": float(
+                _guard_value(active_guard_key, "activation_price_guard_available_internal_mwh", 0.0)
+            ),
+            "activation_price_guard_available_headroom_mwh": float(
+                _guard_value(active_guard_key, "activation_price_guard_available_headroom_mwh", 0.0)
+            ),
+            "activation_price_guard_required_internal_mwh": float(
+                _guard_value(active_guard_key, "activation_price_guard_required_internal_mwh", 0.0)
+            ),
+            "activation_price_guard_required_headroom_mwh": float(
+                _guard_value(active_guard_key, "activation_price_guard_required_headroom_mwh", 0.0)
+            ),
+            "activation_price_guard_out_of_merit": float(
+                _guard_value(active_guard_key, "activation_price_guard_out_of_merit", 0.0)
+            ),
+            "activation_price_guard_headroom_insufficient": float(
+                _guard_value(active_guard_key, "activation_price_guard_headroom_insufficient", 0.0)
+            ),
+            "activation_price_guard_reason": str(
+                _guard_value(active_guard_key, "activation_price_guard_reason", "none")
+            ),
             "bem_activation_bid_price_pos_eur_per_mwh": float(bem_activation_bid_price_pos),
             "bem_activation_bid_price_neg_eur_per_mwh": float(bem_activation_bid_price_neg),
             "bem_activation_bid_price_eur_per_mwh": float(
@@ -11224,7 +11309,9 @@ class BatteryBacktester:
         global_pf_solver_rejection_reason = "disabled"
         global_pf_solver_terminal_shortfall_mwh = float("nan")
         global_pf_no_market_feasible = 0.0
+        global_pf_no_market_rejection_reason = "disabled"
         global_pf_realized_path_feasible = 0.0
+        global_pf_realized_path_rejection_reason = "disabled"
         da_true_for_global_pf = self._finite_numeric_series(
             perfect_foresight_df,
             colmap.true_da_price,
@@ -11246,12 +11333,12 @@ class BatteryBacktester:
                 require_ok_codes: bool,
             ) -> tuple[bool, str, float]:
                 if frame is None or frame.empty:
-                    return False, "empty_frame", float("nan")
+                    return False, "empty_candidate", float("nan")
                 if colmap.timestamp not in frame.columns:
-                    return False, "missing_timestamp", float("nan")
+                    return False, "missing_timestamps", float("nan")
                 candidate_ts = pd.to_datetime(frame[colmap.timestamp], utc=True, errors="coerce").reset_index(drop=True)
                 if len(candidate_ts) != len(expected_global_pf_ts) or not candidate_ts.equals(expected_global_pf_ts):
-                    return False, "timestamp_index_mismatch", float("nan")
+                    return False, "missing_timestamps", float("nan")
                 soc_col = f"{prefix}_soc_mwh"
                 if soc_col not in frame.columns:
                     return False, "missing_soc", float("nan")
@@ -11262,9 +11349,9 @@ class BatteryBacktester:
                 soc_max_violation = float((soc_vals - float(self.soc_max)).clip(lower=0.0).max())
                 terminal_shortfall = max(0.0, float(self.soc_target_end) - float(soc_vals.iloc[-1]))
                 if soc_min_violation > 1e-6:
-                    return False, "soc_min_violation", terminal_shortfall
+                    return False, "soc_bounds_violation", terminal_shortfall
                 if soc_max_violation > 1e-6:
-                    return False, "soc_max_violation", terminal_shortfall
+                    return False, "soc_bounds_violation", terminal_shortfall
                 if terminal_shortfall > 1e-6:
                     return False, "terminal_soc_shortfall", terminal_shortfall
                 for c in (
@@ -11276,20 +11363,40 @@ class BatteryBacktester:
                     if c in frame.columns:
                         max_violation = float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).clip(lower=0.0).max())
                         if max_violation > 1e-6:
-                            return False, "power_bounds_violation", terminal_shortfall
+                            return False, "power_stack_violation", terminal_shortfall
                 fallback_col = f"{prefix}_optimizer_fallback_used"
                 if fallback_col in frame.columns:
                     fallback_used = float(pd.to_numeric(frame[fallback_col], errors="coerce").fillna(0.0).max())
                     if fallback_used > 0.5:
                         return False, "fallback_used", terminal_shortfall
+                repair_col = f"{prefix}_reserve_feasibility_repair_used"
+                if repair_col in frame.columns:
+                    repair_used = float(pd.to_numeric(frame[repair_col], errors="coerce").fillna(0.0).max())
+                    if repair_used > 0.5:
+                        return False, "reserve_feasibility_repair", terminal_shortfall
+                missed_cols = (
+                    f"{prefix}_missed_capacity_pos_mw",
+                    f"{prefix}_missed_capacity_neg_mw",
+                    f"{prefix}_missed_capacity_mw",
+                )
+                for c in missed_cols:
+                    if c in frame.columns:
+                        missed = float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).clip(lower=0.0).max())
+                        if missed > 1e-6:
+                            return False, "missed_capacity", terminal_shortfall
+                dump_col = f"{prefix}_accepted_path_infeasible_debug_dump_count"
+                if dump_col in frame.columns:
+                    dump_count = float(pd.to_numeric(frame[dump_col], errors="coerce").fillna(0.0).max())
+                    if dump_count > 0.5:
+                        return False, "accepted_path_infeasible_debug_dump", terminal_shortfall
                 code_col = f"{prefix}_optimization_error_code"
                 if require_ok_codes and code_col in frame.columns:
                     codes = frame[code_col].fillna("ok").astype(str).str.strip().str.lower()
                     bad_codes = codes[~codes.isin({"", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"})]
                     if not bad_codes.empty:
-                        return False, "non_ok_optimization_code", terminal_shortfall
+                        return False, "non_ok_optimization_status", terminal_shortfall
                 if not np.isfinite(float(value_eur)):
-                    return False, "nonfinite_value", terminal_shortfall
+                    return False, "nonfinite_pnl", terminal_shortfall
                 return True, "none", terminal_shortfall
 
             no_trade_real, no_trade_diag = _build_no_market_terminal_id_incumbent(perfect_foresight_df)
@@ -11310,6 +11417,7 @@ class BatteryBacktester:
             )
             no_trade_feasible = bool(float(no_trade_diag.get("feasible", 0.0)) >= 0.5 and no_trade_valid)
             global_pf_no_market_feasible = float(no_trade_feasible)
+            global_pf_no_market_rejection_reason = "none" if no_trade_feasible else str(no_trade_rejection_reason)
 
             solver_global = _empty_pf_frame("global_perfect_foresight")
             solver_feasible = False
@@ -11384,6 +11492,9 @@ class BatteryBacktester:
                 )
             )
             global_pf_realized_path_feasible = float(realized_global_feasible)
+            global_pf_realized_path_rejection_reason = (
+                "none" if realized_global_feasible else str(_realized_rejection_reason)
+            )
 
             selection = self._select_global_pf_incumbent(
                 {
@@ -11471,6 +11582,13 @@ class BatteryBacktester:
         if not global_perfect_foresight_real.empty:
             hourly = _merge_unique(hourly, global_perfect_foresight_real)
         hourly = hourly.sort_values(colmap.timestamp).reset_index(drop=True)
+        hourly["global_pf_selected_incumbent"] = str(global_pf_selected_incumbent)
+        hourly["global_pf_solver_feasible"] = float(global_pf_solver_feasible)
+        hourly["global_pf_no_market_feasible"] = float(global_pf_no_market_feasible)
+        hourly["global_pf_realized_path_feasible"] = float(global_pf_realized_path_feasible)
+        hourly["global_pf_solver_rejection_reason"] = str(global_pf_solver_rejection_reason)
+        hourly["global_pf_no_market_rejection_reason"] = str(global_pf_no_market_rejection_reason)
+        hourly["global_pf_realized_path_rejection_reason"] = str(global_pf_realized_path_rejection_reason)
         self._validate_strategy_isolation_outputs(
             hourly=hourly,
             allowed_markets=allowed_markets,
@@ -11933,7 +12051,9 @@ class BatteryBacktester:
             "global_pf_solver_rejection_reason": str(global_pf_solver_rejection_reason),
             "global_pf_solver_terminal_shortfall_mwh": float(global_pf_solver_terminal_shortfall_mwh),
             "global_pf_no_market_feasible": float(global_pf_no_market_feasible),
+            "global_pf_no_market_rejection_reason": str(global_pf_no_market_rejection_reason),
             "global_pf_realized_path_feasible": float(global_pf_realized_path_feasible),
+            "global_pf_realized_path_rejection_reason": str(global_pf_realized_path_rejection_reason),
             "global_pf_upper_bound_gap_eur": float(global_pf_upper_bound_gap_eur),
             "global_pf_below_realized_incumbent": float(global_pf_below_realized_incumbent),
             "global_pf_solver_solution_eur": float(global_pf_solver_solution_eur),
@@ -13556,6 +13676,12 @@ class BatteryBacktester:
             ("global_pf_available", 0.0),
             ("global_pf_solver_status", "disabled"),
             ("global_pf_verified", 0.0),
+            ("global_pf_solver_feasible", 0.0),
+            ("global_pf_no_market_feasible", 0.0),
+            ("global_pf_realized_path_feasible", 0.0),
+            ("global_pf_solver_rejection_reason", "disabled"),
+            ("global_pf_no_market_rejection_reason", "disabled"),
+            ("global_pf_realized_path_rejection_reason", "disabled"),
             ("global_pf_upper_bound_gap_eur", float("nan")),
             ("global_pf_below_realized_incumbent", 0.0),
             ("global_pf_solver_solution_eur", float("nan")),

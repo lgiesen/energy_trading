@@ -55,6 +55,94 @@ def _mk_backtester(forecast_value_mode: str = "raw_signed") -> BatteryBacktester
     return BatteryBacktester()
 
 
+def test_afrr_activation_price_guard_pos_uses_activation_headroom_when_sufficient() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.bid_builder.afrr_energy_bid_strategy = "forecast"
+
+    price = bt.bid_builder.dynamic_afrr_energy_price(
+        side="pos",
+        pred_act_price=123.0,
+        soc_now_mwh=10.0,
+        soc_min_mwh=2.0,
+        soc_max_mwh=18.0,
+        obligation_mw=9.0,
+        delivery_duration_h=1.0,
+        activation_headroom_h=0.5,
+    )
+
+    assert price != pytest.approx(9999.0)
+    assert price == pytest.approx(123.0)
+    diag = bt.bid_builder.last_activation_price_guard_diagnostics
+    assert diag["activation_price_guard_out_of_merit"] == pytest.approx(0.0)
+    assert diag["activation_price_guard_activation_headroom_h"] == pytest.approx(0.5)
+
+
+def test_afrr_activation_price_guard_reports_headroom_insufficient_without_out_of_merit_bid() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.bid_builder.afrr_energy_bid_strategy = "forecast"
+
+    price = bt.bid_builder.dynamic_afrr_energy_price(
+        side="pos",
+        pred_act_price=123.0,
+        soc_now_mwh=10.0,
+        soc_min_mwh=2.0,
+        soc_max_mwh=18.0,
+        obligation_mw=20.0,
+        delivery_duration_h=1.0,
+        activation_headroom_h=0.5,
+    )
+
+    assert price == pytest.approx(123.0)
+    diag = bt.bid_builder.last_activation_price_guard_diagnostics
+    assert diag["activation_price_guard_headroom_insufficient"] == pytest.approx(1.0)
+    assert diag["activation_price_guard_out_of_merit"] == pytest.approx(0.0)
+    assert diag["activation_price_guard_reason"] == "insufficient_positive_activation_headroom"
+
+
+def test_afrr_activation_price_guard_neg_uses_headroom_not_full_hour() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.bid_builder.afrr_energy_bid_strategy = "forecast"
+
+    price = bt.bid_builder.dynamic_afrr_energy_price(
+        side="neg",
+        pred_act_price=111.0,
+        soc_now_mwh=10.0,
+        soc_min_mwh=2.0,
+        soc_max_mwh=18.0,
+        obligation_mw=9.0,
+        delivery_duration_h=1.0,
+        activation_headroom_h=0.5,
+    )
+
+    assert price != pytest.approx(9999.0)
+    assert price == pytest.approx(111.0)
+    diag = bt.bid_builder.last_activation_price_guard_diagnostics
+    assert diag["activation_price_guard_out_of_merit"] == pytest.approx(0.0)
+    assert diag["activation_price_guard_required_headroom_mwh"] == pytest.approx(9.0 * 0.5 * bt.eta_in)
+
+
+def test_afrr_activation_price_guard_regression_full_hour_would_fail_half_hour_passes() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.bid_builder.afrr_energy_bid_strategy = "forecast"
+    available_internal_mwh = 8.0
+    obligation_mw = 9.0
+    assert available_internal_mwh < obligation_mw * 1.0 / bt.eta_out
+    assert available_internal_mwh >= obligation_mw * 0.5 / bt.eta_out
+
+    price = bt.bid_builder.dynamic_afrr_energy_price(
+        side="pos",
+        pred_act_price=77.0,
+        soc_now_mwh=10.0,
+        soc_min_mwh=2.0,
+        soc_max_mwh=18.0,
+        obligation_mw=obligation_mw,
+        delivery_duration_h=1.0,
+        activation_headroom_h=0.5,
+    )
+
+    assert price == pytest.approx(77.0)
+
+
 def test_bcm_capacity_toy_ev_arithmetic() -> None:
     assert bcm_capacity_ev_eur(
         p_accept=1.0,
@@ -312,6 +400,60 @@ def test_multi_optimizer_path_has_no_fast_gated_fields_and_keeps_normal_semantic
     assert "bem_only_pos_mw" in out.columns
     assert "reserve_pos_mw" in out.columns
     assert "charge_mw" in out.columns
+
+
+def test_technical_id_repair_penalty_does_not_suppress_positive_bcm_ev() -> None:
+    col = BacktestColumnMap()
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=4, freq="h")
+    df = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [10.0] * 4,
+            col.pred_afrr_capacity_price_pos: [500.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [0.0] * 4,
+            col.pred_afrr_activation_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_rate_pos: [0.0] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
+            col.true_da_price: [10.0] * 4,
+            col.true_afrr_capacity_price_pos: [500.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+            col.true_afrr_activation_price_pos: [0.0] * 4,
+            col.true_afrr_activation_price_neg: [0.0] * 4,
+            col.true_afrr_activation_rate_pos: [0.0] * 4,
+            col.true_afrr_activation_rate_neg: [0.0] * 4,
+            "pacc_pos_bin_0": [1.0] * 4,
+            "pacc_neg_bin_0": [0.0] * 4,
+        }
+    )
+    for pref, val in [
+        (col.pred_afrr_capacity_price_pos, 500.0),
+        (col.pred_afrr_capacity_price_neg, 0.0),
+        (col.pred_afrr_activation_price_pos, 0.0),
+        (col.pred_afrr_activation_price_neg, 0.0),
+        (col.pred_afrr_activation_rate_pos, 0.0),
+        (col.pred_afrr_activation_rate_neg, 0.0),
+    ]:
+        df[f"{pref}_p50"] = val
+
+    bt = _mk_backtester("canonical_economic")
+    bt.afrr_quantile_bins = ["p50"]
+    bt.final_soc_mode = "hard"
+    bt.final_soc_shortfall_penalty_eur_per_mwh = 1e17
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=10.0,
+        soc_end_min_target=10.0,
+        allowed_markets=("aFRR", "ID"),
+        strategy_permissions=StrategyPermissions(False, "technical_repair", True, True, False),
+    )
+
+    assert pd.to_numeric(out["reserve_pos_mw"], errors="coerce").fillna(0.0).sum() > 0.0
+    assert pd.to_numeric(out["id_charge_mw"], errors="coerce").fillna(0.0).sum() > 0.0
+    assert pd.to_numeric(out["id_technical_repair_artificial_penalty_applied"], errors="coerce").eq(0.0).all()
+    assert pd.to_numeric(out["id_technical_repair_energy_cost_eur_per_mwh"], errors="coerce").max() < 1e17
+    assert float(pd.to_numeric(out["soc_lp_mwh"], errors="coerce").iloc[-1]) >= 10.0 - 1e-6
 
 
 def test_simulation_forecast_loader_applies_negative_target_quantile_flip(tmp_path: Path) -> None:
@@ -1458,6 +1600,22 @@ def test_bcm_bid_builder_constructs_capacity_only_bid_without_activation_price()
     assert isinstance(bid, BCMCapacityBid)
     assert set(bid.__dataclass_fields__) == {"ts", "side", "quantity_mw", "capacity_price_eur_mw"}
     assert not hasattr(bid, "energy_price_eur_mwh")
+
+
+def test_bcm_capacity_bid_preserves_negative_predicted_capacity_price() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bids = bt.bid_builder.build_afrr_capacity_bids(
+        ts=pd.Timestamp("2026-01-01T16:00:00Z"),
+        reserve_pos_mw=1.0,
+        reserve_neg_mw=0.0,
+        pred_cap_pos=-12.5,
+        pred_cap_neg=0.0,
+        pred_act_pos=9999.0,
+        pred_act_neg=9999.0,
+    )
+
+    assert len(bids) == 1
+    assert bids[0].capacity_price_eur_mw == pytest.approx(-12.5)
 
 
 def test_bcm_capacity_ev_diagnostic_does_not_use_activation_price() -> None:
@@ -6221,6 +6379,12 @@ def test_global_pf_selects_no_trade_incumbent_when_pf_candidate_misses_terminal_
     )
     s = out.summary
     assert str(s["global_pf_selected_incumbent"]) == "no_market"
+    assert float(s["global_pf_solver_feasible"]) == 0.0
+    assert str(s["global_pf_solver_rejection_reason"]) == "terminal_soc_shortfall"
+    assert float(s["global_pf_no_market_feasible"]) == 1.0
+    assert str(s["global_pf_no_market_rejection_reason"]) == "none"
+    assert "global_pf_realized_path_feasible" in s
+    assert "global_pf_realized_path_rejection_reason" in s
     assert float(s["global_pf_candidate_terminal_shortfall_mwh"]) > 0.0
     assert float(s["global_pf_no_trade_terminal_shortfall_mwh"]) <= 1e-6
     assert float(s["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]) >= float(
@@ -6238,6 +6402,10 @@ def test_global_pf_selects_no_trade_incumbent_when_pf_candidate_misses_terminal_
         h["global_perfect_foresight_terminal_soc_recovery_iteration_count"],
         errors="coerce",
     ).fillna(0.0).max() >= 1.0
+    assert "global_pf_selected_incumbent" in h.columns
+    assert "global_pf_solver_feasible" in h.columns
+    assert "global_pf_realized_path_feasible" in h.columns
+    assert set(h["global_pf_selected_incumbent"].dropna().astype(str)) == {"no_market"}
 
 
 def test_global_pf_incumbent_selector_chooses_no_market_over_solver() -> None:
