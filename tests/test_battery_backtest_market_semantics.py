@@ -3664,7 +3664,7 @@ def test_summary_flags_invalid_runs() -> None:
 def test_bcm_precommitment_reduces_infeasible_bid() -> None:
     bt = _mk_backtester()
     ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")  # 08:00 CET/CEST gate for model path
-    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    target_hours = pd.date_range("2025-05-01 22:00:00+00:00", periods=4, freq="h")
     snap = pd.DataFrame(
         {
             "target_time_utc": target_hours,
@@ -3715,7 +3715,7 @@ def test_bcm_precommit_selector_uses_first_feasible_retry_factor(monkeypatch: py
     bt.enable_reserve_retry_ladder = True
     bt.reserve_retry_ladder = [1.0, 0.5, 0.0]
     col = BacktestColumnMap()
-    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    target_hours = pd.date_range("2025-05-01 22:00:00+00:00", periods=4, freq="h")
     snap = pd.DataFrame(
         {
             "target_time_utc": target_hours,
@@ -4136,11 +4136,97 @@ def test_bcm_precommit_selector_locks_zero_only_when_no_nonzero_feasible(
     assert stats["selection_is_causal"] == 1.0
     assert stats["full_award_feasibility_checked"] == 1.0
     assert stats["realized_clearing_used_for_selection"] == 0.0
-    assert stats["zero_reason"] in {
-        "not_awarded_or_zero_candidate",
-        "terminal_soc_not_recoverable_even_with_id",
-        "no_nonzero_feasible_bcm_bid",
-    }
+    assert stats["zero_reason"] == "terminal_soc_infeasible"
+    assert stats["feasibility_driver"] == "terminal_soc_infeasible"
+    assert stats["zero_reason"] != "not_awarded_or_zero_candidate"
+
+
+def test_bcm_precommit_downward_candidate_not_terminal_shortfall_when_feasible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    bt.enable_reserve_retry_ladder = True
+    bt.reserve_retry_ladder = [1.0, 0.0]
+    col = BacktestColumnMap()
+    target_hours = pd.date_range("2025-05-02 00:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [0.0] * 4,
+            "reserve_neg_mw": [2.0] * 4,
+            "soc_start_lp_mwh": [10.0] * 4,
+            col.pred_afrr_activation_rate_pos: [0.0] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    ).set_index(col.timestamp)
+
+    def fake_clear(*, cap_bids, ts_idx, source, colmap):  # type: ignore[no-untyped-def]
+        raise AssertionError("realized clearing must not be used for BCM precommit retry selection")
+
+    def fake_formulate(*, blk, source, colmap, snapshot_ts, offered_pos, offered_neg, is_perfect_foresight=False):  # type: ignore[no-untyped-def]
+        ts = pd.to_datetime(blk["target_time_utc"].iloc[0], utc=True)
+        bids = []
+        if offered_neg > 0.0:
+            bids.append(
+                AFRRCapacityBid(
+                    ts=ts,
+                    side="neg",
+                    quantity_mw=float(offered_neg),
+                    capacity_price_eur_mw=0.0,
+                    energy_price_eur_mwh=0.0,
+                )
+            )
+        return bids, pd.to_datetime(blk["target_time_utc"], utc=True)
+
+    def feasible_plan(df, colmap, **kwargs):  # type: ignore[no-untyped-def]
+        fixed = kwargs["fixed_reserve_obligation"]
+        max_neg = max((v[1] for v in fixed.values()), default=0.0)
+        assert max_neg == pytest.approx(2.0)
+        return pd.DataFrame(
+            {
+                colmap.timestamp: pd.to_datetime(df[colmap.timestamp], utc=True),
+                "soc_lp_mwh": [10.0] * len(df),
+                "slack_pos_mw": [0.0] * len(df),
+                "slack_neg_mw": [0.0] * len(df),
+                "slack_soc_min_mwh": [0.0] * len(df),
+                "slack_soc_max_mwh": [0.0] * len(df),
+            }
+        )
+
+    monkeypatch.setattr(bt, "_clear_afrr_capacity_block_against_truth", fake_clear)
+    monkeypatch.setattr(bt, "_formulate_afrr_capacity_block_bids", fake_formulate)
+    monkeypatch.setattr(bt, "optimize_dispatch", feasible_plan)
+
+    offered_pos, offered_neg, cap_res, _bids, stats = bt._select_feasible_bcm_lock_candidate(
+        blk=snap,
+        snapshot_plan=snap,
+        source=source,
+        colmap=col,
+        snapshot_ts=pd.Timestamp("2025-05-01 06:00:00+00:00"),
+        offered_pos_mw=0.0,
+        offered_neg_mw=2.0,
+        lock_pos={},
+        lock_neg={},
+        da_lockbook={},
+        strategy_permissions=StrategyPermissions(False, "technical_repair", True, True, False),
+        optimizer_allowed_markets=("aFRR", "ID"),
+        horizon_hours=4,
+    )
+
+    assert offered_pos == pytest.approx(0.0)
+    assert offered_neg == pytest.approx(2.0)
+    assert cap_res is None
+    assert stats["zero_reason"] == "none"
+    assert stats["feasibility_driver"] == "none"
+    assert stats["zero_reason"] != "terminal_soc_infeasible"
 
 
 def test_precommit_includes_aux_losses() -> None:
@@ -6531,6 +6617,100 @@ def test_precommit_ev_includes_headroom_cost() -> None:
     )
     assert any(float(v) > 0.5 for v in pre.get("precommit_bid_zeroed_due_to_negative_ev", {}).values())
     assert any(float(v) > 0.0 for v in pre.get("precommit_headroom_opportunity_cost_eur", {}).values())
+
+
+def test_bcm_precommit_economic_filter_uses_optimizer_ev_with_capacity_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    bt.reserve_min_margin_after_bid_mwh = 0.0
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-01 22:00:00+00:00", periods=4, freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            "reserve_pos_mw": [2.0, 2.0, 2.0, 2.0],
+            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
+            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+            # Optimizer objective EV already includes BCM capacity value.
+            "ev_afrr_pos_eur": [5000.0, 5000.0, 5000.0, 5000.0],
+            "ev_afrr_neg_eur": [0.0, 0.0, 0.0, 0.0],
+        }
+    )
+    col = BacktestColumnMap()
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [1000.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [0.0] * 4,
+            col.pred_afrr_activation_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_rate_pos: [0.0] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
+            col.pred_da_price: [300.0] * 4,
+            col.true_afrr_capacity_price_pos: [1000.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    selector_calls: list[tuple[float, float]] = []
+
+    def fake_select(**kwargs):  # type: ignore[no-untyped-def]
+        offered_pos = float(kwargs["offered_pos_mw"])
+        offered_neg = float(kwargs["offered_neg_mw"])
+        selector_calls.append((offered_pos, offered_neg))
+        return (
+            offered_pos,
+            offered_neg,
+            AFRRCapacityClearingResult(
+                submitted_pos_mw=offered_pos,
+                submitted_neg_mw=offered_neg,
+                awarded_pos_mw=offered_pos,
+                awarded_neg_mw=offered_neg,
+                pos_awarded=offered_pos > 0.0,
+                neg_awarded=offered_neg > 0.0,
+            ),
+            [],
+            {
+                "feasibility_pass": 1.0,
+                "retry_factor_selected": 1.0,
+                "zero_reason": "none",
+                "projected_soc_min_mwh": bt.soc_min + 8.0,
+                "projected_soc_max_mwh": bt.soc_min + 8.0,
+                "projected_terminal_soc_mwh": bt.soc_min + 8.0,
+                "terminal_soc_feasible": 1.0,
+                "terminal_soc_shortfall_mwh": 0.0,
+                "selection_is_causal": 1.0,
+                "full_award_feasibility_checked": 1.0,
+                "retry_factor_selected_before_clearing": 1.0,
+                "realized_clearing_used_for_selection": 0.0,
+            },
+        )
+
+    monkeypatch.setattr(bt, "_select_feasible_bcm_lock_candidate", fake_select)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+    )
+
+    assert selector_calls == [(pytest.approx(2.0), pytest.approx(0.0))]
+    assert all(float(v) == pytest.approx(0.0) for v in pre["precommit_bid_zeroed_due_to_negative_ev"].values())
+    assert all(float(v) > 0.0 for v in pre["precommit_net_capacity_ev_after_headroom_cost_eur"].values())
 
 
 def test_required_series_missing_raises_keyerror() -> None:

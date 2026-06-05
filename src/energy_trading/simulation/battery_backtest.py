@@ -1943,6 +1943,12 @@ class BatteryBacktester:
                 "margin_after_derate_mwh": float(terminal_soc - float(self.soc_target_end))
                 if np.isfinite(terminal_soc)
                 else np.nan,
+                "margin_before_retry_mwh": np.nan,
+                "margin_after_retry_mwh": float(terminal_soc - float(self.soc_target_end))
+                if np.isfinite(terminal_soc)
+                else np.nan,
+                "feasibility_driver": "terminal_soc_infeasible" if term_need > 1e-9 else "none",
+                "baseline_infeasible": 0.0,
                 "id_recourse_needed_mwh": float(id_buy),
                 "id_recourse_cost_eur": float(id_cost),
                 "reduced_due_to_reserve_feasibility": float(factor < 0.999),
@@ -2218,6 +2224,7 @@ class BatteryBacktester:
                 "feasibility_pass": float(feasible),
                 "retry_factor_selected": float(factor),
                 "zero_reason": str(reason),
+                "feasibility_driver": str(reason if not feasible else "none"),
                 "projected_soc_min_mwh": float(min_soc),
                 "projected_soc_max_mwh": float(max_soc),
                 "projected_terminal_soc_mwh": float(soc_now),
@@ -2230,6 +2237,9 @@ class BatteryBacktester:
                 "terminal_soc_shortfall_mwh": float(terminal_violation),
                 "margin_before_derate_mwh": np.nan,
                 "margin_after_derate_mwh": float(soc_now - float(self.soc_target_end)),
+                "margin_before_retry_mwh": np.nan,
+                "margin_after_retry_mwh": float(soc_now - float(self.soc_target_end)),
+                "baseline_infeasible": 0.0,
                 "id_recourse_needed_mwh": float(id_recourse_mwh),
                 "id_recourse_cost_eur": float(id_recourse_cost),
                 "id_recourse_reason": str(id_recourse_reason),
@@ -2245,10 +2255,33 @@ class BatteryBacktester:
                 "realized_clearing_used_for_selection": 0.0,
             }
 
+        def _normalize_precommit_zero_reason(stats: dict[str, float | str]) -> str:
+            reason = str(stats.get("zero_reason", "no_nonzero_feasible_bcm_bid") or "no_nonzero_feasible_bcm_bid")
+            terminal_shortfall = float(stats.get("terminal_soc_shortfall_mwh", 0.0) or 0.0)
+            margin_after = float(stats.get("margin_after_derate_mwh", np.nan) or np.nan)
+            if reason == "terminal_soc_not_recoverable_even_with_id" or terminal_shortfall > 1e-9:
+                return "terminal_soc_infeasible"
+            if reason in {"headroom_infeasible", "reserve_infeasible"}:
+                return "reserve_headroom_infeasible"
+            if reason == "power_infeasible":
+                return "power_stack_infeasible"
+            if reason == "soc_infeasible":
+                return "reserve_headroom_infeasible"
+            if reason in {"existing_lockbook_conflict", "optimizer_slack_required"}:
+                return "baseline_projection_infeasible"
+            if reason in {"none", "", "no_nonzero_feasible_bcm_bid"}:
+                if np.isfinite(margin_after) and margin_after < -1e-9:
+                    return "baseline_projection_infeasible"
+                return "zero_candidate"
+            if reason == "not_awarded_or_zero_candidate":
+                return "zero_candidate"
+            return reason
+
         last_stats: dict[str, float | str] = {
             "feasibility_pass": 0.0,
             "retry_factor_selected": 0.0,
             "zero_reason": "no_nonzero_feasible_bcm_bid",
+            "feasibility_driver": "no_nonzero_feasible_bcm_bid",
             "projected_soc_min_mwh": np.nan,
             "projected_soc_max_mwh": np.nan,
             "projected_terminal_soc_mwh": np.nan,
@@ -2258,6 +2291,9 @@ class BatteryBacktester:
             "terminal_soc_shortfall_mwh": np.nan,
             "margin_before_derate_mwh": np.nan,
             "margin_after_derate_mwh": np.nan,
+            "margin_before_retry_mwh": np.nan,
+            "margin_after_retry_mwh": np.nan,
+            "baseline_infeasible": 0.0,
             "id_recourse_needed_mwh": np.nan,
             "id_recourse_cost_eur": np.nan,
             "id_recourse_reason": "none",
@@ -2306,12 +2342,17 @@ class BatteryBacktester:
             }
             if cand_pos <= 1e-12 and cand_neg <= 1e-12:
                 stats = dict(last_stats)
+                zero_reason = _normalize_precommit_zero_reason(stats)
+                margin_after_retry = float(stats.get("margin_after_derate_mwh", np.nan) or np.nan)
                 stats.update(
                     {
-                        "feasibility_pass": 1.0,
+                        "feasibility_pass": float(zero_reason in {"zero_candidate", "none"}),
                         "retry_factor_selected": float(factor),
-                        "zero_reason": "not_awarded_or_zero_candidate",
+                        "zero_reason": zero_reason,
+                        "feasibility_driver": zero_reason,
                         "reduced_due_to_reserve_feasibility": float(factor < 0.999),
+                        "margin_after_retry_mwh": margin_after_retry,
+                        "baseline_infeasible": float(zero_reason == "baseline_projection_infeasible"),
                         "selection_is_causal": 1.0,
                         "full_award_feasibility_checked": 1.0,
                         "retry_factor_selected_before_clearing": float(factor),
@@ -2334,6 +2375,9 @@ class BatteryBacktester:
                 last_stats = dict(cumulative_stats)
                 if first_candidate_stats is not None:
                     last_stats["margin_before_derate_mwh"] = float(
+                        first_candidate_stats.get("margin_after_derate_mwh", np.nan)
+                    )
+                    last_stats["margin_before_retry_mwh"] = float(
                         first_candidate_stats.get("margin_after_derate_mwh", np.nan)
                     )
                 if factor <= 1e-12:
@@ -2376,6 +2420,10 @@ class BatteryBacktester:
                     stats["margin_before_derate_mwh"] = float(
                         first_candidate_stats.get("margin_after_derate_mwh", np.nan)
                     )
+                    stats["margin_before_retry_mwh"] = float(
+                        first_candidate_stats.get("margin_after_derate_mwh", np.nan)
+                    )
+                stats["margin_after_retry_mwh"] = float(stats.get("margin_after_derate_mwh", np.nan))
                 cumulative_id_mwh = float(cumulative_stats.get("id_recourse_needed_mwh", 0.0) or 0.0)
                 if cumulative_id_mwh > float(stats.get("id_recourse_needed_mwh", 0.0) or 0.0) + 1e-12:
                     stats["id_recourse_needed_mwh"] = cumulative_id_mwh
@@ -2401,6 +2449,7 @@ class BatteryBacktester:
                         "retry_factor_selected": float(factor),
                         "retry_factor_selected_before_clearing": float(factor),
                         "zero_reason": reason,
+                        "feasibility_driver": reason,
                         "reduced_due_to_reserve_feasibility": float(factor < 0.999),
                         "selection_is_causal": 1.0,
                         "full_award_feasibility_checked": 1.0,
@@ -2411,13 +2460,22 @@ class BatteryBacktester:
                     last_stats["margin_before_derate_mwh"] = float(
                         first_candidate_stats.get("margin_after_derate_mwh", np.nan)
                     )
+                    last_stats["margin_before_retry_mwh"] = float(
+                        first_candidate_stats.get("margin_after_derate_mwh", np.nan)
+                    )
 
         if zero_result is not None:
             pos, neg, cap_res, cap_bids, stats = zero_result
             stats = dict(stats)
-            stats.setdefault("zero_reason", "no_nonzero_feasible_bcm_bid")
+            stats["zero_reason"] = _normalize_precommit_zero_reason(stats)
+            stats["feasibility_driver"] = str(stats["zero_reason"])
+            stats["margin_after_retry_mwh"] = float(stats.get("margin_after_derate_mwh", np.nan) or np.nan)
+            stats["baseline_infeasible"] = float(stats["zero_reason"] == "baseline_projection_infeasible")
             if first_candidate_stats is not None:
                 stats["margin_before_derate_mwh"] = float(
+                    first_candidate_stats.get("margin_after_derate_mwh", np.nan)
+                )
+                stats["margin_before_retry_mwh"] = float(
                     first_candidate_stats.get("margin_after_derate_mwh", np.nan)
                 )
             return pos, neg, cap_res, cap_bids, stats
@@ -6245,10 +6303,33 @@ class BatteryBacktester:
                     - self.trans_eur_mwh
                     - (self.deg_eur_mwh * self.eta_in)
                 )
-                expected_capacity_ev_eur = float(
-                    float(offered_pos) * pred_rate_pos_blk * bcm_margin_pos_blk * block_hours
-                    + float(offered_neg) * pred_rate_neg_blk * bcm_margin_neg_blk * block_hours
-                )
+                selected_bcm_ev_eur = float("nan")
+                if "ev_afrr_pos_eur" in blk.columns or "ev_afrr_neg_eur" in blk.columns:
+                    ev_pos_series = _blk_series("ev_afrr_pos_eur", 0.0)
+                    ev_neg_series = _blk_series("ev_afrr_neg_eur", 0.0)
+                    orig_pos_mw = float(_blk_series("reserve_pos_mw", 0.0).mean())
+                    orig_neg_mw = float(_blk_series("reserve_neg_mw", 0.0).mean())
+                    pos_scale = float(offered_pos) / max(orig_pos_mw, 1e-12) if orig_pos_mw > 1e-12 else 0.0
+                    neg_scale = float(offered_neg) / max(orig_neg_mw, 1e-12) if orig_neg_mw > 1e-12 else 0.0
+                    selected_bcm_ev_eur = float(
+                        ev_pos_series.sum() * pos_scale
+                        + ev_neg_series.sum() * neg_scale
+                    )
+                if np.isfinite(selected_bcm_ev_eur):
+                    expected_capacity_ev_eur = float(selected_bcm_ev_eur)
+                else:
+                    pred_cap_pos_blk = float(_src_series(colmap.pred_afrr_capacity_price_pos).mean())
+                    pred_cap_neg_blk = float(_src_series(colmap.pred_afrr_capacity_price_neg).mean())
+                    if not np.isfinite(pred_cap_pos_blk):
+                        pred_cap_pos_blk = 0.0
+                    if not np.isfinite(pred_cap_neg_blk):
+                        pred_cap_neg_blk = 0.0
+                    expected_capacity_ev_eur = float(
+                        float(offered_pos) * pred_cap_pos_blk * block_hours
+                        + float(offered_neg) * pred_cap_neg_blk * block_hours
+                        + float(offered_pos) * pred_rate_pos_blk * bcm_margin_pos_blk * block_hours
+                        + float(offered_neg) * pred_rate_neg_blk * bcm_margin_neg_blk * block_hours
+                    )
                 precommit_net_capacity_ev_after_headroom_cost_eur = float(
                     expected_capacity_ev_eur
                     - precommit_headroom_recharge_cost_eur
@@ -6415,6 +6496,9 @@ class BatteryBacktester:
                         precommit_audit_by_ts.setdefault("precommit_zero_reason", {})[tsu] = str(
                             bcm_precommit_stats.get("zero_reason", precommit_clamp_reason)
                         )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_feasibility_driver", {})[tsu] = str(
+                            bcm_precommit_stats.get("feasibility_driver", bcm_precommit_stats.get("zero_reason", "none"))
+                        )
                         precommit_audit_by_ts.setdefault("precommit_projected_soc_min_mwh", {})[tsu] = float(
                             bcm_precommit_stats.get("projected_soc_min_mwh", np.nan)
                         )
@@ -6516,6 +6600,15 @@ class BatteryBacktester:
                         )
                         precommit_audit_by_ts.setdefault("bcm_precommit_margin_after_derate_mwh", {})[tsu] = float(
                             bcm_precommit_stats.get("margin_after_derate_mwh", np.nan)
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_margin_before_retry_mwh", {})[tsu] = float(
+                            bcm_precommit_stats.get("margin_before_retry_mwh", bcm_precommit_stats.get("margin_before_derate_mwh", np.nan))
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_margin_after_retry_mwh", {})[tsu] = float(
+                            bcm_precommit_stats.get("margin_after_retry_mwh", bcm_precommit_stats.get("margin_after_derate_mwh", np.nan))
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_baseline_infeasible", {})[tsu] = float(
+                            bcm_precommit_stats.get("baseline_infeasible", 0.0)
                         )
                         precommit_audit_by_ts.setdefault("bcm_precommit_id_recourse_needed_mwh", {})[tsu] = float(
                             bcm_precommit_stats.get("id_recourse_needed_mwh", 0.0)
@@ -6763,6 +6856,9 @@ class BatteryBacktester:
                     precommit_audit_by_ts.setdefault("bcm_precommit_zero_reason", {})[tsu] = str(
                         bcm_precommit_stats.get("zero_reason", "none")
                     )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_feasibility_driver", {})[tsu] = str(
+                        bcm_precommit_stats.get("feasibility_driver", bcm_precommit_stats.get("zero_reason", "none"))
+                    )
                     precommit_audit_by_ts.setdefault("bcm_precommit_projected_soc_min_mwh", {})[tsu] = float(
                         bcm_precommit_stats.get("projected_soc_min_mwh", np.nan)
                     )
@@ -6798,6 +6894,15 @@ class BatteryBacktester:
                     )
                     precommit_audit_by_ts.setdefault("bcm_precommit_margin_after_derate_mwh", {})[tsu] = float(
                         bcm_precommit_stats.get("margin_after_derate_mwh", np.nan)
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_margin_before_retry_mwh", {})[tsu] = float(
+                        bcm_precommit_stats.get("margin_before_retry_mwh", bcm_precommit_stats.get("margin_before_derate_mwh", np.nan))
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_margin_after_retry_mwh", {})[tsu] = float(
+                        bcm_precommit_stats.get("margin_after_retry_mwh", bcm_precommit_stats.get("margin_after_derate_mwh", np.nan))
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_baseline_infeasible", {})[tsu] = float(
+                        bcm_precommit_stats.get("baseline_infeasible", 0.0)
                     )
                     precommit_audit_by_ts.setdefault("bcm_precommit_id_recourse_needed_mwh", {})[tsu] = float(
                         bcm_precommit_stats.get("id_recourse_needed_mwh", 0.0)
@@ -8497,6 +8602,7 @@ class BatteryBacktester:
                 "bcm_precommit_locked_neg_mw",
                 "bcm_precommit_retry_factor_selected",
                 "bcm_precommit_zero_reason",
+                "bcm_precommit_feasibility_driver",
                 "bcm_precommit_projected_soc_min_mwh",
                 "bcm_precommit_projected_soc_max_mwh",
                 "bcm_precommit_projected_terminal_soc_mwh",
@@ -8509,6 +8615,9 @@ class BatteryBacktester:
                 "bcm_precommit_terminal_soc_shortfall_mwh",
                 "bcm_precommit_margin_before_derate_mwh",
                 "bcm_precommit_margin_after_derate_mwh",
+                "bcm_precommit_margin_before_retry_mwh",
+                "bcm_precommit_margin_after_retry_mwh",
+                "bcm_precommit_baseline_infeasible",
                 "bcm_precommit_id_recourse_needed_mwh",
                 "bcm_precommit_id_recourse_cost_eur",
                 "bcm_precommit_id_recourse_reason",
