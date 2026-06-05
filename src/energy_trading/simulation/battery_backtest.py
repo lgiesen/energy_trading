@@ -686,6 +686,78 @@ class BatteryBacktester:
         }
 
     @staticmethod
+    def _evaluate_global_pf_solver_benchmark(
+        *,
+        solver_value_eur: float,
+        solver_feasible: bool,
+        solver_available: bool,
+        solver_frame: pd.DataFrame,
+        lower_bound_candidates: dict[str, tuple[float, bool, pd.DataFrame]],
+        tolerance_eur: float = 1e-2,
+        solver_unavailable_reason: str = "solver_unavailable",
+    ) -> dict[str, object]:
+        """Evaluate a true global-PF solver result against lower-bound guards.
+
+        The global hindsight PF benchmark is the full-horizon solver result only.
+        No-market and realized-path candidates are lower-bound diagnostics; they
+        can invalidate the solver as an upper bound, but must not replace it.
+        """
+        solver_value_f = float(solver_value_eur)
+        solver_is_usable = bool(solver_available) and bool(solver_feasible) and np.isfinite(solver_value_f)
+
+        feasible_lower_bounds: list[tuple[str, float, pd.DataFrame]] = []
+        for name, (value, feasible, frame) in lower_bound_candidates.items():
+            value_f = float(value)
+            if bool(feasible) and np.isfinite(value_f):
+                feasible_lower_bounds.append((str(name), value_f, frame))
+
+        if feasible_lower_bounds:
+            best_name, best_value, _best_frame = max(feasible_lower_bounds, key=lambda item: item[1])
+        else:
+            best_name = "none"
+            best_value = float("nan")
+
+        if not solver_is_usable:
+            failure = (
+                str(solver_unavailable_reason)
+                if not bool(solver_available)
+                else "solver_infeasible_or_nonfinite"
+            )
+            return {
+                "selected": "none",
+                "benchmark_value_eur": float("nan"),
+                "value": float("nan"),
+                "frame": pd.DataFrame(),
+                "available": 0.0,
+                "verified": 0.0,
+                "failure_reason": failure,
+                "selection_reason": "no_solver_benchmark_available",
+                "best_feasible_lower_bound_name": best_name,
+                "best_feasible_lower_bound_eur": float(best_value),
+            }
+
+        verified = bool((not np.isfinite(best_value)) or solver_value_f + tolerance_eur >= float(best_value))
+        if verified:
+            failure = "none"
+            selection_reason = "solver_full_horizon_benchmark_verified_against_lower_bounds"
+        else:
+            failure = f"solver_below_{best_name}_incumbent"
+            selection_reason = "solver_full_horizon_benchmark_below_lower_bound"
+
+        return {
+            "selected": "solver",
+            "benchmark_value_eur": float(solver_value_f),
+            "value": float(solver_value_f),
+            "frame": solver_frame,
+            "available": 1.0,
+            "verified": float(verified),
+            "failure_reason": failure,
+            "selection_reason": selection_reason,
+            "best_feasible_lower_bound_name": best_name,
+            "best_feasible_lower_bound_eur": float(best_value),
+        }
+
+    @staticmethod
     def _timestamp_coverage_diagnostics(
         expected_timestamps: pd.Series | pd.Index | list[object],
         candidate_timestamps: pd.Series | pd.Index | list[object],
@@ -727,6 +799,38 @@ class BatteryBacktester:
             "expected_duplicate_timestamp_count": float(expected_duplicate_count),
             "actual_duplicate_timestamp_count": float(actual_duplicate_count),
         }
+
+    @staticmethod
+    def _filter_frame_to_expected_timestamps(
+        frame: pd.DataFrame,
+        *,
+        timestamp_col: str,
+        expected_timestamps: pd.Series | pd.Index | list[object],
+    ) -> pd.DataFrame:
+        """Return only rows in the evaluated settlement timestamp index.
+
+        Global PF lower-bound candidates must not include raw input/warm-up rows
+        that were not actually optimized and settled.
+        """
+        if frame is None or frame.empty:
+            return pd.DataFrame() if frame is None else frame.copy()
+        if timestamp_col not in frame.columns:
+            return frame.copy()
+        expected = pd.to_datetime(pd.Series(expected_timestamps), utc=True, errors="coerce").dropna()
+        expected_idx = pd.DatetimeIndex(expected).drop_duplicates()
+        if len(expected_idx) == 0:
+            return frame.iloc[0:0].copy()
+        expected_order = {pd.Timestamp(ts): i for i, ts in enumerate(expected_idx)}
+        out = frame.copy()
+        ts_norm = pd.to_datetime(out[timestamp_col], utc=True, errors="coerce")
+        keep = ts_norm.isin(expected_idx)
+        out = out.loc[keep].copy()
+        if out.empty:
+            return out
+        out[timestamp_col] = ts_norm.loc[out.index]
+        out["_evaluated_timestamp_order"] = out[timestamp_col].map(expected_order)
+        out = out.sort_values("_evaluated_timestamp_order").drop(columns=["_evaluated_timestamp_order"])
+        return out.reset_index(drop=True)
 
     def __init__(self) -> None:
         dt = float(MODEL_SPECS["time_step_hours"])
@@ -1906,6 +2010,7 @@ class BatteryBacktester:
         horizon_hours: int = 48,
         global_end_utc: pd.Timestamp | None = None,
         is_perfect_foresight: bool = False,
+        candidate_ev_eur: float = float("nan"),
     ) -> tuple[float, float, AFRRCapacityClearingResult | None, list[BCMCapacityBid], dict[str, float | str]]:
         """Select the largest causal BCM bid whose full-award lockbook remains optimizer-feasible."""
         base_pos = max(0.0, float(offered_pos_mw))
@@ -1932,6 +2037,14 @@ class BatteryBacktester:
                 "id_recourse_needed_mwh": 0.0,
                 "id_recourse_cost_eur": 0.0,
                 "id_recourse_reason": "none",
+                "terminal_shortfall_before_recovery_mwh": 0.0,
+                "id_recovery_feasible": 0.0,
+                "id_recovery_mwh": 0.0,
+                "id_recovery_cost_eur": 0.0,
+                "terminal_shortfall_after_recovery_mwh": 0.0,
+                "effective_ev_before_recovery_eur": float("nan"),
+                "effective_ev_after_recovery_eur": float("nan"),
+                "zero_reason_detail": "none",
                 "reduced_due_to_reserve_feasibility": 0.0,
                 "reduced_due_to_terminal_soc": 0.0,
                 "selection_is_causal": 1.0,
@@ -2008,6 +2121,14 @@ class BatteryBacktester:
                 "id_recourse_needed_mwh": np.nan,
                 "id_recourse_cost_eur": np.nan,
                 "id_recourse_reason": "none",
+                "terminal_shortfall_before_recovery_mwh": 0.0,
+                "id_recovery_feasible": 0.0,
+                "id_recovery_mwh": 0.0,
+                "id_recovery_cost_eur": 0.0,
+                "terminal_shortfall_after_recovery_mwh": 0.0,
+                "effective_ev_before_recovery_eur": float("nan"),
+                "effective_ev_after_recovery_eur": float("nan"),
+                "zero_reason_detail": "none",
                 "reduced_due_to_reserve_feasibility": 0.0,
                 "reduced_due_to_terminal_soc": 0.0,
                 "selection_is_causal": 1.0,
@@ -2060,6 +2181,23 @@ class BatteryBacktester:
                 "baseline_infeasible": 0.0,
                 "id_recourse_needed_mwh": float(id_buy),
                 "id_recourse_cost_eur": float(id_cost),
+                "id_recourse_reason": "terminal_soc_recovery" if id_buy > 1e-12 else "none",
+                "terminal_shortfall_before_recovery_mwh": float(term_need),
+                "id_recovery_feasible": float(term_need <= 1e-9),
+                "id_recovery_mwh": float(id_buy),
+                "id_recovery_cost_eur": float(id_cost),
+                "terminal_shortfall_after_recovery_mwh": float(term_need),
+                "effective_ev_before_recovery_eur": (
+                    float(candidate_ev_eur) * float(factor)
+                    if np.isfinite(float(candidate_ev_eur))
+                    else float("nan")
+                ),
+                "effective_ev_after_recovery_eur": (
+                    float(candidate_ev_eur) * float(factor) - float(id_cost)
+                    if np.isfinite(float(candidate_ev_eur))
+                    else float("nan")
+                ),
+                "zero_reason_detail": str(zero_reason),
                 "reduced_due_to_reserve_feasibility": float(factor < 0.999),
                 "reduced_due_to_terminal_soc": float(term_need > 1e-9),
                 "selection_is_causal": 1.0,
@@ -2091,7 +2229,12 @@ class BatteryBacktester:
             required_headroom_neg_max = 0.0
             soc_violation = 0.0
             terminal_violation = 0.0
+            terminal_shortfall_before_recovery = 0.0
+            terminal_id_recovery_mwh = 0.0
+            terminal_id_recovery_cost = 0.0
             terminal_required = False
+            terminal_recovery_residual_grid_mwh = 0.0
+            terminal_recovery_price_weighted_sum = 0.0
             id_allowed = bool((strategy_permissions or self._strategy_permissions).allow_id_technical_repair)
             id_recourse_reason = "none"
             ts_vals_local = pd.to_datetime(rows[colmap.timestamp], utc=True, errors="coerce")
@@ -2207,6 +2350,20 @@ class BatteryBacktester:
                     power_violation_neg,
                     max(0.0, stack_neg - float(self.p_max_mw)),
                 )
+                residual_charge_for_terminal = max(0.0, float(stack.get("charge_residual_mw", 0.0)))
+                terminal_recovery_residual_grid_mwh += residual_charge_for_terminal * float(self.dt_h)
+                row_da_price = pd.to_numeric(
+                    pd.Series([rows.iloc[i].get(colmap.pred_da_price, 0.0)]),
+                    errors="coerce",
+                ).fillna(0.0).iloc[0]
+                row_id_buy_price = max(
+                    0.0,
+                    min(
+                        float(self.id_buy_price_cap_eur_mwh),
+                        float(row_da_price) + float(self.id_rescue_spread_eur_mwh),
+                    ),
+                )
+                terminal_recovery_price_weighted_sum += residual_charge_for_terminal * float(self.dt_h) * row_id_buy_price
                 headroom_violation = max(
                     headroom_violation,
                     max(0.0, protected_min - soc_now),
@@ -2310,12 +2467,50 @@ class BatteryBacktester:
                 terminal_required = True
             if terminal_required:
                 terminal_violation = max(0.0, float(self.soc_target_end) - float(soc_now))
+                terminal_shortfall_before_recovery = float(terminal_violation)
+                if terminal_violation > 1e-9 and id_allowed:
+                    required_grid_mwh = terminal_violation / max(float(self.eta_in), 1e-12)
+                    room_grid_mwh = max(0.0, float(self.soc_max) - float(soc_now)) / max(float(self.eta_in), 1e-12)
+                    available_grid_mwh = min(max(0.0, terminal_recovery_residual_grid_mwh), room_grid_mwh)
+                    terminal_id_recovery_mwh = min(required_grid_mwh, available_grid_mwh)
+                    avg_recovery_price = (
+                        terminal_recovery_price_weighted_sum / max(terminal_recovery_residual_grid_mwh, 1e-12)
+                        if terminal_recovery_residual_grid_mwh > 1e-12
+                        else max(0.0, float(self.id_buy_price_cap_eur_mwh))
+                    )
+                    terminal_id_recovery_cost = float(terminal_id_recovery_mwh * avg_recovery_price)
+                    if terminal_id_recovery_mwh > 1e-12:
+                        soc_now += terminal_id_recovery_mwh * float(self.eta_in)
+                        id_recourse_mwh += terminal_id_recovery_mwh
+                        id_recourse_cost += terminal_id_recovery_cost
+                        id_recourse_reason = (
+                            "reserve_obligation_recovery"
+                            if (required_headroom_pos_max > 1e-9 or required_headroom_neg_max > 1e-9)
+                            else "terminal_soc_recovery"
+                        )
+                    terminal_violation = max(0.0, float(self.soc_target_end) - float(soc_now))
+            standalone_ev = (
+                float(candidate_ev_eur) * float(factor)
+                if np.isfinite(float(candidate_ev_eur))
+                else float("nan")
+            )
+            effective_ev_after_recovery = (
+                standalone_ev - float(terminal_id_recovery_cost)
+                if np.isfinite(standalone_ev)
+                else float("nan")
+            )
+            recovery_ev_violation = bool(
+                terminal_id_recovery_mwh > 1e-12
+                and np.isfinite(effective_ev_after_recovery)
+                and effective_ev_after_recovery < -1e-9
+            )
             feasible = (
                 power_violation_pos <= 1e-9
                 and power_violation_neg <= 1e-9
                 and headroom_violation <= 1e-9
                 and soc_violation <= 1e-9
                 and terminal_violation <= 1e-9
+                and not recovery_ev_violation
             )
             reason = "none"
             if not feasible:
@@ -2327,6 +2522,8 @@ class BatteryBacktester:
                     reason = "soc_infeasible"
                 elif terminal_violation > 1e-9:
                     reason = "terminal_soc_not_recoverable_even_with_id"
+                elif recovery_ev_violation:
+                    reason = "negative_ev_after_recovery"
                 else:
                     reason = "existing_lockbook_conflict"
             return feasible, {
@@ -2352,6 +2549,14 @@ class BatteryBacktester:
                 "id_recourse_needed_mwh": float(id_recourse_mwh),
                 "id_recourse_cost_eur": float(id_recourse_cost),
                 "id_recourse_reason": str(id_recourse_reason),
+                "terminal_shortfall_before_recovery_mwh": float(terminal_shortfall_before_recovery),
+                "id_recovery_feasible": float(terminal_shortfall_before_recovery <= 1e-9 or terminal_violation <= 1e-9),
+                "id_recovery_mwh": float(terminal_id_recovery_mwh),
+                "id_recovery_cost_eur": float(terminal_id_recovery_cost),
+                "terminal_shortfall_after_recovery_mwh": float(terminal_violation),
+                "effective_ev_before_recovery_eur": float(standalone_ev),
+                "effective_ev_after_recovery_eur": float(effective_ev_after_recovery),
+                "zero_reason_detail": str(reason),
                 "reduced_due_to_reserve_feasibility": float(factor < 0.999),
                 "reduced_due_to_terminal_soc": float(terminal_violation > 1e-9),
                 "reduced_due_to_power": float(power_violation_pos > 1e-9 or power_violation_neg > 1e-9),
@@ -2369,7 +2574,9 @@ class BatteryBacktester:
             terminal_shortfall = float(stats.get("terminal_soc_shortfall_mwh", 0.0) or 0.0)
             margin_after = float(stats.get("margin_after_derate_mwh", np.nan) or np.nan)
             if reason == "terminal_soc_not_recoverable_even_with_id" or terminal_shortfall > 1e-9:
-                return "terminal_soc_infeasible"
+                return "terminal_soc_not_recoverable"
+            if reason == "negative_ev_after_recovery":
+                return "negative_ev_after_recovery"
             if reason in {"headroom_infeasible", "reserve_infeasible"}:
                 return "reserve_headroom_infeasible"
             if reason == "power_infeasible":
@@ -2538,6 +2745,17 @@ class BatteryBacktester:
                     stats["id_recourse_needed_mwh"] = cumulative_id_mwh
                     stats["id_recourse_cost_eur"] = float(cumulative_stats.get("id_recourse_cost_eur", 0.0) or 0.0)
                     stats["id_recourse_reason"] = str(cumulative_stats.get("id_recourse_reason", "none") or "none")
+                    for diag_name in (
+                        "terminal_shortfall_before_recovery_mwh",
+                        "id_recovery_feasible",
+                        "id_recovery_mwh",
+                        "id_recovery_cost_eur",
+                        "terminal_shortfall_after_recovery_mwh",
+                        "effective_ev_before_recovery_eur",
+                        "effective_ev_after_recovery_eur",
+                        "zero_reason_detail",
+                    ):
+                        stats[diag_name] = cumulative_stats.get(diag_name, stats.get(diag_name, "none" if diag_name.endswith("detail") else 0.0))
                 if slack_sum <= 1e-8:
                     return trial_pos, trial_neg, None, cap_bids, stats
                 stats["zero_reason"] = "optimizer_slack_required"
@@ -6317,6 +6535,7 @@ class BatteryBacktester:
             precommit_headroom_opportunity_cost_eur = 0.0
             precommit_net_capacity_ev_after_headroom_cost_eur = 0.0
             precommit_bid_zeroed_due_to_negative_ev = 0.0
+            expected_capacity_ev_eur = float("nan")
             bcm_precommit_stats: dict[str, float | str] = {
                 "feasibility_pass": 1.0,
                 "retry_factor_selected": 1.0,
@@ -6663,6 +6882,7 @@ class BatteryBacktester:
                     horizon_hours=int(horizon_hours),
                     global_end_utc=global_end_utc,
                     is_perfect_foresight=is_perfect_foresight,
+                    candidate_ev_eur=float(expected_capacity_ev_eur),
                 )
                 reserve_retry_factor = float(bcm_precommit_stats.get("retry_factor_selected", reserve_retry_factor))
                 submitted_reserve_pos_mw_after_retry = float(offered_pos)
@@ -6828,6 +7048,21 @@ class BatteryBacktester:
                         )
                         precommit_audit_by_ts.setdefault("precommit_id_recourse_reason", {})[tsu] = str(
                             bcm_precommit_stats.get("id_recourse_reason", "none")
+                        )
+                        for diag_name in (
+                            "terminal_shortfall_before_recovery_mwh",
+                            "id_recovery_feasible",
+                            "id_recovery_mwh",
+                            "id_recovery_cost_eur",
+                            "terminal_shortfall_after_recovery_mwh",
+                            "effective_ev_before_recovery_eur",
+                            "effective_ev_after_recovery_eur",
+                        ):
+                            precommit_audit_by_ts.setdefault(f"bcm_precommit_{diag_name}", {})[tsu] = float(
+                                bcm_precommit_stats.get(diag_name, np.nan if "ev" in diag_name else 0.0)
+                            )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_zero_reason_detail", {})[tsu] = str(
+                            bcm_precommit_stats.get("zero_reason_detail", bcm_precommit_stats.get("zero_reason", "none"))
                         )
                         for diag_name in (
                             "reduced_due_to_power",
@@ -7120,6 +7355,24 @@ class BatteryBacktester:
                     precommit_audit_by_ts.setdefault("precommit_id_recourse_cost_eur", {})[tsu] = float(
                         bcm_precommit_stats.get("id_recourse_cost_eur", 0.0)
                     )
+                    precommit_audit_by_ts.setdefault("precommit_id_recourse_reason", {})[tsu] = str(
+                        bcm_precommit_stats.get("id_recourse_reason", "none")
+                    )
+                    for diag_name in (
+                        "terminal_shortfall_before_recovery_mwh",
+                        "id_recovery_feasible",
+                        "id_recovery_mwh",
+                        "id_recovery_cost_eur",
+                        "terminal_shortfall_after_recovery_mwh",
+                        "effective_ev_before_recovery_eur",
+                        "effective_ev_after_recovery_eur",
+                    ):
+                        precommit_audit_by_ts.setdefault(f"bcm_precommit_{diag_name}", {})[tsu] = float(
+                            bcm_precommit_stats.get(diag_name, np.nan if "ev" in diag_name else 0.0)
+                        )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_zero_reason_detail", {})[tsu] = str(
+                        bcm_precommit_stats.get("zero_reason_detail", bcm_precommit_stats.get("zero_reason", "none"))
+                    )
                     for diag_name in (
                         "reduced_due_to_power",
                         "reduced_due_to_soc",
@@ -7292,6 +7545,32 @@ class BatteryBacktester:
             pred_act_neg=0.0,
             is_perfect_foresight=is_perfect_foresight,
         )
+        # Defensive propagation: the lockbook/settlement path pays BCM
+        # capacity pay-as-bid from the submitted bid object. If a custom or
+        # stale bid builder accidentally returns a zero/non-finite capacity
+        # price while the forecast block has a finite nonzero capacity price,
+        # preserve the submitted MW but restore the forecast-side capacity bid
+        # price before the bid enters the lockbook. Negative capacity forecasts
+        # remain valid and are not floored.
+        fixed_bids: list[BCMCapacityBid] = []
+        for bid in cap_bids:
+            cap_price = float(bid.capacity_price_eur_mw)
+            fallback_price = pred_cap_pos if bid.side == "pos" else pred_cap_neg
+            if (
+                float(bid.quantity_mw) > 1e-12
+                and (not np.isfinite(cap_price) or (abs(cap_price) <= 1e-12 and abs(fallback_price) > 1e-12))
+                and np.isfinite(fallback_price)
+            ):
+                cap_price = float(fallback_price)
+            fixed_bids.append(
+                BCMCapacityBid(
+                    ts=bid.ts,
+                    side=bid.side,
+                    quantity_mw=float(bid.quantity_mw),
+                    capacity_price_eur_mw=float(cap_price),
+                )
+            )
+        cap_bids = fixed_bids
         return cap_bids, ts_idx
 
     def _clear_afrr_capacity_block_against_truth(
@@ -7316,6 +7595,52 @@ class BatteryBacktester:
             true_cap_neg=true_cap_neg,
             clearing_price_basis="capacity_price",
         )
+
+    @staticmethod
+    def _infer_infeasibility_driver_for_row(
+        *,
+        optimization_error_code: str,
+        fixed_reserve_obligation_pos_mw: float = 0.0,
+        fixed_reserve_obligation_neg_mw: float = 0.0,
+        headroom_violation_pos_mwh: float = 0.0,
+        headroom_violation_neg_mwh: float = 0.0,
+        power_violation_pos_mw: float = 0.0,
+        power_violation_neg_mw: float = 0.0,
+        terminal_recovery_scheduled_grid_mwh: float = 0.0,
+    ) -> str:
+        """Stable accepted-path infeasibility attribution for diagnostics."""
+        code = str(optimization_error_code or "").strip().lower()
+        if code in {"", "none", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"}:
+            return "none"
+        fixed_reserve = (
+            max(0.0, float(fixed_reserve_obligation_pos_mw))
+            + max(0.0, float(fixed_reserve_obligation_neg_mw))
+        )
+        headroom_violation = (
+            max(0.0, float(headroom_violation_pos_mwh))
+            + max(0.0, float(headroom_violation_neg_mwh))
+        )
+        power_violation = (
+            max(0.0, float(power_violation_pos_mw))
+            + max(0.0, float(power_violation_neg_mw))
+        )
+        if headroom_violation > 1e-9:
+            return "reserve_headroom_infeasible"
+        if power_violation > 1e-9:
+            return "power_stack_blocked"
+        if "terminal_soc_conflict" in code:
+            if fixed_reserve > 1e-9:
+                return "locked_reserve_terminal_infeasible"
+            if max(0.0, float(terminal_recovery_scheduled_grid_mwh)) <= 1e-12:
+                return "terminal_recovery_unavailable"
+            return "id_recovery_blocked"
+        if "reserve" in code and fixed_reserve > 1e-9:
+            return "locked_reserve_terminal_infeasible"
+        if "solver" in code or "not set" in code or "numerical" in code:
+            return "solver_failure"
+        if "power" in code:
+            return "power_stack_blocked"
+        return "unknown_solver_or_numeric"
 
     def optimize_dispatch_rolling(
         self,
@@ -8146,6 +8471,13 @@ class BatteryBacktester:
                 has_fixed_reserve_obligation = bool(
                     any((float(v[0]) > 1e-9 or float(v[1]) > 1e-9) for v in fixed_reserve_obligation.values())
                 )
+                recoverable_terminal_conflict = bool(
+                    is_infeasible
+                    and has_fixed_reserve_obligation
+                    and ("terminal" in msg_l or "final" in msg_l)
+                    and str(self.final_soc_mode) == "hard"
+                    and bool(perms.allow_id_technical_repair)
+                )
                 def _safe_hold_with_obligations() -> pd.DataFrame:
                     ts_vals = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
                     hold = pd.DataFrame(
@@ -8564,7 +8896,7 @@ class BatteryBacktester:
                 if plan is not None:
                     pass
                 if plan is None:
-                    if recoverable_solver_failure:
+                    if recoverable_solver_failure or recoverable_terminal_conflict:
                         terminal_recovery_plan, terminal_recovery_diag = _terminal_recovery_fallback_with_id()
                         if terminal_recovery_plan is not None:
                             plan = terminal_recovery_plan
@@ -8918,6 +9250,14 @@ class BatteryBacktester:
                 "bcm_precommit_id_recourse_needed_mwh",
                 "bcm_precommit_id_recourse_cost_eur",
                 "bcm_precommit_id_recourse_reason",
+                "bcm_precommit_terminal_shortfall_before_recovery_mwh",
+                "bcm_precommit_id_recovery_feasible",
+                "bcm_precommit_id_recovery_mwh",
+                "bcm_precommit_id_recovery_cost_eur",
+                "bcm_precommit_terminal_shortfall_after_recovery_mwh",
+                "bcm_precommit_effective_ev_before_recovery_eur",
+                "bcm_precommit_effective_ev_after_recovery_eur",
+                "bcm_precommit_zero_reason_detail",
                 "bcm_precommit_reduced_due_to_power",
                 "bcm_precommit_reduced_due_to_soc",
                 "bcm_precommit_reduced_due_to_headroom",
@@ -11506,7 +11846,11 @@ class BatteryBacktester:
         global_perfect_foresight_bem_only_included = 0.0
         global_perfect_foresight_pnl_reconciliation_error_eur = float("nan")
         global_perfect_foresight_available_flag = 0.0
+        global_pf_solver_available = 0.0
+        global_pf_solver_benchmark_verified = 0.0
         global_pf_solver_solution_eur = float("nan")
+        global_pf_best_feasible_lower_bound_name = "none"
+        global_pf_best_feasible_lower_bound_eur = float("nan")
         global_pf_no_trade_incumbent_eur = float("nan")
         global_pf_realized_path_incumbent_eur = float("nan")
         global_pf_no_trade_final_soc_mwh = float("nan")
@@ -11639,7 +11983,12 @@ class BatteryBacktester:
                     return False, "nonfinite_pnl", terminal_shortfall
                 return True, "none", terminal_shortfall
 
-            no_trade_real, no_trade_diag = _build_no_market_terminal_id_incumbent(perfect_foresight_df)
+            no_trade_input = self._filter_frame_to_expected_timestamps(
+                perfect_foresight_df,
+                timestamp_col=colmap.timestamp,
+                expected_timestamps=expected_global_pf_ts,
+            )
+            no_trade_real, no_trade_diag = _build_no_market_terminal_id_incumbent(no_trade_input)
             no_trade_global = _rename_realized_frame(no_trade_real, "global_perfect_foresight")
             global_pf_no_trade_final_soc_mwh = float(no_trade_diag.get("final_soc_mwh", float("nan")))
             global_pf_no_trade_terminal_shortfall_mwh = float(no_trade_diag.get("terminal_shortfall_mwh", float("nan")))
@@ -11662,62 +12011,91 @@ class BatteryBacktester:
 
             solver_global = _empty_pf_frame("global_perfect_foresight")
             solver_feasible = False
-            if rolling_pf_cmp_available >= 0.5:
-                global_pf_solver_status = "ok"
-                global_perfect_foresight_dispatch_rows = float(len(perfect_foresight_cmp_dispatch))
-                global_perfect_foresight_bem_only_included = float(
-                    ("plan_bem_only_pos_mw" in perfect_foresight_cmp_dispatch.columns)
-                    and ("plan_bem_only_neg_mw" in perfect_foresight_cmp_dispatch.columns)
-                )
-                # Use the raw comparable PF solver candidate here. The
-                # rolling-PF frame may already have been replaced by a
-                # no-market or realized-path incumbent, and relabeling that
-                # selected incumbent as "solver" makes global PF feasibility
-                # checks too weak.
-                solver_global = perfect_foresight_cmp_solver_real.rename(
-                    columns={
-                        c: c.replace("pf_", "global_perfect_foresight_", 1)
-                        for c in perfect_foresight_cmp_solver_real.columns
-                        if c.startswith("pf_")
-                    }
-                )
-                solver_global = solver_global.rename(
-                    columns={
-                        c: c.replace("real_", "global_perfect_foresight_", 1)
-                        for c in solver_global.columns
-                        if c.startswith("real_")
-                    }
-                )
-                solver_soc_vals = (
-                    pd.to_numeric(solver_global["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
-                    if "global_perfect_foresight_soc_mwh" in solver_global.columns
-                    else pd.Series(dtype=float)
-                )
-                solver_final_soc = float(solver_soc_vals.iloc[-1]) if not solver_soc_vals.empty else float(self.soc_init)
-                global_pf_candidate_terminal_shortfall_mwh = max(
-                    0.0,
-                    float(self.soc_target_end) - float(solver_final_soc),
-                )
-                global_pf_solver_terminal_shortfall_mwh = float(global_pf_candidate_terminal_shortfall_mwh)
-                global_pf_solver_solution_eur = _pnl_total_for_realized_frame(
-                    solver_global,
-                    "global_perfect_foresight",
-                    terminal_price_for_global_pf,
-                )
-                solver_feasible, global_pf_solver_rejection_reason, global_pf_solver_terminal_shortfall_mwh = (
-                    _validate_global_pf_candidate(
-                        solver_global,
-                        candidate_label="solver",
-                        prefix="global_perfect_foresight",
-                        value_eur=global_pf_solver_solution_eur,
-                        require_ok_codes=True,
-                    )
-                )
-                global_pf_solver_feasible = float(solver_feasible)
+            solver_available = False
+            if bool(run_strategy_permissions.allow_bcm):
+                # The full-horizon optimizer has block-constant BCM variables, but the
+                # rolling path owns causal gate/precommit/lockbook semantics. Do not
+                # relabel rolling PF as a global hindsight benchmark.
+                global_pf_solver_status = "global_solver_missing_market_semantics"
+                global_pf_solver_rejection_reason = "solver_unavailable:global_solver_missing_market_semantics"
+                pf_failure_reason = pf_failure_reason or "global_pf_solver_unavailable:global_solver_missing_market_semantics"
             else:
-                global_pf_solver_status = rolling_pf_cmp_solver_status
-                pf_failure_reason = pf_failure_reason or f"global_pf_solver_failed:{global_pf_solver_status}"
-                global_pf_solver_rejection_reason = f"solver_unavailable:{global_pf_solver_status}"
+                try:
+                    expected_idx = pd.DatetimeIndex(pd.to_datetime(expected_global_pf_ts, utc=True, errors="coerce").dropna())
+                    solver_input = perfect_foresight_df.copy()
+                    solver_input_ts = pd.to_datetime(solver_input[colmap.timestamp], utc=True, errors="coerce")
+                    solver_input = solver_input.loc[solver_input_ts.isin(expected_idx)].reset_index(drop=True)
+                    if solver_input.empty:
+                        raise ValueError("global PF solver input is empty after evaluated-window clamp")
+                    _orig_tl_global = float(self.milp_time_limit_seconds)
+                    _orig_gap_global = float(self.milp_rel_gap)
+                    self.milp_time_limit_seconds = max(_orig_tl_global, 300.0)
+                    self.milp_rel_gap = min(_orig_gap_global, 1e-5)
+                    try:
+                        global_pf_dispatch = self.optimize_dispatch(
+                            solver_input,
+                            colmap,
+                            soc_start=self.soc_init,
+                            soc_end_target=None,
+                            soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
+                            deterministic_reserve_settlement=False,
+                            allowed_markets=allowed_markets,
+                            strategy_permissions=run_strategy_permissions,
+                            strict_input_validation=True,
+                        )
+                    finally:
+                        self.milp_time_limit_seconds = _orig_tl_global
+                        self.milp_rel_gap = _orig_gap_global
+                    global_perfect_foresight_dispatch_rows = float(len(global_pf_dispatch))
+                    global_perfect_foresight_bem_only_included = float(
+                        ("plan_bem_only_pos_mw" in global_pf_dispatch.columns)
+                        and ("plan_bem_only_neg_mw" in global_pf_dispatch.columns)
+                    )
+                    with _phase_watchdog("settlement_global_perfect_foresight_realized"):
+                        solver_real = self.settle_dispatch(
+                            solver_input,
+                            global_pf_dispatch,
+                            colmap,
+                            predicted_settlement=False,
+                            apply_market_clearing=True,
+                            perfect_foresight_mode=True,
+                        )
+                    solver_global = _rename_realized_frame(solver_real, "global_perfect_foresight")
+                    global_pf_solver_status = "ok"
+                    solver_available = True
+                    global_pf_solver_available = 1.0
+                    solver_soc_vals = (
+                        pd.to_numeric(solver_global["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
+                        if "global_perfect_foresight_soc_mwh" in solver_global.columns
+                        else pd.Series(dtype=float)
+                    )
+                    solver_final_soc = float(solver_soc_vals.iloc[-1]) if not solver_soc_vals.empty else float(self.soc_init)
+                    global_pf_candidate_terminal_shortfall_mwh = max(
+                        0.0,
+                        float(self.soc_target_end) - float(solver_final_soc),
+                    )
+                    global_pf_solver_terminal_shortfall_mwh = float(global_pf_candidate_terminal_shortfall_mwh)
+                    global_pf_solver_solution_eur = _pnl_total_for_realized_frame(
+                        solver_global,
+                        "global_perfect_foresight",
+                        terminal_price_for_global_pf,
+                    )
+                    solver_feasible, global_pf_solver_rejection_reason, global_pf_solver_terminal_shortfall_mwh = (
+                        _validate_global_pf_candidate(
+                            solver_global,
+                            candidate_label="solver",
+                            prefix="global_perfect_foresight",
+                            value_eur=global_pf_solver_solution_eur,
+                            require_ok_codes=True,
+                        )
+                    )
+                    global_pf_solver_feasible = float(solver_feasible)
+                    if not solver_feasible:
+                        global_pf_solver_status = f"unverified:{global_pf_solver_rejection_reason}"
+                except (RuntimeError, ValueError) as exc:
+                    global_pf_solver_status = _pf_failure_status(exc) if isinstance(exc, RuntimeError) else "solver_failed"
+                    pf_failure_reason = pf_failure_reason or f"global_pf_solver_failed:{global_pf_solver_status}"
+                    global_pf_solver_rejection_reason = f"solver_unavailable:{global_pf_solver_status}:{exc}"
 
             realized_global = _rename_realized_frame(real, "global_perfect_foresight")
             global_pf_realized_path_incumbent_eur = _pnl_total_for_realized_frame(
@@ -11760,17 +12138,26 @@ class BatteryBacktester:
                 "none" if realized_global_feasible else str(_realized_rejection_reason)
             )
 
-            selection = self._select_global_pf_incumbent(
-                {
-                    "solver": (global_pf_solver_solution_eur, solver_feasible, solver_global),
+            selection = self._evaluate_global_pf_solver_benchmark(
+                solver_value_eur=global_pf_solver_solution_eur,
+                solver_feasible=solver_feasible,
+                solver_available=solver_available,
+                solver_frame=solver_global,
+                lower_bound_candidates={
                     "no_market": (global_pf_no_trade_incumbent_eur, no_trade_feasible, no_trade_global),
                     "realized_path": (global_pf_realized_path_incumbent_eur, realized_global_feasible, realized_global),
-                }
+                },
+                solver_unavailable_reason=str(global_pf_solver_rejection_reason),
             )
             global_pf_selected_incumbent = str(selection["selected"])
             global_pf_incumbent_selection_reason = str(selection["selection_reason"])
+            global_pf_best_feasible_lower_bound_name = str(selection["best_feasible_lower_bound_name"])
+            global_pf_best_feasible_lower_bound_eur = float(selection["best_feasible_lower_bound_eur"])
+            global_pf_solver_benchmark_verified = float(selection["verified"])
+            if str(selection["failure_reason"]) != "none":
+                pf_failure_reason = pf_failure_reason or str(selection["failure_reason"])
             global_perfect_foresight_real = selection["frame"] if isinstance(selection["frame"], pd.DataFrame) else pd.DataFrame()
-            global_perfect_foresight_available_flag = float(selection["verified"])
+            global_perfect_foresight_available_flag = float(selection["available"])
             global_perfect_foresight_settlement_rows = float(len(global_perfect_foresight_real))
 
             selected_soc_vals = (
@@ -11788,18 +12175,14 @@ class BatteryBacktester:
             )
 
             if global_perfect_foresight_available_flag >= 0.5:
-                if global_pf_selected_incumbent == "solver":
-                    global_perfect_foresight_validation_status = "verified_solver_incumbent"
-                elif global_pf_selected_incumbent == "no_market":
-                    global_perfect_foresight_validation_status = "verified_no_market_incumbent"
-                elif global_pf_selected_incumbent == "realized_path":
-                    global_perfect_foresight_validation_status = "verified_realized_path_incumbent"
+                if float(selection["verified"]) >= 0.5:
+                    global_perfect_foresight_validation_status = "verified_full_horizon_solver"
                 else:
-                    global_perfect_foresight_validation_status = "verified_incumbent"
+                    global_perfect_foresight_validation_status = str(selection["failure_reason"])
             else:
                 global_perfect_foresight_real = _empty_pf_frame("global_perfect_foresight")
-                global_perfect_foresight_validation_status = "no_feasible_incumbent"
-                pf_failure_reason = pf_failure_reason or "global_pf_no_feasible_incumbent"
+                global_perfect_foresight_validation_status = str(selection["failure_reason"])
+                pf_failure_reason = pf_failure_reason or str(selection["failure_reason"])
 
 
         # Legacy isolated-market retrospective accounting removed.
@@ -11847,7 +12230,10 @@ class BatteryBacktester:
             hourly = _merge_unique(hourly, global_perfect_foresight_real)
         hourly = hourly.sort_values(colmap.timestamp).reset_index(drop=True)
         hourly["global_pf_selected_incumbent"] = str(global_pf_selected_incumbent)
+        hourly["global_pf_solver_available"] = float(global_pf_solver_available)
         hourly["global_pf_solver_feasible"] = float(global_pf_solver_feasible)
+        hourly["global_pf_best_feasible_lower_bound_name"] = str(global_pf_best_feasible_lower_bound_name)
+        hourly["global_pf_best_feasible_lower_bound_eur"] = float(global_pf_best_feasible_lower_bound_eur)
         hourly["global_pf_no_market_feasible"] = float(global_pf_no_market_feasible)
         hourly["global_pf_realized_path_feasible"] = float(global_pf_realized_path_feasible)
         hourly["global_pf_solver_rejection_reason"] = str(global_pf_solver_rejection_reason)
@@ -12191,8 +12577,7 @@ class BatteryBacktester:
         global_pf_verified_upper_bound = float(
             enable_global_perfect_foresight
             and global_perfect_foresight_available_flag >= 0.5
-            and np.isfinite(global_pf_upper_bound_gap_eur)
-            and global_pf_upper_bound_gap_eur >= -eps_global_perfect_foresight
+            and float(global_pf_solver_benchmark_verified) >= 0.5
         )
         if enable_global_perfect_foresight:
             if str(global_perfect_foresight_validation_status) == "global_pf_solver_failed":
@@ -12201,9 +12586,11 @@ class BatteryBacktester:
                 if not str(global_perfect_foresight_validation_status).startswith("verified_"):
                     global_perfect_foresight_validation_status = "verified_same_rules_dominates_realized"
             elif global_pf_below_realized_incumbent >= 0.5:
-                global_perfect_foresight_validation_status = "global_pf_below_realized_incumbent"
+                global_perfect_foresight_validation_status = "solver_below_realized_path_incumbent"
             elif global_perfect_foresight_available_flag < 0.5:
                 global_perfect_foresight_validation_status = "global_pf_unavailable"
+            elif str(global_perfect_foresight_validation_status) not in {"", "disabled_unverified"}:
+                global_perfect_foresight_validation_status = str(global_perfect_foresight_validation_status)
             else:
                 global_perfect_foresight_validation_status = "global_pf_unverified"
 
@@ -12326,6 +12713,7 @@ class BatteryBacktester:
             "global_pf_available": float(global_perfect_foresight_available_flag),
             "global_pf_solver_status": str(global_pf_solver_status),
             "global_pf_verified": float(global_pf_verified_upper_bound),
+            "global_pf_solver_available": float(global_pf_solver_available),
             "global_pf_solver_feasible": float(global_pf_solver_feasible),
             "global_pf_solver_rejection_reason": str(global_pf_solver_rejection_reason),
             "global_pf_solver_terminal_shortfall_mwh": float(global_pf_solver_terminal_shortfall_mwh),
@@ -12352,6 +12740,8 @@ class BatteryBacktester:
             "global_pf_upper_bound_gap_eur": float(global_pf_upper_bound_gap_eur),
             "global_pf_below_realized_incumbent": float(global_pf_below_realized_incumbent),
             "global_pf_solver_solution_eur": float(global_pf_solver_solution_eur),
+            "global_pf_best_feasible_lower_bound_name": str(global_pf_best_feasible_lower_bound_name),
+            "global_pf_best_feasible_lower_bound_eur": float(global_pf_best_feasible_lower_bound_eur),
             "global_pf_no_trade_incumbent_eur": float(global_pf_no_trade_incumbent_eur),
             "global_pf_no_market_incumbent_eur": float(global_pf_no_trade_incumbent_eur),
             "global_pf_realized_path_incumbent_eur": float(global_pf_realized_path_incumbent_eur),
@@ -12370,7 +12760,7 @@ class BatteryBacktester:
             "global_pf_candidate_terminal_shortfall_mwh": float(global_pf_candidate_terminal_shortfall_mwh),
             "global_hindsight_perfect_foresight_is_global_upper_bound": 0.0,
             "global_perfect_foresight_available": float(global_perfect_foresight_available_flag),
-            "global_perfect_foresight_capacity_bid_semantics": "same_rules_hindsight_candidate",
+            "global_perfect_foresight_capacity_bid_semantics": "full_horizon_solver_with_lower_bound_guards",
             "benchmark_is_global_upper_bound_global_perfect_foresight": 1.0,
             "pf_failure_reason": str(pf_failure_reason),
             "predicted_pnl_excl_terminal_eur": float(pred_pnl_raw),
@@ -12786,6 +13176,8 @@ class BatteryBacktester:
         summary["global_pf_realized_path_incumbent_eur"] = float(realized_path_pnl_under_global_upper_bound_rules_eur)
         summary["global_pf_solution_eur"] = float(global_pf_solver_solution_eur)
         summary["global_pf_solver_solution_eur"] = float(global_pf_solver_solution_eur)
+        summary["global_pf_best_feasible_lower_bound_name"] = str(global_pf_best_feasible_lower_bound_name)
+        summary["global_pf_best_feasible_lower_bound_eur"] = float(global_pf_best_feasible_lower_bound_eur)
         summary["global_pf_no_market_incumbent_eur"] = float(global_pf_no_trade_incumbent_eur)
         summary["global_pf_minus_no_market_incumbent_eur"] = (
             float(global_perfect_foresight_pnl_total - global_pf_no_trade_incumbent_eur)
@@ -12795,14 +13187,15 @@ class BatteryBacktester:
         summary["global_pf_minus_realized_incumbent_eur"] = float(global_pf_upper_bound_gap_eur)
         global_pf_failure_reason = "none"
         if enable_global_perfect_foresight:
-            if str(global_perfect_foresight_validation_status) == "no_feasible_incumbent":
-                global_pf_failure_reason = "no_feasible_incumbent"
-            elif str(global_perfect_foresight_validation_status) == "global_pf_solver_failed":
-                global_pf_failure_reason = "solver_failed"
-            elif global_perfect_foresight_available_flag < 0.5:
+            status_reason = str(global_perfect_foresight_validation_status)
+            if status_reason in {"no_feasible_incumbent", "global_pf_unavailable"}:
                 global_pf_failure_reason = "unavailable"
+            elif status_reason == "global_pf_solver_failed":
+                global_pf_failure_reason = "solver_failed"
+            elif status_reason and status_reason not in {"verified_full_horizon_solver", "verified_same_rules_dominates_realized"}:
+                global_pf_failure_reason = status_reason
             elif global_pf_below_realized_incumbent >= 0.5:
-                global_pf_failure_reason = "below_realized_incumbent"
+                global_pf_failure_reason = "solver_below_realized_path_incumbent"
             elif global_pf_verified_upper_bound < 0.5:
                 global_pf_failure_reason = "unverified"
         else:
@@ -13779,7 +14172,25 @@ class BatteryBacktester:
         summary["invalid_reason"] = ",".join(invalid_reasons)
         infeasibility_driver = "none"
         if summary["simulation_valid"] < 0.5:
-            if (not headroom_ok) or ("headroom" in invalid_reasons) or ("reserve_infeasible" in invalid_reasons):
+            has_terminal_soc_conflict = bool(
+                opt_codes_series is not None
+                and opt_codes_series.str.contains("terminal_soc_conflict", regex=False, na=False).any()
+            )
+            if has_terminal_soc_conflict:
+                def _hourly_num_series(*names: str) -> pd.Series:
+                    for name in names:
+                        if name in hourly.columns:
+                            return pd.to_numeric(hourly[name], errors="coerce").fillna(0.0)
+                    return pd.Series(0.0, index=hourly.index, dtype=float)
+
+                fixed_pos = _hourly_num_series("real_fixed_reserve_obligation_pos_mw", "fixed_reserve_obligation_pos_mw")
+                fixed_neg = _hourly_num_series("real_fixed_reserve_obligation_neg_mw", "fixed_reserve_obligation_neg_mw")
+                infeasibility_driver = (
+                    "locked_reserve_terminal_infeasible"
+                    if float((fixed_pos + fixed_neg).max()) > 1e-9
+                    else "terminal_recovery_unavailable"
+                )
+            elif (not headroom_ok) or ("headroom" in invalid_reasons) or ("reserve_infeasible" in invalid_reasons):
                 infeasibility_driver = "reserve_headroom"
             elif ("optimization_infeasible" in invalid_reasons) or ("terminal_soc" in invalid_reasons):
                 infeasibility_driver = "terminal_soc"
@@ -13790,11 +14201,117 @@ class BatteryBacktester:
         summary["infeasibility_driver"] = str(infeasibility_driver)
         if "optimization_error_code" in hourly.columns:
             drv = np.full(len(hourly), "none", dtype=object)
-            if infeasibility_driver != "none":
-                ok_codes = {"ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""}
-                mask_bad = ~hourly["optimization_error_code"].fillna("ok").astype(str).str.lower().isin(ok_codes)
-                drv = np.where(mask_bad.to_numpy(dtype=bool), infeasibility_driver, drv)
+            ok_codes = {"ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""}
+            opt_code_for_rows = hourly["optimization_error_code"].fillna("ok").astype(str).str.lower()
+            mask_bad = ~opt_code_for_rows.isin(ok_codes)
+            if bool(mask_bad.any()):
+                def _row_num(row: pd.Series, *names: str) -> float:
+                    for name in names:
+                        if name in row.index:
+                            val = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").fillna(0.0).iloc[0]
+                            return float(val)
+                    return 0.0
+
+                for idx in hourly.index[mask_bad]:
+                    row = hourly.loc[idx]
+                    drv[hourly.index.get_loc(idx)] = self._infer_infeasibility_driver_for_row(
+                        optimization_error_code=str(row.get("optimization_error_code", "")),
+                        fixed_reserve_obligation_pos_mw=_row_num(
+                            row,
+                            "real_fixed_reserve_obligation_pos_mw",
+                            "fixed_reserve_obligation_pos_mw",
+                        ),
+                        fixed_reserve_obligation_neg_mw=_row_num(
+                            row,
+                            "real_fixed_reserve_obligation_neg_mw",
+                            "fixed_reserve_obligation_neg_mw",
+                        ),
+                        headroom_violation_pos_mwh=_row_num(
+                            row,
+                            "real_headroom_violation_pos_mwh",
+                            "headroom_violation_pos_mwh",
+                        ),
+                        headroom_violation_neg_mwh=_row_num(
+                            row,
+                            "real_headroom_violation_neg_mwh",
+                            "headroom_violation_neg_mwh",
+                        ),
+                        power_violation_pos_mw=_row_num(
+                            row,
+                            "real_power_violation_discharge_mw",
+                            "power_violation_pos_mw",
+                        ),
+                        power_violation_neg_mw=_row_num(
+                            row,
+                            "real_power_violation_charge_mw",
+                            "power_violation_neg_mw",
+                        ),
+                        terminal_recovery_scheduled_grid_mwh=_row_num(
+                            row,
+                            "real_terminal_soc_id_recourse_scheduled_grid_mwh",
+                            "terminal_soc_id_recourse_scheduled_grid_mwh",
+                        ),
+                    )
             hourly["infeasibility_driver"] = drv
+            def _numeric_hourly_col(*names: str, default: float = 0.0) -> pd.Series:
+                for name in names:
+                    if name in hourly.columns:
+                        return pd.to_numeric(hourly[name], errors="coerce").fillna(float(default))
+                return pd.Series(float(default), index=hourly.index, dtype=float)
+
+            terminal_mask = opt_code_for_rows.str.contains("terminal_soc_conflict", regex=False, na=False)
+            terminal_driver = np.where(terminal_mask, hourly["infeasibility_driver"].astype(str), "none")
+            locked_pos = _numeric_hourly_col("real_fixed_reserve_obligation_pos_mw", "fixed_reserve_obligation_pos_mw")
+            locked_neg = _numeric_hourly_col("real_fixed_reserve_obligation_neg_mw", "fixed_reserve_obligation_neg_mw")
+            projected_before_id = _numeric_hourly_col(
+                "real_projected_terminal_soc_without_id_mwh",
+                "projected_terminal_soc_without_id_mwh",
+                default=np.nan,
+            )
+            projected_after_id = _numeric_hourly_col(
+                "real_projected_terminal_soc_with_id_mwh",
+                "projected_terminal_soc_with_id_mwh",
+                default=np.nan,
+            )
+            id_recovery_mwh = _numeric_hourly_col(
+                "real_terminal_soc_id_recourse_scheduled_grid_mwh",
+                "terminal_soc_id_recourse_scheduled_grid_mwh",
+            )
+            id_recovery_cost = _numeric_hourly_col(
+                "real_terminal_soc_id_recourse_cost_eur",
+                "terminal_soc_id_recourse_cost_eur",
+                "id_recourse_cost_eur",
+            )
+            soc_series = _numeric_hourly_col("real_soc_mwh", "soc_mwh", default=np.nan)
+            soc_min_violation = (float(self.soc_min) - soc_series).clip(lower=0.0)
+            soc_max_violation = (soc_series - float(self.soc_max)).clip(lower=0.0)
+            power_violation_charge = _numeric_hourly_col("real_power_violation_charge_mw", "power_violation_neg_mw")
+            power_violation_discharge = _numeric_hourly_col("real_power_violation_discharge_mw", "power_violation_pos_mw")
+            power_violation = pd.concat([power_violation_charge, power_violation_discharge], axis=1).max(axis=1)
+            hourly["terminal_conflict_driver"] = terminal_driver
+            hourly["terminal_conflict_detail"] = np.where(
+                terminal_mask,
+                opt_code_for_rows.astype(str) + ":" + pd.Series(terminal_driver, index=hourly.index).astype(str),
+                "none",
+            )
+            hourly["locked_reserve_pos_mw"] = locked_pos
+            hourly["locked_reserve_neg_mw"] = locked_neg
+            hourly["projected_terminal_soc_before_id_mwh"] = projected_before_id
+            hourly["projected_terminal_soc_after_id_mwh"] = projected_after_id
+            hourly["id_recovery_feasible"] = (
+                (projected_after_id >= float(self.soc_target_end) - 1e-6) & terminal_mask
+            ).astype(float)
+            hourly["id_recovery_mwh"] = id_recovery_mwh
+            hourly["id_recovery_cost_eur"] = id_recovery_cost
+            hourly["soc_min_violation_mwh"] = soc_min_violation
+            hourly["soc_max_violation_mwh"] = soc_max_violation
+            hourly["power_stack_violation_mw"] = power_violation
+            hourly["solver_status"] = hourly["optimization_error_code"].astype(str)
+            hourly["solver_message"] = (
+                hourly["optimization_error"].astype(str)
+                if "optimization_error" in hourly.columns
+                else pd.Series("", index=hourly.index, dtype=object)
+            )
         summary["thesis_reportable"] = float(
             (summary["simulation_valid"] >= 0.5)
             and (summary.get("fallback_used", 0.0) <= 0.5)
@@ -13971,6 +14488,7 @@ class BatteryBacktester:
             ("global_pf_available", 0.0),
             ("global_pf_solver_status", "disabled"),
             ("global_pf_verified", 0.0),
+            ("global_pf_solver_available", 0.0),
             ("global_pf_solver_feasible", 0.0),
             ("global_pf_no_market_feasible", 0.0),
             ("global_pf_realized_path_feasible", 0.0),
@@ -13988,6 +14506,8 @@ class BatteryBacktester:
             ("global_pf_upper_bound_gap_eur", float("nan")),
             ("global_pf_below_realized_incumbent", 0.0),
             ("global_pf_solver_solution_eur", float("nan")),
+            ("global_pf_best_feasible_lower_bound_name", "none"),
+            ("global_pf_best_feasible_lower_bound_eur", float("nan")),
             ("global_pf_no_trade_incumbent_eur", float("nan")),
             ("global_pf_no_market_incumbent_eur", float("nan")),
             ("global_pf_realized_path_incumbent_eur", float("nan")),
@@ -14001,7 +14521,7 @@ class BatteryBacktester:
             ("global_pf_incumbent_selection_reason", "disabled"),
             ("global_pf_candidate_terminal_shortfall_mwh", float("nan")),
             ("global_hindsight_perfect_foresight_is_global_upper_bound", 0.0),
-            ("global_perfect_foresight_capacity_bid_semantics", "hindsight_pay_as_bid_upper_bound"),
+            ("global_perfect_foresight_capacity_bid_semantics", "full_horizon_solver_with_lower_bound_guards"),
             ("realized_minus_global_perfect_foresight_eur", float("nan")),
             ("realized_vs_global_hindsight_perfect_foresight_upper_bound_pct", float("nan")),
             ("realized_exceeds_global_perfect_foresight", 0.0),
