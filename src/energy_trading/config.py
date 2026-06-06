@@ -8,7 +8,7 @@ MODEL_SPECS = {
     # 0.25 means 15 minutes within a 1-hour optimization step.
     "min_activation_headroom_fraction": 0.25,
     "market_scope": "DE_LU",  # Sign/settlement convention scope
-    "terminal_soc_value_discount": 1,  # Discount for terminal SoC value in objective
+    "terminal_soc_value_discount": 0.8,  # Discount for terminal SoC value in objective
     # Hard headroom assumptions for reserve/activation deliverability (hours).
     # 0.5h means full awarded MW must be energetically deliverable for 30 minutes.
     "reserve_activation_headroom_h": 0.5,
@@ -83,7 +83,7 @@ FINANCIAL_PARAMS = {
     "imbalance_penalty_eur_mwh": 500.0,  # Non-delivery/imbalance penalty proxy
     # Enforce final SoC >= soc_target_end effectively as hard in optimization:
     # very large soft-shortfall cost (not a settlement cashflow component).
-    "final_soc_shortfall_penalty_eur_per_mwh": 100000000000000000.0,
+    "final_soc_shortfall_penalty_eur_per_mwh": 1.0,
 }
 
 # --- MARKET CONSTRAINTS ---
@@ -104,10 +104,11 @@ MARKET_SPECS = {
     # buy_limit = pred + buy_offset, sell_limit = pred - sell_offset
     "da_buy_limit_offset_eur_mwh": 0.0,
     "da_sell_limit_offset_eur_mwh": 2.0,
-    # Quantile-backed DA limit thresholds (absolute prices from forecast tails):
-    # buy uses conservative upper tail (e.g. p90/p95), sell lower tail (e.g. p10/p05).
-    "da_buy_limit_quantile": "p90",
-    "da_sell_limit_quantile": "p10",
+    # Quantile-backed DA limit thresholds (absolute prices from selected forecasts).
+    # Use p50 by default so a p50-p50 scenario submits p50 DA limit prices unless
+    # explicitly overridden via CLI/config.
+    "da_buy_limit_quantile": "p50",
+    "da_sell_limit_quantile": "p50",
     # Debug guard for DA limit bids:
     # if enabled, fail hard when configured DA quantile inputs are missing/invalid
     # instead of silently falling back to weaker pricing logic.
@@ -182,10 +183,10 @@ def _validate_config() -> None:
         raise ValueError("da_execution_mode must be one of {'price_taker', 'limit'}.")
     if MARKET_SPECS["da_arbitrage_mode"] not in {"price_taker", "limit"}:
         raise ValueError("da_arbitrage_mode must be one of {'price_taker', 'limit'}.")
-    if str(MARKET_SPECS.get("da_buy_limit_quantile", "p90")).lower() not in {"p05", "p10", "p90", "p95"}:
-        raise ValueError("da_buy_limit_quantile must be one of {'p05','p10','p90','p95'}.")
-    if str(MARKET_SPECS.get("da_sell_limit_quantile", "p10")).lower() not in {"p05", "p10", "p90", "p95"}:
-        raise ValueError("da_sell_limit_quantile must be one of {'p05','p10','p90','p95'}.")
+    if str(MARKET_SPECS.get("da_buy_limit_quantile", "p50")).lower() not in {"p05", "p10", "p50", "p90", "p95"}:
+        raise ValueError("da_buy_limit_quantile must be one of {'p05','p10','p50','p90','p95'}.")
+    if str(MARKET_SPECS.get("da_sell_limit_quantile", "p50")).lower() not in {"p05", "p10", "p50", "p90", "p95"}:
+        raise ValueError("da_sell_limit_quantile must be one of {'p05','p10','p50','p90','p95'}.")
     if not isinstance(MARKET_SPECS.get("da_bid_fail_fast_debug", False), bool):
         raise ValueError("da_bid_fail_fast_debug must be boolean.")
     if MARKET_SPECS["afrr_energy_bid_strategy"] not in {"forecast", "marginal_cost", "hybrid"}:

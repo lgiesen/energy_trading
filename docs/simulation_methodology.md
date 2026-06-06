@@ -16,6 +16,9 @@ For hour `t` with duration `Δt`:
 Constraints:
 - `0 <= P_ch, P_dis <= P_max`
 - `SoC_min <= SoC_t <= SoC_max` (softened by explicit slack penalties)
+- DA discharge headroom at hour `t` is enforced as:
+  - `SoC_t - (Δt / η_out) P_{dis,t} ≥ SoC_min`
+  - equivalently `P_{dis,t} ≤ (SoC_t - SoC_min) * η_out / Δt`
 - Reserve/BEM deliverability headroom constraints use configured activation headroom hours.
 
 ## C. aFRR Quantile Bins

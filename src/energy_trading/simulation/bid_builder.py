@@ -105,8 +105,8 @@ class BidBuilder:
         da_arb_mode: str = "limit",
         da_buy_limit_offset_eur_mwh: float = 0.0,
         da_sell_limit_offset_eur_mwh: float = 0.0,
-        da_buy_limit_quantile: str = "p90",
-        da_sell_limit_quantile: str = "p10",
+        da_buy_limit_quantile: str = "p50",
+        da_sell_limit_quantile: str = "p50",
         afrr_energy_bid_strategy: str = "forecast",
         link_da_to_awarded_afrr: bool = True,
         forecast_value_mode: str = "canonical_economic",
@@ -318,6 +318,7 @@ class BidBuilder:
         pred_da_price: float,
         pred_da_price_p05: float | None = None,
         pred_da_price_p10: float | None = None,
+        pred_da_price_p50: float | None = None,
         pred_da_price_p90: float | None = None,
         pred_da_price_p95: float | None = None,
         is_perfect_foresight: bool = False,
@@ -335,6 +336,7 @@ class BidBuilder:
         qmap = {
             "p05": pred_da_price_p05,
             "p10": pred_da_price_p10,
+            "p50": pred_da_price if pred_da_price_p50 is None else pred_da_price_p50,
             "p90": pred_da_price_p90,
             "p95": pred_da_price_p95,
         }
@@ -350,13 +352,13 @@ class BidBuilder:
             buy_is_hedge = self.link_da_to_awarded_afrr and float(obligation_pos_mw) > 0.0
             # Quantile-backed DA limits: always use limit mode for standard DA actions.
             buy_mode = "limit"
-            buy_q = _qval(self.da_buy_limit_quantile) or _qval("p90") or _qval("p95")
-            if buy_q is not None:
-                buy_price = float(buy_q)
-            elif math.isfinite(float(pred_da_price)):
-                buy_price = float(pred_da_price) + self.da_buy_limit_offset_eur_mwh
-            else:
-                buy_price = float(self.pricing.da_buy_limit_price_eur_mwh)
+            buy_q = _qval(self.da_buy_limit_quantile)
+            if buy_q is None:
+                raise ValueError(
+                    "missing_da_quantile: configured DA buy limit quantile "
+                    f"{self.da_buy_limit_quantile!r} is unavailable/non-finite"
+                )
+            buy_price = float(buy_q)
             bids.append(
                 DABid(
                     ts=ts,
@@ -376,13 +378,13 @@ class BidBuilder:
             sell_is_hedge = self.link_da_to_awarded_afrr and float(obligation_neg_mw) > 0.0
             # Quantile-backed DA limits: conservative lower tail for sell.
             sell_mode = "limit"
-            sell_q = _qval(self.da_sell_limit_quantile) or _qval("p10") or _qval("p05")
-            if sell_q is not None:
-                sell_price = float(sell_q)
-            elif math.isfinite(float(pred_da_price)):
-                sell_price = float(pred_da_price) - self.da_sell_limit_offset_eur_mwh
-            else:
-                sell_price = float(self.pricing.da_sell_limit_price_eur_mwh)
+            sell_q = _qval(self.da_sell_limit_quantile)
+            if sell_q is None:
+                raise ValueError(
+                    "missing_da_quantile: configured DA sell limit quantile "
+                    f"{self.da_sell_limit_quantile!r} is unavailable/non-finite"
+                )
+            sell_price = float(sell_q)
             bids.append(
                 DABid(
                     ts=ts,

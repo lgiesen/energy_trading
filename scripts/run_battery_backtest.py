@@ -61,7 +61,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from energy_trading.config import MODEL_SPECS
+from energy_trading.config import MARKET_SPECS, MODEL_SPECS
 from energy_trading.simulation.battery_backtest import (
     AFRR_QUANTILE_BINS,
     BacktestColumnMap,
@@ -3080,6 +3080,15 @@ def parse_args() -> argparse.Namespace:
         help="Day-Ahead bid submission hour in Europe/Berlin local time used for locking next-day DA bids (default: 11).",
     )
     p.add_argument(
+        "--da-limit-quantile",
+        choices=["p05", "p10", "p50", "p90", "p95"],
+        default=None,
+        help=(
+            "DA limit-price quantile for both buy and sell orders. "
+            "Defaults to config MARKET_SPECS['da_*_limit_quantile']."
+        ),
+    )
+    p.add_argument(
         "--bcm-bid-hour-local",
         type=int,
         default=8,
@@ -3590,6 +3599,9 @@ def main() -> None:
     MODEL_SPECS["disable_new_bcm_reserve_bids"] = bool(args.disable_new_bcm_reserve_bids)
     MODEL_SPECS["afrr_bcm_bid_hour_local"] = int(args.bcm_bid_hour_local)
     MODEL_SPECS["afrr_bcm_gate_hour_cet"] = int(args.bcm_bid_hour_local)
+    if args.da_limit_quantile is not None:
+        MARKET_SPECS["da_buy_limit_quantile"] = str(args.da_limit_quantile)
+        MARKET_SPECS["da_sell_limit_quantile"] = str(args.da_limit_quantile)
     MODEL_SPECS["bem_only_headroom_safety_mwh"] = float(args.bem_only_headroom_safety_mwh)
     if float(MODEL_SPECS["bem_only_headroom_safety_mwh"]) < 0.0:
         raise ValueError("--bem-only-headroom-safety-mwh must be >= 0.")
@@ -4618,12 +4630,6 @@ def main() -> None:
             f"{outputs.summary.get('realized_total_pnl_eur', float('nan')):.2f} / "
             f"{outputs.summary.get('rolling_perfect_foresight_same_rules_total_pnl_eur', float('nan')):.2f}"
         )
-        cmp_r = outputs.summary.get("comparable_realized_market_pnl_eur", float("nan"))
-        cmp_b = outputs.summary.get("comparable_perfect_foresight_market_pnl_eur", float("nan"))
-        print(
-            "- realized/comparable_rolling_perfect_foresight_same_rules_market: "
-            f"{float(cmp_r):.2f} / {float(cmp_b):.2f}"
-        )
         realized_pnl = pd.to_numeric(
             pd.Series([outputs.summary.get("realized_total_pnl_eur", float("nan"))]),
             errors="coerce",
@@ -4657,11 +4663,6 @@ def main() -> None:
         print(
             "- realized_vs_perfect_foresight_pct (diagnostic, may exceed 100): "
             f"{(100.0 * float(r_multi)) if pd.notna(r_multi) else float('nan'):.2f}%"
-        )
-        r_cmp = outputs.summary.get("realized_vs_perfect_foresight_comparable_market_ratio", float("nan"))
-        print(
-            "- realized/comparable_rolling_perfect_foresight_same_rules_market ratio % (Multi): "
-            f"{(100.0 * float(r_cmp)) if pd.notna(r_cmp) else float('nan'):.2f}%"
         )
         global_ratio_pct = outputs.summary.get("realized_vs_global_hindsight_perfect_foresight_upper_bound_pct", float("nan"))
         global_ok = (
@@ -4745,10 +4746,6 @@ def main() -> None:
             "global_perfect_foresight_available": outputs.summary.get("global_perfect_foresight_available"),
             "global_perfect_foresight_dominance_check_pass": outputs.summary.get("global_perfect_foresight_dominance_check_pass"),
             "global_perfect_foresight_validation_status": outputs.summary.get("global_perfect_foresight_validation_status"),
-            "comparable_realized_market_pnl_eur": outputs.summary.get("comparable_realized_market_pnl_eur"),
-            "comparable_perfect_foresight_market_pnl_eur": outputs.summary.get(
-                "comparable_perfect_foresight_market_pnl_eur"
-            ),
             "benchmark_is_global_upper_bound": outputs.summary.get("benchmark_is_global_upper_bound", 0.0),
             "rolling_pf_is_upper_bound": outputs.summary.get("rolling_pf_is_upper_bound", 0.0),
             "global_perfect_foresight_is_upper_bound": outputs.summary.get("global_perfect_foresight_is_upper_bound", 0.0),
@@ -4845,19 +4842,6 @@ def main() -> None:
                 (r / g) * 100.0,
                 np.nan,
             )
-        if {
-            "comparable_realized_market_pnl_eur",
-            "comparable_perfect_foresight_market_pnl_eur",
-        }.issubset(overview.columns):
-            r_cmp = pd.to_numeric(overview["comparable_realized_market_pnl_eur"], errors="coerce")
-            b_cmp = pd.to_numeric(
-                overview["comparable_perfect_foresight_market_pnl_eur"], errors="coerce"
-            )
-            overview["realized_vs_perfect_foresight_comparable_market_pct"] = np.where(
-                b_cmp.abs() > 1e-12,
-                (r_cmp / b_cmp) * 100.0,
-                np.nan,
-            )
         overview = overview.sort_values([c for c in ["scenario", "trading_strategy"] if c in overview.columns]).reset_index(drop=True)
         overview.to_csv(overview_csv, index=False)
         overview_json.write_text(overview.to_json(orient="records", indent=2), encoding="utf-8")
@@ -4904,7 +4888,6 @@ def main() -> None:
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
                 "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
                 "realized_vs_perfect_foresight_pct",
-                "realized_vs_perfect_foresight_comparable_market_pct",
                 "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
                 "simulation_valid",
                 "thesis_reportable",
@@ -4919,7 +4902,6 @@ def main() -> None:
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
                 "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
                 "realized_vs_perfect_foresight_pct",
-                "realized_vs_perfect_foresight_comparable_market_pct",
                 "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
             ]:
                 if c in display_df.columns:
@@ -4934,7 +4916,6 @@ def main() -> None:
                     "rolling_perfect_foresight_same_rules_total_pnl_eur": "pnl_pf_roll_eur",
                     "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": "pnl_pf_global_ub_eur",
                     "realized_vs_perfect_foresight_pct": "real_vs_pf_roll_pct",
-                    "realized_vs_perfect_foresight_comparable_market_pct": "real_vs_pf_cmp_pct",
                     "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct": "real_vs_pf_global_pct",
                 }
             )

@@ -49,7 +49,7 @@ def _write_scenario(
         "thesis_reportable": 1.0,
         "invalid_reason": "",
         "realized_total_pnl_eur": realized,
-        "comparable_rolling_perfect_foresight_same_rules_market_pnl_eur": rolling,
+        "rolling_perfect_foresight_same_rules_total_pnl_eur": rolling,
         "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": global_pf,
         "global_perfect_foresight_available": global_available,
         "global_pf_verified_upper_bound": global_verified,

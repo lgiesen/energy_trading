@@ -147,14 +147,8 @@ def _build_pnl_validation_report(
         realized = _safe_float(summary.get("realized_total_pnl_eur", rec.get("realized_total_pnl_eur")))
         rolling = _safe_float(
             summary.get(
-                "comparable_rolling_perfect_foresight_same_rules_market_pnl_eur",
-                summary.get(
-                    "comparable_perfect_foresight_market_pnl_eur",
-                    summary.get(
-                        "rolling_perfect_foresight_same_rules_total_pnl_eur",
-                        rec.get("rolling_perfect_foresight_same_rules_total_pnl_eur"),
-                    ),
-                ),
+                "rolling_perfect_foresight_same_rules_total_pnl_eur",
+                rec.get("rolling_perfect_foresight_same_rules_total_pnl_eur"),
             )
         )
         global_pf = _safe_float(
@@ -220,7 +214,7 @@ def _build_pnl_validation_report(
                 "simulation_valid": rec.get("simulation_valid"),
                 "thesis_reportable": rec.get("thesis_reportable"),
                 "realized_total_pnl_eur": realized,
-                "comparable_rolling_pf_eur": rolling,
+                "rolling_pf_eur": rolling,
                 "global_hindsight_pf_eur": global_pf,
                 "realized_minus_rolling_pf_eur": realized_minus_rolling,
                 "rolling_pf_minus_global_pf_eur": rolling_minus_global,
