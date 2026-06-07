@@ -76,8 +76,8 @@ from energy_trading.visualization.style import apply_geo_style, get_backtest_lin
 
 
 INPUT_CACHE_SCHEMA_VERSION = "simulation_input_cache_v1"
-SIMULATION_EVAL_START_UTC = pd.Timestamp("2025-01-08T00:00:00Z")
-SIMULATION_EVAL_END_UTC = pd.Timestamp("2026-01-08T00:00:00Z")
+SIMULATION_EVAL_START_UTC = pd.Timestamp("2025-01-14T00:00:00Z")
+SIMULATION_EVAL_END_UTC = pd.Timestamp("2026-01-14T00:00:00Z")
 FORECAST_COVERAGE_SCHEMA_VERSION = "forecast_coverage_preflight_v1"
 
 
@@ -3123,7 +3123,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Disable common thesis simulation evaluation-window clamp. "
-            "By default simulations use [2025-01-08T00:00:00Z, 2026-01-08T00:00:00Z)."
+            "By default simulations use [2025-01-14T00:00:00Z, 2026-01-14T00:00:00Z)."
         ),
     )
     p.add_argument("--horizon-hours", type=int, default=48, help="Rolling-horizon window length in hours.")
