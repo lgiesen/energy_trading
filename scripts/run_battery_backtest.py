@@ -215,6 +215,13 @@ def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, t
         "real_pnl_eur",
         "real_revenue_da_eur",
         "real_cost_da_eur",
+        "real_da_pnl_eur",
+        "real_submitted_da_buy_mw",
+        "real_submitted_da_sell_mw",
+        "real_submitted_da_buy_price_eur_mwh",
+        "real_submitted_da_sell_price_eur_mwh",
+        "real_da_buy_accepted",
+        "real_da_sell_accepted",
         "real_da_buy_mwh",
         "real_da_sell_mwh",
         "real_revenue_capacity_eur",
@@ -269,6 +276,15 @@ def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, t
         "real_throughput_mwh",
         "perfect_foresight_pnl_eur",
         "global_hindsight_perfect_foresight_pnl_eur",
+        "afrr_activation_rate_guard_policy",
+        "afrr_activation_rate_guard_quantile",
+        "afrr_activation_rate_guard_quantile_resolved",
+        "afrr_activation_rate_guard_source_column_pos",
+        "afrr_activation_rate_guard_source_column_neg",
+        "ev_pred_act_rate_pos_guard",
+        "ev_pred_act_rate_neg_guard",
+        "ev_pred_act_rate_pos_p90",
+        "ev_pred_act_rate_neg_p90",
     }
     prefixes = (
         "real_da_",
@@ -279,6 +295,16 @@ def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, t
         "real_power_",
         "final_soc_",
         "pnl_reconciliation_",
+        "da_precommit_",
+        "da_candidate_",
+        "da_source_",
+        "da_lockbook_",
+        "da_locked_",
+        "da_bid_",
+        "current_row_is_da_gate",
+        "raw_optimizer_",
+        "accepted_lockbook_",
+        "ev_da_",
     )
     cols = [c for c in hourly.columns if c in exact or c.startswith(prefixes)]
     return hourly.loc[:, list(dict.fromkeys(cols))].copy()
@@ -1769,14 +1795,11 @@ def _apply_quantile_pair_to_warehouse(
                 )
             cur["predicted_value"] = pd.to_numeric(cur[q_col], errors="coerce")
         elif "predicted_value" not in cur.columns:
-            # Keep central point forecast for non-DA targets; do not force
-            # directional low/high substitution.
-            if "p50" not in cur.columns:
-                available = [c for c in cur.columns if re.fullmatch(r"p\d{2}", str(c))]
-                raise KeyError(
-                    f"Missing both predicted_value and p50 for {pred_col}. Available quantiles: {available}"
-                )
-            cur["predicted_value"] = pd.to_numeric(cur["p50"], errors="coerce")
+            available = [c for c in cur.columns if re.fullmatch(r"p\d{2}", str(c))]
+            raise KeyError(
+                "missing_forecast_point_value: non-DA prediction is missing predicted_value; "
+                f"silent p50 fallback is disabled for {pred_col}. Available quantiles: {available}"
+            )
         out[pred_col] = cur
     return out
 
@@ -2636,6 +2659,7 @@ def _preflight_manifest_and_quantiles(
     model_key: str,
     manifest_dir: Path,
     expected_quantiles: set[str],
+    afrr_activation_rate_guard_quantile: str | set[str] | None = None,
 ) -> None:
     if not manifest_path.exists():
         raise RuntimeError(f"Manifest not found: {manifest_path}")
@@ -2669,6 +2693,39 @@ def _preflight_manifest_and_quantiles(
     if not expected:
         expected = {"p50"}
     failures: list[str] = []
+    if isinstance(afrr_activation_rate_guard_quantile, (set, list, tuple)):
+        guard_quantiles = {str(q).strip().lower() for q in afrr_activation_rate_guard_quantile if str(q).strip()}
+    else:
+        guard_q_raw = str(afrr_activation_rate_guard_quantile or "").strip().lower()
+        guard_quantiles = {guard_q_raw} if guard_q_raw else set()
+    if guard_quantiles:
+        guard_failures: list[str] = []
+        for guard_q in sorted(guard_quantiles):
+            for pred_col in ["pred_afrr_activation_rate_pos", "pred_afrr_activation_rate_neg"]:
+                file_path = resolved.get(pred_col)
+                if file_path is None:
+                    guard_failures.append(f"{pred_col}: missing prediction file for guard quantile {guard_q}")
+                    continue
+                cols = set(_read_parquet_columns(Path(file_path)))
+                if guard_q not in cols:
+                    guard_failures.append(
+                        f"{pred_col}: missing_afrr_activation_rate_guard_quantile {guard_q!r} "
+                        f"in {file_path}"
+                    )
+        if guard_failures:
+            raise RuntimeError(
+                "Preflight failed: missing_afrr_activation_rate_guard_quantile.\n"
+                f"Guard quantile(s): {','.join(sorted(guard_quantiles))}\n"
+                "Missing columns: "
+                + ", ".join(
+                    [
+                        f"pred_afrr_activation_rate_pos_{q}, pred_afrr_activation_rate_neg_{q}"
+                        for q in sorted(guard_quantiles)
+                    ]
+                )
+                + "\n"
+                + "\n".join(guard_failures)
+            )
     for pred_col, file_path in sorted(resolved.items()):
         cols = set(_read_parquet_columns(Path(file_path)))
         missing = sorted(expected - cols)
@@ -3089,6 +3146,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--afrr-activation-rate-guard-quantile",
+        choices=["scenario", "same_as_bid", "p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"],
+        default="scenario",
+        help=(
+            "aFRR/BEM/BCM activation-rate quantile used for physical headroom guards. "
+            "Use 'scenario' to match a single active --quantile-pairs bid bin (default)."
+        ),
+    )
+    p.add_argument(
         "--bcm-bid-hour-local",
         type=int,
         default=8,
@@ -3379,6 +3445,29 @@ def main() -> None:
         expanded = _expand_quantile_range(q_lo.lower(), q_hi.lower())
         required_quantiles.update(expanded)
         scenario_bin_map[_scenario_suffix(q_lo, q_hi)] = expanded
+    afrr_activation_rate_guard_quantile = str(args.afrr_activation_rate_guard_quantile).lower()
+    strategy_uses_afrr = args.trading_strategy in {"bcm", "bem", "afrr", "multi"}
+    afrr_activation_rate_guard_quantiles_required: set[str] = set()
+    if strategy_uses_afrr:
+        if afrr_activation_rate_guard_quantile in {"scenario", "same_as_bid"}:
+            if not scenario_bin_map:
+                raise ValueError(
+                    "ambiguous_afrr_activation_rate_guard_quantile_for_multi_bin_scenario: "
+                    f"guard_policy={afrr_activation_rate_guard_quantile}, active_bins={list(AFRR_QUANTILE_BINS)}. "
+                    "Pass a single --quantile-pairs value or set --afrr-activation-rate-guard-quantile explicitly."
+                )
+            for scenario_name, bins in scenario_bin_map.items():
+                if len(bins) != 1:
+                    raise ValueError(
+                        "ambiguous_afrr_activation_rate_guard_quantile_for_multi_bin_scenario: "
+                        f"guard_policy={afrr_activation_rate_guard_quantile}, scenario={scenario_name}, "
+                        f"active_bins={bins}. Use a single quantile pair or set "
+                        "--afrr-activation-rate-guard-quantile explicitly."
+                    )
+                afrr_activation_rate_guard_quantiles_required.add(str(bins[0]).lower())
+        else:
+            afrr_activation_rate_guard_quantiles_required.add(afrr_activation_rate_guard_quantile)
+        required_quantiles.update(afrr_activation_rate_guard_quantiles_required)
 
     predictions_path = args.predictions.strip()
     ground_truth_path = args.ground_truth.strip()
@@ -3408,6 +3497,9 @@ def main() -> None:
             model_key=args.model_key.strip(),
             manifest_dir=manifest_dir,
             expected_quantiles=required_quantiles,
+            afrr_activation_rate_guard_quantile=(
+                afrr_activation_rate_guard_quantiles_required if strategy_uses_afrr else None
+            ),
         )
         target_value_modes = _target_value_modes_from_manifest(payload)
     else:
@@ -3566,6 +3658,7 @@ def main() -> None:
 
     MODEL_SPECS["reserve_activation_headroom_h"] = float(args.reserve_activation_headroom_h)
     MODEL_SPECS["bem_activation_headroom_h"] = float(args.bem_activation_headroom_h)
+    MARKET_SPECS["afrr_activation_rate_guard_quantile"] = str(afrr_activation_rate_guard_quantile)
     mode = str(args.reserve_feasibility_mode or "").strip().lower()
     if mode not in {"", "normal", "conservative"}:
         raise ValueError("--reserve-feasibility-mode must be one of: normal, conservative")
@@ -4774,6 +4867,11 @@ def main() -> None:
             row["quantile_low"] = q_lo
             row["quantile_high"] = q_hi
             row["afrr_bid_quantile_bins"] = ",".join(_expand_quantile_range(q_lo, q_hi))
+            row["afrr_activation_rate_guard_policy"] = afrr_activation_rate_guard_quantile
+            row["afrr_activation_rate_guard_quantile"] = (
+                q_lo if afrr_activation_rate_guard_quantile in {"scenario", "same_as_bid"} else afrr_activation_rate_guard_quantile
+            )
+            row["afrr_activation_rate_guard_quantile_resolved"] = row["afrr_activation_rate_guard_quantile"]
         sweep_rows.append(row)
 
     global_plan_history_path = Path("artifacts/backtest_plan_history.parquet")

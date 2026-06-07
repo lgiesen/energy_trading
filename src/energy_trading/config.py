@@ -83,7 +83,7 @@ FINANCIAL_PARAMS = {
     "imbalance_penalty_eur_mwh": 500.0,  # Non-delivery/imbalance penalty proxy
     # Enforce final SoC >= soc_target_end effectively as hard in optimization:
     # very large soft-shortfall cost (not a settlement cashflow component).
-    "final_soc_shortfall_penalty_eur_per_mwh": 1.0,
+    "final_soc_shortfall_penalty_eur_per_mwh": 1000000.0,
 }
 
 # --- MARKET CONSTRAINTS ---
@@ -92,11 +92,14 @@ MARKET_SPECS = {
     "da_bid_granularity": 0.1,  # Bid steps
     "afrr_min_bid_size": 1.0,  # Minimum bid size in MW (Germany)
     "afrr_bid_granularity": 1.0,  # Bid steps
-    "da_execution_mode": "limit",  # "price_taker" or "limit"
-    "da_arbitrage_mode": "limit",  # mode for non-hedging DA volumes
+    "da_execution_mode": "price_taker",  # "price_taker" or "limit"
+    "da_arbitrage_mode": "price_taker",  # mode for non-hedging DA volumes
     "da_link_to_awarded_afrr": True,  # cancel hedges if aFRR capacity was not awarded
     "afrr_capacity_bid_risk_lambda": 0.2,
     "afrr_activation_bid_risk_lambda": 0.2,
+    # Activation-rate quantile policy used for physical reserve/BEM headroom guards.
+    # "scenario" resolves to the single active bid quantile from --quantile-pairs.
+    "afrr_activation_rate_guard_quantile": "scenario",
     "afrr_energy_bid_strategy": "forecast",  # "forecast" | "marginal_cost" | "hybrid"
     "da_buy_limit_price_eur_mwh": 3000.0,
     "da_sell_limit_price_eur_mwh": -500.0,
@@ -189,6 +192,9 @@ def _validate_config() -> None:
         raise ValueError("da_sell_limit_quantile must be one of {'p05','p10','p50','p90','p95'}.")
     if not isinstance(MARKET_SPECS.get("da_bid_fail_fast_debug", False), bool):
         raise ValueError("da_bid_fail_fast_debug must be boolean.")
+    guard_q = str(MARKET_SPECS.get("afrr_activation_rate_guard_quantile", "scenario")).lower()
+    if guard_q not in {"scenario", "same_as_bid", "p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"}:
+        raise ValueError("afrr_activation_rate_guard_quantile must be scenario/same_as_bid or one of p01,p05,p10,p30,p50,p70,p90,p95,p99.")
     if MARKET_SPECS["afrr_energy_bid_strategy"] not in {"forecast", "marginal_cost", "hybrid"}:
         raise ValueError("afrr_energy_bid_strategy must be one of {'forecast', 'marginal_cost', 'hybrid'}.")
     if MARKET_SPECS["afrr_capacity_bid_risk_lambda"] < 0:
