@@ -281,10 +281,15 @@ def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, t
         "afrr_activation_rate_guard_quantile_resolved",
         "afrr_activation_rate_guard_source_column_pos",
         "afrr_activation_rate_guard_source_column_neg",
+        "afrr_activation_rate_guard_missing_columns",
+        "afrr_activation_rate_guard_fallback_used",
+        "afrr_activation_rate_guard_fallback_reason",
+        "afrr_activation_rate_guard_mode",
         "ev_pred_act_rate_pos_guard",
         "ev_pred_act_rate_neg_guard",
         "ev_pred_act_rate_pos_p90",
         "ev_pred_act_rate_neg_p90",
+        "first_da_realized_without_precommit_origin_timestamp_utc",
     }
     prefixes = (
         "real_da_",
@@ -299,6 +304,9 @@ def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, t
         "da_postlock_",
         "da_candidate_",
         "da_source_",
+        "da_originating_",
+        "da_realized_origin_",
+        "da_realized_without_precommit_origin_",
         "da_lockbook_",
         "da_locked_",
         "da_bid_",
@@ -2699,6 +2707,7 @@ def _preflight_manifest_and_quantiles(
     else:
         guard_q_raw = str(afrr_activation_rate_guard_quantile or "").strip().lower()
         guard_quantiles = {guard_q_raw} if guard_q_raw else set()
+    guard_quantiles = {q for q in guard_quantiles if q not in {"auto", "canonical", "point"}}
     if guard_quantiles:
         guard_failures: list[str] = []
         for guard_q in sorted(guard_quantiles):
@@ -3148,11 +3157,26 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--afrr-activation-rate-guard-quantile",
-        choices=["scenario", "same_as_bid", "p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"],
-        default="scenario",
+        choices=[
+            "auto",
+            "scenario",
+            "same_as_bid",
+            "canonical",
+            "point",
+            "p01",
+            "p05",
+            "p10",
+            "p30",
+            "p50",
+            "p70",
+            "p90",
+            "p95",
+            "p99",
+        ],
+        default="auto",
         help=(
-            "aFRR/BEM/BCM activation-rate quantile used for physical headroom guards. "
-            "Use 'scenario' to match a single active --quantile-pairs bid bin (default)."
+            "aFRR/BEM/BCM activation-rate source used for physical headroom guards. "
+            "auto prefers p90 guard columns when available and otherwise uses canonical point columns."
         ),
     )
     p.add_argument(
@@ -3466,7 +3490,7 @@ def main() -> None:
                         "--afrr-activation-rate-guard-quantile explicitly."
                     )
                 afrr_activation_rate_guard_quantiles_required.add(str(bins[0]).lower())
-        else:
+        elif afrr_activation_rate_guard_quantile not in {"auto", "canonical", "point"}:
             afrr_activation_rate_guard_quantiles_required.add(afrr_activation_rate_guard_quantile)
         required_quantiles.update(afrr_activation_rate_guard_quantiles_required)
 
@@ -4869,10 +4893,19 @@ def main() -> None:
             row["quantile_high"] = q_hi
             row["afrr_bid_quantile_bins"] = ",".join(_expand_quantile_range(q_lo, q_hi))
             row["afrr_activation_rate_guard_policy"] = afrr_activation_rate_guard_quantile
-            row["afrr_activation_rate_guard_quantile"] = (
-                q_lo if afrr_activation_rate_guard_quantile in {"scenario", "same_as_bid"} else afrr_activation_rate_guard_quantile
+            row["afrr_activation_rate_guard_quantile"] = outputs.summary.get(
+                "afrr_activation_rate_guard_quantile", ""
             )
-            row["afrr_activation_rate_guard_quantile_resolved"] = row["afrr_activation_rate_guard_quantile"]
+            row["afrr_activation_rate_guard_quantile_resolved"] = outputs.summary.get(
+                "afrr_activation_rate_guard_quantile_resolved", row["afrr_activation_rate_guard_quantile"]
+            )
+            row["afrr_activation_rate_guard_mode"] = outputs.summary.get("afrr_activation_rate_guard_mode", "")
+            row["afrr_activation_rate_guard_fallback_used"] = outputs.summary.get(
+                "afrr_activation_rate_guard_fallback_used", 0.0
+            )
+            row["afrr_activation_rate_guard_fallback_reason"] = outputs.summary.get(
+                "afrr_activation_rate_guard_fallback_reason", "none"
+            )
         sweep_rows.append(row)
 
     global_plan_history_path = Path("artifacts/backtest_plan_history.parquet")

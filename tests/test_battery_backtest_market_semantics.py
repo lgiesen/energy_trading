@@ -960,6 +960,103 @@ def test_afrr_missing_activation_rate_guard_quantile_fails_explicitly() -> None:
         bt.optimize_dispatch(df, col, allowed_markets=("aFRR", "BEM"))
 
 
+def test_afrr_activation_rate_guard_scenario_p30_missing_fails_explicitly() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30"]
+    bt.afrr_quantile_prob = {"p30": 0.7}
+    bt.afrr_activation_rate_guard_policy = "scenario"
+    bt.afrr_activation_rate_guard_quantile = "scenario"
+    df, col = _one_hour_pred_df(
+        da=200.0,
+        cap_pos=200.0,
+        cap_neg=0.0,
+        act_pos=300.0,
+        act_neg=-50.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    df = df.drop(
+        columns=[
+            f"{col.pred_afrr_activation_rate_pos}_p30",
+            f"{col.pred_afrr_activation_rate_neg}_p30",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="missing_afrr_activation_rate_guard_quantile.*p30"):
+        bt.optimize_dispatch(df, col, allowed_markets=("aFRR", "BEM"))
+
+
+def test_afrr_activation_rate_guard_canonical_uses_point_columns() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30"]
+    bt.afrr_quantile_prob = {"p30": 0.7}
+    bt.afrr_activation_rate_guard_policy = "canonical"
+    bt.afrr_activation_rate_guard_quantile = "canonical"
+    df, col = _one_hour_pred_df(
+        da=200.0,
+        cap_pos=200.0,
+        cap_neg=0.0,
+        act_pos=300.0,
+        act_neg=-50.0,
+        rate_pos=0.33,
+        rate_neg=0.22,
+    )
+    df = df.drop(
+        columns=[
+            f"{col.pred_afrr_activation_rate_pos}_p90",
+            f"{col.pred_afrr_activation_rate_neg}_p90",
+        ]
+    )
+    df[f"{col.pred_afrr_activation_rate_pos}_p30"] = 0.99
+    df[f"{col.pred_afrr_activation_rate_neg}_p30"] = 0.88
+
+    out = bt.optimize_dispatch(df, col, allowed_markets=("aFRR", "BEM"))
+
+    assert str(out["afrr_activation_rate_guard_policy"].iloc[0]) == "canonical"
+    assert str(out["afrr_activation_rate_guard_quantile_resolved"].iloc[0]) == "canonical"
+    assert str(out["afrr_activation_rate_guard_mode"].iloc[0]) == "canonical"
+    assert str(out["afrr_activation_rate_guard_source_column_pos"].iloc[0]) == col.pred_afrr_activation_rate_pos
+    assert str(out["afrr_activation_rate_guard_source_column_neg"].iloc[0]) == col.pred_afrr_activation_rate_neg
+    assert float(out["afrr_activation_rate_guard_fallback_used"].iloc[0]) == pytest.approx(0.0)
+    assert float(out["ev_pred_act_rate_pos_guard"].iloc[0]) == pytest.approx(0.33)
+    assert float(out["ev_pred_act_rate_neg_guard"].iloc[0]) == pytest.approx(0.22)
+
+
+def test_afrr_activation_rate_guard_auto_uses_canonical_when_p90_missing() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30"]
+    bt.afrr_quantile_prob = {"p30": 0.7}
+    bt.afrr_activation_rate_guard_policy = "auto"
+    bt.afrr_activation_rate_guard_quantile = "auto"
+    df, col = _one_hour_pred_df(
+        da=200.0,
+        cap_pos=200.0,
+        cap_neg=0.0,
+        act_pos=300.0,
+        act_neg=-50.0,
+        rate_pos=0.44,
+        rate_neg=0.11,
+    )
+    df = df.drop(
+        columns=[
+            f"{col.pred_afrr_activation_rate_pos}_p90",
+            f"{col.pred_afrr_activation_rate_neg}_p90",
+        ]
+    )
+    df[f"{col.pred_afrr_activation_rate_pos}_p30"] = 0.99
+    df[f"{col.pred_afrr_activation_rate_neg}_p30"] = 0.88
+
+    out = bt.optimize_dispatch(df, col, allowed_markets=("aFRR", "BEM"))
+
+    assert str(out["afrr_activation_rate_guard_policy"].iloc[0]) == "auto"
+    assert str(out["afrr_activation_rate_guard_quantile_resolved"].iloc[0]) == "canonical"
+    assert str(out["afrr_activation_rate_guard_mode"].iloc[0]) == "canonical"
+    assert float(out["afrr_activation_rate_guard_fallback_used"].iloc[0]) == pytest.approx(1.0)
+    assert "p90" in str(out["afrr_activation_rate_guard_missing_columns"].iloc[0])
+    assert float(out["ev_pred_act_rate_pos_guard"].iloc[0]) == pytest.approx(0.44)
+    assert float(out["ev_pred_act_rate_neg_guard"].iloc[0]) == pytest.approx(0.11)
+
+
 def test_afrr_activation_rate_guard_quantile_p70_does_not_require_p90() -> None:
     bt = _mk_backtester()
     bt.afrr_quantile_bins = ["p30"]
@@ -1102,6 +1199,38 @@ def test_da_only_does_not_require_afrr_activation_rate_guard_columns() -> None:
 
     assert float(out["reserve_pos_mw"].iloc[0]) == pytest.approx(0.0)
     assert float(out["bem_only_pos_mw"].iloc[0]) == pytest.approx(0.0)
+
+
+def test_perfect_foresight_materializes_missing_afrr_p30_ev_bin_columns_from_truth() -> None:
+    col = BacktestColumnMap()
+    df = pd.DataFrame(
+        {
+            col.timestamp: pd.date_range("2026-01-01T00:00:00Z", periods=2, freq="h"),
+            col.true_da_price: [10.0, 20.0],
+            col.true_afrr_capacity_price_pos: [1.0, 2.0],
+            col.true_afrr_capacity_price_neg: [3.0, 4.0],
+            col.true_afrr_activation_price_pos: [100.0, 110.0],
+            col.true_afrr_activation_price_neg: [-50.0, -55.0],
+            col.true_afrr_activation_rate_pos: [0.2, 0.3],
+            col.true_afrr_activation_rate_neg: [0.4, 0.5],
+        }
+    )
+
+    out = BatteryBacktester._materialize_perfect_foresight_quantile_columns(df, colmap=col)
+
+    for pred_col, true_col in (
+        (col.pred_da_price, col.true_da_price),
+        (col.pred_afrr_capacity_price_pos, col.true_afrr_capacity_price_pos),
+        (col.pred_afrr_capacity_price_neg, col.true_afrr_capacity_price_neg),
+        (col.pred_afrr_activation_price_pos, col.true_afrr_activation_price_pos),
+        (col.pred_afrr_activation_price_neg, col.true_afrr_activation_price_neg),
+        (col.pred_afrr_activation_rate_pos, col.true_afrr_activation_rate_pos),
+        (col.pred_afrr_activation_rate_neg, col.true_afrr_activation_rate_neg),
+    ):
+        p30_col = f"{pred_col}_p30"
+        assert p30_col in out.columns
+        assert out[pred_col].to_numpy(dtype=float).tolist() == pytest.approx(df[true_col].tolist())
+        assert out[p30_col].to_numpy(dtype=float).tolist() == pytest.approx(df[true_col].tolist())
 
 
 def test_bem_missing_requested_quantile_fails_explicitly() -> None:
@@ -2765,6 +2894,93 @@ def test_soc_mass_balance_audit_id_buy_grid_energy_visible_to_audit() -> None:
         bt._audit_backtest_results(realized=realized_bad, dispatch=dispatch, df_input=df_input, colmap=col)
 
 
+def test_id_recourse_buy_and_sell_apply_physical_soc_effect_and_reason() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_trading_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt._strategy_permissions = bt.resolve_strategy_permissions(
+        strategy_name="da",
+        allowed_markets=("DA",),
+        id_recourse_mode="common",
+    )
+
+    soc_buy, buy = bt._settle_one_hour(
+        soc=10.0,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=1.0,
+        id_discharge_mw=0.0,
+        id_recourse_reason_hint="none",
+    )
+    assert soc_buy == pytest.approx(10.95)
+    assert float(buy["id_buy_mwh"]) == pytest.approx(1.0)
+    assert float(buy["id_charge_internal_mwh"]) == pytest.approx(0.95)
+    assert str(buy["id_recourse_reason"]) == "protected_soc_recovery"
+
+    soc_sell, sell = bt._settle_one_hour(
+        soc=10.0,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=0.0,
+        id_discharge_mw=1.0,
+        id_recourse_reason_hint="none",
+    )
+    assert soc_sell == pytest.approx(10.0 - 1.0 / 0.95)
+    assert float(sell["id_sell_mwh"]) == pytest.approx(1.0)
+    assert float(sell["id_discharge_internal_mwh"]) == pytest.approx(1.0 / 0.95)
+    assert str(sell["id_recourse_reason"]) == "upper_soc_relief"
+
+
+def test_hard_terminal_economic_repair_does_not_pass_physical_shortfall() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard"
+    summary = {
+        "final_soc_shortfall_mwh": 0.19,
+        "final_soc_physical_check_pass": 0.0,
+        "terminal_soc_repair_cost_eur": 19.0,
+        "terminal_soc_net_adjustment_eur": -19.0,
+        "realized_pnl_excl_terminal_eur": 10.0,
+        "realized_total_pnl_eur": -9.0,
+    }
+    terminal_repair_included = bool(
+        abs(
+            float(summary["realized_total_pnl_eur"])
+            - (float(summary["realized_pnl_excl_terminal_eur"]) + float(summary["terminal_soc_net_adjustment_eur"]))
+        )
+        <= 1e-4
+    )
+    economic_repair_pass = bool(
+        (float(summary["final_soc_shortfall_mwh"]) <= 1e-6)
+        or (
+            str(bt.final_soc_mode) != "hard"
+            and float(summary["terminal_soc_repair_cost_eur"]) > 0.0
+            and terminal_repair_included
+        )
+    )
+    assert terminal_repair_included is True
+    assert economic_repair_pass is False
+
+
 def test_da_revenue_formula() -> None:
     bt = _mk_backtester()
     _, m = bt._settle_one_hour(
@@ -3413,6 +3629,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
         float(locked["da_lockbook_row_present"].iloc[0])
     )
     assert str(locked["da_originating_source_snapshot_utc"].iloc[0])
+    assert str(locked["da_originating_delivery_timestamp_utc"].iloc[0]) == ts0.isoformat()
     assert str(locked["da_originating_precommit_id"].iloc[0])
     assert float(locked["da_source_gate_valid"].iloc[0]) == pytest.approx(1.0)
     assert float(locked["source_snapshot_is_da_gate"].iloc[0]) == pytest.approx(1.0)
@@ -3476,7 +3693,11 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
             "da_locked_buy_mwh": [1.0],
             "da_locked_sell_mwh": [0.0],
             "da_originating_source_snapshot_utc": [source_ts.isoformat()],
+            "da_originating_delivery_timestamp_utc": [ts0.isoformat()],
             "da_originating_precommit_id": [f"{source_ts.isoformat()}->{ts0}"],
+            "da_precommit_final_selected_incumbent": ["optimized"],
+            "da_precommit_selection_reason": ["accepted_lockbook"],
+            "da_precommit_da_zero_reason": ["none"],
             "real_submitted_da_buy_mw": [0.0],
             "real_submitted_da_sell_mw": [0.0],
             "real_da_buy_accepted": [0.0],
@@ -7370,7 +7591,11 @@ def test_strict_final_soc_hard_constraint_or_repair() -> None:
     shortfall = float(s.get("final_soc_shortfall_mwh", 0.0))
     repair = float(s.get("terminal_soc_repair_cost_eur", 0.0))
     assert (shortfall <= 1e-6) or (repair > 0.0)
-    assert float(s.get("final_soc_check_pass", 0.0)) >= 0.5
+    if shortfall <= 1e-6:
+        assert float(s.get("final_soc_check_pass", 0.0)) >= 0.5
+    else:
+        assert float(s.get("final_soc_physical_check_pass", 1.0)) == 0.0
+        assert float(s.get("final_soc_check_pass", 1.0)) == 0.0
     assert "final_soc_actual_mwh" in s
     assert "final_soc_target_mwh" in s
     assert "final_soc_physical_check_pass" in s
@@ -7404,8 +7629,9 @@ def test_final_soc_shortfall_repaired_is_valid_if_pnl_reconciles() -> None:
     s = out.summary
     if float(s.get("final_soc_shortfall_mwh", 0.0)) > 1e-6 and float(s.get("terminal_soc_repair_cost_eur", 0.0)) > 1e-9:
         assert float(s.get("terminal_soc_repair_included_in_pnl", 0.0)) >= 0.5
-        assert float(s.get("final_soc_economic_repair_check_pass", 0.0)) >= 0.5
-        assert float(s.get("final_soc_check_pass", 0.0)) >= 0.5
+        assert float(s.get("final_soc_economic_repair_check_pass", 1.0)) == 0.0
+        assert float(s.get("final_soc_check_pass", 1.0)) == 0.0
+        assert float(s.get("simulation_valid", 1.0)) == 0.0
 
 
 def test_terminal_repair_mode_allows_physical_shortfall_if_repaired() -> None:
@@ -7794,6 +8020,13 @@ def test_da_postlock_diagnostics_survive_thesis_hourly_output_filter() -> None:
             "timestamp_utc": [pd.Timestamp("2026-01-02T01:00:00Z")],
             "real_soc_mwh": [10.0],
             "da_precommit_da_zero_reason": ["postlock_future_infeasible_no_trade_selected"],
+            "da_originating_precommit_id": ["2026-01-01T10:00:00+00:00->2026-01-02T01:00:00+00:00"],
+            "da_originating_source_snapshot_utc": ["2026-01-01T10:00:00+00:00"],
+            "da_originating_delivery_timestamp_utc": ["2026-01-02T01:00:00+00:00"],
+            "da_originating_candidate_group_id": ["2026-01-01T10:00:00+00:00->2026-01-02"],
+            "da_originating_schedule_reduced": [0.0],
+            "da_realized_without_precommit_origin_error": [0.0],
+            "da_realized_origin_complete": [1.0],
             **required,
             "ev_bcm_debug_should_drop": [123.0],
         }
@@ -7802,6 +8035,16 @@ def test_da_postlock_diagnostics_survive_thesis_hourly_output_filter() -> None:
     out = _select_hourly_output_columns(hourly, output_detail="thesis", timestamp_col="timestamp_utc")
 
     for col in required:
+        assert col in out.columns
+    for col in (
+        "da_originating_precommit_id",
+        "da_originating_source_snapshot_utc",
+        "da_originating_delivery_timestamp_utc",
+        "da_originating_candidate_group_id",
+        "da_originating_schedule_reduced",
+        "da_realized_without_precommit_origin_error",
+        "da_realized_origin_complete",
+    ):
         assert col in out.columns
     assert "da_precommit_da_zero_reason" in out.columns
     assert "ev_bcm_debug_should_drop" not in out.columns
@@ -7912,9 +8155,11 @@ def test_da_recovery_cost_realized_rows_with_final_precommit_origin_are_valid() 
             "da_locked_buy_mwh": [1.5],
             "da_locked_sell_mwh": [0.0],
             "da_originating_source_snapshot_utc": [str(source_snapshot)],
+            "da_originating_delivery_timestamp_utc": [ts.isoformat()],
             "da_originating_precommit_id": [f"{source_snapshot}->{ts}"],
             "da_precommit_final_selected_incumbent": ["optimized"],
             "da_precommit_selection_reason": ["accepted_lockbook"],
+            "da_precommit_da_zero_reason": ["none"],
             "real_submitted_da_buy_mw": [1.5],
             "real_submitted_da_sell_mw": [0.0],
             "real_submitted_da_buy_price_eur_mwh": [10.0],
@@ -7928,6 +8173,35 @@ def test_da_recovery_cost_realized_rows_with_final_precommit_origin_are_valid() 
     origin_counters = BatteryBacktester._compute_da_naming_semantics_counters(realized_with_origin)
     assert origin_counters["da_realized_without_precommit_origin_count"] == pytest.approx(0.0)
     assert origin_counters["da_naming_semantics_error_count"] == pytest.approx(0.0)
+
+
+def test_realized_da_origin_requires_delivery_timestamp() -> None:
+    ts = pd.Timestamp("2026-01-02T01:00:00Z")
+    source_snapshot = pd.Timestamp("2026-01-01T10:00:00Z")
+    missing_delivery = pd.DataFrame(
+        {
+            "da_lockbook_row_present": [1.0],
+            "da_bid_locked": [1.0],
+            "da_locked_buy_mwh": [1.0],
+            "da_locked_sell_mwh": [0.0],
+            "da_originating_source_snapshot_utc": [str(source_snapshot)],
+            "da_originating_precommit_id": [f"{source_snapshot}->{ts}"],
+            "da_precommit_final_selected_incumbent": ["optimized"],
+            "da_precommit_selection_reason": ["accepted_lockbook"],
+            "da_precommit_da_zero_reason": ["none"],
+            "real_submitted_da_buy_mw": [1.0],
+            "real_submitted_da_sell_mw": [0.0],
+            "real_submitted_da_buy_price_eur_mwh": [10.0],
+            "real_da_buy_accepted": [1.0],
+            "real_da_sell_accepted": [0.0],
+            "real_da_buy_mwh": [1.0],
+            "real_da_sell_mwh": [0.0],
+        }
+    )
+
+    counters = BatteryBacktester._compute_da_naming_semantics_counters(missing_delivery)
+    assert counters["da_realized_without_precommit_origin_count"] == pytest.approx(1.0)
+    assert counters["da_naming_semantics_error_count"] == pytest.approx(1.0)
 
 
 def test_da_postlock_recomputes_locked_candidate_pnl_against_no_trade() -> None:
@@ -8280,6 +8554,7 @@ def test_da_delivery_plan_executes_only_lockbook_quantities_with_origin() -> Non
     assert float(locked_row["da_is_locked_delivery_hour"]) == pytest.approx(1.0)
     assert float(locked_row["da_unlocked_trade_blocked"]) == pytest.approx(0.0)
     assert str(locked_row["da_originating_source_snapshot_utc"]) == str(source_snapshot)
+    assert str(locked_row["da_originating_delivery_timestamp_utc"]) == ts_locked.isoformat()
     assert str(locked_row["da_originating_precommit_id"]) == f"{source_snapshot}->{ts_locked}"
     assert str(locked_row["da_precommit_final_selected_incumbent"]) == "optimized"
     assert str(locked_row["da_precommit_selection_reason"]) == "accepted_lockbook"
@@ -8291,9 +8566,11 @@ def test_da_delivery_plan_executes_only_lockbook_quantities_with_origin() -> Non
             "da_locked_buy_mwh": [1.5],
             "da_locked_sell_mwh": [0.0],
             "da_originating_source_snapshot_utc": [str(source_snapshot)],
+            "da_originating_delivery_timestamp_utc": [ts_locked.isoformat()],
             "da_originating_precommit_id": [f"{source_snapshot}->{ts_locked}"],
             "da_precommit_final_selected_incumbent": ["optimized"],
             "da_precommit_selection_reason": ["accepted_lockbook"],
+            "da_precommit_da_zero_reason": ["none"],
             "real_submitted_da_buy_mw": [1.5],
             "real_submitted_da_sell_mw": [0.0],
             "real_submitted_da_buy_price_eur_mwh": [10.0],
@@ -8679,6 +8956,30 @@ def test_terminal_id_recovery_schedules_grid_buy_including_recovery_aux() -> Non
     assert float(diag["terminal_repair_projected_final_soc_after_repair_mwh"]) >= 10.0 - 1e-9
 
 
+def test_terminal_id_recovery_room_cap_allows_same_hour_aux_buffer_at_soc_max() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_max = 10.0
+    diag = bt._schedule_terminal_id_recovery(
+        projected_terminal_soc_without_new_id_mwh=9.5,
+        current_soc_mwh=9.5,
+        terminal_soc_target_mwh=10.0,
+        residual_charge_mw=2.0,
+        terminal_soc_safety_margin_mwh=0.0,
+        terminal_repair_known_future_aux_mwh=0.0,
+        terminal_repair_recovery_aux_mwh=0.095,
+    )
+
+    expected_internal = 10.0 - 9.5 + 0.095
+    assert float(diag["terminal_repair_required_internal_mwh"]) == pytest.approx(expected_internal)
+    assert float(diag["terminal_soc_id_recourse_scheduled_internal_mwh"]) == pytest.approx(expected_internal)
+    assert float(diag["terminal_recovery_recovery_hour_aux_mwh"]) == pytest.approx(0.095)
+    assert float(diag["terminal_recovery_physical_target_met"]) == pytest.approx(1.0)
+    assert float(diag["terminal_recovery_physical_shortfall_after_recovery_mwh"]) == pytest.approx(0.0)
+    assert float(diag["terminal_repair_projected_final_soc_after_repair_mwh"]) >= 10.0 - 1e-9
+
+
 def test_terminal_id_recovery_schedules_grid_buy_without_aux() -> None:
     bt = _mk_backtester()
     bt.eta_in = 0.95
@@ -8725,6 +9026,221 @@ def test_terminal_id_recovery_projection_updates_between_calls() -> None:
     assert first["projected_terminal_soc_without_new_id_mwh"] == pytest.approx(9.8)
     assert second["projected_terminal_soc_without_new_id_mwh"] == pytest.approx(9.95)
     assert second["terminal_soc_id_recourse_needed_internal_mwh"] < first["terminal_soc_id_recourse_needed_internal_mwh"]
+
+
+def test_terminal_recovery_existing_scheduled_internal_prevents_duplicate() -> None:
+    diag = BatteryBacktester._terminal_recovery_remaining_shortfall_after_existing(
+        projected_terminal_soc_without_new_recovery_mwh=9.0,
+        existing_scheduled_terminal_recovery_internal_mwh=1.0,
+        known_future_aux_mwh=0.0,
+        terminal_soc_target_mwh=10.0,
+        safety_buffer_mwh=0.0,
+    )
+
+    assert diag["terminal_recovery_projected_final_soc_before_existing_recovery_mwh"] == pytest.approx(9.0)
+    assert diag["terminal_recovery_existing_scheduled_internal_mwh"] == pytest.approx(1.0)
+    assert diag["terminal_recovery_projected_final_soc_after_existing_recovery_mwh"] == pytest.approx(10.0)
+    assert diag["terminal_recovery_remaining_shortfall_internal_mwh"] == pytest.approx(0.0)
+
+
+def test_terminal_recovery_existing_scheduled_internal_schedules_only_delta() -> None:
+    diag = BatteryBacktester._terminal_recovery_remaining_shortfall_after_existing(
+        projected_terminal_soc_without_new_recovery_mwh=9.0,
+        existing_scheduled_terminal_recovery_internal_mwh=1.0,
+        known_future_aux_mwh=0.2,
+        terminal_soc_target_mwh=10.0,
+        safety_buffer_mwh=0.0,
+    )
+
+    assert diag["terminal_recovery_projected_final_soc_after_existing_recovery_mwh"] == pytest.approx(9.8)
+    assert diag["terminal_recovery_remaining_shortfall_internal_mwh"] == pytest.approx(0.2)
+
+
+def test_protected_soc_recovery_is_sized_net_positive_after_aux() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_peak_mw = 0.095
+    bt.aux_trading_mw = 0.095
+    bt.aux_standby_mw = 0.0
+    bt.reserve_headroom_safety_mwh = 0.0
+    soc_next = bt.soc_min - 0.01
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=soc_next,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    assert reason == "protected_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert float(diag["protected_recovery_aux_mwh"]) == pytest.approx(0.095)
+    assert float(diag["protected_recovery_required_internal_mwh"]) == pytest.approx(0.105)
+    assert float(diag["protected_recovery_net_internal_mwh"]) == pytest.approx(0.01)
+    assert float(diag["protected_recovery_suppressed_zero_net_effect"]) == pytest.approx(0.0)
+    assert id_charge * bt.dt_h * bt.eta_in - float(diag["protected_recovery_aux_mwh"]) > 0.0
+
+
+def test_terminal_recovery_sizes_to_target_after_same_hour_aux() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_peak_mw = 0.095
+    bt.aux_trading_mw = 0.095
+    bt.aux_standby_mw = 0.0
+    bt.p_max_mw = 10.0
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=2.155,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=2.155,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    expected_internal = 10.0 - 2.155 + 0.095
+    assert reason == "terminal_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(0.095)
+    assert float(diag["terminal_soc_id_recourse_needed_internal_mwh"]) == pytest.approx(expected_internal)
+    assert id_charge * bt.dt_h * bt.eta_in == pytest.approx(expected_internal)
+    assert float(diag["terminal_repair_projected_final_soc_after_repair_mwh"]) >= 10.0 - 1e-9
+    assert float(diag["terminal_soc_recovery_post_aux_shortfall_mwh"]) == pytest.approx(0.0)
+
+
+def test_da_origin_summary_counter_uses_canonical_origin_fields() -> None:
+    ts = pd.Timestamp("2026-01-02T01:00:00Z")
+    source_snapshot = pd.Timestamp("2026-01-01T10:00:00Z")
+    hourly = pd.DataFrame(
+        {
+            "da_lockbook_row_present": [1.0],
+            "da_bid_locked": [1.0],
+            "da_locked_buy_mwh": [1.0],
+            "da_locked_sell_mwh": [0.0],
+            "da_originating_source_snapshot_utc": [source_snapshot.isoformat()],
+            "da_originating_delivery_timestamp_utc": [ts.isoformat()],
+            "da_originating_precommit_id": [f"{source_snapshot.isoformat()}->{ts.isoformat()}"],
+            "da_precommit_final_selected_incumbent": ["optimized"],
+            "da_precommit_selection_reason": ["accepted_lockbook"],
+            "da_precommit_da_zero_reason": ["none"],
+            "real_submitted_da_buy_mw": [1.0],
+            "real_submitted_da_sell_mw": [0.0],
+            "real_submitted_da_buy_price_eur_mwh": [10.0],
+            "real_da_buy_accepted": [1.0],
+            "real_da_sell_accepted": [0.0],
+            "real_da_buy_mwh": [1.0],
+            "real_da_sell_mwh": [0.0],
+            # Stale exported flag from an older merge must not be trusted over canonical fields.
+            "da_realized_without_precommit_origin_error": [1.0],
+        }
+    )
+
+    counters = BatteryBacktester._compute_da_naming_semantics_counters(hourly)
+    summary_error_count = float(counters["da_realized_without_precommit_origin_count"])
+    assert summary_error_count == pytest.approx(0.0)
+
+
+def test_realized_da_origin_diagnostics_recompute_stale_error_from_canonical_fields() -> None:
+    ts = pd.Timestamp("2026-01-02T01:00:00Z")
+    source_snapshot = pd.Timestamp("2026-01-01T10:00:00Z")
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [ts],
+            "da_originating_precommit_id": [f"{source_snapshot.isoformat()}->{ts.isoformat()}"],
+            "da_originating_source_snapshot_utc": [source_snapshot.isoformat()],
+            "da_originating_delivery_timestamp_utc": [ts.isoformat()],
+            "da_precommit_final_selected_incumbent": ["optimized"],
+            "da_precommit_selection_reason": ["accepted_lockbook"],
+            "real_da_buy_mwh": [1.0],
+            "real_da_sell_mwh": [0.0],
+            # This stale intermediate value must be overwritten from final canonical metadata.
+            "da_realized_without_precommit_origin_error": [1.0],
+            "da_realized_without_precommit_origin_missing_columns": ["da_originating_precommit_id"],
+        }
+    )
+
+    out = BatteryBacktester._attach_da_realized_origin_diagnostics(hourly, timestamp_col="timestamp_utc")
+
+    assert float(out["da_realized_without_precommit_origin_error"].iloc[0]) == pytest.approx(0.0)
+    assert float(out["da_realized_origin_complete"].iloc[0]) == pytest.approx(1.0)
+    assert str(out["da_realized_without_precommit_origin_missing_columns"].iloc[0]) == ""
+    assert str(out["first_da_realized_without_precommit_origin_timestamp_utc"].iloc[0]) == ""
+
+
+def test_realized_da_origin_diagnostics_reports_missing_canonical_columns() -> None:
+    ts = pd.Timestamp("2026-01-02T01:00:00Z")
+    source_snapshot = pd.Timestamp("2026-01-01T10:00:00Z")
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [ts],
+            "da_originating_precommit_id": [""],
+            "da_originating_source_snapshot_utc": [source_snapshot.isoformat()],
+            "da_originating_delivery_timestamp_utc": [ts.isoformat()],
+            "da_precommit_final_selected_incumbent": ["optimized"],
+            "da_precommit_selection_reason": ["accepted_lockbook"],
+            "real_da_buy_mwh": [1.0],
+            "real_da_sell_mwh": [0.0],
+        }
+    )
+
+    out = BatteryBacktester._attach_da_realized_origin_diagnostics(hourly, timestamp_col="timestamp_utc")
+
+    assert float(out["da_realized_without_precommit_origin_error"].iloc[0]) == pytest.approx(1.0)
+    assert float(out["da_realized_origin_complete"].iloc[0]) == pytest.approx(0.0)
+    assert "da_originating_precommit_id" in str(
+        out["da_realized_without_precommit_origin_missing_columns"].iloc[0]
+    )
+    assert str(out["first_da_realized_without_precommit_origin_timestamp_utc"].iloc[0]) == ts.isoformat()
+
+
+def test_realized_da_origin_diagnostics_ignores_zero_volume_no_trade_row() -> None:
+    ts = pd.Timestamp("2026-01-02T01:00:00Z")
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [ts],
+            "real_da_buy_mwh": [0.0],
+            "real_da_sell_mwh": [0.0],
+        }
+    )
+
+    out = BatteryBacktester._attach_da_realized_origin_diagnostics(hourly, timestamp_col="timestamp_utc")
+
+    assert float(out["da_realized_without_precommit_origin_error"].iloc[0]) == pytest.approx(0.0)
+    assert float(out["da_realized_origin_complete"].iloc[0]) == pytest.approx(0.0)
+    assert str(out["da_realized_without_precommit_origin_missing_columns"].iloc[0]) == ""
+    assert str(out["first_da_realized_without_precommit_origin_timestamp_utc"].iloc[0]) == ""
+
+
+def test_upper_soc_relief_is_blocked_when_it_would_undo_hard_terminal_target() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=17.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=10.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=10.0,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    assert id_charge == pytest.approx(0.0)
+    assert id_discharge == pytest.approx(0.0)
+    assert reason == "none"
+    assert float(diag["upper_soc_relief_terminal_shortfall_prevented"]) == pytest.approx(1.0)
+    assert float(diag["upper_soc_relief_caused_terminal_shortfall"]) == pytest.approx(0.0)
 
 
 def test_bcm_only_common_technical_id_passes_strategy_isolation() -> None:
