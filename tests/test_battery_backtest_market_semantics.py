@@ -43,6 +43,7 @@ from scripts.run_battery_backtest import (  # noqa: E402
     _build_optimization_infeasibility_attribution,
     _prepare_scenario_output_dir,
     _resolve_final_soc_policy,
+    _select_hourly_output_columns,
     _suspected_infeasibility_driver_from_row,
     _target_value_modes_from_manifest,
     optional_numeric_series,
@@ -7655,6 +7656,7 @@ def test_da_postlock_future_guard_rejects_future_infeasible_candidate_and_accept
             "da_accepted_sell_mw": 10.0,
             "candidate_selection_pnl_eur": 100.0,
             "incumbent_selection_pnl_eur": 0.0,
+            "selected_incumbent": "optimized",
         }
     ]
 
@@ -7671,12 +7673,23 @@ def test_da_postlock_future_guard_rejects_future_infeasible_candidate_and_accept
     )
 
     assert selected[ts1] == pytest.approx((0.0, 0.0))
-    assert float(audit[0]["da_postlock_future_feasible"]) == pytest.approx(1.0)
+    assert float(audit[0]["da_postlock_future_feasible"]) == pytest.approx(0.0)
+    assert float(audit[0]["da_postlock_candidate_future_feasible"]) == pytest.approx(0.0)
+    assert float(audit[0]["da_postlock_no_trade_future_feasible"]) == pytest.approx(1.0)
+    assert float(audit[0]["da_postlock_final_selected_future_feasible"]) == pytest.approx(1.0)
     assert str(audit[0]["da_postlock_selected_after_future_check"]) == "no_trade"
+    assert str(audit[0]["da_postlock_final_selected_after_future_check"]) == "no_trade"
     assert float(audit[0]["da_postlock_rejected_due_to_future_infeasibility"]) == pytest.approx(1.0)
-    assert str(audit[0]["da_postlock_infeasibility_driver"]) == "locked_da_commitment_infeasible"
+    assert str(audit[0]["da_postlock_infeasibility_driver"]) == "locked_da_hourly_soc_min_infeasible"
+    assert str(audit[0]["da_postlock_infeasibility_driver_detail"]) == "locked_da_hourly_soc_min_infeasible"
     assert str(audit[0]["da_postlock_first_infeasible_timestamp_utc"]) == str(ts1)
     assert float(audit[0]["da_postlock_candidate_locked_sell_mwh"]) == pytest.approx(10.0 * bt.dt_h)
+    assert float(audit[0]["da_postlock_candidate_locked_sell_mwh_t"]) == pytest.approx(10.0 * bt.dt_h)
+    assert float(audit[0]["da_postlock_candidate_total_locked_sell_mwh"]) == pytest.approx(10.0 * bt.dt_h)
+    assert float(audit[0]["da_postlock_failed_locked_sell_mwh_t"]) == pytest.approx(10.0 * bt.dt_h)
+    assert str(audit[0]["da_postlock_failed_reason_detail"]) == "locked_da_hourly_soc_min_infeasible"
+    assert str(audit[0]["pre_postlock_selected_incumbent"]) == "optimized"
+    assert str(audit[0]["final_selected_incumbent"]) == "no_trade"
 
     selected_ok, audit_ok = bt._apply_da_postlock_future_guard(
         selected_da={ts0: (1.0, 0.0)},
@@ -7692,8 +7705,229 @@ def test_da_postlock_future_guard_rejects_future_infeasible_candidate_and_accept
 
     assert selected_ok[ts0] == pytest.approx((1.0, 0.0))
     assert float(audit_ok[0]["da_postlock_future_feasible"]) == pytest.approx(1.0)
+    assert float(audit_ok[0]["da_postlock_candidate_future_feasible"]) == pytest.approx(1.0)
     assert str(audit_ok[0]["da_postlock_selected_after_future_check"]) == "candidate"
     assert float(audit_ok[0]["da_postlock_rejected_due_to_future_infeasibility"]) == pytest.approx(0.0)
+
+
+def test_da_postlock_uses_hourly_commitments_not_schedule_totals_for_feasibility() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.date_range("2026-01-02T00:00:00Z", periods=3, freq="h")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0],
+        }
+    )
+    selected_da = {pd.Timestamp(t): (0.0, 4.0) for t in ts}
+    audit_rows = [
+        {
+            "timestamp_utc": str(pd.Timestamp(t)),
+            "da_candidate_buy_mw": 0.0,
+            "da_candidate_sell_mw": 4.0,
+            "candidate_selection_pnl_eur": 100.0,
+            "incumbent_selection_pnl_eur": 0.0,
+        }
+        for t in ts
+    ]
+
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da=selected_da,
+        da_audit_rows=audit_rows,
+        future_rows=future_rows,
+        colmap=col,
+        current_soc_mwh=18.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert all(pair == pytest.approx((0.0, 4.0)) for pair in selected.values())
+    assert all(float(r["da_postlock_candidate_future_feasible"]) == pytest.approx(1.0) for r in audit)
+    assert all(str(r["da_postlock_selected_after_future_check"]) == "candidate" for r in audit)
+    assert all(float(r["da_postlock_candidate_locked_sell_mwh_t"]) == pytest.approx(4.0 * bt.dt_h) for r in audit)
+    assert all(float(r["da_postlock_candidate_total_locked_sell_mwh"]) == pytest.approx(12.0 * bt.dt_h) for r in audit)
+    assert all(float(r["da_postlock_candidate_total_locked_sell_mwh"]) > bt.p_max_mw for r in audit)
+
+
+def test_da_postlock_diagnostics_survive_thesis_hourly_output_filter() -> None:
+    required = {
+        "da_postlock_candidate_future_feasible": [0.0],
+        "da_postlock_no_trade_future_feasible": [1.0],
+        "da_postlock_final_selected_future_feasible": [1.0],
+        "da_postlock_final_selected_after_future_check": ["no_trade"],
+        "da_postlock_rejected_due_to_future_infeasibility": [1.0],
+        "da_postlock_infeasibility_driver": ["locked_da_hourly_soc_min_infeasible"],
+        "da_postlock_infeasibility_driver_detail": ["locked_da_hourly_soc_min_infeasible"],
+        "da_postlock_guard_mode": ["recoverability_aware"],
+        "da_postlock_hard_projection_until": ["next_recovery_opportunity"],
+        "da_postlock_hard_local_candidate_feasible": [0.0],
+        "da_postlock_terminal_shortfall_recoverable": [0.0],
+        "da_postlock_terminal_shortfall_unrecoverable": [0.0],
+        "da_postlock_failed_reason_detail": ["locked_da_hourly_soc_min_infeasible"],
+        "da_postlock_failed_timestamp_utc": ["2026-01-02 01:00:00+00:00"],
+        "da_postlock_failed_candidate_buy_mw": [0.0],
+        "da_postlock_failed_candidate_sell_mw": [10.0],
+        "da_postlock_failed_locked_buy_mwh_t": [0.0],
+        "da_postlock_failed_locked_sell_mwh_t": [10.0],
+        "da_postlock_failed_total_locked_buy_mwh": [0.0],
+        "da_postlock_failed_total_locked_sell_mwh": [10.0],
+        "da_postlock_failed_soc_before_mwh": [2.2],
+        "da_postlock_failed_soc_after_mwh": [1.1],
+        "da_postlock_failed_soc_min_mwh": [2.0],
+        "da_postlock_failed_soc_max_mwh": [18.0],
+        "da_postlock_failed_power_stack_mw": [10.0],
+        "da_postlock_failed_power_limit_mw": [10.0],
+        "da_precommit_pre_postlock_selected_incumbent": ["optimized"],
+        "da_precommit_final_selected_incumbent": ["no_trade"],
+        "da_precommit_da_postlock_candidate_future_feasible": [0.0],
+        "da_precommit_da_postlock_no_trade_future_feasible": [1.0],
+        "da_precommit_da_postlock_final_selected_future_feasible": [1.0],
+        "da_precommit_da_postlock_infeasibility_driver_detail": ["locked_da_hourly_soc_min_infeasible"],
+        "da_precommit_da_postlock_failed_reason_detail": ["locked_da_hourly_soc_min_infeasible"],
+    }
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2026-01-02T01:00:00Z")],
+            "real_soc_mwh": [10.0],
+            "da_precommit_da_zero_reason": ["postlock_future_infeasible_no_trade_selected"],
+            **required,
+            "ev_bcm_debug_should_drop": [123.0],
+        }
+    )
+
+    out = _select_hourly_output_columns(hourly, output_detail="thesis", timestamp_col="timestamp_utc")
+
+    for col in required:
+        assert col in out.columns
+    assert "da_precommit_da_zero_reason" in out.columns
+    assert "ev_bcm_debug_should_drop" not in out.columns
+
+
+def test_da_postlock_missing_rejection_diagnostics_are_counted_for_strict_validity() -> None:
+    bad = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2026-01-02T01:00:00Z")],
+            "da_precommit_da_zero_reason": ["postlock_future_infeasible_no_trade_selected"],
+            "da_postlock_infeasibility_driver": ["locked_da_hourly_soc_min_infeasible"],
+        }
+    )
+    bad_audit = BatteryBacktester._audit_da_postlock_rejection_diagnostics(
+        bad,
+        timestamp_col="timestamp_utc",
+    )
+    assert float(bad_audit["da_postlock_rejection_count"]) == pytest.approx(1.0)
+    assert float(bad_audit["missing_da_postlock_rejection_diagnostics_count"]) == pytest.approx(1.0)
+    missing_cols = set(json.loads(str(bad_audit["missing_da_postlock_rejection_diagnostics_columns"])))
+    assert "da_postlock_candidate_future_feasible" in missing_cols
+    assert "da_postlock_failed_reason_detail" in missing_cols
+    assert (
+        str(bad_audit["first_missing_da_postlock_rejection_diagnostics_timestamp_utc"])
+        == "2026-01-02T01:00:00+00:00"
+    )
+
+    good = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2026-01-02T01:00:00Z")],
+            "da_precommit_da_zero_reason": ["postlock_future_infeasible_no_trade_selected"],
+            "da_postlock_candidate_future_feasible": [0.0],
+            "da_postlock_no_trade_future_feasible": [1.0],
+            "da_postlock_final_selected_future_feasible": [1.0],
+            "da_postlock_final_selected_after_future_check": ["no_trade"],
+            "da_postlock_infeasibility_driver": ["locked_da_hourly_soc_min_infeasible"],
+            "da_postlock_failed_reason_detail": ["locked_da_hourly_soc_min_infeasible"],
+            "da_postlock_failed_timestamp_utc": ["2026-01-02 01:00:00+00:00"],
+            "da_postlock_failed_locked_buy_mwh_t": [0.0],
+            "da_postlock_failed_locked_sell_mwh_t": [10.0],
+            "da_postlock_failed_soc_before_mwh": [2.2],
+            "da_postlock_failed_soc_after_mwh": [1.1],
+            "da_postlock_failed_soc_min_mwh": [2.0],
+            "da_postlock_failed_soc_max_mwh": [18.0],
+        }
+    )
+    good_audit = BatteryBacktester._audit_da_postlock_rejection_diagnostics(
+        good,
+        timestamp_col="timestamp_utc",
+    )
+    assert float(good_audit["missing_da_postlock_rejection_diagnostics_count"]) == pytest.approx(0.0)
+    assert json.loads(str(good_audit["missing_da_postlock_rejection_diagnostics_columns"])) == []
+
+
+def test_da_recovery_cost_postlock_rejected_group_broadcasts_failure_diagnostics() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-02T00:00:00Z")
+    ts1 = pd.Timestamp("2026-01-02T01:00:00Z")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+        }
+    )
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da={ts0: (0.0, 0.0), ts1: (0.0, 10.0)},
+        da_audit_rows=[
+            {"timestamp_utc": str(ts0), "da_candidate_buy_mw": 0.0, "da_candidate_sell_mw": 0.0},
+            {"timestamp_utc": str(ts1), "da_candidate_buy_mw": 0.0, "da_candidate_sell_mw": 10.0},
+        ],
+        future_rows=future_rows,
+        colmap=col,
+        current_soc_mwh=bt.soc_min + 0.2,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert all(pair == pytest.approx((0.0, 0.0)) for pair in selected.values())
+    assert {str(r["da_postlock_failed_timestamp_utc"]) for r in audit} == {str(ts1)}
+    assert all(str(r["da_postlock_failed_reason_detail"]) == "locked_da_hourly_soc_min_infeasible" for r in audit)
+    assert all(np.isfinite(float(r["da_postlock_failed_soc_before_mwh"])) for r in audit)
+    assert all(np.isfinite(float(r["da_postlock_failed_soc_after_mwh"])) for r in audit)
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp(r["timestamp_utc"]) for r in audit],
+            "da_precommit_da_zero_reason": [r["da_zero_reason"] for r in audit],
+            **{k: [r.get(k) for r in audit] for k in audit[0] if str(k).startswith("da_postlock_")},
+        }
+    )
+    postlock_audit = BatteryBacktester._audit_da_postlock_rejection_diagnostics(
+        hourly,
+        timestamp_col="timestamp_utc",
+    )
+    assert float(postlock_audit["missing_da_postlock_rejection_diagnostics_count"]) == pytest.approx(0.0)
+
+
+def test_da_recovery_cost_realized_rows_with_final_precommit_origin_are_valid() -> None:
+    ts = pd.Timestamp("2026-01-02T01:00:00Z")
+    source_snapshot = pd.Timestamp("2026-01-01T10:00:00Z")
+    realized_with_origin = pd.DataFrame(
+        {
+            "da_lockbook_row_present": [1.0],
+            "da_bid_locked": [1.0],
+            "da_locked_buy_mwh": [1.5],
+            "da_locked_sell_mwh": [0.0],
+            "da_originating_source_snapshot_utc": [str(source_snapshot)],
+            "da_originating_precommit_id": [f"{source_snapshot}->{ts}"],
+            "da_precommit_final_selected_incumbent": ["optimized"],
+            "da_precommit_selection_reason": ["accepted_lockbook"],
+            "real_submitted_da_buy_mw": [1.5],
+            "real_submitted_da_sell_mw": [0.0],
+            "real_submitted_da_buy_price_eur_mwh": [10.0],
+            "real_da_buy_accepted": [1.0],
+            "real_da_sell_accepted": [0.0],
+            "real_da_buy_mwh": [1.5],
+            "real_da_sell_mwh": [0.0],
+        }
+    )
+
+    origin_counters = BatteryBacktester._compute_da_naming_semantics_counters(realized_with_origin)
+    assert origin_counters["da_realized_without_precommit_origin_count"] == pytest.approx(0.0)
+    assert origin_counters["da_naming_semantics_error_count"] == pytest.approx(0.0)
 
 
 def test_da_postlock_recomputes_locked_candidate_pnl_against_no_trade() -> None:
@@ -7792,6 +8026,218 @@ def test_da_postlock_future_sell_can_use_soc_from_earlier_candidate_buy() -> Non
     assert str(sell_row["sell_disabled_reason"]) == "none"
 
 
+def test_da_postlock_terminal_shortfall_recoverable_candidate_survives() -> None:
+    bt = _mk_backtester()
+    bt.da_postlock_guard_mode = "recoverability_aware"
+    col = BacktestColumnMap()
+    ts = pd.date_range("2026-01-02T00:00:00Z", periods=3, freq="h")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [50.0, 50.0, 50.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0],
+        }
+    )
+
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da={pd.Timestamp(ts[0]): (0.0, 5.0)},
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(pd.Timestamp(ts[0])),
+                "da_candidate_buy_mw": 0.0,
+                "da_candidate_sell_mw": 5.0,
+            }
+        ],
+        future_rows=future_rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=pd.Timestamp(ts[-1]),
+    )
+
+    assert selected[pd.Timestamp(ts[0])] == pytest.approx((0.0, 5.0))
+    assert str(audit[0]["da_postlock_selected_after_future_check"]) == "candidate"
+    assert float(audit[0]["da_postlock_candidate_future_feasible"]) == pytest.approx(1.0)
+    assert float(audit[0]["da_postlock_terminal_shortfall_recoverable"]) == pytest.approx(1.0)
+    assert float(audit[0]["da_postlock_terminal_shortfall_unrecoverable"]) == pytest.approx(0.0)
+    assert str(audit[0]["da_postlock_infeasibility_driver_detail"]) == "locked_da_terminal_shortfall_recoverable"
+    assert str(audit[0]["da_postlock_next_recovery_opportunity_type"]) == "technical_id_recourse"
+    assert str(audit[0]["da_postlock_hard_projection_end_utc"]) == str(pd.Timestamp(ts[0]))
+    assert float(audit[0]["da_postlock_hard_projection_reached_next_recovery"]) == pytest.approx(1.0)
+
+
+def test_da_postlock_hard_projection_stops_at_next_recovery_opportunity() -> None:
+    bt = _mk_backtester()
+    bt.da_postlock_guard_mode = "recoverability_aware"
+    bt.aux_standby_mw = 0.5
+    col = BacktestColumnMap()
+    ts = pd.date_range("2026-01-02T00:00:00Z", periods=4, freq="h")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [50.0, 50.0, 50.0, 50.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0, 0.0],
+        }
+    )
+
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da={pd.Timestamp(ts[0]): (0.0, 0.1)},
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(pd.Timestamp(ts[0])),
+                "da_candidate_buy_mw": 0.0,
+                "da_candidate_sell_mw": 0.1,
+            }
+        ],
+        future_rows=future_rows,
+        colmap=col,
+        current_soc_mwh=bt.soc_min + 0.25,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert selected[pd.Timestamp(ts[0])] == pytest.approx((0.0, 0.1))
+    assert float(audit[0]["da_postlock_candidate_future_feasible"]) == pytest.approx(1.0)
+    assert str(audit[0]["da_postlock_infeasibility_driver"]) == "none"
+    assert str(audit[0]["da_postlock_hard_projection_end_utc"]) == str(pd.Timestamp(ts[0]))
+    assert str(audit[0]["da_postlock_next_recovery_opportunity_utc"]) == str(pd.Timestamp(ts[1]))
+
+
+def test_da_postlock_terminal_shortfall_unrecoverable_rejected() -> None:
+    bt = _mk_backtester()
+    bt.da_postlock_guard_mode = "recoverability_aware"
+    bt.p_max_mw = 2.0
+    bt.soc_target_end = 18.0
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-02T00:00:00Z")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            col.pred_da_price: [50.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da={ts: (0.0, 1.5)},
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(ts),
+                "da_candidate_buy_mw": 0.0,
+                "da_candidate_sell_mw": 1.5,
+            }
+        ],
+        future_rows=future_rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=ts,
+    )
+
+    assert selected[ts] == pytest.approx((0.0, 0.0))
+    assert float(audit[0]["da_postlock_candidate_future_feasible"]) == pytest.approx(0.0)
+    assert float(audit[0]["da_postlock_terminal_shortfall_unrecoverable"]) == pytest.approx(1.0)
+    assert str(audit[0]["da_postlock_infeasibility_driver"]) == "locked_da_terminal_shortfall_unrecoverable"
+    assert str(audit[0]["da_postlock_selected_after_future_check"]) == "rejected"
+
+
+def test_da_postlock_terminal_recovery_cost_can_select_no_trade() -> None:
+    bt = _mk_backtester()
+    bt.da_postlock_guard_mode = "recoverability_aware"
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-02T00:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "target_time_utc": [ts],
+            "snapshot_time_utc": [pd.Timestamp("2026-01-01T10:00:00Z")],
+            "soc_start_lp_mwh": [10.0],
+            col.pred_da_price: [1_000.0],
+            col.pred_afrr_capacity_price_pos: [0.0],
+            col.pred_afrr_capacity_price_neg: [0.0],
+            col.pred_afrr_activation_price_pos: [0.0],
+            col.pred_afrr_activation_price_neg: [0.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da={ts: (0.0, 5.0)},
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(ts),
+                "da_candidate_buy_mw": 0.0,
+                "da_candidate_sell_mw": 5.0,
+            }
+        ],
+        lock_rows=rows,
+        future_rows=rows[[col.timestamp, col.pred_da_price, col.pred_afrr_activation_rate_pos, col.pred_afrr_activation_rate_neg]],
+        colmap=col,
+        current_soc_mwh=10.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=ts,
+    )
+
+    assert selected[ts] == pytest.approx((0.0, 0.0))
+    assert str(audit[0]["da_postlock_selected_after_future_check"]) == "no_trade_after_terminal_recovery_cost"
+    assert str(audit[0]["candidate_rejection_reason"]) == "locked_da_terminal_recovery_cost_negative_pnl"
+    assert float(audit[0]["da_postlock_terminal_shortfall_recoverable"]) == pytest.approx(1.0)
+    assert float(audit[0]["candidate_pnl_after_recovery_cost_eur"]) < float(audit[0]["no_trade_pnl"])
+    assert str(audit[0]["final_selected_incumbent"]) == "no_trade"
+    assert float(audit[0]["locked_sell_mwh_by_hour"]) == pytest.approx(0.0)
+    assert float(audit[0]["da_postlock_final_selected_pnl_eur"]) == pytest.approx(float(audit[0]["no_trade_pnl"]))
+
+
+def test_da_postlock_strict_no_future_action_keeps_legacy_terminal_rejection() -> None:
+    bt = _mk_backtester()
+    bt.da_postlock_guard_mode = "strict_no_future_action"
+    col = BacktestColumnMap()
+    ts = pd.date_range("2026-01-02T00:00:00Z", periods=3, freq="h")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [50.0, 50.0, 50.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0],
+        }
+    )
+
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da={pd.Timestamp(ts[0]): (0.0, 5.0)},
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(pd.Timestamp(ts[0])),
+                "da_candidate_buy_mw": 0.0,
+                "da_candidate_sell_mw": 5.0,
+            }
+        ],
+        future_rows=future_rows,
+        colmap=col,
+        current_soc_mwh=12.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=pd.Timestamp(ts[-1]),
+    )
+
+    assert selected[pd.Timestamp(ts[0])] == pytest.approx((0.0, 0.0))
+    assert str(audit[0]["da_postlock_guard_mode"]) == "strict_no_future_action"
+    assert str(audit[0]["da_postlock_selected_after_future_check"]) == "no_trade"
+    assert str(audit[0]["da_postlock_infeasibility_driver"]) == "locked_da_terminal_shortfall_unrecoverable"
+
+
 def test_da_delivery_plan_executes_only_lockbook_quantities_with_origin() -> None:
     bt = _mk_backtester()
     bt.bid_builder.da_buy_limit_quantile = "p50"
@@ -7835,6 +8281,31 @@ def test_da_delivery_plan_executes_only_lockbook_quantities_with_origin() -> Non
     assert float(locked_row["da_unlocked_trade_blocked"]) == pytest.approx(0.0)
     assert str(locked_row["da_originating_source_snapshot_utc"]) == str(source_snapshot)
     assert str(locked_row["da_originating_precommit_id"]) == f"{source_snapshot}->{ts_locked}"
+    assert str(locked_row["da_precommit_final_selected_incumbent"]) == "optimized"
+    assert str(locked_row["da_precommit_selection_reason"]) == "accepted_lockbook"
+
+    realized_with_origin = pd.DataFrame(
+        {
+            "da_lockbook_row_present": [1.0],
+            "da_bid_locked": [1.0],
+            "da_locked_buy_mwh": [1.5],
+            "da_locked_sell_mwh": [0.0],
+            "da_originating_source_snapshot_utc": [str(source_snapshot)],
+            "da_originating_precommit_id": [f"{source_snapshot}->{ts_locked}"],
+            "da_precommit_final_selected_incumbent": ["optimized"],
+            "da_precommit_selection_reason": ["accepted_lockbook"],
+            "real_submitted_da_buy_mw": [1.5],
+            "real_submitted_da_sell_mw": [0.0],
+            "real_submitted_da_buy_price_eur_mwh": [10.0],
+            "real_da_buy_accepted": [1.0],
+            "real_da_sell_accepted": [0.0],
+            "real_da_buy_mwh": [1.5],
+            "real_da_sell_mwh": [0.0],
+        }
+    )
+    origin_counters = BatteryBacktester._compute_da_naming_semantics_counters(realized_with_origin)
+    assert origin_counters["da_realized_without_precommit_origin_count"] == pytest.approx(0.0)
+    assert origin_counters["da_naming_semantics_error_count"] == pytest.approx(0.0)
 
     unlocked_clearing = bt._apply_market_clearing(
         target_time_utc=ts_unlocked,

@@ -931,6 +931,16 @@ class BatteryBacktester:
         self.final_soc_mode = str(MODEL_SPECS.get("final_soc_mode", "terminal_repair")).strip().lower()
         if self.final_soc_mode not in {"terminal_repair", "hard"}:
             self.final_soc_mode = "terminal_repair"
+        self.da_postlock_guard_mode = str(
+            MODEL_SPECS.get("da_postlock_guard_mode", "recoverability_aware")
+        ).strip().lower()
+        if self.da_postlock_guard_mode not in {"recoverability_aware", "strict_no_future_action"}:
+            self.da_postlock_guard_mode = "recoverability_aware"
+        self.da_postlock_hard_projection_until = str(
+            MODEL_SPECS.get("da_postlock_hard_projection_until", "next_recovery_opportunity")
+        ).strip().lower()
+        if self.da_postlock_hard_projection_until not in {"next_recovery_opportunity", "global_final"}:
+            self.da_postlock_hard_projection_until = "next_recovery_opportunity"
         # Single source of truth for aFRR BCM bid submission hour (CET/CEST local clock).
         # The perfect_foresight branch must use the same local submission hour.
         self.afrr_bcm_bid_hour_local = int(
@@ -2316,6 +2326,88 @@ class BatteryBacktester:
         return pd.DataFrame(out_rows)
 
     @staticmethod
+    def _audit_da_postlock_rejection_diagnostics(
+        hourly: pd.DataFrame,
+        *,
+        timestamp_col: str = "timestamp_utc",
+    ) -> dict[str, float | str]:
+        """Ensure postlock-rejected DA rows carry actionable failure diagnostics."""
+        required_postlock_diag_cols = [
+            "da_postlock_candidate_future_feasible",
+            "da_postlock_no_trade_future_feasible",
+            "da_postlock_final_selected_future_feasible",
+            "da_postlock_final_selected_after_future_check",
+            "da_postlock_infeasibility_driver",
+            "da_postlock_failed_reason_detail",
+            "da_postlock_failed_timestamp_utc",
+            "da_postlock_failed_locked_buy_mwh_t",
+            "da_postlock_failed_locked_sell_mwh_t",
+            "da_postlock_failed_soc_before_mwh",
+            "da_postlock_failed_soc_after_mwh",
+            "da_postlock_failed_soc_min_mwh",
+            "da_postlock_failed_soc_max_mwh",
+        ]
+        if hourly is None or hourly.empty:
+            return {
+                "da_postlock_rejection_count": 0.0,
+                "missing_da_postlock_rejection_diagnostics_count": 0.0,
+                "missing_da_postlock_rejection_diagnostics_columns": "[]",
+                "first_missing_da_postlock_rejection_diagnostics_timestamp_utc": "",
+            }
+
+        postlock_rejected_mask = pd.Series(False, index=hourly.index)
+        for zero_reason_col in (
+            "da_precommit_da_zero_reason",
+            "da_precommit_zero_reason",
+            "da_zero_reason",
+        ):
+            if zero_reason_col in hourly.columns:
+                postlock_rejected_mask |= (
+                    hourly[zero_reason_col]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .eq("postlock_future_infeasible_no_trade_selected")
+                )
+
+        missing_postlock_diag_mask = pd.Series(False, index=hourly.index)
+        missing_postlock_diag_cols: list[str] = []
+        for diag_col in required_postlock_diag_cols:
+            if diag_col not in hourly.columns:
+                missing_postlock_diag_mask |= postlock_rejected_mask
+                missing_postlock_diag_cols.append(diag_col)
+                continue
+            vals = hourly[diag_col]
+            missing_here = vals.isna()
+            if diag_col.endswith("_utc") or any(
+                token in diag_col
+                for token in ("reason", "driver", "selected_after_future_check")
+            ):
+                text = vals.fillna("").astype(str).str.strip().str.lower()
+                missing_here |= text.isin(["", "nan", "nat", "none"])
+            missing_postlock_diag_mask |= postlock_rejected_mask & missing_here
+            if bool((postlock_rejected_mask & missing_here).any()):
+                missing_postlock_diag_cols.append(diag_col)
+        missing_postlock_diag_cols = list(dict.fromkeys(missing_postlock_diag_cols))
+
+        if bool(missing_postlock_diag_mask.any()) and timestamp_col in hourly.columns:
+            missing_ts = pd.to_datetime(
+                hourly.loc[missing_postlock_diag_mask, timestamp_col],
+                utc=True,
+                errors="coerce",
+            ).dropna()
+            first_missing_ts = "" if missing_ts.empty else missing_ts.min().isoformat()
+        else:
+            first_missing_ts = ""
+
+        return {
+            "da_postlock_rejection_count": float(postlock_rejected_mask.sum()),
+            "missing_da_postlock_rejection_diagnostics_count": float(missing_postlock_diag_mask.sum()),
+            "missing_da_postlock_rejection_diagnostics_columns": json.dumps(missing_postlock_diag_cols),
+            "first_missing_da_postlock_rejection_diagnostics_timestamp_utc": str(first_missing_ts),
+        }
+
+    @staticmethod
     def _compute_da_naming_semantics_counters(hourly: pd.DataFrame) -> dict[str, float]:
         """Validate DA candidate/lockbook/submission/realization namespace semantics."""
         if hourly is None or hourly.empty:
@@ -2368,10 +2460,20 @@ class BatteryBacktester:
         realized_sell = _num("real_da_sell_mwh", "da_sell_mwh")
         buy_accepted = _num("real_da_buy_accepted", "da_buy_accepted")
         sell_accepted = _num("real_da_sell_accepted", "da_sell_accepted")
-        incumbent = _str("da_precommit_selected_incumbent", "selected_incumbent")
+        incumbent = _str(
+            "da_precommit_final_selected_incumbent",
+            "da_precommit_selected_incumbent",
+            "final_selected_incumbent",
+            "selected_incumbent",
+        )
         origin_source = _str("da_originating_source_snapshot_utc", "da_precommit_source_snapshot_utc")
         origin_id = _str("da_originating_precommit_id", "da_precommit_originating_precommit_id")
-        selection_reason = _str("da_precommit_selection_reason", "selection_reason")
+        selection_reason = _str(
+            "da_precommit_selection_reason",
+            "da_precommit_da_zero_reason",
+            "selection_reason",
+            "da_zero_reason",
+        )
         replay_error = _num("da_precommit_cashflow_replay_error", "cashflow_replay_error")
         candidate_replay_valid = (
             _num("da_precommit_candidate_replay_valid", "candidate_replay_valid")
@@ -3216,6 +3318,7 @@ class BatteryBacktester:
         fixed_reserve_pos: dict[pd.Timestamp, float],
         fixed_reserve_neg: dict[pd.Timestamp, float],
         global_end_utc: pd.Timestamp | None = None,
+        candidate_timestamps: set[pd.Timestamp] | None = None,
     ) -> tuple[bool, dict[str, float | str]]:
         """Project whether fixed DA/reserve obligations remain feasible after a lockbook update."""
         if future_rows is None or future_rows.empty:
@@ -3241,9 +3344,101 @@ class BatteryBacktester:
         expected_aux = 0.0
         fixed_da_charge = 0.0
         fixed_da_discharge = 0.0
+        guard_mode = str(getattr(self, "da_postlock_guard_mode", "recoverability_aware")).strip().lower()
+        if guard_mode not in {"recoverability_aware", "strict_no_future_action"}:
+            guard_mode = "recoverability_aware"
+        hard_projection_until = str(
+            getattr(self, "da_postlock_hard_projection_until", "next_recovery_opportunity")
+        ).strip().lower()
+        if hard_projection_until not in {"next_recovery_opportunity", "global_final"}:
+            hard_projection_until = "next_recovery_opportunity"
+        recovery_capacity_by_ts: list[tuple[pd.Timestamp, float]] = []
+        price_by_ts: list[tuple[pd.Timestamp, float]] = []
+        candidate_ts = {
+            pd.to_datetime(ts, utc=True, errors="coerce")
+            for ts in (candidate_timestamps or set())
+        }
+        candidate_ts = {ts for ts in candidate_ts if pd.notna(ts)}
+        candidate_last_ts = max(candidate_ts) if candidate_ts else None
+        all_ts = [pd.to_datetime(v, utc=True, errors="coerce") for v in rows[colmap.timestamp].tolist()]
+        all_ts = [ts for ts in all_ts if pd.notna(ts)]
+        next_recovery_ts = ""
+        next_recovery_type = "none"
+        if guard_mode == "recoverability_aware" and hard_projection_until == "next_recovery_opportunity":
+            after_candidate = [ts for ts in all_ts if candidate_last_ts is None or ts > candidate_last_ts]
+            if after_candidate:
+                next_ts = min(after_candidate)
+                next_recovery_ts = str(next_ts)
+                if str(getattr(self, "_id_recourse_mode", "common")) != "disabled":
+                    next_recovery_type = "technical_id_recourse"
+                else:
+                    next_recovery_type = "rolling_optimizer_decision"
+            elif global_end_utc is not None and pd.notna(global_end_utc):
+                next_recovery_ts = str(pd.to_datetime(global_end_utc, utc=True, errors="coerce"))
+                next_recovery_type = "terminal_recovery"
+        hard_projection_end_ts = (
+            candidate_last_ts
+            if guard_mode == "recoverability_aware"
+            and hard_projection_until == "next_recovery_opportunity"
+            and candidate_last_ts is not None
+            else (pd.to_datetime(global_end_utc, utc=True, errors="coerce") if global_end_utc is not None else None)
+        )
 
-        def _finish(ts: pd.Timestamp, reason: str) -> tuple[bool, dict[str, float | str]]:
-            return False, {
+        def _base_diag() -> dict[str, float | str]:
+            return {
+                "guard_mode": str(guard_mode),
+                "hard_projection_until": str(hard_projection_until),
+                "next_recovery_opportunity_utc": str(next_recovery_ts),
+                "next_recovery_opportunity_type": str(next_recovery_type),
+                "hard_projection_end_utc": "" if hard_projection_end_ts is None else str(hard_projection_end_ts),
+                "hard_projection_reached_next_recovery": float(bool(next_recovery_ts)),
+                "hard_local_candidate_feasible": 1.0,
+                "terminal_shortfall_mwh": 0.0,
+                "terminal_shortfall_recoverable": 0.0,
+                "terminal_shortfall_unrecoverable": 0.0,
+                "max_recoverable_internal_mwh": 0.0,
+                "required_recovery_internal_mwh": 0.0,
+                "recovery_capacity_margin_mwh": 0.0,
+                "terminal_recovery_cost_eur": 0.0,
+                "terminal_recovery_cost_estimate_available": 0.0,
+                "infeasibility_driver_detail": "none",
+            }
+
+        def _estimate_terminal_recovery_cost(required_internal_mwh: float) -> tuple[float, float]:
+            if required_internal_mwh <= 1e-9:
+                return 0.0, 1.0
+            finite_prices = [float(v) for _, v in price_by_ts if np.isfinite(float(v))]
+            if not finite_prices:
+                return 0.0, 0.0
+            price = min(
+                float(self.id_buy_price_cap_eur_mwh),
+                max(-1e6, float(finite_prices[0]) + float(self.id_rescue_spread_eur_mwh)),
+            )
+            grid_buy_mwh = float(required_internal_mwh) / max(float(self.eta_in), 1e-12)
+            cost = (
+                grid_buy_mwh * price
+                + grid_buy_mwh * float(self.trans_eur_mwh)
+                + float(required_internal_mwh) * float(self.deg_eur_mwh)
+            )
+            return float(cost), 1.0
+
+        def _finish(
+            ts: pd.Timestamp,
+            reason: str,
+            *,
+            ch_mw: float = 0.0,
+            dis_mw: float = 0.0,
+            soc_before: float | None = None,
+            soc_after: float | None = None,
+            stack: dict[str, float | dict[str, float]] | None = None,
+            reason_detail: str = "",
+        ) -> tuple[bool, dict[str, float | str]]:
+            stack = stack or {}
+            before = float(soc if soc_before is None else soc_before)
+            after = float(soc if soc_after is None else soc_after)
+            diag = _base_diag()
+            diag.update(
+                {
                 "first_infeasible_timestamp_utc": str(ts),
                 "infeasibility_driver": str(reason),
                 "projected_final_soc_mwh": float(soc),
@@ -3252,7 +3447,77 @@ class BatteryBacktester:
                 "expected_auxiliary_losses_mwh": float(expected_aux),
                 "fixed_da_charge_mwh_in_window": float(fixed_da_charge),
                 "fixed_da_discharge_mwh_in_window": float(fixed_da_discharge),
-            }
+                "failed_timestamp_utc": str(ts),
+                "failed_candidate_buy_mw": float(ch_mw),
+                "failed_candidate_sell_mw": float(dis_mw),
+                "failed_locked_buy_mwh_t": float(max(0.0, ch_mw) * float(self.dt_h)),
+                "failed_locked_sell_mwh_t": float(max(0.0, dis_mw) * float(self.dt_h)),
+                "failed_soc_before_mwh": float(before),
+                "failed_soc_after_mwh": float(after),
+                "failed_soc_min_mwh": float(self.soc_min),
+                "failed_soc_max_mwh": float(self.soc_max),
+                "failed_power_stack_mw": float(stack.get("total_stack_mw", 0.0)),
+                "failed_power_limit_mw": float(self.p_max_mw),
+                "failed_reason_detail": str(reason_detail or reason),
+                    "hard_local_candidate_feasible": 0.0,
+                    "infeasibility_driver_detail": str(reason_detail or reason),
+                }
+            )
+            return False, diag
+
+        def _terminal_diag(ts: pd.Timestamp, projected_soc: float, ch_mw: float, dis_mw: float) -> dict[str, float | str]:
+            shortfall = max(0.0, float(self.soc_target_end) - float(projected_soc))
+            safety = max(0.0, float(getattr(self, "terminal_id_recovery_safety_mwh", 0.0)))
+            required = shortfall + (safety if shortfall > 1e-9 else 0.0)
+            max_recoverable = float(sum(max(0.0, cap) for _, cap in recovery_capacity_by_ts))
+            margin = max_recoverable - required
+            cost, cost_available = _estimate_terminal_recovery_cost(required)
+            recoverable = bool(required <= 1e-9 or margin >= -1e-9)
+            detail = (
+                "locked_da_terminal_shortfall_recoverable"
+                if recoverable
+                else "locked_da_terminal_shortfall_unrecoverable"
+            )
+            diag = _base_diag()
+            diag.update(
+                {
+                    "first_infeasible_timestamp_utc": "" if recoverable else str(ts),
+                    "infeasibility_driver": "none" if recoverable else "locked_da_terminal_shortfall_unrecoverable",
+                    "projected_final_soc_mwh": float(projected_soc),
+                    "projected_soc_min_mwh": float(min_soc),
+                    "projected_soc_max_mwh": float(max_soc),
+                    "expected_auxiliary_losses_mwh": float(expected_aux),
+                    "fixed_da_charge_mwh_in_window": float(fixed_da_charge),
+                    "fixed_da_discharge_mwh_in_window": float(fixed_da_discharge),
+                    "failed_timestamp_utc": "" if recoverable else str(ts),
+                    "failed_candidate_buy_mw": float(ch_mw),
+                    "failed_candidate_sell_mw": float(dis_mw),
+                    "failed_locked_buy_mwh_t": float(max(0.0, ch_mw) * float(self.dt_h)),
+                    "failed_locked_sell_mwh_t": float(max(0.0, dis_mw) * float(self.dt_h)),
+                    "failed_soc_before_mwh": float(projected_soc),
+                    "failed_soc_after_mwh": float(projected_soc),
+                    "failed_soc_min_mwh": float(self.soc_min),
+                    "failed_soc_max_mwh": float(self.soc_max),
+                    "failed_power_stack_mw": 0.0,
+                    "failed_power_limit_mw": float(self.p_max_mw),
+                    "failed_reason_detail": detail,
+                    "next_recovery_opportunity_utc": str(next_recovery_ts),
+                    "next_recovery_opportunity_type": str(next_recovery_type),
+                    "hard_projection_end_utc": "" if hard_projection_end_ts is None else str(hard_projection_end_ts),
+                    "hard_projection_reached_next_recovery": float(bool(next_recovery_ts)),
+                    "hard_local_candidate_feasible": 1.0,
+                    "terminal_shortfall_mwh": float(shortfall),
+                    "terminal_shortfall_recoverable": float(recoverable and shortfall > 1e-9),
+                    "terminal_shortfall_unrecoverable": float((not recoverable) and shortfall > 1e-9),
+                    "max_recoverable_internal_mwh": float(max_recoverable),
+                    "required_recovery_internal_mwh": float(required),
+                    "recovery_capacity_margin_mwh": float(margin),
+                    "terminal_recovery_cost_eur": float(cost),
+                    "terminal_recovery_cost_estimate_available": float(cost_available),
+                    "infeasibility_driver_detail": detail,
+                }
+            )
+            return diag
 
         for _, row in rows.iterrows():
             ts = pd.to_datetime(row[colmap.timestamp], utc=True, errors="coerce")
@@ -3277,8 +3542,29 @@ class BatteryBacktester:
                 bcm_pos_obligation_mw=float(ob_pos),
                 bcm_neg_obligation_mw=float(ob_neg),
             )
-            if float(stack["charge_stack_violation_mw"]) > 1e-9 or float(stack["discharge_stack_violation_mw"]) > 1e-9:
-                return _finish(ts, "power_stack_infeasible")
+            hard_check_this_row = bool(
+                guard_mode == "strict_no_future_action"
+                or hard_projection_until == "global_final"
+                or hard_projection_end_ts is None
+                or ts <= hard_projection_end_ts
+            )
+            if hard_check_this_row and (
+                float(stack["charge_stack_violation_mw"]) > 1e-9
+                or float(stack["discharge_stack_violation_mw"]) > 1e-9
+            ):
+                return _finish(
+                    ts,
+                    "locked_da_hourly_power_infeasible",
+                    ch_mw=float(ch_mw),
+                    dis_mw=float(dis_mw),
+                    soc_before=float(soc),
+                    soc_after=float(soc),
+                    stack=stack,
+                    reason_detail=(
+                        f"charge_violation={float(stack['charge_stack_violation_mw']):.6g},"
+                        f"discharge_violation={float(stack['discharge_stack_violation_mw']):.6g}"
+                    ),
+                )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
                 discharge_mw=float(dis_mw),
@@ -3303,21 +3589,77 @@ class BatteryBacktester:
                 battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
                 dt_h=float(self.dt_h),
             )
+            soc_before = float(soc)
             soc += float(delta)
+            soc_after = float(soc)
             min_soc = min(min_soc, float(soc))
             max_soc = max(max_soc, float(soc))
             expected_aux += float(aux_mwh)
             fixed_da_charge += float(ch_mw) * float(self.dt_h)
             fixed_da_discharge += float(dis_mw) * float(self.dt_h)
-            if soc + 1e-9 < float(self.soc_min):
-                return _finish(ts, "locked_da_commitment_infeasible")
-            if soc > float(self.soc_max) + 1e-9:
-                return _finish(ts, "soc_upper_bound_conflict")
+            if hard_check_this_row and soc + 1e-9 < float(self.soc_min):
+                return _finish(
+                    ts,
+                    "locked_da_hourly_soc_min_infeasible",
+                    ch_mw=float(ch_mw),
+                    dis_mw=float(dis_mw),
+                    soc_before=soc_before,
+                    soc_after=soc_after,
+                    stack=stack,
+                    reason_detail="locked_da_hourly_soc_min_infeasible",
+                )
+            if hard_check_this_row and soc > float(self.soc_max) + 1e-9:
+                return _finish(
+                    ts,
+                    "locked_da_hourly_soc_max_infeasible",
+                    ch_mw=float(ch_mw),
+                    dis_mw=float(dis_mw),
+                    soc_before=soc_before,
+                    soc_after=soc_after,
+                    stack=stack,
+                    reason_detail="locked_da_hourly_soc_max_infeasible",
+                )
+            recovery_allowed_this_row = bool(
+                guard_mode == "recoverability_aware"
+                and (
+                    hard_projection_until != "next_recovery_opportunity"
+                    or not next_recovery_ts
+                    or ts >= pd.to_datetime(next_recovery_ts, utc=True, errors="coerce")
+                )
+            )
+            if recovery_allowed_this_row:
+                raw_recovery_internal = (
+                    max(0.0, float(stack.get("charge_residual_mw", 0.0)))
+                    * float(self.dt_h)
+                    * max(0.0, float(self.eta_in))
+                )
+                soc_room_mwh = max(0.0, float(self.soc_max) - min(float(self.soc_max), max(float(self.soc_min), float(soc))))
+                recovery_capacity_by_ts.append((ts, min(float(raw_recovery_internal), float(soc_room_mwh))))
+                if colmap.pred_da_price in row.index:
+                    price = pd.to_numeric(pd.Series([row.get(colmap.pred_da_price)]), errors="coerce").iloc[0]
+                    if pd.notna(price):
+                        price_by_ts.append((ts, float(price)))
             if global_end_utc is not None and pd.notna(global_end_utc) and ts == global_end_utc:
                 if soc + 1e-9 < float(self.soc_target_end):
-                    return _finish(ts, "locked_da_commitment_infeasible")
+                    if guard_mode == "strict_no_future_action":
+                        return _finish(
+                            ts,
+                            "locked_da_terminal_shortfall_unrecoverable",
+                            ch_mw=float(ch_mw),
+                            dis_mw=float(dis_mw),
+                            soc_before=soc_before,
+                            soc_after=soc_after,
+                            stack=stack,
+                            reason_detail="locked_da_terminal_shortfall_unrecoverable",
+                        )
+                    terminal_diag = _terminal_diag(ts, soc, float(ch_mw), float(dis_mw))
+                    if float(terminal_diag.get("terminal_shortfall_recoverable", 0.0)) >= 0.5:
+                        return True, terminal_diag
+                    return False, terminal_diag
 
-        return True, {
+        diag = _base_diag()
+        diag.update(
+            {
             "first_infeasible_timestamp_utc": "",
             "infeasibility_driver": "none",
             "projected_final_soc_mwh": float(soc),
@@ -3326,7 +3668,9 @@ class BatteryBacktester:
             "expected_auxiliary_losses_mwh": float(expected_aux),
             "fixed_da_charge_mwh_in_window": float(fixed_da_charge),
             "fixed_da_discharge_mwh_in_window": float(fixed_da_discharge),
-        }
+            }
+        )
+        return True, diag
 
     def _apply_da_postlock_future_guard(
         self,
@@ -3387,6 +3731,8 @@ class BatteryBacktester:
 
         candidate_buy_mwh = float(sum(max(0.0, ch) for ch, _ in selected_da.values()) * float(self.dt_h))
         candidate_sell_mwh = float(sum(max(0.0, dis) for _, dis in selected_da.values()) * float(self.dt_h))
+        candidate_timestamps = {pd.to_datetime(ts, utc=True, errors="coerce") for ts in selected_da.keys()}
+        candidate_timestamps = {ts for ts in candidate_timestamps if pd.notna(ts)}
         zero_schedule = {ts: (0.0, 0.0) for ts in selected_da.keys()}
         zero_feasible, zero_diag = self._project_da_postlock_future_feasibility(
             future_rows=future_rows,
@@ -3396,6 +3742,7 @@ class BatteryBacktester:
             fixed_reserve_pos=fixed_reserve_pos,
             fixed_reserve_neg=fixed_reserve_neg,
             global_end_utc=global_end_utc,
+            candidate_timestamps=candidate_timestamps,
         )
         zero_replay = _predicted_replay(zero_schedule)
         feasible, diag = self._project_da_postlock_future_feasibility(
@@ -3406,19 +3753,30 @@ class BatteryBacktester:
             fixed_reserve_pos=fixed_reserve_pos,
             fixed_reserve_neg=fixed_reserve_neg,
             global_end_utc=global_end_utc,
+            candidate_timestamps=candidate_timestamps,
         )
         candidate_future_feasible = bool(feasible)
         candidate_failure_diag = dict(diag)
+        candidate_failure_ts = pd.to_datetime(
+            candidate_failure_diag.get(
+                "failed_timestamp_utc",
+                candidate_failure_diag.get("first_infeasible_timestamp_utc", ""),
+            ),
+            utc=True,
+            errors="coerce",
+        )
         selected_after_check = "candidate"
         rejected_due_to_future = 0.0
         final_schedule = dict(selected_da)
         final_diag = dict(diag)
+        final_selected_future_feasible = bool(feasible)
         if not bool(feasible):
             rejected_due_to_future = 1.0
             if bool(zero_feasible):
                 final_schedule = zero_schedule
                 final_diag = dict(zero_diag)
                 feasible = True
+                final_selected_future_feasible = True
                 selected_after_check = "no_trade"
             else:
                 ladder = self._parse_reserve_retry_ladder(getattr(self, "reserve_retry_ladder", "1.0,0.75,0.5,0.25,0.0"))
@@ -3437,35 +3795,76 @@ class BatteryBacktester:
                         fixed_reserve_pos=fixed_reserve_pos,
                         fixed_reserve_neg=fixed_reserve_neg,
                         global_end_utc=global_end_utc,
+                        candidate_timestamps=candidate_timestamps,
                     )
                     if bool(trial_feasible):
                         final_schedule = trial
                         final_diag = dict(trial_diag)
                         feasible = True
+                        final_selected_future_feasible = True
                         selected_after_check = f"retry_factor_{factor:g}"
                         break
                 if not bool(feasible):
                     final_schedule = zero_schedule
+                    final_selected_future_feasible = False
                     selected_after_check = "rejected"
 
         postlock_candidate_schedule = dict(final_schedule)
         postlock_candidate_replay = _predicted_replay(postlock_candidate_schedule)
         postlock_candidate_pnl = float(postlock_candidate_replay.get("selection_pnl_eur", float("nan")))
         no_trade_pnl = float(zero_replay.get("selection_pnl_eur", float("nan")))
+        terminal_recovery_cost = float(candidate_failure_diag.get("terminal_recovery_cost_eur", 0.0))
+        terminal_recovery_cost_available = float(
+            candidate_failure_diag.get("terminal_recovery_cost_estimate_available", 0.0)
+        )
+        postlock_candidate_pnl_after_recovery = float(postlock_candidate_pnl)
+        if (
+            np.isfinite(postlock_candidate_pnl_after_recovery)
+            and terminal_recovery_cost_available >= 0.5
+            and terminal_recovery_cost > 0.0
+        ):
+            postlock_candidate_pnl_after_recovery -= float(terminal_recovery_cost)
         if (
             bool(zero_feasible)
-            and any(ch > 1e-9 or dis > 1e-9 for ch, dis in postlock_candidate_schedule.values())
-            and np.isfinite(postlock_candidate_pnl)
+            and candidate_future_feasible
+            and str(candidate_failure_diag.get("infeasibility_driver_detail", ""))
+            == "locked_da_terminal_shortfall_recoverable"
+            and terminal_recovery_cost_available >= 0.5
+            and np.isfinite(postlock_candidate_pnl_after_recovery)
             and np.isfinite(no_trade_pnl)
-            and postlock_candidate_pnl <= no_trade_pnl + 1e-6
+            and postlock_candidate_pnl_after_recovery <= no_trade_pnl + 1e-6
         ):
             final_schedule = zero_schedule
             final_diag = dict(zero_diag)
             feasible = True
-            selected_after_check = "no_trade_after_locked_pnl_recompute"
+            final_selected_future_feasible = True
+            selected_after_check = "no_trade_after_terminal_recovery_cost"
+            rejected_due_to_future = 1.0
+            candidate_failure_diag["infeasibility_driver_detail"] = "locked_da_terminal_recovery_cost_negative_pnl"
+            candidate_failure_diag["infeasibility_driver"] = "locked_da_terminal_recovery_cost_negative_pnl"
+        if (
+            bool(zero_feasible)
+            and any(ch > 1e-9 or dis > 1e-9 for ch, dis in postlock_candidate_schedule.values())
+            and np.isfinite(postlock_candidate_pnl_after_recovery)
+            and np.isfinite(no_trade_pnl)
+            and postlock_candidate_pnl_after_recovery <= no_trade_pnl + 1e-6
+        ):
+            final_schedule = zero_schedule
+            final_diag = dict(zero_diag)
+            feasible = True
+            final_selected_future_feasible = True
+            if str(selected_after_check) != "no_trade_after_terminal_recovery_cost":
+                selected_after_check = "no_trade_after_locked_pnl_recompute"
 
         locked_buy_mwh = float(sum(max(0.0, ch) for ch, _ in final_schedule.values()) * float(self.dt_h))
         locked_sell_mwh = float(sum(max(0.0, dis) for _, dis in final_schedule.values()) * float(self.dt_h))
+        final_selected_is_no_trade = str(selected_after_check) in {
+            "no_trade",
+            "no_trade_after_locked_pnl_recompute",
+            "no_trade_after_terminal_recovery_cost",
+            "rejected",
+        }
+        final_selected_pnl = float(no_trade_pnl) if final_selected_is_no_trade else float(postlock_candidate_pnl_after_recovery)
         updated_rows: list[dict[str, float | str]] = []
         for row in da_audit_rows:
             out = dict(row)
@@ -3476,6 +3875,16 @@ class BatteryBacktester:
             )
             locked_ch, locked_dis = (
                 final_schedule.get(row_ts, (0.0, 0.0)) if pd.notna(row_ts) else (0.0, 0.0)
+            )
+            candidate_ch, candidate_dis = (
+                selected_da.get(row_ts, (0.0, 0.0)) if pd.notna(row_ts) else (0.0, 0.0)
+            )
+            candidate_locked_buy_mwh_t = float(max(0.0, float(candidate_ch)) * float(self.dt_h))
+            candidate_locked_sell_mwh_t = float(max(0.0, float(candidate_dis)) * float(self.dt_h))
+            broadcast_failure_diag = bool(
+                str(candidate_failure_diag.get("failed_timestamp_utc", "")).strip()
+                or str(candidate_failure_diag.get("first_infeasible_timestamp_utc", "")).strip()
+                or str(candidate_failure_diag.get("failed_reason_detail", "")).strip()
             )
             out.update(
                 {
@@ -3492,7 +3901,12 @@ class BatteryBacktester:
                     "realized_sell_mwh_by_hour": float(locked_dis) * float(self.dt_h),
                     "candidate_pnl_before_locking": float(row.get("candidate_selection_pnl_eur", np.nan)),
                     "candidate_pnl_after_locking": float(postlock_candidate_pnl),
+                    "candidate_pnl_after_recovery_cost_eur": float(postlock_candidate_pnl_after_recovery),
                     "no_trade_pnl": float(no_trade_pnl),
+                    "pre_postlock_selected_incumbent": str(row.get("selected_incumbent", "")),
+                    "final_selected_incumbent": (
+                        "no_trade" if final_selected_is_no_trade else "optimized"
+                    ),
                     "postlock_candidate_gross_spread_eur": float(
                         postlock_candidate_replay.get("gross_spread_eur", np.nan)
                     ),
@@ -3516,21 +3930,138 @@ class BatteryBacktester:
                     ),
                     "da_accepted_buy_mw": float(locked_ch),
                     "da_accepted_sell_mw": float(locked_dis),
-                    "da_postlock_future_feasible": float(bool(feasible)),
+                    "da_postlock_future_feasible": float(bool(candidate_future_feasible)),
+                    "da_postlock_candidate_future_feasible": float(bool(candidate_future_feasible)),
+                    "da_postlock_no_trade_future_feasible": float(bool(zero_feasible)),
+                    "da_postlock_final_selected_future_feasible": float(bool(final_selected_future_feasible)),
                     "da_postlock_first_infeasible_timestamp_utc": str(
                         ""
                         if bool(candidate_future_feasible)
+                        and str(selected_after_check) != "no_trade_after_terminal_recovery_cost"
                         else candidate_failure_diag.get("first_infeasible_timestamp_utc", "")
                     ),
                     "da_postlock_infeasibility_driver": str(
                         "none"
                         if bool(candidate_future_feasible)
+                        and str(selected_after_check) != "no_trade_after_terminal_recovery_cost"
                         else candidate_failure_diag.get("infeasibility_driver", "unknown")
                     ),
+                    "da_postlock_infeasibility_driver_detail": str(
+                        candidate_failure_diag.get("infeasibility_driver_detail", "none")
+                    ),
+                    "da_postlock_guard_mode": str(candidate_failure_diag.get("guard_mode", "")),
+                    "da_postlock_hard_projection_until": str(
+                        candidate_failure_diag.get("hard_projection_until", "")
+                    ),
+                    "da_postlock_next_recovery_opportunity_utc": str(
+                        candidate_failure_diag.get("next_recovery_opportunity_utc", "")
+                    ),
+                    "da_postlock_next_recovery_opportunity_type": str(
+                        candidate_failure_diag.get("next_recovery_opportunity_type", "")
+                    ),
+                    "da_postlock_hard_projection_end_utc": str(
+                        candidate_failure_diag.get("hard_projection_end_utc", "")
+                    ),
+                    "da_postlock_hard_projection_reached_next_recovery": float(
+                        candidate_failure_diag.get("hard_projection_reached_next_recovery", np.nan)
+                    ),
+                    "da_postlock_hard_local_candidate_feasible": float(
+                        candidate_failure_diag.get("hard_local_candidate_feasible", np.nan)
+                    ),
+                    "da_postlock_terminal_shortfall_mwh": float(
+                        candidate_failure_diag.get("terminal_shortfall_mwh", np.nan)
+                    ),
+                    "da_postlock_terminal_shortfall_recoverable": float(
+                        candidate_failure_diag.get("terminal_shortfall_recoverable", np.nan)
+                    ),
+                    "da_postlock_terminal_shortfall_unrecoverable": float(
+                        candidate_failure_diag.get("terminal_shortfall_unrecoverable", np.nan)
+                    ),
+                    "da_postlock_max_recoverable_internal_mwh": float(
+                        candidate_failure_diag.get("max_recoverable_internal_mwh", np.nan)
+                    ),
+                    "da_postlock_required_recovery_internal_mwh": float(
+                        candidate_failure_diag.get("required_recovery_internal_mwh", np.nan)
+                    ),
+                    "da_postlock_recovery_capacity_margin_mwh": float(
+                        candidate_failure_diag.get("recovery_capacity_margin_mwh", np.nan)
+                    ),
+                    "da_postlock_terminal_recovery_cost_eur": float(
+                        candidate_failure_diag.get("terminal_recovery_cost_eur", np.nan)
+                    ),
+                    "da_postlock_terminal_recovery_cost_estimate_available": float(
+                        candidate_failure_diag.get("terminal_recovery_cost_estimate_available", np.nan)
+                    ),
+                    "da_postlock_candidate_pnl_before_recovery_cost_eur": float(postlock_candidate_pnl),
+                    "da_postlock_candidate_pnl_after_recovery_cost_eur": float(postlock_candidate_pnl_after_recovery),
+                    "da_postlock_final_selected_pnl_eur": float(final_selected_pnl),
                     "da_postlock_selected_after_future_check": str(selected_after_check),
+                    "da_postlock_final_selected_after_future_check": str(selected_after_check),
                     "da_postlock_rejected_due_to_future_infeasibility": float(rejected_due_to_future),
-                    "da_postlock_candidate_locked_buy_mwh": float(candidate_buy_mwh),
-                    "da_postlock_candidate_locked_sell_mwh": float(candidate_sell_mwh),
+                    "da_postlock_candidate_locked_buy_mwh": float(candidate_locked_buy_mwh_t),
+                    "da_postlock_candidate_locked_sell_mwh": float(candidate_locked_sell_mwh_t),
+                    "da_postlock_candidate_locked_buy_mwh_t": float(candidate_locked_buy_mwh_t),
+                    "da_postlock_candidate_locked_sell_mwh_t": float(candidate_locked_sell_mwh_t),
+                    "da_postlock_candidate_total_locked_buy_mwh": float(candidate_buy_mwh),
+                    "da_postlock_candidate_total_locked_sell_mwh": float(candidate_sell_mwh),
+                    "da_postlock_failed_timestamp_utc": str(
+                        candidate_failure_diag.get("failed_timestamp_utc", "")
+                    ),
+                    "da_postlock_failed_candidate_buy_mw": float(
+                        candidate_failure_diag.get("failed_candidate_buy_mw", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_candidate_sell_mw": float(
+                        candidate_failure_diag.get("failed_candidate_sell_mw", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_locked_buy_mwh_t": float(
+                        candidate_failure_diag.get("failed_locked_buy_mwh_t", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_locked_sell_mwh_t": float(
+                        candidate_failure_diag.get("failed_locked_sell_mwh_t", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_total_locked_buy_mwh": float(candidate_buy_mwh),
+                    "da_postlock_failed_total_locked_sell_mwh": float(candidate_sell_mwh),
+                    "da_postlock_failed_soc_before_mwh": float(
+                        candidate_failure_diag.get("failed_soc_before_mwh", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_soc_after_mwh": float(
+                        candidate_failure_diag.get("failed_soc_after_mwh", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_soc_min_mwh": float(
+                        candidate_failure_diag.get("failed_soc_min_mwh", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_soc_max_mwh": float(
+                        candidate_failure_diag.get("failed_soc_max_mwh", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_power_stack_mw": float(
+                        candidate_failure_diag.get("failed_power_stack_mw", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_power_limit_mw": float(
+                        candidate_failure_diag.get("failed_power_limit_mw", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_postlock_failed_reason_detail": str(
+                        candidate_failure_diag.get("failed_reason_detail", "") if broadcast_failure_diag else ""
+                    ),
                     "da_retry_factor_selected": float(
                         locked_buy_mwh / candidate_buy_mwh
                         if candidate_buy_mwh > 1e-9
@@ -3543,6 +4074,10 @@ class BatteryBacktester:
             if str(selected_after_check) == "no_trade":
                 out["da_zeroed_all_bids"] = 1.0
                 out["da_zero_reason"] = "postlock_future_infeasible_no_trade_selected"
+            elif str(selected_after_check) == "no_trade_after_terminal_recovery_cost":
+                out["da_zeroed_all_bids"] = 1.0
+                out["da_zero_reason"] = "postlock_terminal_recovery_cost_negative_pnl"
+                out["candidate_rejection_reason"] = "locked_da_terminal_recovery_cost_negative_pnl"
             elif str(selected_after_check) == "no_trade_after_locked_pnl_recompute":
                 out["da_zeroed_all_bids"] = 1.0
                 out["da_zero_reason"] = "postlock_locked_candidate_pnl_below_no_trade"
@@ -3602,9 +4137,18 @@ class BatteryBacktester:
         gate_hour_vals: list[float] = []
         gate_violation_vals: list[float] = []
         gate_valid_vals: list[float] = []
+        pre_postlock_incumbent_vals: list[str] = []
+        final_incumbent_vals: list[str] = []
+        selection_reason_vals: list[str] = []
+        zero_reason_vals: list[str] = []
 
         source_map = audit_maps.get("da_precommit_source_snapshot_utc", {})
         precommit_id_map = audit_maps.get("da_precommit_originating_precommit_id", {})
+        pre_postlock_incumbent_map = audit_maps.get("da_precommit_pre_postlock_selected_incumbent", {})
+        final_incumbent_map = audit_maps.get("da_precommit_final_selected_incumbent", {})
+        selected_incumbent_map = audit_maps.get("da_precommit_selected_incumbent", {})
+        selection_reason_map = audit_maps.get("da_precommit_selection_reason", {})
+        zero_reason_map = audit_maps.get("da_precommit_da_zero_reason", {})
         delivery_start_map = audit_maps.get("da_precommit_da_delivery_start_utc", {})
         delivery_end_map = audit_maps.get("da_precommit_da_delivery_end_utc", {})
         delivery_start_local_map = audit_maps.get("da_precommit_da_delivery_start_local", {})
@@ -3684,6 +4228,15 @@ class BatteryBacktester:
             if not precommit_id and is_locked > 0.5:
                 precommit_id = f"{source}->{ts}" if source else f"unknown->{ts}"
             precommit_id_vals.append(precommit_id)
+            pre_postlock_incumbent = _audit_text(pre_postlock_incumbent_map, ts)
+            selected_incumbent = _audit_text(selected_incumbent_map, ts)
+            final_incumbent = _audit_text(final_incumbent_map, ts) or selected_incumbent
+            if is_locked > 0.5 and not final_incumbent:
+                final_incumbent = "optimized" if abs(ch_mw) + abs(dis_mw) > 1e-9 else "no_trade"
+            pre_postlock_incumbent_vals.append(pre_postlock_incumbent or selected_incumbent)
+            final_incumbent_vals.append(final_incumbent)
+            selection_reason_vals.append(_audit_text(selection_reason_map, ts) or ("accepted_lockbook" if is_locked > 0.5 else ""))
+            zero_reason_vals.append(_audit_text(zero_reason_map, ts))
 
         locked_charge = pd.Series(locked_charge_vals, index=out.index, dtype=float)
         locked_discharge = pd.Series(locked_discharge_vals, index=out.index, dtype=float)
@@ -3712,6 +4265,10 @@ class BatteryBacktester:
         out["da_is_locked_delivery_hour"] = lockbook_row_present
         out["da_originating_source_snapshot_utc"] = source_vals
         out["da_originating_precommit_id"] = precommit_id_vals
+        out["da_precommit_pre_postlock_selected_incumbent"] = pre_postlock_incumbent_vals
+        out["da_precommit_final_selected_incumbent"] = final_incumbent_vals
+        out["da_precommit_selection_reason"] = selection_reason_vals
+        out["da_precommit_da_zero_reason"] = zero_reason_vals
         out["da_bid_source_snapshot_utc"] = source_vals
         out["da_bid_source_snapshot_local"] = source_local_vals
         out["da_bid_source_timezone"] = source_timezone_vals
@@ -12390,7 +12947,10 @@ class BatteryBacktester:
                 "da_precommit_realized_sell_mwh_by_hour",
                 "da_precommit_candidate_pnl_before_locking",
                 "da_precommit_candidate_pnl_after_locking",
+                "da_precommit_candidate_pnl_after_recovery_cost_eur",
                 "da_precommit_no_trade_pnl",
+                "da_precommit_pre_postlock_selected_incumbent",
+                "da_precommit_final_selected_incumbent",
                 "da_precommit_postlock_candidate_gross_spread_eur",
                 "da_precommit_postlock_candidate_revenue_eur",
                 "da_precommit_postlock_candidate_cost_eur",
@@ -12446,17 +13006,99 @@ class BatteryBacktester:
                 "da_postlock_future_feasible",
                 "da_postlock_first_infeasible_timestamp_utc",
                 "da_postlock_infeasibility_driver",
+                "da_postlock_infeasibility_driver_detail",
+                "da_postlock_guard_mode",
+                "da_postlock_hard_projection_until",
+                "da_postlock_next_recovery_opportunity_utc",
+                "da_postlock_next_recovery_opportunity_type",
+                "da_postlock_hard_projection_end_utc",
+                "da_postlock_hard_projection_reached_next_recovery",
+                "da_postlock_hard_local_candidate_feasible",
+                "da_postlock_terminal_shortfall_mwh",
+                "da_postlock_terminal_shortfall_recoverable",
+                "da_postlock_terminal_shortfall_unrecoverable",
+                "da_postlock_max_recoverable_internal_mwh",
+                "da_postlock_required_recovery_internal_mwh",
+                "da_postlock_recovery_capacity_margin_mwh",
+                "da_postlock_terminal_recovery_cost_eur",
+                "da_postlock_terminal_recovery_cost_estimate_available",
+                "da_postlock_candidate_pnl_before_recovery_cost_eur",
+                "da_postlock_candidate_pnl_after_recovery_cost_eur",
+                "da_postlock_final_selected_pnl_eur",
                 "da_postlock_selected_after_future_check",
                 "da_postlock_rejected_due_to_future_infeasibility",
                 "da_postlock_candidate_locked_buy_mwh",
                 "da_postlock_candidate_locked_sell_mwh",
+                "da_postlock_candidate_future_feasible",
+                "da_postlock_no_trade_future_feasible",
+                "da_postlock_final_selected_future_feasible",
+                "da_postlock_final_selected_after_future_check",
+                "da_postlock_candidate_locked_buy_mwh_t",
+                "da_postlock_candidate_locked_sell_mwh_t",
+                "da_postlock_candidate_total_locked_buy_mwh",
+                "da_postlock_candidate_total_locked_sell_mwh",
+                "da_postlock_failed_timestamp_utc",
+                "da_postlock_failed_candidate_buy_mw",
+                "da_postlock_failed_candidate_sell_mw",
+                "da_postlock_failed_locked_buy_mwh_t",
+                "da_postlock_failed_locked_sell_mwh_t",
+                "da_postlock_failed_total_locked_buy_mwh",
+                "da_postlock_failed_total_locked_sell_mwh",
+                "da_postlock_failed_soc_before_mwh",
+                "da_postlock_failed_soc_after_mwh",
+                "da_postlock_failed_soc_min_mwh",
+                "da_postlock_failed_soc_max_mwh",
+                "da_postlock_failed_power_stack_mw",
+                "da_postlock_failed_power_limit_mw",
+                "da_postlock_failed_reason_detail",
                 "da_precommit_da_postlock_future_feasible",
                 "da_precommit_da_postlock_first_infeasible_timestamp_utc",
                 "da_precommit_da_postlock_infeasibility_driver",
+                "da_precommit_da_postlock_infeasibility_driver_detail",
+                "da_precommit_da_postlock_guard_mode",
+                "da_precommit_da_postlock_hard_projection_until",
+                "da_precommit_da_postlock_next_recovery_opportunity_utc",
+                "da_precommit_da_postlock_next_recovery_opportunity_type",
+                "da_precommit_da_postlock_hard_projection_end_utc",
+                "da_precommit_da_postlock_hard_projection_reached_next_recovery",
+                "da_precommit_da_postlock_hard_local_candidate_feasible",
+                "da_precommit_da_postlock_terminal_shortfall_mwh",
+                "da_precommit_da_postlock_terminal_shortfall_recoverable",
+                "da_precommit_da_postlock_terminal_shortfall_unrecoverable",
+                "da_precommit_da_postlock_max_recoverable_internal_mwh",
+                "da_precommit_da_postlock_required_recovery_internal_mwh",
+                "da_precommit_da_postlock_recovery_capacity_margin_mwh",
+                "da_precommit_da_postlock_terminal_recovery_cost_eur",
+                "da_precommit_da_postlock_terminal_recovery_cost_estimate_available",
+                "da_precommit_da_postlock_candidate_pnl_before_recovery_cost_eur",
+                "da_precommit_da_postlock_candidate_pnl_after_recovery_cost_eur",
+                "da_precommit_da_postlock_final_selected_pnl_eur",
                 "da_precommit_da_postlock_selected_after_future_check",
                 "da_precommit_da_postlock_rejected_due_to_future_infeasibility",
                 "da_precommit_da_postlock_candidate_locked_buy_mwh",
                 "da_precommit_da_postlock_candidate_locked_sell_mwh",
+                "da_precommit_da_postlock_candidate_future_feasible",
+                "da_precommit_da_postlock_no_trade_future_feasible",
+                "da_precommit_da_postlock_final_selected_future_feasible",
+                "da_precommit_da_postlock_final_selected_after_future_check",
+                "da_precommit_da_postlock_candidate_locked_buy_mwh_t",
+                "da_precommit_da_postlock_candidate_locked_sell_mwh_t",
+                "da_precommit_da_postlock_candidate_total_locked_buy_mwh",
+                "da_precommit_da_postlock_candidate_total_locked_sell_mwh",
+                "da_precommit_da_postlock_failed_timestamp_utc",
+                "da_precommit_da_postlock_failed_candidate_buy_mw",
+                "da_precommit_da_postlock_failed_candidate_sell_mw",
+                "da_precommit_da_postlock_failed_locked_buy_mwh_t",
+                "da_precommit_da_postlock_failed_locked_sell_mwh_t",
+                "da_precommit_da_postlock_failed_total_locked_buy_mwh",
+                "da_precommit_da_postlock_failed_total_locked_sell_mwh",
+                "da_precommit_da_postlock_failed_soc_before_mwh",
+                "da_precommit_da_postlock_failed_soc_after_mwh",
+                "da_precommit_da_postlock_failed_soc_min_mwh",
+                "da_precommit_da_postlock_failed_soc_max_mwh",
+                "da_precommit_da_postlock_failed_power_stack_mw",
+                "da_precommit_da_postlock_failed_power_limit_mw",
+                "da_precommit_da_postlock_failed_reason_detail",
                 "da_precommit_candidate_predicted_pnl_excl_terminal_eur",
                 "da_precommit_incumbent_predicted_pnl_excl_terminal_eur",
                 "da_precommit_gross_spread_eur",
@@ -13777,14 +14419,22 @@ class BatteryBacktester:
                     else pd.Series("", index=out.index, dtype=object)
                 )
                 selected_incumbent = (
-                    out["da_precommit_selected_incumbent"].fillna("").astype(str).str.strip()
-                    if "da_precommit_selected_incumbent" in out.columns
-                    else pd.Series("", index=out.index, dtype=object)
+                    out["da_precommit_final_selected_incumbent"].fillna("").astype(str).str.strip()
+                    if "da_precommit_final_selected_incumbent" in out.columns
+                    else (
+                        out["da_precommit_selected_incumbent"].fillna("").astype(str).str.strip()
+                        if "da_precommit_selected_incumbent" in out.columns
+                        else pd.Series("", index=out.index, dtype=object)
+                    )
                 )
                 selection_reason = (
                     out["da_precommit_selection_reason"].fillna("").astype(str).str.strip()
                     if "da_precommit_selection_reason" in out.columns
-                    else pd.Series("", index=out.index, dtype=object)
+                    else (
+                        out["da_precommit_da_zero_reason"].fillna("").astype(str).str.strip()
+                        if "da_precommit_da_zero_reason" in out.columns
+                        else pd.Series("", index=out.index, dtype=object)
+                    )
                 )
                 realized_nonzero = realized_buy.abs().gt(1e-9) | realized_sell.abs().gt(1e-9)
                 missing_origin = (
@@ -17615,6 +18265,12 @@ class BatteryBacktester:
         summary["da_precommit_gross_spread_reconciliation_error_max_eur"] = float(
             da_gross_replay_error_abs.max() if len(da_gross_replay_error_abs) else 0.0
         )
+        summary.update(
+            self._audit_da_postlock_rejection_diagnostics(
+                hourly,
+                timestamp_col=colmap.timestamp,
+            )
+        )
         bcm_requested_q = _summary_str_series("real_bcm_requested_quantile", "bcm_requested_quantile")
         bcm_selected_q = _summary_str_series("real_bcm_selected_quantile", "bcm_selected_quantile")
         bem_requested_q = _summary_str_series("real_bem_requested_quantile", "bem_requested_quantile")
@@ -17719,6 +18375,8 @@ class BatteryBacktester:
                 invalid_reasons.append("da_quantile_fallback")
             if float(summary.get("da_precommit_cashflow_replay_error_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_precommit_cashflow_replay_error")
+            if float(summary.get("missing_da_postlock_rejection_diagnostics_count", 0.0)) > 0.5:
+                invalid_reasons.append("missing_da_postlock_rejection_diagnostics")
             if float(summary.get("bcm_quantile_fallback_count", 0.0)) > 0.5:
                 invalid_reasons.append("bcm_quantile_fallback")
             if float(summary.get("bem_quantile_fallback_count", 0.0)) > 0.5:

@@ -18,6 +18,12 @@ MODEL_SPECS = {
     "reserve_bid_derate": 1.0,
     "max_reserve_bid_mw": None,
     "final_soc_mode": "terminal_repair",
+    # DA postlock guard:
+    # - recoverability_aware rejects hard local infeasibility but allows terminal
+    #   shortfall that can be recovered by future DA/ID/terminal recourse.
+    # - strict_no_future_action reproduces the legacy static no-action projection.
+    "da_postlock_guard_mode": "recoverability_aware",
+    "da_postlock_hard_projection_until": "next_recovery_opportunity",
 }
 MODEL_SPECS["optimization_step_min"] = int(MODEL_SPECS["time_step_hours"] * 60)
 

@@ -296,6 +296,7 @@ def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, t
         "final_soc_",
         "pnl_reconciliation_",
         "da_precommit_",
+        "da_postlock_",
         "da_candidate_",
         "da_source_",
         "da_lockbook_",
