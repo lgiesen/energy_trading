@@ -8982,6 +8982,35 @@ def test_terminal_id_recovery_room_cap_allows_same_hour_aux_buffer_at_soc_max() 
     assert float(diag["terminal_repair_projected_final_soc_after_repair_mwh"]) >= 10.0 - 1e-9
 
 
+def test_terminal_id_recovery_aux_buffer_not_double_counted() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    projection_before = 9.8
+    safety = 0.10
+    known_future_aux = 0.04
+    recovery_hour_aux = 0.095
+
+    diag = bt._schedule_terminal_id_recovery(
+        projected_terminal_soc_without_new_id_mwh=projection_before,
+        current_soc_mwh=9.5,
+        terminal_soc_target_mwh=10.0,
+        residual_charge_mw=2.0,
+        terminal_soc_safety_margin_mwh=safety,
+        terminal_repair_known_future_aux_mwh=known_future_aux,
+        terminal_repair_recovery_aux_mwh=recovery_hour_aux,
+    )
+
+    expected_internal = 10.0 + safety + known_future_aux + recovery_hour_aux - projection_before
+    assert float(diag["terminal_repair_required_internal_mwh"]) == pytest.approx(expected_internal)
+    assert float(diag["terminal_recovery_recovery_hour_aux_mwh"]) == pytest.approx(recovery_hour_aux)
+    assert float(diag["terminal_recovery_recovery_induced_aux_mwh"]) == pytest.approx(0.0)
+    assert float(diag["terminal_soc_id_recourse_scheduled_grid_mwh"]) == pytest.approx(
+        expected_internal / bt.eta_in
+    )
+    assert float(diag["terminal_repair_projected_final_soc_after_repair_mwh"]) >= 10.0 + safety - 1e-9
+
+
 def test_terminal_id_recovery_schedules_grid_buy_without_aux() -> None:
     bt = _mk_backtester()
     bt.eta_in = 0.95
@@ -11223,6 +11252,46 @@ def test_da_bcm_gate_uses_berlin_time_and_next_local_delivery_day() -> None:
     assert summer_end_local == pd.Timestamp("2025-07-03T00:00:00", tz="Europe/Berlin")
     assert summer_start_utc == pd.Timestamp("2025-07-01T22:00:00Z")
     assert summer_end_utc == pd.Timestamp("2025-07-02T22:00:00Z")
+
+
+def test_da_gate_delivery_window_rejects_same_day_targets() -> None:
+    bt = _mk_backtester()
+    snapshot = pd.Timestamp("2025-10-22T09:00:00Z")  # 11:00 Europe/Berlin, still CEST.
+
+    window = bt._da_delivery_window_for_snapshot(snapshot, da_bid_hour_local=11)
+    assert window["is_gate"] is True
+    assert window["delivery_start_local"] == pd.Timestamp("2025-10-23T00:00:00", tz="Europe/Berlin")
+    assert window["delivery_end_local"] == pd.Timestamp("2025-10-24T00:00:00", tz="Europe/Berlin")
+
+    # Same local day as the gate snapshot: not bidable for DA.
+    assert not bt._is_da_target_allowed(
+        snapshot,
+        pd.Timestamp("2025-10-22T10:00:00Z"),  # 12:00 Europe/Berlin
+        da_bid_hour_local=11,
+    )
+    # Next local delivery day 00:00 through 23:00: bidable.
+    assert bt._is_da_target_allowed(
+        snapshot,
+        pd.Timestamp("2025-10-22T22:00:00Z"),  # 2025-10-23 00:00 Europe/Berlin
+        da_bid_hour_local=11,
+    )
+    assert bt._is_da_target_allowed(
+        snapshot,
+        pd.Timestamp("2025-10-23T21:00:00Z"),  # 2025-10-23 23:00 Europe/Berlin
+        da_bid_hour_local=11,
+    )
+    # Following local day boundary: outside the DA delivery window.
+    assert not bt._is_da_target_allowed(
+        snapshot,
+        pd.Timestamp("2025-10-23T22:00:00Z"),  # 2025-10-24 00:00 Europe/Berlin
+        da_bid_hour_local=11,
+    )
+    # Outside 11:00 local gate: no new DA target is bidable.
+    assert not bt._is_da_target_allowed(
+        pd.Timestamp("2025-10-22T08:00:00Z"),  # 10:00 Europe/Berlin
+        pd.Timestamp("2025-10-22T22:00:00Z"),
+        da_bid_hour_local=11,
+    )
 
 
 def test_da_bcm_candidate_gate_window_masks_are_applied_before_solve(

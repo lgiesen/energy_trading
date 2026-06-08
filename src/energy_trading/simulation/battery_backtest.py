@@ -8876,15 +8876,31 @@ class BatteryBacktester:
         # Single-source safety handling: safety is added once here and nowhere else.
         shortfall_before_aux = max(0.0, target_with_safety_mwh - float(projected_terminal_soc_without_new_id_mwh))
         known_future_aux_mwh = max(0.0, float(terminal_repair_known_future_aux_mwh))
-        recovery_aux_mwh = max(0.0, float(terminal_repair_recovery_aux_mwh))
-        required_additional_internal = shortfall_before_aux + known_future_aux_mwh + recovery_aux_mwh
+        # This is the battery-supplied auxiliary energy in the recovery hour.
+        # It is included once in the required internal recovery and once in the
+        # SoC max room cap because the aux is subtracted after the ID buy.
+        recovery_hour_aux_mwh = max(0.0, float(terminal_repair_recovery_aux_mwh))
+        recovery_induced_aux_mwh = 0.0
+        recovery_aux_mwh = recovery_hour_aux_mwh + recovery_induced_aux_mwh
+        required_additional_internal = max(
+            0.0,
+            target_mwh
+            + safety_buffer_mwh
+            + known_future_aux_mwh
+            + recovery_hour_aux_mwh
+            + recovery_induced_aux_mwh
+            - float(projected_terminal_soc_without_new_id_mwh),
+        )
         provisional_internal = max(0.0, float(provisional_scheduled_internal_mwh))
         # Recovery-hour auxiliary load is battery-supplied and is subtracted in
         # the same settlement hour. Allowing that aux in the room cap prevents
         # sizing recovery to hit the target before aux and ending at target-aux.
         room_internal = max(
             0.0,
-            float(self.soc_max) + recovery_aux_mwh - (float(current_soc_mwh) + provisional_internal),
+            float(self.soc_max)
+            + recovery_hour_aux_mwh
+            + recovery_induced_aux_mwh
+            - (float(current_soc_mwh) + provisional_internal),
         )
         available_additional_internal = (
             max(0.0, float(residual_charge_mw)) * float(self.dt_h) * max(float(self.eta_in), 1e-12)
@@ -8953,8 +8969,8 @@ class BatteryBacktester:
             "terminal_recovery_known_future_aux_mwh": float(known_future_aux_mwh),
             "terminal_recovery_remaining_known_future_aux_mwh": float(known_future_aux_mwh),
             "terminal_recovery_recovery_aux_mwh": float(recovery_aux_mwh),
-            "terminal_recovery_recovery_hour_aux_mwh": float(recovery_aux_mwh),
-            "terminal_recovery_recovery_induced_aux_mwh": float(recovery_aux_mwh),
+            "terminal_recovery_recovery_hour_aux_mwh": float(recovery_hour_aux_mwh),
+            "terminal_recovery_recovery_induced_aux_mwh": float(recovery_induced_aux_mwh),
             "terminal_recovery_safety_buffer_mwh": float(safety_buffer_mwh),
             "terminal_repair_projected_final_soc_before_repair_mwh": float(projected_terminal_soc_without_new_id_mwh),
             "terminal_repair_projected_final_soc_after_repair_mwh": float(projected_after),
@@ -10360,6 +10376,63 @@ class BatteryBacktester:
         start_local = (pd.Timestamp(snap).tz_convert("Europe/Berlin") + pd.Timedelta(days=1)).normalize()
         end_local = start_local + pd.Timedelta(days=1)
         return start_local, end_local, start_local.tz_convert("UTC"), end_local.tz_convert("UTC")
+
+    @classmethod
+    def _da_delivery_window_for_snapshot(
+        cls,
+        snapshot_ts_utc: pd.Timestamp,
+        *,
+        timezone_name: str = "Europe/Berlin",
+        da_bid_hour_local: int = 11,
+    ) -> dict[str, object]:
+        """Canonical DA gate and D+1 local delivery-window rule.
+
+        DA bids are created only at the configured local gate hour for the next
+        Europe/Berlin local delivery day [00:00, 24:00). The returned UTC
+        timestamps are the canonical indexing keys used by the optimizer and
+        lockbook.
+        """
+        snap = pd.to_datetime(snapshot_ts_utc, utc=True, errors="coerce")
+        if pd.isna(snap):
+            return {
+                "is_gate": False,
+                "delivery_start_local": pd.NaT,
+                "delivery_end_local": pd.NaT,
+                "delivery_start_utc": pd.NaT,
+                "delivery_end_utc": pd.NaT,
+            }
+        snap_local = pd.Timestamp(snap).tz_convert(timezone_name)
+        start_local = (snap_local + pd.Timedelta(days=1)).normalize()
+        end_local = start_local + pd.Timedelta(days=1)
+        return {
+            "is_gate": bool(int(snap_local.hour) == int(da_bid_hour_local) and int(snap_local.minute) == 0),
+            "delivery_start_local": start_local,
+            "delivery_end_local": end_local,
+            "delivery_start_utc": start_local.tz_convert("UTC"),
+            "delivery_end_utc": end_local.tz_convert("UTC"),
+        }
+
+    @classmethod
+    def _is_da_target_allowed(
+        cls,
+        snapshot_ts_utc: pd.Timestamp,
+        target_ts_utc: pd.Timestamp,
+        *,
+        timezone_name: str = "Europe/Berlin",
+        da_bid_hour_local: int = 11,
+    ) -> bool:
+        window = cls._da_delivery_window_for_snapshot(
+            snapshot_ts_utc,
+            timezone_name=timezone_name,
+            da_bid_hour_local=da_bid_hour_local,
+        )
+        if not bool(window["is_gate"]):
+            return False
+        target = pd.to_datetime(target_ts_utc, utc=True, errors="coerce")
+        if pd.isna(target):
+            return False
+        target_local = pd.Timestamp(target).tz_convert(timezone_name)
+        return bool(window["delivery_start_local"] <= target_local < window["delivery_end_local"])
 
     def _update_afrr_capacity_lockbooks_from_snapshot(
         self,
@@ -12569,11 +12642,11 @@ class BatteryBacktester:
             reserve_retry_infeasible_after_zero_reserve = 0.0
             disable_new_bcm_reserve_bids_used = float(self.disable_new_bcm_reserve_bids)
             snapshot_current_ts = pd.to_datetime(snapshot_ts, utc=True, errors="coerce") if forecast_warehouse else pd.to_datetime(window.iloc[0][colmap.timestamp], utc=True, errors="coerce")
-            da_gate_valid_for_snapshot = bool(
-                da_enabled
-                and pd.notna(snapshot_current_ts)
-                and self._is_local_bid_hour(snapshot_current_ts, int(da_bid_hour_local))
+            da_window_info = self._da_delivery_window_for_snapshot(
+                snapshot_current_ts,
+                da_bid_hour_local=int(da_bid_hour_local),
             )
+            da_gate_valid_for_snapshot = bool(da_enabled and bool(da_window_info["is_gate"]))
             da_delivery_start_utc: pd.Timestamp | None = None
             da_delivery_end_utc: pd.Timestamp | None = None
             da_delivery_start_local: pd.Timestamp | None = None
@@ -12623,18 +12696,21 @@ class BatteryBacktester:
                 elif self.bem_gate_mode == "disabled":
                     bem_gate_valid_for_row = np.zeros(len(window), dtype=bool)
             if bool(da_enabled) and pd.notna(snapshot_current_ts):
-                delivery_start_local, delivery_end_local, delivery_start_utc, delivery_end_utc = (
-                    self._next_berlin_delivery_day_window(snapshot_current_ts)
+                da_delivery_start_local = da_window_info["delivery_start_local"]
+                da_delivery_end_local = da_window_info["delivery_end_local"]
+                da_delivery_start_utc = da_window_info["delivery_start_utc"]
+                da_delivery_end_utc = da_window_info["delivery_end_utc"]
+                da_delivery_mask = np.array(
+                    [
+                        self._is_da_target_allowed(
+                            snapshot_current_ts,
+                            tsw,
+                            da_bid_hour_local=int(da_bid_hour_local),
+                        )
+                        for tsw in window_ts_for_da_gate
+                    ],
+                    dtype=bool,
                 )
-                da_delivery_start_local = delivery_start_local
-                da_delivery_end_local = delivery_end_local
-                da_delivery_start_utc = delivery_start_utc
-                da_delivery_end_utc = delivery_end_utc
-                target_local_da = pd.Series(window_ts_for_da_gate, index=window.index).dt.tz_convert("Europe/Berlin")
-                da_delivery_mask = (
-                    (target_local_da >= delivery_start_local)
-                    & (target_local_da < delivery_end_local)
-                ).fillna(False).to_numpy(dtype=bool)
             if bool(perms.allow_bcm) and pd.notna(snapshot_current_ts):
                 delivery_start_local, delivery_end_local, delivery_start_utc, delivery_end_utc = (
                     self._next_berlin_delivery_day_window(snapshot_current_ts)
@@ -13340,11 +13416,54 @@ class BatteryBacktester:
                 window.get("_disable_da_bid", pd.Series(0.0, index=window.index)),
                 errors="coerce",
             ).fillna(0.0).iloc[: len(snapshot_plan)].to_numpy(dtype=float)
-            snapshot_plan["da_candidate_allowed_by_gate_window"] = 1.0 - da_disable_for_plan
+            target_local_for_da = snapshot_plan["target_time_utc"].dt.tz_convert("Europe/Berlin")
+            snapshot_local_for_da = (
+                pd.NaT
+                if pd.isna(snapshot_current_ts)
+                else pd.Timestamp(snapshot_current_ts).tz_convert("Europe/Berlin")
+            )
+            canonical_da_allowed_for_plan = np.array(
+                [
+                    self._is_da_target_allowed(
+                        snapshot_current_ts,
+                        tsw,
+                        da_bid_hour_local=int(da_bid_hour_local),
+                    )
+                    for tsw in snapshot_plan["target_time_utc"]
+                ],
+                dtype=bool,
+            )
+            same_day_target_for_plan = np.zeros(len(snapshot_plan), dtype=bool)
+            if pd.notna(snapshot_local_for_da):
+                same_day_target_for_plan = (
+                    target_local_for_da.dt.date.to_numpy()
+                    == pd.Timestamp(snapshot_local_for_da).date()
+                )
+            outside_next_day_for_plan = np.array(
+                [
+                    bool(
+                        pd.notna(tsw)
+                        and pd.notna(da_delivery_start_utc)
+                        and pd.notna(da_delivery_end_utc)
+                        and not (pd.Timestamp(da_delivery_start_utc) <= pd.Timestamp(tsw) < pd.Timestamp(da_delivery_end_utc))
+                    )
+                    for tsw in snapshot_plan["target_time_utc"]
+                ],
+                dtype=bool,
+            )
+            snapshot_plan["da_candidate_allowed_by_gate_window"] = canonical_da_allowed_for_plan.astype(float)
             snapshot_plan["da_candidate_disabled_reason"] = np.where(
-                da_disable_for_plan > 0.5,
-                "outside_da_gate_window",
+                canonical_da_allowed_for_plan,
                 "none",
+                np.where(
+                    not bool(da_gate_valid_for_snapshot),
+                    "outside_da_gate",
+                    np.where(
+                        same_day_target_for_plan,
+                        "same_day_not_bidable",
+                        "outside_next_day_delivery_window",
+                    ),
+                ),
             )
             snapshot_plan["raw_optimizer_charge_mw_before_da_gate_mask"] = snapshot_plan.get(
                 "raw_optimizer_charge_mw_before_da_gate_mask",
@@ -13360,9 +13479,20 @@ class BatteryBacktester:
                     + pd.to_numeric(snapshot_plan["discharge_mw"], errors="coerce").fillna(0.0).abs()
                 )
                 .gt(1e-9)
-                & pd.Series(da_disable_for_plan, index=snapshot_plan.index).gt(0.5)
+                & pd.Series(~canonical_da_allowed_for_plan, index=snapshot_plan.index)
+                & pd.to_numeric(snapshot_plan["da_bid_locked"], errors="coerce").fillna(0.0).lt(0.5)
+            ).astype(float)
+            snapshot_plan["da_same_day_target_allowed_error"] = (
+                pd.Series(same_day_target_for_plan, index=snapshot_plan.index)
+                & pd.Series(canonical_da_allowed_for_plan, index=snapshot_plan.index)
+            ).astype(float)
+            snapshot_plan["da_outside_delivery_window_allowed_error"] = (
+                pd.Series(outside_next_day_for_plan, index=snapshot_plan.index)
+                & pd.Series(canonical_da_allowed_for_plan, index=snapshot_plan.index)
             ).astype(float)
             snapshot_plan["da_gate_valid"] = float(da_gate_valid_for_snapshot)
+            snapshot_plan["source_snapshot_is_da_gate"] = float(da_gate_valid_for_snapshot)
+            snapshot_plan["current_row_is_da_gate"] = target_local_for_da.dt.hour.eq(int(da_bid_hour_local)).astype(float)
             snapshot_plan["da_bid_source_snapshot_utc"] = (
                 "" if pd.isna(snapshot_current_ts) else pd.Timestamp(snapshot_current_ts).isoformat()
             )
@@ -13377,12 +13507,16 @@ class BatteryBacktester:
             snapshot_plan["da_delivery_end_utc"] = (
                 "" if da_delivery_end_utc is None else pd.Timestamp(da_delivery_end_utc).isoformat()
             )
+            snapshot_plan["da_gate_delivery_start_utc"] = snapshot_plan["da_delivery_start_utc"]
+            snapshot_plan["da_gate_delivery_end_utc"] = snapshot_plan["da_delivery_end_utc"]
             snapshot_plan["da_delivery_start_local"] = (
                 "" if da_delivery_start_local is None else pd.Timestamp(da_delivery_start_local).isoformat()
             )
             snapshot_plan["da_delivery_end_local"] = (
                 "" if da_delivery_end_local is None else pd.Timestamp(da_delivery_end_local).isoformat()
             )
+            snapshot_plan["da_gate_delivery_start_local"] = snapshot_plan["da_delivery_start_local"]
+            snapshot_plan["da_gate_delivery_end_local"] = snapshot_plan["da_delivery_end_local"]
             snapshot_plan["da_outside_gate_skipped"] = float(bool(da_enabled) and not bool(da_gate_valid_for_snapshot))
             snapshot_plan["da_gate_violation"] = 0.0
             snapshot_plan["optimization_fallback"] = optimization_fallback
@@ -13552,14 +13686,30 @@ class BatteryBacktester:
                 continue
 
             # Lock-in DA bids at gate closure for the next Europe/Berlin local day.
-            if da_enabled and pd.notna(snapshot_plan["snapshot_time_utc"].iloc[0]) and self._is_local_bid_hour(pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True), da_bid_hour_local):
+            if da_enabled and pd.notna(snapshot_plan["snapshot_time_utc"].iloc[0]) and bool(
+                self._da_delivery_window_for_snapshot(
+                    pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True),
+                    da_bid_hour_local=int(da_bid_hour_local),
+                )["is_gate"]
+            ):
                 snapshot_ts_effective = pd.to_datetime(snapshot_plan["snapshot_time_utc"].iloc[0], utc=True)
-                da_delivery_start_local, da_delivery_end_local, da_delivery_start_utc, da_delivery_end_utc = (
-                    self._next_berlin_delivery_day_window(snapshot_ts_effective)
+                da_win = self._da_delivery_window_for_snapshot(
+                    snapshot_ts_effective,
+                    da_bid_hour_local=int(da_bid_hour_local),
+                )
+                da_delivery_start_local = da_win["delivery_start_local"]
+                da_delivery_end_local = da_win["delivery_end_local"]
+                da_delivery_start_utc = da_win["delivery_start_utc"]
+                da_delivery_end_utc = da_win["delivery_end_utc"]
+                canonical_lock_mask = snapshot_plan["target_time_utc"].map(
+                    lambda ts: self._is_da_target_allowed(
+                        snapshot_ts_effective,
+                        ts,
+                        da_bid_hour_local=int(da_bid_hour_local),
+                    )
                 )
                 lock_rows = snapshot_plan[
-                    (snapshot_plan["target_time_utc"] >= da_delivery_start_utc)
-                    & (snapshot_plan["target_time_utc"] < da_delivery_end_utc)
+                    canonical_lock_mask.fillna(False).astype(bool)
                 ]
                 accepted_da, da_audit_rows = self._select_feasible_da_lock_schedule(
                     lock_rows=lock_rows,
@@ -14504,7 +14654,7 @@ class BatteryBacktester:
                             id_discharge_mw=0.0,
                             act_pos_mwh=max(0.0, fut_rate_pos) * (fut_res_pos + fut_bem_pos) * self.dt_h,
                             act_neg_mwh=max(0.0, fut_rate_neg) * (fut_res_neg + fut_bem_neg) * self.dt_h,
-                            aux_mwh=0.0,
+                            aux_mwh=float(fut_aux_mwh),
                             battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
                             dt_h=self.dt_h,
                         )
@@ -14517,7 +14667,10 @@ class BatteryBacktester:
                     existing_recovery_diag = self._terminal_recovery_remaining_shortfall_after_existing(
                         projected_terminal_soc_without_new_recovery_mwh=float(projected_terminal_without_new_id),
                         existing_scheduled_terminal_recovery_internal_mwh=float(existing_terminal_recovery_internal_mwh),
-                        known_future_aux_mwh=float(remaining_known_losses_mwh),
+                        # projected_terminal_without_new_id already includes
+                        # the modeled future auxiliary losses above. Passing
+                        # them here again would double-subtract aux.
+                        known_future_aux_mwh=0.0,
                         terminal_soc_target_mwh=float(self.soc_target_end),
                         safety_buffer_mwh=float(self.terminal_id_recovery_safety_mwh),
                     )
@@ -19398,9 +19551,29 @@ class BatteryBacktester:
             ).fillna(0.0)
             summary["da_candidate_gate_window_violation_count"] = float(ph_da_candidate_violation.gt(0.5).sum())
             summary["bcm_candidate_gate_window_violation_count"] = float(ph_bcm_candidate_violation.gt(0.5).sum())
+            summary["da_same_day_target_allowed_error_count"] = float(
+                pd.to_numeric(
+                    plan_history.get("da_same_day_target_allowed_error", 0.0),
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .gt(0.5)
+                .sum()
+            )
+            summary["da_outside_delivery_window_allowed_error_count"] = float(
+                pd.to_numeric(
+                    plan_history.get("da_outside_delivery_window_allowed_error", 0.0),
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .gt(0.5)
+                .sum()
+            )
         else:
             summary["da_candidate_gate_window_violation_count"] = 0.0
             summary["bcm_candidate_gate_window_violation_count"] = 0.0
+            summary["da_same_day_target_allowed_error_count"] = 0.0
+            summary["da_outside_delivery_window_allowed_error_count"] = 0.0
         bcm_submitted_pos = _summary_num_series("real_submitted_bcm_capacity_pos_mw", "submitted_bcm_capacity_pos_mw")
         bcm_submitted_neg = _summary_num_series("real_submitted_bcm_capacity_neg_mw", "submitted_bcm_capacity_neg_mw")
         bcm_locked_pos = _summary_num_series("real_locked_bcm_capacity_pos_mw", "locked_bcm_capacity_pos_mw")
@@ -19517,6 +19690,10 @@ class BatteryBacktester:
                 invalid_reasons.append("da_gate_violation")
             if float(summary.get("da_candidate_gate_window_violation_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_candidate_gate_window_violation")
+            if float(summary.get("da_same_day_target_allowed_error_count", 0.0)) > 0.5:
+                invalid_reasons.append("da_same_day_target_allowed_error")
+            if float(summary.get("da_outside_delivery_window_allowed_error_count", 0.0)) > 0.5:
+                invalid_reasons.append("da_outside_delivery_window_allowed_error")
             if float(summary.get("da_quantile_fallback_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_quantile_fallback")
             if float(summary.get("da_precommit_cashflow_replay_error_count", 0.0)) > 0.5:

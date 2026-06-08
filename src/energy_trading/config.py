@@ -43,35 +43,31 @@ BATTERY_SPECS = {
     "soc_target_end": 0.5,  # Cyclic neutrality target (SoC_0 ~= SoC_T)
 
     # Costs
-    "degradation_cost": 0.0,  # EUR/MWh internal throughput
+    "degradation_cost": 7.5,  # EUR/MWh internal throughput
     # State-dependent auxiliary duty-cycle model (recommended):
     # OFF -> STANDBY -> TRADING -> aFRR_ACTIVE
     # Duty values are multipliers of aux_power_peak_mw.
     # Example: duty=0.95 means 95% of aux_power_peak_mw (not 0.95 MW absolute).
     "aux_power_mode": "state_dependent",  # "state_dependent" | "constant"
 
-    # Source-derived for a 10 MW / 20 MWh, 2-hour Li-ion BESS:
-    # Aurecon/AEMO Table 9-1 gives operating auxiliary load = 0.95% of gross power.
-    # 10 MW * 0.0095 = 0.095 MW = 95 kW.
-    "aux_power_peak_mw": 0.095,
+    # Aux peak is configured so state duties realize the intended hourly
+    # auxiliary energy directly at dt_h=1:
+    # standby=0.035 MWh/h, trading=0.050 MWh/h, aFRR active=0.050 MWh/h.
+    "aux_power_peak_mw": 0.05,
 
-    # Source-derived standby:
-    # Aurecon/AEMO Table 9-1 gives standby auxiliary load = 0.30% of gross power.
-    # 10 MW * 0.003 = 0.030 MW = 30 kW.
-    # As fraction of aux_power_peak_mw: 0.030 / 0.095 = 0.3158.
-    "aux_power_standby_duty": 0.316,
+    # 0.05 MW * 0.70 * 1h = 0.035 MWh/h standby auxiliary energy.
+    "aux_power_standby_duty": 0.70,
 
-    # Trading duty = full operating auxiliary load.
-    # This maps charging/discharging operation to the source's "operating" auxiliary load.
+    # 0.05 MW * 1.00 * 1h = 0.050 MWh/h trading auxiliary energy.
     "aux_power_trading_duty": 1.00,
 
-    # aFRR active duty = full operating auxiliary load.
-    # Do not use a higher value unless you explicitly label it as a sensitivity assumption.
+    # 0.05 MW * 1.00 * 1h = 0.050 MWh/h aFRR-active auxiliary energy.
     "aux_power_afrr_active_duty": 1.00,
 
     # Use 0 only if "off duty" means no auxiliary cost allocated to market operation.
     # Physically, an energized site would still have some parasitic load.
-    "aux_power_off_duty": 0.00,
+    # BMS, Kommunikation, Heizung/Kühlung und Sicherheitssysteme
+    "aux_power_off_duty": 0.02,
 }
 BATTERY_SPECS["efficiency_rt"] = BATTERY_SPECS["efficiency_in"] * BATTERY_SPECS["efficiency_out"]
 

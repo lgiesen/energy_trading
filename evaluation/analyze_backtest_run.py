@@ -7,6 +7,7 @@ Usage:
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_da_short
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_da_mid_no_id
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_bcm_mid
+  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_bcm_mid_p70
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_bem_mid
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_multi_mid
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_afrr_mid

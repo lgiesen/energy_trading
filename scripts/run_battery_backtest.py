@@ -84,9 +84,18 @@ FORECAST_COVERAGE_SCHEMA_VERSION = "forecast_coverage_preflight_v1"
 def _to_utc_ts(value: object) -> pd.Timestamp | None:
     if value is None or value == "":
         return None
-    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="raise")
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid timestamp {value!r}. Use an ISO-8601 UTC timestamp, "
+            "for example 2025-10-19T10:00:00Z."
+        ) from exc
     if pd.isna(ts):
-        return None
+        raise ValueError(
+            f"Invalid timestamp {value!r}. Use an ISO-8601 UTC timestamp, "
+            "for example 2025-10-19T10:00:00Z."
+        )
     return pd.Timestamp(ts)
 
 
@@ -119,7 +128,7 @@ def _resolve_simulation_eval_window(
             )
             effective_end = upper_bound
             reasons.append("end_above_common_upper_bound")
-    if effective_start > effective_end:
+    if effective_start >= effective_end:
         raise ValueError(
             "Effective simulation window is empty after applying bounds: "
             f"effective_start={effective_start.isoformat()}, effective_end={effective_end.isoformat()}"
@@ -139,6 +148,87 @@ def _resolve_simulation_eval_window(
         "simulation_window_days": float(window_hours / 24.0),
         "simulation_window_hours": float(window_hours),
         "warnings": warnings,
+    }
+
+
+def _infer_timestamp_step_utc(timestamps: pd.Series | pd.DatetimeIndex) -> pd.Timedelta:
+    simulation_step = pd.Timedelta(hours=1)
+    ts = pd.to_datetime(timestamps, utc=True, errors="coerce").dropna()
+    if len(ts) < 2:
+        return simulation_step
+    idx = pd.DatetimeIndex(ts).sort_values().unique()
+    diffs = pd.Series(idx[1:].asi8 - idx[:-1].asi8)
+    diffs = diffs[diffs > 0]
+    if diffs.empty:
+        return simulation_step
+    # The backtest evaluates hourly target timestamps. Long-format forecast
+    # frames can contain non-hourly timestamp artifacts; those must not redefine
+    # the simulation grid.
+    step_ns = int(diffs.mode().iloc[0] if not diffs.mode().empty else diffs.median())
+    step = pd.Timedelta(step_ns, unit="ns")
+    return step if step == simulation_step else simulation_step
+
+
+def _timestamp_aligned_to_grid(ts: pd.Timestamp, *, origin: pd.Timestamp, step: pd.Timedelta) -> bool:
+    if step <= pd.Timedelta(0):
+        return False
+    return int((pd.Timestamp(ts).value - pd.Timestamp(origin).value) % int(step.value)) == 0
+
+
+def _validate_eval_window_against_data(
+    *,
+    df: pd.DataFrame,
+    timestamp_col: str,
+    effective_start_utc: pd.Timestamp,
+    effective_end_utc: pd.Timestamp,
+    split: str,
+) -> dict[str, object]:
+    if timestamp_col not in df.columns:
+        raise ValueError(f"timestamp_validation_failed: missing timestamp column {timestamp_col!r}.")
+    ts = pd.to_datetime(df[timestamp_col], utc=True, errors="coerce").dropna()
+    if ts.empty:
+        raise ValueError(
+            f"timestamp_validation_failed: split={split!r} has no finite timestamps in column {timestamp_col!r}."
+        )
+    idx = pd.DatetimeIndex(ts).sort_values().unique()
+    data_min = pd.Timestamp(idx[0])
+    data_max = pd.Timestamp(idx[-1])
+    step = _infer_timestamp_step_utc(idx)
+    exclusive_end_max = data_max + step
+    start = pd.Timestamp(effective_start_utc)
+    end = pd.Timestamp(effective_end_utc)
+    start_aligned = _timestamp_aligned_to_grid(start, origin=data_min, step=step)
+    end_aligned = _timestamp_aligned_to_grid(end, origin=data_min, step=step)
+    if not start_aligned:
+        raise ValueError(
+            "invalid_simulation_start_timestamp: "
+            f"start={start.isoformat()} is not aligned to the hourly simulation grid in split={split!r}. "
+            f"available_range=[{data_min.isoformat()}, {data_max.isoformat()}], "
+            f"inferred_step={step}."
+        )
+    if not end_aligned:
+        raise ValueError(
+            "invalid_simulation_end_timestamp: "
+            f"end={end.isoformat()} is not aligned to the hourly simulation grid in split={split!r}. "
+            f"available_range=[{data_min.isoformat()}, {data_max.isoformat()}], "
+            f"max_exclusive_end={exclusive_end_max.isoformat()}, inferred_step={step}."
+        )
+    if start < data_min or start > data_max:
+        raise ValueError(
+            "simulation_start_outside_split: "
+            f"start={start.isoformat()}, available_range=[{data_min.isoformat()}, {data_max.isoformat()}]."
+        )
+    if end <= data_min or end > exclusive_end_max:
+        raise ValueError(
+            "simulation_end_outside_split: "
+            f"end={end.isoformat()}, allowed_end_range=({data_min.isoformat()}, {exclusive_end_max.isoformat()}]."
+        )
+    return {
+        "simulation_timestamp_validation_pass": 1.0,
+        "simulation_timestamp_data_min_utc": data_min.isoformat(),
+        "simulation_timestamp_data_max_utc": data_max.isoformat(),
+        "simulation_timestamp_max_exclusive_end_utc": exclusive_end_max.isoformat(),
+        "simulation_timestamp_inferred_step_seconds": float(step.total_seconds()),
     }
 
 
@@ -3652,6 +3742,14 @@ def main() -> None:
                 coverage_max=coverage_max,
             )
             print(f"[INFO] Simulation input cache written: {input_cache_path}")
+    timestamp_validation = _validate_eval_window_against_data(
+        df=df,
+        timestamp_col=colmap.timestamp,
+        effective_start_utc=effective_start_utc,
+        effective_end_utc=effective_end_utc,
+        split=str(args.split),
+    )
+    eval_window.update(timestamp_validation)
     forecast_coverage_report_csv, forecast_coverage_report_json, forecast_coverage_summary = _preflight_forecast_coverage(
         forecast_warehouse=forecast_warehouse,
         out_dir=out_dir,
@@ -4418,6 +4516,15 @@ def main() -> None:
             "simulation_window_hours": float(eval_window["simulation_window_hours"]),
             "simulation_window_interval_semantics": "[start,end)",
             "common_eval_window_clamp_enabled": float(not bool(args.disable_common_eval_window_clamp)),
+            "simulation_timestamp_validation_pass": float(eval_window.get("simulation_timestamp_validation_pass", 0.0)),
+            "simulation_timestamp_data_min_utc": str(eval_window.get("simulation_timestamp_data_min_utc", "")),
+            "simulation_timestamp_data_max_utc": str(eval_window.get("simulation_timestamp_data_max_utc", "")),
+            "simulation_timestamp_max_exclusive_end_utc": str(
+                eval_window.get("simulation_timestamp_max_exclusive_end_utc", "")
+            ),
+            "simulation_timestamp_inferred_step_seconds": float(
+                eval_window.get("simulation_timestamp_inferred_step_seconds", 0.0)
+            ),
             "forecast_coverage_report_path": str(forecast_coverage_report_csv or ""),
             "forecast_coverage_report_json_path": str(forecast_coverage_report_json or ""),
             "forecast_coverage_status": str(forecast_coverage_summary.get("status", "")),
