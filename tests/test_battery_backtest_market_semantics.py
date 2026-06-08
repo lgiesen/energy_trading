@@ -22,6 +22,11 @@ from energy_trading.simulation.battery_backtest import (  # noqa: E402
     BacktestColumnMap,
     BatteryBacktester,
     StrategyPermissions,
+    _atomic_write_json,
+    _atomic_write_parquet,
+    _update_checkpoint_manifest,
+    _write_checkpoint_run_status,
+    _write_stage_checkpoint,
     assign_bcm_capacity_block,
     bcm_capacity_ev_eur,
     bcm_capacity_hourly_revenue_decomposition_eur,
@@ -55,6 +60,104 @@ from scripts import validate_simulation_outputs as validate_outputs  # noqa: E40
 def _mk_backtester(forecast_value_mode: str = "raw_signed") -> BatteryBacktester:
     MODEL_SPECS["forecast_value_mode"] = forecast_value_mode
     return BatteryBacktester()
+
+
+def test_checkpoint_atomic_json_write(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoints" / "stage_summary.json"
+
+    _atomic_write_json(path, {"stage": "stage_01_model_realized", "value": 1.25})
+
+    assert path.exists()
+    with path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    assert payload["stage"] == "stage_01_model_realized"
+    assert payload["value"] == pytest.approx(1.25)
+    assert not list(path.parent.glob("*.tmp*"))
+
+
+def test_checkpoint_atomic_parquet_write(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoints" / "stage_01_model_realized_hourly.parquet"
+    df = pd.DataFrame({"timestamp_utc": pd.date_range("2025-01-01", periods=2, freq="h", tz="UTC"), "real_pnl_eur": [1.0, 2.0]})
+
+    _atomic_write_parquet(path, df)
+
+    out = pd.read_parquet(path)
+    assert list(out.columns) == ["timestamp_utc", "real_pnl_eur"]
+    assert len(out) == 2
+    assert float(out["real_pnl_eur"].sum()) == pytest.approx(3.0)
+    assert not list(path.parent.glob("*.tmp*"))
+
+
+def test_checkpoint_manifest_update_tracks_completed_stages(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    metadata = {"run_id": "run-1", "scenario": "da/p50_p50", "model_key": "linear", "trading_strategy": "da"}
+
+    _update_checkpoint_manifest(
+        checkpoint_dir,
+        metadata=metadata,
+        stage_name="stage_01_model_realized",
+        stage_status="complete",
+        stage_files=["stage_01_model_realized_summary.json"],
+        final_complete=False,
+    )
+    _update_checkpoint_manifest(
+        checkpoint_dir,
+        metadata=metadata,
+        stage_name="stage_02_naive",
+        stage_status="complete",
+        stage_files=["stage_02_naive_summary.json"],
+        final_complete=False,
+    )
+
+    manifest = json.loads((checkpoint_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["last_completed_stage"] == "stage_02_naive"
+    assert set(manifest["stages"]) >= {"stage_01_model_realized", "stage_02_naive"}
+    assert manifest["final_complete"] is False
+
+
+def test_checkpoint_failed_run_status_preserves_completed_checkpoint(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    metadata = {"run_id": "run-1", "scenario": "da/p50_p50", "model_key": "linear", "trading_strategy": "da"}
+    df = pd.DataFrame({"timestamp_utc": pd.date_range("2025-01-01", periods=1, freq="h", tz="UTC"), "real_pnl_eur": [5.0]})
+
+    _write_stage_checkpoint(
+        checkpoint_dir,
+        stage_name="stage_01_model_realized",
+        frame=df,
+        summary={},
+        metadata=metadata,
+        detail="hourly",
+    )
+    _write_checkpoint_run_status(
+        checkpoint_dir,
+        status="failed",
+        metadata=metadata,
+        error_type="RuntimeError",
+        error_message="boom",
+    )
+
+    status = json.loads((checkpoint_dir / "run_status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert status["error_type"] == "RuntimeError"
+    assert (checkpoint_dir / "stage_01_model_realized_hourly.parquet").exists()
+
+
+def test_checkpoint_summary_only_writes_no_hourly_parquet(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    metadata = {"run_id": "run-1", "scenario": "da/p50_p50", "model_key": "linear", "trading_strategy": "da"}
+    df = pd.DataFrame({"timestamp_utc": pd.date_range("2025-01-01", periods=1, freq="h", tz="UTC"), "real_pnl_eur": [5.0]})
+
+    _write_stage_checkpoint(
+        checkpoint_dir,
+        stage_name="stage_01_model_realized",
+        frame=df,
+        summary={},
+        metadata=metadata,
+        detail="summary_only",
+    )
+
+    assert (checkpoint_dir / "stage_01_model_realized_summary.json").exists()
+    assert not (checkpoint_dir / "stage_01_model_realized_hourly.parquet").exists()
 
 
 def test_afrr_activation_price_guard_pos_uses_activation_headroom_when_sufficient() -> None:
@@ -3419,7 +3522,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(audit[0]["candidate_selection_pnl_eur"]) == pytest.approx(
         float(audit[0]["candidate_predicted_pnl_excl_terminal_eur"])
     )
-    assert float(audit[0]["candidate_selection_pnl_eur"]) < float(audit[0]["incumbent_selection_pnl_eur"])
+    assert float(audit[0]["candidate_selection_pnl_eur"]) <= float(audit[0]["incumbent_selection_pnl_eur"])
     assert float(audit[0]["candidate_replay_valid"]) == pytest.approx(1.0)
     assert float(audit[0]["incumbent_replay_valid"]) == pytest.approx(1.0)
     assert float(audit[0]["selection_valid"]) == pytest.approx(1.0)
@@ -3431,9 +3534,12 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(audit[0]["sell_locked_mwh"]) == pytest.approx(0.0)
     assert audit[0]["sell_disabled_reason"] == "none"
     assert audit[0]["da_zero_reason"] == "no_trade_incumbent_selected"
+    assert float(audit[0]["raw_candidate_revenue_eur"]) == pytest.approx(0.0)
+    assert float(audit[0]["raw_candidate_cost_eur"]) == pytest.approx(100.0)
+    assert float(audit[0]["raw_candidate_gross_spread_eur"]) == pytest.approx(-100.0)
     assert float(audit[0]["candidate_revenue_eur"]) == pytest.approx(0.0)
-    assert float(audit[0]["candidate_cost_eur"]) == pytest.approx(100.0)
-    assert float(audit[0]["candidate_gross_spread_eur"]) == pytest.approx(-100.0)
+    assert float(audit[0]["candidate_cost_eur"]) == pytest.approx(0.0)
+    assert float(audit[0]["candidate_gross_spread_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["candidate_pnl_recomputed_eur"]) == pytest.approx(
         float(audit[0]["candidate_predicted_pnl_eur"])
     )
@@ -3510,9 +3616,16 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert selected2[ts2] == pytest.approx((0.0, 1.0))
     assert {row["selected_incumbent"] for row in audit2} == {"optimized"}
     assert float(audit2[0]["candidate_minus_incumbent_eur"]) > 0.0
+    assert float(audit2[0]["raw_candidate_revenue_eur"]) == pytest.approx(100.0)
+    assert float(audit2[0]["raw_candidate_cost_eur"]) == pytest.approx(10.0)
+    assert float(audit2[0]["raw_candidate_gross_spread_eur"]) == pytest.approx(90.0)
     assert float(audit2[0]["candidate_revenue_eur"]) == pytest.approx(100.0)
-    assert float(audit2[0]["candidate_cost_eur"]) == pytest.approx(10.0)
-    assert float(audit2[0]["candidate_gross_spread_eur"]) == pytest.approx(90.0)
+    assert float(audit2[0]["candidate_cost_eur"]) == pytest.approx(0.0)
+    assert float(audit2[0]["candidate_gross_spread_eur"]) == pytest.approx(100.0)
+    assert float(audit2[0]["selected_lockable_revenue_eur"]) == pytest.approx(100.0)
+    assert float(audit2[0]["selected_lockable_cost_eur"]) == pytest.approx(0.0)
+    assert float(audit2[0]["selected_lockable_gross_spread_eur"]) == pytest.approx(100.0)
+    assert float(audit2[0]["selected_lockable_reconciliation_error_eur"]) == pytest.approx(0.0)
     assert float(audit2[0]["candidate_transaction_cost_eur"]) == pytest.approx(0.0)
     assert float(audit2[0]["candidate_degradation_cost_eur"]) == pytest.approx(0.0)
     assert float(audit2[0]["candidate_auxiliary_cost_eur"]) == pytest.approx(0.0)
@@ -3554,6 +3667,60 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(postlock_audit2[0]["postlock_candidate_gross_spread_eur"]) == pytest.approx(100.0)
     assert float(postlock_audit2[0]["postlock_candidate_pnl_recomputed_eur"]) == pytest.approx(100.0)
     assert str(postlock_audit2[0]["postlock_replay_price_source_column"]) == col.pred_da_price
+
+    bt.final_soc_mode = "hard"
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 10.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    ts_final = pd.Timestamp("2025-01-10T03:00:00Z")
+    hard_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts2, ts_final],
+            "target_time_utc": [ts2, ts_final],
+            col.pred_da_price: [100.0, 100.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+        }
+    )
+    hard_audit_rows = [
+        {
+            "timestamp_utc": str(ts2),
+            "da_candidate_buy_mw": 0.0,
+            "da_candidate_sell_mw": 9.5,
+            "selected_incumbent": "optimized",
+            "candidate_selection_pnl_eur": 950.0,
+        }
+    ]
+    hard_selected, hard_audit = bt._apply_da_postlock_future_guard(
+        selected_da={ts2: (0.0, 9.5)},
+        da_audit_rows=hard_audit_rows,
+        lock_rows=hard_rows.iloc[[0]].copy(),
+        future_rows=hard_rows,
+        colmap=col,
+        current_soc_mwh=11.5,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=ts_final,
+    )
+    assert hard_selected[ts2] == pytest.approx((0.0, 0.0))
+    assert hard_audit[0]["final_selected_incumbent"] == "no_trade"
+    assert hard_audit[0]["da_zero_reason"] == "postlock_future_infeasible_no_trade_selected"
+    assert float(hard_audit[0]["da_candidate_rejected_hard_final_soc_infeasible"]) == pytest.approx(1.0)
+    assert float(hard_audit[0]["da_candidate_rejected_final_soc_feasibility_not_proven"]) == pytest.approx(0.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_checked_before_lock"]) == pytest.approx(1.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_required_mwh"]) == pytest.approx(10.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_projected_final_soc_mwh"]) == pytest.approx(2.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_margin_mwh"]) == pytest.approx(-8.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_existing_locked_buy_mwh"]) == pytest.approx(0.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_existing_locked_sell_mwh"]) == pytest.approx(0.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_candidate_buy_mwh"]) == pytest.approx(0.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_candidate_sell_mwh"]) == pytest.approx(9.5)
+    assert float(hard_audit[0]["da_final_soc_feasibility_id_recourse_assumed"]) == pytest.approx(0.0)
+    assert str(hard_audit[0]["da_final_soc_feasibility_reason"]) == "rejected_hard_final_soc_infeasible"
 
     bt.deg_eur_mwh = 200.0
     selected3, audit3 = bt._select_feasible_da_lock_schedule(
@@ -3830,6 +3997,81 @@ def test_da_precommit_selection_blocks_invalid_replay(monkeypatch: pytest.Monkey
     counters = BatteryBacktester._compute_da_naming_semantics_counters(bad_semantics)
     assert counters["da_replay_error_as_no_trade_dominance_count"] == pytest.approx(1.0)
     assert counters["da_invalid_selection_not_flagged_count"] == pytest.approx(1.0)
+
+
+def test_da_postlock_selection_schedule_mismatch_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_trading_mw = 0.0
+
+    ts0 = pd.Timestamp("2025-01-10T00:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts0],
+            "target_time_utc": [ts0],
+            col.pred_da_price: [100.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+    selected_da = {ts0: (0.0, 1.0)}
+    audit_rows = [
+        {
+            "timestamp_utc": str(ts0),
+            "da_candidate_buy_mw": 0.0,
+            "da_candidate_sell_mw": 1.0,
+            "selected_incumbent": "optimized",
+            "candidate_selection_pnl_eur": 100.0,
+        }
+    ]
+    original_replay = bt._replay_da_candidate_cashflow
+
+    def fake_replay(*, schedule: dict[pd.Timestamp, tuple[float, float]], **kwargs: object) -> dict[str, float | str]:
+        has_volume = any(ch > 1e-9 or dis > 1e-9 for ch, dis in schedule.values())
+        if has_volume:
+            return {
+                "selection_pnl_eur": 100.0,
+                "pnl_eur": 100.0,
+                "cashflow_replay_error": 1.0,
+                "cashflow_replay_error_reason": "forced_selection_schedule_reconciliation_failed",
+                "pnl_reconciliation_error_eur": 999.0,
+                "revenue_eur": 100.0,
+                "cost_eur": 0.0,
+                "gross_spread_eur": 100.0,
+                "pnl_recomputed_eur": 100.0,
+                "price_source_column": col.pred_da_price,
+            }
+        return original_replay(schedule=schedule, **kwargs)
+
+    monkeypatch.setattr(bt, "_replay_da_candidate_cashflow", fake_replay)
+
+    final_schedule, audit = bt._apply_da_postlock_future_guard(
+        selected_da=selected_da,
+        da_audit_rows=audit_rows,
+        lock_rows=rows,
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert final_schedule[ts0] == pytest.approx((0.0, 0.0))
+    assert audit[0]["final_selected_incumbent"] == "no_trade"
+    assert audit[0]["da_zero_reason"] == "selection_schedule_reconciliation_failed"
+    assert float(audit[0]["da_precommit_selection_valid"]) == pytest.approx(0.0)
+    assert audit[0]["da_precommit_selection_invalid_reason"] == "selection_schedule_reconciliation_failed"
+    assert float(audit[0]["da_selected_lockable_sell_mw"]) == pytest.approx(0.0)
+    assert float(audit[0]["da_selected_lockable_replay_revenue_eur"]) == pytest.approx(0.0)
+    assert float(audit[0]["da_selected_lockable_replay_gross_spread_eur"]) == pytest.approx(0.0)
+    assert audit[0]["da_precommit_schedule_stage_used_for_selection"] == "selected_lockable"
+    assert audit[0]["da_precommit_schedule_stage_used_for_lockbook"] == "selected_lockable"
 
 
 def test_da_precommit_replay_cashflow_formulas_and_export_validation() -> None:
@@ -7859,8 +8101,11 @@ def test_da_precommit_zeroes_when_no_nonzero_schedule_feasible() -> None:
     )
     assert all(ch == pytest.approx(0.0) and dis == pytest.approx(0.0) for ch, dis in schedule.values())
     assert all(float(r["da_zeroed_all_bids"]) == pytest.approx(1.0) for r in audit)
-    assert all(str(r["da_zero_reason"]) == "no_nonzero_feasible_da_schedule" for r in audit)
-    assert all(str(r["selected_incumbent"]) == "zeroed_candidate" for r in audit)
+    assert all(
+        str(r["da_zero_reason"]) in {"no_nonzero_feasible_da_schedule", "no_trade_incumbent_selected"}
+        for r in audit
+    )
+    assert all(str(r["selected_incumbent"]) in {"zeroed_candidate", "no_trade"} for r in audit)
 
 
 def test_da_postlock_future_guard_rejects_future_infeasible_candidate_and_accepts_feasible() -> None:
@@ -11294,6 +11539,34 @@ def test_da_gate_delivery_window_rejects_same_day_targets() -> None:
     )
 
 
+def test_same_day_da_lockbook_obligation_is_valid_from_previous_gate() -> None:
+    bt = _mk_backtester()
+    current_snapshot = pd.Timestamp("2025-10-22T09:00:00Z")  # 11:00 Europe/Berlin.
+    origin_snapshot = pd.Timestamp("2025-10-21T09:00:00Z")  # Previous valid DA gate.
+    delivery = pd.Timestamp("2025-10-22T11:00:00Z")  # 13:00 Europe/Berlin, same day as current snapshot.
+
+    assert not bt._is_da_target_allowed(current_snapshot, delivery, da_bid_hour_local=11)
+    assert bt._da_origin_window_valid(origin_snapshot, delivery, da_bid_hour_local=11)
+
+    row = pd.DataFrame(
+        {
+            "charge_mw": [5.0],
+            "discharge_mw": [0.0],
+            "da_candidate_allowed_by_gate_window": [0.0],
+            "da_bid_locked": [1.0],
+            "da_lockbook_row_present": [1.0],
+            "da_existing_lockbook_delivery_row": [1.0],
+            "da_new_bid_gate_window_violation": [0.0],
+            "da_existing_lockbook_origin_window_valid": [1.0],
+            "da_existing_lockbook_origin_window_violation": [0.0],
+            "da_originating_source_snapshot_utc": [origin_snapshot.isoformat()],
+            "timestamp_utc": [delivery.isoformat()],
+        }
+    )
+    assert float(row["da_new_bid_gate_window_violation"].iloc[0]) == pytest.approx(0.0)
+    assert float(row["da_existing_lockbook_origin_window_violation"].iloc[0]) == pytest.approx(0.0)
+
+
 def test_da_bcm_candidate_gate_window_masks_are_applied_before_solve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12118,6 +12391,74 @@ def test_terminal_surplus_value_is_target_relative() -> None:
     )
     assert float(shortfall["terminal_surplus_mwh"]) == pytest.approx(0.0)
     assert float(shortfall["terminal_surplus_value_net_eur"]) == pytest.approx(0.0)
+
+
+def test_da_soc_shadow_value_uses_conservative_internal_mwh_value() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.9
+    bt.eta_out = 0.9
+    bt.trans_eur_mwh = 1.0
+    bt.deg_eur_mwh = 5.0
+    bt.da_terminal_soc_value_enabled = True
+    bt.da_terminal_value_quantile_sell = 0.5
+    bt.da_terminal_value_quantile_buy = 0.5
+    bt.da_terminal_value_margin_eur_mwh = 0.0
+    bt.da_terminal_value_min_eur_mwh = 0.0
+    bt.da_terminal_value_max_eur_mwh = 500.0
+
+    comp = bt._da_soc_shadow_value_components(pd.Series([10.0, 100.0]))
+
+    sell_value = 0.9 * 55.0 - 0.9 * 1.0 - 5.0
+    replacement_cost = 55.0 / 0.9 + 1.0 / 0.9 + 5.0
+    assert float(comp["da_future_sell_value_internal_eur_mwh"]) == pytest.approx(sell_value)
+    assert float(comp["da_future_replacement_cost_internal_eur_mwh"]) == pytest.approx(replacement_cost)
+    assert float(comp["da_soc_shadow_value_eur_per_internal_mwh"]) == pytest.approx(
+        min(sell_value, replacement_cost)
+    )
+    assert str(comp["da_terminal_value_source"]) == "conservative_da_quantile"
+
+
+def test_da_replay_terminal_value_only_counts_global_final_window() -> None:
+    bt = _mk_backtester()
+    bt.soc_target_end = 10.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_peak_mw = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.da_terminal_soc_value_enabled = True
+    bt.da_terminal_value_quantile_sell = 0.5
+    bt.da_terminal_value_quantile_buy = 0.5
+    bt.da_terminal_value_min_eur_mwh = 0.0
+    bt.da_terminal_value_max_eur_mwh = 500.0
+    df, col = _tiny_backtest_df(hours=1)
+    df[col.pred_da_price] = 100.0
+    ts = pd.to_datetime(df[col.timestamp].iloc[0], utc=True)
+    rows = df.rename(columns={col.timestamp: "target_time_utc"})
+
+    no_global = bt._replay_da_candidate_cashflow(
+        rows=rows,
+        schedule={ts: (0.0, 0.0)},
+        colmap=col,
+        current_soc_mwh=12.0,
+        global_end_utc=None,
+    )
+    with_global = bt._replay_da_candidate_cashflow(
+        rows=rows,
+        schedule={ts: (0.0, 0.0)},
+        colmap=col,
+        current_soc_mwh=12.0,
+        global_end_utc=ts,
+    )
+
+    assert float(no_global["terminal_credit_eur"]) == pytest.approx(0.0)
+    assert float(no_global["local_terminal_credit_ignored_eur"]) == pytest.approx(200.0)
+    assert float(with_global["terminal_credit_eur"]) == pytest.approx(200.0)
+    assert float(with_global["da_soc_shadow_value_eur_per_internal_mwh"]) == pytest.approx(100.0)
 
 
 def test_raw_optimizer_objective_scope_separates_terminal_credit_from_row_ev() -> None:

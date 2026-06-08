@@ -11,6 +11,7 @@ Usage:
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_bem_mid
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_multi_mid
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_afrr_mid
+  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/linear_long
 
 Outputs:
   archive/backtesting_analysis/<run_name>_analysis.md

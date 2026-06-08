@@ -67,6 +67,7 @@ from energy_trading.simulation.battery_backtest import (
     BacktestColumnMap,
     BatteryBacktester,
     PhaseTimeoutError,
+    _write_checkpoint_run_status,
     canonicalize_market_frame,
     load_and_align_market_data,
     load_prediction_warehouse_long,
@@ -3483,6 +3484,18 @@ def parse_args() -> argparse.Namespace:
         help="Hourly output width. debug preserves all columns; thesis writes only essential validation/report columns.",
     )
     p.add_argument(
+        "--write-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write staged checkpoint artifacts under each scenario output directory (default: enabled).",
+    )
+    p.add_argument(
+        "--checkpoint-detail",
+        choices=["summary_only", "hourly", "full"],
+        default="hourly",
+        help="Checkpoint payload width. summary_only writes JSON only; hourly/full also write stage parquet.",
+    )
+    p.add_argument(
         "--debug-dumps",
         choices=["accepted_only", "all", "none"],
         default="all",
@@ -3913,25 +3926,52 @@ def main() -> None:
             "strategy": str(args.trading_strategy),
         }
 
-        with _phase_watchdog("backtester_run"):
-            outputs = backtester.run(
-                df,
-                colmap,
-                use_rolling_horizon=not args.disable_rolling_horizon,
-                horizon_hours=args.horizon_hours,
-                reopt_step_hours=args.reopt_step_hours,
-                forecast_warehouse=scenario_warehouse,
-                da_bid_hour_local=args.da_bid_hour_local if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
-                soc_feedback_mode=args.soc_feedback_mode,
-                enforce_final_soc_min=enforce_final_soc_min,
-                allowed_markets=allowed_markets,
-                strategy_name=str(args.trading_strategy),
-                id_mode=resolved_id_mode,
-                id_recourse_mode=resolved_id_recourse_mode,
-                strict_simulation_validity=bool(args.strict_simulation_validity),
-                enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
-                bcm_bid_hour_local=int(args.bcm_bid_hour_local),
-            )
+        checkpoint_metadata = {
+            "run_id": str(run_id or resolved_run_id or args.model_key or args.model or ""),
+            "scenario": f"{args.trading_strategy}/{scenario_name}",
+            "model_key": str(args.model_key or args.model),
+            "trading_strategy": str(args.trading_strategy),
+            "start_utc": str(effective_start_utc.isoformat()) if effective_start_utc is not None else "",
+            "end_utc": str(effective_end_utc.isoformat()) if effective_end_utc is not None else "",
+        }
+        checkpoint_dir = scenario_out_dir / "checkpoints"
+        try:
+            with _phase_watchdog("backtester_run"):
+                outputs = backtester.run(
+                    df,
+                    colmap,
+                    use_rolling_horizon=not args.disable_rolling_horizon,
+                    horizon_hours=args.horizon_hours,
+                    reopt_step_hours=args.reopt_step_hours,
+                    forecast_warehouse=scenario_warehouse,
+                    da_bid_hour_local=args.da_bid_hour_local if args.da_gate_hour_utc is None else args.da_gate_hour_utc,
+                    soc_feedback_mode=args.soc_feedback_mode,
+                    enforce_final_soc_min=enforce_final_soc_min,
+                    allowed_markets=allowed_markets,
+                    strategy_name=str(args.trading_strategy),
+                    id_mode=resolved_id_mode,
+                    id_recourse_mode=resolved_id_recourse_mode,
+                    strict_simulation_validity=bool(args.strict_simulation_validity),
+                    enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
+                    bcm_bid_hour_local=int(args.bcm_bid_hour_local),
+                    checkpoint_dir=checkpoint_dir,
+                    write_checkpoints=bool(args.write_checkpoints),
+                    checkpoint_detail=str(args.checkpoint_detail),
+                    checkpoint_metadata=checkpoint_metadata,
+                )
+        except Exception as exc:
+            if bool(args.write_checkpoints):
+                try:
+                    _write_checkpoint_run_status(
+                        checkpoint_dir,
+                        status="failed",
+                        metadata=checkpoint_metadata,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                except Exception as status_exc:
+                    print(f"[WARN] failed to write checkpoint failure status: {status_exc}")
+            raise
         outputs = replace(outputs, hourly=_ensure_hourly_throughput(outputs.hourly))
 
         hourly_path = scenario_out_dir / "backtest_hourly.parquet"

@@ -8,7 +8,15 @@ MODEL_SPECS = {
     # 0.25 means 15 minutes within a 1-hour optimization step.
     "min_activation_headroom_fraction": 0.25,
     "market_scope": "DE_LU",  # Sign/settlement convention scope
-    "terminal_soc_value_discount": 0.8,  # Discount for terminal SoC value in objective
+    "terminal_soc_value_discount": 0.8,  # Legacy fallback for terminal SoC value in objective
+    # Conservative DA continuation value for horizon-end internal SoC inventory.
+    # This is a terminal value only, not a per-buy charge bonus.
+    "da_terminal_soc_value_enabled": True,
+    "da_terminal_value_quantile_sell": 0.50,
+    "da_terminal_value_quantile_buy": 0.25,
+    "da_terminal_value_margin_eur_mwh": 0.0,
+    "da_terminal_value_min_eur_mwh": 0.0,
+    "da_terminal_value_max_eur_mwh": 500.0,
     # Hard headroom assumptions for reserve/activation deliverability (hours).
     # 0.5h means full awarded MW must be energetically deliverable for 30 minutes.
     "reserve_activation_headroom_h": 0.5,
@@ -43,7 +51,7 @@ BATTERY_SPECS = {
     "soc_target_end": 0.5,  # Cyclic neutrality target (SoC_0 ~= SoC_T)
 
     # Costs
-    "degradation_cost": 7.5,  # EUR/MWh internal throughput
+    "degradation_cost": 15,  # EUR/MWh internal throughput
     # State-dependent auxiliary duty-cycle model (recommended):
     # OFF -> STANDBY -> TRADING -> aFRR_ACTIVE
     # Duty values are multipliers of aux_power_peak_mw.
@@ -52,7 +60,8 @@ BATTERY_SPECS = {
 
     # Aux peak is configured so state duties realize the intended hourly
     # auxiliary energy directly at dt_h=1:
-    # standby=0.035 MWh/h, trading=0.050 MWh/h, aFRR active=0.050 MWh/h.
+    # off=0.020 MWh/h, standby=0.035 MWh/h,
+    # trading=0.050 MWh/h, aFRR active=0.050 MWh/h.
     "aux_power_peak_mw": 0.05,
 
     # 0.05 MW * 0.70 * 1h = 0.035 MWh/h standby auxiliary energy.
@@ -64,10 +73,9 @@ BATTERY_SPECS = {
     # 0.05 MW * 1.00 * 1h = 0.050 MWh/h aFRR-active auxiliary energy.
     "aux_power_afrr_active_duty": 1.00,
 
-    # Use 0 only if "off duty" means no auxiliary cost allocated to market operation.
-    # Physically, an energized site would still have some parasitic load.
-    # BMS, Kommunikation, Heizung/Kühlung und Sicherheitssysteme
-    "aux_power_off_duty": 0.02,
+    # 0.05 MW * 0.40 * 1h = 0.020 MWh/h off auxiliary energy.
+    # Covers BMS, Kommunikation, Heizung/Kühlung und Sicherheitssysteme.
+    "aux_power_off_duty": 0.40,
 }
 BATTERY_SPECS["efficiency_rt"] = BATTERY_SPECS["efficiency_in"] * BATTERY_SPECS["efficiency_out"]
 
