@@ -9084,6 +9084,81 @@ def test_protected_soc_recovery_is_sized_net_positive_after_aux() -> None:
     assert id_charge * bt.dt_h * bt.eta_in - float(diag["protected_recovery_aux_mwh"]) > 0.0
 
 
+def test_protected_soc_recovery_uses_minimum_net_gain_after_aux() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_peak_mw = 0.095
+    bt.aux_trading_mw = 0.095
+    bt.aux_standby_mw = 0.0
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.min_protected_recovery_net_gain_mwh = 0.01
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=bt.soc_min - 0.0001,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    assert reason == "protected_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert float(diag["protected_recovery_required_net_internal_mwh"]) == pytest.approx(0.01)
+    assert float(diag["protected_recovery_required_internal_mwh"]) == pytest.approx(0.105)
+    assert float(diag["protected_recovery_net_internal_mwh"]) == pytest.approx(0.01)
+    assert float(diag["protected_recovery_min_net_gain_mwh"]) == pytest.approx(0.01)
+    assert float(diag["protected_recovery_suppressed_zero_net_effect"]) == pytest.approx(0.0)
+
+
+def test_protected_soc_recovery_does_not_offset_aux_when_soc_is_valid() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_peak_mw = 0.095
+    bt.aux_trading_mw = 0.095
+    bt.aux_standby_mw = 0.0
+    bt.reserve_headroom_safety_mwh = 0.1
+    bt.min_protected_recovery_net_gain_mwh = 0.01
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=bt.soc_min + 0.155,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+    )
+
+    assert reason == "none"
+    assert id_charge == pytest.approx(0.0)
+    assert id_discharge == pytest.approx(0.0)
+
+
+def test_terminal_recovery_suppressed_outside_final_recovery_window() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.terminal_id_recovery_safety_mwh = 0.0
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=9.8,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=9.8,
+        terminal_recovery_allowed=False,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    assert reason == "none"
+    assert id_charge == pytest.approx(0.0)
+    assert id_discharge == pytest.approx(0.0)
+    assert float(diag["terminal_recovery_suppressed_until_final_window"]) == pytest.approx(1.0)
+
+
 def test_terminal_recovery_sizes_to_target_after_same_hour_aux() -> None:
     bt = _mk_backtester()
     bt.eta_in = 0.95

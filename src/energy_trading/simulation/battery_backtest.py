@@ -40,7 +40,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 
 from energy_trading.config import BATTERY_SPECS, FINANCIAL_PARAMS, MARKET_SPECS, MODEL_SPECS
 from energy_trading.evaluation.forecast_postprocessing import (
@@ -1035,6 +1035,10 @@ class BatteryBacktester:
             0.0,
             float(MODEL_SPECS.get("terminal_id_recovery_safety_mwh", 0.10)),
         )
+        self.min_protected_recovery_net_gain_mwh = max(
+            0.0,
+            float(MODEL_SPECS.get("min_protected_recovery_net_gain_mwh", 0.01)),
+        )
         # MILP runtime controls:
         # - default execution is bounded and robust for rolling simulation
         # - diagnostic mode can be enabled to inspect HiGHS solver behavior
@@ -1369,14 +1373,19 @@ class BatteryBacktester:
         ch = max(0.0, float(charge_mw))
         dis = max(0.0, float(discharge_mw))
         net = dis - ch
-        step = self.da_bid_granularity_mw
-        # Enforce DA market granularity on lockbook bids.
+        step = max(float(self.da_bid_granularity_mw), 1e-12)
+        min_bid = max(0.0, float(getattr(self, "da_min_bid_size_mw", step)))
+        # Enforce DA market size rules on lockbook bids. Floor to avoid
+        # exceeding physical feasibility; sub-minimum remnants are not bidable.
         def q(x: float) -> float:
             if x <= 0.0:
                 return 0.0
             # Floor to the nearest valid step so we never exceed power limits.
             units = int(np.floor((x / step) + 1e-12))
-            return min(self.p_max_mw, float(units * step))
+            rounded = min(self.p_max_mw, float(units * step))
+            if rounded + 1e-12 < min_bid:
+                return 0.0
+            return float(rounded)
         if net >= 0.0:
             return 0.0, q(min(self.p_max_mw, net))
         return q(min(self.p_max_mw, -net)), 0.0
@@ -2977,6 +2986,276 @@ class BatteryBacktester:
                 out[ts] = self._normalize_da_bid(float(ch) * factor, float(dis) * factor)
             return out
 
+        def _lp_size_schedule() -> tuple[
+            dict[pd.Timestamp, tuple[float, float]] | None,
+            bool,
+            dict[str, float | str],
+        ]:
+            """Size DA lock quantities continuously instead of using a uniform retry factor."""
+            ordered_ts = [
+                pd.to_datetime(ts, utc=True, errors="coerce")
+                for ts in candidates.keys()
+            ]
+            ordered_ts = [ts for ts in ordered_ts if pd.notna(ts)]
+            if not ordered_ts:
+                return None, False, {"da_bid_sizer_status": "empty_candidate"}
+            row_by_ts: dict[pd.Timestamp, pd.Series] = {}
+            for _, row in rows.iterrows():
+                ts = pd.to_datetime(row.get("target_time_utc"), utc=True, errors="coerce")
+                if pd.notna(ts):
+                    row_by_ts[ts] = row
+            if any(ts not in row_by_ts for ts in ordered_ts):
+                return None, False, {"da_bid_sizer_status": "missing_candidate_rows"}
+
+            n = len(ordered_ts)
+            if n <= 0:
+                return None, False, {"da_bid_sizer_status": "empty_candidate"}
+            bounds: list[tuple[float, float]] = []
+            prices: list[float] = []
+            fixed_delta: list[float] = []
+            for ts in ordered_ts:
+                ch_ub, dis_ub = candidates.get(ts, (0.0, 0.0))
+                bounds.append((0.0, max(0.0, float(ch_ub))))
+                bounds.append((0.0, max(0.0, float(dis_ub))))
+                row = row_by_ts[ts]
+                pred_da = pd.to_numeric(pd.Series([row.get(colmap.pred_da_price)]), errors="coerce").iloc[0]
+                if pd.isna(pred_da) or not np.isfinite(float(pred_da)):
+                    return None, False, {
+                        "da_bid_sizer_status": "missing_or_nonfinite_pred_da_price",
+                        "da_bid_sizer_failed_timestamp_utc": str(ts),
+                    }
+                prices.append(float(pred_da))
+                ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
+                ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
+                rate_pos = float(
+                    pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce")
+                    .fillna(0.0)
+                    .iloc[0]
+                )
+                rate_neg = float(
+                    pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce")
+                    .fillna(0.0)
+                    .iloc[0]
+                )
+                aux_power_mw, _ = self._state_aux_power_mw(
+                    charge_mw=0.0,
+                    discharge_mw=0.0,
+                    reserve_pos_mw=float(ob_pos),
+                    reserve_neg_mw=float(ob_neg),
+                    act_pos_rate=float(rate_pos),
+                    act_neg_rate=float(rate_neg),
+                    id_charge_mw=0.0,
+                    id_discharge_mw=0.0,
+                )
+                ch_ub, dis_ub = candidates.get(ts, (0.0, 0.0))
+                aux_with_da_power_mw, _ = self._state_aux_power_mw(
+                    charge_mw=float(ch_ub),
+                    discharge_mw=float(dis_ub),
+                    reserve_pos_mw=float(ob_pos),
+                    reserve_neg_mw=float(ob_neg),
+                    act_pos_rate=float(rate_pos),
+                    act_neg_rate=float(rate_neg),
+                    id_charge_mw=0.0,
+                    id_discharge_mw=0.0,
+                )
+                da_candidate_aux_increment_mwh = 0.0
+                if float(ch_ub) > 1e-9 or float(dis_ub) > 1e-9:
+                    da_candidate_aux_increment_mwh = max(
+                        0.0,
+                        float(aux_with_da_power_mw) - float(aux_power_mw),
+                    ) * float(self.dt_h)
+                act_pos_mwh = max(0.0, ob_pos * max(0.0, min(1.0, rate_pos)) * float(self.dt_h))
+                act_neg_mwh = max(0.0, ob_neg * max(0.0, min(1.0, rate_neg)) * float(self.dt_h))
+                delta, _ = self._calculate_soc_delta(
+                    charge_mw=0.0,
+                    discharge_mw=0.0,
+                    id_charge_mw=0.0,
+                    id_discharge_mw=0.0,
+                    act_pos_mwh=float(act_pos_mwh),
+                    act_neg_mwh=float(act_neg_mwh),
+                    aux_mwh=max(0.0, float(aux_power_mw) * float(self.dt_h)),
+                    battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                    dt_h=float(self.dt_h),
+                )
+                fixed_delta.append(float(delta) - float(da_candidate_aux_increment_mwh))
+
+            soc_start = float(current_soc_mwh)
+            if "soc_start_lp_mwh" in rows.columns:
+                first_soc = pd.to_numeric(rows["soc_start_lp_mwh"], errors="coerce").dropna()
+                if not first_soc.empty:
+                    soc_start = float(first_soc.iloc[0])
+
+            aux_da_per_mw_mwh = 0.0
+            if float(self.p_max_mw) > 1e-12:
+                aux_da_per_mw_mwh = max(0.0, float(self.aux_trading_mw)) * float(self.dt_h) / float(self.p_max_mw)
+            charge_soc_coef = float(self.eta_in) * float(self.dt_h)
+            discharge_soc_coef = -float(self.dt_h) / max(float(self.eta_out), 1e-12)
+
+            c = np.zeros(2 * n, dtype=float)
+            for i, price in enumerate(prices):
+                charge_profit = (
+                    -float(price) * float(self.dt_h)
+                    - float(self.trans_eur_mwh) * float(self.dt_h)
+                    - float(self.deg_eur_mwh) * float(self.eta_in) * float(self.dt_h)
+                    - float(price) * float(aux_da_per_mw_mwh)
+                )
+                discharge_profit = (
+                    float(price) * float(self.dt_h)
+                    - float(self.trans_eur_mwh) * float(self.dt_h)
+                    - float(self.deg_eur_mwh) * float(self.dt_h) / max(float(self.eta_out), 1e-12)
+                    - float(price) * float(aux_da_per_mw_mwh)
+                )
+                c[2 * i] = -float(charge_profit)
+                c[2 * i + 1] = -float(discharge_profit)
+
+            a_ub: list[np.ndarray] = []
+            b_ub: list[float] = []
+            fixed_cum = 0.0
+            for k, ts in enumerate(ordered_ts):
+                fixed_cum += float(fixed_delta[k])
+                row = np.zeros(2 * n, dtype=float)
+                for j in range(k + 1):
+                    row[2 * j] = charge_soc_coef
+                    row[2 * j + 1] = discharge_soc_coef
+                # Upper SoC bound: soc_start + fixed + variable <= soc_max.
+                a_ub.append(row.copy())
+                b_ub.append(float(self.soc_max) - float(soc_start) - float(fixed_cum))
+                # Lower SoC bound: soc_start + fixed + variable >= soc_min.
+                a_ub.append(-row.copy())
+                b_ub.append(float(soc_start) + float(fixed_cum) - float(self.soc_min))
+                if global_end_utc is not None and pd.notna(global_end_utc) and ts == global_end_utc:
+                    # Hard final target: soc_start + fixed + variable >= target.
+                    a_ub.append(-row.copy())
+                    b_ub.append(float(soc_start) + float(fixed_cum) - float(self.soc_target_end))
+
+            try:
+                res = linprog(
+                    c,
+                    A_ub=np.vstack(a_ub) if a_ub else None,
+                    b_ub=np.asarray(b_ub, dtype=float) if b_ub else None,
+                    bounds=bounds,
+                    method="highs",
+                )
+            except Exception as exc:
+                return None, False, {
+                    "da_bid_sizer_status": "linprog_exception",
+                    "da_bid_sizer_error": str(exc),
+                }
+            if not bool(res.success):
+                return None, False, {
+                    "da_bid_sizer_status": "linprog_failed",
+                    "da_bid_sizer_error": str(getattr(res, "message", "")),
+                }
+            x = np.asarray(res.x, dtype=float)
+            schedule: dict[pd.Timestamp, tuple[float, float]] = {}
+            for i, ts in enumerate(ordered_ts):
+                ch = 0.0 if abs(float(x[2 * i])) <= 1e-8 else float(x[2 * i])
+                dis = 0.0 if abs(float(x[2 * i + 1])) <= 1e-8 else float(x[2 * i + 1])
+                schedule[ts] = self._normalize_da_bid(ch, dis)
+            feasible, stats = _evaluate(schedule)
+            if not bool(feasible):
+                clipped = dict(schedule)
+                soc_clip = float(soc_start)
+                for ts in ordered_ts:
+                    row = row_by_ts[ts]
+                    ch_mw, dis_mw = clipped.get(ts, (0.0, 0.0))
+                    ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
+                    ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
+                    rate_pos = float(
+                        pd.to_numeric(
+                            pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]),
+                            errors="coerce",
+                        )
+                        .fillna(0.0)
+                        .iloc[0]
+                    )
+                    rate_neg = float(
+                        pd.to_numeric(
+                            pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]),
+                            errors="coerce",
+                        )
+                        .fillna(0.0)
+                        .iloc[0]
+                    )
+
+                    def _next_soc(ch_val: float, dis_val: float) -> float:
+                        aux_power_mw, _ = self._state_aux_power_mw(
+                            charge_mw=float(ch_val),
+                            discharge_mw=float(dis_val),
+                            reserve_pos_mw=float(ob_pos),
+                            reserve_neg_mw=float(ob_neg),
+                            act_pos_rate=float(rate_pos),
+                            act_neg_rate=float(rate_neg),
+                            id_charge_mw=0.0,
+                            id_discharge_mw=0.0,
+                        )
+                        act_pos_mwh = max(
+                            0.0, ob_pos * max(0.0, min(1.0, rate_pos)) * float(self.dt_h)
+                        )
+                        act_neg_mwh = max(
+                            0.0, ob_neg * max(0.0, min(1.0, rate_neg)) * float(self.dt_h)
+                        )
+                        delta, _ = self._calculate_soc_delta(
+                            charge_mw=float(ch_val),
+                            discharge_mw=float(dis_val),
+                            id_charge_mw=0.0,
+                            id_discharge_mw=0.0,
+                            act_pos_mwh=float(act_pos_mwh),
+                            act_neg_mwh=float(act_neg_mwh),
+                            aux_mwh=max(0.0, float(aux_power_mw) * float(self.dt_h)),
+                            battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                            dt_h=float(self.dt_h),
+                        )
+                        return float(soc_clip) + float(delta)
+
+                    soc_after = _next_soc(ch_mw, dis_mw)
+                    if soc_after > float(self.soc_max) + 1e-9 and ch_mw > 1e-9:
+                        excess = float(soc_after) - float(self.soc_max)
+                        ch_mw = max(
+                            0.0,
+                            float(ch_mw) - float(excess) / max(float(self.eta_in) * float(self.dt_h), 1e-12),
+                        )
+                        ch_mw, dis_mw = self._normalize_da_bid(float(ch_mw), float(dis_mw))
+                        clipped[ts] = (float(ch_mw), float(dis_mw))
+                        soc_after = _next_soc(ch_mw, dis_mw)
+                    if soc_after + 1e-9 < float(self.soc_min) and dis_mw > 1e-9:
+                        shortfall = float(self.soc_min) - float(soc_after)
+                        dis_mw = max(
+                            0.0,
+                            float(dis_mw)
+                            - float(shortfall) * max(float(self.eta_out), 1e-12) / max(float(self.dt_h), 1e-12),
+                        )
+                        ch_mw, dis_mw = self._normalize_da_bid(float(ch_mw), float(dis_mw))
+                        clipped[ts] = (float(ch_mw), float(dis_mw))
+                        soc_after = _next_soc(ch_mw, dis_mw)
+                    soc_clip = float(soc_after)
+                clipped_feasible, clipped_stats = _evaluate(clipped)
+                if bool(clipped_feasible):
+                    schedule = clipped
+                    feasible = True
+                    stats = dict(clipped_stats)
+                    stats["da_bid_sizer_status"] = "ok_after_exact_soc_clip"
+            diag = dict(stats)
+            diag.update(
+                {
+                    "da_bid_sizer_status": str(
+                        diag.get(
+                            "da_bid_sizer_status",
+                            "ok" if bool(feasible) else "linprog_exact_feasibility_failed",
+                        )
+                    ),
+                    "da_bid_sizer_objective_eur": float(-float(res.fun)),
+                    "da_bid_sizer_total_buy_mwh": float(
+                        sum(ch for ch, _ in schedule.values()) * float(self.dt_h)
+                    ),
+                    "da_bid_sizer_total_sell_mwh": float(
+                        sum(dis for _, dis in schedule.values()) * float(self.dt_h)
+                    ),
+                    "da_bid_sizer_method": "linprog_continuous_per_hour",
+                }
+            )
+            return schedule, bool(feasible), diag
+
         def _evaluate(schedule: dict[pd.Timestamp, tuple[float, float]]) -> tuple[bool, dict[str, float | str]]:
             soc = float(current_soc_mwh)
             if "soc_start_lp_mwh" in rows.columns:
@@ -3090,19 +3369,37 @@ class BatteryBacktester:
         selected = _scaled_schedule(0.0)
         selected_stats: dict[str, float | str] = {}
         selected_feasible = False
-        for factor in ladder:
-            schedule = _scaled_schedule(float(factor))
-            feasible, stats = _evaluate(schedule)
-            if feasible:
-                selected_factor = float(factor)
-                selected = schedule
-                selected_stats = stats
-                selected_feasible = True
-                break
-        if not selected_feasible:
-            selected_factor = 0.0
-            selected = _scaled_schedule(0.0)
-            selected_feasible, selected_stats = _evaluate(selected)
+        selected_sizing_method = "linprog_continuous_per_hour"
+        lp_schedule, lp_feasible, lp_stats = _lp_size_schedule()
+        if lp_schedule is not None and bool(lp_feasible):
+            selected = dict(lp_schedule)
+            selected_stats = dict(lp_stats)
+            selected_feasible = True
+            raw_total = float(sum(ch + dis for ch, dis in candidates.values()))
+            sized_total = float(sum(ch + dis for ch, dis in selected.values()))
+            selected_factor = float(sized_total / raw_total) if raw_total > 1e-12 else 0.0
+        else:
+            selected_sizing_method = "uniform_retry_ladder_fallback"
+            for factor in ladder:
+                schedule = _scaled_schedule(float(factor))
+                feasible, stats = _evaluate(schedule)
+                if feasible:
+                    selected_factor = float(factor)
+                    selected = schedule
+                    selected_stats = stats
+                    selected_feasible = True
+                    break
+            if not selected_feasible:
+                selected_factor = 0.0
+                selected = _scaled_schedule(0.0)
+                selected_feasible, selected_stats = _evaluate(selected)
+            selected_stats = dict(selected_stats)
+            selected_stats.setdefault("da_bid_sizer_status", str(lp_stats.get("da_bid_sizer_status", "not_run")))
+            selected_stats.setdefault("da_bid_sizer_method", "uniform_retry_ladder_fallback")
+            for key, value in lp_stats.items():
+                selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
+            if "da_bid_sizer_error" in lp_stats:
+                selected_stats.setdefault("da_bid_sizer_error", str(lp_stats.get("da_bid_sizer_error")))
 
         optimized_schedule = dict(selected)
         optimized_factor = float(selected_factor)
@@ -3111,6 +3408,7 @@ class BatteryBacktester:
         incumbent_schedule = _scaled_schedule(0.0)
         incumbent_feasible, incumbent_stats = _evaluate(incumbent_schedule)
         candidate_replay = _predicted_replay(optimized_schedule)
+        raw_candidate_replay = _predicted_replay(candidates)
         incumbent_replay = _predicted_replay(incumbent_schedule)
         candidate_pnl = float(candidate_replay.get("selection_pnl_eur", float("nan")))
         incumbent_pnl = float(incumbent_replay.get("selection_pnl_eur", float("nan")))
@@ -3245,6 +3543,39 @@ class BatteryBacktester:
                     "realized_buy_mwh_by_hour": float(acc_ch) * float(self.dt_h),
                     "realized_sell_mwh_by_hour": float(acc_dis) * float(self.dt_h),
                     "da_retry_factor_selected": float(selected_factor),
+                    "da_bid_sizer_method": str(selected_sizing_method),
+                    "da_bid_sizer_status": str(selected_stats.get("da_bid_sizer_status", "unknown")),
+                    "da_bid_sizer_market_rules_applied": 1.0,
+                    "da_bid_sizer_min_bid_size_mw": float(self.da_min_bid_size_mw),
+                    "da_bid_sizer_bid_granularity_mw": float(self.da_bid_granularity_mw),
+                    "da_bid_sizer_objective_eur": float(
+                        selected_stats.get("da_bid_sizer_objective_eur", np.nan)
+                    ),
+                    "da_bid_sizer_total_buy_mwh": float(
+                        selected_stats.get("da_bid_sizer_total_buy_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_total_sell_mwh": float(
+                        selected_stats.get("da_bid_sizer_total_sell_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_error": str(selected_stats.get("da_bid_sizer_error", "none")),
+                    "da_bid_sizer_lp_projected_soc_min_mwh": float(
+                        selected_stats.get("da_bid_sizer_lp_projected_soc_min_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_soc_max_mwh": float(
+                        selected_stats.get("da_bid_sizer_lp_projected_soc_max_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_final_soc_mwh": float(
+                        selected_stats.get("da_bid_sizer_lp_projected_final_soc_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_final_soc_shortfall_mwh": float(
+                        selected_stats.get("da_bid_sizer_lp_projected_final_soc_shortfall_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_power_violation_pos_mw": float(
+                        selected_stats.get("da_bid_sizer_lp_projected_power_violation_pos_mw", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_power_violation_neg_mw": float(
+                        selected_stats.get("da_bid_sizer_lp_projected_power_violation_neg_mw", np.nan)
+                    ),
                     "da_zeroed_all_bids": float(zeroed),
                     "da_zero_reason": str(zero_reason),
                     "projected_soc_min_mwh": float(selected_stats.get("projected_soc_min_mwh", np.nan)),
@@ -3259,6 +3590,7 @@ class BatteryBacktester:
                     "expected_auxiliary_losses_mwh": float(selected_stats.get("expected_auxiliary_losses_mwh", np.nan)),
                     "feasibility_pass": float(bool(selected_feasible)),
                     "candidate_predicted_pnl_eur": float(candidate_replay.get("pnl_eur", np.nan)),
+                    "raw_candidate_predicted_pnl_eur": float(raw_candidate_replay.get("pnl_eur", np.nan)),
                     "incumbent_predicted_pnl_eur": float(incumbent_replay.get("pnl_eur", np.nan)),
                     "candidate_minus_incumbent_eur": float(candidate_minus_incumbent),
                     "selected_incumbent": str(da_selected_incumbent),
@@ -3269,6 +3601,9 @@ class BatteryBacktester:
                     "selection_error": float(da_precommit_selection_error),
                     "selection_error_reason": str(da_precommit_selection_error_reason),
                     "candidate_replay_error_reason": str(candidate_replay_error_reason),
+                    "raw_candidate_replay_error_reason": str(
+                        raw_candidate_replay.get("da_cashflow_replay_error_reason", "unknown")
+                    ),
                     "incumbent_replay_error_reason": str(incumbent_replay_error_reason),
                     "selection_blocked_by_replay_error": float(da_precommit_selection_blocked_by_replay_error),
                     "candidate_zeroed_due_to_invalid_replay": float(candidate_zeroed_due_to_invalid_replay),
@@ -3308,6 +3643,16 @@ class BatteryBacktester:
                         incumbent_replay.get("pnl_excl_terminal_eur", np.nan)
                     ),
                     "gross_spread_eur": float(candidate_replay.get("da_gross_spread_eur", np.nan)),
+                    "raw_candidate_revenue_eur": float(
+                        raw_candidate_replay.get("da_candidate_revenue_eur", np.nan)
+                    ),
+                    "raw_candidate_cost_eur": float(raw_candidate_replay.get("da_candidate_cost_eur", np.nan)),
+                    "raw_candidate_gross_spread_eur": float(
+                        raw_candidate_replay.get("da_candidate_gross_spread_eur", np.nan)
+                    ),
+                    "raw_candidate_pnl_recomputed_eur": float(
+                        raw_candidate_replay.get("da_candidate_pnl_recomputed_eur", np.nan)
+                    ),
                     "candidate_revenue_eur": float(candidate_replay.get("da_candidate_revenue_eur", np.nan)),
                     "candidate_cost_eur": float(candidate_replay.get("da_candidate_cost_eur", np.nan)),
                     "candidate_gross_spread_eur": float(
@@ -4951,15 +5296,49 @@ class BatteryBacktester:
                     )
                     residual_charge = max(0.0, float(stack_with_existing_id["charge_residual_mw"]))
                     residual_total = max(0.0, float(stack_with_existing_id["total_residual_mw"]))
-                    room_grid_mwh = max(0.0, float(self.soc_max) - float(soc_now)) / max(float(self.eta_in), 1e-12)
                     need_internal = float(self.soc_min) - projected_next_soc
+                    protected_min_net_gain_mwh = max(
+                        0.0,
+                        float(getattr(self, "min_protected_recovery_net_gain_mwh", 0.01)),
+                    )
+                    required_net_internal = max(need_internal, protected_min_net_gain_mwh)
+                    base_room_grid_mwh = max(0.0, float(self.soc_max) - float(soc_now)) / max(float(self.eta_in), 1e-12)
+                    tentative_add_id_charge = min(
+                        residual_charge,
+                        residual_total,
+                        base_room_grid_mwh / max(float(self.dt_h), 1e-12),
+                        required_net_internal / max(float(self.eta_in) * float(self.dt_h), 1e-12),
+                    )
+                    aux_with_tentative_id_mw, _ = self._state_aux_power_mw(
+                        charge_mw=float(ch_mw),
+                        discharge_mw=float(dis_mw),
+                        reserve_pos_mw=float(ob_pos),
+                        reserve_neg_mw=float(ob_neg),
+                        act_pos_rate=float(rate_pos),
+                        act_neg_rate=float(rate_neg),
+                        id_charge_mw=float(id_charge + tentative_add_id_charge),
+                        id_discharge_mw=float(id_discharge),
+                    )
+                    recovery_aux_delta_mwh = max(
+                        0.0,
+                        (float(aux_with_tentative_id_mw) - float(aux_power_mw)) * float(self.dt_h),
+                    )
+                    room_grid_mwh = (
+                        max(0.0, float(self.soc_max) + recovery_aux_delta_mwh - float(soc_now))
+                        / max(float(self.eta_in), 1e-12)
+                    )
                     add_id_charge = min(
                         residual_charge,
                         residual_total,
                         room_grid_mwh / max(float(self.dt_h), 1e-12),
-                        need_internal / max(float(self.eta_in) * float(self.dt_h), 1e-12),
+                        (required_net_internal + recovery_aux_delta_mwh)
+                        / max(float(self.eta_in) * float(self.dt_h), 1e-12),
                     )
-                    if add_id_charge > 1e-9:
+                    projected_add_net_internal = (
+                        float(add_id_charge) * float(self.dt_h) * max(float(self.eta_in), 1e-12)
+                        - recovery_aux_delta_mwh
+                    )
+                    if add_id_charge > 1e-9 and projected_add_net_internal + 1e-9 >= required_net_internal:
                         id_charge += float(add_id_charge)
                         id_recourse_mwh += float(add_id_charge) * float(self.dt_h)
                         id_recourse_cost += (
@@ -5016,8 +5395,31 @@ class BatteryBacktester:
                 terminal_shortfall_before_recovery = float(terminal_violation)
                 terminal_soc_before_recovery_mwh = float(soc_now)
                 if terminal_violation > 1e-9 and id_allowed:
-                    required_grid_mwh = terminal_violation / max(float(self.eta_in), 1e-12)
-                    room_grid_mwh = max(0.0, float(self.soc_max) - float(soc_now)) / max(float(self.eta_in), 1e-12)
+                    base_required_grid_mwh = terminal_violation / max(float(self.eta_in), 1e-12)
+                    base_room_grid_mwh = max(0.0, float(self.soc_max) - float(soc_now)) / max(float(self.eta_in), 1e-12)
+                    tentative_grid_mwh = min(
+                        base_required_grid_mwh,
+                        max(0.0, terminal_recovery_residual_grid_mwh),
+                        base_room_grid_mwh,
+                    )
+                    recovery_aux_power_mw, _ = self._state_aux_power_mw(
+                        charge_mw=0.0,
+                        discharge_mw=0.0,
+                        reserve_pos_mw=0.0,
+                        reserve_neg_mw=0.0,
+                        act_pos_rate=0.0,
+                        act_neg_rate=0.0,
+                        id_charge_mw=float(tentative_grid_mwh) / max(float(self.dt_h), 1e-12),
+                        id_discharge_mw=0.0,
+                    )
+                    terminal_recovery_aux_mwh = max(0.0, float(recovery_aux_power_mw) * float(self.dt_h))
+                    required_grid_mwh = (
+                        terminal_violation + terminal_recovery_aux_mwh
+                    ) / max(float(self.eta_in), 1e-12)
+                    room_grid_mwh = (
+                        max(0.0, float(self.soc_max) + terminal_recovery_aux_mwh - float(soc_now))
+                        / max(float(self.eta_in), 1e-12)
+                    )
                     available_grid_mwh = min(max(0.0, terminal_recovery_residual_grid_mwh), room_grid_mwh)
                     terminal_id_recovery_mwh = min(required_grid_mwh, available_grid_mwh)
                     avg_recovery_price = (
@@ -5027,7 +5429,8 @@ class BatteryBacktester:
                     )
                     terminal_id_recovery_cost = float(terminal_id_recovery_mwh * avg_recovery_price)
                     if terminal_id_recovery_mwh > 1e-12:
-                        soc_now += terminal_id_recovery_mwh * float(self.eta_in)
+                        soc_now += terminal_id_recovery_mwh * float(self.eta_in) - terminal_recovery_aux_mwh
+                        expected_aux_losses += terminal_recovery_aux_mwh
                         id_recourse_mwh += terminal_id_recovery_mwh
                         id_recourse_cost += terminal_id_recovery_cost
                         id_recourse_reason = (
@@ -7512,13 +7915,19 @@ class BatteryBacktester:
             (colmap.pred_afrr_activation_rate_pos, colmap.true_afrr_activation_rate_pos),
             (colmap.pred_afrr_activation_rate_neg, colmap.true_afrr_activation_rate_neg),
         ]
+        materialized_cols: dict[str, pd.Series] = {}
         for pred_col, true_col in true_pairs:
             if true_col not in out.columns:
                 continue
             true_vals = pd.to_numeric(out[true_col], errors="coerce")
-            out[pred_col] = true_vals
+            materialized_cols[pred_col] = true_vals
             for q in QUANTILE_COLUMNS:
-                out[f"{pred_col}_{q}"] = true_vals
+                materialized_cols[f"{pred_col}_{q}"] = true_vals
+        if materialized_cols:
+            out = pd.concat(
+                [out.drop(columns=[c for c in materialized_cols if c in out.columns]), pd.DataFrame(materialized_cols, index=out.index)],
+                axis=1,
+            ).copy()
         return out
 
     @staticmethod
@@ -8550,6 +8959,7 @@ class BatteryBacktester:
         projected_terminal_soc_without_new_id_mwh: float | None = None,
         remaining_known_losses_mwh: float = 0.0,
         terminal_soc_safety_margin_mwh: float = 0.0,
+        terminal_recovery_allowed: bool = True,
     ) -> tuple[float, float, str]:
         """Compute ID rescue setpoints decided at t for execution in t+1."""
         id_charge = 0.0
@@ -8586,16 +8996,22 @@ class BatteryBacktester:
             "terminal_soc_not_recoverable_with_id": 0.0,
             "terminal_soc_not_recoverable_reason": "none",
         }
-        req_soc_min_for_pos = (
-            self.soc_min
-            + (max(0.0, reserve_pos_next_mw) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
-            + float(self.reserve_headroom_safety_mwh)
+        reserve_pos_requirement_mwh = (
+            (max(0.0, reserve_pos_next_mw) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
         )
-        req_soc_max_for_neg = (
-            self.soc_max
-            - (max(0.0, reserve_neg_next_mw) * self.reserve_activation_headroom_h) * self.eta_in
-            - float(self.reserve_headroom_safety_mwh)
+        reserve_neg_requirement_mwh = (
+            (max(0.0, reserve_neg_next_mw) * self.reserve_activation_headroom_h) * self.eta_in
         )
+        # Protected ID recovery is a validity guard, not an hourly aux-offset
+        # mechanism. In non-reserve hours it should only repair physical lower
+        # bound violations. Reserve safety is only relevant when a reserve
+        # obligation exists and must be deliverable.
+        req_soc_min_for_pos = self.soc_min + reserve_pos_requirement_mwh
+        if reserve_pos_next_mw > 1e-12:
+            req_soc_min_for_pos += float(self.reserve_headroom_safety_mwh)
+        req_soc_max_for_neg = self.soc_max - reserve_neg_requirement_mwh
+        if reserve_neg_next_mw > 1e-12:
+            req_soc_max_for_neg -= float(self.reserve_headroom_safety_mwh)
         if soc_next < req_soc_min_for_pos:
             soc_gap_up = req_soc_min_for_pos - soc_next
             residual_stack = self._compute_canonical_power_stack(
@@ -8620,7 +9036,20 @@ class BatteryBacktester:
                 id_discharge_mw=0.0,
             )
             protected_recovery_aux_mwh = max(0.0, float(aux_with_id_mw) * float(self.dt_h))
-            protected_required_internal_mwh = max(0.0, float(soc_gap_up) + protected_recovery_aux_mwh)
+            protected_min_net_gain_mwh = max(
+                0.0,
+                float(getattr(self, "min_protected_recovery_net_gain_mwh", 0.01)),
+            )
+            protected_required_net_internal_mwh = max(float(soc_gap_up), protected_min_net_gain_mwh)
+            # If the only reason for buying would be to offset the aux caused
+            # by the ID action itself, suppress it. Terminal recovery handles
+            # final-hour aux explicitly; protected recovery should not run every
+            # hour just to keep SoC flat.
+            protected_validity_gap_mwh = max(0.0, float(req_soc_min_for_pos) - float(soc_next))
+            protected_required_internal_mwh = max(
+                0.0,
+                protected_required_net_internal_mwh + protected_recovery_aux_mwh,
+            )
             needed_charge_mw = (
                 protected_required_internal_mwh
                 / max(float(self.eta_in), 1e-12)
@@ -8631,8 +9060,11 @@ class BatteryBacktester:
                 float(id_charge) * float(self.dt_h) * max(float(self.eta_in), 1e-12)
                 - protected_recovery_aux_mwh
             )
-            suppressed_zero_net = float(protected_net_internal_mwh <= 1e-9)
-            if suppressed_zero_net >= 0.5:
+            suppressed_zero_net = float(
+                protected_net_internal_mwh + 1e-9 < protected_required_net_internal_mwh
+            )
+            aux_only_recovery = float(protected_validity_gap_mwh <= 1e-9 and protected_recovery_aux_mwh > 1e-12)
+            if suppressed_zero_net >= 0.5 or aux_only_recovery >= 0.5:
                 id_charge = 0.0
                 reason = "none"
                 protected_net_internal_mwh = 0.0
@@ -8641,9 +9073,13 @@ class BatteryBacktester:
             self._last_id_rescue_plan_diagnostics.update(
                 {
                     "protected_recovery_required_internal_mwh": float(protected_required_internal_mwh),
+                    "protected_recovery_required_net_internal_mwh": float(protected_required_net_internal_mwh),
                     "protected_recovery_aux_mwh": float(protected_recovery_aux_mwh),
                     "protected_recovery_net_internal_mwh": float(protected_net_internal_mwh),
+                    "protected_recovery_min_net_gain_mwh": float(protected_min_net_gain_mwh),
                     "protected_recovery_suppressed_zero_net_effect": float(suppressed_zero_net),
+                    "protected_recovery_suppressed_aux_only": float(aux_only_recovery),
+                    "protected_recovery_validity_gap_mwh": float(protected_validity_gap_mwh),
                     "protected_recovery_sized_for_aux": 1.0,
                     "protected_recovery_residual_charge_mw": float(residual_mw),
                 }
@@ -8673,16 +9109,45 @@ class BatteryBacktester:
             if terminal_soc_target_mwh is not None and np.isfinite(float(terminal_soc_target_mwh)):
                 target_with_margin = float(terminal_soc_target_mwh) + max(0.0, float(terminal_soc_safety_margin_mwh))
                 projected_surplus_internal = max(0.0, float(projected_raw) - target_with_margin)
-                max_grid_sell_preserving_terminal = (
-                    projected_surplus_internal * max(float(self.eta_out), 1e-12) / max(float(self.dt_h), 1e-12)
+                tentative_grid_sell_mwh = min(
+                    max(0.0, float(id_discharge)) * max(float(self.dt_h), 1e-12),
+                    projected_surplus_internal * max(float(self.eta_out), 1e-12),
+                )
+                aux_with_relief_mw, _ = self._state_aux_power_mw(
+                    charge_mw=max(0.0, float(da_charge_next_mw)),
+                    discharge_mw=max(0.0, float(da_discharge_next_mw)),
+                    reserve_pos_mw=max(0.0, float(reserve_pos_next_mw)),
+                    reserve_neg_mw=max(0.0, float(reserve_neg_next_mw)),
+                    act_pos_rate=0.0,
+                    act_neg_rate=0.0,
+                    id_charge_mw=0.0,
+                    id_discharge_mw=tentative_grid_sell_mwh / max(float(self.dt_h), 1e-12),
+                )
+                relief_aux_mwh = max(0.0, float(aux_with_relief_mw) * float(self.dt_h))
+                max_grid_sell_preserving_terminal = max(
+                    0.0,
+                    (projected_surplus_internal - relief_aux_mwh)
+                    * max(float(self.eta_out), 1e-12)
+                    / max(float(self.dt_h), 1e-12),
                 )
                 original_id_discharge = float(id_discharge)
                 id_discharge = min(float(id_discharge), float(max_grid_sell_preserving_terminal))
+                projected_terminal_after_relief = float(projected_raw) - (
+                    float(id_discharge) * float(self.dt_h) / max(float(self.eta_out), 1e-12)
+                ) - (relief_aux_mwh if id_discharge > 1e-12 else 0.0)
                 if original_id_discharge > 1e-12:
                     self._last_id_rescue_plan_diagnostics.update(
                         {
-                            "upper_soc_relief_preserves_terminal_target": float(id_discharge <= max_grid_sell_preserving_terminal + 1e-12),
-                            "upper_soc_relief_caused_terminal_shortfall": 0.0,
+                            "upper_soc_relief_preserves_terminal_target": float(
+                                projected_terminal_after_relief + 1e-9 >= target_with_margin
+                            ),
+                            "upper_soc_relief_caused_terminal_shortfall": float(
+                                projected_terminal_after_relief + 1e-9 < target_with_margin
+                            ),
+                            "upper_soc_relief_projected_terminal_soc_after_relief_mwh": float(
+                                projected_terminal_after_relief
+                            ),
+                            "upper_soc_relief_aux_mwh": float(relief_aux_mwh if id_discharge > 1e-12 else 0.0),
                             "upper_soc_relief_terminal_shortfall_prevented": float(id_discharge + 1e-12 < original_id_discharge),
                             "upper_soc_relief_origin_reason": str(reason),
                             "upper_soc_relief_original_id_discharge_mw": float(original_id_discharge),
@@ -8702,7 +9167,17 @@ class BatteryBacktester:
                 0.0,
                 float(terminal_soc_target_mwh) + max(0.0, float(terminal_soc_safety_margin_mwh)) - projected_without_base,
             )
-            if terminal_need_internal > 1e-9:
+            if terminal_need_internal > 1e-9 and not bool(terminal_recovery_allowed):
+                self._last_id_rescue_plan_diagnostics.update(
+                    {
+                        "terminal_recovery_suppressed_until_final_window": 1.0,
+                        "terminal_recovery_suppressed_projected_shortfall_internal_mwh": float(
+                            terminal_need_internal
+                        ),
+                        "terminal_recovery_suppressed_reason": "not_latest_terminal_recovery_window",
+                    }
+                )
+            if terminal_need_internal > 1e-9 and bool(terminal_recovery_allowed):
                 known_future_aux_mwh = max(0.0, float(remaining_known_losses_mwh))
                 residual_stack = self._compute_canonical_power_stack(
                     da_charge_mw=da_charge_next_mw,
@@ -14003,6 +14478,12 @@ class BatteryBacktester:
                     projected_terminal_after_existing_recovery = float(
                         existing_recovery_diag["terminal_recovery_projected_final_soc_after_existing_recovery_mwh"]
                     )
+                    next_global_idx_for_id = global_pos_by_ts.get(next_ts, int(current_global_idx) + 1)
+                    # Terminal ID recovery is a final-validity repair. Do not
+                    # schedule it every rolling hour from a long-horizon
+                    # projection; otherwise the same terminal shortfall can be
+                    # bought repeatedly and later undone by upper-SoC relief.
+                    terminal_recovery_allowed = bool(int(next_global_idx_for_id) >= n - 1)
                     pending_id_charge_mw, pending_id_discharge_mw, pending_id_reason = self._plan_id_rescue_for_next_hour(
                         soc_next=float(executed_s),
                         reserve_pos_next_mw=reserve_pos_next,
@@ -14017,6 +14498,7 @@ class BatteryBacktester:
                         projected_terminal_soc_without_new_id_mwh=projected_terminal_after_existing_recovery,
                         remaining_known_losses_mwh=0.0,
                         terminal_soc_safety_margin_mwh=float(self.terminal_id_recovery_safety_mwh),
+                        terminal_recovery_allowed=terminal_recovery_allowed,
                     )
                     remaining_shortfall_after_existing = float(
                         existing_recovery_diag["terminal_recovery_remaining_shortfall_internal_mwh"]
@@ -14051,6 +14533,10 @@ class BatteryBacktester:
                             "terminal_soc_projection_future_bem_pos_activation_mwh": float(future_bem_pos_mwh),
                             "terminal_soc_projection_future_bem_neg_activation_mwh": float(future_bem_neg_mwh),
                             "terminal_soc_projection_future_aux_losses_mwh": float(remaining_known_losses_mwh),
+                            "terminal_recovery_allowed_this_hour": float(terminal_recovery_allowed),
+                            "terminal_recovery_allowed_delivery_timestamp_utc": (
+                                "" if pd.isna(next_ts) else pd.to_datetime(next_ts, utc=True).isoformat()
+                            ),
                         }
                     )
                     if str(pending_id_reason) == "terminal_soc_recovery" and float(pending_id_charge_mw) > 1e-12:
@@ -16483,26 +16969,23 @@ class BatteryBacktester:
                     if true_col not in solver_input.columns:
                         continue
                     true_vals = pd.to_numeric(solver_input[true_col], errors="coerce")
-                    solver_input[pred_col] = true_vals
+                    ghpf_added_cols[pred_col] = true_vals
                     for q in QUANTILE_COLUMNS:
                         q_col = f"{pred_col}_{q}"
-                        if q_col in solver_input.columns:
-                            solver_input[q_col] = true_vals
-                        else:
-                            ghpf_added_cols[q_col] = true_vals
+                        ghpf_added_cols[q_col] = true_vals
                 for b in range(len(self.afrr_quantile_bins)):
                     for pacc_col in (f"pacc_pos_bin_{b}", f"pacc_neg_bin_{b}"):
-                        if pacc_col in solver_input.columns:
-                            solver_input[pacc_col] = 1.0
-                        else:
-                            ghpf_added_cols[pacc_col] = np.ones(len(solver_input), dtype=float)
+                        ghpf_added_cols[pacc_col] = np.ones(len(solver_input), dtype=float)
                 if bool(run_strategy_permissions.allow_bcm):
                     ghpf_added_cols["_disable_bcm_product_bid"] = (
                         self._bcm_partial_product_disable_mask(solver_input[colmap.timestamp]).to_numpy(dtype=float)
                     )
                 if ghpf_added_cols:
                     solver_input = pd.concat(
-                        [solver_input, pd.DataFrame(ghpf_added_cols, index=solver_input.index)],
+                        [
+                            solver_input.drop(columns=[c for c in ghpf_added_cols if c in solver_input.columns]),
+                            pd.DataFrame(ghpf_added_cols, index=solver_input.index),
+                        ],
                         axis=1,
                     ).copy()
                 _orig_tl_global = float(self.milp_time_limit_seconds)

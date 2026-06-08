@@ -4,8 +4,12 @@ Analyze one battery backtest simulation run and write an archive report.
 
 Usage:
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_da_mid
+  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_da_short
   python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_da_mid_no_id
-  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_da_p50-p50_3d/da/p50_p50
+  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_bcm_mid
+  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_bem_mid
+  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_multi_mid
+  python3 evaluation/analyze_backtest_run.py artifacts/simulation_runs/xgb_afrr_mid
 
 Outputs:
   archive/backtesting_analysis/<run_name>_analysis.md

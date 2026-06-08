@@ -43,7 +43,7 @@ BATTERY_SPECS = {
     "soc_target_end": 0.5,  # Cyclic neutrality target (SoC_0 ~= SoC_T)
 
     # Costs
-    "degradation_cost": 25.0,  # EUR/MWh internal throughput
+    "degradation_cost": 0.0,  # EUR/MWh internal throughput
     # State-dependent auxiliary duty-cycle model (recommended):
     # OFF -> STANDBY -> TRADING -> aFRR_ACTIVE
     # Duty values are multipliers of aux_power_peak_mw.
@@ -187,6 +187,8 @@ def _validate_config() -> None:
     if FINANCIAL_PARAMS["risk_margin_eur_per_mwh"] < 0:
         raise ValueError("risk_margin_eur_per_mwh must be >= 0.")
 
+    if MARKET_SPECS["da_bid_granularity"] <= 0:
+        raise ValueError("da_bid_granularity must be > 0.")
     if MARKET_SPECS["afrr_bid_granularity"] <= 0:
         raise ValueError("afrr_bid_granularity must be > 0.")
     if MARKET_SPECS["da_execution_mode"] not in {"price_taker", "limit"}:
@@ -228,6 +230,8 @@ def _validate_config() -> None:
         raise ValueError("afrr_activation_bid_risk_lambda must be >= 0.")
     if MARKET_SPECS["afrr_min_bid_size"] < 0:
         raise ValueError("afrr_min_bid_size must be >= 0.")
+    if MARKET_SPECS["da_min_bid_size"] < 0:
+        raise ValueError("da_min_bid_size must be >= 0.")
     # Optional legacy key: keep validation backward-compatible when key is removed.
     if float(MARKET_SPECS.get("settlement_period_min", 15)) <= 0:
         raise ValueError("settlement_period_min must be > 0.")
