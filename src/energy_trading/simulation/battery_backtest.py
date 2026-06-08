@@ -3093,6 +3093,7 @@ class BatteryBacktester:
 
             c = np.zeros(2 * n, dtype=float)
             for i, price in enumerate(prices):
+                ts = ordered_ts[i]
                 charge_profit = (
                     -float(price) * float(self.dt_h)
                     - float(self.trans_eur_mwh) * float(self.dt_h)
@@ -3105,6 +3106,15 @@ class BatteryBacktester:
                     - float(self.deg_eur_mwh) * float(self.dt_h) / max(float(self.eta_out), 1e-12)
                     - float(price) * float(aux_da_per_mw_mwh)
                 )
+                if global_end_utc is not None and pd.notna(global_end_utc) and ts == global_end_utc:
+                    terminal_price = max(0.0, float(price))
+                    charge_profit += (
+                        float(self.eta_in)
+                        * float(self.dt_h)
+                        * float(self.eta_out)
+                        * float(terminal_price)
+                    )
+                    discharge_profit -= float(self.dt_h) * float(terminal_price)
                 c[2 * i] = -float(charge_profit)
                 c[2 * i + 1] = -float(discharge_profit)
 
@@ -3407,20 +3417,34 @@ class BatteryBacktester:
         optimized_stats = dict(selected_stats)
         incumbent_schedule = _scaled_schedule(0.0)
         incumbent_feasible, incumbent_stats = _evaluate(incumbent_schedule)
-        candidate_replay = _predicted_replay(optimized_schedule)
-        raw_candidate_replay = _predicted_replay(candidates)
+        sized_candidate_replay = _predicted_replay(optimized_schedule)
+        candidate_replay = _predicted_replay(candidates)
+        raw_candidate_replay = candidate_replay
         incumbent_replay = _predicted_replay(incumbent_schedule)
         candidate_pnl = float(candidate_replay.get("selection_pnl_eur", float("nan")))
+        sized_candidate_pnl = float(sized_candidate_replay.get("selection_pnl_eur", float("nan")))
         incumbent_pnl = float(incumbent_replay.get("selection_pnl_eur", float("nan")))
         candidate_replay_error = float(candidate_replay.get("da_cashflow_replay_error", 1.0))
+        sized_candidate_replay_error = float(sized_candidate_replay.get("da_cashflow_replay_error", 1.0))
         incumbent_replay_error = float(incumbent_replay.get("da_cashflow_replay_error", 1.0))
         candidate_replay_error_reason = str(candidate_replay.get("da_cashflow_replay_error_reason", "unknown"))
+        sized_candidate_replay_error_reason = str(
+            sized_candidate_replay.get("da_cashflow_replay_error_reason", "unknown")
+        )
         incumbent_replay_error_reason = str(incumbent_replay.get("da_cashflow_replay_error_reason", "unknown"))
         candidate_replay_valid = bool(candidate_replay_error <= 0.5 and np.isfinite(candidate_pnl))
+        sized_candidate_replay_valid = bool(
+            sized_candidate_replay_error <= 0.5 and np.isfinite(sized_candidate_pnl)
+        )
         incumbent_replay_valid = bool(incumbent_replay_error <= 0.5 and np.isfinite(incumbent_pnl))
         candidate_minus_incumbent = (
             float(candidate_pnl - incumbent_pnl)
             if bool(candidate_replay_valid) and bool(incumbent_replay_valid)
+            else float("nan")
+        )
+        sized_candidate_minus_incumbent = (
+            float(sized_candidate_pnl - incumbent_pnl)
+            if bool(sized_candidate_replay_valid) and bool(incumbent_replay_valid)
             else float("nan")
         )
         solver_objective_vals = (
@@ -3430,8 +3454,8 @@ class BatteryBacktester:
         )
         solver_objective_eur = float(solver_objective_vals.iloc[0]) if not solver_objective_vals.empty else float("nan")
         objective_minus_replay = (
-            float(solver_objective_eur - candidate_pnl)
-            if np.isfinite(solver_objective_eur) and np.isfinite(candidate_pnl)
+            float(solver_objective_eur - sized_candidate_pnl)
+            if np.isfinite(solver_objective_eur) and np.isfinite(sized_candidate_pnl)
             else float("nan")
         )
         objective_replay_consistent = 0.0
@@ -3450,7 +3474,12 @@ class BatteryBacktester:
         candidate_zeroed_due_to_invalid_replay = 0.0
         candidate_zeroed_due_to_negative_valid_replay = 0.0
 
-        if not bool(candidate_replay_valid) and not bool(incumbent_replay_valid):
+        sized_schedule_zero = bool(all((ch <= 1e-9 and dis <= 1e-9) for ch, dis in optimized_schedule.values()))
+
+        if (
+            (not bool(candidate_replay_valid) or not bool(sized_candidate_replay_valid))
+            and not bool(incumbent_replay_valid)
+        ):
             selected = incumbent_schedule
             selected_factor = 0.0
             selected_feasible = bool(incumbent_feasible)
@@ -3464,7 +3493,7 @@ class BatteryBacktester:
             candidate_rejection_reason = "invalid_replay"
             no_trade_rejection_reason = "invalid_replay"
             candidate_zeroed_due_to_invalid_replay = 1.0
-        elif not bool(candidate_replay_valid):
+        elif not bool(candidate_replay_valid) or not bool(sized_candidate_replay_valid):
             selected = incumbent_schedule
             selected_factor = 0.0
             selected_feasible = bool(incumbent_feasible)
@@ -3477,6 +3506,8 @@ class BatteryBacktester:
             da_precommit_selection_blocked_by_replay_error = 1.0
             candidate_rejection_reason = "invalid_replay"
             candidate_zeroed_due_to_invalid_replay = 1.0
+            if bool(candidate_replay_valid) and not bool(sized_candidate_replay_valid):
+                candidate_replay_error_reason = str(sized_candidate_replay_error_reason)
         elif not bool(incumbent_replay_valid):
             selected = incumbent_schedule
             selected_factor = 0.0
@@ -3492,7 +3523,15 @@ class BatteryBacktester:
             candidate_zeroed_due_to_invalid_replay = 1.0
         elif bool(incumbent_feasible) and (
             (not bool(optimized_feasible))
-            or (np.isfinite(candidate_minus_incumbent) and candidate_minus_incumbent < -1e-6)
+            or (
+                np.isfinite(sized_candidate_minus_incumbent)
+                and sized_candidate_minus_incumbent < -1e-6
+            )
+            or (
+                bool(sized_schedule_zero)
+                and np.isfinite(candidate_minus_incumbent)
+                and candidate_minus_incumbent <= 1e-6
+            )
         ):
             selected = incumbent_schedule
             selected_factor = 0.0
@@ -3501,7 +3540,17 @@ class BatteryBacktester:
             da_selected_incumbent = "no_trade"
             da_selection_reason = "no_trade_incumbent_predicted_replay_dominates"
             candidate_rejection_reason = "candidate_pnl_below_no_trade"
-            if bool(optimized_feasible) and np.isfinite(candidate_minus_incumbent) and candidate_minus_incumbent < -1e-6:
+            if bool(optimized_feasible) and (
+                (
+                    np.isfinite(candidate_minus_incumbent)
+                    and candidate_minus_incumbent < -1e-6
+                )
+                or (
+                    bool(sized_schedule_zero)
+                    and np.isfinite(candidate_minus_incumbent)
+                    and candidate_minus_incumbent <= 1e-6
+                )
+            ):
                 candidate_zeroed_due_to_negative_valid_replay = 1.0
         elif not bool(incumbent_feasible):
             da_selection_reason = "optimized_selected_no_trade_infeasible"

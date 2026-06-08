@@ -3452,8 +3452,8 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
         global_end_utc=ts,
     )
 
-    assert selected_global_end[ts] == pytest.approx((1.0, 0.0))
-    assert audit_global_end[0]["selected_incumbent"] == "optimized"
+    assert selected_global_end[ts] == pytest.approx((0.0, 0.0))
+    assert audit_global_end[0]["selected_incumbent"] == "no_trade"
     assert str(audit_global_end[0]["selection_pnl_basis"]) == "includes_global_terminal"
     assert float(audit_global_end[0]["terminal_credit_eur"]) > 0.0
     assert float(audit_global_end[0]["local_terminal_credit_ignored_eur"]) == pytest.approx(0.0)
@@ -3502,7 +3502,10 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
         global_end_utc=None,
     )
 
-    assert selected2[ts0] == pytest.approx((1.0, 0.0))
+    # The bid sizer may choose a profitable subset of the raw candidate. With
+    # no final SoC target in this local replay, selling existing inventory at
+    # the high-price hour dominates adding the low-price buy leg.
+    assert selected2[ts0] == pytest.approx((0.0, 0.0))
     assert selected2[ts1] == pytest.approx((0.0, 0.0))
     assert selected2[ts2] == pytest.approx((0.0, 1.0))
     assert {row["selected_incumbent"] for row in audit2} == {"optimized"}
@@ -3546,12 +3549,10 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
         fixed_reserve_neg={},
         global_end_utc=None,
     )
-    assert float(postlock_audit2[0]["postlock_candidate_gross_spread_eur"]) == pytest.approx(
-        float(audit2[0]["candidate_gross_spread_eur"])
-    )
-    assert float(postlock_audit2[0]["postlock_candidate_pnl_recomputed_eur"]) == pytest.approx(
-        float(audit2[0]["candidate_pnl_recomputed_eur"])
-    )
+    # Postlock replay evaluates the accepted/sized schedule, while
+    # candidate_gross_spread_eur preserves the raw optimizer candidate.
+    assert float(postlock_audit2[0]["postlock_candidate_gross_spread_eur"]) == pytest.approx(100.0)
+    assert float(postlock_audit2[0]["postlock_candidate_pnl_recomputed_eur"]) == pytest.approx(100.0)
     assert str(postlock_audit2[0]["postlock_replay_price_source_column"]) == col.pred_da_price
 
     bt.deg_eur_mwh = 200.0
@@ -7797,6 +7798,7 @@ def _da_lock_rows(
             "charge_mw": [charge_mw] * hours,
             "discharge_mw": [discharge_mw] * hours,
             "soc_start_lp_mwh": [soc_start] * hours,
+            col.pred_da_price: [100.0] * hours,
             col.pred_afrr_activation_rate_pos: [0.0] * hours,
             col.pred_afrr_activation_rate_neg: [0.0] * hours,
         }
