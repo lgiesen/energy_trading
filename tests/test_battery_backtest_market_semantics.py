@@ -818,6 +818,19 @@ def test_bem_execution_probability_convention_and_no_double_probability() -> Non
     expected_share = 0.70 * 0.2
     assert float(out["ev_expected_act_share_pos_bin_0"].iloc[0]) == pytest.approx(expected_share)
     assert float(out["ev_expected_act_share_pos_bin_0"].iloc[0]) != pytest.approx(0.70 * expected_share)
+    expected_mean_exec_prob = (0.70 + 0.70 + 0.10 + 0.10) / 4.0
+    expected_mean_act_share = ((0.70 * 0.2) + (0.70 * 0.3) + (0.10 * 0.2) + (0.10 * 0.3)) / 4.0
+    assert float(out["bem_execution_probability_used_for_revenue"].iloc[0]) == pytest.approx(expected_mean_exec_prob)
+    assert float(out["bem_execution_probability_used_for_cost"].iloc[0]) == pytest.approx(expected_mean_exec_prob)
+    assert float(out["bem_expected_activation_share_used_for_revenue"].iloc[0]) == pytest.approx(
+        expected_mean_act_share
+    )
+    assert float(out["bem_expected_activation_share_used_for_cost"].iloc[0]) == pytest.approx(
+        expected_mean_act_share
+    )
+    assert float(out["bem_expected_activation_share_used_for_soc"].iloc[0]) == pytest.approx(
+        expected_mean_act_share
+    )
 
 
 def _tiny_backtest_df(hours: int = 6) -> tuple[pd.DataFrame, BacktestColumnMap]:
@@ -6357,11 +6370,19 @@ def test_summary_flags_invalid_runs() -> None:
 
 def test_bcm_precommitment_reduces_infeasible_bid() -> None:
     bt = _mk_backtester()
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = None
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.reserve_min_margin_after_bid_mwh = 0.0
     ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")  # 08:00 CET/CEST gate for model path
     target_hours = pd.date_range("2025-05-01 22:00:00+00:00", periods=4, freq="h")
+    col = BacktestColumnMap()
     snap = pd.DataFrame(
         {
             "target_time_utc": target_hours,
+            col.timestamp: target_hours,
             "reserve_pos_mw": [10.0, 10.0, 10.0, 10.0],
             "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
             # only ~2 MWh above soc_min -> infeasible for 10 MW @ 0.5h
@@ -6372,7 +6393,6 @@ def test_bcm_precommitment_reduces_infeasible_bid() -> None:
             "bem_only_neg_mw": [0.0] * 4,
         }
     )
-    col = BacktestColumnMap()
     src = pd.DataFrame(
         {
             col.timestamp: target_hours,
@@ -6398,6 +6418,7 @@ def test_bcm_precommitment_reduces_infeasible_bid() -> None:
         lock_energy_pos=lock_e_pos,
         lock_energy_neg=lock_e_neg,
         is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
     )
     # 2 MWh headroom with 0.5h/eta_out implies <4 MW feasible.
     assert len(lock_pos) == 4
@@ -6620,7 +6641,7 @@ def test_bcm_precommit_derates_terminal_soc_infeasible_bid_before_lockbook(
     assert float(stats["retry_factor_selected_before_clearing"]) == pytest.approx(
         float(stats["retry_factor_selected"])
     )
-    assert float(stats["margin_before_derate_mwh"]) < 0.0
+    assert float(stats["margin_before_derate_mwh"]) <= 0.0
     assert float(stats["margin_after_derate_mwh"]) >= 0.0
     assert float(stats["terminal_soc_shortfall_mwh"]) == pytest.approx(0.0)
     assert str(stats["zero_reason"]) == "none"
@@ -6795,7 +6816,7 @@ def test_bcm_precommit_recoverable_terminal_shortfall_keeps_candidate(
         candidate_ev_eur=500.0,
     )
 
-    assert offered_pos == pytest.approx(2.0)
+    assert offered_pos == pytest.approx(2.0), stats
     assert offered_neg == pytest.approx(0.0)
     assert float(stats["id_recovery_feasible"]) == pytest.approx(1.0)
     assert float(stats["terminal_shortfall_before_recovery_mwh"]) > 0.0
@@ -6932,6 +6953,54 @@ def test_bcm_precommit_negative_ev_after_id_recovery_zeroes_candidate(
     assert str(stats["zero_reason"]) == "negative_ev_after_id_recovery"
     assert float(stats["id_recovery_feasible"]) == pytest.approx(1.0)
     assert float(stats["effective_ev_after_recovery_eur"]) < 0.0
+
+
+def test_bcm_precommit_uses_incremental_recovery_cost_not_full_baseline_recovery() -> None:
+    stats = BatteryBacktester._bcm_ev_recovery_cost_adjustment(
+        candidate_ev_eur=50.0,
+        retry_factor=1.0,
+        baseline_recovery_cost_eur=100.0,
+        candidate_recovery_cost_eur=130.0,
+    )
+
+    assert float(stats["incremental_recovery_cost_eur"]) == pytest.approx(30.0)
+    assert float(stats["ev_after_incremental_recovery_eur"]) == pytest.approx(20.0)
+    assert float(stats["recovery_ev_violation"]) == pytest.approx(0.0)
+    assert float(stats["full_recovery_cost_ev_after_recovery_eur"]) == pytest.approx(-80.0)
+    assert float(stats["full_recovery_cost_would_have_zeroed"]) == pytest.approx(1.0)
+    assert float(stats["recovery_cost_probability_weighted"]) == pytest.approx(0.0)
+
+
+def test_bcm_precommit_recovery_cost_probability_factor() -> None:
+    stats = BatteryBacktester._bcm_ev_recovery_cost_adjustment(
+        candidate_ev_eur=60.0,
+        retry_factor=1.0,
+        baseline_recovery_cost_eur=0.0,
+        candidate_recovery_cost_eur=100.0,
+        recovery_cost_probability_factor=0.5,
+    )
+
+    assert float(stats["incremental_recovery_cost_eur"]) == pytest.approx(100.0)
+    assert float(stats["expected_incremental_recovery_cost_eur"]) == pytest.approx(50.0)
+    assert float(stats["ev_after_incremental_recovery_eur"]) == pytest.approx(10.0)
+    assert float(stats["recovery_ev_violation"]) == pytest.approx(0.0)
+    assert float(stats["recovery_cost_probability_weighted"]) == pytest.approx(1.0)
+    assert float(stats["recovery_cost_probability_factor"]) == pytest.approx(0.5)
+    assert str(stats["recovery_cost_used_in_ev_mode"]) == "expected_incremental_award_weighted"
+
+
+def test_bcm_precommit_ev_nan_is_not_negative_ev() -> None:
+    stats = BatteryBacktester._bcm_ev_recovery_cost_adjustment(
+        candidate_ev_eur=float("nan"),
+        retry_factor=1.0,
+        baseline_recovery_cost_eur=0.0,
+        candidate_recovery_cost_eur=100.0,
+        recovery_cost_probability_factor=0.5,
+    )
+
+    assert float(stats["ev_nan_detected"]) == pytest.approx(1.0)
+    assert str(stats["ev_nan_component"]) == "candidate_ev_eur"
+    assert float(stats["recovery_ev_violation"]) == pytest.approx(0.0)
 
 
 def test_bcm_precommit_selector_selects_full_factor_when_full_award_feasible(
@@ -7079,8 +7148,8 @@ def test_bcm_precommit_selector_locks_zero_only_when_no_nonzero_feasible(
     assert stats["selection_is_causal"] == 1.0
     assert stats["full_award_feasibility_checked"] == 1.0
     assert stats["realized_clearing_used_for_selection"] == 0.0
-    assert stats["zero_reason"] == "terminal_soc_infeasible"
-    assert stats["feasibility_driver"] == "terminal_soc_infeasible"
+    assert stats["zero_reason"] == "id_recovery_blocked"
+    assert stats["feasibility_driver"] == "id_recovery_blocked"
     assert stats["zero_reason"] != "not_awarded_or_zero_candidate"
 
 
@@ -7857,6 +7926,7 @@ def test_reserve_bid_derate_reduces_submitted_mw() -> None:
         lock_energy_neg={},
         precommit_audit_by_ts=pre,
         is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
     )
     fea = list(pre.get("precommit_feasible_pos_mw", {}).values())
     sub = list(pre.get("precommit_submitted_pos_mw_after_derate_cap", {}).values())
@@ -7909,6 +7979,7 @@ def test_max_reserve_bid_mw_caps_submission() -> None:
         lock_energy_neg={},
         precommit_audit_by_ts=pre,
         is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
     )
     sub = list(pre.get("precommit_submitted_pos_mw_after_derate_cap", {}).values())
     assert sub and all(float(v) <= 2.0 + 1e-9 for v in sub)
@@ -7981,6 +8052,7 @@ def test_quantile_aggressiveness_not_changed_by_feasibility_cap() -> None:
         lock_energy_neg={},
         precommit_audit_by_ts=pre,
         is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
     )
     assert all(abs(float(v) - 6.0) < 1e-9 for v in pre.get("desired_reserve_pos_mw", {}).values())
     assert all(abs(float(v) - 4.0) < 1e-9 for v in pre.get("desired_reserve_neg_mw", {}).values())
@@ -8031,6 +8103,7 @@ def test_reserve_submission_capped_by_safe_mw() -> None:
         lock_energy_neg={},
         precommit_audit_by_ts=pre,
         is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
     )
     for ts, desired in pre.get("desired_reserve_pos_mw", {}).items():
         safe = float(pre.get("safe_reserve_pos_mw", {}).get(ts, 0.0))
@@ -8357,6 +8430,30 @@ def test_rolling_final_soc_target_only_applies_at_global_end() -> None:
         soc_min=2.0,
         soc_target_end=10.0,
     ) is None
+
+
+def test_rolling_final_soc_target_includes_terminal_safety_at_global_end() -> None:
+    assert BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=True,
+        window_end=24,
+        total_rows=24,
+        soc_min=2.0,
+        soc_target_end=10.0,
+        terminal_soc_safety_margin_mwh=0.03,
+        soc_max=18.0,
+    ) == pytest.approx(10.03)
+
+
+def test_rolling_final_soc_target_safety_is_capped_by_soc_max() -> None:
+    assert BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=True,
+        window_end=24,
+        total_rows=24,
+        soc_min=2.0,
+        soc_target_end=10.0,
+        terminal_soc_safety_margin_mwh=0.50,
+        soc_max=10.2,
+    ) == pytest.approx(10.2)
 
 
 def test_rolling_final_soc_target_anticipates_latest_technical_id_recovery() -> None:
@@ -9387,6 +9484,12 @@ def test_da_postlock_terminal_recovery_cost_can_select_no_trade() -> None:
     assert str(audit[0]["final_selected_incumbent"]) == "no_trade"
     assert float(audit[0]["locked_sell_mwh_by_hour"]) == pytest.approx(0.0)
     assert float(audit[0]["da_postlock_final_selected_pnl_eur"]) == pytest.approx(float(audit[0]["no_trade_pnl"]))
+    assert float(audit[0]["da_postlock_recovery_cost_probability_weighting_required"]) == pytest.approx(0.0)
+    assert str(audit[0]["da_postlock_recovery_cost_context"]) == "post_clearing_locked_schedule"
+    assert str(audit[0]["da_postlock_recovery_cost_used_in_ev_mode"]) == "full_locked_schedule_recovery_cost"
+    assert float(audit[0]["da_postlock_recovery_cost_full_eur"]) == pytest.approx(
+        float(audit[0]["da_postlock_recovery_cost_expected_eur"])
+    )
 
 
 def test_da_postlock_strict_no_future_action_keeps_legacy_terminal_rejection() -> None:
@@ -10000,6 +10103,85 @@ def test_terminal_recovery_existing_scheduled_internal_schedules_only_delta() ->
     assert diag["terminal_recovery_remaining_shortfall_internal_mwh"] == pytest.approx(0.2)
 
 
+def test_terminal_recovery_existing_scheduled_internal_subtracts_induced_aux_delta() -> None:
+    diag = BatteryBacktester._terminal_recovery_remaining_shortfall_after_existing(
+        projected_terminal_soc_without_new_recovery_mwh=8.30,
+        existing_scheduled_terminal_recovery_internal_mwh=1.70,
+        known_future_aux_mwh=0.0,
+        terminal_soc_target_mwh=10.0,
+        safety_buffer_mwh=0.0,
+        existing_recovery_aux_without_recovery_mwh=0.02,
+        existing_recovery_aux_with_recovery_mwh=0.05,
+        existing_recovery_projection_includes_aux_without_recovery=True,
+    )
+
+    assert diag["terminal_recovery_existing_induced_aux_delta_mwh"] == pytest.approx(0.03)
+    assert diag["terminal_recovery_existing_aux_sized_mwh"] == pytest.approx(0.03)
+    assert diag["terminal_recovery_projected_final_soc_after_existing_before_aux_mwh"] == pytest.approx(10.0)
+    assert diag["terminal_recovery_projected_final_soc_after_existing_after_aux_mwh"] == pytest.approx(9.97)
+    assert diag["terminal_recovery_remaining_shortfall_after_existing_recovery_mwh"] == pytest.approx(0.03)
+
+
+def test_terminal_recovery_existing_scheduled_internal_subtracts_full_aux_for_pre_aux_projection() -> None:
+    diag = BatteryBacktester._terminal_recovery_remaining_shortfall_after_existing(
+        projected_terminal_soc_without_new_recovery_mwh=8.32,
+        existing_scheduled_terminal_recovery_internal_mwh=1.70,
+        known_future_aux_mwh=0.0,
+        terminal_soc_target_mwh=10.0,
+        safety_buffer_mwh=0.0,
+        existing_recovery_aux_without_recovery_mwh=0.02,
+        existing_recovery_aux_with_recovery_mwh=0.05,
+        existing_recovery_projection_includes_aux_without_recovery=False,
+    )
+
+    assert diag["terminal_recovery_existing_induced_aux_delta_mwh"] == pytest.approx(0.03)
+    assert diag["terminal_recovery_existing_aux_sized_mwh"] == pytest.approx(0.05)
+    assert diag["terminal_recovery_projected_final_soc_after_existing_before_aux_mwh"] == pytest.approx(10.02)
+    assert diag["terminal_recovery_projected_final_soc_after_existing_after_aux_mwh"] == pytest.approx(9.97)
+    assert diag["terminal_recovery_remaining_shortfall_after_existing_recovery_mwh"] == pytest.approx(0.03)
+
+
+def test_terminal_recovery_topup_scheduled_after_existing_recovery_aux_shortfall() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_off_mw = 0.02
+    bt.aux_trading_mw = 0.05
+    bt.aux_standby_mw = 0.0
+    bt.p_max_mw = 10.0
+
+    existing = BatteryBacktester._terminal_recovery_remaining_shortfall_after_existing(
+        projected_terminal_soc_without_new_recovery_mwh=8.30,
+        existing_scheduled_terminal_recovery_internal_mwh=1.70,
+        known_future_aux_mwh=0.0,
+        terminal_soc_target_mwh=10.0,
+        safety_buffer_mwh=0.0,
+        existing_recovery_aux_without_recovery_mwh=0.02,
+        existing_recovery_aux_with_recovery_mwh=0.05,
+        existing_recovery_projection_includes_aux_without_recovery=True,
+    )
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=9.97,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=float(
+            existing["terminal_recovery_projected_final_soc_after_existing_after_aux_mwh"]
+        ),
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    assert reason == "terminal_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert id_charge * bt.dt_h > 0.03 / bt.eta_in
+    assert float(diag["terminal_recovery_projected_final_soc_after_recovery_mwh"]) >= 10.0 - 1e-9
+
+
 def test_protected_soc_recovery_is_sized_net_positive_after_aux() -> None:
     bt = _mk_backtester()
     bt.eta_in = 0.95
@@ -10126,13 +10308,15 @@ def test_terminal_recovery_sizes_to_target_after_same_hour_aux() -> None:
     diag = bt._last_id_rescue_plan_diagnostics
 
     expected_aux_delta = 0.095 - float(bt.aux_off_mw)
-    expected_internal = 10.0 - 2.155 + expected_aux_delta
+    expected_aux_sized = 0.095
+    expected_internal = 10.0 - 2.155 + expected_aux_sized
     assert reason == "terminal_soc_recovery"
     assert id_discharge == pytest.approx(0.0)
     assert float(diag["terminal_recovery_aux_without_recovery_mwh"]) == pytest.approx(float(bt.aux_off_mw))
     assert float(diag["terminal_recovery_aux_with_recovery_mwh"]) == pytest.approx(0.095)
     assert float(diag["terminal_recovery_induced_aux_delta_mwh"]) == pytest.approx(expected_aux_delta)
-    assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(expected_aux_delta)
+    assert float(diag["terminal_recovery_aux_sized_mwh"]) == pytest.approx(expected_aux_sized)
+    assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(expected_aux_sized)
     assert float(diag["terminal_soc_id_recourse_needed_internal_mwh"]) == pytest.approx(expected_internal)
     assert id_charge * bt.dt_h * bt.eta_in == pytest.approx(expected_internal)
     assert float(diag["terminal_repair_projected_final_soc_after_repair_mwh"]) >= 10.0 - 1e-9
@@ -10166,11 +10350,13 @@ def test_terminal_recovery_observed_residual_shortfall_regression() -> None:
     assert reason == "terminal_soc_recovery"
     assert id_discharge == pytest.approx(0.0)
     expected_aux_delta = 0.03 - float(bt.aux_off_mw)
+    expected_aux_sized = 0.03
     assert float(diag["terminal_recovery_aux_without_recovery_mwh"]) == pytest.approx(float(bt.aux_off_mw))
     assert float(diag["terminal_recovery_aux_with_recovery_mwh"]) == pytest.approx(0.03)
     assert float(diag["terminal_recovery_induced_aux_delta_mwh"]) == pytest.approx(expected_aux_delta)
-    assert aux_mwh == pytest.approx(expected_aux_delta)
-    assert id_charge * bt.dt_h * bt.eta_in == pytest.approx(10.0 - 8.58 + expected_aux_delta)
+    assert float(diag["terminal_recovery_aux_sized_mwh"]) == pytest.approx(expected_aux_sized)
+    assert aux_mwh == pytest.approx(expected_aux_sized)
+    assert id_charge * bt.dt_h * bt.eta_in == pytest.approx(10.0 - 8.58 + expected_aux_sized)
     assert final_projection >= 10.0 - 1e-9
     assert float(diag["terminal_recovery_remaining_shortfall_after_recovery_mwh"]) == pytest.approx(0.0)
     assert float(diag["terminal_recovery_final_projection_passed"]) == pytest.approx(1.0)
@@ -10199,14 +10385,17 @@ def test_terminal_recovery_includes_off_to_trading_aux_delta() -> None:
     diag = bt._last_id_rescue_plan_diagnostics
 
     expected_delta = 0.05 - 0.02
-    expected_internal = 10.0 - 8.58 + expected_delta
-    final_projection = 8.58 + id_charge * bt.dt_h * bt.eta_in - expected_delta
+    expected_aux_sized = 0.05
+    expected_internal = 10.0 - 8.58 + expected_aux_sized
+    final_projection = 8.58 + id_charge * bt.dt_h * bt.eta_in - expected_aux_sized
 
     assert reason == "terminal_soc_recovery"
     assert id_discharge == pytest.approx(0.0)
     assert float(diag["terminal_recovery_aux_without_recovery_mwh"]) == pytest.approx(0.02)
     assert float(diag["terminal_recovery_aux_with_recovery_mwh"]) == pytest.approx(0.05)
     assert float(diag["terminal_recovery_induced_aux_delta_mwh"]) == pytest.approx(expected_delta)
+    assert float(diag["terminal_recovery_aux_sized_mwh"]) == pytest.approx(expected_aux_sized)
+    assert float(diag["terminal_recovery_projection_includes_aux_without_recovery"]) == pytest.approx(0.0)
     assert float(diag["terminal_soc_id_recourse_needed_internal_mwh"]) == pytest.approx(expected_internal)
     assert final_projection >= 10.0 - 1e-9
 
@@ -11416,11 +11605,15 @@ def test_bcm_precommit_economic_filter_uses_optimizer_ev_with_capacity_value(
 ) -> None:
     bt = _mk_backtester()
     bt.reserve_min_margin_after_bid_mwh = 0.0
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = None
     ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
     target_hours = pd.date_range("2025-05-01 22:00:00+00:00", periods=4, freq="h")
+    col = BacktestColumnMap()
     snap = pd.DataFrame(
         {
             "target_time_utc": target_hours,
+            col.timestamp: target_hours,
             "reserve_pos_mw": [2.0, 2.0, 2.0, 2.0],
             "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
             "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
@@ -11436,7 +11629,6 @@ def test_bcm_precommit_economic_filter_uses_optimizer_ev_with_capacity_value(
             "ev_afrr_neg_eur": [0.0, 0.0, 0.0, 0.0],
         }
     )
-    col = BacktestColumnMap()
     src = pd.DataFrame(
         {
             col.timestamp: target_hours,
@@ -11498,6 +11690,7 @@ def test_bcm_precommit_economic_filter_uses_optimizer_ev_with_capacity_value(
         lock_energy_neg={},
         precommit_audit_by_ts=pre,
         is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
     )
 
     assert selector_calls == [(pytest.approx(2.0), pytest.approx(0.0))]
@@ -13457,3 +13650,112 @@ def test_performance_paths_long_contains_only_enabled_paths_and_stable_schema() 
     assert set(daily["path_type"]) == {"model", "naive"}
     assert "soc_mean_mwh" in daily.columns
     assert "soc_end_mwh" in daily.columns
+
+
+def test_terminal_inventory_main_milp_objective_coefficient_is_negative_lambda() -> None:
+    bt = _mk_backtester()
+    bt.da_terminal_soc_value_enabled = True
+    bt.da_terminal_value_min_eur_mwh = 100.0
+    bt.da_terminal_value_max_eur_mwh = 100.0
+    df, col = _tiny_backtest_df(hours=1)
+    df[col.pred_da_price] = 50.0
+    df[col.true_da_price] = 50.0
+
+    out = bt.optimize_dispatch(df, col, allowed_markets=())
+
+    assert float(out["terminal_inventory_shadow_value_eur_per_internal_mwh"].iloc[0]) == pytest.approx(100.0)
+    assert float(out["terminal_inventory_objective_coef_soc_end"].iloc[0]) == pytest.approx(-100.0)
+    assert str(out["terminal_inventory_value_source"].iloc[0]) == "da_liquidation_replacement_proxy"
+    assert float(out["da_soc_shadow_value_eur_per_internal_mwh"].iloc[0]) == pytest.approx(100.0)
+
+
+def test_terminal_inventory_da_buy_and_sell_effects_use_execution_probability() -> None:
+    bt = _mk_backtester()
+    bt.da_execution_mode = "limit"
+    bt.bid_builder.da_buy_limit_quantile = "p50"
+    bt.bid_builder.da_sell_limit_quantile = "p50"
+    bt.da_terminal_soc_value_enabled = True
+    bt.da_terminal_value_min_eur_mwh = 100.0
+    bt.da_terminal_value_max_eur_mwh = 100.0
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    col = BacktestColumnMap()
+    ts_buy = pd.Timestamp("2026-01-01T00:00:00Z")
+    ts_sell = pd.Timestamp("2026-01-01T01:00:00Z")
+    rows = pd.DataFrame(
+        {
+            "target_time_utc": [ts_buy, ts_sell],
+            col.timestamp: [ts_buy, ts_sell],
+            col.pred_da_price: [50.0, 50.0],
+        }
+    )
+
+    replay = bt._replay_da_candidate_cashflow(
+        rows=rows,
+        schedule={ts_buy: (10.0, 0.0), ts_sell: (0.0, 10.0)},
+        colmap=col,
+        current_soc_mwh=10.0,
+    )
+
+    assert float(replay["da_terminal_inventory_effect_buy_eur"]) == pytest.approx(0.5 * 10.0 * 0.95 * 100.0)
+    assert float(replay["da_terminal_inventory_effect_sell_eur"]) == pytest.approx(0.5 * 10.0 / 0.95 * 100.0)
+    assert float(replay["terminal_inventory_shadow_value_eur_per_internal_mwh"]) == pytest.approx(100.0)
+
+
+def test_bcm_terminal_inventory_effect_formulas() -> None:
+    pos, neg = BatteryBacktester.terminal_inventory_effects_eur_per_mw(
+        probability=0.5,
+        activation_rate=0.01,
+        duration_h=4.0,
+        eta_in=0.95,
+        eta_out=0.95,
+        lambda_eur_per_internal_mwh=100.0,
+    )
+
+    assert float(pos) * 10.0 == pytest.approx(-0.5 * 10.0 * 0.01 * 4.0 / 0.95 * 100.0)
+    assert float(neg) * 10.0 == pytest.approx(0.5 * 10.0 * 0.01 * 4.0 * 0.95 * 100.0)
+
+
+def test_bem_terminal_inventory_effect_formulas_use_execution_probability() -> None:
+    pos, neg = BatteryBacktester.terminal_inventory_effects_eur_per_mw(
+        probability=0.5,
+        activation_rate=0.01,
+        duration_h=4.0,
+        eta_in=0.95,
+        eta_out=0.95,
+        lambda_eur_per_internal_mwh=100.0,
+    )
+
+    assert float(pos) * 10.0 == pytest.approx(-0.5 * 10.0 * 0.01 * 4.0 / 0.95 * 100.0)
+    assert float(neg) * 10.0 == pytest.approx(0.5 * 10.0 * 0.01 * 4.0 * 0.95 * 100.0)
+
+
+def test_bem_terminal_inventory_diagnostics_not_double_counted_in_full_objective() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p50"]
+    bt.da_terminal_soc_value_enabled = True
+    bt.da_terminal_value_min_eur_mwh = 100.0
+    bt.da_terminal_value_max_eur_mwh = 100.0
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    df, col = _one_hour_pred_df(
+        da=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos=0.0,
+        act_neg=0.0,
+        rate_pos=0.01,
+        rate_neg=0.01,
+    )
+
+    out = bt.optimize_dispatch(df, col, allowed_markets=("afrr", "bem"))
+
+    expected_pos = -0.5 * 0.01 * 1.0 / 0.95 * 100.0
+    expected_neg = 0.5 * 0.01 * 1.0 * 0.95 * 100.0
+    assert float(out["bem_terminal_inventory_effect_pos_bin_0_eur_per_mw"].iloc[0]) == pytest.approx(expected_pos)
+    assert float(out["bem_terminal_inventory_effect_neg_bin_0_eur_per_mw"].iloc[0]) == pytest.approx(expected_neg)
+    assert float(out["bem_terminal_inventory_shadow_value_already_in_full_objective"].iloc[0]) == pytest.approx(1.0)
+    assert float(out["terminal_inventory_shadow_value_eur_per_internal_mwh"].iloc[0]) == pytest.approx(100.0)

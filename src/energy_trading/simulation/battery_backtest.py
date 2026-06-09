@@ -2556,7 +2556,10 @@ class BatteryBacktester:
         if not bool(enforce_final_soc_min):
             return None
         if int(window_end) >= int(total_rows):
-            return float(soc_target_end)
+            target = float(soc_target_end) + max(0.0, float(terminal_soc_safety_margin_mwh))
+            if soc_max is not None and np.isfinite(float(soc_max)):
+                target = min(target, float(soc_max))
+            return float(target)
         if p_max_mw is None or eta_in is None:
             return float(soc_min)
         remaining_hours = max(0.0, float(int(total_rows) - int(window_end)) * float(dt_h))
@@ -2716,6 +2719,7 @@ class BatteryBacktester:
         max_val = float(getattr(self, "da_terminal_value_max_eur_mwh", 500.0))
         margin = float(getattr(self, "da_terminal_value_margin_eur_mwh", 0.0))
         if not enabled:
+            source = "disabled" if not bool(self.da_terminal_soc_value_enabled) else "missing_prices"
             return {
                 "da_terminal_soc_value_enabled": 0.0,
                 "da_soc_shadow_value_eur_per_internal_mwh": 0.0,
@@ -2723,7 +2727,14 @@ class BatteryBacktester:
                 "da_future_replacement_cost_internal_eur_mwh": 0.0,
                 "da_terminal_value_quantile_sell": float(q_sell),
                 "da_terminal_value_quantile_buy": float(q_buy),
-                "da_terminal_value_source": "disabled" if not bool(self.da_terminal_soc_value_enabled) else "missing_prices",
+                "da_terminal_value_source": source,
+                "terminal_inventory_shadow_value_enabled": 0.0,
+                "terminal_inventory_shadow_value_eur_per_internal_mwh": 0.0,
+                "terminal_inventory_future_sell_value_internal_eur_mwh": 0.0,
+                "terminal_inventory_future_replacement_cost_internal_eur_mwh": 0.0,
+                "terminal_inventory_value_quantile_sell": float(q_sell),
+                "terminal_inventory_value_quantile_buy": float(q_buy),
+                "terminal_inventory_value_source": source,
             }
 
         sell_price = float(prices.quantile(q_sell))
@@ -2751,7 +2762,39 @@ class BatteryBacktester:
             "da_terminal_value_quantile_sell": float(q_sell),
             "da_terminal_value_quantile_buy": float(q_buy),
             "da_terminal_value_source": "conservative_da_quantile",
+            "terminal_inventory_shadow_value_enabled": 1.0,
+            "terminal_inventory_shadow_value_eur_per_internal_mwh": float(lambda_soc),
+            "terminal_inventory_future_sell_value_internal_eur_mwh": float(future_sell_value_internal),
+            "terminal_inventory_future_replacement_cost_internal_eur_mwh": float(future_replacement_cost_internal),
+            "terminal_inventory_value_quantile_sell": float(q_sell),
+            "terminal_inventory_value_quantile_buy": float(q_buy),
+            "terminal_inventory_value_source": "da_liquidation_replacement_proxy",
         }
+
+    @staticmethod
+    def terminal_inventory_effects_eur_per_mw(
+        *,
+        probability: np.ndarray | float,
+        activation_rate: np.ndarray | float,
+        duration_h: float,
+        eta_in: float,
+        eta_out: float,
+        lambda_eur_per_internal_mwh: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Expected terminal inventory effect per MW for positive/negative activation.
+
+        Positive activation exports grid MWh and reduces internal SoC, so the
+        effect is negative. Negative activation consumes grid MWh and increases
+        internal SoC, so the effect is positive. Probability is applied exactly
+        once here and activation_rate is conditional on award/execution.
+        """
+        prob = np.asarray(probability, dtype=float)
+        rate = np.asarray(activation_rate, dtype=float)
+        expected_grid_mwh_per_mw = np.clip(prob, 0.0, 1.0) * np.clip(rate, 0.0, 1.0) * float(duration_h)
+        lam = float(lambda_eur_per_internal_mwh)
+        pos = -expected_grid_mwh_per_mw / max(float(eta_out), 1e-12) * lam
+        neg = expected_grid_mwh_per_mw * float(eta_in) * lam
+        return np.asarray(pos, dtype=float), np.asarray(neg, dtype=float)
 
     @staticmethod
     def _validate_da_precommit_replay_export_cashflow(
@@ -2897,6 +2940,115 @@ class BatteryBacktester:
                 }
             )
         return pd.DataFrame(out_rows)
+
+    @staticmethod
+    def _validate_da_selected_lockable_stage_consistency(
+        frame: pd.DataFrame,
+        *,
+        tol_eur: float = DA_PRECOMMIT_REPLAY_TOL_EUR,
+    ) -> pd.DataFrame:
+        """Validate legacy selected-lockable fields against accepted lockbook replay."""
+        cols = [
+            "da_selected_lockable_stage_mismatch",
+            "da_selected_lockable_stage_mismatch_reason",
+            "da_selected_lockable_revenue_gap_eur",
+            "da_selected_lockable_cost_gap_eur",
+            "da_selected_lockable_gross_gap_eur",
+            "da_selected_lockable_pnl_gap_eur",
+        ]
+        if frame is None or frame.empty:
+            return pd.DataFrame(columns=cols)
+
+        def _num(*names: str) -> pd.Series:
+            for name in names:
+                if name in frame.columns:
+                    return pd.to_numeric(frame[name], errors="coerce").fillna(0.0).astype(float)
+            return pd.Series(0.0, index=frame.index, dtype=float)
+
+        selected_revenue = _num("da_precommit_selected_lockable_revenue_eur", "da_selected_lockable_revenue_eur")
+        selected_cost = _num("da_precommit_selected_lockable_cost_eur", "da_selected_lockable_cost_eur")
+        selected_gross = _num(
+            "da_precommit_selected_lockable_gross_spread_eur",
+            "da_selected_lockable_gross_spread_eur",
+        )
+        selected_pnl = _num("da_precommit_selected_lockable_pnl_eur", "da_selected_lockable_pnl_eur")
+        accepted_revenue = _num(
+            "da_precommit_accepted_lockbook_revenue_eur",
+            "da_precommit_da_accepted_lockbook_revenue_eur",
+            "accepted_lockbook_revenue_eur",
+            "da_accepted_lockbook_revenue_eur",
+        )
+        accepted_cost = _num(
+            "da_precommit_accepted_lockbook_cost_eur",
+            "da_precommit_da_accepted_lockbook_cost_eur",
+            "accepted_lockbook_cost_eur",
+            "da_accepted_lockbook_cost_eur",
+        )
+        accepted_gross = _num(
+            "da_precommit_accepted_lockbook_gross_spread_eur",
+            "da_precommit_da_accepted_lockbook_gross_spread_eur",
+            "accepted_lockbook_gross_spread_eur",
+            "da_accepted_lockbook_gross_spread_eur",
+        )
+        accepted_pnl = _num(
+            "da_precommit_accepted_lockbook_pnl_eur",
+            "da_precommit_da_accepted_lockbook_pnl_eur",
+            "accepted_lockbook_pnl_eur",
+            "da_accepted_lockbook_pnl_eur",
+        )
+        accepted_energy = _num(
+            "da_precommit_accepted_lockbook_energy_mwh",
+            "accepted_lockbook_energy_mwh",
+        )
+        real_da_energy = _num("real_da_buy_mwh", "da_buy_mwh") + _num("real_da_sell_mwh", "da_sell_mwh")
+        legacy_present = pd.Series(False, index=frame.index)
+        for name in (
+            "da_precommit_selected_lockable_revenue_eur",
+            "da_selected_lockable_revenue_eur",
+            "da_precommit_selected_lockable_pnl_eur",
+            "da_selected_lockable_pnl_eur",
+        ):
+            if name in frame.columns:
+                legacy_present |= pd.to_numeric(frame[name], errors="coerce").notna()
+
+        revenue_gap = selected_revenue - accepted_revenue
+        cost_gap = selected_cost - accepted_cost
+        gross_gap = selected_gross - accepted_gross
+        pnl_gap = selected_pnl - accepted_pnl
+        mismatch = legacy_present & (
+            revenue_gap.abs().gt(float(tol_eur))
+            | cost_gap.abs().gt(float(tol_eur))
+            | gross_gap.abs().gt(float(tol_eur))
+            | pnl_gap.abs().gt(float(tol_eur))
+        )
+        zero_lockbook_leaks = (
+            legacy_present
+            & accepted_energy.abs().le(1e-12)
+            & real_da_energy.abs().le(1e-12)
+            & (
+                selected_revenue.abs().gt(float(tol_eur))
+                | selected_cost.abs().gt(float(tol_eur))
+                | selected_gross.abs().gt(float(tol_eur))
+                | selected_pnl.abs().gt(float(tol_eur))
+            )
+        )
+        mismatch |= zero_lockbook_leaks
+        reasons = np.where(
+            zero_lockbook_leaks,
+            "selected_lockable_leaks_economics_with_zero_accepted_lockbook",
+            np.where(mismatch, "selected_lockable_not_equal_accepted_lockbook", "none"),
+        )
+        return pd.DataFrame(
+            {
+                "da_selected_lockable_stage_mismatch": mismatch.astype(float),
+                "da_selected_lockable_stage_mismatch_reason": reasons,
+                "da_selected_lockable_revenue_gap_eur": revenue_gap.astype(float),
+                "da_selected_lockable_cost_gap_eur": cost_gap.astype(float),
+                "da_selected_lockable_gross_gap_eur": gross_gap.astype(float),
+                "da_selected_lockable_pnl_gap_eur": pnl_gap.astype(float),
+            },
+            index=frame.index,
+        )
 
     @staticmethod
     def _audit_da_postlock_rejection_diagnostics(
@@ -3342,6 +3494,8 @@ class BatteryBacktester:
         final_required = False
         contains_global_end = False
         candidate_volume = 0.0
+        total_buy_mwh = 0.0
+        total_sell_mwh = 0.0
         nonzero_price_seen = False
         da_exec_prob = self._da_limit_execution_probabilities()
         p_buy_exec = float(da_exec_prob["buy_probability"])
@@ -3363,6 +3517,8 @@ class BatteryBacktester:
             buy_mwh = max(0.0, float(ch_mw)) * float(self.dt_h)
             sell_mwh = max(0.0, float(dis_mw)) * float(self.dt_h)
             candidate_volume += float(buy_mwh + sell_mwh)
+            total_buy_mwh += float(buy_mwh)
+            total_sell_mwh += float(sell_mwh)
 
             row_revenue = float(sell_mwh) * float(pred_da)
             row_cost = float(buy_mwh) * float(pred_da)
@@ -3564,6 +3720,26 @@ class BatteryBacktester:
             "da_terminal_value_quantile_sell": float(shadow_components["da_terminal_value_quantile_sell"]),
             "da_terminal_value_quantile_buy": float(shadow_components["da_terminal_value_quantile_buy"]),
             "da_terminal_value_source": str(shadow_components["da_terminal_value_source"]),
+            "terminal_inventory_shadow_value_enabled": float(shadow_components["terminal_inventory_shadow_value_enabled"]),
+            "terminal_inventory_shadow_value_eur_per_internal_mwh": float(lambda_soc),
+            "terminal_inventory_future_sell_value_internal_eur_mwh": float(
+                shadow_components["terminal_inventory_future_sell_value_internal_eur_mwh"]
+            ),
+            "terminal_inventory_future_replacement_cost_internal_eur_mwh": float(
+                shadow_components["terminal_inventory_future_replacement_cost_internal_eur_mwh"]
+            ),
+            "terminal_inventory_value_quantile_sell": float(shadow_components["terminal_inventory_value_quantile_sell"]),
+            "terminal_inventory_value_quantile_buy": float(shadow_components["terminal_inventory_value_quantile_buy"]),
+            "terminal_inventory_value_source": str(shadow_components["terminal_inventory_value_source"]),
+            "da_terminal_inventory_shadow_value_applied": float(shadow_components["terminal_inventory_shadow_value_enabled"]),
+            "da_terminal_inventory_effect_buy_eur": float(
+                p_buy_exec * total_buy_mwh * float(self.eta_in) * float(lambda_soc)
+            ),
+            "da_terminal_inventory_effect_sell_eur": float(
+                p_sell_exec * total_sell_mwh / max(float(self.eta_out), 1e-12) * float(lambda_soc)
+            ),
+            "da_ev_before_terminal_inventory_eur": float(pnl_excl_terminal),
+            "da_ev_after_terminal_inventory_eur": float(selection_pnl),
             "da_limit_execution_probability_enabled": float(limit_prob_enabled),
             "da_buy_execution_probability": float(p_buy_exec),
             "da_sell_execution_probability": float(p_sell_exec),
@@ -3580,6 +3756,246 @@ class BatteryBacktester:
             "da_expected_auxiliary_cost_probability_adjusted_eur": float(expected_aux_probability_adjusted),
             "da_expected_pnl_probability_adjusted_eur": float(expected_pnl_probability_adjusted),
         }
+
+    def _zero_da_replay_cashflow(self) -> dict[str, float]:
+        return {
+            "revenue_eur": 0.0,
+            "cost_eur": 0.0,
+            "gross_spread_eur": 0.0,
+            "transaction_cost_eur": 0.0,
+            "degradation_cost_eur": 0.0,
+            "auxiliary_cost_eur": 0.0,
+            "terminal_credit_eur": 0.0,
+            "pnl_eur": 0.0,
+            "selection_pnl_eur": 0.0,
+            "pnl_recomputed_eur": 0.0,
+            "pnl_reconciliation_error_eur": 0.0,
+            "gross_spread_reconciliation_error_eur": 0.0,
+        }
+
+    def _da_replay_cashflow_values(self, replay: dict[str, float | str]) -> dict[str, float]:
+        return {
+            "revenue_eur": float(replay.get("da_candidate_revenue_eur", replay.get("revenue_eur", 0.0)) or 0.0),
+            "cost_eur": float(replay.get("da_candidate_cost_eur", replay.get("cost_eur", 0.0)) or 0.0),
+            "gross_spread_eur": float(
+                replay.get("da_candidate_gross_spread_eur", replay.get("gross_spread_eur", 0.0)) or 0.0
+            ),
+            "transaction_cost_eur": float(
+                replay.get("da_candidate_transaction_cost_eur", replay.get("transaction_cost_eur", 0.0)) or 0.0
+            ),
+            "degradation_cost_eur": float(
+                replay.get("da_candidate_degradation_cost_eur", replay.get("degradation_cost_eur", 0.0)) or 0.0
+            ),
+            "auxiliary_cost_eur": float(
+                replay.get("da_candidate_auxiliary_cost_eur", replay.get("auxiliary_cost_eur", 0.0)) or 0.0
+            ),
+            "terminal_credit_eur": float(
+                replay.get("da_candidate_terminal_credit_eur", replay.get("terminal_credit_eur", 0.0)) or 0.0
+            ),
+            "pnl_eur": float(replay.get("selection_pnl_eur", replay.get("pnl_eur", 0.0)) or 0.0),
+            "selection_pnl_eur": float(replay.get("selection_pnl_eur", replay.get("pnl_eur", 0.0)) or 0.0),
+            "pnl_recomputed_eur": float(
+                replay.get("da_candidate_pnl_recomputed_eur", replay.get("pnl_recomputed_eur", 0.0)) or 0.0
+            ),
+            "pnl_reconciliation_error_eur": float(
+                replay.get(
+                    "da_candidate_pnl_reconciliation_error_eur",
+                    replay.get("pnl_reconciliation_error_eur", 0.0),
+                )
+                or 0.0
+            ),
+            "gross_spread_reconciliation_error_eur": float(
+                replay.get(
+                    "da_gross_spread_reconciliation_error_eur",
+                    replay.get("gross_spread_reconciliation_error_eur", 0.0),
+                )
+                or 0.0
+            ),
+        }
+
+    def _apply_da_accepted_lockbook_replay_to_audit_rows(
+        self,
+        *,
+        da_audit_rows: list[dict[str, float | str]],
+        accepted_da: dict[pd.Timestamp, tuple[float, float]],
+        lock_rows: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        current_soc_mwh: float,
+        fixed_reserve_pos: dict[pd.Timestamp, float] | None = None,
+        fixed_reserve_neg: dict[pd.Timestamp, float] | None = None,
+        global_end_utc: pd.Timestamp | None = None,
+        selection_tolerance_eur: float = DA_PRECOMMIT_REPLAY_TOL_EUR,
+    ) -> tuple[dict[pd.Timestamp, tuple[float, float]], list[dict[str, float | str]]]:
+        """Replay and export the final rounded DA lockbook stage.
+
+        Earlier DA diagnostics may describe raw/sized/postlock schedules. This
+        helper is the single final audit layer: it computes economics from the
+        exact schedule that can be written to the lockbook after postlock guards
+        and market rounding.
+        """
+        normalized_da: dict[pd.Timestamp, tuple[float, float]] = {}
+        for ts_key, (buy_mw, sell_mw) in (accepted_da or {}).items():
+            tsu = pd.to_datetime(ts_key, utc=True, errors="coerce")
+            if pd.isna(tsu):
+                continue
+            buy = max(0.0, float(buy_mw))
+            sell = max(0.0, float(sell_mw))
+            buy, sell = self._normalize_da_bid(buy, sell)
+            if buy > 1e-12 or sell > 1e-12:
+                normalized_da[pd.Timestamp(tsu)] = (float(buy), float(sell))
+
+        accepted_energy_mwh = float(
+            sum((buy + sell) * float(self.dt_h) for buy, sell in normalized_da.values())
+        )
+        if accepted_energy_mwh > 1e-12:
+            replay = self._replay_da_candidate_cashflow(
+                rows=lock_rows,
+                schedule=normalized_da,
+                colmap=colmap,
+                current_soc_mwh=float(current_soc_mwh),
+                fixed_reserve_pos=fixed_reserve_pos,
+                fixed_reserve_neg=fixed_reserve_neg,
+                global_end_utc=global_end_utc,
+            )
+            values = self._da_replay_cashflow_values(replay)
+            no_trade_values = self._zero_da_replay_cashflow()
+            try:
+                no_trade_replay = self._replay_da_candidate_cashflow(
+                    rows=lock_rows,
+                    schedule={},
+                    colmap=colmap,
+                    current_soc_mwh=float(current_soc_mwh),
+                    fixed_reserve_pos=fixed_reserve_pos,
+                    fixed_reserve_neg=fixed_reserve_neg,
+                    global_end_utc=global_end_utc,
+                )
+                no_trade_values = self._da_replay_cashflow_values(no_trade_replay)
+            except Exception:
+                no_trade_values = self._zero_da_replay_cashflow()
+            if values["selection_pnl_eur"] <= no_trade_values["selection_pnl_eur"] + float(selection_tolerance_eur):
+                normalized_da = {}
+                accepted_energy_mwh = 0.0
+                values = self._zero_da_replay_cashflow()
+                final_incumbent = "no_trade"
+                zero_reason = "rounded_lockbook_pnl_below_no_trade"
+            else:
+                final_incumbent = "optimized"
+                zero_reason = "none"
+        else:
+            values = self._zero_da_replay_cashflow()
+            final_incumbent = "no_trade"
+            zero_reason = "no_trade_or_market_rounding_zeroed"
+
+        updated_rows: list[dict[str, float | str]] = []
+        for audit_row in da_audit_rows:
+            out_row = dict(audit_row)
+            tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
+            buy_mw = 0.0
+            sell_mw = 0.0
+            if pd.notna(tsu):
+                buy_mw, sell_mw = normalized_da.get(pd.Timestamp(tsu), (0.0, 0.0))
+            locked_buy_mwh = float(buy_mw) * float(self.dt_h)
+            locked_sell_mwh = float(sell_mw) * float(self.dt_h)
+            row_has_lock = float((locked_buy_mwh + locked_sell_mwh) > 1e-12)
+
+            out_row.update(
+                {
+                    "da_precommit_stage_model": (
+                        "raw_optimizer_candidate>sized_candidate>postlock_candidate>"
+                        "rounded_lockbook_candidate>accepted_lockbook>realized_settlement"
+                    ),
+                    "da_precommit_schedule_stage_used_for_selection": "accepted_lockbook",
+                    "da_precommit_schedule_stage_used_for_lockbook": "accepted_lockbook",
+                    "schedule_stage_used_for_selection": "accepted_lockbook",
+                    "schedule_stage_used_for_lockbook": "accepted_lockbook",
+                    "da_precommit_selection_valid": 1.0,
+                    "da_precommit_selection_invalid_reason": "none",
+                    "da_accepted_buy_mw": float(buy_mw),
+                    "da_accepted_sell_mw": float(sell_mw),
+                    "accepted_buy_mw": float(buy_mw),
+                    "accepted_sell_mw": float(sell_mw),
+                    "da_selected_lockable_buy_mw": float(buy_mw),
+                    "da_selected_lockable_sell_mw": float(sell_mw),
+                    "locked_buy_mwh_by_hour": float(locked_buy_mwh),
+                    "locked_sell_mwh_by_hour": float(locked_sell_mwh),
+                    "realized_buy_mwh_by_hour": float(locked_buy_mwh),
+                    "realized_sell_mwh_by_hour": float(locked_sell_mwh),
+                    "accepted_lockbook_energy_mwh": float(accepted_energy_mwh),
+                    "accepted_lockbook_row_buy_mwh": float(locked_buy_mwh),
+                    "accepted_lockbook_row_sell_mwh": float(locked_sell_mwh),
+                    "accepted_lockbook_revenue_eur": float(values["revenue_eur"]),
+                    "accepted_lockbook_cost_eur": float(values["cost_eur"]),
+                    "accepted_lockbook_gross_spread_eur": float(values["gross_spread_eur"]),
+                    "accepted_lockbook_transaction_cost_eur": float(values["transaction_cost_eur"]),
+                    "accepted_lockbook_degradation_cost_eur": float(values["degradation_cost_eur"]),
+                    "accepted_lockbook_auxiliary_cost_eur": float(values["auxiliary_cost_eur"]),
+                    "accepted_lockbook_terminal_credit_eur": float(values["terminal_credit_eur"]),
+                    "accepted_lockbook_pnl_eur": float(values["selection_pnl_eur"]),
+                    "accepted_lockbook_pnl_recomputed_eur": float(values["pnl_recomputed_eur"]),
+                    "accepted_lockbook_pnl_reconciliation_error_eur": float(
+                        values["pnl_reconciliation_error_eur"]
+                    ),
+                    "accepted_lockbook_gross_spread_reconciliation_error_eur": float(
+                        values["gross_spread_reconciliation_error_eur"]
+                    ),
+                    "da_accepted_lockbook_revenue_eur": float(values["revenue_eur"]),
+                    "da_accepted_lockbook_cost_eur": float(values["cost_eur"]),
+                    "da_accepted_lockbook_gross_spread_eur": float(values["gross_spread_eur"]),
+                    "da_accepted_lockbook_pnl_eur": float(values["selection_pnl_eur"]),
+                    "selected_lockable_revenue_eur": float(values["revenue_eur"]),
+                    "selected_lockable_cost_eur": float(values["cost_eur"]),
+                    "selected_lockable_gross_spread_eur": float(values["gross_spread_eur"]),
+                    "selected_lockable_pnl_eur": float(values["selection_pnl_eur"]),
+                    "selected_lockable_reconciliation_error_eur": float(
+                        values["pnl_reconciliation_error_eur"]
+                    ),
+                    "da_selected_lockable_revenue_eur": float(values["revenue_eur"]),
+                    "da_selected_lockable_cost_eur": float(values["cost_eur"]),
+                    "da_selected_lockable_gross_spread_eur": float(values["gross_spread_eur"]),
+                    "da_selected_lockable_pnl_eur": float(values["selection_pnl_eur"]),
+                    "da_selected_lockable_reconciliation_error_eur": float(
+                        values["pnl_reconciliation_error_eur"]
+                    ),
+                    "da_selected_lockable_manual_revenue_eur": float(values["revenue_eur"]),
+                    "da_selected_lockable_manual_cost_eur": float(values["cost_eur"]),
+                    "da_selected_lockable_manual_gross_spread_eur": float(values["gross_spread_eur"]),
+                    "da_selected_lockable_manual_pnl_eur": float(values["pnl_recomputed_eur"]),
+                    "da_selected_lockable_replay_revenue_eur": float(values["revenue_eur"]),
+                    "da_selected_lockable_replay_cost_eur": float(values["cost_eur"]),
+                    "da_selected_lockable_replay_gross_spread_eur": float(values["gross_spread_eur"]),
+                    "da_selected_lockable_replay_pnl_eur": float(values["selection_pnl_eur"]),
+                    "candidate_revenue_eur": float(values["revenue_eur"]),
+                    "candidate_cost_eur": float(values["cost_eur"]),
+                    "candidate_gross_spread_eur": float(values["gross_spread_eur"]),
+                    "candidate_transaction_cost_eur": float(values["transaction_cost_eur"]),
+                    "candidate_degradation_cost_eur": float(values["degradation_cost_eur"]),
+                    "candidate_auxiliary_cost_eur": float(values["auxiliary_cost_eur"]),
+                    "candidate_terminal_credit_eur": float(values["terminal_credit_eur"]),
+                    "candidate_predicted_pnl_eur": float(values["selection_pnl_eur"]),
+                    "candidate_selection_pnl_eur": float(values["selection_pnl_eur"]),
+                    "candidate_pnl_recomputed_eur": float(values["pnl_recomputed_eur"]),
+                    "candidate_pnl_reconciliation_error_eur": float(
+                        values["pnl_reconciliation_error_eur"]
+                    ),
+                    "gross_spread_reconciliation_error_eur": float(
+                        values["gross_spread_reconciliation_error_eur"]
+                    ),
+                    "predicted_replay_pnl_eur": float(values["selection_pnl_eur"]),
+                    "selected_incumbent": str(final_incumbent if accepted_energy_mwh <= 1e-12 else out_row.get("selected_incumbent", final_incumbent)),
+                    "final_selected_incumbent": str(final_incumbent if accepted_energy_mwh <= 1e-12 else out_row.get("final_selected_incumbent", final_incumbent)),
+                    "da_zeroed_all_bids": float(accepted_energy_mwh <= 1e-12),
+                    "selected_lockable_deprecated": 0.0,
+                    "selected_lockable_deprecated_reason": "equals_accepted_lockbook_replay_after_rounding",
+                    "da_bid_locked": row_has_lock,
+                    "da_lockbook_row_present": 1.0,
+                }
+            )
+            if accepted_energy_mwh <= 1e-12:
+                out_row["da_zero_reason"] = str(out_row.get("da_zero_reason", zero_reason) or zero_reason)
+                out_row["zero_reason"] = str(out_row.get("zero_reason", zero_reason) or zero_reason)
+            updated_rows.append(out_row)
+
+        return normalized_da, updated_rows
 
     def _select_feasible_da_lock_schedule(
         self,
@@ -3918,6 +4334,23 @@ class BatteryBacktester:
                         shadow_components["da_terminal_value_quantile_buy"]
                     ),
                     "da_terminal_value_source": str(shadow_components["da_terminal_value_source"]),
+                    "terminal_inventory_shadow_value_enabled": float(
+                        shadow_components["terminal_inventory_shadow_value_enabled"]
+                    ),
+                    "terminal_inventory_shadow_value_eur_per_internal_mwh": float(lambda_soc),
+                    "terminal_inventory_future_sell_value_internal_eur_mwh": float(
+                        shadow_components["terminal_inventory_future_sell_value_internal_eur_mwh"]
+                    ),
+                    "terminal_inventory_future_replacement_cost_internal_eur_mwh": float(
+                        shadow_components["terminal_inventory_future_replacement_cost_internal_eur_mwh"]
+                    ),
+                    "terminal_inventory_value_quantile_sell": float(
+                        shadow_components["terminal_inventory_value_quantile_sell"]
+                    ),
+                    "terminal_inventory_value_quantile_buy": float(
+                        shadow_components["terminal_inventory_value_quantile_buy"]
+                    ),
+                    "terminal_inventory_value_source": str(shadow_components["terminal_inventory_value_source"]),
                 }
             )
             return schedule, bool(feasible), diag
@@ -4438,13 +4871,14 @@ class BatteryBacktester:
                     "candidate_gross_spread_eur": float(
                         candidate_replay.get("da_candidate_gross_spread_eur", np.nan)
                     ),
-                    "selected_lockable_revenue_eur": float(
-                        candidate_replay.get("da_candidate_revenue_eur", np.nan)
-                    ),
-                    "selected_lockable_cost_eur": float(candidate_replay.get("da_candidate_cost_eur", np.nan)),
-                    "selected_lockable_gross_spread_eur": float(
+                    "sized_candidate_revenue_eur": float(candidate_replay.get("da_candidate_revenue_eur", np.nan)),
+                    "sized_candidate_cost_eur": float(candidate_replay.get("da_candidate_cost_eur", np.nan)),
+                    "sized_candidate_gross_spread_eur": float(
                         candidate_replay.get("da_candidate_gross_spread_eur", np.nan)
                     ),
+                    "selected_lockable_revenue_eur": float("nan"),
+                    "selected_lockable_cost_eur": float("nan"),
+                    "selected_lockable_gross_spread_eur": float("nan"),
                     "candidate_transaction_cost_eur": float(
                         candidate_replay.get("da_candidate_transaction_cost_eur", np.nan)
                     ),
@@ -4460,13 +4894,17 @@ class BatteryBacktester:
                     "candidate_pnl_recomputed_eur": float(
                         candidate_replay.get("da_candidate_pnl_recomputed_eur", np.nan)
                     ),
-                    "selected_lockable_pnl_eur": float(candidate_replay.get("selection_pnl_eur", np.nan)),
+                    "sized_candidate_pnl_eur": float(candidate_replay.get("selection_pnl_eur", np.nan)),
+                    "selected_lockable_pnl_eur": float("nan"),
                     "candidate_pnl_reconciliation_error_eur": float(
                         candidate_replay.get("da_candidate_pnl_reconciliation_error_eur", np.nan)
                     ),
-                    "selected_lockable_reconciliation_error_eur": float(
+                    "sized_candidate_reconciliation_error_eur": float(
                         candidate_replay.get("da_candidate_pnl_reconciliation_error_eur", np.nan)
                     ),
+                    "selected_lockable_reconciliation_error_eur": float("nan"),
+                    "selected_lockable_deprecated": 1.0,
+                    "selected_lockable_deprecated_reason": "pre_rounding_pre_postlock_stage_not_final",
                     "gross_spread_reconciliation_error_eur": float(
                         candidate_replay.get("da_gross_spread_reconciliation_error_eur", np.nan)
                     ),
@@ -5841,6 +6279,17 @@ class BatteryBacktester:
                     "da_postlock_terminal_recovery_cost_eur": float(
                         candidate_failure_diag.get("terminal_recovery_cost_eur", np.nan)
                     ),
+                    "da_postlock_recovery_cost_full_eur": float(
+                        candidate_failure_diag.get("terminal_recovery_cost_eur", np.nan)
+                    ),
+                    "da_postlock_recovery_cost_expected_eur": float(
+                        candidate_failure_diag.get("terminal_recovery_cost_eur", np.nan)
+                    ),
+                    "da_postlock_recovery_cost_probability_factor_buy": 1.0,
+                    "da_postlock_recovery_cost_probability_factor_sell": 1.0,
+                    "da_postlock_recovery_cost_probability_weighting_required": 0.0,
+                    "da_postlock_recovery_cost_used_in_ev_mode": "full_locked_schedule_recovery_cost",
+                    "da_postlock_recovery_cost_context": "post_clearing_locked_schedule",
                     "da_postlock_terminal_recovery_cost_estimate_available": float(
                         candidate_failure_diag.get("terminal_recovery_cost_estimate_available", np.nan)
                     ),
@@ -6301,6 +6750,77 @@ class BatteryBacktester:
         out["ev_da_discharge_eur"] = accepted_ev_discharge
         return out
 
+    @staticmethod
+    def _bcm_ev_recovery_cost_adjustment(
+        *,
+        candidate_ev_eur: float,
+        retry_factor: float,
+        baseline_recovery_cost_eur: float,
+        candidate_recovery_cost_eur: float,
+        recovery_cost_probability_factor: float = 1.0,
+    ) -> dict[str, float]:
+        """Compute BCM EV after charging only candidate-incremental recovery cost."""
+        standalone_ev = (
+            float(candidate_ev_eur) * float(retry_factor)
+            if np.isfinite(float(candidate_ev_eur))
+            else float("nan")
+        )
+        baseline_cost = max(
+            0.0,
+            float(baseline_recovery_cost_eur)
+            if np.isfinite(float(baseline_recovery_cost_eur))
+            else 0.0,
+        )
+        candidate_cost = max(
+            0.0,
+            float(candidate_recovery_cost_eur)
+            if np.isfinite(float(candidate_recovery_cost_eur))
+            else 0.0,
+        )
+        incremental_cost = max(0.0, candidate_cost - baseline_cost)
+        probability_factor = max(
+            0.0,
+            min(
+                1.0,
+                float(recovery_cost_probability_factor)
+                if np.isfinite(float(recovery_cost_probability_factor))
+                else 1.0,
+            ),
+        )
+        expected_incremental_cost = incremental_cost * probability_factor
+        ev_after_incremental = (
+            standalone_ev - expected_incremental_cost if np.isfinite(standalone_ev) else float("nan")
+        )
+        ev_after_full = standalone_ev - candidate_cost if np.isfinite(standalone_ev) else float("nan")
+        return {
+            "standalone_ev_eur": float(standalone_ev),
+            "baseline_recovery_cost_eur": float(baseline_cost),
+            "candidate_recovery_cost_eur": float(candidate_cost),
+            "incremental_recovery_cost_eur": float(incremental_cost),
+            "expected_incremental_recovery_cost_eur": float(expected_incremental_cost),
+            "ev_after_incremental_recovery_eur": float(ev_after_incremental),
+            "full_recovery_cost_eur": float(candidate_cost),
+            "full_recovery_cost_ev_after_recovery_eur": float(ev_after_full),
+            "full_recovery_cost_would_have_zeroed": float(
+                np.isfinite(ev_after_full)
+                and ev_after_full < -1e-9
+                and np.isfinite(ev_after_incremental)
+                and ev_after_incremental >= -1e-9
+            ),
+            "recovery_ev_violation": float(
+                expected_incremental_cost > 1e-12
+                and np.isfinite(ev_after_incremental)
+                and ev_after_incremental < -1e-9
+            ),
+            "recovery_cost_probability_weighted": float(probability_factor < 1.0),
+            "recovery_cost_probability_factor": float(probability_factor),
+            "recovery_cost_used_in_ev_mode": "expected_incremental_award_weighted"
+            if probability_factor < 1.0
+            else "incremental_full_award",
+            "ev_nan_detected": float(not np.isfinite(standalone_ev)),
+            "ev_nan_component": "candidate_ev_eur" if not np.isfinite(standalone_ev) else "none",
+        }
+
     def _select_feasible_bcm_lock_candidate(
         self,
         *,
@@ -6319,7 +6839,8 @@ class BatteryBacktester:
         horizon_hours: int = 48,
         global_end_utc: pd.Timestamp | None = None,
         is_perfect_foresight: bool = False,
-        candidate_ev_eur: float = float("nan"),
+        candidate_ev_eur: float = 0.0,
+        recovery_cost_probability_factor: float = 1.0,
     ) -> tuple[float, float, AFRRCapacityClearingResult | None, list[BCMCapacityBid], dict[str, float | str]]:
         """Select the largest causal BCM bid whose full-award lockbook remains optimizer-feasible."""
         base_pos = max(0.0, float(offered_pos_mw))
@@ -6918,21 +7439,21 @@ class BatteryBacktester:
                     valid_ts_for_issue = pd.to_datetime(ts_vals_local, utc=True, errors="coerce").dropna()
                     issue_ts = valid_ts_for_issue.iloc[-1] if len(valid_ts_for_issue) else pd.Timestamp.utcnow()
                     _mark_projected_issue(issue_ts, "terminal_recovery_blocked")
-            standalone_ev = (
-                float(candidate_ev_eur) * float(factor)
-                if np.isfinite(float(candidate_ev_eur))
-                else float("nan")
+            recovery_ev = self._bcm_ev_recovery_cost_adjustment(
+                candidate_ev_eur=float(candidate_ev_eur),
+                retry_factor=float(factor),
+                baseline_recovery_cost_eur=float(baseline_bcm_precommit_recovery_cost_eur),
+                candidate_recovery_cost_eur=float(terminal_id_recovery_cost),
+                recovery_cost_probability_factor=float(recovery_cost_probability_factor),
             )
-            effective_ev_after_recovery = (
-                standalone_ev - float(terminal_id_recovery_cost)
-                if np.isfinite(standalone_ev)
-                else float("nan")
-            )
-            recovery_ev_violation = bool(
-                terminal_id_recovery_mwh > 1e-12
-                and np.isfinite(effective_ev_after_recovery)
-                and effective_ev_after_recovery < -1e-9
-            )
+            standalone_ev = float(recovery_ev["standalone_ev_eur"])
+            baseline_recovery_cost_eur = float(recovery_ev["baseline_recovery_cost_eur"])
+            incremental_recovery_cost_eur = float(recovery_ev["incremental_recovery_cost_eur"])
+            expected_incremental_recovery_cost_eur = float(recovery_ev["expected_incremental_recovery_cost_eur"])
+            effective_ev_after_recovery = float(recovery_ev["ev_after_incremental_recovery_eur"])
+            full_recovery_cost_ev_after_recovery = float(recovery_ev["full_recovery_cost_ev_after_recovery_eur"])
+            recovery_ev_violation = bool(float(recovery_ev["recovery_ev_violation"]) >= 0.5)
+            ev_nan_violation = bool(float(recovery_ev["ev_nan_detected"]) >= 0.5)
             feasible = (
                 power_violation_pos <= 1e-9
                 and power_violation_neg <= 1e-9
@@ -6940,6 +7461,7 @@ class BatteryBacktester:
                 and soc_violation <= 1e-9
                 and terminal_violation <= 1e-9
                 and not recovery_ev_violation
+                and not ev_nan_violation
             )
             reason = "none"
             if not feasible:
@@ -6953,6 +7475,8 @@ class BatteryBacktester:
                     reason = "terminal_soc_not_recoverable_even_with_id"
                 elif recovery_ev_violation:
                     reason = "negative_ev_after_id_recovery"
+                elif ev_nan_violation:
+                    reason = "ev_nan"
                 else:
                     reason = "existing_lockbook_conflict"
             return feasible, {
@@ -6994,6 +7518,19 @@ class BatteryBacktester:
                 "effective_ev_before_recovery_eur": float(standalone_ev),
                 "ev_after_recovery_eur": float(effective_ev_after_recovery),
                 "effective_ev_after_recovery_eur": float(effective_ev_after_recovery),
+                "baseline_recovery_cost_eur": float(baseline_recovery_cost_eur),
+                "candidate_recovery_cost_eur": float(terminal_id_recovery_cost),
+                "incremental_recovery_cost_eur": float(incremental_recovery_cost_eur),
+                "expected_incremental_recovery_cost_eur": float(expected_incremental_recovery_cost_eur),
+                "full_recovery_cost_eur": float(terminal_id_recovery_cost),
+                "full_recovery_cost_would_have_zeroed": float(recovery_ev["full_recovery_cost_would_have_zeroed"]),
+                "ev_after_incremental_recovery_eur": float(effective_ev_after_recovery),
+                "full_recovery_cost_ev_after_recovery_eur": float(full_recovery_cost_ev_after_recovery),
+                "recovery_cost_probability_weighted": float(recovery_ev["recovery_cost_probability_weighted"]),
+                "recovery_cost_probability_factor": float(recovery_ev["recovery_cost_probability_factor"]),
+                "recovery_cost_used_in_ev_mode": str(recovery_ev["recovery_cost_used_in_ev_mode"]),
+                "ev_nan_detected": float(recovery_ev["ev_nan_detected"]),
+                "ev_nan_component": str(recovery_ev["ev_nan_component"]),
                 "zero_reason_detail": str(reason),
                 "reduced_due_to_reserve_feasibility": float(factor < 0.999),
                 "reduced_due_to_terminal_soc": float(terminal_violation > 1e-9),
@@ -7017,6 +7554,8 @@ class BatteryBacktester:
                 return "id_recovery_blocked"
             if reason == "negative_ev_after_id_recovery":
                 return "negative_ev_after_id_recovery"
+            if reason == "ev_nan":
+                return "ev_nan"
             if reason in {"headroom_infeasible", "reserve_infeasible"}:
                 return "reserve_headroom_blocked"
             if reason == "power_infeasible":
@@ -7062,6 +7601,23 @@ class BatteryBacktester:
         }
         zero_result: tuple[float, float, AFRRCapacityClearingResult | None, list[BCMCapacityBid], dict[str, float | str]] | None = None
         first_candidate_stats: dict[str, float | str] | None = None
+        baseline_bcm_precommit_recovery_cost_eur = 0.0
+        baseline_bcm_precommit_recovery_mwh = 0.0
+        try:
+            _baseline_ok, baseline_stats = _check_cumulative_commitment_feasibility(
+                rows=guard_rows,
+                reserve_pos_lockbook={pd.to_datetime(k, utc=True): float(v) for k, v in lock_pos.items()},
+                reserve_neg_lockbook={pd.to_datetime(k, utc=True): float(v) for k, v in lock_neg.items()},
+                factor=0.0,
+            )
+            baseline_bcm_precommit_recovery_cost_eur = float(
+                baseline_stats.get("candidate_recovery_cost_eur", baseline_stats.get("id_recovery_cost_eur", 0.0))
+                or 0.0
+            )
+            baseline_bcm_precommit_recovery_mwh = float(baseline_stats.get("id_recovery_mwh", 0.0) or 0.0)
+        except Exception:
+            baseline_bcm_precommit_recovery_cost_eur = 0.0
+            baseline_bcm_precommit_recovery_mwh = 0.0
         for factor in ladder:
             trial_pos = float(self.bid_builder._qfloor(base_pos * float(factor), self.afrr_bid_granularity_mw))
             trial_neg = float(self.bid_builder._qfloor(base_neg * float(factor), self.afrr_bid_granularity_mw))
@@ -7200,6 +7756,19 @@ class BatteryBacktester:
                         "projected_infeasibility_driver",
                         "effective_ev_before_recovery_eur",
                         "effective_ev_after_recovery_eur",
+                        "baseline_recovery_cost_eur",
+                        "candidate_recovery_cost_eur",
+                        "incremental_recovery_cost_eur",
+                        "expected_incremental_recovery_cost_eur",
+                        "full_recovery_cost_eur",
+                        "full_recovery_cost_would_have_zeroed",
+                        "ev_after_incremental_recovery_eur",
+                        "full_recovery_cost_ev_after_recovery_eur",
+                        "recovery_cost_probability_weighted",
+                        "recovery_cost_probability_factor",
+                        "recovery_cost_used_in_ev_mode",
+                        "ev_nan_detected",
+                        "ev_nan_component",
                         "zero_reason_detail",
                     ):
                         stats[diag_name] = cumulative_stats.get(
@@ -7593,6 +8162,15 @@ class BatteryBacktester:
                 f"Fix data pipeline. bad_columns={bad_inputs}"
             )
 
+        # Shared terminal inventory value for horizon-end internal SoC.
+        # DA prices are only the liquidation/replacement proxy; the value is
+        # applied through the shared SoC state and therefore affects all markets
+        # whose variables change expected SoC.
+        da_shadow_components = self._da_soc_shadow_value_components(pd.Series(p_da, dtype="float64"))
+        da_soc_shadow_value_eur_per_internal_mwh = float(
+            da_shadow_components["da_soc_shadow_value_eur_per_internal_mwh"]
+        )
+
         # BCM award probabilities are defined for each 4-hour BCM product.
         # p_award is therefore block-constant across each product window for each bin,
         # and applied once in expected-value terms.
@@ -7830,6 +8408,14 @@ class BatteryBacktester:
         bem_standby_aux_cost_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_activation_margin_pos_by_bin = np.zeros((n, n_bins), dtype=float)
         bem_activation_margin_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_terminal_inventory_effect_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_terminal_inventory_effect_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_terminal_inventory_effect_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_terminal_inventory_effect_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_ev_before_terminal_inventory_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bcm_ev_before_terminal_inventory_neg_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_ev_before_terminal_inventory_pos_by_bin = np.zeros((n, n_bins), dtype=float)
+        bem_ev_before_terminal_inventory_neg_by_bin = np.zeros((n, n_bins), dtype=float)
         for b in range(n_bins):
             # EV convention:
             # - BCM p_award is product-level; hourly coefficients sum to product EV
@@ -7842,6 +8428,38 @@ class BatteryBacktester:
             # - Probability is applied exactly once; diagnostics expose value/cost terms separately.
             exp_act_pos = p_award_pos_by_bin[:, b] * act_rate_pos_by_bin[:, b]
             exp_act_neg = p_award_neg_by_bin[:, b] * act_rate_neg_by_bin[:, b]
+            bcm_terminal_pos, bcm_terminal_neg = self.terminal_inventory_effects_eur_per_mw(
+                probability=p_award_pos_by_bin[:, b],
+                activation_rate=act_rate_pos_by_bin[:, b],
+                duration_h=float(self.dt_h),
+                eta_in=float(self.eta_in),
+                eta_out=float(self.eta_out),
+                lambda_eur_per_internal_mwh=float(da_soc_shadow_value_eur_per_internal_mwh),
+            )
+            bcm_terminal_neg = self.terminal_inventory_effects_eur_per_mw(
+                probability=p_award_neg_by_bin[:, b],
+                activation_rate=act_rate_neg_by_bin[:, b],
+                duration_h=float(self.dt_h),
+                eta_in=float(self.eta_in),
+                eta_out=float(self.eta_out),
+                lambda_eur_per_internal_mwh=float(da_soc_shadow_value_eur_per_internal_mwh),
+            )[1]
+            bem_terminal_pos, bem_terminal_neg = self.terminal_inventory_effects_eur_per_mw(
+                probability=p_award_pos_by_bin[:, b],
+                activation_rate=act_rate_pos_by_bin[:, b],
+                duration_h=float(self.dt_h),
+                eta_in=float(self.eta_in),
+                eta_out=float(self.eta_out),
+                lambda_eur_per_internal_mwh=float(da_soc_shadow_value_eur_per_internal_mwh),
+            )
+            bem_terminal_neg = self.terminal_inventory_effects_eur_per_mw(
+                probability=p_award_neg_by_bin[:, b],
+                activation_rate=act_rate_neg_by_bin[:, b],
+                duration_h=float(self.dt_h),
+                eta_in=float(self.eta_in),
+                eta_out=float(self.eta_out),
+                lambda_eur_per_internal_mwh=float(da_soc_shadow_value_eur_per_internal_mwh),
+            )[1]
             offer_cost = self.afrr_offer_cost_eur_mw_h * self.dt_h
             # Hourly BCM auxiliary energy per reserve MW. Product-level auxiliary
             # EV is the sum of these hourly coefficients under block-constant MW.
@@ -7916,6 +8534,10 @@ class BatteryBacktester:
             s_neg = sl["rneg_bin"].start + b * n
             rpos_coef_by_bin[:, b] = rpos_coef
             rneg_coef_by_bin[:, b] = rneg_coef
+            bcm_ev_before_terminal_inventory_pos_by_bin[:, b] = rpos_coef
+            bcm_ev_before_terminal_inventory_neg_by_bin[:, b] = rneg_coef
+            bcm_terminal_inventory_effect_pos_by_bin[:, b] = bcm_terminal_pos
+            bcm_terminal_inventory_effect_neg_by_bin[:, b] = bcm_terminal_neg
             c[s_pos : s_pos + n] = -(rpos_coef * afrr_step)
             c[s_neg : s_neg + n] = -(rneg_coef * afrr_step)
             # BEM-only uses the same quantile-derived probability heuristic as
@@ -8021,6 +8643,10 @@ class BatteryBacktester:
             bem_activation_margin_neg_by_bin[:, b] = bem_act_margin_neg
             bem_pos_coef_by_bin[:, b] = bem_pos_coef
             bem_neg_coef_by_bin[:, b] = bem_neg_coef
+            bem_ev_before_terminal_inventory_pos_by_bin[:, b] = bem_pos_coef
+            bem_ev_before_terminal_inventory_neg_by_bin[:, b] = bem_neg_coef
+            bem_terminal_inventory_effect_pos_by_bin[:, b] = bem_terminal_pos
+            bem_terminal_inventory_effect_neg_by_bin[:, b] = bem_terminal_neg
             s_bem_pos = sl["bem_pos_bin"].start + b * n
             s_bem_neg = sl["bem_neg_bin"].start + b * n
             c[s_bem_pos : s_bem_pos + n] = -(bem_pos_coef * afrr_step)
@@ -8114,10 +8740,6 @@ class BatteryBacktester:
         # Terminal SoC opportunity value (anti end-of-horizon dumping):
         # value only horizon-end internal SoC with a conservative continuation
         # value. This is intentionally not a per-buy energy bonus.
-        da_shadow_components = self._da_soc_shadow_value_components(pd.Series(p_da, dtype="float64"))
-        da_soc_shadow_value_eur_per_internal_mwh = float(
-            da_shadow_components["da_soc_shadow_value_eur_per_internal_mwh"]
-        )
         # scipy.milp minimizes, so a positive continuation value is a negative
         # coefficient on terminal internal SoC. The target offset is constant
         # and therefore omitted from the linear objective.
@@ -8149,11 +8771,13 @@ class BatteryBacktester:
                 row[sl["rpos_bin"].start + b * n + t] = (exp_pos / self.eta_out) * afrr_step
                 row[sl["rneg_bin"].start + b * n + t] = -self.eta_in * exp_neg * afrr_step
             for b in range(n_bins):
+                bem_exp_pos = p_award_pos_by_bin[t, b] * act_rate_pos_by_bin[t, b]
+                bem_exp_neg = p_award_neg_by_bin[t, b] * act_rate_neg_by_bin[t, b]
                 row[sl["bem_pos_bin"].start + b * n + t] = (
-                    act_rate_pos_by_bin[t, b] / self.eta_out
+                    bem_exp_pos / self.eta_out
                 ) * afrr_step
                 row[sl["bem_neg_bin"].start + b * n + t] = (
-                    -self.eta_in * act_rate_neg_by_bin[t, b]
+                    -self.eta_in * bem_exp_neg
                 ) * afrr_step
             a_eq.append(row)
             b_eq.append(0.0)
@@ -8266,6 +8890,12 @@ class BatteryBacktester:
                 row[sl["u"].start + t] = -1.0
                 row[sl["ch"].start + t] = (self.aux_trading_mw / power_scale) * da_step
                 row[sl["dis"].start + t] = (self.aux_trading_mw / power_scale) * da_step
+                # ID recourse is a physical charge/discharge action and also
+                # moves the battery into trading aux state in settlement.
+                # Including it here prevents terminal ID repair from hitting
+                # the target before aux and ending short after settlement aux.
+                row[sl["id_buy"].start + t] = self.aux_trading_mw / power_scale
+                row[sl["id_sell"].start + t] = self.aux_trading_mw / power_scale
                 a_ub.append(row)
                 b_ub.append(0.0)
 
@@ -8898,6 +9528,38 @@ class BatteryBacktester:
                 / max(self.eta_out, 1e-12)
                 * self.deg_eur_mwh
             ),
+            "da_terminal_inventory_effect_buy_eur": (
+                da_buy_execution_probability
+                * np.maximum(0.0, charge_mw)
+                * self.dt_h
+                * self.eta_in
+                * da_soc_shadow_value_eur_per_internal_mwh
+            ),
+            "da_terminal_inventory_effect_sell_eur": (
+                da_sell_execution_probability
+                * np.maximum(0.0, discharge_mw)
+                * self.dt_h
+                / max(self.eta_out, 1e-12)
+                * da_soc_shadow_value_eur_per_internal_mwh
+            ),
+            "da_ev_before_terminal_inventory_eur": ev_da_charge_eur + ev_da_discharge_eur,
+            "da_ev_after_terminal_inventory_eur": (
+                ev_da_charge_eur
+                + ev_da_discharge_eur
+                + da_buy_execution_probability
+                * np.maximum(0.0, charge_mw)
+                * self.dt_h
+                * self.eta_in
+                * da_soc_shadow_value_eur_per_internal_mwh
+                - da_sell_execution_probability
+                * np.maximum(0.0, discharge_mw)
+                * self.dt_h
+                / max(self.eta_out, 1e-12)
+                * da_soc_shadow_value_eur_per_internal_mwh
+            ),
+            "da_terminal_inventory_shadow_value_applied": np.full(
+                n, float(da_shadow_components["terminal_inventory_shadow_value_enabled"]), dtype=float
+            ),
             "da_expected_pnl_probability_adjusted_eur": ev_da_charge_eur + ev_da_discharge_eur,
             "ev_afrr_pos_eur": ev_afrr_pos_eur,
             "ev_afrr_neg_eur": ev_afrr_neg_eur,
@@ -8939,6 +9601,30 @@ class BatteryBacktester:
             ),
             "da_terminal_value_source": np.full(
                 n, str(da_shadow_components["da_terminal_value_source"]), dtype=object
+            ),
+            "terminal_inventory_shadow_value_enabled": np.full(
+                n, float(da_shadow_components["terminal_inventory_shadow_value_enabled"]), dtype=float
+            ),
+            "terminal_inventory_shadow_value_eur_per_internal_mwh": np.full(
+                n, float(da_shadow_components["terminal_inventory_shadow_value_eur_per_internal_mwh"]), dtype=float
+            ),
+            "terminal_inventory_future_sell_value_internal_eur_mwh": np.full(
+                n, float(da_shadow_components["terminal_inventory_future_sell_value_internal_eur_mwh"]), dtype=float
+            ),
+            "terminal_inventory_future_replacement_cost_internal_eur_mwh": np.full(
+                n, float(da_shadow_components["terminal_inventory_future_replacement_cost_internal_eur_mwh"]), dtype=float
+            ),
+            "terminal_inventory_value_quantile_sell": np.full(
+                n, float(da_shadow_components["terminal_inventory_value_quantile_sell"]), dtype=float
+            ),
+            "terminal_inventory_value_quantile_buy": np.full(
+                n, float(da_shadow_components["terminal_inventory_value_quantile_buy"]), dtype=float
+            ),
+            "terminal_inventory_value_source": np.full(
+                n, str(da_shadow_components["terminal_inventory_value_source"]), dtype=object
+            ),
+            "terminal_inventory_objective_coef_soc_end": np.full(
+                n, -float(da_soc_shadow_value_eur_per_internal_mwh), dtype=float
             ),
             "ev_objective_rebuild_eur": ev_objective_rebuild_eur,
             "ev_objective_rebuild_including_window_terminal_eur": (
@@ -8996,8 +9682,66 @@ class BatteryBacktester:
             "bcm_missing_quantile": np.zeros(n, dtype=float),
             "bem_requested_quantile": np.full(n, _requested_afrr_quantile_label(), dtype=object),
             "bem_selected_quantile": np.full(n, _requested_afrr_quantile_label(), dtype=object),
-            "bem_execution_probability": np.nanmean(p_award_pos_by_bin, axis=1) if n_bins else np.zeros(n, dtype=float),
-            "bem_execution_probability_source_quantile": np.full(n, _requested_afrr_quantile_label(), dtype=object),
+                "bem_execution_probability": np.nanmean(p_award_pos_by_bin, axis=1) if n_bins else np.zeros(n, dtype=float),
+                "bem_execution_probability_source_quantile": np.full(n, _requested_afrr_quantile_label(), dtype=object),
+                "bem_execution_probability_used_for_revenue": (
+                    np.nanmean(
+                        np.concatenate([p_award_pos_by_bin, p_award_neg_by_bin], axis=1),
+                        axis=1,
+                    )
+                    if n_bins
+                    else np.zeros(n, dtype=float)
+                ),
+                "bem_execution_probability_used_for_cost": (
+                    np.nanmean(
+                        np.concatenate([p_award_pos_by_bin, p_award_neg_by_bin], axis=1),
+                        axis=1,
+                    )
+                    if n_bins
+                    else np.zeros(n, dtype=float)
+                ),
+                "bem_expected_activation_share_used_for_revenue": (
+                    np.nanmean(
+                        np.concatenate(
+                            [
+                                p_award_pos_by_bin * act_rate_pos_by_bin,
+                                p_award_neg_by_bin * act_rate_neg_by_bin,
+                            ],
+                            axis=1,
+                        ),
+                        axis=1,
+                    )
+                    if n_bins
+                    else np.zeros(n, dtype=float)
+                ),
+                "bem_expected_activation_share_used_for_cost": (
+                    np.nanmean(
+                        np.concatenate(
+                            [
+                                p_award_pos_by_bin * act_rate_pos_by_bin,
+                                p_award_neg_by_bin * act_rate_neg_by_bin,
+                            ],
+                            axis=1,
+                        ),
+                        axis=1,
+                    )
+                    if n_bins
+                    else np.zeros(n, dtype=float)
+                ),
+                "bem_expected_activation_share_used_for_soc": (
+                    np.nanmean(
+                        np.concatenate(
+                            [
+                                p_award_pos_by_bin * act_rate_pos_by_bin,
+                                p_award_neg_by_bin * act_rate_neg_by_bin,
+                            ],
+                            axis=1,
+                        ),
+                        axis=1,
+                    )
+                    if n_bins
+                    else np.zeros(n, dtype=float)
+                ),
             "bem_probability_convention": np.full(
                 n, "activation_price_quantile_q_clears_with_probability_1_minus_q", dtype=object
             ),
@@ -9282,6 +10026,58 @@ class BatteryBacktester:
                 "ev_bem_aux_cost_basis": np.full(
                     n, "activation_proportional_no_standby_aux", dtype=object
                 ),
+                "bcm_terminal_inventory_effect_pos_eur": np.nansum(
+                    np.nan_to_num(bcm_terminal_inventory_effect_pos_by_bin, nan=0.0), axis=1
+                ),
+                "bcm_terminal_inventory_effect_neg_eur": np.nansum(
+                    np.nan_to_num(bcm_terminal_inventory_effect_neg_by_bin, nan=0.0), axis=1
+                ),
+                "bcm_ev_before_terminal_inventory_pos_eur": np.nansum(
+                    np.nan_to_num(bcm_ev_before_terminal_inventory_pos_by_bin, nan=0.0), axis=1
+                ),
+                "bcm_ev_before_terminal_inventory_neg_eur": np.nansum(
+                    np.nan_to_num(bcm_ev_before_terminal_inventory_neg_by_bin, nan=0.0), axis=1
+                ),
+                "bcm_ev_after_terminal_inventory_pos_eur": np.nansum(
+                    np.nan_to_num(bcm_ev_before_terminal_inventory_pos_by_bin, nan=0.0)
+                    + np.nan_to_num(bcm_terminal_inventory_effect_pos_by_bin, nan=0.0),
+                    axis=1,
+                ),
+                "bcm_ev_after_terminal_inventory_neg_eur": np.nansum(
+                    np.nan_to_num(bcm_ev_before_terminal_inventory_neg_by_bin, nan=0.0)
+                    + np.nan_to_num(bcm_terminal_inventory_effect_neg_by_bin, nan=0.0),
+                    axis=1,
+                ),
+                "bcm_terminal_inventory_shadow_value_applied": np.full(
+                    n, float(da_shadow_components["terminal_inventory_shadow_value_enabled"]), dtype=float
+                ),
+                "bcm_terminal_inventory_shadow_value_already_in_full_objective": np.ones(n, dtype=float),
+                "bem_terminal_inventory_effect_pos_eur": np.nansum(
+                    np.nan_to_num(bem_terminal_inventory_effect_pos_by_bin, nan=0.0), axis=1
+                ),
+                "bem_terminal_inventory_effect_neg_eur": np.nansum(
+                    np.nan_to_num(bem_terminal_inventory_effect_neg_by_bin, nan=0.0), axis=1
+                ),
+                "bem_ev_before_terminal_inventory_pos_eur": np.nansum(
+                    np.nan_to_num(bem_ev_before_terminal_inventory_pos_by_bin, nan=0.0), axis=1
+                ),
+                "bem_ev_before_terminal_inventory_neg_eur": np.nansum(
+                    np.nan_to_num(bem_ev_before_terminal_inventory_neg_by_bin, nan=0.0), axis=1
+                ),
+                "bem_ev_after_terminal_inventory_pos_eur": np.nansum(
+                    np.nan_to_num(bem_ev_before_terminal_inventory_pos_by_bin, nan=0.0)
+                    + np.nan_to_num(bem_terminal_inventory_effect_pos_by_bin, nan=0.0),
+                    axis=1,
+                ),
+                "bem_ev_after_terminal_inventory_neg_eur": np.nansum(
+                    np.nan_to_num(bem_ev_before_terminal_inventory_neg_by_bin, nan=0.0)
+                    + np.nan_to_num(bem_terminal_inventory_effect_neg_by_bin, nan=0.0),
+                    axis=1,
+                ),
+                "bem_terminal_inventory_shadow_value_applied": np.full(
+                    n, float(da_shadow_components["terminal_inventory_shadow_value_enabled"]), dtype=float
+                ),
+                "bem_terminal_inventory_shadow_value_already_in_full_objective": np.ones(n, dtype=float),
             }
         )
         if "optimizer_required_input_imputed_count" in df.columns:
@@ -9326,6 +10122,16 @@ class BatteryBacktester:
             extra_cols[f"ev_bem_bin_{b}_p_exec_neg"] = p_award_neg_by_bin[:, b]
             extra_cols[f"ev_bem_pos_coef_bin_{b}_eur_per_mw"] = bem_pos_coef_by_bin[:, b]
             extra_cols[f"ev_bem_neg_coef_bin_{b}_eur_per_mw"] = bem_neg_coef_by_bin[:, b]
+            extra_cols[f"bem_terminal_inventory_effect_pos_bin_{b}_eur_per_mw"] = bem_terminal_inventory_effect_pos_by_bin[:, b]
+            extra_cols[f"bem_terminal_inventory_effect_neg_bin_{b}_eur_per_mw"] = bem_terminal_inventory_effect_neg_by_bin[:, b]
+            extra_cols[f"bem_ev_before_terminal_inventory_pos_bin_{b}_eur_per_mw"] = bem_ev_before_terminal_inventory_pos_by_bin[:, b]
+            extra_cols[f"bem_ev_before_terminal_inventory_neg_bin_{b}_eur_per_mw"] = bem_ev_before_terminal_inventory_neg_by_bin[:, b]
+            extra_cols[f"bem_ev_after_terminal_inventory_pos_bin_{b}_eur_per_mw"] = (
+                bem_ev_before_terminal_inventory_pos_by_bin[:, b] + bem_terminal_inventory_effect_pos_by_bin[:, b]
+            )
+            extra_cols[f"bem_ev_after_terminal_inventory_neg_bin_{b}_eur_per_mw"] = (
+                bem_ev_before_terminal_inventory_neg_by_bin[:, b] + bem_terminal_inventory_effect_neg_by_bin[:, b]
+            )
             extra_cols[f"ev_rpos_coef_bin_{b}_eur_per_mw"] = rpos_coef_by_bin[:, b]
             extra_cols[f"ev_rneg_coef_bin_{b}_eur_per_mw"] = rneg_coef_by_bin[:, b]
             extra_cols[f"ev_bcm_p_award_pos_bin_{b}"] = p_award_pos_by_bin[:, b]
@@ -9336,6 +10142,16 @@ class BatteryBacktester:
             extra_cols[f"ev_bcm_activation_volume_multiplier_applied_once_bin_{b}"] = np.ones(n, dtype=float)
             extra_cols[f"ev_bcm_product_coef_pos_bin_{b}_eur_per_mw"] = bcm_product_coef_pos_by_bin[:, b]
             extra_cols[f"ev_bcm_product_coef_neg_bin_{b}_eur_per_mw"] = bcm_product_coef_neg_by_bin[:, b]
+            extra_cols[f"bcm_terminal_inventory_effect_pos_bin_{b}_eur_per_mw"] = bcm_terminal_inventory_effect_pos_by_bin[:, b]
+            extra_cols[f"bcm_terminal_inventory_effect_neg_bin_{b}_eur_per_mw"] = bcm_terminal_inventory_effect_neg_by_bin[:, b]
+            extra_cols[f"bcm_ev_before_terminal_inventory_pos_bin_{b}_eur_per_mw"] = bcm_ev_before_terminal_inventory_pos_by_bin[:, b]
+            extra_cols[f"bcm_ev_before_terminal_inventory_neg_bin_{b}_eur_per_mw"] = bcm_ev_before_terminal_inventory_neg_by_bin[:, b]
+            extra_cols[f"bcm_ev_after_terminal_inventory_pos_bin_{b}_eur_per_mw"] = (
+                bcm_ev_before_terminal_inventory_pos_by_bin[:, b] + bcm_terminal_inventory_effect_pos_by_bin[:, b]
+            )
+            extra_cols[f"bcm_ev_after_terminal_inventory_neg_bin_{b}_eur_per_mw"] = (
+                bcm_ev_before_terminal_inventory_neg_by_bin[:, b] + bcm_terminal_inventory_effect_neg_by_bin[:, b]
+            )
             extra_cols[f"ev_bem_p_exec_pos_bin_{b}"] = p_award_pos_by_bin[:, b]
             extra_cols[f"ev_bem_p_exec_neg_bin_{b}"] = p_award_neg_by_bin[:, b]
             extra_cols[f"ev_bcm_capacity_value_pos_bin_{b}"] = bcm_expected_capacity_revenue_pos_by_bin[:, b]
@@ -9383,7 +10199,7 @@ class BatteryBacktester:
             extra_cols[f"ev_bem_activation_margin_neg_bin_{b}"] = bem_activation_margin_neg_by_bin[:, b]
         if not bool(perms.allow_bcm):
             for key in list(extra_cols):
-                if key.startswith("ev_bcm") or key in {
+                if key.startswith("ev_bcm") or key.startswith("bcm_terminal_inventory") or key.startswith("bcm_ev_before_terminal") or key.startswith("bcm_ev_after_terminal") or key in {
                     "bcm_allowed",
                     "bcm_ev_pos",
                     "bcm_ev_neg",
@@ -10520,6 +11336,7 @@ class BatteryBacktester:
         terminal_repair_recovery_aux_mwh: float = 0.0,
         terminal_repair_aux_without_recovery_mwh: float = 0.0,
         provisional_scheduled_internal_mwh: float = 0.0,
+        terminal_repair_projection_includes_aux_without_recovery: bool = True,
     ) -> dict[str, float | str]:
         """Size one-step technical ID recovery using grid-side MWh and eta_in."""
         safety_buffer_mwh = max(0.0, float(terminal_soc_safety_margin_mwh))
@@ -10535,13 +11352,19 @@ class BatteryBacktester:
         aux_without_recovery_mwh = max(0.0, float(terminal_repair_aux_without_recovery_mwh))
         aux_with_recovery_mwh = max(0.0, float(terminal_repair_recovery_aux_mwh))
         recovery_induced_aux_mwh = max(0.0, aux_with_recovery_mwh - aux_without_recovery_mwh)
-        recovery_aux_mwh = recovery_induced_aux_mwh
+        projection_includes_aux_without = bool(terminal_repair_projection_includes_aux_without_recovery)
+        # If the no-ID projection already includes the recovery hour's
+        # no-recovery aux state, only the incremental OFF/STANDBY -> TRADING
+        # delta must be added. If the projection is pre-aux for the recovery
+        # hour, size against the full post-recovery aux state. This avoids
+        # ending at target - (trading_aux - off_aux) in hard-final-SoC runs.
+        recovery_aux_mwh = recovery_induced_aux_mwh if projection_includes_aux_without else aux_with_recovery_mwh
         required_additional_internal = max(
             0.0,
             target_mwh
             + safety_buffer_mwh
             + known_future_aux_mwh
-            + recovery_induced_aux_mwh
+            + recovery_aux_mwh
             - float(projected_terminal_soc_without_new_id_mwh),
         )
         provisional_internal = max(0.0, float(provisional_scheduled_internal_mwh))
@@ -10550,9 +11373,7 @@ class BatteryBacktester:
         # sizing recovery to hit the target before aux and ending at target-aux.
         room_internal = max(
             0.0,
-            float(self.soc_max)
-            + recovery_induced_aux_mwh
-            - (float(current_soc_mwh) + provisional_internal),
+            float(self.soc_max) + aux_with_recovery_mwh - (float(current_soc_mwh) + provisional_internal),
         )
         available_additional_internal = (
             max(0.0, float(residual_charge_mw)) * float(self.dt_h) * max(float(self.eta_in), 1e-12)
@@ -10629,6 +11450,8 @@ class BatteryBacktester:
             "terminal_recovery_aux_without_recovery_mwh": float(aux_without_recovery_mwh),
             "terminal_recovery_aux_with_recovery_mwh": float(aux_with_recovery_mwh),
             "terminal_recovery_induced_aux_delta_mwh": float(recovery_induced_aux_mwh),
+            "terminal_recovery_aux_sized_mwh": float(recovery_aux_mwh),
+            "terminal_recovery_projection_includes_aux_without_recovery": float(projection_includes_aux_without),
             "terminal_recovery_recovery_hour_aux_mwh": float(aux_with_recovery_mwh),
             "terminal_recovery_recovery_induced_aux_mwh": float(recovery_induced_aux_mwh),
             "terminal_recovery_induced_aux_loss_mwh": float(recovery_induced_aux_mwh),
@@ -10665,18 +11488,35 @@ class BatteryBacktester:
         known_future_aux_mwh: float,
         terminal_soc_target_mwh: float,
         safety_buffer_mwh: float,
+        existing_recovery_aux_without_recovery_mwh: float = 0.0,
+        existing_recovery_aux_with_recovery_mwh: float = 0.0,
+        existing_recovery_projection_includes_aux_without_recovery: bool = True,
     ) -> dict[str, float]:
         before_existing = float(projected_terminal_soc_without_new_recovery_mwh)
         existing_internal = max(0.0, float(existing_scheduled_terminal_recovery_internal_mwh))
         aux = max(0.0, float(known_future_aux_mwh))
         target = float(terminal_soc_target_mwh) + max(0.0, float(safety_buffer_mwh))
-        after_existing = before_existing + existing_internal - aux
+        existing_aux_without = max(0.0, float(existing_recovery_aux_without_recovery_mwh))
+        existing_aux_with = max(0.0, float(existing_recovery_aux_with_recovery_mwh))
+        existing_aux_delta = max(0.0, existing_aux_with - existing_aux_without)
+        projection_includes_aux_without = bool(existing_recovery_projection_includes_aux_without_recovery)
+        existing_aux_sized = existing_aux_delta if projection_includes_aux_without else existing_aux_with
+        after_existing_before_aux = before_existing + existing_internal - aux
+        after_existing = after_existing_before_aux - existing_aux_sized
         remaining = max(0.0, target - after_existing)
         return {
             "terminal_recovery_projected_final_soc_before_existing_recovery_mwh": float(before_existing),
             "terminal_recovery_existing_scheduled_internal_mwh": float(existing_internal),
+            "terminal_recovery_existing_aux_without_recovery_mwh": float(existing_aux_without),
+            "terminal_recovery_existing_aux_with_recovery_mwh": float(existing_aux_with),
+            "terminal_recovery_existing_induced_aux_delta_mwh": float(existing_aux_delta),
+            "terminal_recovery_existing_aux_sized_mwh": float(existing_aux_sized),
+            "terminal_recovery_existing_projection_includes_aux_without_recovery": float(projection_includes_aux_without),
+            "terminal_recovery_projected_final_soc_after_existing_before_aux_mwh": float(after_existing_before_aux),
+            "terminal_recovery_projected_final_soc_after_existing_after_aux_mwh": float(after_existing),
             "terminal_recovery_projected_final_soc_after_existing_recovery_mwh": float(after_existing),
             "terminal_recovery_remaining_shortfall_internal_mwh": float(remaining),
+            "terminal_recovery_remaining_shortfall_after_existing_recovery_mwh": float(remaining),
         }
 
     def _plan_id_rescue_for_next_hour(
@@ -10943,6 +11783,10 @@ class BatteryBacktester:
                     id_discharge_mw=0.0,
                 )
                 aux_without_id_mwh = max(0.0, float(aux_without_id_mw) * float(self.dt_h))
+                projection_includes_aux_without_recovery = bool(
+                    aux_without_id_mwh <= 1e-12
+                    or float(projected_without_base) <= float(soc_next) - aux_without_id_mwh + 1e-9
+                )
                 aux_with_id_mw, _ = self._state_aux_power_mw(
                     charge_mw=max(0.0, float(da_charge_next_mw)),
                     discharge_mw=max(0.0, float(da_discharge_next_mw)),
@@ -10972,6 +11816,7 @@ class BatteryBacktester:
                         terminal_repair_known_future_aux_mwh=known_future_aux_mwh,
                         terminal_repair_recovery_aux_mwh=recovery_aux_mwh,
                         terminal_repair_aux_without_recovery_mwh=aux_without_id_mwh,
+                        terminal_repair_projection_includes_aux_without_recovery=projection_includes_aux_without_recovery,
                     )
                     scheduled_grid_for_aux = float(
                         recovery_diag.get("terminal_soc_id_recourse_scheduled_grid_mwh", 0.0)
@@ -11006,12 +11851,24 @@ class BatteryBacktester:
                     )
                     recovery_diag["terminal_recovery_aux_loss_included_mwh"] = float(
                         known_future_aux_mwh
-                        + max(0.0, float(recovery_aux_mwh) - float(aux_without_id_mwh))
+                        + (
+                            max(0.0, float(recovery_aux_mwh) - float(aux_without_id_mwh))
+                            if projection_includes_aux_without_recovery
+                            else max(0.0, float(recovery_aux_mwh))
+                        )
                     )
                     recovery_diag["terminal_recovery_aux_without_recovery_mwh"] = float(aux_without_id_mwh)
                     recovery_diag["terminal_recovery_aux_with_recovery_mwh"] = float(recovery_aux_mwh)
                     recovery_diag["terminal_recovery_induced_aux_delta_mwh"] = float(
                         max(0.0, float(recovery_aux_mwh) - float(aux_without_id_mwh))
+                    )
+                    recovery_diag["terminal_recovery_aux_sized_mwh"] = float(
+                        max(0.0, float(recovery_aux_mwh) - float(aux_without_id_mwh))
+                        if projection_includes_aux_without_recovery
+                        else max(0.0, float(recovery_aux_mwh))
+                    )
+                    recovery_diag["terminal_recovery_projection_includes_aux_without_recovery"] = float(
+                        projection_includes_aux_without_recovery
                     )
                 scheduled_internal_mwh = float(
                     recovery_diag.get("terminal_soc_id_recourse_scheduled_internal_mwh", 0.0)
@@ -11029,7 +11886,7 @@ class BatteryBacktester:
                 recovery_diag.update(
                     {
                         "terminal_soc_projection_id_extra_aux_losses_mwh": float(
-                            max(0.0, float(recovery_aux_mwh) - float(aux_without_id_mwh))
+                            recovery_diag.get("terminal_recovery_aux_sized_mwh", 0.0)
                         ),
                         "projected_terminal_soc_with_new_id_before_aux_mwh": float(projected_before_aux),
                         "projected_terminal_soc_without_new_id_mwh": float(projected_without_base),
@@ -12734,6 +13591,7 @@ class BatteryBacktester:
                     - (self.deg_eur_mwh * self.eta_in)
                 )
                 selected_bcm_ev_eur = float("nan")
+                selected_bcm_terminal_inventory_effect_eur = 0.0
                 if "ev_afrr_pos_eur" in blk.columns or "ev_afrr_neg_eur" in blk.columns:
                     ev_pos_series = _blk_series("ev_afrr_pos_eur", 0.0)
                     ev_neg_series = _blk_series("ev_afrr_neg_eur", 0.0)
@@ -12745,8 +13603,15 @@ class BatteryBacktester:
                         ev_pos_series.sum() * pos_scale
                         + ev_neg_series.sum() * neg_scale
                     )
+                    for b in range(int(len(self.afrr_quantile_bins))):
+                        pos_mw = _blk_series(f"reserve_pos_bin_{b}_mw", 0.0)
+                        neg_mw = _blk_series(f"reserve_neg_bin_{b}_mw", 0.0)
+                        term_pos = _blk_series(f"bcm_terminal_inventory_effect_pos_bin_{b}_eur_per_mw", 0.0)
+                        term_neg = _blk_series(f"bcm_terminal_inventory_effect_neg_bin_{b}_eur_per_mw", 0.0)
+                        selected_bcm_terminal_inventory_effect_eur += float((pos_mw * term_pos).sum() * pos_scale)
+                        selected_bcm_terminal_inventory_effect_eur += float((neg_mw * term_neg).sum() * neg_scale)
                 if np.isfinite(selected_bcm_ev_eur):
-                    expected_capacity_ev_eur = float(selected_bcm_ev_eur)
+                    expected_capacity_ev_eur = float(selected_bcm_ev_eur + selected_bcm_terminal_inventory_effect_eur)
                 else:
                     pred_cap_pos_blk = float(_src_series(colmap.pred_afrr_capacity_price_pos).mean())
                     pred_cap_neg_blk = float(_src_series(colmap.pred_afrr_capacity_price_neg).mean())
@@ -12762,10 +13627,36 @@ class BatteryBacktester:
                         float(offered_pos) * pred_rate_pos_blk * pred_act_pos_blk * block_hours
                         + float(offered_neg) * pred_rate_neg_blk * act_value_neg_blk * block_hours
                     )
+                    term_pos, _term_pos_neg_unused = self.terminal_inventory_effects_eur_per_mw(
+                        probability=1.0,
+                        activation_rate=pred_rate_pos_blk,
+                        duration_h=block_hours,
+                        eta_in=float(self.eta_in),
+                        eta_out=float(self.eta_out),
+                        lambda_eur_per_internal_mwh=float(
+                            self._da_soc_shadow_value_components(pred_da_blk)[
+                                "terminal_inventory_shadow_value_eur_per_internal_mwh"
+                            ]
+                        ),
+                    )
+                    _term_neg_pos_unused, term_neg = self.terminal_inventory_effects_eur_per_mw(
+                        probability=1.0,
+                        activation_rate=pred_rate_neg_blk,
+                        duration_h=block_hours,
+                        eta_in=float(self.eta_in),
+                        eta_out=float(self.eta_out),
+                        lambda_eur_per_internal_mwh=float(
+                            self._da_soc_shadow_value_components(pred_da_blk)[
+                                "terminal_inventory_shadow_value_eur_per_internal_mwh"
+                            ]
+                        ),
+                    )
+                    selected_bcm_terminal_inventory_effect_eur = float(offered_pos) * float(np.asarray(term_pos).item()) + float(offered_neg) * float(np.asarray(term_neg).item())
                     expected_capacity_ev_eur = float(
                         expected_capacity_revenue_eur
                         + float(offered_pos) * pred_rate_pos_blk * bcm_margin_pos_blk * block_hours
                         + float(offered_neg) * pred_rate_neg_blk * bcm_margin_neg_blk * block_hours
+                        + selected_bcm_terminal_inventory_effect_eur
                     )
                 expected_aux_cost_eur = float(
                     precommit_headroom_recharge_cost_eur + precommit_headroom_opportunity_cost_eur
@@ -12778,6 +13669,11 @@ class BatteryBacktester:
                 bcm_precommit_stats["expected_capacity_revenue_eur"] = float(expected_capacity_revenue_eur)
                 bcm_precommit_stats["expected_activation_revenue_eur"] = float(expected_activation_revenue_eur)
                 bcm_precommit_stats["expected_aux_cost_eur"] = float(expected_aux_cost_eur)
+                bcm_precommit_stats["bcm_terminal_inventory_effect_eur"] = float(selected_bcm_terminal_inventory_effect_eur)
+                bcm_precommit_stats["bcm_terminal_inventory_shadow_value_applied"] = float(
+                    selected_bcm_terminal_inventory_effect_eur != 0.0
+                )
+                bcm_precommit_stats["bcm_terminal_inventory_shadow_value_already_in_full_objective"] = 1.0
                 bcm_precommit_stats["ev_before_recovery_eur"] = float(
                     precommit_net_capacity_ev_after_headroom_cost_eur
                 )
@@ -12795,6 +13691,50 @@ class BatteryBacktester:
                     precommit_clamp_reason = "zeroed_due_to_negative_ev_after_headroom_cost"
                     precommit_reduction_reason = "negative_ev_after_headroom_cost"
                     precommit_applied = 1.0
+
+            def _selected_bcm_award_probability_factor() -> float:
+                weights: list[float] = []
+                probs: list[float] = []
+                for b in range(int(len(self.afrr_quantile_bins))):
+                    pos_mw = (
+                        float(pd.to_numeric(blk[f"reserve_pos_bin_{b}_mw"], errors="coerce").fillna(0.0).mean())
+                        if f"reserve_pos_bin_{b}_mw" in blk.columns
+                        else 0.0
+                    )
+                    neg_mw = (
+                        float(pd.to_numeric(blk[f"reserve_neg_bin_{b}_mw"], errors="coerce").fillna(0.0).mean())
+                        if f"reserve_neg_bin_{b}_mw" in blk.columns
+                        else 0.0
+                    )
+                    p_pos = (
+                        float(pd.to_numeric(blk[f"ev_bcm_p_award_pos_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                        if f"ev_bcm_p_award_pos_bin_{b}" in blk.columns
+                        else (
+                            float(pd.to_numeric(blk[f"ev_pacc_pos_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                            if f"ev_pacc_pos_bin_{b}" in blk.columns
+                            else 1.0
+                        )
+                    )
+                    p_neg = (
+                        float(pd.to_numeric(blk[f"ev_bcm_p_award_neg_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                        if f"ev_bcm_p_award_neg_bin_{b}" in blk.columns
+                        else (
+                            float(pd.to_numeric(blk[f"ev_pacc_neg_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                            if f"ev_pacc_neg_bin_{b}" in blk.columns
+                            else 1.0
+                        )
+                    )
+                    if pos_mw > 1e-12:
+                        weights.append(float(pos_mw))
+                        probs.append(float(np.clip(p_pos, 0.0, 1.0)))
+                    if neg_mw > 1e-12:
+                        weights.append(float(neg_mw))
+                        probs.append(float(np.clip(p_neg, 0.0, 1.0)))
+                if weights and sum(weights) > 1e-12:
+                    return float(np.average(np.asarray(probs, dtype=float), weights=np.asarray(weights, dtype=float)))
+                return 1.0
+
+            bcm_recovery_cost_probability_factor = float(_selected_bcm_award_probability_factor())
 
             cap_bids: list[AFRRCapacityBid] = []
             cap_res: AFRRCapacityClearingResult | None = None
@@ -12822,6 +13762,7 @@ class BatteryBacktester:
                     global_end_utc=global_end_utc,
                     is_perfect_foresight=is_perfect_foresight,
                     candidate_ev_eur=float(expected_capacity_ev_eur),
+                    recovery_cost_probability_factor=float(bcm_recovery_cost_probability_factor),
                 )
                 reserve_retry_factor = float(bcm_precommit_stats.get("retry_factor_selected", reserve_retry_factor))
                 submitted_reserve_pos_mw_after_retry = float(offered_pos)
@@ -12853,6 +13794,8 @@ class BatteryBacktester:
                     float(expected_activation_revenue_eur),
                 )
                 bcm_precommit_stats.setdefault("expected_aux_cost_eur", float(expected_aux_cost_eur))
+                bcm_precommit_stats.setdefault("bcm_terminal_inventory_effect_eur", float(selected_bcm_terminal_inventory_effect_eur))
+                bcm_precommit_stats.setdefault("bcm_terminal_inventory_shadow_value_already_in_full_objective", 1.0)
                 bcm_precommit_stats.setdefault(
                     "ev_before_recovery_eur",
                     float(precommit_net_capacity_ev_after_headroom_cost_eur),
@@ -13074,6 +14017,17 @@ class BatteryBacktester:
                             "effective_ev_before_recovery_eur",
                             "ev_after_recovery_eur",
                             "effective_ev_after_recovery_eur",
+                            "baseline_recovery_cost_eur",
+                            "candidate_recovery_cost_eur",
+                            "incremental_recovery_cost_eur",
+                            "expected_incremental_recovery_cost_eur",
+                            "full_recovery_cost_eur",
+                            "full_recovery_cost_would_have_zeroed",
+                            "ev_after_incremental_recovery_eur",
+                            "full_recovery_cost_ev_after_recovery_eur",
+                            "recovery_cost_probability_weighted",
+                            "recovery_cost_probability_factor",
+                            "ev_nan_detected",
                             "expected_capacity_revenue_eur",
                             "expected_activation_revenue_eur",
                             "expected_aux_cost_eur",
@@ -13083,6 +14037,12 @@ class BatteryBacktester:
                             )
                         precommit_audit_by_ts.setdefault("bcm_precommit_zero_reason_detail", {})[tsu] = str(
                             bcm_precommit_stats.get("zero_reason_detail", bcm_precommit_stats.get("zero_reason", "none"))
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_recovery_cost_used_in_ev_mode", {})[tsu] = str(
+                            bcm_precommit_stats.get("recovery_cost_used_in_ev_mode", "unknown")
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_precommit_ev_nan_component", {})[tsu] = str(
+                            bcm_precommit_stats.get("ev_nan_component", "none")
                         )
                         precommit_audit_by_ts.setdefault("bcm_precommit_aux_mode", {})[tsu] = str(
                             bcm_precommit_stats.get("aux_mode", self.aux_mode)
@@ -13435,12 +14395,29 @@ class BatteryBacktester:
                         "terminal_shortfall_after_recovery_mwh",
                         "effective_ev_before_recovery_eur",
                         "effective_ev_after_recovery_eur",
+                        "baseline_recovery_cost_eur",
+                        "candidate_recovery_cost_eur",
+                        "incremental_recovery_cost_eur",
+                        "expected_incremental_recovery_cost_eur",
+                        "full_recovery_cost_eur",
+                        "full_recovery_cost_would_have_zeroed",
+                        "ev_after_incremental_recovery_eur",
+                        "full_recovery_cost_ev_after_recovery_eur",
+                        "recovery_cost_probability_weighted",
+                        "recovery_cost_probability_factor",
+                        "ev_nan_detected",
                     ):
                         precommit_audit_by_ts.setdefault(f"bcm_precommit_{diag_name}", {})[tsu] = float(
                             bcm_precommit_stats.get(diag_name, np.nan if "ev" in diag_name else 0.0)
                         )
                     precommit_audit_by_ts.setdefault("bcm_precommit_zero_reason_detail", {})[tsu] = str(
                         bcm_precommit_stats.get("zero_reason_detail", bcm_precommit_stats.get("zero_reason", "none"))
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_recovery_cost_used_in_ev_mode", {})[tsu] = str(
+                        bcm_precommit_stats.get("recovery_cost_used_in_ev_mode", "unknown")
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_ev_nan_component", {})[tsu] = str(
+                        bcm_precommit_stats.get("ev_nan_component", "none")
                     )
                     for diag_name in (
                         "reduced_due_to_power",
@@ -13879,8 +14856,22 @@ class BatteryBacktester:
             *,
             after_timestamp_utc: pd.Timestamp,
         ) -> float:
+            return float(
+                _terminal_recovery_existing_scheduled_summary(
+                    after_timestamp_utc=after_timestamp_utc
+                )["remaining_internal_mwh"]
+            )
+
+        def _terminal_recovery_existing_scheduled_summary(
+            *,
+            after_timestamp_utc: pd.Timestamp,
+        ) -> dict[str, float]:
             after_ts = pd.to_datetime(after_timestamp_utc, utc=True, errors="coerce")
-            total = 0.0
+            total_internal = 0.0
+            aux_without = 0.0
+            aux_with = 0.0
+            aux_sized = 0.0
+            projection_includes_aux_without = True
             for rec in terminal_recovery_ledger:
                 if str(rec.get("terminal_recovery_status", "")).strip().lower() != "scheduled":
                     continue
@@ -13891,8 +14882,25 @@ class BatteryBacktester:
                 )
                 if pd.isna(after_ts) or pd.isna(delivery_ts) or delivery_ts <= after_ts:
                     continue
-                total += max(0.0, float(rec.get("terminal_recovery_remaining_internal_mwh", 0.0) or 0.0))
-            return float(total)
+                total_internal += max(0.0, float(rec.get("terminal_recovery_remaining_internal_mwh", 0.0) or 0.0))
+                aux_without += max(0.0, float(rec.get("terminal_recovery_aux_without_recovery_mwh", 0.0) or 0.0))
+                aux_with += max(0.0, float(rec.get("terminal_recovery_aux_with_recovery_mwh", 0.0) or 0.0))
+                aux_sized += max(0.0, float(rec.get("terminal_recovery_aux_sized_mwh", 0.0) or 0.0))
+                projection_includes_aux_without = projection_includes_aux_without and bool(
+                    float(rec.get("terminal_recovery_projection_includes_aux_without_recovery", 1.0) or 0.0) >= 0.5
+                )
+            if aux_sized > 1e-12:
+                if projection_includes_aux_without:
+                    aux_with = max(aux_with, aux_without + aux_sized)
+                else:
+                    aux_with = max(aux_with, aux_sized)
+            return {
+                "remaining_internal_mwh": float(total_internal),
+                "aux_without_recovery_mwh": float(aux_without),
+                "aux_with_recovery_mwh": float(aux_with),
+                "aux_sized_mwh": float(aux_sized),
+                "projection_includes_aux_without_recovery": float(projection_includes_aux_without),
+            }
 
         def _upsert_scheduled_terminal_recovery(
             *,
@@ -13902,6 +14910,10 @@ class BatteryBacktester:
             scheduled_grid_mwh: float,
             scheduled_internal_mwh: float,
             reason: str,
+            aux_without_recovery_mwh: float = 0.0,
+            aux_with_recovery_mwh: float = 0.0,
+            aux_sized_mwh: float = 0.0,
+            projection_includes_aux_without_recovery: float = 1.0,
         ) -> None:
             for rec in terminal_recovery_ledger:
                 if str(rec.get("terminal_recovery_plan_id", "")) == str(plan_id):
@@ -13912,6 +14924,12 @@ class BatteryBacktester:
                             "terminal_recovery_remaining_internal_mwh": float(scheduled_internal_mwh),
                             "terminal_recovery_status": "scheduled",
                             "terminal_recovery_reason": str(reason),
+                            "terminal_recovery_aux_without_recovery_mwh": float(aux_without_recovery_mwh),
+                            "terminal_recovery_aux_with_recovery_mwh": float(aux_with_recovery_mwh),
+                            "terminal_recovery_aux_sized_mwh": float(aux_sized_mwh),
+                            "terminal_recovery_projection_includes_aux_without_recovery": float(
+                                projection_includes_aux_without_recovery
+                            ),
                         }
                     )
                     return
@@ -13927,6 +14945,12 @@ class BatteryBacktester:
                     "terminal_recovery_remaining_internal_mwh": float(scheduled_internal_mwh),
                     "terminal_recovery_status": "scheduled",
                     "terminal_recovery_reason": str(reason),
+                    "terminal_recovery_aux_without_recovery_mwh": float(aux_without_recovery_mwh),
+                    "terminal_recovery_aux_with_recovery_mwh": float(aux_with_recovery_mwh),
+                    "terminal_recovery_aux_sized_mwh": float(aux_sized_mwh),
+                    "terminal_recovery_projection_includes_aux_without_recovery": float(
+                        projection_includes_aux_without_recovery
+                    ),
                 }
             )
 
@@ -14503,6 +15527,12 @@ class BatteryBacktester:
             # Terminal valuation in objective governs economic carry-over behavior.
             enforce_end = None
             rolling_window_contains_global_end = bool(w_end == n)
+            no_action_aux_mwh_per_hour = max(0.0, float(self.aux_off_mw))
+            terminal_recovery_aux_transition_buffer_mwh = (
+                max(0.0, float(self.aux_trading_mw) - float(self.aux_off_mw)) * float(self.dt_h)
+                if str(self.aux_mode) == "state_dependent"
+                else 0.0
+            )
             enforce_end_min = self._rolling_final_soc_min_target(
                 enforce_final_soc_min=bool(enforce_final_soc_min),
                 window_end=int(w_end),
@@ -14512,8 +15542,11 @@ class BatteryBacktester:
                 p_max_mw=float(self.p_max_mw),
                 eta_in=float(self.eta_in),
                 dt_h=float(self.dt_h),
-                remaining_aux_loss_mwh_per_hour=float(self.aux_standby_mw),
-                terminal_soc_safety_margin_mwh=float(self.terminal_id_recovery_safety_mwh),
+                remaining_aux_loss_mwh_per_hour=float(no_action_aux_mwh_per_hour),
+                terminal_soc_safety_margin_mwh=(
+                    float(self.terminal_id_recovery_safety_mwh)
+                    + float(terminal_recovery_aux_transition_buffer_mwh)
+                ),
                 soc_max=float(self.soc_max),
             )
             optimization_fallback = "none"
@@ -15818,6 +16851,16 @@ class BatteryBacktester:
                         )
                     annotated_da_audit_rows.append(out_row)
                 da_audit_rows = annotated_da_audit_rows
+                accepted_da, da_audit_rows = self._apply_da_accepted_lockbook_replay_to_audit_rows(
+                    da_audit_rows=da_audit_rows,
+                    accepted_da=accepted_da,
+                    lock_rows=lock_rows,
+                    colmap=colmap,
+                    current_soc_mwh=float(soc),
+                    fixed_reserve_pos=afrr_cap_pos_lockbook,
+                    fixed_reserve_neg=afrr_cap_neg_lockbook,
+                    global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
+                )
                 for row in da_audit_rows:
                     tsu = pd.to_datetime(row.get("timestamp_utc", ""), utc=True, errors="coerce")
                     if pd.isna(tsu):
@@ -16105,6 +17148,19 @@ class BatteryBacktester:
                 "bcm_precommit_effective_ev_before_recovery_eur",
                 "bcm_precommit_ev_after_recovery_eur",
                 "bcm_precommit_effective_ev_after_recovery_eur",
+                "bcm_precommit_baseline_recovery_cost_eur",
+                "bcm_precommit_candidate_recovery_cost_eur",
+                "bcm_precommit_incremental_recovery_cost_eur",
+                "bcm_precommit_expected_incremental_recovery_cost_eur",
+                "bcm_precommit_full_recovery_cost_eur",
+                "bcm_precommit_full_recovery_cost_would_have_zeroed",
+                "bcm_precommit_ev_after_incremental_recovery_eur",
+                "bcm_precommit_full_recovery_cost_ev_after_recovery_eur",
+                "bcm_precommit_recovery_cost_probability_weighted",
+                "bcm_precommit_recovery_cost_probability_factor",
+                "bcm_precommit_recovery_cost_used_in_ev_mode",
+                "bcm_precommit_ev_nan_detected",
+                "bcm_precommit_ev_nan_component",
                 "bcm_precommit_expected_capacity_revenue_eur",
                 "bcm_precommit_expected_activation_revenue_eur",
                 "bcm_precommit_expected_aux_cost_eur",
@@ -16148,6 +17204,24 @@ class BatteryBacktester:
                 "da_precommit_da_postlock_candidate_sell_mw",
                 "da_precommit_da_accepted_buy_mw",
                 "da_precommit_da_accepted_sell_mw",
+                "da_precommit_da_accepted_lockbook_revenue_eur",
+                "da_precommit_da_accepted_lockbook_cost_eur",
+                "da_precommit_da_accepted_lockbook_gross_spread_eur",
+                "da_precommit_da_accepted_lockbook_pnl_eur",
+                "da_precommit_accepted_lockbook_energy_mwh",
+                "da_precommit_accepted_lockbook_row_buy_mwh",
+                "da_precommit_accepted_lockbook_row_sell_mwh",
+                "da_precommit_accepted_lockbook_revenue_eur",
+                "da_precommit_accepted_lockbook_cost_eur",
+                "da_precommit_accepted_lockbook_gross_spread_eur",
+                "da_precommit_accepted_lockbook_transaction_cost_eur",
+                "da_precommit_accepted_lockbook_degradation_cost_eur",
+                "da_precommit_accepted_lockbook_auxiliary_cost_eur",
+                "da_precommit_accepted_lockbook_terminal_credit_eur",
+                "da_precommit_accepted_lockbook_pnl_eur",
+                "da_precommit_accepted_lockbook_pnl_recomputed_eur",
+                "da_precommit_accepted_lockbook_pnl_reconciliation_error_eur",
+                "da_precommit_accepted_lockbook_gross_spread_reconciliation_error_eur",
                 "da_precommit_candidate_buy_mw",
                 "da_precommit_candidate_sell_mw",
                 "da_precommit_accepted_buy_mw",
@@ -16167,6 +17241,7 @@ class BatteryBacktester:
                 "da_precommit_da_selected_lockable_replay_cost_eur",
                 "da_precommit_da_selected_lockable_replay_gross_spread_eur",
                 "da_precommit_da_selected_lockable_replay_pnl_eur",
+                "da_precommit_da_precommit_stage_model",
                 "da_precommit_da_precommit_schedule_stage_used_for_selection",
                 "da_precommit_da_precommit_schedule_stage_used_for_lockbook",
                 "da_precommit_da_precommit_selection_valid",
@@ -16226,6 +17301,13 @@ class BatteryBacktester:
                 "da_precommit_selected_lockable_gross_spread_eur",
                 "da_precommit_selected_lockable_pnl_eur",
                 "da_precommit_selected_lockable_reconciliation_error_eur",
+                "da_precommit_selected_lockable_deprecated",
+                "da_precommit_selected_lockable_deprecated_reason",
+                "da_precommit_sized_candidate_revenue_eur",
+                "da_precommit_sized_candidate_cost_eur",
+                "da_precommit_sized_candidate_gross_spread_eur",
+                "da_precommit_sized_candidate_pnl_eur",
+                "da_precommit_sized_candidate_reconciliation_error_eur",
                 "da_precommit_selection_invalid_reason",
                 "da_precommit_da_candidate_rejected_hard_final_soc_infeasible",
                 "da_precommit_da_candidate_rejected_locked_commitment_infeasible",
@@ -16356,6 +17438,13 @@ class BatteryBacktester:
                 "da_postlock_required_recovery_internal_mwh",
                 "da_postlock_recovery_capacity_margin_mwh",
                 "da_postlock_terminal_recovery_cost_eur",
+                "da_postlock_recovery_cost_full_eur",
+                "da_postlock_recovery_cost_expected_eur",
+                "da_postlock_recovery_cost_probability_factor_buy",
+                "da_postlock_recovery_cost_probability_factor_sell",
+                "da_postlock_recovery_cost_probability_weighting_required",
+                "da_postlock_recovery_cost_used_in_ev_mode",
+                "da_postlock_recovery_cost_context",
                 "da_postlock_terminal_recovery_cost_estimate_available",
                 "da_postlock_candidate_pnl_before_recovery_cost_eur",
                 "da_postlock_candidate_pnl_after_recovery_cost_eur",
@@ -16404,6 +17493,13 @@ class BatteryBacktester:
                 "da_precommit_da_postlock_required_recovery_internal_mwh",
                 "da_precommit_da_postlock_recovery_capacity_margin_mwh",
                 "da_precommit_da_postlock_terminal_recovery_cost_eur",
+                "da_precommit_da_postlock_recovery_cost_full_eur",
+                "da_precommit_da_postlock_recovery_cost_expected_eur",
+                "da_precommit_da_postlock_recovery_cost_probability_factor_buy",
+                "da_precommit_da_postlock_recovery_cost_probability_factor_sell",
+                "da_precommit_da_postlock_recovery_cost_probability_weighting_required",
+                "da_precommit_da_postlock_recovery_cost_used_in_ev_mode",
+                "da_precommit_da_postlock_recovery_cost_context",
                 "da_precommit_da_postlock_terminal_recovery_cost_estimate_available",
                 "da_precommit_da_postlock_candidate_pnl_before_recovery_cost_eur",
                 "da_precommit_da_postlock_candidate_pnl_after_recovery_cost_eur",
@@ -16511,6 +17607,17 @@ class BatteryBacktester:
                 "da_postlock_candidate_sell_mw": "da_precommit_da_postlock_candidate_sell_mw",
                 "da_selected_lockable_buy_mw": "da_precommit_da_selected_lockable_buy_mw",
                 "da_selected_lockable_sell_mw": "da_precommit_da_selected_lockable_sell_mw",
+                "da_accepted_lockbook_revenue_eur": "da_precommit_da_accepted_lockbook_revenue_eur",
+                "da_accepted_lockbook_cost_eur": "da_precommit_da_accepted_lockbook_cost_eur",
+                "da_accepted_lockbook_gross_spread_eur": "da_precommit_da_accepted_lockbook_gross_spread_eur",
+                "da_accepted_lockbook_pnl_eur": "da_precommit_da_accepted_lockbook_pnl_eur",
+                "accepted_lockbook_energy_mwh": "da_precommit_accepted_lockbook_energy_mwh",
+                "accepted_lockbook_row_buy_mwh": "da_precommit_accepted_lockbook_row_buy_mwh",
+                "accepted_lockbook_row_sell_mwh": "da_precommit_accepted_lockbook_row_sell_mwh",
+                "accepted_lockbook_revenue_eur": "da_precommit_accepted_lockbook_revenue_eur",
+                "accepted_lockbook_cost_eur": "da_precommit_accepted_lockbook_cost_eur",
+                "accepted_lockbook_gross_spread_eur": "da_precommit_accepted_lockbook_gross_spread_eur",
+                "accepted_lockbook_pnl_eur": "da_precommit_accepted_lockbook_pnl_eur",
                 "da_selected_lockable_revenue_eur": "da_precommit_da_selected_lockable_revenue_eur",
                 "da_selected_lockable_cost_eur": "da_precommit_da_selected_lockable_cost_eur",
                 "da_selected_lockable_gross_spread_eur": "da_precommit_da_selected_lockable_gross_spread_eur",
@@ -16941,9 +18048,10 @@ class BatteryBacktester:
                         projected_terminal_without_new_id = float(
                             np.clip(projected_terminal_without_new_id + delta, self.soc_min, self.soc_max)
                         )
-                    existing_terminal_recovery_internal_mwh = _terminal_recovery_existing_scheduled_internal_mwh(
+                    existing_recovery_summary = _terminal_recovery_existing_scheduled_summary(
                         after_timestamp_utc=pd.to_datetime(ts, utc=True, errors="coerce")
                     )
+                    existing_terminal_recovery_internal_mwh = float(existing_recovery_summary["remaining_internal_mwh"])
                     existing_recovery_diag = self._terminal_recovery_remaining_shortfall_after_existing(
                         projected_terminal_soc_without_new_recovery_mwh=float(projected_terminal_without_new_id),
                         existing_scheduled_terminal_recovery_internal_mwh=float(existing_terminal_recovery_internal_mwh),
@@ -16953,6 +18061,15 @@ class BatteryBacktester:
                         known_future_aux_mwh=0.0,
                         terminal_soc_target_mwh=float(self.soc_target_end),
                         safety_buffer_mwh=float(self.terminal_id_recovery_safety_mwh),
+                        existing_recovery_aux_without_recovery_mwh=float(
+                            existing_recovery_summary["aux_without_recovery_mwh"]
+                        ),
+                        existing_recovery_aux_with_recovery_mwh=float(
+                            existing_recovery_summary["aux_with_recovery_mwh"]
+                        ),
+                        existing_recovery_projection_includes_aux_without_recovery=bool(
+                            float(existing_recovery_summary["projection_includes_aux_without_recovery"]) >= 0.5
+                        ),
                     )
                     projected_terminal_before_existing_recovery = float(
                         existing_recovery_diag["terminal_recovery_projected_final_soc_before_existing_recovery_mwh"]
@@ -16999,6 +18116,7 @@ class BatteryBacktester:
                                 else 0.0
                             ),
                             "terminal_recovery_duplicate_prevented": float(duplicate_prevented),
+                            "terminal_recovery_duplicate_prevented_after_aux_check": float(duplicate_prevented),
                             "terminal_recovery_duplicate_prevented_reason": (
                                 "existing_scheduled_recovery_covers_shortfall"
                                 if duplicate_prevented >= 0.5
@@ -17046,6 +18164,24 @@ class BatteryBacktester:
                                 "previous_recovery_insufficient"
                                 if existing_terminal_recovery_internal_mwh > 1e-12
                                 else "initial_terminal_shortfall"
+                            ),
+                            aux_without_recovery_mwh=float(
+                                self._last_id_rescue_plan_diagnostics.get(
+                                    "terminal_recovery_aux_without_recovery_mwh", 0.0
+                                )
+                            ),
+                            aux_with_recovery_mwh=float(
+                                self._last_id_rescue_plan_diagnostics.get(
+                                    "terminal_recovery_aux_with_recovery_mwh", 0.0
+                                )
+                            ),
+                            aux_sized_mwh=float(
+                                self._last_id_rescue_plan_diagnostics.get("terminal_recovery_aux_sized_mwh", 0.0)
+                            ),
+                            projection_includes_aux_without_recovery=float(
+                                self._last_id_rescue_plan_diagnostics.get(
+                                    "terminal_recovery_projection_includes_aux_without_recovery", 1.0
+                                )
                             ),
                         )
                 else:
@@ -22097,6 +23233,27 @@ class BatteryBacktester:
         summary["da_precommit_gross_spread_reconciliation_error_max_eur"] = float(
             da_gross_replay_error_abs.max() if len(da_gross_replay_error_abs) else 0.0
         )
+        da_stage_validation = self._validate_da_selected_lockable_stage_consistency(hourly)
+        if not da_stage_validation.empty:
+            stage_mismatch = pd.to_numeric(
+                da_stage_validation["da_selected_lockable_stage_mismatch"],
+                errors="coerce",
+            ).fillna(0.0)
+            summary["da_selected_lockable_stage_mismatch_count"] = float(stage_mismatch.gt(0.5).sum())
+            for gap_col, summary_key in (
+                ("da_selected_lockable_revenue_gap_eur", "da_selected_lockable_revenue_gap_max_eur"),
+                ("da_selected_lockable_cost_gap_eur", "da_selected_lockable_cost_gap_max_eur"),
+                ("da_selected_lockable_gross_gap_eur", "da_selected_lockable_gross_gap_max_eur"),
+                ("da_selected_lockable_pnl_gap_eur", "da_selected_lockable_pnl_gap_max_eur"),
+            ):
+                gap = pd.to_numeric(da_stage_validation[gap_col], errors="coerce").fillna(0.0).abs()
+                summary[summary_key] = float(gap.max() if len(gap) else 0.0)
+        else:
+            summary["da_selected_lockable_stage_mismatch_count"] = 0.0
+            summary["da_selected_lockable_revenue_gap_max_eur"] = 0.0
+            summary["da_selected_lockable_cost_gap_max_eur"] = 0.0
+            summary["da_selected_lockable_gross_gap_max_eur"] = 0.0
+            summary["da_selected_lockable_pnl_gap_max_eur"] = 0.0
         summary.update(
             self._audit_da_postlock_rejection_diagnostics(
                 hourly,
@@ -22368,6 +23525,8 @@ class BatteryBacktester:
                 invalid_reasons.append("da_quantile_fallback")
             if float(summary.get("da_precommit_cashflow_replay_error_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_precommit_cashflow_replay_error")
+            if float(summary.get("da_selected_lockable_stage_mismatch_count", 0.0)) > 0.5:
+                invalid_reasons.append("da_selected_lockable_stage_mismatch")
             if float(summary.get("missing_da_postlock_rejection_diagnostics_count", 0.0)) > 0.5:
                 invalid_reasons.append("missing_da_postlock_rejection_diagnostics")
             if float(summary.get("bcm_quantile_fallback_count", 0.0)) > 0.5:
