@@ -1,0 +1,4 @@
+run_id,model,quantile,benchmark_mode,status,start_utc,end_utc,exit_code,out_dir,log_dir
+benchmarks_naive_p50,linear,p50-p50,naive_only,failed,2026-06-09T20:30:06Z,2026-06-09T20:30:29Z,1,artifacts/simulation_runs/thesis_final_multi_3m_20260609T203005Z/benchmarks_naive_p50,logs/thesis_final_multi_3m_20260609T203005Z/benchmarks_naive_p50
+benchmarks_rhpf_p50,linear,p50-p50,rhpf_only,failed,2026-06-09T20:30:29Z,2026-06-09T20:30:50Z,1,artifacts/simulation_runs/thesis_final_multi_3m_20260609T203005Z/benchmarks_rhpf_p50,logs/thesis_final_multi_3m_20260609T203005Z/benchmarks_rhpf_p50
+linear_p30,linear,p30-p30,model_only,failed,2026-06-09T20:30:50Z,2026-06-09T20:32:55Z,143,artifacts/simulation_runs/thesis_final_multi_3m_20260609T203005Z/linear_p30,logs/thesis_final_multi_3m_20260609T203005Z/linear_p30

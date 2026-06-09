@@ -1,0 +1,2 @@
+?? logs/
+?? run_final_thesis_multi_3m.sh
