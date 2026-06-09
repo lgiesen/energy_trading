@@ -369,6 +369,179 @@ def test_bcm_product_toy_price_and_acceptance_probability_block_constant() -> No
     assert hourly.groupby("block")["p_accept"].nunique().iloc[0] == 1
 
 
+def test_bid_rounding_da_min_size_and_granularity() -> None:
+    round_bid = BatteryBacktester._round_market_bid_down_mw
+
+    assert round_bid(0.053, step_mw=0.1, min_mw=0.1) == pytest.approx(0.0)
+    assert round_bid(0.100, step_mw=0.1, min_mw=0.1) == pytest.approx(0.1)
+    assert round_bid(0.149, step_mw=0.1, min_mw=0.1) == pytest.approx(0.1)
+    assert round_bid(0.199, step_mw=0.1, min_mw=0.1) == pytest.approx(0.1)
+    assert round_bid(0.200, step_mw=0.1, min_mw=0.1) == pytest.approx(0.2)
+
+
+def test_bid_rounding_afrr_min_size_and_no_round_up() -> None:
+    round_bid = BatteryBacktester._round_market_bid_down_mw
+
+    assert round_bid(0.99, step_mw=1.0, min_mw=1.0) == pytest.approx(0.0)
+    assert round_bid(1.00, step_mw=1.0, min_mw=1.0) == pytest.approx(1.0)
+    assert round_bid(1.99, step_mw=1.0, min_mw=1.0) == pytest.approx(1.0)
+    assert round_bid(2.00, step_mw=1.0, min_mw=1.0) == pytest.approx(2.0)
+
+
+def test_market_compliant_da_lockable_quantities_are_rounded_before_lockbook() -> None:
+    bt = _mk_backtester()
+    bt.da_bid_granularity_mw = 0.1
+    bt.da_min_bid_size_mw = 0.1
+
+    buy_mw, sell_mw = bt._normalize_da_bid(0.149, 0.0)
+    assert buy_mw == pytest.approx(0.1)
+    assert sell_mw == pytest.approx(0.0)
+    assert not bool(
+        BatteryBacktester._market_bid_rule_violations(
+            [buy_mw, sell_mw],
+            step_mw=bt.da_bid_granularity_mw,
+            min_mw=bt.da_min_bid_size_mw,
+        ).any()
+    )
+
+
+def test_market_compliant_bem_guard_rounds_final_afrr_quantities() -> None:
+    bt = _mk_backtester()
+    bt.afrr_bid_granularity_mw = 1.0
+    bt.afrr_step_mw = 1.0
+    bt.afrr_min_bid_size_mw = 1.0
+    bt.soc_init = 10.0
+
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=1.99,
+        desired_bem_only_neg_mw=0.99,
+        soc_start_mwh=10.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        pred_act_pos=100.0,
+        pred_act_neg=100.0,
+    )
+
+    assert float(guard["submitted_bem_only_pos_mw"]) == pytest.approx(1.0)
+    assert float(guard["submitted_bem_only_neg_mw"]) == pytest.approx(0.0)
+    assert float(guard["afrr_bid_market_rounding_applied"]) == pytest.approx(1.0)
+    assert float(guard["bid_market_rounding_zeroed_below_min"]) == pytest.approx(1.0)
+
+
+def test_aux_scaled_trading_power_mode_scales_by_executed_utilization() -> None:
+    bt = _mk_backtester()
+    bt.aux_mode = "state_dependent_scaled"
+    bt.aux_peak_mw = 0.2
+    bt.aux_trading_mw = 0.2 * 0.75
+    bt.aux_off_mw = 0.0
+    bt.p_max_mw = 10.0
+
+    aux_mw, aux_state = bt._state_aux_power_mw(
+        charge_mw=5.0,
+        discharge_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+    assert aux_state == "TRADING_SCALED"
+    assert aux_mw == pytest.approx(0.2 * 0.75 * 0.5)
+
+    bt.aux_off_mw = 0.02
+    aux_mw, aux_state = bt._state_aux_power_mw(
+        charge_mw=0.1,
+        discharge_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+    assert aux_state == "TRADING_SCALED"
+    assert aux_mw == pytest.approx(max(0.02, 0.2 * 0.75 * 0.01))
+
+
+def test_aux_power_mode_fixed_state_dependent_unchanged_and_no_submitted_only_trading_aux() -> None:
+    bt = _mk_backtester()
+    bt.aux_mode = "state_dependent"
+    bt.aux_trading_mw = 0.15
+    bt.aux_standby_mw = 0.05
+    bt.aux_off_mw = 0.01
+
+    aux_mw, aux_state = bt._state_aux_power_mw(
+        charge_mw=0.1,
+        discharge_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+    assert aux_state == "TRADING"
+    assert aux_mw == pytest.approx(0.15)
+
+    aux_mw, aux_state = bt._state_aux_power_mw(
+        charge_mw=0.0,
+        discharge_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+    assert aux_state == "OFF"
+    assert aux_mw == pytest.approx(0.01)
+
+
+def test_state_dependent_scaled_no_trade_uses_off_aux() -> None:
+    bt = _mk_backtester()
+    bt.aux_mode = "state_dependent_scaled"
+    bt.aux_off_mw = 0.02
+    bt.aux_trading_mw = 0.05
+
+    aux_mw, aux_state = bt._state_aux_power_mw(
+        charge_mw=0.0,
+        discharge_mw=0.0,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=0.0,
+        id_discharge_mw=0.0,
+    )
+
+    assert aux_state == "OFF"
+    assert aux_mw == pytest.approx(0.02)
+
+
+def test_state_dependent_scaled_reserve_standby_and_afrr_active_unchanged() -> None:
+    bt = _mk_backtester()
+    bt.aux_mode = "state_dependent_scaled"
+    bt.aux_standby_mw = 0.035
+    bt.aux_afrr_active_mw = 0.05
+
+    aux_mw, aux_state = bt._state_aux_power_mw(
+        charge_mw=0.0,
+        discharge_mw=0.0,
+        reserve_pos_mw=1.0,
+        reserve_neg_mw=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+
+    assert aux_state == "STANDBY"
+    assert aux_mw == pytest.approx(0.035)
+
+    aux_mw, aux_state = bt._state_aux_power_mw(
+        charge_mw=0.0,
+        discharge_mw=0.0,
+        reserve_pos_mw=1.0,
+        reserve_neg_mw=0.0,
+        act_pos_rate=0.25,
+        act_neg_rate=0.0,
+    )
+
+    assert aux_state == "aFRR_ACTIVE"
+    assert aux_mw == pytest.approx(0.05)
+
+
 def test_terminal_id_recovery_converts_internal_shortfall_to_grid_mwh() -> None:
     bt = _mk_backtester()
     diag = bt._schedule_terminal_id_recovery(

@@ -1496,7 +1496,7 @@ class BatteryBacktester:
         id_discharge_mw: float = 0.0,
     ) -> tuple[float, str]:
         """Return state-dependent auxiliary power and discrete operating mode."""
-        if self.aux_mode != "state_dependent":
+        if self.aux_mode not in {"state_dependent", "state_dependent_scaled"}:
             return float(BATTERY_SPECS.get("aux_power_mw", 0.0)), "CONSTANT"
         eps = 1e-9
         reserve_committed = (reserve_pos_mw > eps) or (reserve_neg_mw > eps)
@@ -1505,10 +1505,34 @@ class BatteryBacktester:
         if activated:
             return self.aux_afrr_active_mw, "aFRR_ACTIVE"
         if trading:
+            if self.aux_mode == "state_dependent_scaled":
+                util = self._aux_trading_utilization_mw(
+                    charge_mw=charge_mw,
+                    discharge_mw=discharge_mw,
+                    id_charge_mw=id_charge_mw,
+                    id_discharge_mw=id_discharge_mw,
+                )
+                return max(self.aux_off_mw, self.aux_trading_mw * util), "TRADING_SCALED"
             return self.aux_trading_mw, "TRADING"
         if reserve_committed:
             return self.aux_standby_mw, "STANDBY"
         return self.aux_off_mw, "OFF"
+
+    def _aux_trading_utilization_mw(
+        self,
+        *,
+        charge_mw: float = 0.0,
+        discharge_mw: float = 0.0,
+        id_charge_mw: float = 0.0,
+        id_discharge_mw: float = 0.0,
+    ) -> float:
+        trading_mw = (
+            max(0.0, float(charge_mw))
+            + max(0.0, float(discharge_mw))
+            + max(0.0, float(id_charge_mw))
+            + max(0.0, float(id_discharge_mw))
+        )
+        return float(min(1.0, max(0.0, trading_mw / max(float(self.p_max_mw), 1e-12))))
 
     @staticmethod
     def _clip_rate(x: np.ndarray) -> np.ndarray:
@@ -1645,22 +1669,68 @@ class BatteryBacktester:
         ch = max(0.0, float(charge_mw))
         dis = max(0.0, float(discharge_mw))
         net = dis - ch
-        step = max(float(self.da_bid_granularity_mw), 1e-12)
-        min_bid = max(0.0, float(getattr(self, "da_min_bid_size_mw", step)))
-        # Enforce DA market size rules on lockbook bids. Floor to avoid
-        # exceeding physical feasibility; sub-minimum remnants are not bidable.
-        def q(x: float) -> float:
-            if x <= 0.0:
-                return 0.0
-            # Floor to the nearest valid step so we never exceed power limits.
-            units = int(np.floor((x / step) + 1e-12))
-            rounded = min(self.p_max_mw, float(units * step))
-            if rounded + 1e-12 < min_bid:
-                return 0.0
-            return float(rounded)
         if net >= 0.0:
-            return 0.0, q(min(self.p_max_mw, net))
-        return q(min(self.p_max_mw, -net)), 0.0
+            return 0.0, self._round_market_bid_down_mw(
+                min(self.p_max_mw, net),
+                step_mw=self.da_bid_granularity_mw,
+                min_mw=self.da_min_bid_size_mw,
+            )
+        return self._round_market_bid_down_mw(
+            min(self.p_max_mw, -net),
+            step_mw=self.da_bid_granularity_mw,
+            min_mw=self.da_min_bid_size_mw,
+        ), 0.0
+
+    @staticmethod
+    def _round_market_bid_down_mw(
+        q_mw: float,
+        *,
+        step_mw: float,
+        min_mw: float,
+        tol: float = 1e-9,
+    ) -> float:
+        """Floor a market-facing bid to min-size/granularity without rounding up."""
+        try:
+            q = float(q_mw)
+            step = float(step_mw)
+            min_bid = max(0.0, float(min_mw))
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(q) or not np.isfinite(step) or step <= 0.0:
+            return 0.0
+        sign = -1.0 if q < 0.0 else 1.0
+        abs_q = abs(q)
+        if abs_q < min_bid - tol:
+            return 0.0
+        units = int(np.floor((abs_q + tol) / step))
+        rounded_abs = float(units * step)
+        if rounded_abs < min_bid - tol:
+            return 0.0
+        decimals = max(0, min(12, int(np.ceil(-np.log10(step))) + 6)) if step > 0.0 else 12
+        rounded_abs = round(rounded_abs, decimals)
+        if rounded_abs <= tol:
+            return 0.0
+        return float(sign * rounded_abs)
+
+    @classmethod
+    def _market_bid_rule_violations(
+        cls,
+        values: pd.Series | list[float] | np.ndarray,
+        *,
+        step_mw: float,
+        min_mw: float,
+        tol: float = 1e-6,
+    ) -> pd.Series:
+        s = pd.to_numeric(pd.Series(values), errors="coerce").fillna(0.0).abs()
+        step = float(step_mw)
+        min_bid = max(0.0, float(min_mw))
+        if step <= 0.0:
+            return pd.Series(True, index=s.index)
+        nonzero = s > tol
+        below_min = nonzero & (s < min_bid - tol)
+        step_units = s / step
+        off_step = nonzero & ((step_units - np.round(step_units)).abs() > tol)
+        return below_min | off_step
 
     def _compute_canonical_power_stack(
         self,
@@ -9577,6 +9647,12 @@ class BatteryBacktester:
         )
         stack_components = final_stack["component_breakdown"]
         assert isinstance(stack_components, dict)
+        aux_trading_utilization = self._aux_trading_utilization_mw(
+            charge_mw=settled_charge_mw,
+            discharge_mw=settled_discharge_mw,
+            id_charge_mw=settled_id_charge_mw,
+            id_discharge_mw=settled_id_discharge_mw,
+        )
         rev_da = da_sell_mwh * da_price
         cost_da = da_buy_mwh * da_price
         # Synthetic ID rescue prices with EPEX technical caps.
@@ -9895,6 +9971,8 @@ class BatteryBacktester:
             "id_technical_repair_pnl_eur": float((revenue_id_eur - cost_id_eur) if id_trade_type == "technical_repair" else 0.0),
             "pnl_id_eur": float(revenue_id_eur - cost_id_eur),
             "aux_power_mw": aux_power_mw,
+            "aux_power_mode": str(self.aux_mode),
+            "aux_trading_utilization": float(aux_trading_utilization),
             "aux_energy_mwh": aux_mwh,
             "aux_cost_eur": aux_cost_eur,
             "aux_state": aux_state,
@@ -10556,10 +10634,26 @@ class BatteryBacktester:
             submitted_pos = min(submitted_pos, float(self.max_bem_only_bid_mw))
             submitted_neg = min(submitted_neg, float(self.max_bem_only_bid_mw))
         total_budget = float(residual_stack["total_residual_mw"])
-        if submitted_pos <= 1e-9:
-            submitted_pos = 0.0
-        if submitted_neg <= 1e-9:
-            submitted_neg = 0.0
+        rounding_before_pos = float(submitted_pos)
+        rounding_before_neg = float(submitted_neg)
+        submitted_pos = self._round_market_bid_down_mw(
+            submitted_pos,
+            step_mw=self.afrr_bid_granularity_mw,
+            min_mw=self.afrr_min_bid_size_mw,
+        )
+        submitted_neg = self._round_market_bid_down_mw(
+            submitted_neg,
+            step_mw=self.afrr_bid_granularity_mw,
+            min_mw=self.afrr_min_bid_size_mw,
+        )
+        rounding_applied = (
+            abs(rounding_before_pos - submitted_pos) > 1e-9
+            or abs(rounding_before_neg - submitted_neg) > 1e-9
+        )
+        zeroed_below_min = (
+            (rounding_before_pos > 1e-9 and submitted_pos <= 1e-9)
+            or (rounding_before_neg > 1e-9 and submitted_neg <= 1e-9)
+        )
         if guard_reason == "none" and (
             abs(submitted_pos - desired_pos) > 1e-9 or abs(submitted_neg - desired_neg) > 1e-9
         ):
@@ -10568,6 +10662,10 @@ class BatteryBacktester:
                 or desired_neg > float(residual_stack["charge_residual_mw"]) + 1e-9
             ):
                 guard_reason = "power_stack_cap"
+            elif zeroed_below_min:
+                guard_reason = "market_bid_below_min"
+            elif rounding_applied:
+                guard_reason = "market_bid_granularity_round_down"
             else:
                 guard_reason = "protected_soc_headroom_cap"
         guard_applied = float(guard_reason != "none")
@@ -10582,6 +10680,12 @@ class BatteryBacktester:
             "bem_only_submitted_neg_mw_after_guard": float(submitted_neg),
             "submitted_bem_only_pos_mw": float(submitted_pos),
             "submitted_bem_only_neg_mw": float(submitted_neg),
+            "afrr_bid_market_rounding_applied": float(rounding_applied),
+            "afrr_bid_market_rounding_before_pos_mw": float(rounding_before_pos),
+            "afrr_bid_market_rounding_after_pos_mw": float(submitted_pos),
+            "afrr_bid_market_rounding_before_neg_mw": float(rounding_before_neg),
+            "afrr_bid_market_rounding_after_neg_mw": float(submitted_neg),
+            "bid_market_rounding_zeroed_below_min": float(zeroed_below_min),
             "bem_only_pos_reduced_by_headroom_mw": float(max(0.0, desired_bem_only_pos_mw - submitted_pos)),
             "bem_only_neg_reduced_by_headroom_mw": float(max(0.0, desired_bem_only_neg_mw - submitted_neg)),
             "bem_only_headroom_guard_applied": guard_applied,
@@ -10854,12 +10958,16 @@ class BatteryBacktester:
         bem_cap_bids: list[AFRRCapacityBid] = []
         bcm_cap_bids: list[AFRRCapacityBid] = []
         if allow_bem:
-            bem_q_pos = self.bid_builder._qfloor(float(bem_guard["submitted_bem_only_pos_mw"]), self.afrr_step_mw)
-            bem_q_neg = self.bid_builder._qfloor(float(bem_guard["submitted_bem_only_neg_mw"]), self.afrr_step_mw)
-            if 0.0 < bem_q_pos < self.afrr_min_bid_size_mw:
-                bem_q_pos = 0.0
-            if 0.0 < bem_q_neg < self.afrr_min_bid_size_mw:
-                bem_q_neg = 0.0
+            bem_q_pos = self._round_market_bid_down_mw(
+                float(bem_guard["submitted_bem_only_pos_mw"]),
+                step_mw=self.afrr_step_mw,
+                min_mw=self.afrr_min_bid_size_mw,
+            )
+            bem_q_neg = self._round_market_bid_down_mw(
+                float(bem_guard["submitted_bem_only_neg_mw"]),
+                step_mw=self.afrr_step_mw,
+                min_mw=self.afrr_min_bid_size_mw,
+            )
 
         if ob_pos > 0.0 or ob_neg > 0.0:
             # Capacity already cleared in aFRR BCM: use mandatory obligation.
@@ -10942,10 +11050,18 @@ class BatteryBacktester:
             # volume so rejected/no-BCM capacity does not suppress BEM trading.
             cap_bids: list[AFRRCapacityBid] = []
             free_bem_from_unawarded_reserve_pos = (
-                self.bid_builder._qfloor(float(res_pos_plan), self.afrr_step_mw) if allow_bem else 0.0
+                self._round_market_bid_down_mw(
+                    float(res_pos_plan),
+                    step_mw=self.afrr_step_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ) if allow_bem else 0.0
             )
             free_bem_from_unawarded_reserve_neg = (
-                self.bid_builder._qfloor(float(res_neg_plan), self.afrr_step_mw) if allow_bem else 0.0
+                self._round_market_bid_down_mw(
+                    float(res_neg_plan),
+                    step_mw=self.afrr_step_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ) if allow_bem else 0.0
             )
             q_pos = max(float(bem_q_pos), float(free_bem_from_unawarded_reserve_pos))
             q_neg = max(float(bem_q_neg), float(free_bem_from_unawarded_reserve_neg))
@@ -11341,6 +11457,22 @@ class BatteryBacktester:
             "bem_only_pos_neg_exclusivity_applied": float(bem_guard.get("bem_only_pos_neg_exclusivity_applied", 0.0)),
             "bem_only_disabled_by_config": float(bem_guard.get("bem_only_disabled_by_config", 0.0)),
             "max_bem_only_bid_mw": float(bem_guard.get("max_bem_only_bid_mw", float("nan"))),
+            "afrr_bid_market_rounding_applied": float(bem_guard.get("afrr_bid_market_rounding_applied", 0.0)),
+            "afrr_bid_market_rounding_before_pos_mw": float(
+                bem_guard.get("afrr_bid_market_rounding_before_pos_mw", 0.0)
+            ),
+            "afrr_bid_market_rounding_after_pos_mw": float(
+                bem_guard.get("afrr_bid_market_rounding_after_pos_mw", 0.0)
+            ),
+            "afrr_bid_market_rounding_before_neg_mw": float(
+                bem_guard.get("afrr_bid_market_rounding_before_neg_mw", 0.0)
+            ),
+            "afrr_bid_market_rounding_after_neg_mw": float(
+                bem_guard.get("afrr_bid_market_rounding_after_neg_mw", 0.0)
+            ),
+            "bid_market_rounding_zeroed_below_min": float(
+                bem_guard.get("bid_market_rounding_zeroed_below_min", 0.0)
+            ),
             "submitted_da_buy_mw": float(da_res.submitted_buy_mw),
             "submitted_da_sell_mw": float(da_res.submitted_sell_mw),
             "submitted_da_buy_price_eur_mwh": submitted_da_buy_price,
@@ -11812,6 +11944,12 @@ class BatteryBacktester:
             expected_capacity_revenue_eur = 0.0
             expected_activation_revenue_eur = 0.0
             expected_aux_cost_eur = 0.0
+            afrr_rounding_before_pos_mw = 0.0
+            afrr_rounding_before_neg_mw = 0.0
+            afrr_rounding_after_pos_mw = 0.0
+            afrr_rounding_after_neg_mw = 0.0
+            afrr_rounding_applied = 0.0
+            afrr_rounding_zeroed_below_min = 0.0
             bcm_precommit_stats: dict[str, float | str] = {
                 "feasibility_pass": 1.0,
                 "retry_factor_selected": 1.0,
@@ -12228,6 +12366,42 @@ class BatteryBacktester:
                     float(precommit_net_capacity_ev_after_headroom_cost_eur),
                 )
 
+            afrr_rounding_before_pos_mw = float(offered_pos)
+            afrr_rounding_before_neg_mw = float(offered_neg)
+            rounded_offered_pos = self._round_market_bid_down_mw(
+                offered_pos,
+                step_mw=self.afrr_bid_granularity_mw,
+                min_mw=self.afrr_min_bid_size_mw,
+            )
+            rounded_offered_neg = self._round_market_bid_down_mw(
+                offered_neg,
+                step_mw=self.afrr_bid_granularity_mw,
+                min_mw=self.afrr_min_bid_size_mw,
+            )
+            afrr_rounding_after_pos_mw = float(rounded_offered_pos)
+            afrr_rounding_after_neg_mw = float(rounded_offered_neg)
+            afrr_rounding_applied = float(
+                abs(afrr_rounding_before_pos_mw - afrr_rounding_after_pos_mw) > 1e-9
+                or abs(afrr_rounding_before_neg_mw - afrr_rounding_after_neg_mw) > 1e-9
+            )
+            afrr_rounding_zeroed_below_min = float(
+                (afrr_rounding_before_pos_mw > 1e-9 and afrr_rounding_after_pos_mw <= 1e-9)
+                or (afrr_rounding_before_neg_mw > 1e-9 and afrr_rounding_after_neg_mw <= 1e-9)
+            )
+            if afrr_rounding_applied > 0.5:
+                offered_pos = float(rounded_offered_pos)
+                offered_neg = float(rounded_offered_neg)
+                submitted_reserve_pos_mw_after_retry = float(offered_pos)
+                submitted_reserve_neg_mw_after_retry = float(offered_neg)
+                cap_bids = []
+                cap_res = None
+                precommit_applied = 1.0
+                if afrr_rounding_zeroed_below_min > 0.5 and offered_pos <= 0.0 and offered_neg <= 0.0:
+                    precommit_clamp_reason = "market_bid_below_min"
+                    precommit_reduction_reason = "market_bid_below_min"
+                    retry_reduction_reason = "market_bid_below_min"
+                    bcm_precommit_stats["zero_reason"] = "market_bid_below_min"
+
             if offered_pos <= 0.0 and offered_neg <= 0.0:
                 for ts in blk["target_time_utc"]:
                     lock_pos[pd.to_datetime(ts, utc=True)] = 0.0
@@ -12326,6 +12500,24 @@ class BatteryBacktester:
                         precommit_audit_by_ts.setdefault("precommit_locked_neg_mw", {})[tsu] = 0.0
                         precommit_audit_by_ts.setdefault("precommit_retry_factor_selected", {})[tsu] = float(
                             bcm_precommit_stats.get("retry_factor_selected", reserve_retry_factor)
+                        )
+                        precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_applied", {})[tsu] = float(
+                            afrr_rounding_applied
+                        )
+                        precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_before_pos_mw", {})[tsu] = float(
+                            afrr_rounding_before_pos_mw
+                        )
+                        precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_after_pos_mw", {})[tsu] = float(
+                            afrr_rounding_after_pos_mw
+                        )
+                        precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_before_neg_mw", {})[tsu] = float(
+                            afrr_rounding_before_neg_mw
+                        )
+                        precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_after_neg_mw", {})[tsu] = float(
+                            afrr_rounding_after_neg_mw
+                        )
+                        precommit_audit_by_ts.setdefault("bid_market_rounding_zeroed_below_min", {})[tsu] = float(
+                            afrr_rounding_zeroed_below_min
                         )
                         precommit_audit_by_ts.setdefault("precommit_zero_reason", {})[tsu] = str(
                             bcm_precommit_stats.get("zero_reason", precommit_clamp_reason)
@@ -12612,6 +12804,24 @@ class BatteryBacktester:
                         submitted_reserve_neg_mw_before_retry
                     )
                     precommit_audit_by_ts.setdefault("reserve_retry_factor", {})[tsu] = float(reserve_retry_factor)
+                    precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_applied", {})[tsu] = float(
+                        afrr_rounding_applied
+                    )
+                    precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_before_pos_mw", {})[tsu] = float(
+                        afrr_rounding_before_pos_mw
+                    )
+                    precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_after_pos_mw", {})[tsu] = float(
+                        afrr_rounding_after_pos_mw
+                    )
+                    precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_before_neg_mw", {})[tsu] = float(
+                        afrr_rounding_before_neg_mw
+                    )
+                    precommit_audit_by_ts.setdefault("afrr_bid_market_rounding_after_neg_mw", {})[tsu] = float(
+                        afrr_rounding_after_neg_mw
+                    )
+                    precommit_audit_by_ts.setdefault("bid_market_rounding_zeroed_below_min", {})[tsu] = float(
+                        afrr_rounding_zeroed_below_min
+                    )
                     precommit_audit_by_ts.setdefault("submitted_reserve_pos_mw_after_retry", {})[tsu] = float(
                         submitted_reserve_pos_mw_after_retry
                     )
@@ -12929,7 +13139,13 @@ class BatteryBacktester:
                 BCMCapacityBid(
                     ts=bid.ts,
                     side=bid.side,
-                    quantity_mw=float(bid.quantity_mw),
+                    quantity_mw=float(
+                        self._round_market_bid_down_mw(
+                            float(bid.quantity_mw),
+                            step_mw=self.afrr_bid_granularity_mw,
+                            min_mw=self.afrr_min_bid_size_mw,
+                        )
+                    ),
                     capacity_price_eur_mw=float(cap_price),
                 )
             )
@@ -14946,6 +15162,73 @@ class BatteryBacktester:
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
                 )
+                da_rounding_by_ts: dict[pd.Timestamp, dict[str, float]] = {}
+                rounded_accepted_da: dict[pd.Timestamp, tuple[float, float]] = {}
+                for ts_key, qty_pair in accepted_da.items():
+                    tsu = pd.to_datetime(ts_key, utc=True, errors="coerce")
+                    if pd.isna(tsu):
+                        continue
+                    before_buy = max(0.0, float(qty_pair[0]))
+                    before_sell = max(0.0, float(qty_pair[1]))
+                    after_buy = self._round_market_bid_down_mw(
+                        before_buy,
+                        step_mw=self.da_bid_granularity_mw,
+                        min_mw=self.da_min_bid_size_mw,
+                    )
+                    after_sell = self._round_market_bid_down_mw(
+                        before_sell,
+                        step_mw=self.da_bid_granularity_mw,
+                        min_mw=self.da_min_bid_size_mw,
+                    )
+                    after_buy, after_sell = self._normalize_da_bid(after_buy, after_sell)
+                    rounding_applied = float(
+                        abs(before_buy - after_buy) > 1e-9
+                        or abs(before_sell - after_sell) > 1e-9
+                    )
+                    zeroed_below_min = float(
+                        (before_buy > 1e-9 and after_buy <= 1e-9)
+                        or (before_sell > 1e-9 and after_sell <= 1e-9)
+                    )
+                    da_rounding_by_ts[pd.Timestamp(tsu)] = {
+                        "da_bid_market_rounding_applied": rounding_applied,
+                        "da_bid_market_rounding_before_buy_mw": float(before_buy),
+                        "da_bid_market_rounding_after_buy_mw": float(after_buy),
+                        "da_bid_market_rounding_before_sell_mw": float(before_sell),
+                        "da_bid_market_rounding_after_sell_mw": float(after_sell),
+                        "bid_market_rounding_zeroed_below_min": zeroed_below_min,
+                    }
+                    if after_buy > 1e-12 or after_sell > 1e-12:
+                        rounded_accepted_da[pd.Timestamp(tsu)] = (float(after_buy), float(after_sell))
+                accepted_da = rounded_accepted_da
+                if da_rounding_by_ts:
+                    patched_da_audit_rows: list[dict[str, float | str]] = []
+                    for audit_row in da_audit_rows:
+                        out_row = dict(audit_row)
+                        tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
+                        diag = da_rounding_by_ts.get(pd.Timestamp(tsu), {}) if pd.notna(tsu) else {}
+                        for key, value in diag.items():
+                            out_row[str(key)] = value
+                        if pd.notna(tsu) and pd.Timestamp(tsu) in accepted_da:
+                            buy_mw, sell_mw = accepted_da[pd.Timestamp(tsu)]
+                            out_row["da_accepted_buy_mw"] = float(buy_mw)
+                            out_row["da_accepted_sell_mw"] = float(sell_mw)
+                            out_row["da_selected_lockable_buy_mw"] = float(buy_mw)
+                            out_row["da_selected_lockable_sell_mw"] = float(sell_mw)
+                            out_row["locked_buy_mwh_by_hour"] = float(buy_mw * self.dt_h)
+                            out_row["locked_sell_mwh_by_hour"] = float(sell_mw * self.dt_h)
+                        elif diag:
+                            out_row["da_accepted_buy_mw"] = 0.0
+                            out_row["da_accepted_sell_mw"] = 0.0
+                            out_row["da_selected_lockable_buy_mw"] = 0.0
+                            out_row["da_selected_lockable_sell_mw"] = 0.0
+                            out_row["locked_buy_mwh_by_hour"] = 0.0
+                            out_row["locked_sell_mwh_by_hour"] = 0.0
+                            if float(diag.get("bid_market_rounding_zeroed_below_min", 0.0)) > 0.5:
+                                out_row["da_zero_reason"] = "market_bid_below_min"
+                                out_row["zero_reason"] = "market_bid_below_min"
+                                out_row["final_selected_incumbent"] = "no_trade"
+                        patched_da_audit_rows.append(out_row)
+                    da_audit_rows = patched_da_audit_rows
                 lock_phys_ok, lock_phys_diag, lock_phys_by_ts = self._check_da_hourly_lock_physical_feasibility(
                     future_rows=future_rows_for_da_guard,
                     colmap=colmap,
@@ -21051,6 +21334,45 @@ class BatteryBacktester:
         da_real_sell = _summary_num_series("real_da_sell_mwh", "da_sell_mwh")
         da_submitted_buy = _summary_num_series("real_submitted_da_buy_mw", "submitted_da_buy_mw")
         da_submitted_sell = _summary_num_series("real_submitted_da_sell_mw", "submitted_da_sell_mw")
+        da_locked_buy_mw = _summary_num_series("da_locked_buy_mw")
+        da_locked_sell_mw = _summary_num_series("da_locked_sell_mw")
+        if float((da_locked_buy_mw.abs() + da_locked_sell_mw.abs()).sum()) <= 1e-12:
+            da_locked_buy_mw = _summary_num_series(
+                "da_locked_buy_mwh",
+                "da_precommit_locked_buy_mwh_by_hour",
+                "locked_buy_mwh_by_hour",
+            ) / max(float(self.dt_h), 1e-12)
+            da_locked_sell_mw = _summary_num_series(
+                "da_locked_sell_mwh",
+                "da_precommit_locked_sell_mwh_by_hour",
+                "locked_sell_mwh_by_hour",
+            ) / max(float(self.dt_h), 1e-12)
+        da_market_rule_violations = pd.concat(
+            [
+                self._market_bid_rule_violations(
+                    da_submitted_buy,
+                    step_mw=self.da_bid_granularity_mw,
+                    min_mw=self.da_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    da_submitted_sell,
+                    step_mw=self.da_bid_granularity_mw,
+                    min_mw=self.da_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    da_locked_buy_mw,
+                    step_mw=self.da_bid_granularity_mw,
+                    min_mw=self.da_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    da_locked_sell_mw,
+                    step_mw=self.da_bid_granularity_mw,
+                    min_mw=self.da_min_bid_size_mw,
+                ),
+            ],
+            axis=1,
+        ).any(axis=1)
+        summary["da_market_bid_rule_violation_count"] = float(da_market_rule_violations.sum())
         da_locked_delivery = _summary_num_series("da_is_locked_delivery_hour")
         da_unlocked_settled_mask = ((da_real_buy.abs() + da_real_sell.abs()) > 1e-9) & da_locked_delivery.lt(0.5)
         da_unplanned_submission_mask = (
@@ -21215,6 +21537,52 @@ class BatteryBacktester:
         bem_submission_nonzero = (bem_submitted_pos.abs() + bem_submitted_neg.abs()) > 1e-9
         summary["bem_gate_violation_count"] = float((bem_submission_nonzero & bem_gate_valid.lt(0.5)).sum())
         summary["bem_unplanned_submission_count"] = float(bem_unplanned_submission_flag.gt(0.5).sum())
+        afrr_market_rule_violations = pd.concat(
+            [
+                self._market_bid_rule_violations(
+                    bcm_submitted_pos,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    bcm_submitted_neg,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    bcm_locked_pos,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    bcm_locked_neg,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    bem_submitted_pos,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    bem_submitted_neg,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    bcm_precommit_locked_pos,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+                self._market_bid_rule_violations(
+                    bcm_precommit_locked_neg,
+                    step_mw=self.afrr_bid_granularity_mw,
+                    min_mw=self.afrr_min_bid_size_mw,
+                ),
+            ],
+            axis=1,
+        ).any(axis=1)
+        summary["afrr_market_bid_rule_violation_count"] = float(afrr_market_rule_violations.sum())
         soc_mass_balance_abs = _summary_num_series("soc_mass_balance_error_mwh").abs()
         summary["soc_mass_balance_error_max_mwh"] = float(
             soc_mass_balance_abs.max() if len(soc_mass_balance_abs) else 0.0
@@ -21327,6 +21695,10 @@ class BatteryBacktester:
                 invalid_reasons.append("da_realized_without_precommit_origin")
             if float(summary.get("da_execution_lockbook_physical_infeasibility_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_execution_lockbook_physical_infeasible")
+            if float(summary.get("da_market_bid_rule_violation_count", 0.0)) > 0.5:
+                invalid_reasons.append("da_market_bid_rule_violation")
+            if float(summary.get("afrr_market_bid_rule_violation_count", 0.0)) > 0.5:
+                invalid_reasons.append("afrr_market_bid_rule_violation")
             if float(summary.get("bcm_gate_violation_count", 0.0)) > 0.5:
                 invalid_reasons.append("bcm_gate_violation")
             if float(summary.get("bcm_candidate_gate_window_violation_count", 0.0)) > 0.5:
