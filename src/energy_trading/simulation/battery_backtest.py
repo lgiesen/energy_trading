@@ -5546,8 +5546,15 @@ class BatteryBacktester:
                 else "locked_da_terminal_shortfall_unrecoverable"
             )
             if str(self.final_soc_mode) == "hard" and shortfall > 1e-9:
-                recoverable = False
-                detail = "rejected_hard_final_soc_infeasible"
+                id_recovery_allowed = bool(
+                    guard_mode == "recoverability_aware"
+                    and str(getattr(self, "_id_recourse_mode", "common")) != "disabled"
+                )
+                if bool(recoverable) and bool(id_recovery_allowed):
+                    detail = "locked_da_terminal_shortfall_recoverable_with_id"
+                else:
+                    recoverable = False
+                    detail = "rejected_hard_final_soc_infeasible"
             diag = _base_diag()
             diag.update(
                 {
@@ -16746,6 +16753,24 @@ class BatteryBacktester:
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
                 )
+                postlock_selected_candidate = any(
+                    str(row.get("da_postlock_selected_after_future_check", "")).strip() == "candidate"
+                    for row in da_audit_rows
+                )
+                postlock_candidate_buy_mwh_total = float(
+                    sum(
+                        max(0.0, float(row.get("da_postlock_candidate_buy_mw", 0.0) or 0.0))
+                        * float(self.dt_h)
+                        for row in da_audit_rows
+                    )
+                )
+                postlock_candidate_sell_mwh_total = float(
+                    sum(
+                        max(0.0, float(row.get("da_postlock_candidate_sell_mw", 0.0) or 0.0))
+                        * float(self.dt_h)
+                        for row in da_audit_rows
+                    )
+                )
                 da_rounding_by_ts: dict[pd.Timestamp, dict[str, float]] = {}
                 rounded_accepted_da: dict[pd.Timestamp, tuple[float, float]] = {}
                 for ts_key, qty_pair in accepted_da.items():
@@ -16784,6 +16809,44 @@ class BatteryBacktester:
                     if after_buy > 1e-12 or after_sell > 1e-12:
                         rounded_accepted_da[pd.Timestamp(tsu)] = (float(after_buy), float(after_sell))
                 accepted_da = rounded_accepted_da
+                physical_check_input_buy_mwh_total = float(
+                    sum(max(0.0, float(ch)) * float(self.dt_h) for ch, _ in accepted_da.values())
+                )
+                physical_check_input_sell_mwh_total = float(
+                    sum(max(0.0, float(dis)) * float(self.dt_h) for _, dis in accepted_da.values())
+                )
+                handoff_lost_postlock_candidate = float(
+                    bool(postlock_selected_candidate)
+                    and (postlock_candidate_buy_mwh_total + postlock_candidate_sell_mwh_total) > 1e-9
+                    and (physical_check_input_buy_mwh_total + physical_check_input_sell_mwh_total) <= 1e-9
+                )
+                handoff_loss_explained_by_rounding = float(
+                    handoff_lost_postlock_candidate > 0.5
+                    and any(
+                        float(v.get("bid_market_rounding_zeroed_below_min", 0.0) or 0.0) > 0.5
+                        for v in da_rounding_by_ts.values()
+                    )
+                )
+                handoff_diag = {
+                    "da_handoff_postlock_selected_candidate": float(bool(postlock_selected_candidate)),
+                    "da_handoff_postlock_candidate_buy_mwh": float(postlock_candidate_buy_mwh_total),
+                    "da_handoff_postlock_candidate_sell_mwh": float(postlock_candidate_sell_mwh_total),
+                    "da_handoff_physical_check_input_buy_mwh": float(physical_check_input_buy_mwh_total),
+                    "da_handoff_physical_check_input_sell_mwh": float(physical_check_input_sell_mwh_total),
+                    "da_handoff_lost_postlock_candidate": float(handoff_lost_postlock_candidate),
+                    "da_handoff_loss_explained_by_market_rounding": float(handoff_loss_explained_by_rounding),
+                    "da_handoff_lost_postlock_candidate_reason": (
+                        "market_rounding_zeroed_below_min"
+                        if handoff_loss_explained_by_rounding > 0.5
+                        else (
+                            "postlock_candidate_missing_before_physical_replay"
+                            if handoff_lost_postlock_candidate > 0.5
+                            else "none"
+                        )
+                    ),
+                }
+                if handoff_diag:
+                    da_audit_rows = [{**dict(row), **handoff_diag} for row in da_audit_rows]
                 if da_rounding_by_ts:
                     patched_da_audit_rows: list[dict[str, float | str]] = []
                     for audit_row in da_audit_rows:
@@ -16825,6 +16888,79 @@ class BatteryBacktester:
                     include_existing_lockbook=True,
                     schedule_source="selected_lockable",
                 )
+                resize_attempted = 0.0
+                resize_success = 0.0
+                resize_reason = "none"
+                if (not bool(lock_phys_ok)) and accepted_da:
+                    fail_reason = str(lock_phys_diag.get("da_hourly_lock_infeasible_reason", ""))
+                    fail_ts = pd.to_datetime(
+                        lock_phys_diag.get("da_hourly_lock_infeasible_timestamp_utc", ""),
+                        utc=True,
+                        errors="coerce",
+                    )
+                    if pd.notna(fail_ts) and fail_reason in {
+                        "locked_da_projected_soc_below_min",
+                        "locked_da_sell_exceeds_available_energy",
+                    }:
+                        fail_key = pd.Timestamp(fail_ts)
+                        old_buy, old_sell = accepted_da.get(fail_key, (0.0, 0.0))
+                        if old_sell > 1e-12:
+                            resize_attempted = 1.0
+                            max_sell_mwh = float(
+                                lock_phys_by_ts.get(fail_key, {}).get(
+                                    "da_hourly_lock_max_feasible_sell_mwh",
+                                    max(0.0, float(old_sell) * float(self.dt_h)),
+                                )
+                                or 0.0
+                            )
+                            if fail_reason == "locked_da_projected_soc_below_min":
+                                projected_end = float(
+                                    lock_phys_by_ts.get(fail_key, {}).get(
+                                        "da_hourly_lock_projected_soc_end_mwh",
+                                        float(self.soc_min),
+                                    )
+                                    or float(self.soc_min)
+                                )
+                                soc_shortfall = max(0.0, float(self.soc_min) - projected_end)
+                                max_sell_mwh = min(
+                                    max_sell_mwh,
+                                    max(0.0, float(old_sell) * float(self.dt_h) - soc_shortfall * float(self.eta_out)),
+                                )
+                            resized_sell_mw = self._round_market_bid_down_mw(
+                                max_sell_mwh / max(float(self.dt_h), 1e-12),
+                                step_mw=self.da_bid_granularity_mw,
+                                min_mw=self.da_min_bid_size_mw,
+                            )
+                            resized_buy_mw, resized_sell_mw = self._normalize_da_bid(float(old_buy), resized_sell_mw)
+                            resized_da = dict(accepted_da)
+                            if resized_buy_mw > 1e-12 or resized_sell_mw > 1e-12:
+                                resized_da[fail_key] = (float(resized_buy_mw), float(resized_sell_mw))
+                            else:
+                                resized_da.pop(fail_key, None)
+                            retry_ok, retry_diag, retry_by_ts = self._check_da_hourly_lock_physical_feasibility(
+                                future_rows=future_rows_for_da_guard,
+                                colmap=colmap,
+                                current_soc_mwh=float(soc),
+                                existing_da_lockbook=da_lockbook,
+                                candidate_da=resized_da,
+                                fixed_reserve_pos=afrr_cap_pos_lockbook,
+                                fixed_reserve_neg=afrr_cap_neg_lockbook,
+                                global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
+                                include_existing_lockbook=True,
+                                schedule_source="resized_selected_lockable",
+                            )
+                            if bool(retry_ok):
+                                accepted_da = resized_da
+                                lock_phys_ok, lock_phys_diag, lock_phys_by_ts = retry_ok, retry_diag, retry_by_ts
+                                resize_success = 1.0
+                                resize_reason = "resized_sell_to_hourly_soc_min_feasible"
+                            else:
+                                resize_reason = "resize_attempt_failed"
+                resize_diag = {
+                    "da_hourly_soc_min_resize_attempted": float(resize_attempted),
+                    "da_hourly_soc_min_resize_success": float(resize_success),
+                    "da_hourly_soc_min_resize_reason": str(resize_reason),
+                }
                 if not bool(lock_phys_ok):
                     accepted_da = {}
                 annotated_da_audit_rows: list[dict[str, float | str]] = []
@@ -16832,7 +16968,7 @@ class BatteryBacktester:
                     out_row = dict(audit_row)
                     tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
                     row_diag = lock_phys_by_ts.get(tsu, {}) if pd.notna(tsu) else {}
-                    for key, value in {**lock_phys_diag, **row_diag}.items():
+                    for key, value in {**lock_phys_diag, **row_diag, **resize_diag}.items():
                         out_row.setdefault(str(key), value)
                     if not bool(lock_phys_ok):
                         out_row["da_zero_reason"] = "hourly_lock_physical_infeasible_no_trade_selected"
@@ -17202,6 +17338,14 @@ class BatteryBacktester:
                 "da_precommit_da_sized_candidate_sell_mw",
                 "da_precommit_da_postlock_candidate_buy_mw",
                 "da_precommit_da_postlock_candidate_sell_mw",
+                "da_precommit_da_handoff_postlock_selected_candidate",
+                "da_precommit_da_handoff_postlock_candidate_buy_mwh",
+                "da_precommit_da_handoff_postlock_candidate_sell_mwh",
+                "da_precommit_da_handoff_physical_check_input_buy_mwh",
+                "da_precommit_da_handoff_physical_check_input_sell_mwh",
+                "da_precommit_da_handoff_lost_postlock_candidate",
+                "da_precommit_da_handoff_loss_explained_by_market_rounding",
+                "da_precommit_da_handoff_lost_postlock_candidate_reason",
                 "da_precommit_da_accepted_buy_mw",
                 "da_precommit_da_accepted_sell_mw",
                 "da_precommit_da_accepted_lockbook_revenue_eur",
@@ -17278,6 +17422,9 @@ class BatteryBacktester:
                 "da_precommit_da_lockbook_physical_replay_existing_lockbook_included",
                 "da_precommit_da_lockbook_physical_replay_candidate_included",
                 "da_precommit_da_lockbook_physical_replay_projected_final_soc_mwh",
+                "da_precommit_da_hourly_soc_min_resize_attempted",
+                "da_precommit_da_hourly_soc_min_resize_success",
+                "da_precommit_da_hourly_soc_min_resize_reason",
                 "da_precommit_da_candidate_overlaps_existing_lockbook",
                 "da_precommit_da_candidate_overlaps_existing_lockbook_timestamp_utc",
                 "da_precommit_da_candidate_overlaps_existing_lockbook_reason",
@@ -17666,6 +17813,17 @@ class BatteryBacktester:
                 "da_lockbook_physical_replay_existing_lockbook_included": "da_precommit_da_lockbook_physical_replay_existing_lockbook_included",
                 "da_lockbook_physical_replay_candidate_included": "da_precommit_da_lockbook_physical_replay_candidate_included",
                 "da_lockbook_physical_replay_projected_final_soc_mwh": "da_precommit_da_lockbook_physical_replay_projected_final_soc_mwh",
+                "da_handoff_postlock_selected_candidate": "da_precommit_da_handoff_postlock_selected_candidate",
+                "da_handoff_postlock_candidate_buy_mwh": "da_precommit_da_handoff_postlock_candidate_buy_mwh",
+                "da_handoff_postlock_candidate_sell_mwh": "da_precommit_da_handoff_postlock_candidate_sell_mwh",
+                "da_handoff_physical_check_input_buy_mwh": "da_precommit_da_handoff_physical_check_input_buy_mwh",
+                "da_handoff_physical_check_input_sell_mwh": "da_precommit_da_handoff_physical_check_input_sell_mwh",
+                "da_handoff_lost_postlock_candidate": "da_precommit_da_handoff_lost_postlock_candidate",
+                "da_handoff_loss_explained_by_market_rounding": "da_precommit_da_handoff_loss_explained_by_market_rounding",
+                "da_handoff_lost_postlock_candidate_reason": "da_precommit_da_handoff_lost_postlock_candidate_reason",
+                "da_hourly_soc_min_resize_attempted": "da_precommit_da_hourly_soc_min_resize_attempted",
+                "da_hourly_soc_min_resize_success": "da_precommit_da_hourly_soc_min_resize_success",
+                "da_hourly_soc_min_resize_reason": "da_precommit_da_hourly_soc_min_resize_reason",
                 "da_candidate_overlaps_existing_lockbook": "da_precommit_da_candidate_overlaps_existing_lockbook",
                 "da_candidate_overlaps_existing_lockbook_timestamp_utc": "da_precommit_da_candidate_overlaps_existing_lockbook_timestamp_utc",
                 "da_candidate_overlaps_existing_lockbook_reason": "da_precommit_da_candidate_overlaps_existing_lockbook_reason",
@@ -23233,6 +23391,24 @@ class BatteryBacktester:
         summary["da_precommit_gross_spread_reconciliation_error_max_eur"] = float(
             da_gross_replay_error_abs.max() if len(da_gross_replay_error_abs) else 0.0
         )
+        handoff_lost = _summary_num_series("da_handoff_lost_postlock_candidate", "da_precommit_da_handoff_lost_postlock_candidate")
+        handoff_explained = _summary_num_series(
+            "da_handoff_loss_explained_by_market_rounding",
+            "da_precommit_da_handoff_loss_explained_by_market_rounding",
+        )
+        unexplained_handoff = handoff_lost.gt(0.5) & handoff_explained.lt(0.5)
+        summary["da_handoff_lost_postlock_candidate_count"] = float(handoff_lost.gt(0.5).sum())
+        summary["da_handoff_lost_postlock_candidate_unexplained_count"] = float(unexplained_handoff.sum())
+        summary["da_hourly_soc_min_resize_attempt_count"] = float(
+            _summary_num_series("da_hourly_soc_min_resize_attempted", "da_precommit_da_hourly_soc_min_resize_attempted")
+            .gt(0.5)
+            .sum()
+        )
+        summary["da_hourly_soc_min_resize_success_count"] = float(
+            _summary_num_series("da_hourly_soc_min_resize_success", "da_precommit_da_hourly_soc_min_resize_success")
+            .gt(0.5)
+            .sum()
+        )
         da_stage_validation = self._validate_da_selected_lockable_stage_consistency(hourly)
         if not da_stage_validation.empty:
             stage_mismatch = pd.to_numeric(
@@ -23525,6 +23701,8 @@ class BatteryBacktester:
                 invalid_reasons.append("da_quantile_fallback")
             if float(summary.get("da_precommit_cashflow_replay_error_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_precommit_cashflow_replay_error")
+            if float(summary.get("da_handoff_lost_postlock_candidate_unexplained_count", 0.0)) > 0.5:
+                invalid_reasons.append("da_handoff_lost_postlock_candidate")
             if float(summary.get("da_selected_lockable_stage_mismatch_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_selected_lockable_stage_mismatch")
             if float(summary.get("missing_da_postlock_rejection_diagnostics_count", 0.0)) > 0.5:
