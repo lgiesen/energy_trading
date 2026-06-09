@@ -9405,6 +9405,63 @@ def test_da_postlock_terminal_shortfall_recoverable_candidate_survives() -> None
     assert float(audit[0]["da_postlock_hard_projection_reached_next_recovery"]) == pytest.approx(1.0)
 
 
+def test_da_final_lockbook_check_allows_terminal_shortfall_when_id_recoverable() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.soc_target_end = 10.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt._id_recourse_mode = "common"
+    ts = pd.Timestamp("2026-01-02T00:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        existing_da_lockbook={},
+        candidate_da={ts: (0.0, 1.0)},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=ts,
+        include_existing_lockbook=True,
+        schedule_source="selected_lockable",
+    )
+
+    assert ok is True
+    assert float(diag["da_lockbook_physical_replay_candidate_included"]) == pytest.approx(1.0)
+    assert float(by_ts[ts]["da_hourly_lock_terminal_shortfall_mwh"]) == pytest.approx(1.0)
+    assert float(by_ts[ts]["da_hourly_lock_terminal_shortfall_recoverable"]) == pytest.approx(1.0)
+    assert str(by_ts[ts]["da_hourly_lock_infeasible_reason"]) == "terminal_shortfall_recoverable_with_id"
+
+    bt._id_recourse_mode = "disabled"
+    ok_disabled, diag_disabled, _ = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        existing_da_lockbook={},
+        candidate_da={ts: (0.0, 1.0)},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=ts,
+        include_existing_lockbook=True,
+        schedule_source="selected_lockable",
+    )
+
+    assert ok_disabled is False
+    assert str(diag_disabled["da_hourly_lock_infeasible_reason"]) == "locked_da_final_soc_below_target"
+
+
 def test_da_postlock_hard_projection_stops_at_next_recovery_opportunity() -> None:
     bt = _mk_backtester()
     bt.da_postlock_guard_mode = "recoverability_aware"

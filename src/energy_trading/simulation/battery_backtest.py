@@ -5274,6 +5274,24 @@ class BatteryBacktester:
                     return _fail(ts, "locked_da_projected_soc_above_max", rec)
                 replay_by_ts[ts] = rec
                 if pd.notna(global_end) and ts == global_end and soc < float(self.soc_target_end) - float(tol_mwh):
+                    terminal_shortfall_mwh = max(0.0, float(self.soc_target_end) - float(soc))
+                    id_terminal_recovery_allowed = bool(
+                        str(getattr(self, "_id_recourse_mode", "common")) != "disabled"
+                        and bool(getattr(self._strategy_permissions, "allow_id_technical_repair", True))
+                    )
+                    if bool(id_terminal_recovery_allowed):
+                        rec.update(
+                            {
+                                "da_hourly_lock_terminal_shortfall_mwh": float(terminal_shortfall_mwh),
+                                "da_hourly_lock_terminal_shortfall_recoverable": 1.0,
+                                "da_hourly_lock_terminal_shortfall_recovery_assumed": 1.0,
+                                "da_hourly_lock_infeasible_reason": "terminal_shortfall_recoverable_with_id",
+                                "da_candidate_rejected_hourly_lock_infeasible": 0.0,
+                                "da_candidate_rejected_hourly_lock_infeasible_reason": "none",
+                            }
+                        )
+                        replay_by_ts[ts] = rec
+                        continue
                     return _fail(ts, "locked_da_final_soc_below_target", rec)
 
             diag = dict(base_diag)
@@ -17409,6 +17427,9 @@ class BatteryBacktester:
                 "da_precommit_da_hourly_lock_feasibility_passed_before_lock",
                 "da_precommit_da_hourly_lock_projected_soc_start_mwh",
                 "da_precommit_da_hourly_lock_projected_soc_end_mwh",
+                "da_precommit_da_hourly_lock_terminal_shortfall_mwh",
+                "da_precommit_da_hourly_lock_terminal_shortfall_recoverable",
+                "da_precommit_da_hourly_lock_terminal_shortfall_recovery_assumed",
                 "da_precommit_da_hourly_lock_max_feasible_buy_mwh",
                 "da_precommit_da_hourly_lock_max_feasible_sell_mwh",
                 "da_precommit_da_hourly_lock_infeasible_buy_mwh",
@@ -17800,6 +17821,9 @@ class BatteryBacktester:
                 "da_hourly_lock_feasibility_passed_before_lock": "da_precommit_da_hourly_lock_feasibility_passed_before_lock",
                 "da_hourly_lock_projected_soc_start_mwh": "da_precommit_da_hourly_lock_projected_soc_start_mwh",
                 "da_hourly_lock_projected_soc_end_mwh": "da_precommit_da_hourly_lock_projected_soc_end_mwh",
+                "da_hourly_lock_terminal_shortfall_mwh": "da_precommit_da_hourly_lock_terminal_shortfall_mwh",
+                "da_hourly_lock_terminal_shortfall_recoverable": "da_precommit_da_hourly_lock_terminal_shortfall_recoverable",
+                "da_hourly_lock_terminal_shortfall_recovery_assumed": "da_precommit_da_hourly_lock_terminal_shortfall_recovery_assumed",
                 "da_hourly_lock_max_feasible_buy_mwh": "da_precommit_da_hourly_lock_max_feasible_buy_mwh",
                 "da_hourly_lock_max_feasible_sell_mwh": "da_precommit_da_hourly_lock_max_feasible_sell_mwh",
                 "da_hourly_lock_infeasible_buy_mwh": "da_precommit_da_hourly_lock_infeasible_buy_mwh",
