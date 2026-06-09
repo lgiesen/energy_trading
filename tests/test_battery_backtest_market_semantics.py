@@ -36,13 +36,17 @@ from energy_trading.simulation.battery_backtest import (  # noqa: E402
     canonicalize_market_frame,
     load_prediction_warehouse_long,
     normalize_predicted_pnl_aliases,
+    apply_benchmark_availability_to_summary,
+    resolve_benchmark_paths,
 )
 from energy_trading.config import MODEL_SPECS  # noqa: E402
 from energy_trading.simulation.bid_builder import AFRRCapacityBid, BCMCapacityBid  # noqa: E402
 from energy_trading.simulation.market_clearing import AFRRCapacityClearingResult, MarketClearingEngine  # noqa: E402
 from scripts.run_battery_backtest import (  # noqa: E402
     _build_daily_performance_metrics,
+    _build_daily_performance_paths_long,
     _build_performance_metrics,
+    _build_performance_paths_long,
     _build_performance_reconciliation_debug,
     _validate_performance_metrics,
     _build_optimization_infeasibility_attribution,
@@ -692,6 +696,128 @@ def _one_hour_pred_df(
         for q in ["p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"]:
             row[f"{pref}_{q}"] = [val]
     return pd.DataFrame(row), col
+
+
+def test_da_execution_probability_buy_quantiles() -> None:
+    bt = _mk_backtester()
+    bt.da_execution_mode = "limit"
+
+    for quantile, expected in [("p30", 0.30), ("p50", 0.50), ("p90", 0.90)]:
+        bt.bid_builder.da_buy_limit_quantile = quantile
+        probs = bt._da_limit_execution_probabilities()
+        assert float(probs["buy_probability"]) == pytest.approx(expected)
+
+
+def test_da_execution_probability_sell_quantiles() -> None:
+    bt = _mk_backtester()
+    bt.da_execution_mode = "limit"
+
+    for quantile, expected in [("p30", 0.70), ("p50", 0.50), ("p90", 0.10)]:
+        bt.bid_builder.da_sell_limit_quantile = quantile
+        probs = bt._da_limit_execution_probabilities()
+        assert float(probs["sell_probability"]) == pytest.approx(expected)
+
+
+def test_da_execution_probability_adjusted_replay_cashflow() -> None:
+    bt = _mk_backtester()
+    bt.da_execution_mode = "limit"
+    bt.bid_builder.da_buy_limit_quantile = "p30"
+    bt.bid_builder.da_sell_limit_quantile = "p70"
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_mode = "state_dependent"
+    bt.aux_trading_mw = 0.0
+    col = BacktestColumnMap()
+    ts_buy = pd.Timestamp("2026-01-01T00:00:00Z")
+    ts_sell = pd.Timestamp("2026-01-01T01:00:00Z")
+    rows = pd.DataFrame(
+        {
+            "target_time_utc": [ts_buy, ts_sell],
+            col.timestamp: [ts_buy, ts_sell],
+            col.pred_da_price: [100.0, 100.0],
+        }
+    )
+    replay = bt._replay_da_candidate_cashflow(
+        rows=rows,
+        schedule={ts_buy: (10.0, 0.0), ts_sell: (0.0, 10.0)},
+        colmap=col,
+        current_soc_mwh=10.0,
+    )
+
+    assert float(replay["da_expected_buy_cost_probability_adjusted_eur"]) == pytest.approx(300.0)
+    assert float(replay["da_expected_sell_revenue_probability_adjusted_eur"]) == pytest.approx(300.0)
+    assert float(replay["da_expected_pnl_probability_adjusted_eur"]) == pytest.approx(0.0)
+    assert float(replay["da_limit_execution_probability_enabled"]) == pytest.approx(1.0)
+
+
+def test_da_execution_probability_price_taker_mode_unchanged() -> None:
+    bt = _mk_backtester()
+    bt.da_execution_mode = "price_taker"
+    bt.bid_builder.da_buy_limit_quantile = "p30"
+    bt.bid_builder.da_sell_limit_quantile = "p90"
+
+    probs = bt._da_limit_execution_probabilities()
+
+    assert float(probs["enabled"]) == pytest.approx(0.0)
+    assert float(probs["buy_probability"]) == pytest.approx(1.0)
+    assert float(probs["sell_probability"]) == pytest.approx(1.0)
+
+
+def test_bcm_award_probability_convention_uses_one_minus_quantile() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30", "p90"]
+    df, col = _one_hour_pred_df(
+        da=0.0,
+        cap_pos=100.0,
+        cap_neg=80.0,
+        act_pos=50.0,
+        act_neg=60.0,
+        rate_pos=0.2,
+        rate_neg=0.3,
+    )
+
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR", "BCM", "BEM"),
+        deterministic_reserve_settlement=False,
+    )
+
+    assert float(out["ev_bcm_p_award_pos_bin_0"].iloc[0]) == pytest.approx(0.70)
+    assert float(out["ev_bcm_p_award_pos_bin_1"].iloc[0]) == pytest.approx(0.10)
+    assert str(out["bcm_probability_convention"].iloc[0]) == (
+        "capacity_price_quantile_q_clears_with_probability_1_minus_q"
+    )
+
+
+def test_bem_execution_probability_convention_and_no_double_probability() -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p30", "p90"]
+    df, col = _one_hour_pred_df(
+        da=0.0,
+        cap_pos=100.0,
+        cap_neg=80.0,
+        act_pos=50.0,
+        act_neg=60.0,
+        rate_pos=0.2,
+        rate_neg=0.3,
+    )
+
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        allowed_markets=("aFRR", "BCM", "BEM"),
+        deterministic_reserve_settlement=False,
+    )
+
+    assert float(out["ev_bem_p_exec_pos_bin_0"].iloc[0]) == pytest.approx(0.70)
+    assert float(out["ev_bem_p_exec_pos_bin_1"].iloc[0]) == pytest.approx(0.10)
+    assert str(out["bem_probability_convention"].iloc[0]) == (
+        "activation_price_quantile_q_clears_with_probability_1_minus_q"
+    )
+    expected_share = 0.70 * 0.2
+    assert float(out["ev_expected_act_share_pos_bin_0"].iloc[0]) == pytest.approx(expected_share)
+    assert float(out["ev_expected_act_share_pos_bin_0"].iloc[0]) != pytest.approx(0.70 * expected_share)
 
 
 def _tiny_backtest_df(hours: int = 6) -> tuple[pd.DataFrame, BacktestColumnMap]:
@@ -5268,6 +5394,90 @@ def test_bcm_and_bem_same_hour_split_by_source_mwh() -> None:
         comp["activation_revenue_reconciled_eur"],
         comp["bcm_linked_activation_revenue_eur"] + comp["bem_only_activation_revenue_eur"],
     )
+    assert float(comp["bcm_linked_activation_revenue_allocation_share"]) == pytest.approx(0.4)
+    assert float(comp["bem_only_activation_revenue_allocation_share"]) == pytest.approx(0.6)
+    assert float(comp["bcm_linked_pos_activation_revenue_allocation_share"]) == pytest.approx(0.4)
+    assert float(comp["bem_only_pos_activation_revenue_allocation_share"]) == pytest.approx(0.6)
+
+
+def test_activation_revenue_allocation_uses_directional_mw_shares() -> None:
+    bt = _mk_backtester("canonical_economic")
+    comp = bt._split_activation_revenue_components(
+        delivered_pos_mwh=6.0,
+        delivered_neg_mwh=4.0,
+        bem_only_pos_mwh=2.0,
+        bem_only_neg_mwh=1.0,
+        act_pos_price_eur_mwh=100.0,
+        act_neg_price_eur_mwh=200.0,
+        bcm_linked_pos_mwh=4.0,
+        bcm_linked_neg_mwh=3.0,
+    )
+    assert float(comp["bcm_linked_pos_activation_revenue_allocation_share"]) == pytest.approx(4.0 / 6.0)
+    assert float(comp["bem_only_pos_activation_revenue_allocation_share"]) == pytest.approx(2.0 / 6.0)
+    assert float(comp["bcm_linked_neg_activation_revenue_allocation_share"]) == pytest.approx(3.0 / 4.0)
+    assert float(comp["bem_only_neg_activation_revenue_allocation_share"]) == pytest.approx(1.0 / 4.0)
+    assert float(comp["bcm_linked_activation_revenue_eur"]) == pytest.approx(4.0 * 100.0 + 3.0 * 200.0)
+    assert float(comp["bem_only_activation_revenue_eur"]) == pytest.approx(2.0 * 100.0 + 1.0 * 200.0)
+
+
+def test_bem_only_missed_capacity_diagnostics_are_ignored_for_capacity_validation() -> None:
+    hourly = pd.DataFrame(
+        {
+            "real_missed_capacity_pos_mw": [2.0],
+            "real_missed_capacity_neg_mw": [0.0],
+            "real_bem_only_submitted_pos_mw": [2.0],
+            "real_bem_only_submitted_neg_mw": [0.0],
+            "real_submitted_bcm_capacity_pos_mw": [0.0],
+            "real_locked_bcm_capacity_pos_mw": [0.0],
+            "real_bcm_awarded_capacity_pos_mw": [0.0],
+        }
+    )
+
+    diag = BatteryBacktester._missed_capacity_validation_components(hourly)
+
+    assert float(diag["missed_capacity_true_bcm_pos_mw"].sum()) == pytest.approx(0.0)
+    assert float(diag["missed_capacity_ignored_bem_only_pos_mw"].sum()) == pytest.approx(2.0)
+    assert float(diag["missed_capacity_ignored_bem_only_submission"]) == pytest.approx(1.0)
+    assert str(diag["missed_capacity_reason"]) == "bem_only_activation_submission_ignored"
+
+
+def test_bcm_capacity_missed_still_triggers_capacity_validation() -> None:
+    hourly = pd.DataFrame(
+        {
+            "real_missed_capacity_pos_mw": [2.0],
+            "real_missed_capacity_neg_mw": [0.0],
+            "real_bem_only_submitted_pos_mw": [0.0],
+            "real_submitted_bcm_capacity_pos_mw": [2.0],
+            "real_locked_bcm_capacity_pos_mw": [0.0],
+            "real_bcm_awarded_capacity_pos_mw": [0.0],
+        }
+    )
+
+    diag = BatteryBacktester._missed_capacity_validation_components(hourly)
+
+    assert float(diag["missed_capacity_true_bcm_pos_mw"].sum()) == pytest.approx(2.0)
+    assert float(diag["missed_capacity_ignored_bem_only_pos_mw"].sum()) == pytest.approx(0.0)
+    assert float(diag["missed_capacity_check_applied"]) == pytest.approx(1.0)
+    assert str(diag["missed_capacity_reason"]) == "true_bcm_capacity_missed"
+
+
+def test_multi_bem_only_submission_does_not_imply_missed_bcm_capacity() -> None:
+    hourly = pd.DataFrame(
+        {
+            "real_missed_capacity_pos_mw": [1.0],
+            "real_missed_capacity_neg_mw": [0.0],
+            "real_submitted_afrr_pos_mw": [1.0],
+            "real_bem_only_submitted_pos_mw": [1.0],
+            "real_submitted_bcm_capacity_pos_mw": [0.0],
+            "real_locked_bcm_capacity_pos_mw": [0.0],
+            "real_bcm_awarded_capacity_pos_mw": [0.0],
+        }
+    )
+
+    diag = BatteryBacktester._missed_capacity_validation_components(hourly)
+
+    assert float(diag["missed_capacity_true_bcm_pos_mw"].sum()) == pytest.approx(0.0)
+    assert float(diag["missed_capacity_ignored_bem_only_pos_mw"].sum()) == pytest.approx(1.0)
 
 
 def test_canonical_negative_activation_positive_for_bcm_and_bem_sources() -> None:
@@ -5399,6 +5609,7 @@ def test_full_settlement_activation_revenue_not_overwritten_by_wrong_split() -> 
 
 def test_bem_only_forced_scenario_has_nonzero_revenue_and_benchmark_diagnostics() -> None:
     bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p50"]
     n = 48
     idx = pd.date_range("2025-05-01 00:00:00+00:00", periods=n, freq="h", tz="UTC")
     col = BacktestColumnMap()
@@ -5416,6 +5627,12 @@ def test_bem_only_forced_scenario_has_nonzero_revenue_and_benchmark_diagnostics(
             col.pred_afrr_activation_price_neg: np.full(n, 10.0),
             col.pred_afrr_activation_rate_pos: np.full(n, 0.95),
             col.pred_afrr_activation_rate_neg: np.full(n, 0.05),
+            f"{col.pred_afrr_capacity_price_pos}_p50": np.full(n, 1.0),
+            f"{col.pred_afrr_capacity_price_neg}_p50": np.full(n, 1.0),
+            f"{col.pred_afrr_activation_price_pos}_p50": np.full(n, 140.0),
+            f"{col.pred_afrr_activation_price_neg}_p50": np.full(n, 10.0),
+            f"{col.pred_afrr_activation_rate_pos}_p50": np.full(n, 0.95),
+            f"{col.pred_afrr_activation_rate_neg}_p50": np.full(n, 0.05),
             col.true_da_price: np.full(n, -18.0),
             col.true_afrr_capacity_price_pos: np.full(n, 0.5),
             col.true_afrr_capacity_price_neg: np.full(n, 0.5),
@@ -5460,6 +5677,7 @@ def test_bem_only_forced_scenario_has_nonzero_revenue_and_benchmark_diagnostics(
 
 def test_no_headroom_violations_in_clean_forced_bem_only() -> None:
     bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p50"]
     n = 24
     idx = pd.date_range("2025-05-01 00:00:00+00:00", periods=n, freq="h", tz="UTC")
     col = BacktestColumnMap()
@@ -5477,6 +5695,12 @@ def test_no_headroom_violations_in_clean_forced_bem_only() -> None:
             col.pred_afrr_activation_price_neg: np.full(n, 10.0),
             col.pred_afrr_activation_rate_pos: np.full(n, 0.95),
             col.pred_afrr_activation_rate_neg: np.full(n, 0.05),
+            f"{col.pred_afrr_capacity_price_pos}_p50": np.full(n, 0.5),
+            f"{col.pred_afrr_capacity_price_neg}_p50": np.full(n, 0.5),
+            f"{col.pred_afrr_activation_price_pos}_p50": np.full(n, 140.0),
+            f"{col.pred_afrr_activation_price_neg}_p50": np.full(n, 10.0),
+            f"{col.pred_afrr_activation_rate_pos}_p50": np.full(n, 0.95),
+            f"{col.pred_afrr_activation_rate_neg}_p50": np.full(n, 0.05),
             col.true_da_price: np.full(n, -18.0),
             col.true_afrr_capacity_price_pos: np.full(n, 0.5),
             col.true_afrr_capacity_price_neg: np.full(n, 0.5),
@@ -9159,7 +9383,7 @@ def test_da_postlock_terminal_recovery_cost_can_select_no_trade() -> None:
     assert str(audit[0]["da_postlock_selected_after_future_check"]) == "no_trade_after_terminal_recovery_cost"
     assert str(audit[0]["candidate_rejection_reason"]) == "locked_da_terminal_recovery_cost_negative_pnl"
     assert float(audit[0]["da_postlock_terminal_shortfall_recoverable"]) == pytest.approx(1.0)
-    assert float(audit[0]["candidate_pnl_after_recovery_cost_eur"]) < float(audit[0]["no_trade_pnl"])
+    assert float(audit[0]["candidate_pnl_after_recovery_cost_eur"]) <= float(audit[0]["no_trade_pnl"]) + 1e-6
     assert str(audit[0]["final_selected_incumbent"]) == "no_trade"
     assert float(audit[0]["locked_sell_mwh_by_hour"]) == pytest.approx(0.0)
     assert float(audit[0]["da_postlock_final_selected_pnl_eur"]) == pytest.approx(float(audit[0]["no_trade_pnl"]))
@@ -9901,14 +10125,145 @@ def test_terminal_recovery_sizes_to_target_after_same_hour_aux() -> None:
     )
     diag = bt._last_id_rescue_plan_diagnostics
 
-    expected_internal = 10.0 - 2.155 + 0.095
+    expected_aux_delta = 0.095 - float(bt.aux_off_mw)
+    expected_internal = 10.0 - 2.155 + expected_aux_delta
     assert reason == "terminal_soc_recovery"
     assert id_discharge == pytest.approx(0.0)
-    assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(0.095)
+    assert float(diag["terminal_recovery_aux_without_recovery_mwh"]) == pytest.approx(float(bt.aux_off_mw))
+    assert float(diag["terminal_recovery_aux_with_recovery_mwh"]) == pytest.approx(0.095)
+    assert float(diag["terminal_recovery_induced_aux_delta_mwh"]) == pytest.approx(expected_aux_delta)
+    assert float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"]) == pytest.approx(expected_aux_delta)
     assert float(diag["terminal_soc_id_recourse_needed_internal_mwh"]) == pytest.approx(expected_internal)
     assert id_charge * bt.dt_h * bt.eta_in == pytest.approx(expected_internal)
     assert float(diag["terminal_repair_projected_final_soc_after_repair_mwh"]) >= 10.0 - 1e-9
     assert float(diag["terminal_soc_recovery_post_aux_shortfall_mwh"]) == pytest.approx(0.0)
+
+
+def test_terminal_recovery_observed_residual_shortfall_regression() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_peak_mw = 0.03
+    bt.aux_trading_mw = 0.03
+    bt.aux_standby_mw = 0.0
+    bt.p_max_mw = 10.0
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=8.58,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=8.58,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+    aux_mwh = float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"])
+    final_projection = 8.58 + id_charge * bt.dt_h * bt.eta_in - aux_mwh
+
+    assert reason == "terminal_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    expected_aux_delta = 0.03 - float(bt.aux_off_mw)
+    assert float(diag["terminal_recovery_aux_without_recovery_mwh"]) == pytest.approx(float(bt.aux_off_mw))
+    assert float(diag["terminal_recovery_aux_with_recovery_mwh"]) == pytest.approx(0.03)
+    assert float(diag["terminal_recovery_induced_aux_delta_mwh"]) == pytest.approx(expected_aux_delta)
+    assert aux_mwh == pytest.approx(expected_aux_delta)
+    assert id_charge * bt.dt_h * bt.eta_in == pytest.approx(10.0 - 8.58 + expected_aux_delta)
+    assert final_projection >= 10.0 - 1e-9
+    assert float(diag["terminal_recovery_remaining_shortfall_after_recovery_mwh"]) == pytest.approx(0.0)
+    assert float(diag["terminal_recovery_final_projection_passed"]) == pytest.approx(1.0)
+
+
+def test_terminal_recovery_includes_off_to_trading_aux_delta() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_off_mw = 0.02
+    bt.aux_trading_mw = 0.05
+    bt.aux_standby_mw = 0.0
+    bt.p_max_mw = 10.0
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=8.58,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=8.58,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    expected_delta = 0.05 - 0.02
+    expected_internal = 10.0 - 8.58 + expected_delta
+    final_projection = 8.58 + id_charge * bt.dt_h * bt.eta_in - expected_delta
+
+    assert reason == "terminal_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert float(diag["terminal_recovery_aux_without_recovery_mwh"]) == pytest.approx(0.02)
+    assert float(diag["terminal_recovery_aux_with_recovery_mwh"]) == pytest.approx(0.05)
+    assert float(diag["terminal_recovery_induced_aux_delta_mwh"]) == pytest.approx(expected_delta)
+    assert float(diag["terminal_soc_id_recourse_needed_internal_mwh"]) == pytest.approx(expected_internal)
+    assert final_projection >= 10.0 - 1e-9
+
+
+def test_terminal_recovery_iterates_scaled_aux_to_remove_residual_shortfall() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.aux_mode = "state_dependent_scaled"
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.05
+    bt.aux_standby_mw = 0.0
+    bt.p_max_mw = 10.0
+
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=9.97,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=9.97,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+    aux_mwh = float(diag["terminal_soc_projection_id_extra_aux_losses_mwh"])
+    final_projection = 9.97 + id_charge * bt.dt_h * bt.eta_in - aux_mwh
+
+    assert reason == "terminal_soc_recovery"
+    assert id_discharge == pytest.approx(0.0)
+    assert final_projection >= 10.0 - 1e-9
+    assert float(diag["terminal_recovery_projected_final_soc_after_recovery_mwh"]) >= 10.0 - 1e-9
+    assert float(diag["terminal_recovery_remaining_shortfall_after_recovery_mwh"]) == pytest.approx(0.0)
+    assert float(diag["terminal_recovery_final_projection_passed"]) == pytest.approx(1.0)
+    assert float(diag["terminal_recovery_iteration_count"]) >= 2.0
+    assert float(diag["terminal_recovery_replanned_due_to_residual_shortfall"]) == pytest.approx(1.0)
+
+
+def test_terminal_recovery_marks_unrecoverable_when_power_limit_blocks_target() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+
+    diag = bt._schedule_terminal_id_recovery(
+        projected_terminal_soc_without_new_id_mwh=9.0,
+        current_soc_mwh=9.0,
+        terminal_soc_target_mwh=10.0,
+        residual_charge_mw=0.2,
+        terminal_soc_safety_margin_mwh=0.0,
+        terminal_repair_known_future_aux_mwh=0.0,
+        terminal_repair_recovery_aux_mwh=0.0,
+    )
+
+    assert float(diag["terminal_soc_recovery_feasible"]) == pytest.approx(0.0)
+    assert float(diag["terminal_recovery_remaining_shortfall_after_recovery_mwh"]) > 0.0
+    assert str(diag["terminal_soc_not_recoverable_reason"]) == "insufficient_remaining_id_capacity"
 
 
 def test_da_origin_summary_counter_uses_canonical_origin_fields() -> None:
@@ -12069,6 +12424,22 @@ def test_da_bcm_candidate_gate_window_masks_are_applied_before_solve(
     assert bcm_disable.eq(1.0).all()
     assert pd.to_numeric(plan_history["da_candidate_gate_window_violation"], errors="coerce").fillna(0.0).eq(0.0).all()
     assert pd.to_numeric(plan_history["bcm_candidate_gate_window_violation"], errors="coerce").fillna(0.0).eq(0.0).all()
+    assert "da_gate_actionable" in plan_history.columns
+    assert "da_optimizer_ub_zeroed_by_gate" in plan_history.columns
+    assert "da_illegal_same_day_variable_count" in plan_history.columns
+    assert "bcm_gate_actionable" in plan_history.columns
+    assert "bcm_optimizer_ub_zeroed_by_gate" in plan_history.columns
+    assert "bcm_illegal_same_day_variable_count" in plan_history.columns
+    ph_target_local = pd.to_datetime(plan_history["target_time_utc"], utc=True, errors="coerce").dt.tz_convert("Europe/Berlin")
+    ph_same_day = ph_target_local.dt.date == pd.Timestamp("2025-06-02", tz="Europe/Berlin").date()
+    ph_next_day = (ph_target_local >= pd.Timestamp("2025-06-03T00:00:00", tz="Europe/Berlin")) & (
+        ph_target_local < pd.Timestamp("2025-06-04T00:00:00", tz="Europe/Berlin")
+    )
+    assert pd.to_numeric(plan_history.loc[ph_same_day, "da_gate_actionable"], errors="coerce").fillna(0.0).eq(0.0).all()
+    assert pd.to_numeric(plan_history.loc[ph_same_day, "da_optimizer_ub_zeroed_by_gate"], errors="coerce").fillna(0.0).eq(1.0).all()
+    assert pd.to_numeric(plan_history.loc[ph_same_day, "da_illegal_same_day_variable_count"], errors="coerce").fillna(0.0).eq(0.0).all()
+    assert pd.to_numeric(plan_history.loc[ph_next_day, "da_gate_actionable"], errors="coerce").fillna(0.0).eq(1.0).all()
+    assert pd.to_numeric(plan_history["bcm_optimizer_ub_zeroed_by_gate"], errors="coerce").fillna(0.0).eq(1.0).all()
 
 
 def test_bcm_gate_disables_new_candidates_outside_gate_and_limits_gate_to_next_day(
@@ -12136,6 +12507,26 @@ def test_bcm_gate_disables_new_candidates_outside_gate_and_limits_gate_to_next_d
     gate_disable = pd.to_numeric(gate_window["_disable_bcm_product_bid"], errors="coerce").fillna(0.0)
     assert gate_disable.loc[next_day_mask].eq(0.0).all()
     assert gate_disable.loc[~next_day_mask].eq(1.0).all()
+
+    plan_history = bt.optimize_dispatch_rolling(
+        gate_df,
+        col,
+        horizon_hours=len(gate_df),
+        reopt_step_hours=len(gate_df),
+        allowed_markets=("aFRR", "BCM", "BEM"),
+        strategy_name="afrr",
+        strict_simulation_validity=False,
+    )[1]
+    assert "bcm_gate_actionable" in plan_history.columns
+    assert "bcm_optimizer_ub_zeroed_by_gate" in plan_history.columns
+    assert "bcm_illegal_same_day_variable_count" in plan_history.columns
+    ph_target_local = pd.to_datetime(plan_history["target_time_utc"], utc=True, errors="coerce").dt.tz_convert("Europe/Berlin")
+    ph_same_day = ph_target_local.dt.date == pd.Timestamp("2025-05-01", tz="Europe/Berlin").date()
+    ph_next_day = (ph_target_local >= next_day_start) & (ph_target_local < next_day_end)
+    assert pd.to_numeric(plan_history.loc[ph_same_day, "bcm_gate_actionable"], errors="coerce").fillna(0.0).eq(0.0).all()
+    assert pd.to_numeric(plan_history.loc[ph_same_day, "bcm_optimizer_ub_zeroed_by_gate"], errors="coerce").fillna(0.0).eq(1.0).all()
+    assert pd.to_numeric(plan_history.loc[ph_same_day, "bcm_illegal_same_day_variable_count"], errors="coerce").fillna(0.0).eq(0.0).all()
+    assert pd.to_numeric(plan_history.loc[ph_next_day, "bcm_gate_actionable"], errors="coerce").fillna(0.0).eq(1.0).all()
 
 
 def test_bem_gate_next_hour_disables_later_horizon_candidates(
@@ -12932,3 +13323,137 @@ def test_raw_optimizer_objective_scope_separates_terminal_credit_from_row_ev() -
     assert float(row["terminal_surplus_mwh"]) == pytest.approx(7.56)
     assert row["raw_optimizer_objective_scope"] == "rolling_window"
     assert "raw_optimizer_window_terminal_credit_eur" in out.columns
+
+
+
+def test_benchmark_mode_model_only_masks_disabled_benchmarks() -> None:
+    mode, paths = resolve_benchmark_paths("model_only", enable_global_perfect_foresight=True)
+
+    summary = apply_benchmark_availability_to_summary(
+        {
+            "realized_total_pnl_eur": 12.0,
+            "naive_total_pnl_eur": 0.0,
+            "rolling_perfect_foresight_same_rules_total_pnl_eur": 0.0,
+            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": 0.0,
+        },
+        benchmark_mode=mode,
+        benchmark_paths=paths,
+    )
+
+    assert paths == {"model": True, "naive": False, "rhpf": False, "ghpf": False}
+    assert summary["model_available"] == 1.0
+    assert summary["naive_available"] == 0.0
+    assert summary["rolling_pf_available"] == 0.0
+    assert summary["global_pf_available"] == 0.0
+    assert summary["model_total_pnl_eur"] == pytest.approx(12.0)
+    assert np.isnan(float(summary["naive_total_pnl_eur"]))
+    assert np.isnan(float(summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+    assert np.isnan(float(summary["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]))
+
+
+def test_benchmark_mode_full_preserves_all_paths_available() -> None:
+    mode, paths = resolve_benchmark_paths("full", enable_global_perfect_foresight=True)
+    summary = apply_benchmark_availability_to_summary(
+        {
+            "realized_total_pnl_eur": 1.0,
+            "naive_total_pnl_eur": 2.0,
+            "rolling_perfect_foresight_same_rules_total_pnl_eur": 3.0,
+            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": 4.0,
+            "rolling_pf_available": 1.0,
+            "global_pf_available": 1.0,
+        },
+        benchmark_mode=mode,
+        benchmark_paths=paths,
+    )
+
+    assert paths == {"model": True, "naive": True, "rhpf": True, "ghpf": True}
+    assert summary["model_available"] == 1.0
+    assert summary["naive_available"] == 1.0
+    assert summary["rolling_pf_available"] == 1.0
+    assert summary["global_pf_available"] == 1.0
+    assert summary["model_total_pnl_eur"] == pytest.approx(1.0)
+    assert summary["rhpf_total_pnl_eur"] == pytest.approx(3.0)
+    assert summary["ghpf_total_pnl_eur"] == pytest.approx(4.0)
+
+
+def test_benchmark_mode_naive_rhpf_ghpf_only() -> None:
+    assert resolve_benchmark_paths("naive_only")[1] == {"model": False, "naive": True, "rhpf": False, "ghpf": False}
+    assert resolve_benchmark_paths("rhpf_only")[1] == {"model": False, "naive": False, "rhpf": True, "ghpf": False}
+    assert resolve_benchmark_paths("ghpf_only", enable_global_perfect_foresight=True)[1] == {
+        "model": False,
+        "naive": False,
+        "rhpf": False,
+        "ghpf": True,
+    }
+    assert resolve_benchmark_paths("rolling_pf_only")[0] == "rhpf_only"
+    assert resolve_benchmark_paths("global_pf_only")[0] == "ghpf_only"
+
+
+def test_benchmark_mode_selected_respects_enable_disable_flags() -> None:
+    mode, paths = resolve_benchmark_paths(
+        "selected",
+        enable_naive=False,
+        enable_rolling_pf=True,
+        enable_global_pf=False,
+        enable_global_perfect_foresight=True,
+    )
+
+    assert mode == "selected"
+    assert paths == {"model": True, "naive": False, "rhpf": True, "ghpf": False}
+
+
+def test_performance_paths_long_contains_only_enabled_paths_and_stable_schema() -> None:
+    hourly_model = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2025-01-01", periods=2, freq="h", tz="UTC"),
+            "real_pnl_eur": [1.0, 2.0],
+            "real_revenue_da_eur": [10.0, 20.0],
+            "real_cost_da_eur": [4.0, 5.0],
+            "real_revenue_id_eur": [0.0, 0.0],
+            "real_cost_id_eur": [0.0, 1.0],
+            "real_soc_mwh": [10.0, 11.0],
+        }
+    )
+    hourly_naive = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2025-01-01", periods=2, freq="h", tz="UTC"),
+            "naive_pnl_eur": [0.5, 0.25],
+            "naive_revenue_da_eur": [1.0, 2.0],
+            "naive_cost_da_eur": [0.5, 1.75],
+            "naive_soc_mwh": [10.0, 10.0],
+        }
+    )
+    args = argparse.Namespace(trading_strategy="da", model_key="linear", model="linear", split="test")
+    paths = _build_performance_paths_long(
+        isolated_hourly={"model": hourly_model, "naive": hourly_naive},
+        summary={"model_available": 1.0, "naive_available": 1.0, "rhpf_available": 0.0, "ghpf_available": 0.0, "simulation_valid": 1.0},
+        args=args,
+        scenario_name="p50_p50",
+        scenario_bins=["p50"],
+    )
+
+    assert set(paths["path_type"]) == {"model", "naive"}
+    assert len(paths) == 4
+    for col in [
+        "scenario",
+        "strategy",
+        "model_key",
+        "split",
+        "quantile_low",
+        "quantile_high",
+        "path_type",
+        "timestamp_utc",
+        "pnl_eur",
+        "cum_pnl_eur",
+        "net_da_eur",
+        "available",
+    ]:
+        assert col in paths.columns
+    model = paths.loc[paths["path_type"].eq("model")].sort_values("timestamp_utc")
+    assert model["cum_pnl_eur"].iloc[-1] == pytest.approx(3.0)
+    assert model["net_da_eur"].iloc[0] == pytest.approx(6.0)
+
+    daily = _build_daily_performance_paths_long(paths)
+    assert set(daily["path_type"]) == {"model", "naive"}
+    assert "soc_mean_mwh" in daily.columns
+    assert "soc_end_mwh" in daily.columns

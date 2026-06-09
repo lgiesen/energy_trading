@@ -60,7 +60,6 @@ BATTERY_SPECS = {
 
     # Aux peak is configured so state duties realize the intended hourly
     # auxiliary energy directly at dt_h=1:
-    # off=0.020 MWh/h, standby=0.035 MWh/h,
     # trading=0.050 MWh/h, aFRR active=0.050 MWh/h.
     "aux_power_peak_mw": 0.05,
 
@@ -102,8 +101,8 @@ MARKET_SPECS = {
     "da_bid_granularity": 0.1,  # Bid steps
     "afrr_min_bid_size": 1.0,  # Minimum bid size in MW (Germany)
     "afrr_bid_granularity": 1.0,  # Bid steps
-    "da_execution_mode": "price_taker",  # "price_taker" or "limit"
-    "da_arbitrage_mode": "price_taker",  # mode for non-hedging DA volumes
+    "da_execution_mode": "limit",  # "price_taker" or "limit"
+    "da_arbitrage_mode": "limit",  # mode for non-hedging DA volumes
     "da_link_to_awarded_afrr": True,  # cancel hedges if aFRR capacity was not awarded
     "afrr_capacity_bid_risk_lambda": 0.2,
     "afrr_activation_bid_risk_lambda": 0.2,
@@ -212,19 +211,15 @@ def _validate_config() -> None:
         "same_as_bid",
         "canonical",
         "point",
-        "p01",
-        "p05",
         "p10",
         "p30",
         "p50",
         "p70",
-        "p90",
-        "p95",
-        "p99",
+        "p90"
     }:
         raise ValueError(
             "afrr_activation_rate_guard_quantile must be auto/scenario/same_as_bid/canonical/point "
-            "or one of p01,p05,p10,p30,p50,p70,p90,p95,p99."
+            "or one of p10,p30,p50,p70,p90"
         )
     if MARKET_SPECS["afrr_energy_bid_strategy"] not in {"forecast", "marginal_cost", "hybrid"}:
         raise ValueError("afrr_energy_bid_strategy must be one of {'forecast', 'marginal_cost', 'hybrid'}.")

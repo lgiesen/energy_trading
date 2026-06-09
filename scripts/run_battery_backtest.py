@@ -72,6 +72,7 @@ from energy_trading.simulation.battery_backtest import (
     load_and_align_market_data,
     load_prediction_warehouse_long,
     normalize_predicted_pnl_aliases,
+    resolve_benchmark_paths,
 )
 from energy_trading.visualization.style import apply_geo_style, get_backtest_line_style
 
@@ -1278,6 +1279,197 @@ def _build_daily_performance_metrics(
         else False
     )
     return out
+
+
+PERFORMANCE_PATHS_LONG_COLUMNS = [
+    "scenario",
+    "strategy",
+    "model_key",
+    "split",
+    "quantile_low",
+    "quantile_high",
+    "path_type",
+    "timestamp_utc",
+    "date",
+    "pnl_eur",
+    "cum_pnl_eur",
+    "revenue_da_eur",
+    "cost_da_eur",
+    "net_da_eur",
+    "revenue_id_eur",
+    "cost_id_eur",
+    "net_id_eur",
+    "bcm_capacity_revenue_eur",
+    "bcm_linked_activation_revenue_eur",
+    "bem_activation_revenue_eur",
+    "activation_revenue_total_eur",
+    "aux_cost_eur",
+    "degradation_cost_eur",
+    "transaction_cost_eur",
+    "penalty_cost_eur",
+    "throughput_mwh",
+    "soc_mwh",
+    "validity_flag",
+    "available",
+]
+
+
+_PATH_PREFIX = {
+    "model": "real",
+    "naive": "naive",
+    "rhpf": "perfect_foresight",
+    "ghpf": "global_perfect_foresight",
+}
+_PATH_FILE_STEM = {
+    "model": "model",
+    "naive": "naive",
+    "rhpf": "rolling_pf",
+    "ghpf": "global_pf",
+}
+
+
+def _quantile_low_high(scenario_name: str, scenario_bins: list[str] | tuple[str, ...]) -> tuple[str, str]:
+    if scenario_name and scenario_name != "default" and "_" in str(scenario_name):
+        lo, hi = str(scenario_name).split("_", 1)
+        return lo, hi
+    bins = list(scenario_bins or [])
+    if len(bins) >= 2:
+        return str(bins[0]), str(bins[-1])
+    if len(bins) == 1:
+        return str(bins[0]), str(bins[0])
+    return "", ""
+
+
+def _build_performance_paths_long(
+    *,
+    isolated_hourly: dict[str, pd.DataFrame] | None,
+    summary: dict[str, object],
+    args: argparse.Namespace,
+    scenario_name: str,
+    scenario_bins: list[str] | tuple[str, ...],
+) -> pd.DataFrame:
+    rows: list[pd.DataFrame] = []
+    q_low, q_high = _quantile_low_high(scenario_name, scenario_bins)
+    for path_type, prefix in _PATH_PREFIX.items():
+        available = float(pd.to_numeric(pd.Series([summary.get(f"{path_type}_available", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        if available < 0.5:
+            continue
+        frame = (isolated_hourly or {}).get(path_type)
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            continue
+        h = frame.copy()
+        ts_col = "timestamp_utc" if "timestamp_utc" in h.columns else None
+        if ts_col is None:
+            candidates = [c for c in h.columns if c.endswith("timestamp_utc") or c == "timestamp"]
+            ts_col = candidates[0] if candidates else None
+        ts = pd.to_datetime(h[ts_col], utc=True, errors="coerce") if ts_col else pd.Series(pd.NaT, index=h.index)
+
+        def col(suffix: str) -> pd.Series:
+            name = f"{prefix}_{suffix}"
+            if name in h.columns:
+                return pd.to_numeric(h[name], errors="coerce")
+            return pd.Series(np.nan, index=h.index, dtype=float)
+
+        pnl = col("pnl_eur")
+        revenue_da = col("revenue_da_eur")
+        cost_da = col("cost_da_eur")
+        revenue_id = col("revenue_id_eur")
+        cost_id = col("cost_id_eur")
+        out = pd.DataFrame(
+            {
+                "scenario": str(scenario_name),
+                "strategy": str(args.trading_strategy),
+                "model_key": str(args.model_key or args.model),
+                "split": str(args.split),
+                "quantile_low": q_low,
+                "quantile_high": q_high,
+                "path_type": path_type,
+                "timestamp_utc": ts.dt.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "date": ts.dt.date.astype(str),
+                "pnl_eur": pnl,
+                "cum_pnl_eur": pnl.fillna(0.0).cumsum(),
+                "revenue_da_eur": revenue_da,
+                "cost_da_eur": cost_da,
+                "net_da_eur": revenue_da - cost_da,
+                "revenue_id_eur": revenue_id,
+                "cost_id_eur": cost_id,
+                "net_id_eur": revenue_id - cost_id,
+                "bcm_capacity_revenue_eur": col("revenue_capacity_eur"),
+                "bcm_linked_activation_revenue_eur": col("bcm_linked_activation_revenue_eur"),
+                "bem_activation_revenue_eur": col("bem_only_activation_revenue_eur"),
+                "activation_revenue_total_eur": col("revenue_activation_eur"),
+                "aux_cost_eur": col("aux_cost_eur"),
+                "degradation_cost_eur": col("degradation_cost_eur"),
+                "transaction_cost_eur": col("transaction_cost_eur"),
+                "penalty_cost_eur": col("penalty_eur"),
+                "throughput_mwh": col("throughput_mwh"),
+                "soc_mwh": col("soc_mwh"),
+                "validity_flag": float(pd.to_numeric(pd.Series([summary.get("simulation_valid", np.nan)]), errors="coerce").iloc[0]),
+                "available": available,
+            }
+        )
+        rows.append(out)
+    if not rows:
+        return pd.DataFrame(columns=PERFORMANCE_PATHS_LONG_COLUMNS)
+    return pd.concat(rows, ignore_index=True, sort=False).reindex(columns=PERFORMANCE_PATHS_LONG_COLUMNS)
+
+
+def _build_daily_performance_paths_long(paths_long: pd.DataFrame) -> pd.DataFrame:
+    if paths_long.empty:
+        base_cols = [c for c in PERFORMANCE_PATHS_LONG_COLUMNS if c != "timestamp_utc"]
+        return pd.DataFrame(columns=[*base_cols, "soc_mean_mwh", "soc_end_mwh"])
+    group_cols = ["scenario", "strategy", "model_key", "split", "quantile_low", "quantile_high", "path_type", "date"]
+    sum_cols = [
+        "pnl_eur",
+        "revenue_da_eur",
+        "cost_da_eur",
+        "net_da_eur",
+        "revenue_id_eur",
+        "cost_id_eur",
+        "net_id_eur",
+        "bcm_capacity_revenue_eur",
+        "bcm_linked_activation_revenue_eur",
+        "bem_activation_revenue_eur",
+        "activation_revenue_total_eur",
+        "aux_cost_eur",
+        "degradation_cost_eur",
+        "transaction_cost_eur",
+        "penalty_cost_eur",
+        "throughput_mwh",
+    ]
+    d = paths_long.copy()
+    for c in sum_cols + ["soc_mwh", "validity_flag", "available"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    agg = d.groupby(group_cols, dropna=False).agg(
+        {**{c: "sum" for c in sum_cols}, "soc_mwh": ["mean", "last"], "validity_flag": "last", "available": "last"}
+    )
+    agg.columns = ["_".join([x for x in tup if x]) for tup in agg.columns.to_flat_index()]
+    agg = agg.reset_index()
+    agg = agg.rename(columns={"soc_mwh_mean": "soc_mean_mwh", "soc_mwh_last": "soc_end_mwh", "validity_flag_last": "validity_flag", "available_last": "available"})
+    agg["cum_pnl_eur"] = agg.groupby(["scenario", "strategy", "model_key", "split", "quantile_low", "quantile_high", "path_type"], dropna=False)["pnl_eur_sum"].cumsum()
+    agg = agg.rename(columns={f"{c}_sum": c for c in sum_cols})
+    return agg
+
+
+def _write_benchmark_path_outputs(
+    *,
+    scenario_out_dir: Path,
+    isolated_hourly: dict[str, pd.DataFrame] | None,
+    summary: dict[str, object],
+) -> None:
+    for path_type, stem in _PATH_FILE_STEM.items():
+        available = float(pd.to_numeric(pd.Series([summary.get(f"{path_type}_available", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        if available < 0.5:
+            tiny = {"path_type": path_type, "available": 0.0, "disabled_reason": "benchmark_disabled"}
+            (scenario_out_dir / f"{stem}_summary.json").write_text(json.dumps(tiny, indent=2), encoding="utf-8")
+            continue
+        frame = (isolated_hourly or {}).get(path_type)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            frame.to_parquet(scenario_out_dir / f"{stem}_hourly.parquet", index=False)
+        path_summary = {k: v for k, v in summary.items() if k.startswith(path_type) or k.startswith(_PATH_PREFIX[path_type])}
+        path_summary.update({"path_type": path_type, "available": 1.0})
+        (scenario_out_dir / f"{stem}_summary.json").write_text(json.dumps(path_summary, indent=2, default=str), encoding="utf-8")
 
 
 def _performance_reconciliation_specs() -> list[dict[str, object]]:
@@ -3199,6 +3391,19 @@ def parse_args() -> argparse.Namespace:
         help="How DA uses quantile pair in sweep mode: low/high/mid (mid -> p50).",
     )
 
+    p.add_argument(
+        "--benchmark-mode",
+        choices=["full", "model_only", "naive_only", "rhpf_only", "ghpf_only", "selected", "rolling_pf_only", "global_pf_only"],
+        default="full",
+        help="Which benchmark paths to compute: full, model_only, naive_only, rhpf_only, ghpf_only, or selected.",
+    )
+    p.add_argument("--enable-naive", dest="enable_naive", action="store_true", default=None, help="Enable naive benchmark in --benchmark-mode selected or override modes.")
+    p.add_argument("--disable-naive", dest="enable_naive", action="store_false", help="Disable naive benchmark.")
+    p.add_argument("--enable-rhpf", "--enable-rolling-pf", dest="enable_rhpf", action="store_true", default=None, help="Enable rolling hindsight/perfect-foresight benchmark.")
+    p.add_argument("--disable-rhpf", "--disable-rolling-pf", dest="enable_rhpf", action="store_false", help="Disable rolling hindsight/perfect-foresight benchmark.")
+    p.add_argument("--enable-ghpf", "--enable-global-pf", dest="enable_ghpf", action="store_true", default=None, help="Enable global hindsight/perfect-foresight benchmark.")
+    p.add_argument("--disable-ghpf", "--disable-global-pf", dest="enable_ghpf", action="store_false", help="Disable global hindsight/perfect-foresight benchmark.")
+
     p.add_argument("--timestamp-col", default="timestamp_utc")
     p.add_argument("--pred-da-col", default="pred_da_price")
     p.add_argument("--pred-cap-pos-col", default="pred_afrr_capacity_price_pos")
@@ -3792,6 +3997,14 @@ def main() -> None:
             )
             scenarios.append((name, wh, list(scenario_bin_map[name])))
 
+    normalized_benchmark_mode, requested_benchmark_paths = resolve_benchmark_paths(
+        str(args.benchmark_mode),
+        enable_naive=args.enable_naive,
+        enable_rolling_pf=args.enable_rhpf,
+        enable_global_pf=args.enable_ghpf,
+        enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
+    )
+
     MODEL_SPECS["reserve_activation_headroom_h"] = float(args.reserve_activation_headroom_h)
     MODEL_SPECS["bem_activation_headroom_h"] = float(args.bem_activation_headroom_h)
     MARKET_SPECS["afrr_activation_rate_guard_quantile"] = str(afrr_activation_rate_guard_quantile)
@@ -3867,6 +4080,8 @@ def main() -> None:
     perf_rows_all: list[pd.DataFrame] = []
     daily_perf_rows_all: list[pd.DataFrame] = []
     perf_recon_debug_rows_all: list[pd.DataFrame] = []
+    perf_paths_long_all: list[pd.DataFrame] = []
+    daily_perf_paths_long_all: list[pd.DataFrame] = []
     resolved_id_mode = str(args.id_mode).strip().lower()
     resolved_id_recourse_mode = str(args.id_recourse_mode).strip().lower()
     if (
@@ -3953,6 +4168,10 @@ def main() -> None:
                     id_recourse_mode=resolved_id_recourse_mode,
                     strict_simulation_validity=bool(args.strict_simulation_validity),
                     enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
+                    benchmark_mode=normalized_benchmark_mode,
+                    enable_naive=args.enable_naive,
+                    enable_rolling_pf=args.enable_rhpf,
+                    enable_global_pf=args.enable_ghpf,
                     bcm_bid_hour_local=int(args.bcm_bid_hour_local),
                     checkpoint_dir=checkpoint_dir,
                     write_checkpoints=bool(args.write_checkpoints),
@@ -4621,6 +4840,15 @@ def main() -> None:
             "ev_audit_row_count": float(ev_audit_stats.get("ev_audit_row_count", 0.0)),
             "ev_audit_max_bcm_formula_error": float(ev_audit_stats.get("ev_audit_max_bcm_formula_error", 0.0)),
             "ev_audit_max_bem_formula_error": float(ev_audit_stats.get("ev_audit_max_bem_formula_error", 0.0)),
+            "benchmark_mode": str(normalized_benchmark_mode),
+            "enabled_paths": ",".join([p for p, enabled in requested_benchmark_paths.items() if enabled]),
+            "disabled_paths": ",".join([p for p, enabled in requested_benchmark_paths.items() if not enabled]),
+            "model_available": float(requested_benchmark_paths.get("model", False)),
+            "naive_available": float(requested_benchmark_paths.get("naive", False)),
+            "rolling_pf_available": float(requested_benchmark_paths.get("rhpf", False)),
+            "rhpf_available": float(requested_benchmark_paths.get("rhpf", False)),
+            "global_pf_available": float(requested_benchmark_paths.get("ghpf", False)),
+            "ghpf_available": float(requested_benchmark_paths.get("ghpf", False)),
             "output_write_seconds": 0.0,
         }
         defaulted_fields: list[str] = []
@@ -4733,6 +4961,20 @@ def main() -> None:
             daily_performance_json_path.write_text(daily_df.to_json(orient="records", indent=2), encoding="utf-8")
             perf_rows_all.append(perf_df.assign(scenario_path=str(scenario_out_dir)))
             daily_perf_rows_all.append(daily_df.assign(scenario_path=str(scenario_out_dir)))
+            paths_long_df = _build_performance_paths_long(
+                isolated_hourly=outputs.isolated_hourly,
+                summary=outputs.summary,
+                args=args,
+                scenario_name=scenario_name,
+                scenario_bins=scenario_bins,
+            )
+            daily_paths_long_df = _build_daily_performance_paths_long(paths_long_df)
+            paths_long_df.to_csv(scenario_out_dir / "performance_paths_long.csv", index=False)
+            paths_long_df.to_parquet(scenario_out_dir / "performance_paths_long.parquet", index=False)
+            daily_paths_long_df.to_csv(scenario_out_dir / "daily_performance_paths_long.csv", index=False)
+            daily_paths_long_df.to_parquet(scenario_out_dir / "daily_performance_paths_long.parquet", index=False)
+            perf_paths_long_all.append(paths_long_df.assign(scenario_path=str(scenario_out_dir)))
+            daily_perf_paths_long_all.append(daily_paths_long_df.assign(scenario_path=str(scenario_out_dir)))
         with _phase_watchdog("write_state_machine_audit"):
             state_machine_audit_path.write_text(json.dumps(_build_state_machine_audit(outputs.hourly), indent=2), encoding="utf-8")
         with _phase_watchdog("build_and_write_diagnostics"):
@@ -4876,6 +5118,12 @@ def main() -> None:
         outputs.summary["output_write_seconds"] = float(max(0.0, time.monotonic() - output_write_started))
         with _phase_watchdog("write_summary_json"):
             summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
+        with _phase_watchdog("write_benchmark_path_outputs"):
+            _write_benchmark_path_outputs(
+                scenario_out_dir=scenario_out_dir,
+                isolated_hourly=outputs.isolated_hourly,
+                summary=outputs.summary,
+            )
 
         print(f"[OK] Battery backtest completed for scenario={scenario_name}.")
         ts_col = colmap.timestamp if colmap.timestamp in outputs.hourly.columns else None
@@ -5000,6 +5248,13 @@ def main() -> None:
             "da_quantile_role": args.da_quantile_role,
             "realized_total_pnl_eur": outputs.summary.get("realized_total_pnl_eur"),
             "predicted_total_pnl_eur": outputs.summary.get("predicted_total_pnl_eur"),
+            "model_available": outputs.summary.get("model_available"),
+            "naive_available": outputs.summary.get("naive_available"),
+            "rolling_pf_available": outputs.summary.get("rolling_pf_available"),
+            "global_pf_available": outputs.summary.get("global_pf_available"),
+            "benchmark_mode": outputs.summary.get("benchmark_mode", normalized_benchmark_mode),
+            "enabled_paths": outputs.summary.get("enabled_paths"),
+            "disabled_paths": outputs.summary.get("disabled_paths"),
             "naive_total_pnl_eur": outputs.summary.get("naive_total_pnl_eur"),
             "rolling_perfect_foresight_same_rules_total_pnl_eur": outputs.summary.get(
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
@@ -5081,6 +5336,20 @@ def main() -> None:
         daily_all_csv = out_dir / "daily_performance_metrics_all_scenarios.csv"
         daily_all.to_csv(daily_all_csv, index=False)
         print(f"[OK] Daily performance metrics (all scenarios): {daily_all_csv}")
+    if perf_paths_long_all:
+        paths_all = pd.concat(perf_paths_long_all, ignore_index=True, sort=False)
+        paths_all_csv = out_dir / "performance_paths_long.csv"
+        paths_all_parquet = out_dir / "performance_paths_long.parquet"
+        paths_all.to_csv(paths_all_csv, index=False)
+        paths_all.to_parquet(paths_all_parquet, index=False)
+        print(f"[OK] Long-format performance paths: {paths_all_csv}")
+    if daily_perf_paths_long_all:
+        daily_paths_all = pd.concat(daily_perf_paths_long_all, ignore_index=True, sort=False)
+        daily_paths_all_csv = out_dir / "daily_performance_paths_long.csv"
+        daily_paths_all_parquet = out_dir / "daily_performance_paths_long.parquet"
+        daily_paths_all.to_csv(daily_paths_all_csv, index=False)
+        daily_paths_all.to_parquet(daily_paths_all_parquet, index=False)
+        print(f"[OK] Daily long-format performance paths: {daily_paths_all_csv}")
     if perf_recon_debug_rows_all:
         recon_all = pd.concat(perf_recon_debug_rows_all, ignore_index=True, sort=False)
         recon_all_csv = out_dir / "performance_metric_reconciliation_debug_all.csv"
