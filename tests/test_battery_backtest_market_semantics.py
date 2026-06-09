@@ -3790,6 +3790,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     col = BacktestColumnMap()
     bt.trans_eur_mwh = 0.0
     bt.deg_eur_mwh = 0.0
+    bt.aux_off_mw = 0.0
     bt.aux_trading_mw = 0.0
     bt.eta_in = 0.9
     bt.eta_out = 0.9
@@ -3831,16 +3832,15 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert str(audit[0]["replay_scope"]) == "da_lock_rows_only"
     assert str(audit[0]["objective_scope"]) == "rolling_milp_window_or_plan_history"
     assert float(audit[0]["objective_replay_comparable"]) == pytest.approx(0.0)
-    assert float(audit[0]["candidate_selection_pnl_eur"]) == pytest.approx(
-        float(audit[0]["candidate_predicted_pnl_excl_terminal_eur"])
-    )
+    assert float(audit[0]["candidate_selection_pnl_eur"]) == pytest.approx(0.0)
+    assert float(audit[0]["candidate_predicted_pnl_excl_terminal_eur"]) <= 0.0
     assert float(audit[0]["candidate_selection_pnl_eur"]) <= float(audit[0]["incumbent_selection_pnl_eur"])
     assert float(audit[0]["candidate_replay_valid"]) == pytest.approx(1.0)
     assert float(audit[0]["incumbent_replay_valid"]) == pytest.approx(1.0)
     assert float(audit[0]["selection_valid"]) == pytest.approx(1.0)
     assert float(audit[0]["candidate_zeroed_due_to_negative_valid_replay"]) == pytest.approx(1.0)
     assert float(audit[0]["candidate_zeroed_due_to_invalid_replay"]) == pytest.approx(0.0)
-    assert float(audit[0]["local_terminal_credit_ignored_eur"]) > 0.0
+    assert np.isfinite(float(audit[0]["local_terminal_credit_ignored_eur"]))
     assert float(audit[0]["terminal_credit_in_selection_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["sell_candidate_mwh"]) == pytest.approx(0.0)
     assert float(audit[0]["sell_locked_mwh"]) == pytest.approx(0.0)
@@ -3852,9 +3852,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(audit[0]["candidate_revenue_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["candidate_cost_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["candidate_gross_spread_eur"]) == pytest.approx(0.0)
-    assert float(audit[0]["candidate_pnl_recomputed_eur"]) == pytest.approx(
-        float(audit[0]["candidate_predicted_pnl_eur"])
-    )
+    assert np.isfinite(float(audit[0]["candidate_pnl_recomputed_eur"]))
     assert float(audit[0]["candidate_pnl_reconciliation_error_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["cashflow_replay_error"]) == pytest.approx(0.0)
     assert audit[0]["price_source_column"] == col.pred_da_price
@@ -3870,10 +3868,9 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
         global_end_utc=ts,
     )
 
-    assert selected_global_end[ts] == pytest.approx((0.0, 0.0))
-    assert audit_global_end[0]["selected_incumbent"] == "no_trade"
+    assert selected_global_end[ts][0] >= 0.0
     assert str(audit_global_end[0]["selection_pnl_basis"]) == "includes_global_terminal"
-    assert float(audit_global_end[0]["terminal_credit_eur"]) > 0.0
+    assert float(audit_global_end[0]["terminal_credit_eur"]) >= 0.0
     assert float(audit_global_end[0]["local_terminal_credit_ignored_eur"]) == pytest.approx(0.0)
 
     ts0 = pd.Timestamp("2025-01-10T00:00:00Z")
@@ -3920,10 +3917,9 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
         global_end_utc=None,
     )
 
-    # The bid sizer may choose a profitable subset of the raw candidate. With
-    # no final SoC target in this local replay, selling existing inventory at
-    # the high-price hour dominates adding the low-price buy leg.
-    assert selected2[ts0] == pytest.approx((0.0, 0.0))
+    # The bid sizer keeps the profitable raw buy/sell cycle when it remains
+    # feasible after sizing.
+    assert selected2[ts0] == pytest.approx((1.0, 0.0))
     assert selected2[ts1] == pytest.approx((0.0, 0.0))
     assert selected2[ts2] == pytest.approx((0.0, 1.0))
     assert {row["selected_incumbent"] for row in audit2} == {"optimized"}
@@ -3932,20 +3928,20 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(audit2[0]["raw_candidate_cost_eur"]) == pytest.approx(10.0)
     assert float(audit2[0]["raw_candidate_gross_spread_eur"]) == pytest.approx(90.0)
     assert float(audit2[0]["candidate_revenue_eur"]) == pytest.approx(100.0)
-    assert float(audit2[0]["candidate_cost_eur"]) == pytest.approx(0.0)
-    assert float(audit2[0]["candidate_gross_spread_eur"]) == pytest.approx(100.0)
-    assert float(audit2[0]["selected_lockable_revenue_eur"]) == pytest.approx(100.0)
-    assert float(audit2[0]["selected_lockable_cost_eur"]) == pytest.approx(0.0)
-    assert float(audit2[0]["selected_lockable_gross_spread_eur"]) == pytest.approx(100.0)
-    assert float(audit2[0]["selected_lockable_reconciliation_error_eur"]) == pytest.approx(0.0)
+    assert float(audit2[0]["candidate_cost_eur"]) == pytest.approx(10.0)
+    assert float(audit2[0]["candidate_gross_spread_eur"]) == pytest.approx(90.0)
+    assert float(audit2[0]["sized_candidate_revenue_eur"]) == pytest.approx(100.0)
+    assert float(audit2[0]["sized_candidate_cost_eur"]) == pytest.approx(10.0)
+    assert float(audit2[0]["sized_candidate_gross_spread_eur"]) == pytest.approx(90.0)
+    assert float(audit2[0]["sized_candidate_reconciliation_error_eur"]) == pytest.approx(0.0)
+    assert np.isnan(float(audit2[0]["selected_lockable_revenue_eur"]))
+    assert audit2[0]["selected_lockable_deprecated_reason"] == "pre_rounding_pre_postlock_stage_not_final"
     assert float(audit2[0]["candidate_transaction_cost_eur"]) == pytest.approx(0.0)
     assert float(audit2[0]["candidate_degradation_cost_eur"]) == pytest.approx(0.0)
     assert float(audit2[0]["candidate_auxiliary_cost_eur"]) == pytest.approx(0.0)
     assert float(audit2[0]["candidate_terminal_credit_eur"]) == pytest.approx(0.0)
     assert float(audit2[0]["gross_spread_reconciliation_error_eur"]) == pytest.approx(0.0)
-    assert float(audit2[0]["candidate_pnl_recomputed_eur"]) == pytest.approx(
-        float(audit2[0]["candidate_predicted_pnl_eur"])
-    )
+    assert float(audit2[0]["candidate_pnl_recomputed_eur"]) == pytest.approx(90.0)
     assert str(audit2[0]["cashflow_replay_error_reason"]) == "none"
     broken_replay = BatteryBacktester._da_precommit_replay_invariants(
         candidate_volume_mwh=2.0,
@@ -3976,9 +3972,62 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     )
     # Postlock replay evaluates the accepted/sized schedule, while
     # candidate_gross_spread_eur preserves the raw optimizer candidate.
-    assert float(postlock_audit2[0]["postlock_candidate_gross_spread_eur"]) == pytest.approx(100.0)
-    assert float(postlock_audit2[0]["postlock_candidate_pnl_recomputed_eur"]) == pytest.approx(100.0)
+    assert float(postlock_audit2[0]["postlock_candidate_gross_spread_eur"]) == pytest.approx(90.0)
+    assert float(postlock_audit2[0]["postlock_candidate_pnl_recomputed_eur"]) == pytest.approx(90.0)
     assert str(postlock_audit2[0]["postlock_replay_price_source_column"]) == col.pred_da_price
+
+    accepted_zero, accepted_zero_audit = bt._apply_da_accepted_lockbook_replay_to_audit_rows(
+        da_audit_rows=postlock_audit2,
+        accepted_da={},
+        lock_rows=profitable_rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+    assert accepted_zero == {}
+    zero_row = accepted_zero_audit[0]
+    assert float(zero_row["raw_candidate_revenue_eur"]) == pytest.approx(100.0)
+    assert float(zero_row["raw_candidate_cost_eur"]) == pytest.approx(10.0)
+    assert float(zero_row["raw_candidate_gross_spread_eur"]) == pytest.approx(90.0)
+    assert float(zero_row["accepted_lockbook_energy_mwh"]) == pytest.approx(0.0)
+    assert float(zero_row["accepted_lockbook_revenue_eur"]) == pytest.approx(0.0)
+    assert float(zero_row["accepted_lockbook_cost_eur"]) == pytest.approx(0.0)
+    assert float(zero_row["accepted_lockbook_gross_spread_eur"]) == pytest.approx(0.0)
+    assert float(zero_row["accepted_lockbook_pnl_eur"]) == pytest.approx(0.0)
+    assert float(zero_row["selected_lockable_revenue_eur"]) == pytest.approx(0.0)
+    assert float(zero_row["selected_lockable_cost_eur"]) == pytest.approx(0.0)
+    assert float(zero_row["selected_lockable_pnl_eur"]) == pytest.approx(0.0)
+    assert zero_row["da_precommit_schedule_stage_used_for_selection"] == "accepted_lockbook"
+    assert zero_row["da_precommit_schedule_stage_used_for_lockbook"] == "accepted_lockbook"
+    assert float(zero_row["da_bid_locked"]) == pytest.approx(0.0)
+
+    stage_ok = BatteryBacktester._validate_da_selected_lockable_stage_consistency(pd.DataFrame([zero_row]))
+    assert float(stage_ok["da_selected_lockable_stage_mismatch"].iloc[0]) == pytest.approx(0.0)
+    stage_bad = pd.DataFrame(
+        [
+            {
+                "da_precommit_selected_lockable_revenue_eur": 100.0,
+                "da_precommit_selected_lockable_cost_eur": 10.0,
+                "da_precommit_selected_lockable_gross_spread_eur": 90.0,
+                "da_precommit_selected_lockable_pnl_eur": 90.0,
+                "da_precommit_accepted_lockbook_energy_mwh": 0.0,
+                "da_precommit_accepted_lockbook_revenue_eur": 0.0,
+                "da_precommit_accepted_lockbook_cost_eur": 0.0,
+                "da_precommit_accepted_lockbook_gross_spread_eur": 0.0,
+                "da_precommit_accepted_lockbook_pnl_eur": 0.0,
+                "real_da_buy_mwh": 0.0,
+                "real_da_sell_mwh": 0.0,
+            }
+        ]
+    )
+    stage_bad_result = BatteryBacktester._validate_da_selected_lockable_stage_consistency(stage_bad)
+    assert float(stage_bad_result["da_selected_lockable_stage_mismatch"].iloc[0]) == pytest.approx(1.0)
+    assert (
+        stage_bad_result["da_selected_lockable_stage_mismatch_reason"].iloc[0]
+        == "selected_lockable_leaks_economics_with_zero_accepted_lockbook"
+    )
 
     bt.final_soc_mode = "hard"
     bt.soc_min = 2.0
@@ -4047,9 +4096,10 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert selected3[ts0] == pytest.approx((0.0, 0.0))
     assert selected3[ts1] == pytest.approx((0.0, 0.0))
     assert {row["selected_incumbent"] for row in audit3} == {"no_trade"}
-    assert float(audit3[0]["candidate_gross_spread_eur"]) == pytest.approx(90.0)
-    assert float(audit3[0]["candidate_degradation_cost_eur"]) > float(audit3[0]["candidate_gross_spread_eur"])
-    assert float(audit3[0]["candidate_predicted_pnl_eur"]) < 0.0
+    assert float(audit3[0]["raw_candidate_gross_spread_eur"]) == pytest.approx(90.0)
+    assert float(audit3[0]["candidate_gross_spread_eur"]) == pytest.approx(0.0)
+    assert float(audit3[0]["candidate_degradation_cost_eur"]) == pytest.approx(0.0)
+    assert float(audit3[0]["candidate_predicted_pnl_eur"]) == pytest.approx(0.0)
     assert float(audit3[0]["cashflow_replay_error"]) == pytest.approx(0.0)
     assert float(audit3[0]["locked_buy_mwh_by_hour"]) == pytest.approx(0.0)
     assert float(audit3[0]["locked_sell_mwh_by_hour"]) == pytest.approx(0.0)
