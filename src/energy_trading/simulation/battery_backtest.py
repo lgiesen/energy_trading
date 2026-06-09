@@ -4251,8 +4251,349 @@ class BatteryBacktester:
                         "passed" if bool(selected_feasible) else str(candidate_rejection_reason)
                     ),
                 }
-            )
+        )
         return selected, rows_out
+
+    def _check_da_hourly_lock_physical_feasibility(
+        self,
+        *,
+        future_rows: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        current_soc_mwh: float,
+        existing_da_lockbook: dict[pd.Timestamp, tuple[float, float]] | None,
+        candidate_da: dict[pd.Timestamp, tuple[float, float]] | None,
+        fixed_reserve_pos: dict[pd.Timestamp, float] | None = None,
+        fixed_reserve_neg: dict[pd.Timestamp, float] | None = None,
+        global_end_utc: pd.Timestamp | None = None,
+        include_existing_lockbook: bool = True,
+        schedule_source: str = "selected_lockable",
+        tol_mwh: float = 1e-6,
+    ) -> tuple[bool, dict[str, object], dict[pd.Timestamp, dict[str, float | str]]]:
+        """Authoritative pre-lock replay for exact DA lockbook physical executability."""
+        existing_normalized: dict[pd.Timestamp, tuple[float, float]] = {}
+        if include_existing_lockbook:
+            for ts, pair in dict(existing_da_lockbook or {}).items():
+                tsu = pd.to_datetime(ts, utc=True, errors="coerce")
+                if pd.notna(tsu):
+                    existing_normalized[tsu] = self._normalize_da_bid(*pair)
+
+        candidate_normalized: dict[pd.Timestamp, tuple[float, float]] = {}
+        for ts, pair in dict(candidate_da or {}).items():
+            tsu = pd.to_datetime(ts, utc=True, errors="coerce")
+            if pd.notna(tsu):
+                candidate_normalized[tsu] = self._normalize_da_bid(*pair)
+        candidate_ts: set[pd.Timestamp] = set(candidate_normalized)
+
+        by_ts: dict[pd.Timestamp, dict[str, float | str]] = {}
+        base_diag: dict[str, object] = {
+            "da_hourly_lock_feasibility_checked_before_lock": 1.0,
+            "da_hourly_lock_feasibility_passed_before_lock": 1.0,
+            "da_hourly_lock_infeasible_timestamp_utc": "",
+            "da_hourly_lock_infeasible_reason": "none",
+            "da_candidate_rejected_hourly_lock_infeasible": 0.0,
+            "da_candidate_rejected_hourly_lock_infeasible_timestamp_utc": "",
+            "da_candidate_rejected_hourly_lock_infeasible_reason": "none",
+            "da_lockbook_physical_replay_schedule_source": str(schedule_source),
+            "da_lockbook_physical_replay_existing_lockbook_included": float(bool(include_existing_lockbook)),
+            "da_lockbook_physical_replay_candidate_included": float(bool(candidate_ts)),
+            "da_lockbook_physical_replay_projected_final_soc_mwh": float(current_soc_mwh),
+            "da_candidate_overlaps_existing_lockbook": 0.0,
+            "da_candidate_overlaps_existing_lockbook_timestamp_utc": "",
+            "da_candidate_overlaps_existing_lockbook_reason": "none",
+            "da_candidate_overlap_resolution": "none",
+            "da_candidate_duplicate_existing_lockbook_timestamp": 0.0,
+            "da_candidate_existing_lockbook_buy_mw": 0.0,
+            "da_candidate_existing_lockbook_sell_mw": 0.0,
+            "da_candidate_overlap_candidate_buy_mw": 0.0,
+            "da_candidate_overlap_candidate_sell_mw": 0.0,
+            "da_existing_lockbook_physical_feasibility_checked": float(bool(include_existing_lockbook)),
+            "da_existing_lockbook_physical_feasibility_passed": 1.0,
+            "da_existing_lockbook_physical_infeasible_timestamp_utc": "",
+            "da_existing_lockbook_physical_infeasible_reason": "none",
+            "da_combined_lockbook_physical_feasibility_checked": 1.0,
+            "da_combined_lockbook_physical_feasibility_passed": 1.0,
+            "da_combined_lockbook_physical_infeasible_timestamp_utc": "",
+            "da_combined_lockbook_physical_infeasible_reason": "none",
+            "da_hourly_lock_infeasibility_origin": "none",
+        }
+
+        combined_normalized = dict(existing_normalized)
+        overlap_ts = sorted(set(existing_normalized).intersection(candidate_normalized))
+        overlap_diag: dict[str, object] = {}
+        for ts in overlap_ts:
+            existing_buy, existing_sell = existing_normalized[ts]
+            candidate_buy, candidate_sell = candidate_normalized[ts]
+            existing_buy = max(0.0, float(existing_buy))
+            existing_sell = max(0.0, float(existing_sell))
+            candidate_buy = max(0.0, float(candidate_buy))
+            candidate_sell = max(0.0, float(candidate_sell))
+            duplicate = (
+                abs(existing_buy - candidate_buy) <= float(tol_mwh)
+                and abs(existing_sell - candidate_sell) <= float(tol_mwh)
+            )
+            existing_has_buy = existing_buy > float(tol_mwh)
+            existing_has_sell = existing_sell > float(tol_mwh)
+            candidate_has_buy = candidate_buy > float(tol_mwh)
+            candidate_has_sell = candidate_sell > float(tol_mwh)
+            if duplicate:
+                resolution = "exact_duplicate_ignored"
+                combined_normalized[ts] = (existing_buy, existing_sell)
+            elif (existing_has_buy or candidate_has_buy) and not (existing_has_sell or candidate_has_sell):
+                resolution = "same_direction_aggregated"
+                combined_normalized[ts] = (existing_buy + candidate_buy, 0.0)
+            elif (existing_has_sell or candidate_has_sell) and not (existing_has_buy or candidate_has_buy):
+                resolution = "same_direction_aggregated"
+                combined_normalized[ts] = (0.0, existing_sell + candidate_sell)
+            else:
+                resolution = "opposite_direction_rejected"
+            if not overlap_diag:
+                overlap_diag = {
+                    "da_candidate_overlaps_existing_lockbook": 1.0,
+                    "da_candidate_overlaps_existing_lockbook_timestamp_utc": str(ts),
+                    "da_candidate_overlaps_existing_lockbook_reason": "candidate_overlaps_existing_da_lockbook",
+                    "da_candidate_overlap_resolution": resolution,
+                    "da_candidate_duplicate_existing_lockbook_timestamp": float(bool(duplicate)),
+                    "da_candidate_existing_lockbook_buy_mw": float(existing_buy),
+                    "da_candidate_existing_lockbook_sell_mw": float(existing_sell),
+                    "da_candidate_overlap_candidate_buy_mw": float(candidate_buy),
+                    "da_candidate_overlap_candidate_sell_mw": float(candidate_sell),
+                }
+            if resolution == "opposite_direction_rejected":
+                overlap_diag = {
+                    "da_candidate_overlaps_existing_lockbook": 1.0,
+                    "da_candidate_overlaps_existing_lockbook_timestamp_utc": str(ts),
+                    "da_candidate_overlaps_existing_lockbook_reason": "candidate_overlaps_existing_da_lockbook",
+                    "da_candidate_overlap_resolution": resolution,
+                    "da_candidate_duplicate_existing_lockbook_timestamp": 0.0,
+                    "da_candidate_existing_lockbook_buy_mw": float(existing_buy),
+                    "da_candidate_existing_lockbook_sell_mw": float(existing_sell),
+                    "da_candidate_overlap_candidate_buy_mw": float(candidate_buy),
+                    "da_candidate_overlap_candidate_sell_mw": float(candidate_sell),
+                }
+                break
+        for ts, pair in candidate_normalized.items():
+            if ts not in combined_normalized:
+                combined_normalized[ts] = pair
+        if overlap_diag:
+            base_diag.update(overlap_diag)
+        if str(overlap_diag.get("da_candidate_overlap_resolution", "")) == "opposite_direction_rejected":
+            ts = pd.to_datetime(
+                overlap_diag.get("da_candidate_overlaps_existing_lockbook_timestamp_utc", ""),
+                utc=True,
+                errors="coerce",
+            )
+            if pd.isna(ts):
+                ts = overlap_ts[0]
+            rec: dict[str, float | str] = {
+                "da_hourly_lock_feasibility_checked_before_lock": 1.0,
+                "da_hourly_lock_feasibility_passed_before_lock": 0.0,
+                "da_hourly_lock_projected_soc_start_mwh": float(current_soc_mwh),
+                "da_hourly_lock_projected_soc_end_mwh": float(current_soc_mwh),
+                "da_hourly_lock_max_feasible_buy_mwh": np.nan,
+                "da_hourly_lock_max_feasible_sell_mwh": np.nan,
+                "da_hourly_lock_infeasible_buy_mwh": 0.0,
+                "da_hourly_lock_infeasible_sell_mwh": 0.0,
+                "da_hourly_lock_infeasible_timestamp_utc": str(ts),
+                "da_hourly_lock_infeasible_reason": "candidate_overlaps_existing_da_lockbook",
+                "da_candidate_rejected_hourly_lock_infeasible": 1.0,
+                "da_candidate_rejected_hourly_lock_infeasible_timestamp_utc": str(ts),
+                "da_candidate_rejected_hourly_lock_infeasible_reason": "candidate_overlaps_existing_da_lockbook",
+                "da_existing_lockbook_physical_feasibility_checked": float(bool(include_existing_lockbook)),
+                "da_existing_lockbook_physical_feasibility_passed": 1.0,
+                "da_combined_lockbook_physical_feasibility_checked": 0.0,
+                "da_combined_lockbook_physical_feasibility_passed": 0.0,
+                "da_combined_lockbook_physical_infeasible_timestamp_utc": str(ts),
+                "da_combined_lockbook_physical_infeasible_reason": "candidate_overlaps_existing_da_lockbook",
+                "da_hourly_lock_infeasibility_origin": "candidate_overlaps_existing_lockbook",
+                "da_lockbook_physical_replay_schedule_source": str(schedule_source),
+                "da_lockbook_physical_replay_existing_lockbook_included": float(bool(include_existing_lockbook)),
+                "da_lockbook_physical_replay_candidate_included": 1.0,
+            }
+            rec.update(overlap_diag)
+            by_ts[ts] = rec
+            diag = dict(base_diag)
+            diag.update(rec)
+            return False, diag, by_ts
+
+        if future_rows is None or future_rows.empty:
+            return True, base_diag, by_ts
+
+        rows = future_rows.copy()
+        if colmap.timestamp not in rows.columns:
+            return True, base_diag, by_ts
+        rows[colmap.timestamp] = pd.to_datetime(rows[colmap.timestamp], utc=True, errors="coerce")
+        rows = rows.dropna(subset=[colmap.timestamp]).sort_values(colmap.timestamp)
+        if rows.empty:
+            return True, base_diag, by_ts
+
+        fixed_reserve_pos = dict(fixed_reserve_pos or {})
+        fixed_reserve_neg = dict(fixed_reserve_neg or {})
+        global_end = pd.to_datetime(global_end_utc, utc=True, errors="coerce") if global_end_utc is not None else pd.NaT
+
+        def _replay(
+            schedule: dict[pd.Timestamp, tuple[float, float]],
+            *,
+            candidate_included: bool,
+        ) -> tuple[bool, dict[str, object], dict[pd.Timestamp, dict[str, float | str]]]:
+            replay_by_ts: dict[pd.Timestamp, dict[str, float | str]] = {}
+            soc = float(current_soc_mwh)
+
+            def _fail(
+                ts: pd.Timestamp,
+                reason: str,
+                rec: dict[str, float | str],
+            ) -> tuple[bool, dict[str, object], dict[pd.Timestamp, dict[str, float | str]]]:
+                rec["da_hourly_lock_feasibility_passed_before_lock"] = 0.0
+                rec["da_hourly_lock_infeasible_timestamp_utc"] = str(ts)
+                rec["da_hourly_lock_infeasible_reason"] = str(reason)
+                rec["da_candidate_rejected_hourly_lock_infeasible"] = 1.0
+                rec["da_candidate_rejected_hourly_lock_infeasible_timestamp_utc"] = str(ts)
+                rec["da_candidate_rejected_hourly_lock_infeasible_reason"] = str(reason)
+                replay_by_ts[ts] = rec
+                diag = dict(base_diag)
+                diag.update(
+                    {
+                        "da_hourly_lock_feasibility_passed_before_lock": 0.0,
+                        "da_hourly_lock_infeasible_timestamp_utc": str(ts),
+                        "da_hourly_lock_infeasible_reason": str(reason),
+                        "da_candidate_rejected_hourly_lock_infeasible": 1.0,
+                        "da_candidate_rejected_hourly_lock_infeasible_timestamp_utc": str(ts),
+                        "da_candidate_rejected_hourly_lock_infeasible_reason": str(reason),
+                        "da_lockbook_physical_replay_candidate_included": float(bool(candidate_included)),
+                        "da_lockbook_physical_replay_projected_final_soc_mwh": float(
+                            rec.get("da_hourly_lock_projected_soc_end_mwh", soc)
+                        ),
+                    }
+                )
+                return False, diag, replay_by_ts
+
+            for _, row in rows.iterrows():
+                ts = pd.to_datetime(row[colmap.timestamp], utc=True, errors="coerce")
+                if pd.isna(ts):
+                    continue
+                ch_mw, dis_mw = self._normalize_da_bid(*schedule.get(ts, (0.0, 0.0)))
+                locked_buy_mwh = max(0.0, float(ch_mw)) * float(self.dt_h)
+                locked_sell_mwh = max(0.0, float(dis_mw)) * float(self.dt_h)
+                soc_start = float(soc)
+                max_buy_mwh = max(0.0, (float(self.soc_max) - soc_start) / max(float(self.eta_in), 1e-12))
+                max_sell_mwh = max(0.0, (soc_start - float(self.soc_min)) * max(float(self.eta_out), 1e-12))
+                rec: dict[str, float | str] = {
+                    "da_hourly_lock_feasibility_checked_before_lock": 1.0,
+                    "da_hourly_lock_feasibility_passed_before_lock": 1.0,
+                    "da_hourly_lock_projected_soc_start_mwh": float(soc_start),
+                    "da_hourly_lock_projected_soc_end_mwh": float(soc_start),
+                    "da_hourly_lock_max_feasible_buy_mwh": float(max_buy_mwh),
+                    "da_hourly_lock_max_feasible_sell_mwh": float(max_sell_mwh),
+                    "da_hourly_lock_infeasible_buy_mwh": 0.0,
+                    "da_hourly_lock_infeasible_sell_mwh": 0.0,
+                    "da_hourly_lock_infeasible_timestamp_utc": "",
+                    "da_hourly_lock_infeasible_reason": "none",
+                    "da_candidate_rejected_hourly_lock_infeasible": 0.0,
+                    "da_candidate_rejected_hourly_lock_infeasible_timestamp_utc": "",
+                    "da_candidate_rejected_hourly_lock_infeasible_reason": "none",
+                    "da_lockbook_physical_replay_schedule_source": str(schedule_source),
+                    "da_lockbook_physical_replay_existing_lockbook_included": float(bool(include_existing_lockbook)),
+                    "da_lockbook_physical_replay_candidate_included": float(ts in candidate_ts and candidate_included),
+                }
+                if locked_buy_mwh > max_buy_mwh + float(tol_mwh):
+                    rec["da_hourly_lock_infeasible_buy_mwh"] = float(locked_buy_mwh - max_buy_mwh)
+                    return _fail(ts, "locked_da_buy_exceeds_soc_headroom", rec)
+                if locked_sell_mwh > max_sell_mwh + float(tol_mwh):
+                    rec["da_hourly_lock_infeasible_sell_mwh"] = float(locked_sell_mwh - max_sell_mwh)
+                    return _fail(ts, "locked_da_sell_exceeds_available_energy", rec)
+                if locked_buy_mwh > float(tol_mwh) and locked_sell_mwh > float(tol_mwh):
+                    return _fail(ts, "simultaneous_da_buy_sell_lock_infeasible", rec)
+
+                ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
+                ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
+                rate_pos = float(pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                rate_neg = float(pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                aux_power_mw, _ = self._state_aux_power_mw(
+                    charge_mw=float(ch_mw),
+                    discharge_mw=float(dis_mw),
+                    reserve_pos_mw=float(ob_pos),
+                    reserve_neg_mw=float(ob_neg),
+                    act_pos_rate=float(rate_pos),
+                    act_neg_rate=float(rate_neg),
+                    id_charge_mw=0.0,
+                    id_discharge_mw=0.0,
+                )
+                delta, _ = self._calculate_soc_delta(
+                    charge_mw=float(ch_mw),
+                    discharge_mw=float(dis_mw),
+                    id_charge_mw=0.0,
+                    id_discharge_mw=0.0,
+                    act_pos_mwh=max(0.0, ob_pos * max(0.0, min(1.0, rate_pos)) * float(self.dt_h)),
+                    act_neg_mwh=max(0.0, ob_neg * max(0.0, min(1.0, rate_neg)) * float(self.dt_h)),
+                    aux_mwh=max(0.0, float(aux_power_mw) * float(self.dt_h)),
+                    battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                    dt_h=float(self.dt_h),
+                )
+                soc = float(soc_start) + float(delta)
+                rec["da_hourly_lock_projected_soc_end_mwh"] = float(soc)
+                if soc < float(self.soc_min) - float(tol_mwh):
+                    rec["da_hourly_lock_infeasible_sell_mwh"] = float(float(self.soc_min) - soc)
+                    return _fail(ts, "locked_da_projected_soc_below_min", rec)
+                if soc > float(self.soc_max) + float(tol_mwh):
+                    rec["da_hourly_lock_infeasible_buy_mwh"] = float(soc - float(self.soc_max))
+                    return _fail(ts, "locked_da_projected_soc_above_max", rec)
+                replay_by_ts[ts] = rec
+                if pd.notna(global_end) and ts == global_end and soc < float(self.soc_target_end) - float(tol_mwh):
+                    return _fail(ts, "locked_da_final_soc_below_target", rec)
+
+            diag = dict(base_diag)
+            diag["da_lockbook_physical_replay_candidate_included"] = float(bool(candidate_included))
+            diag["da_lockbook_physical_replay_projected_final_soc_mwh"] = float(soc)
+            return True, diag, replay_by_ts
+
+        existing_ok, existing_diag, existing_by_ts = _replay(
+            existing_normalized,
+            candidate_included=False,
+        )
+        if not bool(existing_ok):
+            by_ts.update(existing_by_ts)
+            diag = dict(existing_diag)
+            reason = str(existing_diag.get("da_hourly_lock_infeasible_reason", "existing_lockbook_infeasible"))
+            ts = str(existing_diag.get("da_hourly_lock_infeasible_timestamp_utc", ""))
+            diag.update(
+                {
+                    "da_existing_lockbook_physical_feasibility_checked": 1.0,
+                    "da_existing_lockbook_physical_feasibility_passed": 0.0,
+                    "da_existing_lockbook_physical_infeasible_timestamp_utc": ts,
+                    "da_existing_lockbook_physical_infeasible_reason": reason,
+                    "da_combined_lockbook_physical_feasibility_checked": 0.0,
+                    "da_combined_lockbook_physical_feasibility_passed": 0.0,
+                    "da_hourly_lock_infeasibility_origin": "existing_lockbook_already_infeasible",
+                }
+            )
+            return False, diag, by_ts
+
+        combined_ok, combined_diag, combined_by_ts = _replay(
+            combined_normalized,
+            candidate_included=True,
+        )
+        by_ts.update(combined_by_ts)
+        diag = dict(combined_diag)
+        diag.update(
+            {
+                "da_existing_lockbook_physical_feasibility_checked": 1.0,
+                "da_existing_lockbook_physical_feasibility_passed": 1.0,
+                "da_existing_lockbook_physical_infeasible_timestamp_utc": "",
+                "da_existing_lockbook_physical_infeasible_reason": "none",
+                "da_combined_lockbook_physical_feasibility_checked": 1.0,
+                "da_combined_lockbook_physical_feasibility_passed": float(bool(combined_ok)),
+                "da_combined_lockbook_physical_infeasible_timestamp_utc": (
+                    "" if combined_ok else str(combined_diag.get("da_hourly_lock_infeasible_timestamp_utc", ""))
+                ),
+                "da_combined_lockbook_physical_infeasible_reason": (
+                    "none" if combined_ok else str(combined_diag.get("da_hourly_lock_infeasible_reason", ""))
+                ),
+                "da_hourly_lock_infeasibility_origin": (
+                    "none" if combined_ok else "candidate_caused_infeasibility"
+                ),
+            }
+        )
+        return bool(combined_ok), diag, by_ts
 
     def _project_da_postlock_future_feasibility(
         self,
@@ -14605,6 +14946,44 @@ class BatteryBacktester:
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
                 )
+                lock_phys_ok, lock_phys_diag, lock_phys_by_ts = self._check_da_hourly_lock_physical_feasibility(
+                    future_rows=future_rows_for_da_guard,
+                    colmap=colmap,
+                    current_soc_mwh=float(soc),
+                    existing_da_lockbook=da_lockbook,
+                    candidate_da=accepted_da,
+                    fixed_reserve_pos=afrr_cap_pos_lockbook,
+                    fixed_reserve_neg=afrr_cap_neg_lockbook,
+                    global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
+                    include_existing_lockbook=True,
+                    schedule_source="selected_lockable",
+                )
+                if not bool(lock_phys_ok):
+                    accepted_da = {}
+                annotated_da_audit_rows: list[dict[str, float | str]] = []
+                for audit_row in da_audit_rows:
+                    out_row = dict(audit_row)
+                    tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
+                    row_diag = lock_phys_by_ts.get(tsu, {}) if pd.notna(tsu) else {}
+                    for key, value in {**lock_phys_diag, **row_diag}.items():
+                        out_row.setdefault(str(key), value)
+                    if not bool(lock_phys_ok):
+                        out_row["da_zero_reason"] = "hourly_lock_physical_infeasible_no_trade_selected"
+                        out_row["zero_reason"] = "hourly_lock_physical_infeasible_no_trade_selected"
+                        out_row["final_selected_incumbent"] = "no_trade"
+                        out_row["da_accepted_buy_mw"] = 0.0
+                        out_row["da_accepted_sell_mw"] = 0.0
+                        out_row["da_selected_lockable_buy_mw"] = 0.0
+                        out_row["da_selected_lockable_sell_mw"] = 0.0
+                        out_row["da_postlock_candidate_buy_mw"] = 0.0
+                        out_row["da_postlock_candidate_sell_mw"] = 0.0
+                        out_row["locked_buy_mwh_by_hour"] = 0.0
+                        out_row["locked_sell_mwh_by_hour"] = 0.0
+                        out_row["candidate_pnl_after_recovery_cost_eur"] = float(
+                            out_row.get("no_trade_pnl", 0.0) or 0.0
+                        )
+                    annotated_da_audit_rows.append(out_row)
+                da_audit_rows = annotated_da_audit_rows
                 for row in da_audit_rows:
                     tsu = pd.to_datetime(row.get("timestamp_utc", ""), utc=True, errors="coerce")
                     if pd.isna(tsu):
@@ -14973,6 +15352,41 @@ class BatteryBacktester:
                 "da_precommit_da_final_soc_feasibility_candidate_sell_mwh",
                 "da_precommit_da_final_soc_feasibility_id_recourse_assumed",
                 "da_precommit_da_final_soc_feasibility_reason",
+                "da_precommit_da_hourly_lock_feasibility_checked_before_lock",
+                "da_precommit_da_hourly_lock_feasibility_passed_before_lock",
+                "da_precommit_da_hourly_lock_projected_soc_start_mwh",
+                "da_precommit_da_hourly_lock_projected_soc_end_mwh",
+                "da_precommit_da_hourly_lock_max_feasible_buy_mwh",
+                "da_precommit_da_hourly_lock_max_feasible_sell_mwh",
+                "da_precommit_da_hourly_lock_infeasible_buy_mwh",
+                "da_precommit_da_hourly_lock_infeasible_sell_mwh",
+                "da_precommit_da_hourly_lock_infeasible_timestamp_utc",
+                "da_precommit_da_hourly_lock_infeasible_reason",
+                "da_precommit_da_candidate_rejected_hourly_lock_infeasible",
+                "da_precommit_da_candidate_rejected_hourly_lock_infeasible_timestamp_utc",
+                "da_precommit_da_candidate_rejected_hourly_lock_infeasible_reason",
+                "da_precommit_da_lockbook_physical_replay_schedule_source",
+                "da_precommit_da_lockbook_physical_replay_existing_lockbook_included",
+                "da_precommit_da_lockbook_physical_replay_candidate_included",
+                "da_precommit_da_lockbook_physical_replay_projected_final_soc_mwh",
+                "da_precommit_da_candidate_overlaps_existing_lockbook",
+                "da_precommit_da_candidate_overlaps_existing_lockbook_timestamp_utc",
+                "da_precommit_da_candidate_overlaps_existing_lockbook_reason",
+                "da_precommit_da_candidate_overlap_resolution",
+                "da_precommit_da_candidate_duplicate_existing_lockbook_timestamp",
+                "da_precommit_da_candidate_existing_lockbook_buy_mw",
+                "da_precommit_da_candidate_existing_lockbook_sell_mw",
+                "da_precommit_da_candidate_overlap_candidate_buy_mw",
+                "da_precommit_da_candidate_overlap_candidate_sell_mw",
+                "da_precommit_da_existing_lockbook_physical_feasibility_checked",
+                "da_precommit_da_existing_lockbook_physical_feasibility_passed",
+                "da_precommit_da_existing_lockbook_physical_infeasible_timestamp_utc",
+                "da_precommit_da_existing_lockbook_physical_infeasible_reason",
+                "da_precommit_da_combined_lockbook_physical_feasibility_checked",
+                "da_precommit_da_combined_lockbook_physical_feasibility_passed",
+                "da_precommit_da_combined_lockbook_physical_infeasible_timestamp_utc",
+                "da_precommit_da_combined_lockbook_physical_infeasible_reason",
+                "da_precommit_da_hourly_lock_infeasibility_origin",
                 "da_precommit_selected_lockable_revenue_eur",
                 "da_precommit_selected_lockable_cost_eur",
                 "da_precommit_selected_lockable_gross_spread_eur",
@@ -15294,6 +15708,41 @@ class BatteryBacktester:
                 "da_final_soc_feasibility_candidate_sell_mwh": "da_precommit_da_final_soc_feasibility_candidate_sell_mwh",
                 "da_final_soc_feasibility_id_recourse_assumed": "da_precommit_da_final_soc_feasibility_id_recourse_assumed",
                 "da_final_soc_feasibility_reason": "da_precommit_da_final_soc_feasibility_reason",
+                "da_hourly_lock_feasibility_checked_before_lock": "da_precommit_da_hourly_lock_feasibility_checked_before_lock",
+                "da_hourly_lock_feasibility_passed_before_lock": "da_precommit_da_hourly_lock_feasibility_passed_before_lock",
+                "da_hourly_lock_projected_soc_start_mwh": "da_precommit_da_hourly_lock_projected_soc_start_mwh",
+                "da_hourly_lock_projected_soc_end_mwh": "da_precommit_da_hourly_lock_projected_soc_end_mwh",
+                "da_hourly_lock_max_feasible_buy_mwh": "da_precommit_da_hourly_lock_max_feasible_buy_mwh",
+                "da_hourly_lock_max_feasible_sell_mwh": "da_precommit_da_hourly_lock_max_feasible_sell_mwh",
+                "da_hourly_lock_infeasible_buy_mwh": "da_precommit_da_hourly_lock_infeasible_buy_mwh",
+                "da_hourly_lock_infeasible_sell_mwh": "da_precommit_da_hourly_lock_infeasible_sell_mwh",
+                "da_hourly_lock_infeasible_timestamp_utc": "da_precommit_da_hourly_lock_infeasible_timestamp_utc",
+                "da_hourly_lock_infeasible_reason": "da_precommit_da_hourly_lock_infeasible_reason",
+                "da_candidate_rejected_hourly_lock_infeasible": "da_precommit_da_candidate_rejected_hourly_lock_infeasible",
+                "da_candidate_rejected_hourly_lock_infeasible_timestamp_utc": "da_precommit_da_candidate_rejected_hourly_lock_infeasible_timestamp_utc",
+                "da_candidate_rejected_hourly_lock_infeasible_reason": "da_precommit_da_candidate_rejected_hourly_lock_infeasible_reason",
+                "da_lockbook_physical_replay_schedule_source": "da_precommit_da_lockbook_physical_replay_schedule_source",
+                "da_lockbook_physical_replay_existing_lockbook_included": "da_precommit_da_lockbook_physical_replay_existing_lockbook_included",
+                "da_lockbook_physical_replay_candidate_included": "da_precommit_da_lockbook_physical_replay_candidate_included",
+                "da_lockbook_physical_replay_projected_final_soc_mwh": "da_precommit_da_lockbook_physical_replay_projected_final_soc_mwh",
+                "da_candidate_overlaps_existing_lockbook": "da_precommit_da_candidate_overlaps_existing_lockbook",
+                "da_candidate_overlaps_existing_lockbook_timestamp_utc": "da_precommit_da_candidate_overlaps_existing_lockbook_timestamp_utc",
+                "da_candidate_overlaps_existing_lockbook_reason": "da_precommit_da_candidate_overlaps_existing_lockbook_reason",
+                "da_candidate_overlap_resolution": "da_precommit_da_candidate_overlap_resolution",
+                "da_candidate_duplicate_existing_lockbook_timestamp": "da_precommit_da_candidate_duplicate_existing_lockbook_timestamp",
+                "da_candidate_existing_lockbook_buy_mw": "da_precommit_da_candidate_existing_lockbook_buy_mw",
+                "da_candidate_existing_lockbook_sell_mw": "da_precommit_da_candidate_existing_lockbook_sell_mw",
+                "da_candidate_overlap_candidate_buy_mw": "da_precommit_da_candidate_overlap_candidate_buy_mw",
+                "da_candidate_overlap_candidate_sell_mw": "da_precommit_da_candidate_overlap_candidate_sell_mw",
+                "da_existing_lockbook_physical_feasibility_checked": "da_precommit_da_existing_lockbook_physical_feasibility_checked",
+                "da_existing_lockbook_physical_feasibility_passed": "da_precommit_da_existing_lockbook_physical_feasibility_passed",
+                "da_existing_lockbook_physical_infeasible_timestamp_utc": "da_precommit_da_existing_lockbook_physical_infeasible_timestamp_utc",
+                "da_existing_lockbook_physical_infeasible_reason": "da_precommit_da_existing_lockbook_physical_infeasible_reason",
+                "da_combined_lockbook_physical_feasibility_checked": "da_precommit_da_combined_lockbook_physical_feasibility_checked",
+                "da_combined_lockbook_physical_feasibility_passed": "da_precommit_da_combined_lockbook_physical_feasibility_passed",
+                "da_combined_lockbook_physical_infeasible_timestamp_utc": "da_precommit_da_combined_lockbook_physical_infeasible_timestamp_utc",
+                "da_combined_lockbook_physical_infeasible_reason": "da_precommit_da_combined_lockbook_physical_infeasible_reason",
+                "da_hourly_lock_infeasibility_origin": "da_precommit_da_hourly_lock_infeasibility_origin",
             }
             for alias, source_col in da_selected_lockable_aliases.items():
                 if source_col in take.columns and alias not in take.columns:
@@ -18729,6 +19178,54 @@ class BatteryBacktester:
             id_setpoint_action = (real_id_charge_mw.abs() + real_id_discharge_mw.abs()) > 1e-12
             hourly["id_physical_effect_applied"] = (id_action & id_setpoint_action).astype(float)
             hourly["id_settlement_only_flag"] = (id_action & ~id_setpoint_action).astype(float)
+        soc_start_for_da_lock = (
+            _hourly_num_col("real_soc_start_mwh")
+            if "real_soc_start_mwh" in hourly.columns
+            else _hourly_num_col("real_soc_mwh").shift(1).fillna(float(self.soc_init))
+        )
+        locked_da_buy_mwh = (
+            _hourly_num_col("da_locked_buy_mwh")
+            if "da_locked_buy_mwh" in hourly.columns
+            else _hourly_num_col("real_da_buy_mwh")
+        )
+        locked_da_sell_mwh = (
+            _hourly_num_col("da_locked_sell_mwh")
+            if "da_locked_sell_mwh" in hourly.columns
+            else _hourly_num_col("real_da_sell_mwh")
+        )
+        max_feasible_locked_buy_mwh = (
+            (float(self.soc_max) - soc_start_for_da_lock) / max(float(self.eta_in), 1e-12)
+        ).clip(lower=0.0)
+        max_feasible_locked_sell_mwh = (
+            (soc_start_for_da_lock - float(self.soc_min)) * max(float(self.eta_out), 1e-12)
+        ).clip(lower=0.0)
+        infeasible_locked_buy_mwh = (locked_da_buy_mwh - max_feasible_locked_buy_mwh).clip(lower=0.0)
+        infeasible_locked_sell_mwh = (locked_da_sell_mwh - max_feasible_locked_sell_mwh).clip(lower=0.0)
+        simultaneous_locked_da = (locked_da_buy_mwh > 1e-6) & (locked_da_sell_mwh > 1e-6)
+        lockbook_physical_bug = (
+            (infeasible_locked_buy_mwh > 1e-6)
+            | (infeasible_locked_sell_mwh > 1e-6)
+            | simultaneous_locked_da
+        )
+        lockbook_bug_reason = pd.Series("none", index=hourly.index, dtype=object)
+        lockbook_bug_reason = lockbook_bug_reason.mask(
+            infeasible_locked_buy_mwh > 1e-6,
+            "locked_da_buy_exceeds_soc_headroom",
+        )
+        lockbook_bug_reason = lockbook_bug_reason.mask(
+            infeasible_locked_sell_mwh > 1e-6,
+            "locked_da_sell_exceeds_available_energy",
+        )
+        lockbook_bug_reason = lockbook_bug_reason.mask(
+            simultaneous_locked_da,
+            "simultaneous_da_buy_sell_lock_infeasible",
+        )
+        hourly["da_execution_max_feasible_locked_buy_mwh"] = max_feasible_locked_buy_mwh
+        hourly["da_execution_max_feasible_locked_sell_mwh"] = max_feasible_locked_sell_mwh
+        hourly["da_execution_lockbook_physical_infeasible_buy_mwh"] = infeasible_locked_buy_mwh
+        hourly["da_execution_lockbook_physical_infeasible_sell_mwh"] = infeasible_locked_sell_mwh
+        hourly["da_execution_lockbook_physical_infeasibility_bug"] = lockbook_physical_bug.astype(float)
+        hourly["da_execution_lockbook_physical_infeasibility_reason"] = lockbook_bug_reason
         for c in ("real_bcm_linked_activation_revenue_eur", "real_bem_only_activation_revenue_eur", "real_revenue_activation_eur"):
             if c not in hourly.columns:
                 hourly[c] = 0.0
@@ -20629,6 +21126,17 @@ class BatteryBacktester:
             .gt(0.5)
             .sum()
         )
+        summary["da_execution_lockbook_physical_infeasibility_count"] = float(
+            _summary_num_series("da_execution_lockbook_physical_infeasibility_bug").gt(0.5).sum()
+        )
+        if float(summary["da_execution_lockbook_physical_infeasibility_count"]) > 0.5 and colmap.timestamp in hourly.columns:
+            da_lock_phys_bad = _summary_num_series("da_execution_lockbook_physical_infeasibility_bug").gt(0.5)
+            bad_ts = pd.to_datetime(hourly.loc[da_lock_phys_bad, colmap.timestamp], utc=True, errors="coerce").dropna()
+            summary["first_da_execution_lockbook_physical_infeasible_timestamp_utc"] = (
+                "" if bad_ts.empty else bad_ts.min().isoformat()
+            )
+        else:
+            summary["first_da_execution_lockbook_physical_infeasible_timestamp_utc"] = ""
         if isinstance(plan_history, pd.DataFrame) and not plan_history.empty:
             ph_da_candidate_violation = pd.to_numeric(
                 plan_history.get("da_candidate_gate_window_violation", 0.0),
@@ -20817,6 +21325,8 @@ class BatteryBacktester:
                 invalid_reasons.append("da_unplanned_execution")
             if float(summary.get("da_realized_without_precommit_origin_error_count", 0.0)) > 0.5:
                 invalid_reasons.append("da_realized_without_precommit_origin")
+            if float(summary.get("da_execution_lockbook_physical_infeasibility_count", 0.0)) > 0.5:
+                invalid_reasons.append("da_execution_lockbook_physical_infeasible")
             if float(summary.get("bcm_gate_violation_count", 0.0)) > 0.5:
                 invalid_reasons.append("bcm_gate_violation")
             if float(summary.get("bcm_candidate_gate_window_violation_count", 0.0)) > 0.5:

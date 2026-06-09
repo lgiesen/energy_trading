@@ -41,8 +41,8 @@ BATTERY_SPECS = {
     "power_mw": 10.0,  # Maximum converter power (P_max) -> 2-hour duration
 
     # One-way efficiencies (primary inputs); round-trip efficiency is derived below.
-    "efficiency_in": 0.9487,
-    "efficiency_out": 0.9487,
+    "efficiency_in": 1,
+    "efficiency_out": 1,
 
     # Operation limits as fractions of capacity_mwh
     "soc_min": 0.1,  # 10% minimum SoC to protect battery health
@@ -51,7 +51,7 @@ BATTERY_SPECS = {
     "soc_target_end": 0.5,  # Cyclic neutrality target (SoC_0 ~= SoC_T)
 
     # Costs
-    "degradation_cost": 15,  # EUR/MWh internal throughput
+    "degradation_cost": 0,  # EUR/MWh internal throughput
     # State-dependent auxiliary duty-cycle model (recommended):
     # OFF -> STANDBY -> TRADING -> aFRR_ACTIVE
     # Duty values are multipliers of aux_power_peak_mw.
@@ -62,20 +62,20 @@ BATTERY_SPECS = {
     # auxiliary energy directly at dt_h=1:
     # off=0.020 MWh/h, standby=0.035 MWh/h,
     # trading=0.050 MWh/h, aFRR active=0.050 MWh/h.
-    "aux_power_peak_mw": 0.05,
+    "aux_power_peak_mw": 0.00,
 
     # 0.05 MW * 0.70 * 1h = 0.035 MWh/h standby auxiliary energy.
-    "aux_power_standby_duty": 0.70,
+    "aux_power_standby_duty": 0.00,
 
     # 0.05 MW * 1.00 * 1h = 0.050 MWh/h trading auxiliary energy.
-    "aux_power_trading_duty": 1.00,
+    "aux_power_trading_duty": 0.00,
 
     # 0.05 MW * 1.00 * 1h = 0.050 MWh/h aFRR-active auxiliary energy.
-    "aux_power_afrr_active_duty": 1.00,
+    "aux_power_afrr_active_duty": 0.00,
 
     # 0.05 MW * 0.40 * 1h = 0.020 MWh/h off auxiliary energy.
     # Covers BMS, Kommunikation, Heizung/Kühlung und Sicherheitssysteme.
-    "aux_power_off_duty": 0.40,
+    "aux_power_off_duty": 0.00,
 }
 BATTERY_SPECS["efficiency_rt"] = BATTERY_SPECS["efficiency_in"] * BATTERY_SPECS["efficiency_out"]
 
@@ -87,7 +87,7 @@ FINANCIAL_PARAMS = {
     # Investment assumptions for ROI calculation at the end of the Thesis
     "capex_per_kwh": 350.0,
     "annual_opex_fixed": 5000.0,
-    "transaction_cost_eur_per_mwh": 1.0,  # C_trans in thesis
+    "transaction_cost_eur_per_mwh": 0.0,  # C_trans in thesis
     "afrr_offer_cost_eur_mw_h": 0.0,  # Fixed reserve availability cost per offered MW/h (independent of acceptance)
     "risk_margin_eur_per_mwh": 0.0,  # Optional conservative margin for thresholds
     "imbalance_penalty_eur_mwh": 500.0,  # Non-delivery/imbalance penalty proxy

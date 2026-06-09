@@ -8451,6 +8451,277 @@ def test_realized_da_origin_requires_delivery_timestamp() -> None:
     assert counters["da_naming_semantics_error_count"] == pytest.approx(1.0)
 
 
+def _da_hourly_lock_future_rows(col: BacktestColumnMap, timestamps: list[pd.Timestamp]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            col.timestamp: pd.to_datetime(timestamps, utc=True),
+            col.pred_afrr_activation_rate_pos: [0.0] * len(timestamps),
+            col.pred_afrr_activation_rate_neg: [0.0] * len(timestamps),
+        }
+    )
+
+
+def _configure_zero_aux_unit_efficiency(bt: BatteryBacktester) -> None:
+    bt.dt_h = 1.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 2.0
+    bt.aux_peak_mw = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.aux_afrr_active_mw = 0.0
+
+
+def test_da_hourly_lock_rejects_buy_exceeding_soc_headroom() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T01:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts]),
+        colmap=col,
+        current_soc_mwh=8.25,
+        existing_da_lockbook={},
+        candidate_da={ts: (10.0, 0.0)},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasible_reason"]) == "locked_da_buy_exceeds_soc_headroom"
+    assert float(diag["da_candidate_rejected_hourly_lock_infeasible"]) == pytest.approx(1.0)
+    assert float(by_ts[ts]["da_hourly_lock_max_feasible_buy_mwh"]) == pytest.approx(9.75)
+    assert float(by_ts[ts]["da_hourly_lock_infeasible_buy_mwh"]) == pytest.approx(0.25)
+
+
+def test_da_hourly_lock_rejects_sell_exceeding_available_energy() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T01:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts]),
+        colmap=col,
+        current_soc_mwh=11.5,
+        existing_da_lockbook={},
+        candidate_da={ts: (0.0, 10.0)},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasible_reason"]) == "locked_da_sell_exceeds_available_energy"
+    assert float(diag["da_candidate_rejected_hourly_lock_infeasible"]) == pytest.approx(1.0)
+    assert float(by_ts[ts]["da_hourly_lock_max_feasible_sell_mwh"]) == pytest.approx(9.5)
+    assert float(by_ts[ts]["da_hourly_lock_infeasible_sell_mwh"]) == pytest.approx(0.5)
+
+
+def test_da_hourly_lock_replay_uses_sequential_soc_not_independent_hourly_capacity() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-22T01:00:00Z")
+    ts1 = pd.Timestamp("2026-01-22T02:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts0, ts1]),
+        colmap=col,
+        current_soc_mwh=12.0,
+        existing_da_lockbook={},
+        candidate_da={ts0: (0.0, 6.0), ts1: (0.0, 6.0)},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasible_timestamp_utc"]) == str(ts1)
+    assert str(diag["da_hourly_lock_infeasible_reason"]) == "locked_da_sell_exceeds_available_energy"
+    assert float(by_ts[ts0]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(6.0)
+    assert float(by_ts[ts1]["da_hourly_lock_max_feasible_sell_mwh"]) == pytest.approx(4.0)
+    assert float(by_ts[ts1]["da_hourly_lock_infeasible_sell_mwh"]) == pytest.approx(2.0)
+
+
+def test_da_hourly_lock_accepts_feasible_buy_sell_schedule() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-22T01:00:00Z")
+    ts1 = pd.Timestamp("2026-01-22T02:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts0, ts1]),
+        colmap=col,
+        current_soc_mwh=10.0,
+        existing_da_lockbook={},
+        candidate_da={ts0: (2.0, 0.0), ts1: (0.0, 2.0)},
+    )
+
+    assert ok is True
+    assert str(diag["da_hourly_lock_infeasible_reason"]) == "none"
+    assert float(diag["da_lockbook_physical_replay_projected_final_soc_mwh"]) == pytest.approx(10.0)
+    assert float(by_ts[ts0]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(12.0)
+    assert float(by_ts[ts1]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(10.0)
+
+
+def test_da_hourly_lock_same_direction_buy_overlap_aggregates() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T01:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts]),
+        colmap=col,
+        current_soc_mwh=10.0,
+        existing_da_lockbook={ts: (6.0, 0.0)},
+        candidate_da={ts: (2.0, 0.0)},
+    )
+
+    assert ok is True
+    assert str(diag["da_hourly_lock_infeasibility_origin"]) == "none"
+    assert float(diag["da_candidate_overlaps_existing_lockbook"]) == pytest.approx(1.0)
+    assert str(diag["da_candidate_overlap_resolution"]) == "same_direction_aggregated"
+    assert str(diag["da_candidate_overlaps_existing_lockbook_timestamp_utc"]) == str(ts)
+    assert float(diag["da_candidate_existing_lockbook_buy_mw"]) == pytest.approx(6.0)
+    assert float(diag["da_candidate_overlap_candidate_buy_mw"]) == pytest.approx(2.0)
+    assert float(by_ts[ts]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(18.0)
+
+
+def test_da_hourly_lock_same_direction_sell_overlap_aggregates() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T01:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts]),
+        colmap=col,
+        current_soc_mwh=12.0,
+        existing_da_lockbook={ts: (0.0, 3.0)},
+        candidate_da={ts: (0.0, 4.0)},
+    )
+
+    assert ok is True
+    assert str(diag["da_hourly_lock_infeasibility_origin"]) == "none"
+    assert float(diag["da_candidate_overlaps_existing_lockbook"]) == pytest.approx(1.0)
+    assert str(diag["da_candidate_overlap_resolution"]) == "same_direction_aggregated"
+    assert float(diag["da_candidate_existing_lockbook_sell_mw"]) == pytest.approx(3.0)
+    assert float(diag["da_candidate_overlap_candidate_sell_mw"]) == pytest.approx(4.0)
+    assert float(by_ts[ts]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(5.0)
+
+
+def test_da_hourly_lock_exact_duplicate_overlap_is_ignored_not_double_counted() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T01:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts]),
+        colmap=col,
+        current_soc_mwh=10.0,
+        existing_da_lockbook={ts: (6.0, 0.0)},
+        candidate_da={ts: (6.0, 0.0)},
+    )
+
+    assert ok is True
+    assert str(diag["da_hourly_lock_infeasibility_origin"]) == "none"
+    assert str(diag["da_candidate_overlap_resolution"]) == "exact_duplicate_ignored"
+    assert float(diag["da_candidate_duplicate_existing_lockbook_timestamp"]) == pytest.approx(1.0)
+    assert float(by_ts[ts]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(16.0)
+
+
+def test_da_hourly_lock_opposite_direction_overlap_rejected() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T01:00:00Z")
+
+    ok, diag, _ = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts]),
+        colmap=col,
+        current_soc_mwh=10.0,
+        existing_da_lockbook={ts: (6.0, 0.0)},
+        candidate_da={ts: (0.0, 4.0)},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasibility_origin"]) == "candidate_overlaps_existing_lockbook"
+    assert str(diag["da_candidate_overlap_resolution"]) == "opposite_direction_rejected"
+    assert str(diag["da_hourly_lock_infeasible_reason"]) == "candidate_overlaps_existing_da_lockbook"
+    assert float(diag["da_candidate_existing_lockbook_buy_mw"]) == pytest.approx(6.0)
+    assert float(diag["da_candidate_overlap_candidate_sell_mw"]) == pytest.approx(4.0)
+
+
+def test_da_hourly_lock_reports_existing_lockbook_already_infeasible() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-22T01:00:00Z")
+    ts1 = pd.Timestamp("2026-01-22T02:00:00Z")
+
+    ok, diag, _ = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts0, ts1]),
+        colmap=col,
+        current_soc_mwh=11.0,
+        existing_da_lockbook={ts0: (0.0, 10.0)},
+        candidate_da={ts1: (1.0, 0.0)},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasibility_origin"]) == "existing_lockbook_already_infeasible"
+    assert float(diag["da_existing_lockbook_physical_feasibility_passed"]) == pytest.approx(0.0)
+    assert str(diag["da_existing_lockbook_physical_infeasible_timestamp_utc"]) == str(ts0)
+    assert str(diag["da_existing_lockbook_physical_infeasible_reason"]) == "locked_da_sell_exceeds_available_energy"
+    assert float(diag["da_combined_lockbook_physical_feasibility_checked"]) == pytest.approx(0.0)
+
+
+def test_da_hourly_lock_reports_candidate_caused_infeasibility() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-22T01:00:00Z")
+    ts1 = pd.Timestamp("2026-01-22T02:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts0, ts1]),
+        colmap=col,
+        current_soc_mwh=12.0,
+        existing_da_lockbook={ts0: (0.0, 2.0)},
+        candidate_da={ts1: (0.0, 9.0)},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasibility_origin"]) == "candidate_caused_infeasibility"
+    assert float(diag["da_existing_lockbook_physical_feasibility_passed"]) == pytest.approx(1.0)
+    assert float(diag["da_combined_lockbook_physical_feasibility_passed"]) == pytest.approx(0.0)
+    assert str(diag["da_combined_lockbook_physical_infeasible_timestamp_utc"]) == str(ts1)
+    assert str(diag["da_combined_lockbook_physical_infeasible_reason"]) == "locked_da_sell_exceeds_available_energy"
+    assert float(by_ts[ts1]["da_hourly_lock_max_feasible_sell_mwh"]) == pytest.approx(8.0)
+
+
+def test_da_hourly_lock_existing_and_candidate_feasible_passes() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-22T01:00:00Z")
+    ts1 = pd.Timestamp("2026-01-22T02:00:00Z")
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=_da_hourly_lock_future_rows(col, [ts0, ts1]),
+        colmap=col,
+        current_soc_mwh=12.0,
+        existing_da_lockbook={ts0: (0.0, 2.0)},
+        candidate_da={ts1: (2.0, 0.0)},
+    )
+
+    assert ok is True
+    assert str(diag["da_hourly_lock_infeasibility_origin"]) == "none"
+    assert float(diag["da_existing_lockbook_physical_feasibility_passed"]) == pytest.approx(1.0)
+    assert float(diag["da_combined_lockbook_physical_feasibility_passed"]) == pytest.approx(1.0)
+    assert float(by_ts[ts0]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(10.0)
+    assert float(by_ts[ts1]["da_hourly_lock_projected_soc_end_mwh"]) == pytest.approx(12.0)
+
+
 def test_da_postlock_recomputes_locked_candidate_pnl_against_no_trade() -> None:
     bt = _mk_backtester()
     col = BacktestColumnMap()
