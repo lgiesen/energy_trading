@@ -10688,6 +10688,82 @@ def test_terminal_recovery_marks_unrecoverable_when_power_limit_blocks_target() 
     assert str(diag["terminal_soc_not_recoverable_reason"]) == "insufficient_remaining_id_capacity"
 
 
+def test_terminal_closure_shortfall_buys_id_to_target() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.90
+    bt.trans_eur_mwh = 2.0
+    bt.deg_eur_mwh = 10.0
+    bt.aux_trading_mw = 0.0
+
+    diag = bt._terminal_closure_components(
+        final_soc_before_mwh=9.05,
+        buy_price_eur_mwh=100.0,
+        sell_price_eur_mwh=90.0,
+        aux_settlement_price_eur_mwh=80.0,
+        existing_aux_mwh=0.0,
+    )
+
+    assert str(diag["terminal_closure_reason"]) == "shortfall_recovery"
+    assert float(diag["terminal_closure_id_buy_mwh"]) == pytest.approx(1.0)
+    assert float(diag["terminal_closure_internal_buy_mwh"]) == pytest.approx(0.95)
+    assert float(diag["terminal_closure_soc_after_mwh"]) == pytest.approx(10.0)
+    assert float(diag["terminal_closure_cost_eur"]) == pytest.approx(100.0)
+    assert float(diag["terminal_closure_transaction_cost_eur"]) == pytest.approx(2.0)
+    assert float(diag["terminal_closure_degradation_cost_eur"]) == pytest.approx(9.5)
+    assert float(diag["terminal_closure_net_pnl_eur"]) == pytest.approx(-111.5)
+
+
+def test_terminal_closure_surplus_sells_id_to_target() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.90
+    bt.trans_eur_mwh = 2.0
+    bt.deg_eur_mwh = 10.0
+    bt.aux_trading_mw = 0.0
+
+    diag = bt._terminal_closure_components(
+        final_soc_before_mwh=11.0,
+        buy_price_eur_mwh=100.0,
+        sell_price_eur_mwh=90.0,
+        aux_settlement_price_eur_mwh=80.0,
+        existing_aux_mwh=0.0,
+    )
+
+    assert str(diag["terminal_closure_reason"]) == "surplus_liquidation"
+    assert float(diag["terminal_closure_id_sell_mwh"]) == pytest.approx(0.9)
+    assert float(diag["terminal_closure_internal_sell_mwh"]) == pytest.approx(1.0)
+    assert float(diag["terminal_closure_soc_after_mwh"]) == pytest.approx(10.0)
+    assert float(diag["terminal_closure_revenue_eur"]) == pytest.approx(81.0)
+    assert float(diag["terminal_closure_transaction_cost_eur"]) == pytest.approx(1.8)
+    assert float(diag["terminal_closure_degradation_cost_eur"]) == pytest.approx(10.0)
+    assert float(diag["terminal_closure_net_pnl_eur"]) == pytest.approx(69.2)
+
+
+def test_terminal_closure_includes_recovery_induced_aux_delta() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_trading_mw = 0.05
+
+    diag = bt._terminal_closure_components(
+        final_soc_before_mwh=9.97,
+        buy_price_eur_mwh=100.0,
+        sell_price_eur_mwh=90.0,
+        aux_settlement_price_eur_mwh=80.0,
+        existing_aux_mwh=0.02,
+    )
+
+    expected_internal = 10.0 - 9.97 + 0.03
+    assert str(diag["terminal_closure_reason"]) == "shortfall_recovery"
+    assert float(diag["terminal_closure_recovery_induced_aux_delta_mwh"]) == pytest.approx(0.03)
+    assert float(diag["terminal_closure_internal_buy_mwh"]) == pytest.approx(expected_internal)
+    assert float(diag["terminal_closure_soc_after_mwh"]) == pytest.approx(10.0)
+    assert float(diag["terminal_closure_aux_cost_eur"]) == pytest.approx(0.03 * 80.0)
+
+
 def test_da_origin_summary_counter_uses_canonical_origin_fields() -> None:
     ts = pd.Timestamp("2026-01-02T01:00:00Z")
     source_snapshot = pd.Timestamp("2026-01-01T10:00:00Z")

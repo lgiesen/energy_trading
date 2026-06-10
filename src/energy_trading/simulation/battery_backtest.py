@@ -2751,6 +2751,90 @@ class BatteryBacktester:
             "terminal_value_included_in_total_pnl": 1.0,
         }
 
+    def _terminal_closure_components(
+        self,
+        *,
+        final_soc_before_mwh: float,
+        buy_price_eur_mwh: float,
+        sell_price_eur_mwh: float,
+        aux_settlement_price_eur_mwh: float,
+        existing_aux_mwh: float = 0.0,
+        target_final_soc_mwh: float | None = None,
+        tolerance_mwh: float = 1e-6,
+        include_recovery_induced_aux: bool = True,
+    ) -> dict[str, float | str]:
+        """Physical final settlement-to-target via ID buy/sell at global end.
+
+        Rolling windows may use continuation value. This helper is only for the
+        final global terminal closure and therefore values actual ID settlement,
+        not free terminal inventory.
+        """
+        target = float(self.soc_target_end if target_final_soc_mwh is None else target_final_soc_mwh)
+        tol = max(0.0, float(tolerance_mwh))
+        soc_before = float(final_soc_before_mwh)
+        aux_without = max(0.0, float(existing_aux_mwh))
+        aux_with = max(aux_without, float(self.aux_trading_mw) * float(self.dt_h)) if include_recovery_induced_aux else aux_without
+        aux_delta = max(0.0, aux_with - aux_without)
+        buy_grid = 0.0
+        sell_grid = 0.0
+        reason = "none"
+        if soc_before < target - tol:
+            reason = "shortfall_recovery"
+            required_internal = max(0.0, target - soc_before + aux_delta)
+            buy_grid = required_internal / max(float(self.eta_in), 1e-12)
+            soc_after = soc_before + buy_grid * float(self.eta_in) - aux_delta
+        elif soc_before > target + tol:
+            surplus_before_aux = soc_before - target
+            # If the ID action itself would consume more auxiliary energy than
+            # the surplus, a sell would overshoot below target. In that rare
+            # case, buy only enough to pay the induced auxiliary loss.
+            if aux_delta > surplus_before_aux + tol:
+                reason = "surplus_aux_compensation"
+                buy_grid = (aux_delta - surplus_before_aux) / max(float(self.eta_in), 1e-12)
+                soc_after = soc_before + buy_grid * float(self.eta_in) - aux_delta
+            else:
+                reason = "surplus_liquidation"
+                sell_grid = max(0.0, (surplus_before_aux - aux_delta) * float(self.eta_out))
+                soc_after = soc_before - sell_grid / max(float(self.eta_out), 1e-12) - aux_delta
+        else:
+            soc_after = soc_before
+        internal_buy = buy_grid * float(self.eta_in)
+        internal_sell = sell_grid / max(float(self.eta_out), 1e-12)
+        revenue = sell_grid * float(sell_price_eur_mwh)
+        cost = buy_grid * float(buy_price_eur_mwh)
+        transaction_cost = float(self.trans_eur_mwh) * (buy_grid + sell_grid)
+        degradation_cost = float(self.deg_eur_mwh) * (internal_buy + internal_sell)
+        aux_cost = aux_delta * float(aux_settlement_price_eur_mwh)
+        net_pnl = revenue - cost - transaction_cost - degradation_cost - aux_cost
+        target_met = abs(float(soc_after) - target) <= tol
+        return {
+            "terminal_closure_applied": float(buy_grid > 1e-12 or sell_grid > 1e-12),
+            "terminal_closure_reason": reason,
+            "terminal_closure_soc_before_mwh": float(soc_before),
+            "terminal_closure_soc_after_mwh": float(soc_after),
+            "terminal_closure_target_mwh": float(target),
+            "terminal_closure_tolerance_mwh": float(tol),
+            "terminal_closure_id_buy_mwh": float(buy_grid),
+            "terminal_closure_id_sell_mwh": float(sell_grid),
+            "terminal_closure_internal_buy_mwh": float(internal_buy),
+            "terminal_closure_internal_sell_mwh": float(internal_sell),
+            "terminal_closure_buy_price_eur_mwh": float(buy_price_eur_mwh),
+            "terminal_closure_sell_price_eur_mwh": float(sell_price_eur_mwh),
+            "terminal_closure_revenue_eur": float(revenue),
+            "terminal_closure_cost_eur": float(cost),
+            "terminal_closure_transaction_cost_eur": float(transaction_cost),
+            "terminal_closure_degradation_cost_eur": float(degradation_cost),
+            "terminal_closure_aux_cost_eur": float(aux_cost),
+            "terminal_closure_aux_without_recovery_mwh": float(aux_without),
+            "terminal_closure_aux_with_recovery_mwh": float(aux_with if buy_grid > 1e-12 or sell_grid > 1e-12 else aux_without),
+            "terminal_closure_recovery_induced_aux_delta_mwh": float(aux_delta if buy_grid > 1e-12 or sell_grid > 1e-12 else 0.0),
+            "terminal_closure_net_pnl_eur": float(net_pnl),
+            "terminal_closure_pnl_eur": float(net_pnl),
+            "final_soc_before_terminal_closure_mwh": float(soc_before),
+            "final_soc_after_terminal_closure_mwh": float(soc_after),
+            "final_soc_target_met_after_closure": float(target_met),
+        }
+
     def _da_soc_shadow_value_components(
         self,
         pred_da_prices: pd.Series | np.ndarray | list[float],
@@ -7541,6 +7625,14 @@ class BatteryBacktester:
                 and not recovery_ev_violation
                 and not ev_nan_violation
             )
+            candidate_recoverable = (
+                power_violation_pos <= 1e-9
+                and power_violation_neg <= 1e-9
+                and headroom_violation <= 1e-9
+                and soc_violation <= 1e-9
+                and terminal_violation <= 1e-9
+                and not ev_nan_violation
+            )
             reason = "none"
             if not feasible:
                 if power_violation_pos > 1e-9 or power_violation_neg > 1e-9:
@@ -7610,7 +7702,9 @@ class BatteryBacktester:
                 "ev_nan_detected": float(recovery_ev["ev_nan_detected"]),
                 "ev_nan_component": str(recovery_ev["ev_nan_component"]),
                 "zero_reason_detail": str(reason),
-                "final_decision_reason": str(reason if not feasible else "baseline_recoverable_candidate_positive_ev"),
+                "final_decision_reason": str(reason if not feasible else "accepted_positive_incremental_ev"),
+                "baseline_recoverable": float(bool(baseline_bcm_precommit_recoverable)),
+                "candidate_recoverable": float(candidate_recoverable),
                 "reduced_due_to_reserve_feasibility": float(factor < 0.999),
                 "reduced_due_to_terminal_soc": float(terminal_violation > 1e-9),
                 "reduced_due_to_power": float(power_violation_pos > 1e-9 or power_violation_neg > 1e-9),
@@ -7688,6 +7782,7 @@ class BatteryBacktester:
         first_candidate_stats: dict[str, float | str] | None = None
         baseline_bcm_precommit_recovery_cost_eur = 0.0
         baseline_bcm_precommit_recovery_mwh = 0.0
+        baseline_bcm_precommit_recoverable = True
         try:
             _baseline_ok, baseline_stats = _check_cumulative_commitment_feasibility(
                 rows=guard_rows,
@@ -7700,9 +7795,11 @@ class BatteryBacktester:
                 or 0.0
             )
             baseline_bcm_precommit_recovery_mwh = float(baseline_stats.get("id_recovery_mwh", 0.0) or 0.0)
+            baseline_bcm_precommit_recoverable = bool(float(baseline_stats.get("candidate_recoverable", 1.0)) >= 0.5)
         except Exception:
             baseline_bcm_precommit_recovery_cost_eur = 0.0
             baseline_bcm_precommit_recovery_mwh = 0.0
+            baseline_bcm_precommit_recoverable = False
         for factor in ladder:
             trial_pos = float(self.bid_builder._qfloor(base_pos * float(factor), self.afrr_bid_granularity_mw))
             trial_neg = float(self.bid_builder._qfloor(base_neg * float(factor), self.afrr_bid_granularity_mw))
@@ -7899,7 +7996,7 @@ class BatteryBacktester:
                             diag_name,
                             stats.get(diag_name, "none" if "driver" in diag_name else 0.0),
                         )
-                    stats["final_decision_reason"] = "baseline_recoverable_candidate_positive_ev"
+                    stats["final_decision_reason"] = "accepted_positive_incremental_ev"
                     return trial_pos, trial_neg, None, cap_bids, stats
                 stats["zero_reason"] = "optimizer_slack_required"
                 last_stats = stats
@@ -12998,7 +13095,7 @@ class BatteryBacktester:
         elif (ob_pos > 1e-12 or ob_neg > 1e-12) and (bcm_source_pos_mw <= 1e-12 and bcm_source_neg_mw <= 1e-12):
             bcm_zero_reason = "clearing_failed"
         elif ob_pos <= 1e-12 and ob_neg <= 1e-12 and res_pos_plan <= 1e-12 and res_neg_plan <= 1e-12:
-            bcm_zero_reason = "negative_bcm_ev"
+            bcm_zero_reason = "no_bcm_candidate"
         elif ob_pos <= 1e-12 and ob_neg <= 1e-12:
             bcm_zero_reason = "outside_bcm_gate"
         else:
@@ -13612,6 +13709,8 @@ class BatteryBacktester:
             expected_capacity_ev_eur = float("nan")
             expected_capacity_revenue_eur = 0.0
             expected_activation_revenue_eur = 0.0
+            expected_standby_cost_eur = 0.0
+            expected_activation_cost_eur = 0.0
             expected_aux_cost_eur = 0.0
             afrr_rounding_before_pos_mw = 0.0
             afrr_rounding_before_neg_mw = 0.0
@@ -13910,7 +14009,6 @@ class BatteryBacktester:
                     pred_rate_neg_blk = 0.0
                 pred_rate_pos_blk = float(np.clip(pred_rate_pos_blk, 0.0, 1.0))
                 pred_rate_neg_blk = float(np.clip(pred_rate_neg_blk, 0.0, 1.0))
-                pred_da_blk = _src_series(colmap.pred_da_price)
                 req_pos_mwh = (
                     float(offered_pos) * float(self.reserve_activation_headroom_h) / max(float(self.eta_out), 1e-12)
                     + float(self.reserve_headroom_safety_mwh)
@@ -13963,6 +14061,25 @@ class BatteryBacktester:
                         + float(offered_neg) * pred_rate_neg_blk * act_value_neg_blk * block_hours
                     )
                 )
+                expected_standby_cost_eur = float(
+                    bcm_recovery_cost_probability_factor
+                    * (float(offered_pos) + float(offered_neg))
+                    * float(self.afrr_offer_cost_eur_mw_h)
+                    * block_hours
+                )
+                expected_activation_cost_eur = float(
+                    bcm_recovery_cost_probability_factor
+                    * (
+                        float(offered_pos)
+                        * pred_rate_pos_blk
+                        * (self.trans_eur_mwh + self.deg_eur_mwh / max(self.eta_out, 1e-12))
+                        * block_hours
+                        + float(offered_neg)
+                        * pred_rate_neg_blk
+                        * (self.trans_eur_mwh + self.deg_eur_mwh * self.eta_in)
+                        * block_hours
+                    )
+                )
                 selected_bcm_ev_eur = float("nan")
                 selected_bcm_terminal_inventory_effect_eur = 0.0
                 if "ev_afrr_pos_eur" in blk.columns or "ev_afrr_neg_eur" in blk.columns:
@@ -13984,38 +14101,21 @@ class BatteryBacktester:
                         selected_bcm_terminal_inventory_effect_eur += float((pos_mw * term_pos).sum() * pos_scale)
                         selected_bcm_terminal_inventory_effect_eur += float((neg_mw * term_neg).sum() * neg_scale)
                 if np.isfinite(selected_bcm_ev_eur):
-                    expected_capacity_ev_eur = float(selected_bcm_ev_eur + selected_bcm_terminal_inventory_effect_eur)
+                    # The optimizer EV already represents the enabled BCM
+                    # objective branch. Do not add DA terminal/shadow value or
+                    # any other opportunity proxy in precommit selection.
+                    selected_bcm_terminal_inventory_effect_eur = 0.0
+                    expected_capacity_revenue_eur = float(selected_bcm_ev_eur)
+                    expected_activation_revenue_eur = 0.0
+                    expected_standby_cost_eur = 0.0
+                    expected_activation_cost_eur = 0.0
+                    expected_capacity_ev_eur = float(selected_bcm_ev_eur)
                 else:
-                    term_pos, _term_pos_neg_unused = self.terminal_inventory_effects_eur_per_mw(
-                        probability=bcm_recovery_cost_probability_factor,
-                        activation_rate=pred_rate_pos_blk,
-                        duration_h=block_hours,
-                        eta_in=float(self.eta_in),
-                        eta_out=float(self.eta_out),
-                        lambda_eur_per_internal_mwh=float(
-                            self._da_soc_shadow_value_components(pred_da_blk)[
-                                "terminal_inventory_shadow_value_eur_per_internal_mwh"
-                            ]
-                        ),
-                    )
-                    _term_neg_pos_unused, term_neg = self.terminal_inventory_effects_eur_per_mw(
-                        probability=bcm_recovery_cost_probability_factor,
-                        activation_rate=pred_rate_neg_blk,
-                        duration_h=block_hours,
-                        eta_in=float(self.eta_in),
-                        eta_out=float(self.eta_out),
-                        lambda_eur_per_internal_mwh=float(
-                            self._da_soc_shadow_value_components(pred_da_blk)[
-                                "terminal_inventory_shadow_value_eur_per_internal_mwh"
-                            ]
-                        ),
-                    )
-                    selected_bcm_terminal_inventory_effect_eur = float(offered_pos) * float(np.asarray(term_pos).item()) + float(offered_neg) * float(np.asarray(term_neg).item())
                     expected_capacity_ev_eur = float(
                         expected_capacity_revenue_eur
-                        + bcm_recovery_cost_probability_factor * float(offered_pos) * pred_rate_pos_blk * bcm_margin_pos_blk * block_hours
-                        + bcm_recovery_cost_probability_factor * float(offered_neg) * pred_rate_neg_blk * bcm_margin_neg_blk * block_hours
-                        + selected_bcm_terminal_inventory_effect_eur
+                        + expected_activation_revenue_eur
+                        - expected_standby_cost_eur
+                        - expected_activation_cost_eur
                     )
                 expected_aux_cost_eur = 0.0
                 precommit_net_capacity_ev_after_headroom_cost_eur = float(expected_capacity_ev_eur)
@@ -14023,6 +14123,8 @@ class BatteryBacktester:
                 bcm_precommit_stats["ev_award_probability"] = float(bcm_recovery_cost_probability_factor)
                 bcm_precommit_stats["expected_capacity_revenue_eur"] = float(expected_capacity_revenue_eur)
                 bcm_precommit_stats["expected_activation_revenue_eur"] = float(expected_activation_revenue_eur)
+                bcm_precommit_stats["expected_standby_cost_eur"] = float(expected_standby_cost_eur)
+                bcm_precommit_stats["expected_activation_cost_eur"] = float(expected_activation_cost_eur)
                 bcm_precommit_stats["expected_aux_cost_eur"] = float(expected_aux_cost_eur)
                 bcm_precommit_stats["expected_headroom_recharge_cost_eur"] = float(expected_headroom_recharge_cost_eur)
                 bcm_precommit_stats["expected_headroom_opportunity_cost_eur"] = float(expected_headroom_opportunity_cost_eur)
@@ -14039,17 +14141,9 @@ class BatteryBacktester:
                 bcm_precommit_stats["effective_ev_before_recovery_eur"] = float(
                     precommit_net_capacity_ev_after_headroom_cost_eur
                 )
-                if precommit_net_capacity_ev_after_headroom_cost_eur < -1e-9 and (offered_pos > 0.0 or offered_neg > 0.0):
-                    offered_pos = 0.0
-                    offered_neg = 0.0
-                    reserve_retry_factor = 0.0
-                    submitted_reserve_pos_mw_after_retry = 0.0
-                    submitted_reserve_neg_mw_after_retry = 0.0
-                    bcm_precommit_stats["zero_reason"] = "negative_precommit_ev"
-                    precommit_bid_zeroed_due_to_negative_ev = 1.0
-                    precommit_clamp_reason = "zeroed_due_to_negative_ev_after_headroom_cost"
-                    precommit_reduction_reason = "negative_ev_after_headroom_cost"
-                    precommit_applied = 1.0
+                # Do not zero here. The canonical BCM decision is made by
+                # _select_feasible_bcm_lock_candidate after final physical
+                # recoverability and incremental recovery-cost comparison.
 
             cap_bids: list[AFRRCapacityBid] = []
             cap_res: AFRRCapacityClearingResult | None = None
@@ -14108,6 +14202,8 @@ class BatteryBacktester:
                     "expected_activation_revenue_eur",
                     float(expected_activation_revenue_eur),
                 )
+                bcm_precommit_stats.setdefault("expected_standby_cost_eur", float(expected_standby_cost_eur))
+                bcm_precommit_stats.setdefault("expected_activation_cost_eur", float(expected_activation_cost_eur))
                 bcm_precommit_stats.setdefault("expected_aux_cost_eur", float(expected_aux_cost_eur))
                 bcm_precommit_stats.setdefault("ev_award_probability", float(bcm_recovery_cost_probability_factor))
                 bcm_precommit_stats.setdefault("bcm_ev_award_probability", float(bcm_recovery_cost_probability_factor))
@@ -14136,6 +14232,25 @@ class BatteryBacktester:
                 bcm_precommit_stats.setdefault(
                     "effective_ev_before_recovery_eur",
                     float(precommit_net_capacity_ev_after_headroom_cost_eur),
+                )
+                component_ev_after_incremental = float(
+                    float(bcm_precommit_stats.get("expected_capacity_revenue_eur", expected_capacity_revenue_eur))
+                    + float(bcm_precommit_stats.get("expected_activation_revenue_eur", expected_activation_revenue_eur))
+                    - float(bcm_precommit_stats.get("expected_standby_cost_eur", expected_standby_cost_eur))
+                    - float(bcm_precommit_stats.get("expected_activation_cost_eur", expected_activation_cost_eur))
+                    - float(bcm_precommit_stats.get("incremental_recovery_cost_eur", 0.0))
+                )
+                exported_ev_after_incremental = float(
+                    bcm_precommit_stats.get(
+                        "ev_after_incremental_recovery_eur",
+                        bcm_precommit_stats.get("effective_ev_after_recovery_eur", component_ev_after_incremental),
+                    )
+                )
+                bcm_precommit_stats["component_recomputed_ev_after_incremental_recovery_eur"] = float(
+                    component_ev_after_incremental
+                )
+                bcm_precommit_stats["ev_component_reconciliation_error_eur"] = float(
+                    exported_ev_after_incremental - component_ev_after_incremental
                 )
 
             afrr_rounding_before_pos_mw = float(offered_pos)
@@ -14354,6 +14469,8 @@ class BatteryBacktester:
                             "candidate_recovery_cost_eur",
                             "incremental_recovery_cost_eur",
                             "expected_incremental_recovery_cost_eur",
+                            "component_recomputed_ev_after_incremental_recovery_eur",
+                            "ev_component_reconciliation_error_eur",
                             "full_recovery_cost_eur",
                             "full_recovery_cost_would_have_zeroed",
                             "ev_after_incremental_recovery_eur",
@@ -14365,11 +14482,15 @@ class BatteryBacktester:
                             "bcm_ev_award_probability",
                             "expected_capacity_revenue_eur",
                             "expected_activation_revenue_eur",
+                            "expected_standby_cost_eur",
+                            "expected_activation_cost_eur",
                             "expected_aux_cost_eur",
                             "expected_headroom_recharge_cost_eur",
                             "expected_headroom_opportunity_cost_eur",
                             "full_headroom_recharge_cost_eur",
                             "full_headroom_opportunity_cost_eur",
+                            "baseline_recoverable",
+                            "candidate_recoverable",
                         ):
                             precommit_audit_by_ts.setdefault(f"bcm_precommit_{diag_name}", {})[tsu] = float(
                                 bcm_precommit_stats.get(diag_name, np.nan if "ev" in diag_name else 0.0)
@@ -14744,6 +14865,8 @@ class BatteryBacktester:
                         "candidate_recovery_cost_eur",
                         "incremental_recovery_cost_eur",
                         "expected_incremental_recovery_cost_eur",
+                        "component_recomputed_ev_after_incremental_recovery_eur",
+                        "ev_component_reconciliation_error_eur",
                         "full_recovery_cost_eur",
                         "full_recovery_cost_would_have_zeroed",
                         "ev_after_incremental_recovery_eur",
@@ -14755,11 +14878,15 @@ class BatteryBacktester:
                         "bcm_ev_award_probability",
                         "expected_capacity_revenue_eur",
                         "expected_activation_revenue_eur",
+                        "expected_standby_cost_eur",
+                        "expected_activation_cost_eur",
                         "expected_aux_cost_eur",
                         "expected_headroom_recharge_cost_eur",
                         "expected_headroom_opportunity_cost_eur",
                         "full_headroom_recharge_cost_eur",
                         "full_headroom_opportunity_cost_eur",
+                        "baseline_recoverable",
+                        "candidate_recoverable",
                     ):
                         precommit_audit_by_ts.setdefault(f"bcm_precommit_{diag_name}", {})[tsu] = float(
                             bcm_precommit_stats.get(diag_name, np.nan if "ev" in diag_name else 0.0)
@@ -17641,6 +17768,8 @@ class BatteryBacktester:
                 "bcm_precommit_candidate_recovery_cost_eur",
                 "bcm_precommit_incremental_recovery_cost_eur",
                 "bcm_precommit_expected_incremental_recovery_cost_eur",
+                "bcm_precommit_component_recomputed_ev_after_incremental_recovery_eur",
+                "bcm_precommit_ev_component_reconciliation_error_eur",
                 "bcm_precommit_full_recovery_cost_eur",
                 "bcm_precommit_full_recovery_cost_would_have_zeroed",
                 "bcm_precommit_ev_after_incremental_recovery_eur",
@@ -17654,11 +17783,15 @@ class BatteryBacktester:
                 "bcm_precommit_bcm_ev_award_probability",
                 "bcm_precommit_expected_capacity_revenue_eur",
                 "bcm_precommit_expected_activation_revenue_eur",
+                "bcm_precommit_expected_standby_cost_eur",
+                "bcm_precommit_expected_activation_cost_eur",
                 "bcm_precommit_expected_aux_cost_eur",
                 "bcm_precommit_expected_headroom_recharge_cost_eur",
                 "bcm_precommit_expected_headroom_opportunity_cost_eur",
                 "bcm_precommit_full_headroom_recharge_cost_eur",
                 "bcm_precommit_full_headroom_opportunity_cost_eur",
+                "bcm_precommit_baseline_recoverable",
+                "bcm_precommit_candidate_recoverable",
                 "bcm_precommit_zero_reason_detail",
                 "bcm_precommit_final_decision_reason",
                 "bcm_precommit_reduced_due_to_power",
@@ -21570,6 +21703,146 @@ class BatteryBacktester:
                     repair = repair.mask(repair.str.lower().isin({"", "nan", "none"}) & action, hourly[reason_col])
                     repair = repair.mask(repair.str.lower().isin({"", "nan"}), "none")
                     hourly[repair_col] = repair
+
+        terminal_closure_fields = (
+            "terminal_closure_applied",
+            "terminal_closure_reason",
+            "terminal_closure_soc_before_mwh",
+            "terminal_closure_soc_after_mwh",
+            "terminal_closure_target_mwh",
+            "terminal_closure_tolerance_mwh",
+            "terminal_closure_id_buy_mwh",
+            "terminal_closure_id_sell_mwh",
+            "terminal_closure_internal_buy_mwh",
+            "terminal_closure_internal_sell_mwh",
+            "terminal_closure_buy_price_eur_mwh",
+            "terminal_closure_sell_price_eur_mwh",
+            "terminal_closure_revenue_eur",
+            "terminal_closure_cost_eur",
+            "terminal_closure_transaction_cost_eur",
+            "terminal_closure_degradation_cost_eur",
+            "terminal_closure_aux_cost_eur",
+            "terminal_closure_net_pnl_eur",
+            "terminal_closure_pnl_eur",
+            "final_soc_before_terminal_closure_mwh",
+            "final_soc_after_terminal_closure_mwh",
+            "final_soc_target_met_after_closure",
+        )
+        for field in terminal_closure_fields:
+            if field not in hourly.columns:
+                hourly[field] = "none" if field == "terminal_closure_reason" else 0.0
+
+        def _row_num(row_idx: int, col_name: str, default: float = 0.0) -> float:
+            if col_name not in hourly.columns:
+                return float(default)
+            value = pd.to_numeric(pd.Series([hourly.at[row_idx, col_name]]), errors="coerce").iloc[0]
+            return float(value) if np.isfinite(value) else float(default)
+
+        def _add_to_cell(row_idx: int, col_name: str, delta: float) -> None:
+            if col_name not in hourly.columns:
+                hourly[col_name] = 0.0
+            hourly.at[row_idx, col_name] = float(_row_num(row_idx, col_name, 0.0) + float(delta))
+
+        def _apply_final_terminal_closure(prefix: str) -> dict[str, float | str]:
+            empty = {
+                "terminal_closure_applied": 0.0,
+                "terminal_closure_reason": "not_applicable",
+                "terminal_closure_soc_before_mwh": float("nan"),
+                "terminal_closure_soc_after_mwh": float("nan"),
+                "terminal_closure_target_mwh": float(self.soc_target_end),
+                "terminal_closure_tolerance_mwh": 1e-6,
+                "terminal_closure_id_buy_mwh": 0.0,
+                "terminal_closure_id_sell_mwh": 0.0,
+                "terminal_closure_internal_buy_mwh": 0.0,
+                "terminal_closure_internal_sell_mwh": 0.0,
+                "terminal_closure_buy_price_eur_mwh": 0.0,
+                "terminal_closure_sell_price_eur_mwh": 0.0,
+                "terminal_closure_revenue_eur": 0.0,
+                "terminal_closure_cost_eur": 0.0,
+                "terminal_closure_transaction_cost_eur": 0.0,
+                "terminal_closure_degradation_cost_eur": 0.0,
+                "terminal_closure_aux_cost_eur": 0.0,
+                "terminal_closure_net_pnl_eur": 0.0,
+                "terminal_closure_pnl_eur": 0.0,
+                "final_soc_before_terminal_closure_mwh": float("nan"),
+                "final_soc_after_terminal_closure_mwh": float("nan"),
+                "final_soc_target_met_after_closure": 0.0,
+            }
+            if str(self.final_soc_mode) != "hard" or hourly.empty:
+                return empty
+            soc_col = f"{prefix}_soc_mwh"
+            pnl_col = f"{prefix}_pnl_eur"
+            if soc_col not in hourly.columns or pnl_col not in hourly.columns:
+                return empty
+            idx = int(hourly.index[-1])
+            soc_before = _row_num(idx, soc_col, float(self.soc_init))
+            buy_price = _row_num(idx, f"{prefix}_id_buy_price_eur_mwh", float("nan"))
+            sell_price = _row_num(idx, f"{prefix}_id_sell_price_eur_mwh", float("nan"))
+            da_ref_price = _row_num(idx, f"{prefix}_id_da_reference_price_eur_mwh", float("nan"))
+            if not np.isfinite(buy_price):
+                buy_price = min(float(self.id_buy_price_cap_eur_mwh), max(0.0, da_ref_price) + float(self.id_rescue_spread_eur_mwh))
+            if not np.isfinite(sell_price):
+                sell_price = max(float(self.id_sell_price_floor_eur_mwh), max(0.0, da_ref_price) - float(self.id_rescue_spread_eur_mwh))
+            if not np.isfinite(da_ref_price):
+                da_ref_price = max(0.0, buy_price - float(self.id_rescue_spread_eur_mwh))
+            existing_aux = _row_num(idx, f"{prefix}_aux_energy_mwh", 0.0)
+            comp = self._terminal_closure_components(
+                final_soc_before_mwh=soc_before,
+                buy_price_eur_mwh=float(buy_price),
+                sell_price_eur_mwh=float(sell_price),
+                aux_settlement_price_eur_mwh=float(da_ref_price),
+                existing_aux_mwh=float(existing_aux),
+                target_final_soc_mwh=float(self.soc_target_end),
+                tolerance_mwh=1e-6,
+            )
+            applied = float(comp["terminal_closure_applied"]) >= 0.5
+            if not applied:
+                comp["terminal_closure_reason"] = "already_at_target"
+                comp["terminal_closure_soc_after_mwh"] = float(soc_before)
+                comp["final_soc_after_terminal_closure_mwh"] = float(soc_before)
+                comp["final_soc_target_met_after_closure"] = float(abs(float(soc_before) - float(self.soc_target_end)) <= 1e-6)
+                return comp
+            buy_mwh = float(comp["terminal_closure_id_buy_mwh"])
+            sell_mwh = float(comp["terminal_closure_id_sell_mwh"])
+            aux_delta = float(comp.get("terminal_closure_recovery_induced_aux_delta_mwh", 0.0))
+            pnl_delta = float(comp["terminal_closure_net_pnl_eur"])
+            _add_to_cell(idx, f"{prefix}_id_buy_mwh", buy_mwh)
+            _add_to_cell(idx, f"{prefix}_id_sell_mwh", sell_mwh)
+            _add_to_cell(idx, f"{prefix}_id_charge_mw", buy_mwh / max(float(self.dt_h), 1e-12))
+            _add_to_cell(idx, f"{prefix}_id_discharge_mw", sell_mwh / max(float(self.dt_h), 1e-12))
+            _add_to_cell(idx, f"{prefix}_id_charge_internal_mwh", float(comp["terminal_closure_internal_buy_mwh"]))
+            _add_to_cell(idx, f"{prefix}_id_discharge_internal_mwh", float(comp["terminal_closure_internal_sell_mwh"]))
+            _add_to_cell(idx, f"{prefix}_revenue_id_eur", float(comp["terminal_closure_revenue_eur"]))
+            _add_to_cell(idx, f"{prefix}_cost_id_eur", float(comp["terminal_closure_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_transaction_cost_eur", float(comp["terminal_closure_transaction_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_degradation_cost_eur", float(comp["terminal_closure_degradation_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_degradation_cost_id_eur", float(comp["terminal_closure_degradation_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_aux_energy_mwh", aux_delta)
+            _add_to_cell(idx, f"{prefix}_aux_cost_eur", float(comp["terminal_closure_aux_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_pnl_id_eur", float(comp["terminal_closure_revenue_eur"]) - float(comp["terminal_closure_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_id_net_pnl_eur", float(comp["terminal_closure_revenue_eur"]) - float(comp["terminal_closure_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_id_technical_repair_pnl_eur", float(comp["terminal_closure_revenue_eur"]) - float(comp["terminal_closure_cost_eur"]))
+            _add_to_cell(idx, f"{prefix}_id_repair_mwh", buy_mwh + sell_mwh)
+            _add_to_cell(idx, f"{prefix}_id_repair_cost_eur", float(comp["terminal_closure_cost_eur"]) - float(comp["terminal_closure_revenue_eur"]))
+            _add_to_cell(idx, f"{prefix}_net_cashflow_eur", float(comp["terminal_closure_revenue_eur"]) - float(comp["terminal_closure_cost_eur"]) - float(comp["terminal_closure_transaction_cost_eur"]) - float(comp["terminal_closure_aux_cost_eur"]))
+            _add_to_cell(idx, pnl_col, pnl_delta)
+            hourly.at[idx, soc_col] = float(comp["terminal_closure_soc_after_mwh"])
+            for reason_col in (f"{prefix}_id_recourse_reason", f"{prefix}_id_repair_reason"):
+                if reason_col in hourly.columns:
+                    hourly.at[idx, reason_col] = str(comp["terminal_closure_reason"])
+            return comp
+
+        terminal_closure_by_prefix: dict[str, dict[str, float | str]] = {}
+        for _prefix in ("pred", "real", "naive", "perfect_foresight", "global_perfect_foresight"):
+            terminal_closure_by_prefix[_prefix] = _apply_final_terminal_closure(_prefix)
+        real_terminal_closure = terminal_closure_by_prefix.get("real", {})
+        if not hourly.empty:
+            final_idx = int(hourly.index[-1])
+            for field in terminal_closure_fields:
+                hourly.at[final_idx, field] = real_terminal_closure.get(
+                    field,
+                    "none" if field == "terminal_closure_reason" else 0.0,
+                )
         hourly["rolling_pf_solver_pnl_eur"] = float(rolling_pf_solver_solution_eur)
         hourly["rolling_pf_solver_feasible"] = float(rolling_pf_solver_feasible)
         hourly["rolling_pf_selected_incumbent"] = str(rolling_pf_selected_incumbent)
@@ -21840,11 +22113,26 @@ class BatteryBacktester:
         volatility = calculate_volatility(plan_history)
         naive_volatility = calculate_volatility(naive_plan_history)
 
-        pred_pnl_raw = float(hourly["pred_pnl_eur"].sum())
-        real_pnl_raw = float(hourly["real_pnl_eur"].sum())
-        naive_pnl_raw = float(hourly["naive_pnl_eur"].sum())
+        terminal_closure_pred_pnl_eur = float(
+            terminal_closure_by_prefix.get("pred", {}).get("terminal_closure_net_pnl_eur", 0.0) or 0.0
+        )
+        terminal_closure_real_pnl_eur = float(
+            terminal_closure_by_prefix.get("real", {}).get("terminal_closure_net_pnl_eur", 0.0) or 0.0
+        )
+        terminal_closure_naive_pnl_eur = float(
+            terminal_closure_by_prefix.get("naive", {}).get("terminal_closure_net_pnl_eur", 0.0) or 0.0
+        )
+        terminal_closure_pf_pnl_eur = float(
+            terminal_closure_by_prefix.get("perfect_foresight", {}).get("terminal_closure_net_pnl_eur", 0.0) or 0.0
+        )
+        terminal_closure_global_pf_pnl_eur = float(
+            terminal_closure_by_prefix.get("global_perfect_foresight", {}).get("terminal_closure_net_pnl_eur", 0.0) or 0.0
+        )
+        pred_pnl_raw = float(hourly["pred_pnl_eur"].sum()) - terminal_closure_pred_pnl_eur
+        real_pnl_raw = float(hourly["real_pnl_eur"].sum()) - terminal_closure_real_pnl_eur
+        naive_pnl_raw = float(hourly["naive_pnl_eur"].sum()) - terminal_closure_naive_pnl_eur
         perfect_foresight_pnl_raw = (
-            float(hourly["perfect_foresight_pnl_eur"].sum())
+            float(hourly["perfect_foresight_pnl_eur"].sum()) - terminal_closure_pf_pnl_eur
             if rolling_pf_available >= 0.5
             else float("nan")
         )
@@ -21962,21 +22250,23 @@ class BatteryBacktester:
         term_adj_perfect_foresight = _terminal_target_adjustment(final_perfect_foresight_soc_mwh, terminal_price_true_eur_mwh)
         term_adj_global_perfect_foresight = _terminal_target_adjustment(final_global_perfect_foresight_soc_mwh, terminal_price_true_eur_mwh)
 
-        pred_pnl_total = pred_pnl_raw + term_adj_pred["adjustment_eur"]
-        real_pnl_total = real_pnl_raw + term_adj_real["adjustment_eur"]
-        naive_pnl_total = naive_pnl_raw + term_adj_naive["adjustment_eur"]
+        pred_pnl_total = pred_pnl_raw + terminal_closure_pred_pnl_eur + term_adj_pred["adjustment_eur"]
+        real_pnl_total = real_pnl_raw + terminal_closure_real_pnl_eur + term_adj_real["adjustment_eur"]
+        naive_pnl_total = naive_pnl_raw + terminal_closure_naive_pnl_eur + term_adj_naive["adjustment_eur"]
         perfect_foresight_pnl_total = (
-            perfect_foresight_pnl_raw + term_adj_perfect_foresight["adjustment_eur"]
+            perfect_foresight_pnl_raw + terminal_closure_pf_pnl_eur + term_adj_perfect_foresight["adjustment_eur"]
             if rolling_pf_available >= 0.5
             else float("nan")
         )
         global_perfect_foresight_pnl_raw = (
-            _sum_col_zero("global_perfect_foresight_pnl_eur")
+            _sum_col_zero("global_perfect_foresight_pnl_eur") - terminal_closure_global_pf_pnl_eur
             if enable_global_perfect_foresight and global_perfect_foresight_available_flag >= 0.5
             else float("nan")
         )
         global_perfect_foresight_pnl_total = (
-            global_perfect_foresight_pnl_raw + term_adj_global_perfect_foresight["adjustment_eur"]
+            global_perfect_foresight_pnl_raw
+            + terminal_closure_global_pf_pnl_eur
+            + term_adj_global_perfect_foresight["adjustment_eur"]
             if enable_global_perfect_foresight and global_perfect_foresight_available_flag >= 0.5
             else float("nan")
         )
@@ -22220,7 +22510,11 @@ class BatteryBacktester:
             "realized_pnl_excl_terminal_eur": float(real_pnl_raw),
             "realized_operational_pnl_eur": float(real_pnl_raw),
             "realized_total_pnl_incl_terminal_eur": float(real_pnl_total),
-            "realized_total_pnl_eur_includes_terminal_value": 1.0,
+            "realized_total_pnl_eur_includes_terminal_value": 0.0,
+            "realized_total_pnl_eur_includes_terminal_closure": 1.0,
+            "operational_pnl_excl_terminal_eur": float(real_pnl_raw),
+            "terminal_closure_pnl_eur": float(terminal_closure_real_pnl_eur),
+            "total_pnl_incl_terminal_closure_eur": float(real_pnl_total),
             "naive_pnl_excl_terminal_eur": float(naive_pnl_raw),
             "perfect_foresight_pnl_excl_terminal_eur": float(perfect_foresight_pnl_raw),
             "terminal_value_predicted_eur": float(terminal_value_pred_eur),
@@ -22230,10 +22524,10 @@ class BatteryBacktester:
             "terminal_value_global_perfect_foresight_eur": float(terminal_value_global_perfect_foresight_eur) if enable_global_perfect_foresight else float("nan"),
             "terminal_soc_shortfall_mwh": float(term_adj_real["shortfall_mwh"]),
             "terminal_soc_surplus_mwh": float(term_adj_real["surplus_mwh"]),
-            "terminal_soc_repair_cost_eur": float(term_adj_real["repair_cost_eur"]),
-            "terminal_soc_liquidation_revenue_eur": float(term_adj_real["liquidation_revenue_eur"]),
-            "terminal_soc_adjustment_eur": float(term_adj_real["adjustment_eur"]),
-            "terminal_soc_net_adjustment_eur": float(term_adj_real["adjustment_eur"]),
+            "terminal_soc_repair_cost_eur": float(real_terminal_closure.get("terminal_closure_cost_eur", 0.0)),
+            "terminal_soc_liquidation_revenue_eur": float(real_terminal_closure.get("terminal_closure_revenue_eur", 0.0)),
+            "terminal_soc_adjustment_eur": float(terminal_closure_real_pnl_eur + term_adj_real["adjustment_eur"]),
+            "terminal_soc_net_adjustment_eur": float(terminal_closure_real_pnl_eur + term_adj_real["adjustment_eur"]),
             "terminal_soc_target_mwh": float(term_value_real["terminal_soc_target_mwh"]),
             "terminal_surplus_mwh": float(term_value_real["terminal_surplus_mwh"]),
             "terminal_surplus_grid_mwh": float(term_value_real["terminal_surplus_grid_mwh"]),
@@ -22245,8 +22539,47 @@ class BatteryBacktester:
                 term_value_real["terminal_surplus_degradation_cost_eur"]
             ),
             "terminal_surplus_value_net_eur": float(term_value_real["terminal_surplus_value_net_eur"]),
-            "terminal_value_convention": str(term_value_real["terminal_value_convention"]),
-            "terminal_value_included_in_total_pnl": float(term_value_real["terminal_value_included_in_total_pnl"]),
+            "terminal_value_convention": "physical_id_terminal_closure_to_target",
+            "terminal_value_included_in_total_pnl": 0.0,
+            "terminal_closure_applied": float(real_terminal_closure.get("terminal_closure_applied", 0.0)),
+            "terminal_closure_reason": str(real_terminal_closure.get("terminal_closure_reason", "none")),
+            "terminal_closure_soc_before_mwh": float(
+                real_terminal_closure.get("terminal_closure_soc_before_mwh", float("nan"))
+            ),
+            "terminal_closure_soc_after_mwh": float(
+                real_terminal_closure.get("terminal_closure_soc_after_mwh", float("nan"))
+            ),
+            "terminal_closure_target_mwh": float(real_terminal_closure.get("terminal_closure_target_mwh", self.soc_target_end)),
+            "terminal_closure_tolerance_mwh": float(real_terminal_closure.get("terminal_closure_tolerance_mwh", 1e-6)),
+            "terminal_closure_id_buy_mwh": float(real_terminal_closure.get("terminal_closure_id_buy_mwh", 0.0)),
+            "terminal_closure_id_sell_mwh": float(real_terminal_closure.get("terminal_closure_id_sell_mwh", 0.0)),
+            "terminal_closure_internal_buy_mwh": float(real_terminal_closure.get("terminal_closure_internal_buy_mwh", 0.0)),
+            "terminal_closure_internal_sell_mwh": float(real_terminal_closure.get("terminal_closure_internal_sell_mwh", 0.0)),
+            "terminal_closure_buy_price_eur_mwh": float(
+                real_terminal_closure.get("terminal_closure_buy_price_eur_mwh", 0.0)
+            ),
+            "terminal_closure_sell_price_eur_mwh": float(
+                real_terminal_closure.get("terminal_closure_sell_price_eur_mwh", 0.0)
+            ),
+            "terminal_closure_revenue_eur": float(real_terminal_closure.get("terminal_closure_revenue_eur", 0.0)),
+            "terminal_closure_cost_eur": float(real_terminal_closure.get("terminal_closure_cost_eur", 0.0)),
+            "terminal_closure_transaction_cost_eur": float(
+                real_terminal_closure.get("terminal_closure_transaction_cost_eur", 0.0)
+            ),
+            "terminal_closure_degradation_cost_eur": float(
+                real_terminal_closure.get("terminal_closure_degradation_cost_eur", 0.0)
+            ),
+            "terminal_closure_aux_cost_eur": float(real_terminal_closure.get("terminal_closure_aux_cost_eur", 0.0)),
+            "terminal_closure_net_pnl_eur": float(real_terminal_closure.get("terminal_closure_net_pnl_eur", 0.0)),
+            "final_soc_before_terminal_closure_mwh": float(
+                real_terminal_closure.get("final_soc_before_terminal_closure_mwh", final_real_soc_mwh)
+            ),
+            "final_soc_after_terminal_closure_mwh": float(
+                real_terminal_closure.get("final_soc_after_terminal_closure_mwh", final_real_soc_mwh)
+            ),
+            "final_soc_target_met_after_closure": float(
+                real_terminal_closure.get("final_soc_target_met_after_closure", 0.0)
+            ),
             "terminal_soc_price_eur_mwh": float(terminal_price_true_eur_mwh),
             "terminal_price_eur_mwh": float(terminal_price_true_eur_mwh),
             "terminal_price_source": "last_true_da_price",
@@ -22658,9 +22991,7 @@ class BatteryBacktester:
             - summary["total_penalty_cost_eur"]
         )
         summary["realized_pnl_from_components_eur"] = float(pnl_components_rhs)
-        summary["realized_pnl_from_components_plus_terminal_eur"] = float(
-            pnl_components_rhs + summary["terminal_soc_adjustment_eur"]
-        )
+        summary["realized_pnl_from_components_plus_terminal_eur"] = float(pnl_components_rhs)
         summary["realized_pnl_balance_error_eur"] = float(
             summary["realized_total_pnl_eur"] - summary["realized_pnl_from_components_plus_terminal_eur"]
         )
@@ -22714,9 +23045,7 @@ class BatteryBacktester:
             - summary["perfect_foresight_total_penalty_cost_eur"]
         )
         summary["perfect_foresight_pnl_from_components_eur"] = float(perfect_foresight_pnl_components_rhs)
-        summary["perfect_foresight_pnl_from_components_plus_terminal_eur"] = float(
-            perfect_foresight_pnl_components_rhs + float(term_adj_perfect_foresight["adjustment_eur"])
-        )
+        summary["perfect_foresight_pnl_from_components_plus_terminal_eur"] = float(perfect_foresight_pnl_components_rhs)
         summary["perfect_foresight_pnl_balance_error_eur"] = float(
             summary["perfect_foresight_total_pnl_eur"] - summary["perfect_foresight_pnl_from_components_plus_terminal_eur"]
         )
@@ -23384,7 +23713,7 @@ class BatteryBacktester:
         summary["target_final_soc_mwh"] = float(self.soc_target_end)
         summary["final_soc_min_target_mwh"] = float(self.soc_target_end)
         summary["final_soc_target_mwh"] = float(self.soc_target_end)
-        summary["final_soc_constraint_satisfied"] = float(final_real_soc_mwh >= float(self.soc_target_end) - 1e-9)
+        summary["final_soc_constraint_satisfied"] = float(abs(final_real_soc_mwh - float(self.soc_target_end)) <= 1e-6)
         summary["final_soc_physical_check_pass"] = float(summary["final_soc_constraint_satisfied"])
         summary["final_soc_mode"] = str(self.final_soc_mode)
         summary["final_soc_exact_match_pass"] = float(abs(float(final_real_soc_mwh) - float(self.soc_target_end)) <= 1e-6)
