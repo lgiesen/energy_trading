@@ -38,6 +38,7 @@ from energy_trading.simulation.battery_backtest import (  # noqa: E402
     normalize_predicted_pnl_aliases,
     apply_benchmark_availability_to_summary,
     resolve_benchmark_paths,
+    should_report_rolling_pf_solver_failed,
 )
 from energy_trading.config import MODEL_SPECS  # noqa: E402
 from energy_trading.simulation.bid_builder import AFRRCapacityBid, BCMCapacityBid  # noqa: E402
@@ -4677,7 +4678,9 @@ def test_negative_missed_activation_penalty_is_positive() -> None:
     )
     assert float(m["missed_activation_neg_mwh"]) > 0.0
     assert np.isclose(float(m["penalty_activation_basis_neg_eur_mwh"]), 1000.0, atol=1e-9)
-    assert float(m["penalty_activation_neg_eur"]) > 0.0
+    assert float(m["penalty_activation_neg_eur"]) == pytest.approx(
+        float(m["missed_activation_neg_mwh"]) * 1000.0
+    )
 
 
 def test_degradation_cost_subtracted_once() -> None:
@@ -5214,6 +5217,113 @@ def test_bem_only_guard_keeps_forecast_values_unchanged() -> None:
     assert float(out["desired_bem_only_neg_mw"]) == 2.0
     assert float(out["submitted_bem_only_pos_mw"]) <= 2.0 + 1e-9
     assert float(out["submitted_bem_only_neg_mw"]) <= 2.0 + 1e-9
+
+
+def test_bem_neg_guard_accounts_for_da_buy_before_submission() -> None:
+    bt = _mk_backtester()
+    bt.afrr_min_bid_size_mw = 0.1
+    bt.afrr_bid_granularity_mw = 0.1
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=0.0,
+        desired_bem_only_neg_mw=2.0,
+        soc_start_mwh=bt.soc_max - 1.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        pred_act_pos=0.0,
+        pred_act_neg=100.0,
+        da_charge_mw=0.5,
+        da_discharge_mw=0.0,
+    )
+    assert float(guard["bem_guard_available_charge_headroom_mwh"]) == pytest.approx(0.0)
+    assert float(guard["submitted_bem_only_neg_mw"]) == pytest.approx(0.0)
+    assert str(guard["bem_guard_zero_reason_neg"]) == "charge_headroom_cap"
+    assert float(guard["bem_guard_includes_da_lockbook"]) == pytest.approx(1.0)
+
+
+def test_bem_pos_guard_accounts_for_da_sell_before_submission() -> None:
+    bt = _mk_backtester()
+    bt.afrr_min_bid_size_mw = 0.1
+    bt.afrr_bid_granularity_mw = 0.1
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=2.0,
+        desired_bem_only_neg_mw=0.0,
+        soc_start_mwh=bt.soc_min + 1.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        pred_act_pos=100.0,
+        pred_act_neg=0.0,
+        da_charge_mw=0.0,
+        da_discharge_mw=0.5,
+    )
+    assert float(guard["bem_guard_available_discharge_energy_mwh"]) == pytest.approx(0.0)
+    assert float(guard["submitted_bem_only_pos_mw"]) == pytest.approx(0.0)
+    assert str(guard["bem_guard_zero_reason_pos"]) == "discharge_headroom_cap"
+
+
+def test_multi_stack_derates_bem_neg_to_preserve_da_buy_lockbook() -> None:
+    bt = _mk_backtester()
+    bt.afrr_min_bid_size_mw = 0.1
+    bt.afrr_bid_granularity_mw = 0.1
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=0.0,
+        desired_bem_only_neg_mw=3.0,
+        soc_start_mwh=bt.soc_max - 1.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        pred_act_pos=0.0,
+        pred_act_neg=100.0,
+        da_charge_mw=0.5,
+        da_discharge_mw=0.0,
+        preserve_da_lockbook=True,
+    )
+    assert float(guard["multi_stack_da_lockbook_preserved"]) == pytest.approx(1.0)
+    assert float(guard["multi_stack_bem_neg_before_derate_mw"]) == pytest.approx(3.0)
+    assert float(guard["multi_stack_bem_neg_after_derate_mw"]) == pytest.approx(0.0)
+    assert float(guard["multi_stack_bem_derated_to_preserve_da_lockbook"]) == pytest.approx(1.0)
+    assert float(guard["multi_stack_combined_replay_pass"]) == pytest.approx(1.0)
+    assert str(guard["multi_stack_zero_reason"]) == "charge_headroom_cap"
+
+
+def test_multi_stack_derates_bem_pos_to_preserve_da_sell_lockbook() -> None:
+    bt = _mk_backtester()
+    bt.afrr_min_bid_size_mw = 0.1
+    bt.afrr_bid_granularity_mw = 0.1
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=3.0,
+        desired_bem_only_neg_mw=0.0,
+        soc_start_mwh=bt.soc_min + 1.0,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        pred_act_pos=100.0,
+        pred_act_neg=0.0,
+        da_charge_mw=0.0,
+        da_discharge_mw=0.5,
+        preserve_da_lockbook=True,
+    )
+    assert float(guard["multi_stack_da_lockbook_preserved"]) == pytest.approx(1.0)
+    assert float(guard["multi_stack_bem_pos_before_derate_mw"]) == pytest.approx(3.0)
+    assert float(guard["multi_stack_bem_pos_after_derate_mw"]) == pytest.approx(0.0)
+    assert float(guard["multi_stack_bem_derated_to_preserve_da_lockbook"]) == pytest.approx(1.0)
+    assert float(guard["multi_stack_combined_replay_pass"]) == pytest.approx(1.0)
+    assert str(guard["multi_stack_zero_reason"]) == "discharge_headroom_cap"
+
+
+def test_bem_only_guard_does_not_enable_multi_stack_da_preservation_by_default() -> None:
+    bt = _mk_backtester()
+    bt.afrr_min_bid_size_mw = 0.1
+    bt.afrr_bid_granularity_mw = 0.1
+    guard = bt._apply_bem_only_submission_guard(
+        desired_bem_only_pos_mw=1.0,
+        desired_bem_only_neg_mw=1.0,
+        soc_start_mwh=bt.soc_init,
+        locked_reserve_pos_mw=0.0,
+        locked_reserve_neg_mw=0.0,
+        pred_act_pos=100.0,
+        pred_act_neg=100.0,
+    )
+    assert float(guard["submitted_bem_only_pos_mw"]) > 0.0
+    assert float(guard["submitted_bem_only_neg_mw"]) > 0.0
+    assert float(guard["multi_stack_da_lockbook_preserved"]) == pytest.approx(0.0)
 
 
 def test_simultaneous_bem_only_pos_neg_allowed_if_both_feasible() -> None:
@@ -6032,6 +6142,8 @@ def test_bem_neg_clipped_when_partial_bcm_neg_leaves_less_residual_power() -> No
 
 def test_bem_only_pos_neg_combined_same_hour_stack_is_capped() -> None:
     bt = _mk_backtester()
+    bt.afrr_min_bid_size_mw = 0.1
+    bt.afrr_bid_granularity_mw = 0.1
     guard = bt._apply_bem_only_submission_guard(
         desired_bem_only_pos_mw=7.0,
         desired_bem_only_neg_mw=7.0,
@@ -6042,10 +6154,10 @@ def test_bem_only_pos_neg_combined_same_hour_stack_is_capped() -> None:
         pred_act_neg=100.0,
     )
     submitted_sum = float(guard["submitted_bem_only_pos_mw"]) + float(guard["submitted_bem_only_neg_mw"])
-    assert float(guard["submitted_bem_only_pos_mw"]) == pytest.approx(7.0)
-    assert float(guard["submitted_bem_only_neg_mw"]) == pytest.approx(7.0)
-    assert submitted_sum > bt.p_max_mw
-    assert str(guard["bem_only_headroom_guard_reason"]) == "none"
+    assert submitted_sum <= bt.p_max_mw + 1e-9
+    assert float(guard["submitted_bem_only_pos_mw"]) > 0.0
+    assert float(guard["submitted_bem_only_neg_mw"]) > 0.0
+    assert str(guard["bem_only_headroom_guard_reason"]) == "power_stack_cap"
 
 
 def test_optimizer_clips_independent_bem_neg_against_locked_bcm_neg() -> None:
@@ -7000,7 +7112,7 @@ def test_bcm_precommit_negative_ev_after_id_recovery_zeroes_candidate(
 
     assert offered_pos == pytest.approx(0.0)
     assert offered_neg == pytest.approx(0.0)
-    assert str(stats["zero_reason"]) == "negative_ev_after_id_recovery"
+    assert str(stats["zero_reason"]) == "candidate_incremental_ev_negative"
     assert float(stats["id_recovery_feasible"]) == pytest.approx(1.0)
     assert float(stats["effective_ev_after_recovery_eur"]) < 0.0
 
@@ -7019,6 +7131,20 @@ def test_bcm_precommit_uses_incremental_recovery_cost_not_full_baseline_recovery
     assert float(stats["full_recovery_cost_ev_after_recovery_eur"]) == pytest.approx(-80.0)
     assert float(stats["full_recovery_cost_would_have_zeroed"]) == pytest.approx(1.0)
     assert float(stats["recovery_cost_probability_weighted"]) == pytest.approx(0.0)
+
+
+def test_bcm_precommit_preserves_negative_incremental_recovery_cost_as_benefit() -> None:
+    stats = BatteryBacktester._bcm_ev_recovery_cost_adjustment(
+        candidate_ev_eur=10.0,
+        retry_factor=1.0,
+        baseline_recovery_cost_eur=100.0,
+        candidate_recovery_cost_eur=40.0,
+    )
+
+    assert float(stats["incremental_recovery_cost_eur"]) == pytest.approx(-60.0)
+    assert float(stats["expected_incremental_recovery_cost_eur"]) == pytest.approx(-60.0)
+    assert float(stats["ev_after_incremental_recovery_eur"]) == pytest.approx(70.0)
+    assert float(stats["recovery_ev_violation"]) == pytest.approx(0.0)
 
 
 def test_bcm_precommit_recovery_cost_probability_factor() -> None:
@@ -10679,6 +10805,7 @@ def test_upper_soc_relief_is_blocked_when_it_would_undo_hard_terminal_target() -
         projected_terminal_soc_without_new_id_mwh=10.0,
         remaining_known_losses_mwh=0.0,
         terminal_soc_safety_margin_mwh=0.0,
+        terminal_hard_soc_protection=True,
     )
     diag = bt._last_id_rescue_plan_diagnostics
 
@@ -10687,6 +10814,57 @@ def test_upper_soc_relief_is_blocked_when_it_would_undo_hard_terminal_target() -
     assert reason == "none"
     assert float(diag["upper_soc_relief_terminal_shortfall_prevented"]) == pytest.approx(1.0)
     assert float(diag["upper_soc_relief_caused_terminal_shortfall"]) == pytest.approx(0.0)
+    assert float(diag["terminal_day_upper_soc_relief_capped"]) == pytest.approx(1.0)
+    assert str(diag["terminal_day_upper_soc_relief_reason"]) == "protect_hard_final_soc"
+
+
+def test_non_terminal_upper_soc_relief_does_not_use_global_terminal_cap() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=17.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=10.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=10.0,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+        terminal_hard_soc_protection=False,
+    )
+
+    assert id_charge == pytest.approx(0.0)
+    assert id_discharge > 0.0
+    assert reason == "afrr_headroom_repair"
+
+
+def test_terminal_upper_soc_relief_cap_uses_eta_out() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_out = 0.8
+    bt.soc_target_end = 10.0
+    bt.reserve_headroom_safety_mwh = 0.0
+    id_charge, id_discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=15.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=8.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=10.5,
+        remaining_known_losses_mwh=0.0,
+        terminal_soc_safety_margin_mwh=0.0,
+        terminal_hard_soc_protection=True,
+    )
+    diag = bt._last_id_rescue_plan_diagnostics
+
+    assert id_charge == pytest.approx(0.0)
+    assert id_discharge == pytest.approx(0.5 * bt.eta_out / bt.dt_h)
+    assert reason == "afrr_headroom_repair"
+    assert float(diag["terminal_day_upper_soc_relief_allowed_mwh"]) == pytest.approx(0.5 * bt.eta_out)
+    assert float(diag["terminal_day_upper_soc_relief_projected_soc_after_mwh"]) >= 10.0 - 1e-9
 
 
 def test_bcm_only_common_technical_id_passes_strategy_isolation() -> None:
@@ -11655,34 +11833,38 @@ def test_locked_obligation_still_activates_protected_envelope() -> None:
     assert float(psv["protected_soc_violation_pos_mwh"]) > 0.0
 
 
-def test_precommit_ev_includes_headroom_cost() -> None:
+def test_bcm_precommit_does_not_monetize_headroom_opportunity_cost() -> None:
     bt = _mk_backtester()
     bt.reserve_min_margin_after_bid_mwh = 0.0
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = None
     ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
     target_hours = pd.date_range("2025-05-02 02:00:00+00:00", periods=4, freq="h")
     snap = pd.DataFrame(
         {
             "target_time_utc": target_hours,
-            "reserve_pos_mw": [8.0, 8.0, 8.0, 8.0],
+            "reserve_pos_mw": [2.0, 2.0, 2.0, 2.0],
             "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0],
-            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 10.0] * 4,
             "discharge_mw": [0.0] * 4,
             "charge_mw": [0.0] * 4,
             "id_discharge_mw": [0.0] * 4,
             "id_charge_mw": [0.0] * 4,
             "bem_only_pos_mw": [0.0] * 4,
             "bem_only_neg_mw": [0.0] * 4,
-            "aux_power_mw": [0.2] * 4,
+            "aux_power_mw": [0.0] * 4,
         }
     )
     col = BacktestColumnMap()
     src = pd.DataFrame(
         {
             col.timestamp: target_hours,
-            col.pred_afrr_capacity_price_pos: [1.0] * 4,
+            col.pred_afrr_capacity_price_pos: [100.0] * 4,
             col.pred_afrr_capacity_price_neg: [0.0] * 4,
             col.pred_afrr_activation_price_pos: [0.0] * 4,
             col.pred_afrr_activation_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_rate_pos: [0.0] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
             col.pred_da_price: [300.0] * 4,
             col.true_afrr_capacity_price_pos: [100.0] * 4,
             col.true_afrr_capacity_price_neg: [0.0] * 4,
@@ -11703,8 +11885,12 @@ def test_precommit_ev_includes_headroom_cost() -> None:
         is_perfect_foresight=False,
         global_end_utc=target_hours[-1],
     )
-    assert any(float(v) > 0.5 for v in pre.get("precommit_bid_zeroed_due_to_negative_ev", {}).values())
-    assert any(float(v) > 0.0 for v in pre.get("precommit_headroom_opportunity_cost_eur", {}).values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre.get("precommit_headroom_opportunity_cost_eur", {}).values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre.get("bcm_precommit_expected_headroom_opportunity_cost_eur", {}).values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre.get("bcm_precommit_full_headroom_opportunity_cost_eur", {}).values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre.get("precommit_bid_zeroed_due_to_negative_ev", {}).values())
+    assert any(float(v) > 0.0 for v in pre.get("bcm_precommit_candidate_pos_mw", {}).values())
+    assert all(str(v) != "negative_bcm_ev" for v in pre.get("bcm_precommit_zero_reason", {}).values())
 
 
 def test_bcm_precommit_economic_filter_uses_optimizer_ev_with_capacity_value(
@@ -13764,6 +13950,22 @@ def test_benchmark_mode_model_only_masks_disabled_benchmarks() -> None:
     assert np.isnan(float(summary["naive_total_pnl_eur"]))
     assert np.isnan(float(summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
     assert np.isnan(float(summary["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]))
+
+
+def test_disabled_rolling_pf_does_not_report_solver_failed() -> None:
+    assert not should_report_rolling_pf_solver_failed(
+        strict_simulation_validity=True,
+        rolling_pf_enabled=False,
+        rolling_pf_available=0.0,
+    )
+
+
+def test_enabled_rolling_pf_unavailable_reports_solver_failed() -> None:
+    assert should_report_rolling_pf_solver_failed(
+        strict_simulation_validity=True,
+        rolling_pf_enabled=True,
+        rolling_pf_available=0.0,
+    )
 
 
 def test_benchmark_mode_full_preserves_all_paths_available() -> None:

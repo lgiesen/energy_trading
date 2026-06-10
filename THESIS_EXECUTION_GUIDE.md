@@ -27,8 +27,8 @@ This executes the full end-to-end pipeline for all three models:
 
 During smoke runs, `IS_SMOKE_TEST=1` is injected and read by Python via `os.environ`, enabling aggressive reductions (e.g., trials/epochs/data rows) to validate codebase integrity in under ~5 minutes without running full multi-hour training loops.
 
-## 3. Canonical Full Execution
-Run final canonical model pipelines:
+## 3. Step 1: Train The Forecast Models
+Train the three model families before running final thesis simulations:
 
 ```bash
 make all-xgb
@@ -48,7 +48,72 @@ The pipeline uses direct artifact consumption for tuned hyperparameters:
 `scripts/train_and_export_runs.py` reads these files via `--hpo-artifact`, extracts `best_params`, and applies them directly in Python.  
 This replaces fragile shell-level JSON parsing and ensures deterministic, auditable parameter handoff from tuning to training.
 
-## 4. Quantile Sweep Simulation & Reporting
+## 4. Step 2: Run Final Thesis Simulations
+For the final thesis multi-market benchmark on the server, use:
+
+```bash
+chmod +x run_final_thesis_multi_3m.sh
+nohup ./run_final_thesis_multi_3m.sh \
+  > artifacts/simulation_runs/final_thesis_multi_3m_launcher.out 2>&1 &
+```
+
+This script runs:
+- Models: `xgb`, `tft`, `linear`
+- Strategy: `multi`
+- Horizon: `2025-03-01T00:00:00Z` to `2025-06-01T00:00:00Z`
+- Quantiles: `p30-p30`, `p50-p50`, `p70-p70` first, then `p90-p90`, `p10-p10`
+- Strict final SoC: `--final-soc-mode hard`
+- Strict validity: `--strict-simulation-validity`
+- No GHPF: `--disable-ghpf --no-enable-global-perfect-foresight`
+
+The script uses dedicated output folders for every model/quantile run, so aggregate files do not overwrite each other.
+
+Default output layout:
+
+```text
+artifacts/simulation_runs/thesis_final_multi_3m_<UTC_TIMESTAMP>/
+  xgb_p30/
+  xgb_p50/
+  ...
+  benchmarks_naive/
+  benchmarks_rhpf/
+  logs/
+    status.csv
+    manifest.tsv
+    xgb_p30/stdout.log
+    xgb_p30/stderr.log
+    ...
+```
+
+Logs are saved inside the simulation run root under:
+
+```text
+artifacts/simulation_runs/thesis_final_multi_3m_<UTC_TIMESTAMP>/logs/
+```
+
+Monitor the launcher:
+
+```bash
+tail -f artifacts/simulation_runs/final_thesis_multi_3m_launcher.out
+```
+
+Monitor a specific simulation:
+
+```bash
+RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_3m_<UTC_TIMESTAMP>
+tail -f "$RUN_ROOT/logs/xgb_p30/stdout.log"
+tail -f "$RUN_ROOT/logs/xgb_p30/stderr.log"
+```
+
+The script runs up to 4 simulations concurrently by default. Override this if needed:
+
+```bash
+MAX_PARALLEL_JOBS=4 ./run_final_thesis_multi_3m.sh
+```
+
+Naive and RHPF benchmarks are run once each in separate dedicated folders and can be merged into model/quantile analysis later through their ledger and path outputs. GHPF is intentionally never run in this script.
+
+## 5. Quantile Sweep Simulation & Reporting
 Run the full quantile sweep simulation:
 
 ```bash
@@ -73,7 +138,7 @@ make thesis-report
 This aggregates sweep outputs into:
 - `artifacts/thesis_benchmark_report.csv`
 
-### 4.1 Full Grid (All Models × All Strategies × All DA Roles × All Quantile Pairs)
+### 5.1 Full Grid (All Models × All Strategies × All DA Roles × All Quantile Pairs)
 Best practice for large benchmark campaigns is to run a timestamped grid to avoid accidental overwrites.
 
 Run the complete grid on the full test horizon:
@@ -94,7 +159,7 @@ Outputs are written to unique timestamped roots, e.g.:
 
 So runs do not overwrite each other unless the same `SIM_GRID_STAMP` is reused.
 
-### 4.2 Smoke Grid (Fast End-to-End Validation)
+### 5.2 Smoke Grid (Fast End-to-End Validation)
 Run a short-window version of the same full grid:
 
 ```bash
@@ -107,7 +172,7 @@ Default smoke horizon is 24 hours and can be changed:
 make sim-grid-smoke GRID_SMOKE_HOURS=12
 ```
 
-### 4.3 Useful Overrides
+### 5.3 Useful Overrides
 You can customize the grid with Make variables:
 
 ```bash
@@ -118,7 +183,7 @@ make sim-grid-full \
   SIM_GRID_STAMP=$(date +%Y%m%d_%H%M%S)
 ```
 
-## 5. Audit & Output Artifacts
+## 6. Audit & Output Artifacts
 For every successful run, the pipeline automatically produces an immutable deliverable archive:
 - `artifacts/model_runs/<run_id>_deliverable.zip`
 

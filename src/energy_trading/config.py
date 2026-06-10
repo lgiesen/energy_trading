@@ -6,14 +6,15 @@ MODEL_SPECS = {
     "reserve_product_duration_h": 4.0,  # Duration used for activation-energy bounds
     # Minimum activation-energy headroom floor used inside p90 chance constraints.
     # 0.25 means 15 minutes within a 1-hour optimization step.
-    "min_activation_headroom_fraction": 0.25,
+    "min_activation_headroom_fraction": 0.00,
     "market_scope": "DE_LU",  # Sign/settlement convention scope
-    "terminal_soc_value_discount": 0.8,  # Legacy fallback for terminal SoC value in objective
     # Conservative DA continuation value for horizon-end internal SoC inventory.
     # This is a terminal value only, not a per-buy charge bonus.
     "da_terminal_soc_value_enabled": True,
     "da_terminal_value_quantile_sell": 0.50,
-    "da_terminal_value_quantile_buy": 0.25,
+    "da_terminal_value_quantile_buy": 0.25, 
+    # From the predicted DA prices for a 24-hour future window, 
+    # it sorts and interpolates over those 24 predicted prices and takes the empirical 25% quantile.
     "da_terminal_value_margin_eur_mwh": 0.0,
     "da_terminal_value_min_eur_mwh": 0.0,
     "da_terminal_value_max_eur_mwh": 500.0,

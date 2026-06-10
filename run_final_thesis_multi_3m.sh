@@ -12,9 +12,8 @@ set -Eeuo pipefail
 #   strategy:  multi
 #
 # Parallelism:
-#   Runs 4 chains in parallel:
-#     1 benchmark chain: naive once, RHPF once, never GHPF
-#     3 model chains: one sequential quantile chain per model
+#   Runs up to MAX_PARALLEL_JOBS simulations in parallel.
+#   Default: 4 concurrent jobs.
 #
 # Output policy:
 #   Every run gets a dedicated folder. Do not point multiple runs at the same
@@ -22,15 +21,25 @@ set -Eeuo pipefail
 #
 # Server usage:
 #   chmod +x run_final_thesis_multi_3m.sh
-#   nohup ./run_final_thesis_multi_3m.sh > logs/final_thesis_multi_3m_launcher.out 2>&1 &
-#   tail -f logs/final_thesis_multi_3m_launcher.out
+#   nohup ./run_final_thesis_multi_3m.sh \
+#     > artifacts/simulation_runs/final_thesis_multi_3m_launcher.out 2>&1 &
+#   tail -f artifacts/simulation_runs/final_thesis_multi_3m_launcher.out
 #
 # Resume a specific existing launcher root:
 #   RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_3m_YYYYmmddTHHMMSSZ \
-#   LOG_ROOT=logs/thesis_final_multi_3m_YYYYmmddTHHMMSSZ \
 #   ./run_final_thesis_multi_3m.sh
+#
+# Check simulation worker process
+# pgrep -af "run_battery_backtest.py"
+#
+# Current logs
+# RUN_ROOT="artifacts/simulation_runs/thesis_final_multi_3m_YYYYmmddTHHMMSSZ"
+# tail -f "$RUN_ROOT/logs/MODEL_QUANTILE/stdout.log"
 
-MAX_PARALLEL_CHAINS=4
+# RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_3m_20260609T205217Z \
+# ./run_final_thesis_multi_3m.sh
+
+MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
 
 START="2025-03-01T00:00:00Z"
 END="2025-06-01T00:00:00Z"
@@ -38,12 +47,13 @@ SPLIT="test"
 STRATEGY="multi"
 
 MODELS=("xgb" "tft" "linear")
-QUANTILES=("p50-p50" "p70-p70" "p90-p90" "p10-p10")
-# QUANTILES=("p30-p30" "p50-p50" "p70-p70" "p90-p90" "p10-p10")
+PRIMARY_QUANTILES=("p30-p30" "p50-p50" "p70-p70")
+SECONDARY_QUANTILES=("p90-p90" "p10-p10")
+QUANTILES=("${PRIMARY_QUANTILES[@]}" "${SECONDARY_QUANTILES[@]}")
 
 RUN_TS="${RUN_TS:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_ROOT="${RUN_ROOT:-artifacts/simulation_runs/thesis_final_multi_3m_${RUN_TS}}"
-LOG_ROOT="${LOG_ROOT:-logs/thesis_final_multi_3m_${RUN_TS}}"
+LOG_ROOT="${LOG_ROOT:-${RUN_ROOT}/logs}"
 
 mkdir -p "$RUN_ROOT" "$LOG_ROOT"
 
@@ -70,8 +80,10 @@ HOST="$(hostname)"
   echo "END=$END"
   echo "SPLIT=$SPLIT"
   echo "STRATEGY=$STRATEGY"
-  echo "MAX_PARALLEL_CHAINS=$MAX_PARALLEL_CHAINS"
+  echo "MAX_PARALLEL_JOBS=$MAX_PARALLEL_JOBS"
   echo "MODELS=${MODELS[*]}"
+  echo "PRIMARY_QUANTILES=${PRIMARY_QUANTILES[*]}"
+  echo "SECONDARY_QUANTILES=${SECONDARY_QUANTILES[*]}"
   echo "QUANTILES=${QUANTILES[*]}"
   echo "GIT_COMMIT=$GIT_COMMIT"
   echo "GIT_BRANCH=$GIT_BRANCH"
@@ -239,44 +251,51 @@ run_benchmark_chain() {
     --enable-rhpf
 }
 
-run_model_chain() {
+run_model_job() {
   local model="$1"
+  local quantile_pair="$2"
   local chain="model_${model}"
+  local quantile_label="${quantile_pair%-*}"
+  local run_id="${model}_${quantile_label}"
+  local out_dir="$RUN_ROOT/$run_id"
+  local log_dir="$LOG_ROOT/$run_id"
 
-  for quantile_pair in "${QUANTILES[@]}"; do
-    local quantile_label="${quantile_pair%-*}"
-    local run_id="${model}_${quantile_label}"
-    local out_dir="$RUN_ROOT/$run_id"
-    local log_dir="$LOG_ROOT/$run_id"
-
-    register_manifest_row "$run_id" "$chain" "$model" "$quantile_pair" "model_only" "$out_dir" "$log_dir"
-    run_job "$run_id" "$chain" "$model" "$quantile_pair" "model_only" "$out_dir" "$log_dir" \
-      --disable-naive \
-      --disable-rhpf
-  done
+  register_manifest_row "$run_id" "$chain" "$model" "$quantile_pair" "model_only" "$out_dir" "$log_dir"
+  run_job "$run_id" "$chain" "$model" "$quantile_pair" "model_only" "$out_dir" "$log_dir" \
+    --disable-naive \
+    --disable-rhpf
 }
 
 wait_for_slot() {
-  while (( $(jobs -rp | wc -l | tr -d ' ') >= MAX_PARALLEL_CHAINS )); do
-    wait -n || true
+  while (( $(jobs -rp | wc -l | tr -d ' ') >= MAX_PARALLEL_JOBS )); do
+    if ! wait -n; then
+      failures=$((failures + 1))
+    fi
   done
 }
 
-pids=()
+run_model_wave() {
+  local quantiles=("$@")
+  for quantile_pair in "${quantiles[@]}"; do
+    for model in "${MODELS[@]}"; do
+      wait_for_slot
+      run_model_job "$model" "$quantile_pair" &
+    done
+  done
+}
+
+failures=0
 
 wait_for_slot
 run_benchmark_chain &
-pids+=("$!")
 
-for model in "${MODELS[@]}"; do
-  wait_for_slot
-  run_model_chain "$model" &
-  pids+=("$!")
-done
+# Start the thesis priority quantiles first, then queue p90/p10. Jobs are
+# independent, so the scheduler keeps up to MAX_PARALLEL_JOBS simulations busy.
+run_model_wave "${PRIMARY_QUANTILES[@]}"
+run_model_wave "${SECONDARY_QUANTILES[@]}"
 
-failures=0
-for pid in "${pids[@]}"; do
-  if ! wait "$pid"; then
+while (( $(jobs -rp | wc -l | tr -d ' ') > 0 )); do
+  if ! wait -n; then
     failures=$((failures + 1))
   fi
 done
