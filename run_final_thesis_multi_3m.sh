@@ -38,7 +38,8 @@ SPLIT="test"
 STRATEGY="multi"
 
 MODELS=("xgb" "tft" "linear")
-QUANTILES=("p30-p30" "p50-p50" "p70-p70" "p90-p90" "p10-p10")
+QUANTILES=("p50-p50" "p70-p70" "p90-p90" "p10-p10")
+# QUANTILES=("p30-p30" "p50-p50" "p70-p70" "p90-p90" "p10-p10")
 
 RUN_TS="${RUN_TS:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_ROOT="${RUN_ROOT:-artifacts/simulation_runs/thesis_final_multi_3m_${RUN_TS}}"

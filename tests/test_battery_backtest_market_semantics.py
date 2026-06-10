@@ -11805,6 +11805,121 @@ def test_bcm_precommit_economic_filter_uses_optimizer_ev_with_capacity_value(
     assert all(float(v) > 0.0 for v in pre["precommit_net_capacity_ev_after_headroom_cost_eur"].values())
 
 
+def test_bcm_precommit_fallback_ev_uses_award_probability_for_capacity_and_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p50"]
+    bt.reserve_min_margin_after_bid_mwh = 0.0
+    bt.reserve_activation_headroom_h = 0.0
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = None
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.da_terminal_soc_value_enabled = False
+
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-01 22:00:00+00:00", periods=4, freq="h")
+    col = BacktestColumnMap()
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [2.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "reserve_pos_bin_0_mw": [2.0] * 4,
+            "reserve_neg_bin_0_mw": [0.0] * 4,
+            "ev_bcm_p_award_pos_bin_0": [0.25] * 4,
+            "ev_bcm_p_award_neg_bin_0": [0.25] * 4,
+            "soc_start_lp_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [100.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [50.0] * 4,
+            col.pred_afrr_activation_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_rate_pos: [0.4] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
+            col.pred_da_price: [0.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    captured: dict[str, float] = {}
+
+    def fake_select(**kwargs):  # type: ignore[no-untyped-def]
+        offered_pos = float(kwargs["offered_pos_mw"])
+        offered_neg = float(kwargs["offered_neg_mw"])
+        captured["candidate_ev_eur"] = float(kwargs["candidate_ev_eur"])
+        captured["recovery_cost_probability_factor"] = float(kwargs["recovery_cost_probability_factor"])
+        return (
+            offered_pos,
+            offered_neg,
+            AFRRCapacityClearingResult(
+                submitted_pos_mw=offered_pos,
+                submitted_neg_mw=offered_neg,
+                awarded_pos_mw=offered_pos,
+                awarded_neg_mw=offered_neg,
+                pos_awarded=offered_pos > 0.0,
+                neg_awarded=offered_neg > 0.0,
+            ),
+            [],
+            {
+                "feasibility_pass": 1.0,
+                "retry_factor_selected": 1.0,
+                "zero_reason": "none",
+                "projected_soc_min_mwh": bt.soc_min + 8.0,
+                "projected_soc_max_mwh": bt.soc_min + 8.0,
+                "projected_terminal_soc_mwh": bt.soc_min + 8.0,
+                "terminal_soc_feasible": 1.0,
+                "terminal_soc_shortfall_mwh": 0.0,
+                "selection_is_causal": 1.0,
+                "full_award_feasibility_checked": 1.0,
+                "retry_factor_selected_before_clearing": 1.0,
+                "realized_clearing_used_for_selection": 0.0,
+            },
+        )
+
+    monkeypatch.setattr(bt, "_select_feasible_bcm_lock_candidate", fake_select)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
+    )
+
+    expected_capacity = 0.25 * 2.0 * 100.0 * 4.0
+    expected_activation = 0.25 * 2.0 * 0.4 * 50.0 * 4.0
+    assert captured["recovery_cost_probability_factor"] == pytest.approx(0.25)
+    assert captured["candidate_ev_eur"] == pytest.approx(expected_capacity + expected_activation)
+    assert all(float(v) == pytest.approx(0.25) for v in pre["bcm_precommit_ev_award_probability"].values())
+    assert all(float(v) == pytest.approx(expected_capacity) for v in pre["bcm_precommit_expected_capacity_revenue_eur"].values())
+    assert all(float(v) == pytest.approx(expected_activation) for v in pre["bcm_precommit_expected_activation_revenue_eur"].values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre["precommit_bid_zeroed_due_to_negative_ev"].values())
+
+
 def test_required_series_missing_raises_keyerror() -> None:
     df = pd.DataFrame({"x": [1.0, 2.0]})
     try:

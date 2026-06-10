@@ -13551,6 +13551,50 @@ class BatteryBacktester:
                 submitted_reserve_pos_mw_after_retry = float(offered_pos)
                 submitted_reserve_neg_mw_after_retry = float(offered_neg)
 
+                def _selected_bcm_award_probability_factor() -> float:
+                    weights: list[float] = []
+                    probs: list[float] = []
+                    for b in range(int(len(self.afrr_quantile_bins))):
+                        pos_mw = (
+                            float(pd.to_numeric(blk[f"reserve_pos_bin_{b}_mw"], errors="coerce").fillna(0.0).mean())
+                            if f"reserve_pos_bin_{b}_mw" in blk.columns
+                            else 0.0
+                        )
+                        neg_mw = (
+                            float(pd.to_numeric(blk[f"reserve_neg_bin_{b}_mw"], errors="coerce").fillna(0.0).mean())
+                            if f"reserve_neg_bin_{b}_mw" in blk.columns
+                            else 0.0
+                        )
+                        p_pos = (
+                            float(pd.to_numeric(blk[f"ev_bcm_p_award_pos_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                            if f"ev_bcm_p_award_pos_bin_{b}" in blk.columns
+                            else (
+                                float(pd.to_numeric(blk[f"ev_pacc_pos_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                                if f"ev_pacc_pos_bin_{b}" in blk.columns
+                                else 1.0
+                            )
+                        )
+                        p_neg = (
+                            float(pd.to_numeric(blk[f"ev_bcm_p_award_neg_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                            if f"ev_bcm_p_award_neg_bin_{b}" in blk.columns
+                            else (
+                                float(pd.to_numeric(blk[f"ev_pacc_neg_bin_{b}"], errors="coerce").fillna(1.0).mean())
+                                if f"ev_pacc_neg_bin_{b}" in blk.columns
+                                else 1.0
+                            )
+                        )
+                        if pos_mw > 1e-12:
+                            weights.append(float(pos_mw))
+                            probs.append(float(np.clip(p_pos, 0.0, 1.0)))
+                        if neg_mw > 1e-12:
+                            weights.append(float(neg_mw))
+                            probs.append(float(np.clip(p_neg, 0.0, 1.0)))
+                    if weights and sum(weights) > 1e-12:
+                        return float(np.average(np.asarray(probs, dtype=float), weights=np.asarray(weights, dtype=float)))
+                    return 1.0
+
+                bcm_recovery_cost_probability_factor = float(_selected_bcm_award_probability_factor())
+
                 # Precommit EV check with explicit headroom maintenance cost.
                 # This is a first-line bid filter only; post-award feasibility remains hard-constrained.
                 src_blk = source.reindex(ts_blk)
@@ -13603,6 +13647,12 @@ class BatteryBacktester:
                 precommit_headroom_opportunity_cost_eur = float(
                     reserved_headroom_mwh_block * opp_price_eur_mwh
                 )
+                expected_headroom_recharge_cost_eur = float(
+                    bcm_recovery_cost_probability_factor * precommit_headroom_recharge_cost_eur
+                )
+                expected_headroom_opportunity_cost_eur = float(
+                    bcm_recovery_cost_probability_factor * precommit_headroom_opportunity_cost_eur
+                )
                 block_hours = float(len(blk) * self.dt_h)
                 act_value_neg_blk = float(self._neg_activation_provider_value(pred_act_neg_blk))
                 bcm_margin_pos_blk = float(
@@ -13645,15 +13695,21 @@ class BatteryBacktester:
                     if not np.isfinite(pred_cap_neg_blk):
                         pred_cap_neg_blk = 0.0
                     expected_capacity_revenue_eur = float(
-                        float(offered_pos) * pred_cap_pos_blk * block_hours
-                        + float(offered_neg) * pred_cap_neg_blk * block_hours
+                        bcm_recovery_cost_probability_factor
+                        * (
+                            float(offered_pos) * pred_cap_pos_blk * block_hours
+                            + float(offered_neg) * pred_cap_neg_blk * block_hours
+                        )
                     )
                     expected_activation_revenue_eur = float(
-                        float(offered_pos) * pred_rate_pos_blk * pred_act_pos_blk * block_hours
-                        + float(offered_neg) * pred_rate_neg_blk * act_value_neg_blk * block_hours
+                        bcm_recovery_cost_probability_factor
+                        * (
+                            float(offered_pos) * pred_rate_pos_blk * pred_act_pos_blk * block_hours
+                            + float(offered_neg) * pred_rate_neg_blk * act_value_neg_blk * block_hours
+                        )
                     )
                     term_pos, _term_pos_neg_unused = self.terminal_inventory_effects_eur_per_mw(
-                        probability=1.0,
+                        probability=bcm_recovery_cost_probability_factor,
                         activation_rate=pred_rate_pos_blk,
                         duration_h=block_hours,
                         eta_in=float(self.eta_in),
@@ -13665,7 +13721,7 @@ class BatteryBacktester:
                         ),
                     )
                     _term_neg_pos_unused, term_neg = self.terminal_inventory_effects_eur_per_mw(
-                        probability=1.0,
+                        probability=bcm_recovery_cost_probability_factor,
                         activation_rate=pred_rate_neg_blk,
                         duration_h=block_hours,
                         eta_in=float(self.eta_in),
@@ -13679,21 +13735,27 @@ class BatteryBacktester:
                     selected_bcm_terminal_inventory_effect_eur = float(offered_pos) * float(np.asarray(term_pos).item()) + float(offered_neg) * float(np.asarray(term_neg).item())
                     expected_capacity_ev_eur = float(
                         expected_capacity_revenue_eur
-                        + float(offered_pos) * pred_rate_pos_blk * bcm_margin_pos_blk * block_hours
-                        + float(offered_neg) * pred_rate_neg_blk * bcm_margin_neg_blk * block_hours
+                        + bcm_recovery_cost_probability_factor * float(offered_pos) * pred_rate_pos_blk * bcm_margin_pos_blk * block_hours
+                        + bcm_recovery_cost_probability_factor * float(offered_neg) * pred_rate_neg_blk * bcm_margin_neg_blk * block_hours
                         + selected_bcm_terminal_inventory_effect_eur
                     )
                 expected_aux_cost_eur = float(
-                    precommit_headroom_recharge_cost_eur + precommit_headroom_opportunity_cost_eur
+                    expected_headroom_recharge_cost_eur + expected_headroom_opportunity_cost_eur
                 )
                 precommit_net_capacity_ev_after_headroom_cost_eur = float(
                     expected_capacity_ev_eur
-                    - precommit_headroom_recharge_cost_eur
-                    - precommit_headroom_opportunity_cost_eur
+                    - expected_headroom_recharge_cost_eur
+                    - expected_headroom_opportunity_cost_eur
                 )
+                bcm_precommit_stats["bcm_ev_award_probability"] = float(bcm_recovery_cost_probability_factor)
+                bcm_precommit_stats["ev_award_probability"] = float(bcm_recovery_cost_probability_factor)
                 bcm_precommit_stats["expected_capacity_revenue_eur"] = float(expected_capacity_revenue_eur)
                 bcm_precommit_stats["expected_activation_revenue_eur"] = float(expected_activation_revenue_eur)
                 bcm_precommit_stats["expected_aux_cost_eur"] = float(expected_aux_cost_eur)
+                bcm_precommit_stats["expected_headroom_recharge_cost_eur"] = float(expected_headroom_recharge_cost_eur)
+                bcm_precommit_stats["expected_headroom_opportunity_cost_eur"] = float(expected_headroom_opportunity_cost_eur)
+                bcm_precommit_stats["full_headroom_recharge_cost_eur"] = float(precommit_headroom_recharge_cost_eur)
+                bcm_precommit_stats["full_headroom_opportunity_cost_eur"] = float(precommit_headroom_opportunity_cost_eur)
                 bcm_precommit_stats["bcm_terminal_inventory_effect_eur"] = float(selected_bcm_terminal_inventory_effect_eur)
                 bcm_precommit_stats["bcm_terminal_inventory_shadow_value_applied"] = float(
                     selected_bcm_terminal_inventory_effect_eur != 0.0
@@ -13716,50 +13778,6 @@ class BatteryBacktester:
                     precommit_clamp_reason = "zeroed_due_to_negative_ev_after_headroom_cost"
                     precommit_reduction_reason = "negative_ev_after_headroom_cost"
                     precommit_applied = 1.0
-
-            def _selected_bcm_award_probability_factor() -> float:
-                weights: list[float] = []
-                probs: list[float] = []
-                for b in range(int(len(self.afrr_quantile_bins))):
-                    pos_mw = (
-                        float(pd.to_numeric(blk[f"reserve_pos_bin_{b}_mw"], errors="coerce").fillna(0.0).mean())
-                        if f"reserve_pos_bin_{b}_mw" in blk.columns
-                        else 0.0
-                    )
-                    neg_mw = (
-                        float(pd.to_numeric(blk[f"reserve_neg_bin_{b}_mw"], errors="coerce").fillna(0.0).mean())
-                        if f"reserve_neg_bin_{b}_mw" in blk.columns
-                        else 0.0
-                    )
-                    p_pos = (
-                        float(pd.to_numeric(blk[f"ev_bcm_p_award_pos_bin_{b}"], errors="coerce").fillna(1.0).mean())
-                        if f"ev_bcm_p_award_pos_bin_{b}" in blk.columns
-                        else (
-                            float(pd.to_numeric(blk[f"ev_pacc_pos_bin_{b}"], errors="coerce").fillna(1.0).mean())
-                            if f"ev_pacc_pos_bin_{b}" in blk.columns
-                            else 1.0
-                        )
-                    )
-                    p_neg = (
-                        float(pd.to_numeric(blk[f"ev_bcm_p_award_neg_bin_{b}"], errors="coerce").fillna(1.0).mean())
-                        if f"ev_bcm_p_award_neg_bin_{b}" in blk.columns
-                        else (
-                            float(pd.to_numeric(blk[f"ev_pacc_neg_bin_{b}"], errors="coerce").fillna(1.0).mean())
-                            if f"ev_pacc_neg_bin_{b}" in blk.columns
-                            else 1.0
-                        )
-                    )
-                    if pos_mw > 1e-12:
-                        weights.append(float(pos_mw))
-                        probs.append(float(np.clip(p_pos, 0.0, 1.0)))
-                    if neg_mw > 1e-12:
-                        weights.append(float(neg_mw))
-                        probs.append(float(np.clip(p_neg, 0.0, 1.0)))
-                if weights and sum(weights) > 1e-12:
-                    return float(np.average(np.asarray(probs, dtype=float), weights=np.asarray(weights, dtype=float)))
-                return 1.0
-
-            bcm_recovery_cost_probability_factor = float(_selected_bcm_award_probability_factor())
 
             cap_bids: list[AFRRCapacityBid] = []
             cap_res: AFRRCapacityClearingResult | None = None
@@ -13819,6 +13837,24 @@ class BatteryBacktester:
                     float(expected_activation_revenue_eur),
                 )
                 bcm_precommit_stats.setdefault("expected_aux_cost_eur", float(expected_aux_cost_eur))
+                bcm_precommit_stats.setdefault("ev_award_probability", float(bcm_recovery_cost_probability_factor))
+                bcm_precommit_stats.setdefault("bcm_ev_award_probability", float(bcm_recovery_cost_probability_factor))
+                bcm_precommit_stats.setdefault(
+                    "expected_headroom_recharge_cost_eur",
+                    float(expected_headroom_recharge_cost_eur),
+                )
+                bcm_precommit_stats.setdefault(
+                    "expected_headroom_opportunity_cost_eur",
+                    float(expected_headroom_opportunity_cost_eur),
+                )
+                bcm_precommit_stats.setdefault(
+                    "full_headroom_recharge_cost_eur",
+                    float(precommit_headroom_recharge_cost_eur),
+                )
+                bcm_precommit_stats.setdefault(
+                    "full_headroom_opportunity_cost_eur",
+                    float(precommit_headroom_opportunity_cost_eur),
+                )
                 bcm_precommit_stats.setdefault("bcm_terminal_inventory_effect_eur", float(selected_bcm_terminal_inventory_effect_eur))
                 bcm_precommit_stats.setdefault("bcm_terminal_inventory_shadow_value_already_in_full_objective", 1.0)
                 bcm_precommit_stats.setdefault(
@@ -14053,9 +14089,15 @@ class BatteryBacktester:
                             "recovery_cost_probability_weighted",
                             "recovery_cost_probability_factor",
                             "ev_nan_detected",
+                            "ev_award_probability",
+                            "bcm_ev_award_probability",
                             "expected_capacity_revenue_eur",
                             "expected_activation_revenue_eur",
                             "expected_aux_cost_eur",
+                            "expected_headroom_recharge_cost_eur",
+                            "expected_headroom_opportunity_cost_eur",
+                            "full_headroom_recharge_cost_eur",
+                            "full_headroom_opportunity_cost_eur",
                         ):
                             precommit_audit_by_ts.setdefault(f"bcm_precommit_{diag_name}", {})[tsu] = float(
                                 bcm_precommit_stats.get(diag_name, np.nan if "ev" in diag_name else 0.0)
@@ -14431,6 +14473,15 @@ class BatteryBacktester:
                         "recovery_cost_probability_weighted",
                         "recovery_cost_probability_factor",
                         "ev_nan_detected",
+                        "ev_award_probability",
+                        "bcm_ev_award_probability",
+                        "expected_capacity_revenue_eur",
+                        "expected_activation_revenue_eur",
+                        "expected_aux_cost_eur",
+                        "expected_headroom_recharge_cost_eur",
+                        "expected_headroom_opportunity_cost_eur",
+                        "full_headroom_recharge_cost_eur",
+                        "full_headroom_opportunity_cost_eur",
                     ):
                         precommit_audit_by_ts.setdefault(f"bcm_precommit_{diag_name}", {})[tsu] = float(
                             bcm_precommit_stats.get(diag_name, np.nan if "ev" in diag_name else 0.0)
@@ -17315,9 +17366,15 @@ class BatteryBacktester:
                 "bcm_precommit_recovery_cost_used_in_ev_mode",
                 "bcm_precommit_ev_nan_detected",
                 "bcm_precommit_ev_nan_component",
+                "bcm_precommit_ev_award_probability",
+                "bcm_precommit_bcm_ev_award_probability",
                 "bcm_precommit_expected_capacity_revenue_eur",
                 "bcm_precommit_expected_activation_revenue_eur",
                 "bcm_precommit_expected_aux_cost_eur",
+                "bcm_precommit_expected_headroom_recharge_cost_eur",
+                "bcm_precommit_expected_headroom_opportunity_cost_eur",
+                "bcm_precommit_full_headroom_recharge_cost_eur",
+                "bcm_precommit_full_headroom_opportunity_cost_eur",
                 "bcm_precommit_zero_reason_detail",
                 "bcm_precommit_reduced_due_to_power",
                 "bcm_precommit_reduced_due_to_soc",
