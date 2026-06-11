@@ -13,11 +13,52 @@ This project was tested with:
 - pip
 - A POSIX-compatible shell
 
-Check Python:
+### 0.2 Clone Repository
 
 ```bash
-python3.10 --version
+git clone https://github.com/lgiesen/energy_trading.git
+cd energyTrading
 ```
+
+### 0.3 Create Virtual Environment
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+```
+
+Check that the virtual environment is active:
+
+```bash
+which python
+python --version
+```
+
+Expected:
+
+```text
+.../energyTrading/.venv/bin/python
+Python 3.10.20
+```
+
+### 0.4 Install Dependencies
+
+```bash
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+The editable install is required because the repository uses a local package structure. It ensures that imports from the project source tree work consistently from scripts, tests, and Makefile targets.
+
+### 0.5 Verify Installation
+
+```bash
+python -m pip check
+make doctor
+```
+
+If these commands pass, the environment is ready for full training and simulation runs.
 
 ## 1. Pipeline Overview & Preflight
 
