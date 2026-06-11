@@ -1941,7 +1941,7 @@ def test_bcm_capacity_bid_award_then_pay_as_bid_capacity_revenue() -> None:
     )
     assert np.isclose(float(m["revenue_capacity_eur"]), 5.0 * 20.0 * bt.dt_h), m
     assert np.isclose(float(m["bcm_capacity_revenue_eur"]), 5.0 * 20.0 * bt.dt_h), m
-    assert str(m["bcm_capacity_price_source"]) == "submitted_capacity_bid_pay_as_bid"
+    assert str(m["bcm_capacity_price_source"]) == "obligation_lockbook_price"
 
 
 def test_bcm_obligation_capacity_price_is_used_for_settlement_not_activation_or_cutoff() -> None:
@@ -1996,7 +1996,7 @@ def test_bcm_obligation_capacity_price_is_used_for_settlement_not_activation_or_
     assert float(metrics["bcm_capacity_revenue_pos_eur"]) == pytest.approx(9.0 * 20.0 * bt.dt_h)
 
 
-def test_bcm_existing_obligation_capacity_price_falls_back_past_zero_generic_price() -> None:
+def test_bcm_existing_obligation_capacity_price_missing_does_not_use_generic_price() -> None:
     bt = _mk_backtester()
     bt.afrr_quantile_bins = ["p70"]
     col = BacktestColumnMap()
@@ -2057,10 +2057,11 @@ def test_bcm_existing_obligation_capacity_price_falls_back_past_zero_generic_pri
     )
     clearing = out["clearing_rec"]
 
-    assert float(clearing["submitted_afrr_pos_bin_0_price_eur_mw"]) == pytest.approx(25.0)
-    assert float(clearing["executed_afrr_cap_pos_bin_0_price_eur_mw"]) == pytest.approx(25.0)
-    assert float(clearing["settlement_cap_bid_price_pos_eur_mw"]) == pytest.approx(25.0)
-    assert float(clearing["bcm_capacity_bid_price_pos_eur_per_mw_h"]) == pytest.approx(25.0)
+    assert float(clearing["settlement_cap_bid_price_pos_eur_mw"]) == pytest.approx(0.0)
+    assert float(clearing["bcm_capacity_bid_price_pos_eur_per_mw_h"]) == pytest.approx(0.0)
+    assert float(clearing["bcm_capacity_price_missing_with_awarded_mw"]) == pytest.approx(1.0)
+    assert float(clearing["bcm_capacity_price_lost_before_settlement"]) == pytest.approx(1.0)
+    assert str(clearing["bcm_capacity_price_source"]) == "missing_obligation_capacity_price"
 
     _, metrics = bt._settle_one_hour(
         soc=bt.soc_init,
@@ -2079,9 +2080,113 @@ def test_bcm_existing_obligation_capacity_price_falls_back_past_zero_generic_pri
         cap_bid_neg=float(clearing["settlement_cap_bid_price_neg_eur_mw"]),
     )
 
-    assert float(metrics["bcm_capacity_bid_price_pos_eur_per_mw_h"]) == pytest.approx(25.0)
-    assert float(metrics["bcm_capacity_revenue_eur"]) == pytest.approx(2.0 * 25.0 * bt.dt_h)
-    assert float(metrics["revenue_capacity_eur"]) > 0.0
+    assert float(metrics["bcm_capacity_bid_price_pos_eur_per_mw_h"]) == pytest.approx(0.0)
+    assert float(metrics["bcm_capacity_revenue_eur"]) == pytest.approx(0.0)
+    assert float(metrics["bcm_capacity_price_missing_with_awarded_mw"]) == pytest.approx(1.0)
+    assert str(metrics["bcm_capacity_price_source"]) == "missing_obligation_capacity_price"
+
+
+def test_bcm_obligation_lockbook_price_is_primary_settlement_source() -> None:
+    bt = _mk_backtester()
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T08:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        pred_da_price=50.0,
+        true_da_price=50.0,
+        pred_cap_pos=999.0,
+        true_cap_pos=100.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=80.0,
+        true_act_pos=80.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        obligation_pos_mw=2.0,
+        obligation_neg_mw=0.0,
+        obligation_capacity_price_pos=20.0,
+    )
+
+    assert float(out["fixed_reserve_obligation_pos_mw"]) == pytest.approx(2.0)
+    assert float(out["settlement_cap_bid_price_pos_eur_mw"]) == pytest.approx(20.0)
+    assert float(out["bcm_obligation_capacity_bid_price_pos_eur_per_mw_h"]) == pytest.approx(20.0)
+    assert float(out["bcm_settlement_capacity_price_resolved_pos_eur_per_mw_h"]) == pytest.approx(20.0)
+    assert float(out["bcm_capacity_price_missing_with_awarded_mw"]) == pytest.approx(0.0)
+    assert str(out["bcm_capacity_price_source"]) == "obligation_lockbook_price"
+
+    _, metrics = bt._settle_one_hour(
+        soc=bt.soc_init,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=2.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=100.0,
+        cap_neg=0.0,
+        act_pos_price=80.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        cap_bid_pos=float(out["settlement_cap_bid_price_pos_eur_mw"]),
+        cap_bid_neg=0.0,
+    )
+    assert float(metrics["bcm_capacity_revenue_eur"]) == pytest.approx(2.0 * 20.0 * bt.dt_h)
+    assert str(metrics["bcm_capacity_price_source"]) == "obligation_lockbook_price"
+
+
+def test_bcm_negative_obligation_lockbook_price_settles_pay_as_bid() -> None:
+    bt = _mk_backtester()
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T08:00:00Z"),
+        is_perfect_foresight=False,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        pred_da_price=50.0,
+        true_da_price=50.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=999.0,
+        true_cap_neg=100.0,
+        pred_act_pos=0.0,
+        true_act_pos=0.0,
+        pred_act_neg=-80.0,
+        true_act_neg=-80.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        obligation_pos_mw=0.0,
+        obligation_neg_mw=3.0,
+        obligation_capacity_price_neg=30.0,
+    )
+
+    assert float(out["fixed_reserve_obligation_neg_mw"]) == pytest.approx(3.0)
+    assert float(out["settlement_cap_bid_price_neg_eur_mw"]) == pytest.approx(30.0)
+    assert float(out["bcm_obligation_capacity_bid_price_neg_eur_per_mw_h"]) == pytest.approx(30.0)
+
+    _, metrics = bt._settle_one_hour(
+        soc=bt.soc_init,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=3.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=100.0,
+        act_pos_price=0.0,
+        act_neg_price=-80.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        cap_bid_pos=0.0,
+        cap_bid_neg=float(out["settlement_cap_bid_price_neg_eur_mw"]),
+    )
+    assert float(metrics["bcm_capacity_revenue_eur"]) == pytest.approx(3.0 * 30.0 * bt.dt_h)
+    assert float(metrics["bcm_capacity_revenue_neg_eur"]) == pytest.approx(3.0 * 30.0 * bt.dt_h)
 
 
 def test_bcm_capacity_revenue_uses_awarded_capacity_not_supportable_capacity() -> None:
@@ -3726,7 +3831,7 @@ def test_da_ev_settlement_and_diagnostics_are_meter_side_consistent() -> None:
     assert float(neg_charge["aux_cost_eur"]) < 0.0
     assert float(neg_discharge["revenue_da_eur"]) < 0.0
 
-    df, col = _tiny_backtest_df(hours=2)
+    df, col = _tiny_backtest_df(hours=30)
     opt = bt.optimize_dispatch(
         df,
         col,
@@ -3987,7 +4092,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert audit[0]["selection_reason"] == "no_trade_incumbent_predicted_replay_dominates"
     assert audit[0]["candidate_rejection_reason"] == "candidate_pnl_below_no_trade"
     assert audit[0]["no_trade_rejection_reason"] == "none"
-    assert str(audit[0]["selection_pnl_basis"]) == "excl_terminal"
+    assert str(audit[0]["selection_pnl_basis"]) == "includes_local_continuation"
     assert str(audit[0]["replay_scope"]) == "da_lock_rows_only"
     assert str(audit[0]["objective_scope"]) == "rolling_milp_window_or_plan_history"
     assert float(audit[0]["objective_replay_comparable"]) == pytest.approx(0.0)
@@ -3999,7 +4104,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(audit[0]["selection_valid"]) == pytest.approx(1.0)
     assert float(audit[0]["candidate_zeroed_due_to_negative_valid_replay"]) == pytest.approx(1.0)
     assert float(audit[0]["candidate_zeroed_due_to_invalid_replay"]) == pytest.approx(0.0)
-    assert np.isfinite(float(audit[0]["local_terminal_credit_ignored_eur"]))
+    assert float(audit[0]["local_terminal_credit_ignored_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["terminal_credit_in_selection_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["sell_candidate_mwh"]) == pytest.approx(0.0)
     assert float(audit[0]["sell_locked_mwh"]) == pytest.approx(0.0)
@@ -4189,6 +4294,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     )
 
     bt.final_soc_mode = "hard"
+    bt.da_terminal_soc_value_enabled = False
     bt.soc_min = 2.0
     bt.soc_max = 18.0
     bt.soc_target_end = 10.0
@@ -4228,8 +4334,8 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     )
     assert hard_selected[ts2] == pytest.approx((0.0, 0.0))
     assert hard_audit[0]["final_selected_incumbent"] == "no_trade"
-    assert hard_audit[0]["da_zero_reason"] == "postlock_future_infeasible_no_trade_selected"
-    assert float(hard_audit[0]["da_candidate_rejected_hard_final_soc_infeasible"]) == pytest.approx(1.0)
+    assert hard_audit[0]["da_zero_reason"] == "postlock_locked_candidate_pnl_below_no_trade"
+    assert float(hard_audit[0]["da_candidate_rejected_hard_final_soc_infeasible"]) == pytest.approx(0.0)
     assert float(hard_audit[0]["da_candidate_rejected_final_soc_feasibility_not_proven"]) == pytest.approx(0.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_checked_before_lock"]) == pytest.approx(1.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_required_mwh"]) == pytest.approx(10.0)
@@ -4240,7 +4346,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(hard_audit[0]["da_final_soc_feasibility_candidate_buy_mwh"]) == pytest.approx(0.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_candidate_sell_mwh"]) == pytest.approx(9.5)
     assert float(hard_audit[0]["da_final_soc_feasibility_id_recourse_assumed"]) == pytest.approx(0.0)
-    assert str(hard_audit[0]["da_final_soc_feasibility_reason"]) == "rejected_hard_final_soc_infeasible"
+    assert str(hard_audit[0]["da_final_soc_feasibility_reason"]) == "locked_da_terminal_shortfall_recoverable_with_id"
 
     bt.deg_eur_mwh = 200.0
     selected3, audit3 = bt._select_feasible_da_lock_schedule(
@@ -10181,8 +10287,7 @@ def test_da_realized_anchor_caps_lockbook_candidate_before_write() -> None:
         pd.DataFrame(
             {
                 col.timestamp: [snapshot_ts],
-                "real_soc_start_mwh": [8.86],
-                "real_soc_mwh": [8.84],
+                "soc_before_mwh": [8.86],
                 "executed_soc_mwh": [8.84],
             }
         )
@@ -10218,8 +10323,8 @@ def test_da_realized_anchor_caps_lockbook_candidate_before_write() -> None:
     )
 
     assert anchor == pytest.approx(15.75)
-    assert str(anchor_diag["da_prelock_soc_anchor_source"]) == "realized_settlement_soc"
-    assert str(anchor_diag["da_prelock_anchor_source"]) == "realized_settlement_soc"
+    assert str(anchor_diag["da_prelock_soc_anchor_source"]) == "realized_settlement_replay_soc"
+    assert str(anchor_diag["da_prelock_anchor_source"]) == "realized_settlement_replay_soc"
     assert float(anchor_diag["da_prelock_anchor_used_current_soc"]) == pytest.approx(0.0)
     assert float(anchor_diag["da_prelock_anchor_current_soc_mwh"]) == pytest.approx(8.84)
     assert float(anchor_diag["da_prelock_anchor_exact_decision_soc_mwh"]) == pytest.approx(8.86)
@@ -10256,7 +10361,8 @@ def test_da_realized_anchor_caps_lockbook_candidate_before_write() -> None:
             pd.DataFrame(
                 {
                     col.timestamp: [snapshot_ts - pd.Timedelta(hours=1)],
-                    "soc_mwh": [15.77],
+                    "real_soc_mwh": [15.77],
+                    "soc_mwh": [8.86],
                 }
             )
         ],
@@ -10265,11 +10371,273 @@ def test_da_realized_anchor_caps_lockbook_candidate_before_write() -> None:
         colmap=col,
         realized_settlement_soc_mwh=15.75,
     )
-    assert prior_anchor == pytest.approx(15.75)
-    assert str(prior_diag["da_prelock_soc_anchor_source"]) == "realized_settlement_soc"
-    assert float(prior_diag["da_prelock_anchor_latest_prior_decision_soc_mwh"]) == pytest.approx(15.77)
+    assert prior_anchor == pytest.approx(15.77)
+    assert str(prior_diag["da_prelock_soc_anchor_source"]) == "realized_settlement_latest_prior_end_soc"
+    assert float(prior_diag["da_prelock_anchor_latest_prior_decision_soc_mwh"]) == pytest.approx(8.86)
     assert float(prior_diag["da_prelock_anchor_used_current_soc"]) == pytest.approx(0.0)
     assert float(prior_diag["da_prelock_anchor_stale_state_detected"]) == pytest.approx(1.0)
+
+
+def test_da_soc_feedback_uses_latest_settled_real_soc_before_gate() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    gate_ts = pd.Timestamp("2025-03-03T10:00:00Z")
+    decisions = [
+        pd.DataFrame(
+            {
+                col.timestamp: [gate_ts - pd.Timedelta(hours=1)],
+                "real_soc_mwh": [15.75],
+                # Stale plan/decision columns must not be authoritative.
+                "executed_soc_mwh": [8.84],
+                "soc_mwh": [8.86],
+            }
+        )
+    ]
+
+    anchor, diag = bt._get_optimizer_soc_feedback_for_snapshot(
+        snapshot_ts=gate_ts,
+        decisions=decisions,
+        current_soc_mwh=8.84,
+        colmap=col,
+    )
+
+    assert anchor == pytest.approx(15.75)
+    assert str(diag["optimizer_current_soc_source"]) == "realized_settlement_latest_prior_end_soc"
+    assert float(diag["optimizer_current_soc_mwh"]) == pytest.approx(15.75)
+    assert float(diag["latest_settled_real_soc_mwh_before_gate"]) == pytest.approx(15.75)
+    assert float(diag["da_prelock_anchor_current_soc_mwh"]) == pytest.approx(8.84)
+    assert float(diag["da_prelock_anchor_latest_prior_decision_soc_mwh"]) == pytest.approx(8.84)
+    assert float(diag["optimizer_current_vs_realized_soc_delta_mwh"]) == pytest.approx(8.84 - 15.75)
+    assert float(diag["optimizer_decision_vs_realized_soc_delta_mwh"]) == pytest.approx(8.84 - 15.75)
+    assert float(diag["optimizer_soc_stale_state_detected"]) == pytest.approx(1.0)
+
+
+def test_da_soc_feedback_settlement_exports_executed_da_buy_for_soc_increase() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=10.0,
+        charge=1.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        da_charge_mw=1.0,
+        da_discharge_mw=0.0,
+    )
+
+    assert float(metrics["da_buy_mwh"]) == pytest.approx(1.0)
+    assert float(metrics["da_soc_gain_mwh"]) == pytest.approx(0.95)
+    assert soc_next == pytest.approx(10.95)
+    assert float(metrics["da_unexecuted_buy_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["da_execution_lockbook_physical_infeasible"]) == pytest.approx(0.0)
+
+
+def test_rolling_soc_feedback_includes_current_optimizer_id_setpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester("canonical_economic")
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.soc_init = 8.953905
+    bt.eta_in = 0.943278054766642
+    bt.dt_h = 1.0
+    df, col = _tiny_backtest_df(hours=30)
+    df[col.timestamp] = pd.date_range("2025-03-02T10:00:00Z", periods=len(df), freq="h")
+    id_charge_mw = 9.240225
+
+    def _id_plan(window: pd.DataFrame, colmap: BacktestColumnMap, **_: object) -> pd.DataFrame:
+        ts = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+        return pd.DataFrame(
+            {
+                colmap.timestamp: ts,
+                "charge_mw": np.zeros(len(window), dtype=float),
+                "discharge_mw": np.zeros(len(window), dtype=float),
+                "reserve_pos_mw": np.zeros(len(window), dtype=float),
+                "reserve_neg_mw": np.zeros(len(window), dtype=float),
+                "bem_only_pos_mw": np.zeros(len(window), dtype=float),
+                "bem_only_neg_mw": np.zeros(len(window), dtype=float),
+                "id_charge_mw": [id_charge_mw] + [0.0] * (len(window) - 1),
+                "id_discharge_mw": np.zeros(len(window), dtype=float),
+                "id_recourse_reason": ["protected_soc_recovery"] + ["none"] * (len(window) - 1),
+                "soc_lp_mwh": np.full(len(window), float(bt.soc_init), dtype=float),
+                "soc_start_lp_mwh": np.full(len(window), float(bt.soc_init), dtype=float),
+                "predicted_objective_eur": np.zeros(len(window), dtype=float),
+                "aux_power_mw": np.zeros(len(window), dtype=float),
+            }
+        )
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _id_plan)
+
+    out, _ = bt.optimize_dispatch_rolling(
+        df,
+        col,
+        horizon_hours=30,
+        reopt_step_hours=2,
+        allowed_markets=("DA", "ID"),
+        strategy_name="da",
+        strict_simulation_validity=False,
+    )
+
+    expected_after_first = float(bt.soc_init + id_charge_mw * bt.eta_in)
+    assert float(out.loc[0, "executed_id_charge_mw_for_soc_feedback"]) == pytest.approx(id_charge_mw)
+    assert float(out.loc[0, "rolling_soc_feedback_included_plan_id_setpoint"]) == pytest.approx(1.0)
+    assert float(out.loc[0, "executed_soc_mwh"]) == pytest.approx(expected_after_first)
+    assert float(out.loc[1, "soc_before_mwh"]) == pytest.approx(expected_after_first)
+
+
+def test_realized_feedback_da_clearing_uses_forecast_limit_not_true_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester("canonical_economic")
+    _configure_zero_aux_unit_efficiency(bt)
+    df, col = _tiny_backtest_df(hours=2)
+    df[col.pred_da_price] = [50.0, 50.0]
+    df[col.true_da_price] = [100.0, 100.0]
+    for q in ["p05", "p10", "p90", "p95"]:
+        df[f"{col.pred_da_price}_{q}"] = [50.0, 50.0]
+
+    def _da_plan(window: pd.DataFrame, colmap: BacktestColumnMap, **_: object) -> pd.DataFrame:
+        ts = pd.to_datetime(window[colmap.timestamp], utc=True, errors="coerce")
+        return pd.DataFrame(
+            {
+                colmap.timestamp: ts,
+                "charge_mw": [1.0] + [0.0] * (len(window) - 1),
+                "discharge_mw": np.zeros(len(window), dtype=float),
+                "reserve_pos_mw": np.zeros(len(window), dtype=float),
+                "reserve_neg_mw": np.zeros(len(window), dtype=float),
+                "bem_only_pos_mw": np.zeros(len(window), dtype=float),
+                "bem_only_neg_mw": np.zeros(len(window), dtype=float),
+                "id_charge_mw": np.zeros(len(window), dtype=float),
+                "id_discharge_mw": np.zeros(len(window), dtype=float),
+                "id_recourse_reason": ["none"] * len(window),
+                "soc_lp_mwh": np.full(len(window), float(bt.soc_init), dtype=float),
+                "soc_start_lp_mwh": np.full(len(window), float(bt.soc_init), dtype=float),
+                "predicted_objective_eur": np.zeros(len(window), dtype=float),
+                "aux_power_mw": np.zeros(len(window), dtype=float),
+            }
+        )
+
+    captured: list[tuple[float, float]] = []
+    original_apply_market_clearing = bt._apply_market_clearing
+
+    def _capture_apply_market_clearing(*args: object, **kwargs: object) -> dict[str, object]:
+        captured.append((float(kwargs["pred_da_price"]), float(kwargs["true_da_price"])))
+        return original_apply_market_clearing(*args, **kwargs)
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _da_plan)
+    monkeypatch.setattr(bt, "_apply_market_clearing", _capture_apply_market_clearing)
+
+    bt.optimize_dispatch_rolling(
+        df,
+        col,
+        horizon_hours=2,
+        reopt_step_hours=2,
+        allowed_markets=("DA", "ID"),
+        strategy_name="da",
+        soc_feedback_mode="realized",
+        strict_simulation_validity=False,
+    )
+
+    assert captured
+    assert captured[0] == pytest.approx((50.0, 100.0))
+
+
+def test_da_gate_after_optimizer_id_recovery_uses_high_rolling_soc_feedback() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.soc_max = 18.0
+    col = BacktestColumnMap()
+    gate_ts = pd.Timestamp("2025-03-03T10:00:00Z")
+    realized_high_soc = 17.67
+
+    anchor, diag = bt._get_optimizer_soc_feedback_for_snapshot(
+        snapshot_ts=gate_ts,
+        decisions=[
+            pd.DataFrame(
+                {
+                    col.timestamp: [gate_ts - pd.Timedelta(hours=1)],
+                    "real_soc_mwh": [realized_high_soc],
+                    "executed_soc_mwh": [9.26],
+                    "soc_mwh": [9.26],
+                }
+            )
+        ],
+        current_soc_mwh=9.26,
+        colmap=col,
+    )
+    max_feasible_buy = (bt.soc_max - anchor) / bt.eta_in
+
+    assert anchor == pytest.approx(realized_high_soc)
+    assert str(diag["optimizer_current_soc_source"]) == "realized_settlement_latest_prior_end_soc"
+    assert float(diag["optimizer_soc_stale_state_detected"]) == pytest.approx(1.0)
+    assert max_feasible_buy < 9.9
+
+
+def test_da_precommit_bid_sizer_uses_physical_current_soc_not_stale_lp_soc() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 2.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.da_min_bid_size_mw = 0.1
+    bt.da_bid_granularity_mw = 0.1
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-03-04T00:00:00Z", periods=2, freq="h")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            "charge_mw": [9.9, 0.0],
+            "discharge_mw": [0.0, 1.0],
+            # This stale LP SoC would incorrectly allow the 9.9 MW buy.
+            "soc_start_lp_mwh": [8.0, 8.0],
+            col.pred_da_price: [0.0, 100.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+        }
+    )
+
+    accepted, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=17.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert accepted
+    first_buy = float(accepted[pd.Timestamp(ts[0])][0])
+    assert first_buy <= 1.0 + 1e-9
+    first_audit = next(
+        row
+        for row in audit
+        if pd.Timestamp(row["timestamp_utc"]) == pd.Timestamp(ts[0])
+    )
+    assert float(first_audit["da_candidate_buy_mw"]) == pytest.approx(9.9)
+    assert float(first_audit["da_accepted_buy_mw"]) <= 1.0 + 1e-9
+    assert float(first_audit["projected_soc_max_mwh"]) <= 18.0 + 1e-9
+
+    replay = bt._replay_da_candidate_cashflow(
+        rows=rows,
+        schedule={pd.Timestamp(ts[0]): (1.0, 0.0)},
+        colmap=col,
+        current_soc_mwh=17.0,
+    )
+    assert float(replay["final_soc_mwh"]) == pytest.approx(18.0)
 
 
 def test_da_settlement_equiv_lockbook_cap_prevents_unexecuted_locked_buy() -> None:
@@ -10321,6 +10689,135 @@ def test_da_settlement_equiv_lockbook_cap_prevents_unexecuted_locked_buy() -> No
     assert float(metrics["da_buy_mwh"]) == pytest.approx(2.6)
     assert float(metrics["da_unexecuted_buy_mwh"]) == pytest.approx(0.0)
     assert float(metrics["da_execution_lockbook_physical_infeasible"]) == pytest.approx(0.0)
+
+
+def test_da_actual_independent_limit_clearing_rejects_uncleared_buy() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.da_limit_clearing_policy = "accepted_independent_limit_replay"
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-24T03:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+    rows[col.pred_da_price] = [50.0]
+    rows[col.true_da_price] = [75.0]
+
+    accepted, diag, by_ts = bt._clear_da_limit_schedule_against_true_prices(
+        submitted_da={ts: (2.0, 0.0)},
+        lock_rows=rows,
+        colmap=col,
+        is_perfect_foresight=False,
+    )
+
+    assert accepted == {}
+    assert float(diag["da_actual_independent_clearing_submitted_buy_mwh"]) == pytest.approx(2.0)
+    assert float(diag["da_actual_independent_clearing_accepted_buy_mwh"]) == pytest.approx(0.0)
+    assert float(diag["da_actual_independent_clearing_price_rejected_buy_mwh"]) == pytest.approx(2.0)
+    assert str(diag["da_actual_independent_clearing_rejection_reason"]) == "price_rejected"
+    assert float(by_ts[ts]["da_submitted_buy_mwh"]) == pytest.approx(2.0)
+    assert float(by_ts[ts]["da_auction_accepted_buy_mwh"]) == pytest.approx(0.0)
+    assert float(by_ts[ts]["da_price_rejected_buy_mwh"]) == pytest.approx(2.0)
+
+
+def test_da_actual_independent_limit_clearing_accepts_cleared_sell() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.da_limit_clearing_policy = "accepted_independent_limit_replay"
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-24T17:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+    rows[col.pred_da_price] = [100.0]
+    rows[col.true_da_price] = [125.0]
+
+    accepted, diag, by_ts = bt._clear_da_limit_schedule_against_true_prices(
+        submitted_da={ts: (0.0, 3.0)},
+        lock_rows=rows,
+        colmap=col,
+        is_perfect_foresight=False,
+    )
+
+    assert accepted[ts] == pytest.approx((0.0, 3.0))
+    assert float(diag["da_actual_independent_clearing_submitted_sell_mwh"]) == pytest.approx(3.0)
+    assert float(diag["da_actual_independent_clearing_accepted_sell_mwh"]) == pytest.approx(3.0)
+    assert float(diag["da_actual_independent_clearing_price_rejected_sell_mwh"]) == pytest.approx(0.0)
+    assert str(diag["da_actual_independent_clearing_rejection_reason"]) == "none"
+    assert float(by_ts[ts]["da_auction_accepted_sell_mwh"]) == pytest.approx(3.0)
+    assert float(by_ts[ts]["da_price_rejected_sell_mwh"]) == pytest.approx(0.0)
+
+
+def test_da_limit_robust_guard_caps_sell_when_prior_limit_buys_may_reject() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts_buy_1 = pd.Timestamp("2026-01-24T03:00:00Z")
+    ts_buy_2 = pd.Timestamp("2026-01-24T13:00:00Z")
+    ts_sell = pd.Timestamp("2026-01-24T17:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts_buy_1, ts_buy_2, ts_sell])
+
+    repaired, diag, by_ts = bt._cap_da_limit_schedule_for_independent_clearing(
+        submitted_da={
+            ts_buy_1: (4.0, 0.0),
+            ts_buy_2: (4.0, 0.0),
+            ts_sell: (0.0, 8.8),
+        },
+        current_soc_mwh=9.0,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+    )
+
+    assert repaired[ts_buy_1] == pytest.approx((4.0, 0.0))
+    assert repaired[ts_buy_2] == pytest.approx((4.0, 0.0))
+    assert repaired[ts_sell] == pytest.approx((0.0, 7.0))
+    assert float(diag["da_limit_clearing_low_soc_pass"]) == pytest.approx(0.0)
+    assert str(diag["da_limit_clearing_rejection_reason"]) == "derated_sell_for_buy_rejection_low_soc"
+    assert float(by_ts[ts_sell]["da_submitted_sell_mwh"]) == pytest.approx(8.8)
+    assert float(by_ts[ts_sell]["da_auction_accepted_sell_mwh"]) == pytest.approx(7.0)
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=9.0,
+        charge=0.0,
+        discharge=repaired[ts_sell][1],
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        da_charge_mw=0.0,
+        da_discharge_mw=repaired[ts_sell][1],
+    )
+    assert soc_next == pytest.approx(bt.soc_min)
+    assert float(metrics["da_unexecuted_sell_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["da_execution_lockbook_physical_infeasible"]) == pytest.approx(0.0)
+
+
+def test_da_limit_robust_guard_caps_buy_when_prior_limit_sells_may_reject() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts_buy = pd.Timestamp("2026-01-24T03:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts_buy])
+
+    repaired, diag, by_ts = bt._cap_da_limit_schedule_for_independent_clearing(
+        submitted_da={ts_buy: (5.0, 0.0)},
+        current_soc_mwh=15.5,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+    )
+
+    assert repaired[ts_buy] == pytest.approx((2.5, 0.0))
+    assert float(diag["da_limit_clearing_high_soc_pass"]) == pytest.approx(0.0)
+    assert str(diag["da_limit_clearing_rejection_reason"]) == "derated_buy_for_sell_rejection_high_soc"
+    assert float(by_ts[ts_buy]["da_submitted_buy_mwh"]) == pytest.approx(5.0)
+    assert float(by_ts[ts_buy]["da_auction_accepted_buy_mwh"]) == pytest.approx(2.5)
 
 
 def test_da_prelock_guard_derates_terminal_sell_when_id_recovery_disabled() -> None:
@@ -14855,7 +15352,7 @@ def test_da_soc_shadow_value_uses_conservative_internal_mwh_value() -> None:
     assert str(comp["da_terminal_value_source"]) == "conservative_da_quantile"
 
 
-def test_da_replay_terminal_value_only_counts_global_final_window() -> None:
+def test_da_replay_terminal_value_counts_local_continuation_for_selection() -> None:
     bt = _mk_backtester()
     bt.soc_target_end = 10.0
     bt.eta_in = 1.0
@@ -14892,10 +15389,61 @@ def test_da_replay_terminal_value_only_counts_global_final_window() -> None:
         global_end_utc=ts,
     )
 
-    assert float(no_global["terminal_credit_eur"]) == pytest.approx(0.0)
-    assert float(no_global["local_terminal_credit_ignored_eur"]) == pytest.approx(200.0)
+    assert float(no_global["terminal_credit_eur"]) == pytest.approx(200.0)
+    assert float(no_global["local_terminal_credit_ignored_eur"]) == pytest.approx(0.0)
+    assert str(no_global["selection_pnl_basis"]) == "includes_local_continuation"
     assert float(with_global["terminal_credit_eur"]) == pytest.approx(200.0)
+    assert str(with_global["selection_pnl_basis"]) == "includes_global_terminal"
     assert float(with_global["da_soc_shadow_value_eur_per_internal_mwh"]) == pytest.approx(100.0)
+
+
+def test_da_precommit_selects_inventory_buy_when_local_continuation_value_positive() -> None:
+    bt = _mk_backtester()
+    bt.soc_target_end = 10.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_peak_mw = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.da_terminal_soc_value_enabled = True
+    bt.da_terminal_value_min_eur_mwh = 100.0
+    bt.da_terminal_value_max_eur_mwh = 100.0
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-03-02T00:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "target_time_utc": [ts],
+            "charge_mw": [1.0],
+            "discharge_mw": [0.0],
+            col.pred_da_price: [10.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "predicted_objective_eur": [90.0],
+        }
+    )
+
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert selected[ts] == pytest.approx((1.0, 0.0))
+    assert audit[0]["selected_incumbent"] == "optimized"
+    assert str(audit[0]["selection_pnl_basis"]) == "includes_local_continuation"
+    assert float(audit[0]["candidate_cost_eur"]) == pytest.approx(10.0)
+    assert float(audit[0]["terminal_credit_in_selection_eur"]) == pytest.approx(100.0)
+    assert float(audit[0]["candidate_pnl_recomputed_eur"]) == pytest.approx(90.0)
+    assert float(audit[0]["candidate_selection_pnl_eur"]) > float(audit[0]["incumbent_selection_pnl_eur"])
+    assert float(audit[0]["incumbent_selection_pnl_eur"]) == pytest.approx(0.0)
 
 
 def test_raw_optimizer_objective_scope_separates_terminal_credit_from_row_ev() -> None:
