@@ -124,14 +124,14 @@ def resolve_benchmark_paths(
             "model": True,
             "naive": True if enable_naive is None else bool(enable_naive),
             "rhpf": True if enable_rolling_pf is None else bool(enable_rolling_pf),
-            "ghpf": bool(enable_global_perfect_foresight) if enable_global_pf is None else bool(enable_global_pf),
+            "ghpf": False if enable_global_pf is None else bool(enable_global_pf),
         }
     else:
         paths = {
             "model": mode in {"full", "model_only"},
             "naive": mode in {"full", "naive_only"},
             "rhpf": mode in {"full", "rhpf_only"},
-            "ghpf": mode in {"full", "ghpf_only"},
+            "ghpf": mode in {"ghpf_only"},
         }
         if enable_naive is not None:
             paths["naive"] = bool(enable_naive)
@@ -865,6 +865,12 @@ SETTLEMENT_NUMERIC_COLS = (
     "afrr_cap_neg_awarded",
     "afrr_act_pos_accepted",
     "afrr_act_neg_accepted",
+    "da_actual_independent_clearing_applied",
+    "da_limit_robust_guard_applied",
+    "da_price_rejected_buy_mwh",
+    "da_price_rejected_sell_mwh",
+    "da_auction_accepted_buy_mwh",
+    "da_auction_accepted_sell_mwh",
     "da_price_taker_mode",
     "id_economic_enabled",
     "id_technical_repair_enabled",
@@ -1208,23 +1214,497 @@ class BatteryBacktester:
                 "frame": pd.DataFrame(),
                 "available": 0.0,
                 "verified": 0.0,
+                "is_solver_upper_bound": 0.0,
+                "is_realized_path_fallback": 0.0,
                 "failure_reason": failure,
                 "selection_reason": "no_solver_benchmark_available",
                 "best_feasible_lower_bound_name": best_name,
                 "best_feasible_lower_bound_eur": float(best_value),
             }
 
+        selected_name = str(selected["selected"])
         return {
-            "selected": str(selected["selected"]),
+            "selected": selected_name,
             "benchmark_value_eur": float(selected["value"]),
             "value": float(selected["value"]),
             "frame": selected["frame"],
             "available": 1.0,
             "verified": 1.0,
+            "is_solver_upper_bound": float(selected_name == "solver"),
+            "is_realized_path_fallback": float(selected_name == "realized_path"),
             "failure_reason": "none",
             "selection_reason": str(selected["selection_reason"]),
             "best_feasible_lower_bound_name": best_name,
             "best_feasible_lower_bound_eur": float(best_value),
+        }
+
+    @staticmethod
+    def _global_pf_strict_invalid_reason(
+        *,
+        enable_global_perfect_foresight: bool,
+        global_pf_verified_upper_bound: float,
+        global_perfect_foresight_available: float,
+        global_perfect_foresight_validation_status: str,
+        global_pf_below_realized_incumbent: float,
+        global_pf_is_realized_path_fallback: float,
+    ) -> list[str]:
+        """Return strict invalid reasons caused by global-PF benchmark status only."""
+        if not bool(enable_global_perfect_foresight):
+            return []
+        if float(global_pf_verified_upper_bound) >= 0.5:
+            return []
+        if float(global_perfect_foresight_available) < 0.5:
+            return ["global_pf_unavailable"]
+        # A feasible realized-path incumbent is a benchmark fallback, not a
+        # model-path invalidity. It must not be classified as solver failure.
+        if float(global_pf_is_realized_path_fallback) >= 0.5:
+            return []
+        global_status = str(global_perfect_foresight_validation_status)
+        if "solver" in global_status:
+            return ["global_pf_solver_failed"]
+        if float(global_pf_below_realized_incumbent) >= 0.5:
+            return [
+                "global_pf_below_realized_incumbent",
+                "realized_exceeds_global_perfect_foresight",
+            ]
+        return ["global_pf_unverified"]
+
+    @staticmethod
+    def _global_pf_upper_bound_ratio_pct(
+        *,
+        realized_total_eur: float,
+        global_pf_total_eur: float,
+        global_perfect_foresight_available: float,
+        global_pf_verified_upper_bound: float,
+    ) -> float:
+        """Return realized/global-PF ratio only for an independent verified upper bound."""
+        if float(global_perfect_foresight_available) < 0.5:
+            return float("nan")
+        if float(global_pf_verified_upper_bound) < 0.5:
+            return float("nan")
+        if not (np.isfinite(float(realized_total_eur)) and np.isfinite(float(global_pf_total_eur))):
+            return float("nan")
+        if abs(float(global_pf_total_eur)) <= 1e-12:
+            return float("nan")
+        return float(100.0 * float(realized_total_eur) / float(global_pf_total_eur))
+
+    def _rolling_pf_da_plan_history_diagnostics(
+        self,
+        plan_history: pd.DataFrame,
+    ) -> dict[str, float | str]:
+        """Summarize RHPF DA candidate stages from full plan history, not settled rows."""
+        defaults: dict[str, float | str] = {
+            "rolling_pf_da_plan_history_rows": 0.0,
+            "rolling_pf_da_gate_allowed_rows": 0.0,
+            "rolling_pf_da_gate_nonzero_candidate_rows": 0.0,
+            "rolling_pf_da_raw_candidate_buy_mwh": 0.0,
+            "rolling_pf_da_raw_candidate_sell_mwh": 0.0,
+            "rolling_pf_da_sized_candidate_buy_mwh": 0.0,
+            "rolling_pf_da_sized_candidate_sell_mwh": 0.0,
+            "rolling_pf_da_postlock_candidate_buy_mwh": 0.0,
+            "rolling_pf_da_postlock_candidate_sell_mwh": 0.0,
+            "rolling_pf_da_selected_lockable_buy_mwh": 0.0,
+            "rolling_pf_da_selected_lockable_sell_mwh": 0.0,
+            "rolling_pf_da_zero_trade_stage": "not_evaluated",
+            "rolling_pf_da_plan_history_zero_reason": "not_evaluated",
+            "rolling_pf_da_bid_sizer_status": "not_evaluated",
+            "rolling_pf_da_bid_sizer_error": "",
+            "rolling_pf_da_bid_sizer_method": "",
+            "rolling_pf_da_bid_sizer_objective_eur": float("nan"),
+            "rolling_pf_da_bid_sizer_total_buy_mwh": 0.0,
+            "rolling_pf_da_bid_sizer_total_sell_mwh": 0.0,
+            "rolling_pf_da_bid_sizer_projected_soc_min_mwh": float("nan"),
+            "rolling_pf_da_bid_sizer_projected_soc_max_mwh": float("nan"),
+            "rolling_pf_da_bid_sizer_projected_final_soc_mwh": float("nan"),
+            "rolling_pf_da_candidate_selection_invalid_reason": "",
+            "rolling_pf_da_raw_candidate_pnl_eur": float("nan"),
+            "rolling_pf_da_sized_candidate_pnl_eur": float("nan"),
+            "rolling_pf_da_sized_zero_reason": "not_evaluated",
+            "rolling_pf_da_first_sized_zero_ts_utc": "",
+        }
+        if plan_history is None or plan_history.empty:
+            defaults["rolling_pf_da_zero_trade_stage"] = "no_plan_history"
+            defaults["rolling_pf_da_plan_history_zero_reason"] = "no_plan_history"
+            defaults["rolling_pf_da_sized_zero_reason"] = "no_plan_history"
+            return defaults
+
+        frame = plan_history
+        defaults["rolling_pf_da_plan_history_rows"] = float(len(frame))
+        if "da_candidate_allowed_by_gate_window" in frame.columns:
+            allowed = (
+                pd.to_numeric(frame["da_candidate_allowed_by_gate_window"], errors="coerce")
+                .fillna(0.0)
+                .gt(0.5)
+            )
+        else:
+            allowed = pd.Series(False, index=frame.index)
+        defaults["rolling_pf_da_gate_allowed_rows"] = float(allowed.sum())
+
+        def _stage_series(*cols: str) -> pd.Series:
+            for col in cols:
+                if col in frame.columns:
+                    return pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
+            return pd.Series(0.0, index=frame.index)
+
+        raw_buy = _stage_series("raw_optimizer_charge_mw_before_da_gate_mask")
+        raw_sell = _stage_series("raw_optimizer_discharge_mw_before_da_gate_mask")
+        sized_buy = _stage_series("da_sized_candidate_buy_mw", "da_precommit_da_candidate_buy_mw")
+        sized_sell = _stage_series("da_sized_candidate_sell_mw", "da_precommit_da_candidate_sell_mw")
+        postlock_buy = _stage_series("da_postlock_candidate_buy_mw", "da_precommit_da_postlock_candidate_buy_mw")
+        postlock_sell = _stage_series("da_postlock_candidate_sell_mw", "da_precommit_da_postlock_candidate_sell_mw")
+        selected_buy = _stage_series("da_selected_lockable_buy_mw", "da_accepted_buy_mw", "accepted_buy_mw")
+        selected_sell = _stage_series("da_selected_lockable_sell_mw", "da_accepted_sell_mw", "accepted_sell_mw")
+
+        def _allowed_sum_mwh(series: pd.Series) -> float:
+            return float(series.where(allowed, 0.0).sum() * float(self.dt_h))
+
+        raw_total = raw_buy.abs() + raw_sell.abs()
+        sized_total = sized_buy.abs() + sized_sell.abs()
+        postlock_total = postlock_buy.abs() + postlock_sell.abs()
+        selected_total = selected_buy.abs() + selected_sell.abs()
+        nonzero_any = (raw_total + sized_total + postlock_total + selected_total) > 1e-9
+        defaults["rolling_pf_da_gate_nonzero_candidate_rows"] = float((allowed & nonzero_any).sum())
+        defaults["rolling_pf_da_raw_candidate_buy_mwh"] = _allowed_sum_mwh(raw_buy)
+        defaults["rolling_pf_da_raw_candidate_sell_mwh"] = _allowed_sum_mwh(raw_sell)
+        defaults["rolling_pf_da_sized_candidate_buy_mwh"] = _allowed_sum_mwh(sized_buy)
+        defaults["rolling_pf_da_sized_candidate_sell_mwh"] = _allowed_sum_mwh(sized_sell)
+        defaults["rolling_pf_da_postlock_candidate_buy_mwh"] = _allowed_sum_mwh(postlock_buy)
+        defaults["rolling_pf_da_postlock_candidate_sell_mwh"] = _allowed_sum_mwh(postlock_sell)
+        defaults["rolling_pf_da_selected_lockable_buy_mwh"] = _allowed_sum_mwh(selected_buy)
+        defaults["rolling_pf_da_selected_lockable_sell_mwh"] = _allowed_sum_mwh(selected_sell)
+
+        def _first_allowed_text(*cols: str) -> str:
+            for col in cols:
+                if col not in frame.columns:
+                    continue
+                vals = frame.loc[allowed, col].dropna().astype(str)
+                vals = vals[~vals.str.lower().isin({"", "none", "nan"})]
+                if not vals.empty:
+                    return str(vals.iloc[0])
+            return ""
+
+        def _first_allowed_num(*cols: str, default: float = float("nan")) -> float:
+            for col in cols:
+                if col not in frame.columns:
+                    continue
+                vals = (
+                    pd.to_numeric(frame.loc[allowed, col], errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna()
+                )
+                if not vals.empty:
+                    return float(vals.iloc[0])
+            return float(default)
+
+        defaults["rolling_pf_da_bid_sizer_status"] = _first_allowed_text("da_bid_sizer_status")
+        defaults["rolling_pf_da_bid_sizer_error"] = _first_allowed_text("da_bid_sizer_error")
+        defaults["rolling_pf_da_bid_sizer_method"] = _first_allowed_text("da_bid_sizer_method")
+        defaults["rolling_pf_da_bid_sizer_objective_eur"] = _first_allowed_num("da_bid_sizer_objective_eur")
+        defaults["rolling_pf_da_bid_sizer_total_buy_mwh"] = _first_allowed_num(
+            "da_bid_sizer_total_buy_mwh",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_bid_sizer_total_sell_mwh"] = _first_allowed_num(
+            "da_bid_sizer_total_sell_mwh",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_bid_sizer_projected_soc_min_mwh"] = _first_allowed_num(
+            "da_bid_sizer_lp_projected_soc_min_mwh",
+            "projected_soc_min_mwh",
+        )
+        defaults["rolling_pf_da_bid_sizer_projected_soc_max_mwh"] = _first_allowed_num(
+            "da_bid_sizer_lp_projected_soc_max_mwh",
+            "projected_soc_max_mwh",
+        )
+        defaults["rolling_pf_da_bid_sizer_projected_final_soc_mwh"] = _first_allowed_num(
+            "da_bid_sizer_lp_projected_final_soc_mwh",
+            "projected_final_soc_mwh",
+        )
+        defaults["rolling_pf_da_candidate_selection_invalid_reason"] = _first_allowed_text(
+            "da_precommit_selection_invalid_reason",
+            "selection_error_reason",
+            "candidate_rejection_reason",
+        )
+        defaults["rolling_pf_da_raw_candidate_pnl_eur"] = _first_allowed_num(
+            "raw_candidate_pnl_recomputed_eur",
+            "raw_candidate_predicted_pnl_eur",
+        )
+        defaults["rolling_pf_da_sized_candidate_pnl_eur"] = _first_allowed_num(
+            "sized_candidate_pnl_eur",
+            "candidate_selection_pnl_eur",
+            "candidate_predicted_pnl_eur",
+        )
+
+        raw_mwh = float(defaults["rolling_pf_da_raw_candidate_buy_mwh"]) + float(
+            defaults["rolling_pf_da_raw_candidate_sell_mwh"]
+        )
+        sized_mwh = float(defaults["rolling_pf_da_sized_candidate_buy_mwh"]) + float(
+            defaults["rolling_pf_da_sized_candidate_sell_mwh"]
+        )
+        postlock_mwh = float(defaults["rolling_pf_da_postlock_candidate_buy_mwh"]) + float(
+            defaults["rolling_pf_da_postlock_candidate_sell_mwh"]
+        )
+        selected_mwh = float(defaults["rolling_pf_da_selected_lockable_buy_mwh"]) + float(
+            defaults["rolling_pf_da_selected_lockable_sell_mwh"]
+        )
+
+        if float(defaults["rolling_pf_da_gate_allowed_rows"]) <= 0.0:
+            stage = "no_da_gate_window_rows"
+        elif raw_mwh <= 1e-9:
+            stage = "optimizer_zero_da_candidate"
+        elif sized_mwh <= 1e-9:
+            stage = "sized_candidate_zeroed"
+        elif postlock_mwh <= 1e-9:
+            stage = "postlock_guard_zeroed_candidate"
+        elif selected_mwh <= 1e-9:
+            stage = "selected_lockable_zeroed"
+        else:
+            stage = "candidate_available"
+        defaults["rolling_pf_da_zero_trade_stage"] = stage
+        if stage == "sized_candidate_zeroed":
+            status_reason = str(defaults["rolling_pf_da_bid_sizer_status"])
+            if status_reason.lower() in {"", "none", "nan", "not_evaluated"}:
+                status_reason = "sized_candidate_zeroed"
+            sized_zero_reason = (
+                _first_allowed_text("da_bid_sizer_zero_reason")
+                or _first_allowed_text("da_zero_reason", "zero_reason")
+                or status_reason
+            )
+            defaults["rolling_pf_da_sized_zero_reason"] = sized_zero_reason
+            sized_zero_mask = allowed & (raw_total > 1e-9) & (sized_total <= 1e-9)
+            if bool(sized_zero_mask.any()):
+                ts_col = "target_time_utc" if "target_time_utc" in frame.columns else "timestamp_utc"
+                if ts_col in frame.columns:
+                    ts_val = frame.loc[sized_zero_mask, ts_col].iloc[0]
+                    ts = pd.to_datetime(ts_val, utc=True, errors="coerce")
+                    defaults["rolling_pf_da_first_sized_zero_ts_utc"] = (
+                        str(ts.isoformat()) if pd.notna(ts) else str(ts_val)
+                    )
+        else:
+            defaults["rolling_pf_da_sized_zero_reason"] = "none"
+
+        reason = stage
+        for col in (
+            "da_precommit_selection_invalid_reason",
+            "da_candidate_disabled_reason",
+            "da_postlock_infeasibility_driver_detail",
+            "da_postlock_infeasibility_driver",
+            "da_postlock_failed_reason_detail",
+        ):
+            if col not in frame.columns:
+                continue
+            vals = frame.loc[allowed, col].dropna().astype(str)
+            vals = vals[~vals.str.lower().isin({"", "none", "nan"})]
+            if not vals.empty:
+                reason = str(vals.iloc[0])
+                break
+        defaults["rolling_pf_da_plan_history_zero_reason"] = reason
+        return defaults
+
+    def _rolling_pf_bcm_plan_history_diagnostics(
+        self,
+        plan_history: pd.DataFrame,
+        *,
+        deterministic_reserve_settlement: bool,
+        truth_price_substitution_applied: bool,
+    ) -> dict[str, float | str]:
+        """Summarize RHPF BCM side selection from full plan history."""
+        defaults: dict[str, float | str] = {
+            "rolling_pf_bcm_plan_history_rows": 0.0,
+            "rolling_pf_bcm_gate_allowed_rows": 0.0,
+            "rolling_pf_bcm_gate_nonzero_candidate_rows": 0.0,
+            "rolling_pf_bcm_candidate_pos_mw": 0.0,
+            "rolling_pf_bcm_candidate_neg_mw": 0.0,
+            "rolling_pf_bcm_precommit_candidate_pos_mw": 0.0,
+            "rolling_pf_bcm_precommit_candidate_neg_mw": 0.0,
+            "rolling_pf_bcm_locked_pos_mw": 0.0,
+            "rolling_pf_bcm_locked_neg_mw": 0.0,
+            "rolling_pf_bcm_ev_pos": 0.0,
+            "rolling_pf_bcm_ev_neg": 0.0,
+            "rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw": 0.0,
+            "rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw": 0.0,
+            "rolling_pf_bcm_capacity_price_source_column_pos": "",
+            "rolling_pf_bcm_capacity_price_source_column_neg": "",
+            "rolling_pf_bcm_zero_reason": "not_evaluated",
+            "rolling_pf_bcm_zero_stage": "not_evaluated",
+            "rolling_pf_bcm_deterministic_reserve_settlement": float(bool(deterministic_reserve_settlement)),
+            "rolling_pf_bcm_truth_price_substitution_applied": float(bool(truth_price_substitution_applied)),
+        }
+        if plan_history is None or plan_history.empty:
+            defaults["rolling_pf_bcm_zero_reason"] = "no_plan_history"
+            defaults["rolling_pf_bcm_zero_stage"] = "no_plan_history"
+            return defaults
+
+        frame = plan_history
+        defaults["rolling_pf_bcm_plan_history_rows"] = float(len(frame))
+        if "bcm_candidate_allowed_by_gate_window" in frame.columns:
+            allowed = (
+                pd.to_numeric(frame["bcm_candidate_allowed_by_gate_window"], errors="coerce")
+                .fillna(0.0)
+                .gt(0.5)
+            )
+        elif "bcm_gate_actionable" in frame.columns:
+            allowed = (
+                pd.to_numeric(frame["bcm_gate_actionable"], errors="coerce")
+                .fillna(0.0)
+                .gt(0.5)
+            )
+        else:
+            allowed = pd.Series(False, index=frame.index)
+        defaults["rolling_pf_bcm_gate_allowed_rows"] = float(allowed.sum())
+
+        def _stage_series(*cols: str) -> pd.Series:
+            for col in cols:
+                if col in frame.columns:
+                    return pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
+            return pd.Series(0.0, index=frame.index, dtype="float64")
+
+        def _allowed_sum(series: pd.Series) -> float:
+            return float(series.where(allowed, 0.0).sum())
+
+        def _allowed_mean(series: pd.Series) -> float:
+            vals = series.where(allowed).dropna()
+            return float(vals.mean()) if not vals.empty else 0.0
+
+        cand_pos = _stage_series("bcm_candidate_pos_mw", "plan_reserve_pos_mw", "reserve_pos_mw")
+        cand_neg = _stage_series("bcm_candidate_neg_mw", "plan_reserve_neg_mw", "reserve_neg_mw")
+        pre_pos = _stage_series("bcm_precommit_candidate_pos_mw", "bcm_candidate_pos_mw")
+        pre_neg = _stage_series("bcm_precommit_candidate_neg_mw", "bcm_candidate_neg_mw")
+        locked_pos = _stage_series("bcm_precommit_locked_pos_mw", "locked_bcm_capacity_pos_mw")
+        locked_neg = _stage_series("bcm_precommit_locked_neg_mw", "locked_bcm_capacity_neg_mw")
+        ev_pos = _stage_series("bcm_ev_pos", "bcm_optimizer_expected_ev_pos_eur_per_mw")
+        ev_neg = _stage_series("bcm_ev_neg", "bcm_optimizer_expected_ev_neg_eur_per_mw")
+        coeff_pos = _stage_series("bcm_optimizer_coeff_pos_eur_per_mw", "bcm_p70_reserve_pos_coef_eur_per_mw")
+        coeff_neg = _stage_series("bcm_optimizer_coeff_neg_eur_per_mw", "bcm_p70_reserve_neg_coef_eur_per_mw")
+
+        nonzero_any = (cand_pos.abs() + cand_neg.abs() + pre_pos.abs() + pre_neg.abs() + locked_pos.abs() + locked_neg.abs()) > 1e-9
+        defaults["rolling_pf_bcm_gate_nonzero_candidate_rows"] = float((allowed & nonzero_any).sum())
+        defaults["rolling_pf_bcm_candidate_pos_mw"] = _allowed_sum(cand_pos)
+        defaults["rolling_pf_bcm_candidate_neg_mw"] = _allowed_sum(cand_neg)
+        defaults["rolling_pf_bcm_precommit_candidate_pos_mw"] = _allowed_sum(pre_pos)
+        defaults["rolling_pf_bcm_precommit_candidate_neg_mw"] = _allowed_sum(pre_neg)
+        defaults["rolling_pf_bcm_locked_pos_mw"] = _allowed_sum(locked_pos)
+        defaults["rolling_pf_bcm_locked_neg_mw"] = _allowed_sum(locked_neg)
+        defaults["rolling_pf_bcm_ev_pos"] = _allowed_mean(ev_pos)
+        defaults["rolling_pf_bcm_ev_neg"] = _allowed_mean(ev_neg)
+        defaults["rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw"] = _allowed_mean(coeff_pos)
+        defaults["rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw"] = _allowed_mean(coeff_neg)
+
+        for out_key, col in (
+            ("rolling_pf_bcm_capacity_price_source_column_pos", "bcm_capacity_price_source_column_pos"),
+            ("rolling_pf_bcm_capacity_price_source_column_neg", "bcm_capacity_price_source_column_neg"),
+        ):
+            if col in frame.columns:
+                vals = frame.loc[allowed, col].dropna().astype(str)
+                vals = vals[~vals.str.lower().isin({"", "none", "nan"})]
+                if not vals.empty:
+                    defaults[out_key] = str(vals.iloc[0])
+
+        if float(defaults["rolling_pf_bcm_gate_allowed_rows"]) <= 0.0:
+            stage = "no_bcm_gate_window_rows"
+        elif (
+            float(defaults["rolling_pf_bcm_candidate_pos_mw"])
+            + float(defaults["rolling_pf_bcm_candidate_neg_mw"])
+            <= 1e-9
+        ):
+            stage = "optimizer_zero_bcm_candidate"
+        elif (
+            float(defaults["rolling_pf_bcm_locked_pos_mw"])
+            + float(defaults["rolling_pf_bcm_locked_neg_mw"])
+            <= 1e-9
+        ):
+            stage = "precommit_or_headroom_zeroed"
+        else:
+            stage = "candidate_locked"
+        defaults["rolling_pf_bcm_zero_stage"] = stage
+        reason = stage
+        for col in (
+            "bcm_precommit_zero_reason",
+            "bcm_candidate_disabled_reason",
+            "bcm_gate_reason",
+            "bcm_fallback_reason",
+        ):
+            if col not in frame.columns:
+                continue
+            vals = frame.loc[allowed, col].dropna().astype(str)
+            vals = vals[~vals.str.lower().isin({"", "none", "nan"})]
+            if not vals.empty:
+                reason = str(vals.iloc[0])
+                break
+        defaults["rolling_pf_bcm_zero_reason"] = reason
+        return defaults
+
+    @staticmethod
+    def _bcm_capacity_price_missing_diagnostics(
+        *,
+        timestamps: pd.Series,
+        locked_pos_mw: pd.Series,
+        locked_neg_mw: pd.Series,
+        settlement_price_pos: pd.Series,
+        settlement_price_neg: pd.Series,
+        revenue_pos_eur: pd.Series,
+        revenue_neg_eur: pd.Series,
+        price_source: pd.Series | None = None,
+    ) -> dict[str, float | str]:
+        """Summarize the first awarded-BCM row that lost pay-as-bid capacity price."""
+        ts = pd.to_datetime(timestamps, utc=True, errors="coerce").reset_index(drop=True)
+        pos_mw = pd.to_numeric(locked_pos_mw, errors="coerce").fillna(0.0).reset_index(drop=True)
+        neg_mw = pd.to_numeric(locked_neg_mw, errors="coerce").fillna(0.0).reset_index(drop=True)
+        price_pos = pd.to_numeric(settlement_price_pos, errors="coerce").fillna(0.0).reset_index(drop=True)
+        price_neg = pd.to_numeric(settlement_price_neg, errors="coerce").fillna(0.0).reset_index(drop=True)
+        rev_pos = pd.to_numeric(revenue_pos_eur, errors="coerce").fillna(0.0).reset_index(drop=True)
+        rev_neg = pd.to_numeric(revenue_neg_eur, errors="coerce").fillna(0.0).reset_index(drop=True)
+        src = (
+            price_source.reset_index(drop=True).fillna("").astype(str)
+            if price_source is not None
+            else pd.Series([""] * len(ts))
+        )
+
+        pos_missing = (pos_mw.abs() > 1e-9) & (price_pos.abs() <= 1e-9)
+        neg_missing = (neg_mw.abs() > 1e-9) & (price_neg.abs() <= 1e-9)
+        both_price_missing = (
+            ((pos_mw.abs() + neg_mw.abs()) > 1e-9)
+            & ((price_pos.abs() + price_neg.abs()) <= 1e-9)
+            & ((rev_pos.abs() + rev_neg.abs()) <= 1e-9)
+        )
+        any_missing = pos_missing | neg_missing | both_price_missing
+        if not bool(any_missing.any()):
+            return {
+                "bcm_capacity_price_missing_for_awarded_capacity_count": 0.0,
+                "first_bcm_capacity_price_missing_timestamp_utc": "",
+                "first_bcm_capacity_price_missing_side": "none",
+                "first_bcm_capacity_price_missing_locked_pos_mw": 0.0,
+                "first_bcm_capacity_price_missing_locked_neg_mw": 0.0,
+                "first_bcm_capacity_price_missing_settlement_price_pos_eur_mw": 0.0,
+                "first_bcm_capacity_price_missing_settlement_price_neg_eur_mw": 0.0,
+                "first_bcm_capacity_price_missing_revenue_pos_eur": 0.0,
+                "first_bcm_capacity_price_missing_revenue_neg_eur": 0.0,
+                "first_bcm_capacity_price_missing_source": "none",
+            }
+
+        first_idx = int(np.flatnonzero(any_missing.to_numpy(dtype=bool))[0])
+        if bool(pos_missing.iloc[first_idx]) and bool(neg_missing.iloc[first_idx]):
+            side = "pos_neg"
+        elif bool(pos_missing.iloc[first_idx]):
+            side = "pos"
+        elif bool(neg_missing.iloc[first_idx]):
+            side = "neg"
+        else:
+            side = "unknown"
+        ts_val = ts.iloc[first_idx]
+        return {
+            "bcm_capacity_price_missing_for_awarded_capacity_count": float(both_price_missing.sum()),
+            "first_bcm_capacity_price_missing_timestamp_utc": (
+                pd.Timestamp(ts_val).isoformat() if pd.notna(ts_val) else ""
+            ),
+            "first_bcm_capacity_price_missing_side": side,
+            "first_bcm_capacity_price_missing_locked_pos_mw": float(pos_mw.iloc[first_idx]),
+            "first_bcm_capacity_price_missing_locked_neg_mw": float(neg_mw.iloc[first_idx]),
+            "first_bcm_capacity_price_missing_settlement_price_pos_eur_mw": float(price_pos.iloc[first_idx]),
+            "first_bcm_capacity_price_missing_settlement_price_neg_eur_mw": float(price_neg.iloc[first_idx]),
+            "first_bcm_capacity_price_missing_revenue_pos_eur": float(rev_pos.iloc[first_idx]),
+            "first_bcm_capacity_price_missing_revenue_neg_eur": float(rev_neg.iloc[first_idx]),
+            "first_bcm_capacity_price_missing_source": str(src.iloc[first_idx]) if first_idx < len(src) else "",
         }
 
     @staticmethod
@@ -1490,10 +1970,11 @@ class BatteryBacktester:
         # Backward-compatible attribute. For policy mode this is resolved per
         # optimize_dispatch() call from the active bid-bin set.
         self.afrr_activation_rate_guard_quantile = self.afrr_activation_rate_guard_policy
-        self.da_execution_mode = str(MARKET_SPECS.get("da_execution_mode", "price_taker"))
-        self.da_limit_clearing_policy = str(
-            MARKET_SPECS.get("da_limit_clearing_policy", "accepted_independent_limit_replay")
-        ).strip().lower()
+        (
+            self.da_execution_policy,
+            self.da_execution_mode,
+            self.da_limit_clearing_policy,
+        ) = self._resolve_da_execution_policy(MARKET_SPECS)
         if self.da_limit_clearing_policy not in {
             "accepted_independent_limit_replay",
             "robust_independent_limit",
@@ -1962,10 +2443,46 @@ class BatteryBacktester:
         except (TypeError, ValueError):
             return float(default)
 
+    @staticmethod
+    def _resolve_da_execution_policy(
+        specs: dict[str, object],
+    ) -> tuple[str, str, str]:
+        """Return canonical DA policy plus legacy mode/policy compatibility."""
+        explicit_policy = specs.get("da_execution_policy", None)
+        if explicit_policy is not None and str(explicit_policy).strip():
+            policy = str(explicit_policy).strip().lower()
+        else:
+            legacy_mode = str(specs.get("da_execution_mode", "price_taker")).strip().lower()
+            legacy_limit_policy = str(
+                specs.get("da_limit_clearing_policy", "accepted_independent_limit_replay")
+            ).strip().lower()
+            policy = "price_taker" if legacy_mode == "price_taker" else legacy_limit_policy
+        allowed = {
+            "price_taker",
+            "accepted_independent_limit_replay",
+            "robust_independent_limit",
+        }
+        if policy not in allowed:
+            raise ValueError(
+                "Invalid MARKET_SPECS['da_execution_policy'] "
+                f"{policy!r}. Allowed: {sorted(allowed)}"
+            )
+        mode = "price_taker" if policy == "price_taker" else "limit"
+        limit_policy = (
+            "accepted_independent_limit_replay"
+            if policy == "price_taker"
+            else policy
+        )
+        return policy, mode, limit_policy
+
     def _da_limit_execution_probabilities(self) -> dict[str, float | str]:
         buy_q = str(getattr(self.bid_builder, "da_buy_limit_quantile", "p50")).lower()
         sell_q = str(getattr(self.bid_builder, "da_sell_limit_quantile", "p50")).lower()
-        limit_probability_enabled = str(self.da_execution_mode).strip().lower() != "price_taker"
+        policy = str(getattr(self, "da_execution_policy", "")).strip().lower()
+        legacy_mode = str(getattr(self, "da_execution_mode", "price_taker")).strip().lower()
+        if not policy:
+            policy = legacy_mode
+        limit_probability_enabled = policy != "price_taker" or legacy_mode != "price_taker"
         if not limit_probability_enabled:
             return {
                 "enabled": 0.0,
@@ -4666,24 +5183,53 @@ class BatteryBacktester:
         selected_feasible = False
         selected_sizing_method = "linprog_continuous_per_hour"
         lp_schedule, lp_feasible, lp_stats = _lp_size_schedule()
+        raw_total = float(sum(ch + dis for ch, dis in candidates.values()))
+        retry_selected: dict[pd.Timestamp, tuple[float, float]] | None = None
+        retry_stats: dict[str, float | str] = {}
+        retry_factor = 0.0
+        retry_feasible = False
+        for factor in ladder:
+            schedule = _scaled_schedule(float(factor))
+            feasible, stats = _evaluate(schedule)
+            schedule_total = float(sum(ch + dis for ch, dis in schedule.values()))
+            if feasible and schedule_total > 1e-9:
+                retry_factor = float(factor)
+                retry_selected = schedule
+                retry_stats = dict(stats)
+                retry_feasible = True
+                break
         if lp_schedule is not None and bool(lp_feasible):
-            selected = dict(lp_schedule)
-            selected_stats = dict(lp_stats)
-            selected_feasible = True
-            raw_total = float(sum(ch + dis for ch, dis in candidates.values()))
-            sized_total = float(sum(ch + dis for ch, dis in selected.values()))
-            selected_factor = float(sized_total / raw_total) if raw_total > 1e-12 else 0.0
+            lp_total = float(sum(ch + dis for ch, dis in lp_schedule.values()))
+            if raw_total > 1e-9 and lp_total <= 1e-9 and bool(retry_feasible) and retry_selected is not None:
+                selected = dict(retry_selected)
+                selected_stats = dict(retry_stats)
+                selected_stats["da_bid_sizer_status"] = "lp_zero_used_retry_ladder_candidate"
+                selected_stats["da_bid_sizer_lp_status"] = str(lp_stats.get("da_bid_sizer_status", "unknown"))
+                selected_stats["da_bid_sizer_lp_objective_eur"] = float(
+                    lp_stats.get("da_bid_sizer_objective_eur", np.nan)
+                )
+                selected_stats["da_bid_sizer_retry_factor"] = float(retry_factor)
+                selected_sizing_method = "linprog_zero_then_uniform_retry_ladder"
+                selected_feasible = True
+                selected_factor = float(retry_factor)
+            else:
+                selected = dict(lp_schedule)
+                selected_stats = dict(lp_stats)
+                if raw_total > 1e-9 and lp_total <= 1e-9:
+                    selected_stats["da_bid_sizer_status"] = str(
+                        selected_stats.get("da_bid_sizer_status", "lp_selected_zero_schedule")
+                    )
+                    selected_stats["da_bid_sizer_zero_reason"] = "lp_objective_selected_zero_no_nonzero_retry_feasible"
+                selected_feasible = True
+                sized_total = float(sum(ch + dis for ch, dis in selected.values()))
+                selected_factor = float(sized_total / raw_total) if raw_total > 1e-12 else 0.0
         else:
             selected_sizing_method = "uniform_retry_ladder_fallback"
-            for factor in ladder:
-                schedule = _scaled_schedule(float(factor))
-                feasible, stats = _evaluate(schedule)
-                if feasible:
-                    selected_factor = float(factor)
-                    selected = schedule
-                    selected_stats = stats
-                    selected_feasible = True
-                    break
+            if bool(retry_feasible) and retry_selected is not None:
+                selected_factor = float(retry_factor)
+                selected = retry_selected
+                selected_stats = retry_stats
+                selected_feasible = True
             if not selected_feasible:
                 selected_factor = 0.0
                 selected = _scaled_schedule(0.0)
@@ -4916,6 +5462,7 @@ class BatteryBacktester:
                         selected_stats.get("da_bid_sizer_total_sell_mwh", np.nan)
                     ),
                     "da_bid_sizer_error": str(selected_stats.get("da_bid_sizer_error", "none")),
+                    "da_bid_sizer_zero_reason": str(selected_stats.get("da_bid_sizer_zero_reason", "none")),
                     "da_bid_sizer_lp_projected_soc_min_mwh": float(
                         selected_stats.get("da_bid_sizer_lp_projected_soc_min_mwh", np.nan)
                     ),
@@ -14686,6 +15233,7 @@ class BatteryBacktester:
         ts = pd.to_datetime(target_time_utc, utc=True, errors="coerce")
         if pd.isna(ts):
             ts = pd.Timestamp("1970-01-01T00:00:00Z")
+        da_execution_policy = str(getattr(self, "da_execution_policy", self.da_execution_mode)).strip().lower()
         bcm_block_info = assign_bcm_capacity_block(pd.Series([ts]))
         bcm_product_block_id = str(bcm_block_info["bcm_capacity_block_id"].iloc[0])
         bem_delivery_hour_start_utc = pd.to_datetime(ts, utc=True)
@@ -15075,6 +15623,18 @@ class BatteryBacktester:
                     continue
                 capped_da_bids.append(type(b)(ts=b.ts, side=b.side, quantity_mw=q, price_eur_mwh=b.price_eur_mwh, mode=b.mode, reason=b.reason))
             da_bids = capped_da_bids
+        if da_execution_policy == "price_taker":
+            da_bids = [
+                type(b)(
+                    ts=b.ts,
+                    side=b.side,
+                    quantity_mw=b.quantity_mw,
+                    price_eur_mwh=b.price_eur_mwh,
+                    mode="price_taker",
+                    reason=b.reason,
+                )
+                for b in da_bids
+            ]
         da_res = self.market_clearing_engine.clear_da(
             da_bids,
             true_da_price=float(true_da_price),
@@ -15445,6 +16005,25 @@ class BatteryBacktester:
             ),
             "submitted_da_buy_mw": float(da_res.submitted_buy_mw),
             "submitted_da_sell_mw": float(da_res.submitted_sell_mw),
+            "da_execution_policy": str(da_execution_policy),
+            "da_execution_policy_source": "config:da_execution_policy",
+            "da_actual_independent_clearing_applied": float(
+                da_execution_policy == "accepted_independent_limit_replay"
+            ),
+            "da_limit_robust_guard_applied": float(da_execution_policy == "robust_independent_limit"),
+            "da_submitted_buy_mwh": float(max(0.0, float(da_res.submitted_buy_mw)) * float(self.dt_h)),
+            "da_submitted_sell_mwh": float(max(0.0, float(da_res.submitted_sell_mw)) * float(self.dt_h)),
+            "da_price_rejected_buy_mwh": float(
+                max(0.0, float(da_res.submitted_buy_mw) - float(da_res.executed_buy_mw)) * float(self.dt_h)
+            ),
+            "da_price_rejected_sell_mwh": float(
+                max(0.0, float(da_res.submitted_sell_mw) - float(da_res.executed_sell_mw)) * float(self.dt_h)
+            ),
+            "da_auction_accepted_buy_mwh": float(max(0.0, float(da_res.executed_buy_mw)) * float(self.dt_h)),
+            "da_auction_accepted_sell_mwh": float(max(0.0, float(da_res.executed_sell_mw)) * float(self.dt_h)),
+            "da_physical_lockbook_buy_mwh": float(max(0.0, float(da_res.executed_buy_mw)) * float(self.dt_h)),
+            "da_physical_lockbook_sell_mwh": float(max(0.0, float(da_res.executed_sell_mw)) * float(self.dt_h)),
+            "da_settlement_price_source": "true_da_clearing_price",
             "submitted_da_buy_price_eur_mwh": submitted_da_buy_price,
             "submitted_da_sell_price_eur_mwh": submitted_da_sell_price,
             "da_submitted": float(da_submitted),
@@ -15630,7 +16209,7 @@ class BatteryBacktester:
             "afrr_cap_neg_awarded": float(cap_neg_awarded),
             "afrr_act_pos_accepted": float(act_pos_accepted),
             "afrr_act_neg_accepted": float(act_neg_accepted),
-            "da_price_taker_mode": float(self.da_execution_mode == "price_taker"),
+            "da_price_taker_mode": float(da_execution_policy == "price_taker"),
             "da_buy_reason": str(da_res.reason_buy) if da_res.reason_buy else "none",
             "da_sell_reason": str(da_res.reason_sell) if da_res.reason_sell else "none",
             "aFRR_Capacity_Won_MW": float(max(ob_pos, ob_neg, res_pos_exec, res_neg_exec)),
@@ -17042,25 +17621,43 @@ class BatteryBacktester:
             reserve_commitment_id = (
                 f"{pd.to_datetime(snapshot_ts, utc=True, errors='coerce').isoformat()}|{reserve_product_block_id}"
             )
+            capacity_price_lookup_diag = dict(
+                getattr(self, "_last_bcm_capacity_price_lookup_diagnostics", {})
+            )
+
             def _submitted_capacity_price_for_side(side: str, awarded_mw: float) -> float:
                 if float(awarded_mw) <= 1e-12:
                     return 0.0
                 bids_for_side = [
                     b for b in cap_bids if b.side == side and float(b.quantity_mw) > 1e-12
                 ]
-                if not bids_for_side:
-                    return 0.0
-                qty = float(sum(float(b.quantity_mw) for b in bids_for_side))
-                value = float(
-                    sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in bids_for_side)
+                if bids_for_side:
+                    qty = float(sum(float(b.quantity_mw) for b in bids_for_side))
+                    value = float(
+                        sum(float(b.quantity_mw) * float(b.capacity_price_eur_mw) for b in bids_for_side)
+                    )
+                    mean_price = float(value / max(qty, 1e-12))
+                    if np.isfinite(mean_price) and abs(mean_price) > 1e-12:
+                        return float(mean_price)
+                # Last direct submitted-bid price source before lockbook write:
+                # use only the forecast-side BCM capacity price lookup that
+                # formulated the bid. Do not use activation prices, realized
+                # clearing prices, or unrelated forecast columns as fallbacks.
+                fallback_key = (
+                    "bcm_capacity_price_pos_before_fallback"
+                    if side == "pos"
+                    else "bcm_capacity_price_neg_before_fallback"
                 )
-                return float(value / max(qty, 1e-12))
+                try:
+                    fallback_price = float(capacity_price_lookup_diag.get(fallback_key, np.nan))
+                except (TypeError, ValueError):
+                    fallback_price = float("nan")
+                if np.isfinite(fallback_price) and abs(fallback_price) > 1e-12:
+                    return float(fallback_price)
+                return 0.0
 
             cap_price_pos_awarded = _submitted_capacity_price_for_side("pos", float(cap_res.awarded_pos_mw))
             cap_price_neg_awarded = _submitted_capacity_price_for_side("neg", float(cap_res.awarded_neg_mw))
-            capacity_price_lookup_diag = dict(
-                getattr(self, "_last_bcm_capacity_price_lookup_diagnostics", {})
-            )
             cap_price_missing_for_nonzero_lockbook = float(
                 (float(cap_res.awarded_pos_mw) > 1e-12 and abs(float(cap_price_pos_awarded)) <= 1e-12)
                 or (float(cap_res.awarded_neg_mw) > 1e-12 and abs(float(cap_price_neg_awarded)) <= 1e-12)
@@ -17499,11 +18096,39 @@ class BatteryBacktester:
             values = pd.to_numeric(frame[column], errors="coerce").dropna()
             return float(values.mean()) if len(values) else float("nan")
 
+        active_bins = [str(q).lower() for q in getattr(self, "afrr_quantile_bins", [])]
+
+        def _candidate_capacity_price_columns(side: str) -> list[str]:
+            base = colmap.pred_afrr_capacity_price_pos if side == "pos" else colmap.pred_afrr_capacity_price_neg
+            cols: list[str] = []
+            for b, q in enumerate(active_bins):
+                cols.extend(
+                    [
+                        f"bcm_{q}_capacity_bid_price_{side}_eur_per_mw_h",
+                        f"ev_bcm_capacity_bid_price_{side}_bin_{b}_eur_per_mw_h",
+                        f"{base}_{q}",
+                    ]
+                )
+            cols.append(base)
+            return list(dict.fromkeys(cols))
+
+        def _resolve_capacity_price_from_frame(
+            frame: pd.DataFrame,
+            columns: list[str],
+        ) -> tuple[float, str]:
+            for column in columns:
+                value = _finite_mean(frame, column)
+                if np.isfinite(value):
+                    return float(value), str(column)
+            return float("nan"), ""
+
+        pos_candidate_cols = _candidate_capacity_price_columns("pos")
+        neg_candidate_cols = _candidate_capacity_price_columns("neg")
         # Forecast-side pricing inputs only (no realized capacity clearing prices).
         # BCM capacity is pay-as-bid. The submitted capacity bid price is the
-        # model's predicted capacity price, not activation price.
-        pred_cap_pos_blk = _finite_mean(blk, colmap.pred_afrr_capacity_price_pos)
-        pred_cap_neg_blk = _finite_mean(blk, colmap.pred_afrr_capacity_price_neg)
+        # selected forecast-side capacity price, not activation price.
+        pred_cap_pos_blk, pos_lookup_col = _resolve_capacity_price_from_frame(blk, pos_candidate_cols)
+        pred_cap_neg_blk, neg_lookup_col = _resolve_capacity_price_from_frame(blk, neg_candidate_cols)
         lookup_source = "block_rows"
         pred_cap_pos = pred_cap_pos_blk
         pred_cap_neg = pred_cap_neg_blk
@@ -17519,27 +18144,24 @@ class BatteryBacktester:
                 src.index = pd.to_datetime(src.index, utc=True, errors="coerce")
                 src = src.loc[pd.notna(src.index)]
             sblk = src.reindex(ts_idx).copy()
-            source_pos = _finite_mean(sblk, colmap.pred_afrr_capacity_price_pos)
-            source_neg = _finite_mean(sblk, colmap.pred_afrr_capacity_price_neg)
+            source_pos, source_pos_col = _resolve_capacity_price_from_frame(sblk, pos_candidate_cols)
+            source_neg, source_neg_col = _resolve_capacity_price_from_frame(sblk, neg_candidate_cols)
             if not np.isfinite(pred_cap_pos) and np.isfinite(source_pos):
                 pred_cap_pos = source_pos
+                pos_lookup_col = source_pos_col
                 lookup_source = "timestamp_indexed_source"
             if not np.isfinite(pred_cap_neg) and np.isfinite(source_neg):
                 pred_cap_neg = source_neg
+                neg_lookup_col = source_neg_col
                 lookup_source = "timestamp_indexed_source"
-        pos_lookup_failed = float(
-            colmap.pred_afrr_capacity_price_pos in set(blk.columns).union(set(getattr(source, "columns", [])))
-            and not np.isfinite(pred_cap_pos)
-        )
-        neg_lookup_failed = float(
-            colmap.pred_afrr_capacity_price_neg in set(blk.columns).union(set(getattr(source, "columns", [])))
-            and not np.isfinite(pred_cap_neg)
-        )
+        available_columns = set(blk.columns).union(set(getattr(source, "columns", [])))
+        pos_lookup_failed = float(any(c in available_columns for c in pos_candidate_cols) and not np.isfinite(pred_cap_pos))
+        neg_lookup_failed = float(any(c in available_columns for c in neg_candidate_cols) and not np.isfinite(pred_cap_neg))
         self._last_bcm_capacity_price_lookup_diagnostics = {
             "bcm_capacity_price_lookup_failed": float(pos_lookup_failed > 0.5 or neg_lookup_failed > 0.5),
             "bcm_capacity_price_lookup_source": str(lookup_source),
-            "bcm_capacity_price_lookup_column_pos": str(colmap.pred_afrr_capacity_price_pos),
-            "bcm_capacity_price_lookup_column_neg": str(colmap.pred_afrr_capacity_price_neg),
+            "bcm_capacity_price_lookup_column_pos": str(pos_lookup_col or pos_candidate_cols[-1]),
+            "bcm_capacity_price_lookup_column_neg": str(neg_lookup_col or neg_candidate_cols[-1]),
             "bcm_capacity_price_pos_before_fallback": float(pred_cap_pos),
             "bcm_capacity_price_neg_before_fallback": float(pred_cap_neg),
             "bcm_capacity_price_pos_block_mean": float(pred_cap_pos_blk),
@@ -19982,9 +20604,47 @@ class BatteryBacktester:
                                 out_row["final_selected_incumbent"] = "no_trade"
                         patched_da_audit_rows.append(out_row)
                     da_audit_rows = patched_da_audit_rows
-                da_limit_mode_active = str(self.da_execution_mode).strip().lower() == "limit"
+                da_execution_policy = str(
+                    getattr(self, "da_execution_policy", self.da_execution_mode)
+                ).strip().lower()
+                submitted_da_schedule_for_policy = dict(accepted_da)
+                da_limit_mode_active = da_execution_policy in {
+                    "accepted_independent_limit_replay",
+                    "robust_independent_limit",
+                }
                 da_limit_policy = str(getattr(self, "da_limit_clearing_policy", "accepted_independent_limit_replay")).strip().lower()
-                if da_limit_mode_active and da_limit_policy == "accepted_independent_limit_replay":
+                if da_execution_policy == "price_taker":
+                    price_taker_diag = {
+                        "da_execution_policy": "price_taker",
+                        "da_execution_policy_source": "config:da_execution_policy",
+                        "da_limit_clearing_policy": "price_taker",
+                        "da_actual_independent_clearing_applied": 0.0,
+                        "da_limit_robust_guard_applied": 0.0,
+                        "pf_uses_truth_price_and_skips_robust_guard": 0.0,
+                        "da_settlement_price_source": "true_da_clearing_price",
+                    }
+                    patched_da_audit_rows = []
+                    for audit_row in da_audit_rows:
+                        out_row = dict(audit_row)
+                        tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
+                        out_row.update(price_taker_diag)
+                        if pd.notna(tsu):
+                            ts_key = pd.Timestamp(tsu)
+                            submitted_buy, submitted_sell = self._normalize_da_bid(
+                                *submitted_da_schedule_for_policy.get(ts_key, (0.0, 0.0))
+                            )
+                            accepted_buy, accepted_sell = self._normalize_da_bid(
+                                *accepted_da.get(ts_key, (0.0, 0.0))
+                            )
+                            out_row["da_submitted_buy_mwh"] = float(max(0.0, submitted_buy) * float(self.dt_h))
+                            out_row["da_submitted_sell_mwh"] = float(max(0.0, submitted_sell) * float(self.dt_h))
+                            out_row["da_auction_accepted_buy_mwh"] = float(max(0.0, accepted_buy) * float(self.dt_h))
+                            out_row["da_auction_accepted_sell_mwh"] = float(max(0.0, accepted_sell) * float(self.dt_h))
+                            out_row["da_price_rejected_buy_mwh"] = 0.0
+                            out_row["da_price_rejected_sell_mwh"] = 0.0
+                        patched_da_audit_rows.append(out_row)
+                    da_audit_rows = patched_da_audit_rows
+                elif da_limit_mode_active and da_limit_policy == "accepted_independent_limit_replay":
                     submitted_da_before_actual_clearing = dict(accepted_da)
                     accepted_da, actual_clearing_diag, actual_clearing_by_ts = (
                         self._clear_da_limit_schedule_against_true_prices(
@@ -19999,6 +20659,7 @@ class BatteryBacktester:
                         out_row = dict(audit_row)
                         tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
                         row_diag = actual_clearing_by_ts.get(pd.Timestamp(tsu), {}) if pd.notna(tsu) else {}
+                        out_row["da_execution_policy"] = "accepted_independent_limit_replay"
                         out_row.update(actual_clearing_diag)
                         out_row.update(row_diag)
                         out_row["da_limit_robust_guard_applied"] = 0.0
@@ -20037,6 +20698,7 @@ class BatteryBacktester:
                     da_audit_rows = patched_da_audit_rows
                 else:
                     da_policy_diag = {
+                        "da_execution_policy": str(da_execution_policy),
                         "da_limit_clearing_policy": str(da_limit_policy),
                         "da_actual_independent_clearing_applied": 0.0,
                         "da_limit_robust_guard_applied": float(
@@ -20073,6 +20735,7 @@ class BatteryBacktester:
                         out_row = dict(audit_row)
                         tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
                         row_diag = limit_guard_by_ts.get(pd.Timestamp(tsu), {}) if pd.notna(tsu) else {}
+                        out_row["da_execution_policy"] = "robust_independent_limit"
                         out_row["da_limit_clearing_policy"] = str(da_limit_policy)
                         out_row["da_limit_robust_guard_applied"] = 1.0
                         out_row["da_actual_independent_clearing_applied"] = 0.0
@@ -20401,6 +21064,27 @@ class BatteryBacktester:
                     tsu = pd.to_datetime(row.get("timestamp_utc", ""), utc=True, errors="coerce")
                     if pd.isna(tsu):
                         continue
+                    if da_execution_policy == "price_taker":
+                        submitted_buy_mw, submitted_sell_mw = self._normalize_da_bid(
+                            *submitted_da_schedule_for_policy.get(pd.Timestamp(tsu), (0.0, 0.0))
+                        )
+                        accepted_buy_mw, accepted_sell_mw = self._normalize_da_bid(
+                            *accepted_da.get(pd.Timestamp(tsu), (0.0, 0.0))
+                        )
+                        row["da_execution_policy"] = "price_taker"
+                        row["da_execution_policy_source"] = "config:da_execution_policy"
+                        row["da_limit_clearing_policy"] = "price_taker"
+                        row["da_actual_independent_clearing_applied"] = 0.0
+                        row["da_limit_robust_guard_applied"] = 0.0
+                        row["da_submitted_buy_mwh"] = float(max(0.0, submitted_buy_mw) * float(self.dt_h))
+                        row["da_submitted_sell_mwh"] = float(max(0.0, submitted_sell_mw) * float(self.dt_h))
+                        row["da_price_rejected_buy_mwh"] = 0.0
+                        row["da_price_rejected_sell_mwh"] = 0.0
+                        row["da_auction_accepted_buy_mwh"] = float(max(0.0, submitted_buy_mw) * float(self.dt_h))
+                        row["da_auction_accepted_sell_mwh"] = float(max(0.0, submitted_sell_mw) * float(self.dt_h))
+                        row["da_physical_lockbook_buy_mwh"] = float(max(0.0, accepted_buy_mw) * float(self.dt_h))
+                        row["da_physical_lockbook_sell_mwh"] = float(max(0.0, accepted_sell_mw) * float(self.dt_h))
+                        row["da_settlement_price_source"] = "true_da_clearing_price"
                     row.setdefault("da_bid_source_snapshot_utc", snapshot_ts_effective.isoformat())
                     row.setdefault("source_snapshot_utc", snapshot_ts_effective.isoformat())
                     row.setdefault("delivery_timestamp_utc", tsu.isoformat())
@@ -21666,6 +22350,8 @@ class BatteryBacktester:
                     act_neg_price=_sf(src, colmap.true_afrr_activation_price_neg, 0.0),
                     act_pos_rate=float(cleared["executed_rate_pos"]),
                     act_neg_rate=float(cleared["executed_rate_neg"]),
+                    cap_bid_pos=float(cleared.get("settlement_cap_bid_price_pos_eur_mw", 0.0) or 0.0),
+                    cap_bid_neg=float(cleared.get("settlement_cap_bid_price_neg_eur_mw", 0.0) or 0.0),
                     id_recourse_reason_hint=str(executing_id_reason_for_soc_feedback),
                 )
                 actual_id_charge_mw_for_soc_feedback = float(
@@ -23085,7 +23771,7 @@ class BatteryBacktester:
         pred_da_price_p90 = float(getattr(row, f"{colmap.pred_da_price}_p90")) if require_da_quantiles else np.nan
         pred_da_price_p95 = float(getattr(row, f"{colmap.pred_da_price}_p95")) if require_da_quantiles else np.nan
 
-        def _first_positive_capacity_price(names: list[str]) -> float | None:
+        def _first_nonzero_capacity_price(names: list[str]) -> float | None:
             for name in names:
                 if not hasattr(row, name):
                     continue
@@ -23115,8 +23801,8 @@ class BatteryBacktester:
             "bcm_settlement_capacity_price_resolved_neg_eur_per_mw_h",
         ]
 
-        obligation_capacity_price_pos = _first_positive_capacity_price(pos_capacity_price_names)
-        obligation_capacity_price_neg = _first_positive_capacity_price(neg_capacity_price_names)
+        obligation_capacity_price_pos = _first_nonzero_capacity_price(pos_capacity_price_names)
+        obligation_capacity_price_neg = _first_nonzero_capacity_price(neg_capacity_price_names)
         cleared = self._apply_market_clearing(
             target_time_utc=pd.to_datetime(ts_utc, utc=True, errors="coerce"),
             is_perfect_foresight=perfect_foresight_mode,
@@ -24094,6 +24780,77 @@ class BatteryBacktester:
         rolling_pf_solver_message = ""
         rolling_pf_nonfinite_coeff_count = 0.0
         rolling_pf_bad_bound_count = 0.0
+        rolling_pf_solver_dispatch_da_buy_mwh = 0.0
+        rolling_pf_solver_dispatch_da_sell_mwh = 0.0
+        rolling_pf_solver_settlement_submitted_da_buy_mwh = 0.0
+        rolling_pf_solver_settlement_submitted_da_sell_mwh = 0.0
+        rolling_pf_solver_settlement_accepted_da_buy_mwh = 0.0
+        rolling_pf_solver_settlement_accepted_da_sell_mwh = 0.0
+        rolling_pf_solver_settlement_realized_da_buy_mwh = 0.0
+        rolling_pf_solver_settlement_realized_da_sell_mwh = 0.0
+        rolling_pf_solver_selected_no_trade_reason = "not_evaluated"
+        rolling_pf_da_execution_policy = str(getattr(self, "da_execution_policy", ""))
+        rolling_pf_da_price_taker_mode = float(
+            str(getattr(self, "da_execution_policy", "")).strip().lower() == "price_taker"
+        )
+        rolling_pf_da_actual_independent_clearing_applied = 0.0
+        rolling_pf_da_limit_robust_guard_applied = 0.0
+        rolling_pf_da_truth_price_substitution_applied = float(bool(benchmark_paths["rhpf"]))
+        rolling_pf_da_dispatch_buy_mwh = 0.0
+        rolling_pf_da_dispatch_sell_mwh = 0.0
+        rolling_pf_da_plan_history_rows = 0.0
+        rolling_pf_da_gate_allowed_rows = 0.0
+        rolling_pf_da_gate_nonzero_candidate_rows = 0.0
+        rolling_pf_da_raw_candidate_buy_mwh = 0.0
+        rolling_pf_da_raw_candidate_sell_mwh = 0.0
+        rolling_pf_da_sized_candidate_buy_mwh = 0.0
+        rolling_pf_da_sized_candidate_sell_mwh = 0.0
+        rolling_pf_da_postlock_candidate_buy_mwh = 0.0
+        rolling_pf_da_postlock_candidate_sell_mwh = 0.0
+        rolling_pf_da_selected_lockable_buy_mwh = 0.0
+        rolling_pf_da_selected_lockable_sell_mwh = 0.0
+        rolling_pf_da_zero_trade_reason = "not_evaluated"
+        rolling_pf_da_zero_trade_stage = "not_evaluated"
+        rolling_pf_da_plan_history_zero_reason = "not_evaluated"
+        rolling_pf_da_submitted_buy_mwh = 0.0
+        rolling_pf_da_submitted_sell_mwh = 0.0
+        rolling_pf_da_auction_accepted_buy_mwh = 0.0
+        rolling_pf_da_auction_accepted_sell_mwh = 0.0
+        rolling_pf_da_physical_lockbook_buy_mwh = 0.0
+        rolling_pf_da_physical_lockbook_sell_mwh = 0.0
+        rolling_pf_da_price_rejected_buy_mwh = 0.0
+        rolling_pf_da_price_rejected_sell_mwh = 0.0
+        rolling_pf_da_realized_buy_mwh = 0.0
+        rolling_pf_da_realized_sell_mwh = 0.0
+        rolling_pf_da_revenue_eur = 0.0
+        rolling_pf_da_cost_eur = 0.0
+        rolling_pf_da_gross_eur = 0.0
+        rolling_pf_degradation_cost_eur = 0.0
+        rolling_pf_transaction_cost_eur = 0.0
+        rolling_pf_aux_cost_eur = 0.0
+        rolling_pf_pnl_eur = 0.0
+        rolling_pf_bcm_plan_history_rows = 0.0
+        rolling_pf_bcm_gate_allowed_rows = 0.0
+        rolling_pf_bcm_gate_nonzero_candidate_rows = 0.0
+        rolling_pf_bcm_candidate_pos_mw = 0.0
+        rolling_pf_bcm_candidate_neg_mw = 0.0
+        rolling_pf_bcm_precommit_candidate_pos_mw = 0.0
+        rolling_pf_bcm_precommit_candidate_neg_mw = 0.0
+        rolling_pf_bcm_locked_pos_mw = 0.0
+        rolling_pf_bcm_locked_neg_mw = 0.0
+        rolling_pf_bcm_ev_pos = 0.0
+        rolling_pf_bcm_ev_neg = 0.0
+        rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw = 0.0
+        rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw = 0.0
+        rolling_pf_bcm_capacity_price_source_column_pos = ""
+        rolling_pf_bcm_capacity_price_source_column_neg = ""
+        rolling_pf_bcm_zero_reason = "not_evaluated"
+        rolling_pf_bcm_zero_stage = "not_evaluated"
+        rolling_pf_bcm_deterministic_reserve_settlement = 0.0
+        rolling_pf_bcm_truth_price_substitution_applied = float(bool(benchmark_paths["rhpf"]))
+        rolling_pf_selected_incumbent_pre_terminal_pnl_eur = float("nan")
+        rolling_pf_selected_vs_hourly_final_pnl_delta_eur = float("nan")
+        rolling_pf_selected_vs_component_pnl_delta_eur = float("nan")
         global_pf_solver_status = "disabled"
         pf_failure_reason = ""
 
@@ -24142,6 +24899,22 @@ class BatteryBacktester:
                     if c.startswith("real_")
                 }
             )
+
+        def _sum_first_available_mwh(
+            frame: pd.DataFrame,
+            specs: list[tuple[str, bool]],
+        ) -> float:
+            """Return the first available volume sum; MW columns are converted with dt_h."""
+            if frame is None or frame.empty:
+                return 0.0
+            for col_name, is_mw in specs:
+                if col_name in frame.columns:
+                    vals = pd.to_numeric(frame[col_name], errors="coerce").fillna(0.0)
+                    total = float(vals.sum())
+                    if bool(is_mw):
+                        total *= float(self.dt_h)
+                    return float(total)
+            return 0.0
 
         def _build_no_market_terminal_id_incumbent(path_df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float | str]]:
             """Settle a no-market incumbent with only technical ID to satisfy terminal SoC."""
@@ -24359,11 +25132,16 @@ class BatteryBacktester:
         self.milp_rel_gap = min(_orig_gap, 1e-4)
         rolling_pf_diag_start = len(self._solver_failure_diagnostics)
         perfect_foresight_dispatch = pd.DataFrame()
+        perfect_foresight_plan_history = pd.DataFrame()
+        # Same-rules RHPF gets truth-materialized signals but keeps the model's
+        # reserve-settlement probability mechanics. A deterministic full-award
+        # reserve objective is a different benchmark, not same-rules RHPF.
+        rolling_pf_deterministic_reserve_settlement = False
         if benchmark_paths["rhpf"]:
             try:
                 try:
                     if use_rolling_horizon:
-                        perfect_foresight_dispatch, _ = self.optimize_dispatch_rolling(
+                        perfect_foresight_dispatch, perfect_foresight_plan_history = self.optimize_dispatch_rolling(
                             perfect_foresight_df,
                             colmap,
                             horizon_hours=horizon_hours,
@@ -24371,7 +25149,7 @@ class BatteryBacktester:
                             da_bid_hour_local=da_bid_hour_local,
                             soc_feedback_mode=soc_feedback_mode,
                             enforce_final_soc_min=enforce_final_soc_min,
-                            deterministic_reserve_settlement=True,
+                            deterministic_reserve_settlement=bool(rolling_pf_deterministic_reserve_settlement),
                             is_perfect_foresight=True,
                             allowed_markets=allowed_markets,
                             strategy_name=strategy_name,
@@ -24388,7 +25166,7 @@ class BatteryBacktester:
                             soc_start=self.soc_init,
                             soc_end_target=None,
                             soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
-                            deterministic_reserve_settlement=True,
+                            deterministic_reserve_settlement=bool(rolling_pf_deterministic_reserve_settlement),
                             allowed_markets=allowed_markets,
                             strategy_permissions=run_strategy_permissions,
                         )
@@ -24404,6 +25182,7 @@ class BatteryBacktester:
                     rolling_pf_bad_bound_count = float(diag["bad_bound_count"])
                     pf_failure_reason = f"rolling_pf_solver_failed:{rolling_pf_solver_status}"
                     perfect_foresight_dispatch = pd.DataFrame()
+                    perfect_foresight_plan_history = pd.DataFrame()
             finally:
                 self.milp_time_limit_seconds = _orig_tl
                 self.milp_rel_gap = _orig_gap
@@ -24411,6 +25190,131 @@ class BatteryBacktester:
             self.milp_time_limit_seconds = _orig_tl
             self.milp_rel_gap = _orig_gap
         if benchmark_paths["rhpf"]:
+            rolling_pf_solver_dispatch_da_buy_mwh = _sum_first_available_mwh(
+                perfect_foresight_dispatch,
+                [
+                    ("charge_mw", True),
+                    ("plan_charge_mw", True),
+                    ("da_accepted_buy_mw", True),
+                    ("da_selected_lockable_buy_mw", True),
+                    ("real_da_buy_mwh", False),
+                ],
+            )
+            rolling_pf_solver_dispatch_da_sell_mwh = _sum_first_available_mwh(
+                perfect_foresight_dispatch,
+                [
+                    ("discharge_mw", True),
+                    ("plan_discharge_mw", True),
+                    ("da_accepted_sell_mw", True),
+                    ("da_selected_lockable_sell_mw", True),
+                    ("real_da_sell_mwh", False),
+                ],
+            )
+            rolling_pf_da_execution_policy = str(getattr(self, "da_execution_policy", ""))
+            rolling_pf_da_price_taker_mode = float(
+                str(rolling_pf_da_execution_policy).strip().lower() == "price_taker"
+            )
+            rolling_pf_da_actual_independent_clearing_applied = float(
+                str(rolling_pf_da_execution_policy).strip().lower() == "accepted_independent_limit_replay"
+            )
+            rolling_pf_da_limit_robust_guard_applied = float(
+                str(rolling_pf_da_execution_policy).strip().lower() == "robust_independent_limit"
+            )
+            rolling_pf_da_truth_price_substitution_applied = float(
+                bool(benchmark_paths["rhpf"])
+                and colmap.true_da_price in perfect_foresight_df.columns
+                and colmap.pred_da_price in perfect_foresight_df.columns
+            )
+            rolling_pf_da_dispatch_buy_mwh = float(rolling_pf_solver_dispatch_da_buy_mwh)
+            rolling_pf_da_dispatch_sell_mwh = float(rolling_pf_solver_dispatch_da_sell_mwh)
+            pf_plan_diag = self._rolling_pf_da_plan_history_diagnostics(perfect_foresight_plan_history)
+            rolling_pf_da_plan_history_rows = float(pf_plan_diag["rolling_pf_da_plan_history_rows"])
+            rolling_pf_da_gate_allowed_rows = float(pf_plan_diag["rolling_pf_da_gate_allowed_rows"])
+            rolling_pf_da_gate_nonzero_candidate_rows = float(
+                pf_plan_diag["rolling_pf_da_gate_nonzero_candidate_rows"]
+            )
+            rolling_pf_da_raw_candidate_buy_mwh = float(pf_plan_diag["rolling_pf_da_raw_candidate_buy_mwh"])
+            rolling_pf_da_raw_candidate_sell_mwh = float(pf_plan_diag["rolling_pf_da_raw_candidate_sell_mwh"])
+            rolling_pf_da_sized_candidate_buy_mwh = float(pf_plan_diag["rolling_pf_da_sized_candidate_buy_mwh"])
+            rolling_pf_da_sized_candidate_sell_mwh = float(pf_plan_diag["rolling_pf_da_sized_candidate_sell_mwh"])
+            rolling_pf_da_postlock_candidate_buy_mwh = float(
+                pf_plan_diag["rolling_pf_da_postlock_candidate_buy_mwh"]
+            )
+            rolling_pf_da_postlock_candidate_sell_mwh = float(
+                pf_plan_diag["rolling_pf_da_postlock_candidate_sell_mwh"]
+            )
+            rolling_pf_da_selected_lockable_buy_mwh = float(
+                pf_plan_diag["rolling_pf_da_selected_lockable_buy_mwh"]
+            )
+            rolling_pf_da_selected_lockable_sell_mwh = float(
+                pf_plan_diag["rolling_pf_da_selected_lockable_sell_mwh"]
+            )
+            rolling_pf_da_zero_trade_stage = str(pf_plan_diag["rolling_pf_da_zero_trade_stage"])
+            rolling_pf_da_plan_history_zero_reason = str(pf_plan_diag["rolling_pf_da_plan_history_zero_reason"])
+            rolling_pf_da_bid_sizer_status = str(pf_plan_diag["rolling_pf_da_bid_sizer_status"])
+            rolling_pf_da_bid_sizer_error = str(pf_plan_diag["rolling_pf_da_bid_sizer_error"])
+            rolling_pf_da_bid_sizer_method = str(pf_plan_diag["rolling_pf_da_bid_sizer_method"])
+            rolling_pf_da_bid_sizer_objective_eur = float(pf_plan_diag["rolling_pf_da_bid_sizer_objective_eur"])
+            rolling_pf_da_bid_sizer_total_buy_mwh = float(pf_plan_diag["rolling_pf_da_bid_sizer_total_buy_mwh"])
+            rolling_pf_da_bid_sizer_total_sell_mwh = float(pf_plan_diag["rolling_pf_da_bid_sizer_total_sell_mwh"])
+            rolling_pf_da_bid_sizer_projected_soc_min_mwh = float(
+                pf_plan_diag["rolling_pf_da_bid_sizer_projected_soc_min_mwh"]
+            )
+            rolling_pf_da_bid_sizer_projected_soc_max_mwh = float(
+                pf_plan_diag["rolling_pf_da_bid_sizer_projected_soc_max_mwh"]
+            )
+            rolling_pf_da_bid_sizer_projected_final_soc_mwh = float(
+                pf_plan_diag["rolling_pf_da_bid_sizer_projected_final_soc_mwh"]
+            )
+            rolling_pf_da_candidate_selection_invalid_reason = str(
+                pf_plan_diag["rolling_pf_da_candidate_selection_invalid_reason"]
+            )
+            rolling_pf_da_raw_candidate_pnl_eur = float(pf_plan_diag["rolling_pf_da_raw_candidate_pnl_eur"])
+            rolling_pf_da_sized_candidate_pnl_eur = float(pf_plan_diag["rolling_pf_da_sized_candidate_pnl_eur"])
+            rolling_pf_da_sized_zero_reason = str(pf_plan_diag["rolling_pf_da_sized_zero_reason"])
+            rolling_pf_da_first_sized_zero_ts_utc = str(pf_plan_diag["rolling_pf_da_first_sized_zero_ts_utc"])
+            pf_bcm_plan_diag = self._rolling_pf_bcm_plan_history_diagnostics(
+                perfect_foresight_plan_history,
+                deterministic_reserve_settlement=bool(rolling_pf_deterministic_reserve_settlement),
+                truth_price_substitution_applied=bool(rolling_pf_da_truth_price_substitution_applied),
+            )
+            rolling_pf_bcm_plan_history_rows = float(pf_bcm_plan_diag["rolling_pf_bcm_plan_history_rows"])
+            rolling_pf_bcm_gate_allowed_rows = float(pf_bcm_plan_diag["rolling_pf_bcm_gate_allowed_rows"])
+            rolling_pf_bcm_gate_nonzero_candidate_rows = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_gate_nonzero_candidate_rows"]
+            )
+            rolling_pf_bcm_candidate_pos_mw = float(pf_bcm_plan_diag["rolling_pf_bcm_candidate_pos_mw"])
+            rolling_pf_bcm_candidate_neg_mw = float(pf_bcm_plan_diag["rolling_pf_bcm_candidate_neg_mw"])
+            rolling_pf_bcm_precommit_candidate_pos_mw = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_precommit_candidate_pos_mw"]
+            )
+            rolling_pf_bcm_precommit_candidate_neg_mw = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_precommit_candidate_neg_mw"]
+            )
+            rolling_pf_bcm_locked_pos_mw = float(pf_bcm_plan_diag["rolling_pf_bcm_locked_pos_mw"])
+            rolling_pf_bcm_locked_neg_mw = float(pf_bcm_plan_diag["rolling_pf_bcm_locked_neg_mw"])
+            rolling_pf_bcm_ev_pos = float(pf_bcm_plan_diag["rolling_pf_bcm_ev_pos"])
+            rolling_pf_bcm_ev_neg = float(pf_bcm_plan_diag["rolling_pf_bcm_ev_neg"])
+            rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw"]
+            )
+            rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw"]
+            )
+            rolling_pf_bcm_capacity_price_source_column_pos = str(
+                pf_bcm_plan_diag["rolling_pf_bcm_capacity_price_source_column_pos"]
+            )
+            rolling_pf_bcm_capacity_price_source_column_neg = str(
+                pf_bcm_plan_diag["rolling_pf_bcm_capacity_price_source_column_neg"]
+            )
+            rolling_pf_bcm_zero_reason = str(pf_bcm_plan_diag["rolling_pf_bcm_zero_reason"])
+            rolling_pf_bcm_zero_stage = str(pf_bcm_plan_diag["rolling_pf_bcm_zero_stage"])
+            rolling_pf_bcm_deterministic_reserve_settlement = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_deterministic_reserve_settlement"]
+            )
+            rolling_pf_bcm_truth_price_substitution_applied = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_truth_price_substitution_applied"]
+            )
             if rolling_pf_available >= 0.5:
                 with _phase_watchdog("settlement_perfect_foresight_realized"):
                     perfect_foresight_real = self.settle_dispatch(
@@ -24421,6 +25325,44 @@ class BatteryBacktester:
                         apply_market_clearing=True,
                         perfect_foresight_mode=True,
                     )
+                rolling_pf_solver_settlement_submitted_da_buy_mwh = _sum_first_available_mwh(
+                    perfect_foresight_real,
+                    [
+                        ("da_submitted_buy_mwh", False),
+                        ("real_submitted_da_buy_mw", True),
+                        ("submitted_da_buy_mw", True),
+                    ],
+                )
+                rolling_pf_solver_settlement_submitted_da_sell_mwh = _sum_first_available_mwh(
+                    perfect_foresight_real,
+                    [
+                        ("da_submitted_sell_mwh", False),
+                        ("real_submitted_da_sell_mw", True),
+                        ("submitted_da_sell_mw", True),
+                    ],
+                )
+                rolling_pf_solver_settlement_accepted_da_buy_mwh = _sum_first_available_mwh(
+                    perfect_foresight_real,
+                    [
+                        ("da_auction_accepted_buy_mwh", False),
+                        ("real_da_buy_mwh", False),
+                    ],
+                )
+                rolling_pf_solver_settlement_accepted_da_sell_mwh = _sum_first_available_mwh(
+                    perfect_foresight_real,
+                    [
+                        ("da_auction_accepted_sell_mwh", False),
+                        ("real_da_sell_mwh", False),
+                    ],
+                )
+                rolling_pf_solver_settlement_realized_da_buy_mwh = _sum_first_available_mwh(
+                    perfect_foresight_real,
+                    [("real_da_buy_mwh", False)],
+                )
+                rolling_pf_solver_settlement_realized_da_sell_mwh = _sum_first_available_mwh(
+                    perfect_foresight_real,
+                    [("real_da_sell_mwh", False)],
+                )
                 perfect_foresight_real = perfect_foresight_real.rename(
                     columns={
                         c: c.replace("real_", "perfect_foresight_", 1)
@@ -24428,8 +25370,70 @@ class BatteryBacktester:
                         if c.startswith("real_")
                     }
                 )
+                perfect_foresight_real["perfect_foresight_da_execution_policy"] = str(self.da_execution_policy)
+                perfect_foresight_real["perfect_foresight_da_price_taker_mode"] = float(
+                    str(self.da_execution_policy).strip().lower() == "price_taker"
+                )
+                if "perfect_foresight_da_price_rejected_buy_mwh" not in perfect_foresight_real.columns:
+                    perfect_foresight_real["perfect_foresight_da_price_rejected_buy_mwh"] = 0.0
+                if "perfect_foresight_da_price_rejected_sell_mwh" not in perfect_foresight_real.columns:
+                    perfect_foresight_real["perfect_foresight_da_price_rejected_sell_mwh"] = 0.0
+                def _pf_sum_col(col_name: str) -> float:
+                    if col_name not in perfect_foresight_real.columns:
+                        return 0.0
+                    return float(pd.to_numeric(perfect_foresight_real[col_name], errors="coerce").fillna(0.0).sum())
+
+                rolling_pf_da_submitted_buy_mwh = _pf_sum_col("da_submitted_buy_mwh")
+                rolling_pf_da_submitted_sell_mwh = _pf_sum_col("da_submitted_sell_mwh")
+                rolling_pf_da_auction_accepted_buy_mwh = _pf_sum_col("da_auction_accepted_buy_mwh")
+                rolling_pf_da_auction_accepted_sell_mwh = _pf_sum_col("da_auction_accepted_sell_mwh")
+                rolling_pf_da_physical_lockbook_buy_mwh = _pf_sum_col("da_physical_lockbook_buy_mwh")
+                rolling_pf_da_physical_lockbook_sell_mwh = _pf_sum_col("da_physical_lockbook_sell_mwh")
+                rolling_pf_da_price_rejected_buy_mwh = _pf_sum_col("perfect_foresight_da_price_rejected_buy_mwh")
+                rolling_pf_da_price_rejected_sell_mwh = _pf_sum_col("perfect_foresight_da_price_rejected_sell_mwh")
+                rolling_pf_da_realized_buy_mwh = _pf_sum_col("perfect_foresight_da_buy_mwh")
+                rolling_pf_da_realized_sell_mwh = _pf_sum_col("perfect_foresight_da_sell_mwh")
+                rolling_pf_da_revenue_eur = _pf_sum_col("perfect_foresight_revenue_da_eur")
+                rolling_pf_da_cost_eur = _pf_sum_col("perfect_foresight_cost_da_eur")
+                rolling_pf_da_gross_eur = float(rolling_pf_da_revenue_eur - rolling_pf_da_cost_eur)
+                rolling_pf_degradation_cost_eur = _pf_sum_col("perfect_foresight_degradation_cost_eur")
+                rolling_pf_transaction_cost_eur = _pf_sum_col("perfect_foresight_transaction_cost_eur")
+                rolling_pf_aux_cost_eur = _pf_sum_col("perfect_foresight_aux_cost_eur")
+                rolling_pf_pnl_eur = _pf_sum_col("perfect_foresight_pnl_eur")
             else:
                 perfect_foresight_real = _empty_pf_frame("perfect_foresight")
+            if rolling_pf_solver_dispatch_da_buy_mwh + rolling_pf_solver_dispatch_da_sell_mwh <= 1e-9:
+                rolling_pf_solver_selected_no_trade_reason = "solver_dispatch_zero_da"
+            elif (
+                rolling_pf_solver_settlement_submitted_da_buy_mwh
+                + rolling_pf_solver_settlement_submitted_da_sell_mwh
+                <= 1e-9
+            ):
+                rolling_pf_solver_selected_no_trade_reason = "settlement_zero_submitted_da"
+            elif (
+                rolling_pf_solver_settlement_realized_da_buy_mwh
+                + rolling_pf_solver_settlement_realized_da_sell_mwh
+                <= 1e-9
+            ):
+                rolling_pf_solver_selected_no_trade_reason = "settlement_zero_realized_da"
+            else:
+                rolling_pf_solver_selected_no_trade_reason = "none"
+            rolling_pf_da_zero_trade_reason = str(rolling_pf_solver_selected_no_trade_reason)
+            if (
+                rolling_pf_da_zero_trade_reason == "solver_dispatch_zero_da"
+                and rolling_pf_da_gate_allowed_rows > 0.0
+            ):
+                rolling_pf_da_zero_trade_reason = str(rolling_pf_da_zero_trade_stage)
+                if rolling_pf_da_zero_trade_reason in {"", "not_evaluated", "candidate_available"}:
+                    rolling_pf_da_zero_trade_reason = "solver_dispatch_zero_da_with_allowed_da_gate_rows"
+                if str(rolling_pf_da_plan_history_zero_reason) not in {"", "none", "not_evaluated"}:
+                    rolling_pf_da_zero_trade_reason = str(rolling_pf_da_plan_history_zero_reason)
+            elif (
+                rolling_pf_da_zero_trade_reason == "solver_dispatch_zero_da"
+                and rolling_pf_da_gate_allowed_rows <= 0.0
+                and str(rolling_pf_da_zero_trade_stage) not in {"", "not_evaluated"}
+            ):
+                rolling_pf_da_zero_trade_reason = str(rolling_pf_da_zero_trade_stage)
             rolling_selection = _select_rolling_pf_incumbent(
                 prefix="perfect_foresight",
                 solver_frame=perfect_foresight_real,
@@ -24482,6 +25486,8 @@ class BatteryBacktester:
         global_perfect_foresight_available_flag = 0.0
         global_pf_solver_available = 0.0
         global_pf_solver_benchmark_verified = 0.0
+        global_pf_is_solver_upper_bound = 0.0
+        global_pf_is_realized_path_fallback = 0.0
         global_pf_solver_solution_eur = float("nan")
         global_pf_best_feasible_lower_bound_name = "none"
         global_pf_best_feasible_lower_bound_eur = float("nan")
@@ -24827,6 +25833,8 @@ class BatteryBacktester:
             global_pf_best_feasible_lower_bound_name = str(selection["best_feasible_lower_bound_name"])
             global_pf_best_feasible_lower_bound_eur = float(selection["best_feasible_lower_bound_eur"])
             global_pf_solver_benchmark_verified = float(selection["verified"])
+            global_pf_is_solver_upper_bound = float(selection.get("is_solver_upper_bound", 0.0))
+            global_pf_is_realized_path_fallback = float(selection.get("is_realized_path_fallback", 0.0))
             if str(selection["failure_reason"]) != "none":
                 pf_failure_reason = pf_failure_reason or str(selection["failure_reason"])
             global_perfect_foresight_real = selection["frame"] if isinstance(selection["frame"], pd.DataFrame) else pd.DataFrame()
@@ -24864,7 +25872,9 @@ class BatteryBacktester:
                 summary={
                     "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": float(global_pf_solver_solution_eur),
                     "global_pf_available": float(global_perfect_foresight_available_flag),
-                    "global_pf_verified_upper_bound": float(global_pf_solver_benchmark_verified),
+                    "global_pf_verified_upper_bound": float(global_pf_is_solver_upper_bound),
+                    "global_pf_is_solver_upper_bound": float(global_pf_is_solver_upper_bound),
+                    "global_pf_is_realized_path_fallback": float(global_pf_is_realized_path_fallback),
                     "global_pf_solver_status": str(global_pf_solver_status),
                     "global_pf_failure_reason": str(pf_failure_reason),
                     "global_pf_selected_incumbent": str(global_pf_selected_incumbent),
@@ -25087,13 +26097,140 @@ class BatteryBacktester:
                     field,
                     "none" if field == "terminal_closure_reason" else 0.0,
                 )
+        # The merged hourly output is wide by this point; defragment once
+        # before appending scalar benchmark diagnostics.
+        hourly = hourly.copy()
         hourly["rolling_pf_solver_pnl_eur"] = float(rolling_pf_solver_solution_eur)
         hourly["rolling_pf_solver_feasible"] = float(rolling_pf_solver_feasible)
         hourly["rolling_pf_selected_incumbent"] = str(rolling_pf_selected_incumbent)
         hourly["rolling_pf_selected_incumbent_pnl_eur"] = float(rolling_pf_selected_incumbent_pnl_eur)
         hourly["rolling_pf_no_market_incumbent_eur"] = float(rolling_pf_no_market_incumbent_eur)
         hourly["rolling_pf_realized_path_incumbent_eur"] = float(rolling_pf_realized_path_incumbent_eur)
+        hourly["rolling_pf_solver_dispatch_da_buy_mwh"] = float(rolling_pf_solver_dispatch_da_buy_mwh)
+        hourly["rolling_pf_solver_dispatch_da_sell_mwh"] = float(rolling_pf_solver_dispatch_da_sell_mwh)
+        hourly["rolling_pf_solver_settlement_submitted_da_buy_mwh"] = float(
+            rolling_pf_solver_settlement_submitted_da_buy_mwh
+        )
+        hourly["rolling_pf_solver_settlement_submitted_da_sell_mwh"] = float(
+            rolling_pf_solver_settlement_submitted_da_sell_mwh
+        )
+        hourly["rolling_pf_solver_settlement_accepted_da_buy_mwh"] = float(
+            rolling_pf_solver_settlement_accepted_da_buy_mwh
+        )
+        hourly["rolling_pf_solver_settlement_accepted_da_sell_mwh"] = float(
+            rolling_pf_solver_settlement_accepted_da_sell_mwh
+        )
+        hourly["rolling_pf_solver_settlement_realized_da_buy_mwh"] = float(
+            rolling_pf_solver_settlement_realized_da_buy_mwh
+        )
+        hourly["rolling_pf_solver_settlement_realized_da_sell_mwh"] = float(
+            rolling_pf_solver_settlement_realized_da_sell_mwh
+        )
+        hourly["rolling_pf_solver_selected_no_trade_reason"] = str(rolling_pf_solver_selected_no_trade_reason)
+        hourly["rolling_pf_da_execution_policy"] = str(rolling_pf_da_execution_policy)
+        hourly["rolling_pf_da_price_taker_mode"] = float(rolling_pf_da_price_taker_mode)
+        hourly["rolling_pf_da_actual_independent_clearing_applied"] = float(
+            rolling_pf_da_actual_independent_clearing_applied
+        )
+        hourly["rolling_pf_da_limit_robust_guard_applied"] = float(rolling_pf_da_limit_robust_guard_applied)
+        hourly["rolling_pf_da_truth_price_substitution_applied"] = float(
+            rolling_pf_da_truth_price_substitution_applied
+        )
+        hourly["rolling_pf_da_dispatch_buy_mwh"] = float(rolling_pf_da_dispatch_buy_mwh)
+        hourly["rolling_pf_da_dispatch_sell_mwh"] = float(rolling_pf_da_dispatch_sell_mwh)
+        hourly["rolling_pf_da_plan_history_rows"] = float(rolling_pf_da_plan_history_rows)
+        hourly["rolling_pf_da_gate_allowed_rows"] = float(rolling_pf_da_gate_allowed_rows)
+        hourly["rolling_pf_da_gate_nonzero_candidate_rows"] = float(rolling_pf_da_gate_nonzero_candidate_rows)
+        hourly["rolling_pf_da_raw_candidate_buy_mwh"] = float(rolling_pf_da_raw_candidate_buy_mwh)
+        hourly["rolling_pf_da_raw_candidate_sell_mwh"] = float(rolling_pf_da_raw_candidate_sell_mwh)
+        hourly["rolling_pf_da_sized_candidate_buy_mwh"] = float(rolling_pf_da_sized_candidate_buy_mwh)
+        hourly["rolling_pf_da_sized_candidate_sell_mwh"] = float(rolling_pf_da_sized_candidate_sell_mwh)
+        hourly["rolling_pf_da_postlock_candidate_buy_mwh"] = float(rolling_pf_da_postlock_candidate_buy_mwh)
+        hourly["rolling_pf_da_postlock_candidate_sell_mwh"] = float(rolling_pf_da_postlock_candidate_sell_mwh)
+        hourly["rolling_pf_da_selected_lockable_buy_mwh"] = float(rolling_pf_da_selected_lockable_buy_mwh)
+        hourly["rolling_pf_da_selected_lockable_sell_mwh"] = float(rolling_pf_da_selected_lockable_sell_mwh)
+        hourly["rolling_pf_da_zero_trade_reason"] = str(rolling_pf_da_zero_trade_reason)
+        hourly["rolling_pf_da_zero_trade_stage"] = str(rolling_pf_da_zero_trade_stage)
+        hourly["rolling_pf_da_plan_history_zero_reason"] = str(rolling_pf_da_plan_history_zero_reason)
+        hourly["rolling_pf_da_bid_sizer_status"] = str(rolling_pf_da_bid_sizer_status)
+        hourly["rolling_pf_da_bid_sizer_error"] = str(rolling_pf_da_bid_sizer_error)
+        hourly["rolling_pf_da_bid_sizer_method"] = str(rolling_pf_da_bid_sizer_method)
+        hourly["rolling_pf_da_bid_sizer_objective_eur"] = float(rolling_pf_da_bid_sizer_objective_eur)
+        hourly["rolling_pf_da_bid_sizer_total_buy_mwh"] = float(rolling_pf_da_bid_sizer_total_buy_mwh)
+        hourly["rolling_pf_da_bid_sizer_total_sell_mwh"] = float(rolling_pf_da_bid_sizer_total_sell_mwh)
+        hourly["rolling_pf_da_bid_sizer_projected_soc_min_mwh"] = float(
+            rolling_pf_da_bid_sizer_projected_soc_min_mwh
+        )
+        hourly["rolling_pf_da_bid_sizer_projected_soc_max_mwh"] = float(
+            rolling_pf_da_bid_sizer_projected_soc_max_mwh
+        )
+        hourly["rolling_pf_da_bid_sizer_projected_final_soc_mwh"] = float(
+            rolling_pf_da_bid_sizer_projected_final_soc_mwh
+        )
+        hourly["rolling_pf_da_candidate_selection_invalid_reason"] = str(
+            rolling_pf_da_candidate_selection_invalid_reason
+        )
+        hourly["rolling_pf_da_raw_candidate_pnl_eur"] = float(rolling_pf_da_raw_candidate_pnl_eur)
+        hourly["rolling_pf_da_sized_candidate_pnl_eur"] = float(rolling_pf_da_sized_candidate_pnl_eur)
+        hourly["rolling_pf_da_sized_zero_reason"] = str(rolling_pf_da_sized_zero_reason)
+        hourly["rolling_pf_da_first_sized_zero_ts_utc"] = str(rolling_pf_da_first_sized_zero_ts_utc)
+        hourly["rolling_pf_da_submitted_buy_mwh"] = float(rolling_pf_da_submitted_buy_mwh)
+        hourly["rolling_pf_da_submitted_sell_mwh"] = float(rolling_pf_da_submitted_sell_mwh)
+        hourly["rolling_pf_da_auction_accepted_buy_mwh"] = float(rolling_pf_da_auction_accepted_buy_mwh)
+        hourly["rolling_pf_da_auction_accepted_sell_mwh"] = float(rolling_pf_da_auction_accepted_sell_mwh)
+        hourly["rolling_pf_da_physical_lockbook_buy_mwh"] = float(rolling_pf_da_physical_lockbook_buy_mwh)
+        hourly["rolling_pf_da_physical_lockbook_sell_mwh"] = float(rolling_pf_da_physical_lockbook_sell_mwh)
+        hourly["rolling_pf_da_price_rejected_buy_mwh"] = float(rolling_pf_da_price_rejected_buy_mwh)
+        hourly["rolling_pf_da_price_rejected_sell_mwh"] = float(rolling_pf_da_price_rejected_sell_mwh)
+        hourly["rolling_pf_da_realized_buy_mwh"] = float(rolling_pf_da_realized_buy_mwh)
+        hourly["rolling_pf_da_realized_sell_mwh"] = float(rolling_pf_da_realized_sell_mwh)
+        hourly["rolling_pf_da_revenue_eur"] = float(rolling_pf_da_revenue_eur)
+        hourly["rolling_pf_da_cost_eur"] = float(rolling_pf_da_cost_eur)
+        hourly["rolling_pf_da_gross_eur"] = float(rolling_pf_da_gross_eur)
+        hourly["rolling_pf_degradation_cost_eur"] = float(rolling_pf_degradation_cost_eur)
+        hourly["rolling_pf_transaction_cost_eur"] = float(rolling_pf_transaction_cost_eur)
+        hourly["rolling_pf_aux_cost_eur"] = float(rolling_pf_aux_cost_eur)
+        hourly["rolling_pf_pnl_eur"] = float(rolling_pf_pnl_eur)
+        hourly["rolling_pf_bcm_plan_history_rows"] = float(rolling_pf_bcm_plan_history_rows)
+        hourly["rolling_pf_bcm_gate_allowed_rows"] = float(rolling_pf_bcm_gate_allowed_rows)
+        hourly["rolling_pf_bcm_gate_nonzero_candidate_rows"] = float(
+            rolling_pf_bcm_gate_nonzero_candidate_rows
+        )
+        hourly["rolling_pf_bcm_candidate_pos_mw"] = float(rolling_pf_bcm_candidate_pos_mw)
+        hourly["rolling_pf_bcm_candidate_neg_mw"] = float(rolling_pf_bcm_candidate_neg_mw)
+        hourly["rolling_pf_bcm_precommit_candidate_pos_mw"] = float(
+            rolling_pf_bcm_precommit_candidate_pos_mw
+        )
+        hourly["rolling_pf_bcm_precommit_candidate_neg_mw"] = float(
+            rolling_pf_bcm_precommit_candidate_neg_mw
+        )
+        hourly["rolling_pf_bcm_locked_pos_mw"] = float(rolling_pf_bcm_locked_pos_mw)
+        hourly["rolling_pf_bcm_locked_neg_mw"] = float(rolling_pf_bcm_locked_neg_mw)
+        hourly["rolling_pf_bcm_ev_pos"] = float(rolling_pf_bcm_ev_pos)
+        hourly["rolling_pf_bcm_ev_neg"] = float(rolling_pf_bcm_ev_neg)
+        hourly["rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw"] = float(
+            rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw
+        )
+        hourly["rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw"] = float(
+            rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw
+        )
+        hourly["rolling_pf_bcm_capacity_price_source_column_pos"] = str(
+            rolling_pf_bcm_capacity_price_source_column_pos
+        )
+        hourly["rolling_pf_bcm_capacity_price_source_column_neg"] = str(
+            rolling_pf_bcm_capacity_price_source_column_neg
+        )
+        hourly["rolling_pf_bcm_zero_reason"] = str(rolling_pf_bcm_zero_reason)
+        hourly["rolling_pf_bcm_zero_stage"] = str(rolling_pf_bcm_zero_stage)
+        hourly["rolling_pf_bcm_deterministic_reserve_settlement"] = float(
+            rolling_pf_bcm_deterministic_reserve_settlement
+        )
+        hourly["rolling_pf_bcm_truth_price_substitution_applied"] = float(
+            rolling_pf_bcm_truth_price_substitution_applied
+        )
         hourly["global_pf_selected_incumbent"] = str(global_pf_selected_incumbent)
+        hourly["global_pf_is_solver_upper_bound"] = float(global_pf_is_solver_upper_bound)
+        hourly["global_pf_is_realized_path_fallback"] = float(global_pf_is_realized_path_fallback)
         hourly["global_pf_solver_available"] = float(global_pf_solver_available)
         hourly["global_pf_solver_feasible"] = float(global_pf_solver_feasible)
         hourly["global_pf_best_feasible_lower_bound_name"] = str(global_pf_best_feasible_lower_bound_name)
@@ -25152,15 +26289,27 @@ class BatteryBacktester:
             hourly["perfect_foresight_cashflow_eur"] = hourly["perfect_foresight_net_cashflow_eur"]
         else:
             hourly["perfect_foresight_cashflow_eur"] = hourly["perfect_foresight_pnl_eur"] + hourly.get("perfect_foresight_degradation_cost_eur", 0.0)
-        hourly["real_cum_cash_eur"] = self.initial_cash + hourly["real_cashflow_eur"].cumsum()
-        hourly["pred_cum_cash_eur"] = self.initial_cash + hourly["pred_cashflow_eur"].cumsum()
-        hourly["naive_cum_cash_eur"] = self.initial_cash + hourly["naive_cashflow_eur"].cumsum()
-        hourly["perfect_foresight_cum_cash_eur"] = self.initial_cash + hourly["perfect_foresight_cashflow_eur"].cumsum()
-        # Profit cumulatives (includes non-cash degradation by definition of *_pnl_eur).
-        hourly["real_cum_pnl_eur"] = hourly["real_pnl_eur"].cumsum()
-        hourly["pred_cum_pnl_eur"] = hourly["pred_pnl_eur"].cumsum()
-        hourly["naive_cum_pnl_eur"] = hourly["naive_pnl_eur"].cumsum()
-        hourly["perfect_foresight_cum_pnl_eur"] = hourly["perfect_foresight_pnl_eur"].cumsum()
+        # Batch cumulative output columns to avoid pandas frame fragmentation.
+        cumulative_output_cols = {
+            "real_cum_cash_eur": self.initial_cash + hourly["real_cashflow_eur"].cumsum(),
+            "pred_cum_cash_eur": self.initial_cash + hourly["pred_cashflow_eur"].cumsum(),
+            "naive_cum_cash_eur": self.initial_cash + hourly["naive_cashflow_eur"].cumsum(),
+            "perfect_foresight_cum_cash_eur": self.initial_cash + hourly["perfect_foresight_cashflow_eur"].cumsum(),
+            # Profit cumulatives (includes non-cash degradation by definition of *_pnl_eur).
+            "real_cum_pnl_eur": hourly["real_pnl_eur"].cumsum(),
+            "pred_cum_pnl_eur": hourly["pred_pnl_eur"].cumsum(),
+            "naive_cum_pnl_eur": hourly["naive_pnl_eur"].cumsum(),
+            "perfect_foresight_cum_pnl_eur": hourly["perfect_foresight_pnl_eur"].cumsum(),
+            "pnl_gap_eur": hourly["real_pnl_eur"] - hourly["pred_pnl_eur"],
+            "cost_of_forecast_error_eur": hourly["perfect_foresight_pnl_eur"] - hourly["real_pnl_eur"],
+        }
+        hourly = pd.concat(
+            [
+                hourly.drop(columns=list(cumulative_output_cols), errors="ignore"),
+                pd.DataFrame(cumulative_output_cols, index=hourly.index),
+            ],
+            axis=1,
+        ).copy()
         # User-facing naming alias.
         for old_col, new_col in [
             ("perfect_foresight_pnl_eur", "perfect_foresight_pnl_eur"),
@@ -25170,8 +26319,6 @@ class BatteryBacktester:
         ]:
             if old_col in hourly.columns and new_col not in hourly.columns:
                 hourly[new_col] = hourly[old_col]
-        hourly["pnl_gap_eur"] = hourly["real_pnl_eur"] - hourly["pred_pnl_eur"]
-        hourly["cost_of_forecast_error_eur"] = hourly["perfect_foresight_pnl_eur"] - hourly["real_pnl_eur"]
         # Per-market opportunity-cost proxy (EV-space):
         # Compare DA-only EV vs aFRR-only EV each hour and quantify the gap to the
         # best single-market alternative (non-negative baseline).
@@ -25182,11 +26329,19 @@ class BatteryBacktester:
             ev_afrr_total = pd.to_numeric(hourly["ev_afrr_pos_eur"], errors="coerce").fillna(0.0) + pd.to_numeric(
                 hourly["ev_afrr_neg_eur"], errors="coerce"
             ).fillna(0.0)
-            hourly["ev_da_total_eur"] = ev_da_total
-            hourly["ev_afrr_total_eur"] = ev_afrr_total
-            hourly["ev_best_single_market_eur"] = np.maximum(np.maximum(ev_da_total, ev_afrr_total), 0.0)
-            hourly["ev_opportunity_cost_da_eur"] = hourly["ev_best_single_market_eur"] - ev_da_total
-            hourly["ev_opportunity_cost_afrr_eur"] = hourly["ev_best_single_market_eur"] - ev_afrr_total
+            ev_best_single_market = np.maximum(np.maximum(ev_da_total, ev_afrr_total), 0.0)
+            ev_cols = pd.DataFrame(
+                {
+                    "ev_da_total_eur": ev_da_total,
+                    "ev_afrr_total_eur": ev_afrr_total,
+                    "ev_best_single_market_eur": ev_best_single_market,
+                    "ev_opportunity_cost_da_eur": ev_best_single_market - ev_da_total,
+                    "ev_opportunity_cost_afrr_eur": ev_best_single_market - ev_afrr_total,
+                },
+                index=hourly.index,
+            )
+            hourly = hourly.drop(columns=[c for c in ev_cols.columns if c in hourly.columns], errors="ignore")
+            hourly = pd.concat([hourly, ev_cols], axis=1).copy()
 
         # Lightweight merge audit.
         missing_realized_pnl = int(pd.to_numeric(hourly.get("real_pnl_eur", pd.Series(dtype=float)), errors="coerce").isna().sum())
@@ -25553,6 +26708,26 @@ class BatteryBacktester:
             if rolling_pf_available >= 0.5
             else float("nan")
         )
+        rolling_pf_selected_incumbent_pre_terminal_pnl_eur = float(rolling_pf_selected_incumbent_pnl_eur)
+        if rolling_pf_available >= 0.5 and np.isfinite(float(perfect_foresight_pnl_total)):
+            rolling_pf_selected_incumbent_pnl_eur = float(perfect_foresight_pnl_total)
+            rolling_pf_pnl_eur = float(perfect_foresight_pnl_total)
+        rolling_pf_selected_vs_hourly_final_pnl_delta_eur = (
+            float(rolling_pf_selected_incumbent_pre_terminal_pnl_eur - perfect_foresight_pnl_total)
+            if np.isfinite(float(rolling_pf_selected_incumbent_pre_terminal_pnl_eur))
+            and np.isfinite(float(perfect_foresight_pnl_total))
+            else float("nan")
+        )
+        if not hourly.empty:
+            hourly["rolling_pf_selected_incumbent_pre_terminal_pnl_eur"] = float(
+                rolling_pf_selected_incumbent_pre_terminal_pnl_eur
+            )
+            hourly["rolling_pf_selected_incumbent_pnl_eur"] = float(rolling_pf_selected_incumbent_pnl_eur)
+            hourly["rolling_pf_selected_incumbent_total_pnl_eur"] = float(rolling_pf_selected_incumbent_pnl_eur)
+            hourly["rolling_pf_selected_vs_hourly_final_pnl_delta_eur"] = float(
+                rolling_pf_selected_vs_hourly_final_pnl_delta_eur
+            )
+            hourly["rolling_pf_pnl_eur"] = float(perfect_foresight_pnl_total)
         global_perfect_foresight_pnl_raw = (
             _sum_col_zero("global_perfect_foresight_pnl_eur") - terminal_closure_global_pf_pnl_eur
             if enable_global_perfect_foresight and global_perfect_foresight_available_flag >= 0.5
@@ -25595,7 +26770,7 @@ class BatteryBacktester:
         global_pf_verified_upper_bound = float(
             enable_global_perfect_foresight
             and global_perfect_foresight_available_flag >= 0.5
-            and float(global_pf_solver_benchmark_verified) >= 0.5
+            and float(global_pf_is_solver_upper_bound) >= 0.5
         )
         if enable_global_perfect_foresight:
             if str(global_perfect_foresight_validation_status) == "global_pf_solver_failed":
@@ -25607,6 +26782,8 @@ class BatteryBacktester:
                 global_perfect_foresight_validation_status = "solver_below_realized_path_incumbent"
             elif global_perfect_foresight_available_flag < 0.5:
                 global_perfect_foresight_validation_status = "global_pf_unavailable"
+            elif float(global_pf_is_realized_path_fallback) >= 0.5:
+                global_perfect_foresight_validation_status = "verified_realized_path_fallback"
             elif str(global_perfect_foresight_validation_status) not in {"", "disabled_unverified"}:
                 global_perfect_foresight_validation_status = str(global_perfect_foresight_validation_status)
             else:
@@ -25717,10 +26894,151 @@ class BatteryBacktester:
             "rolling_pf_solver_solution_eur": float(rolling_pf_solver_solution_eur),
             "rolling_pf_solver_pnl_eur": float(rolling_pf_solver_solution_eur),
             "rolling_pf_solver_feasible": float(rolling_pf_solver_feasible),
+            "rolling_pf_selected_incumbent_pre_terminal_pnl_eur": float(
+                rolling_pf_selected_incumbent_pre_terminal_pnl_eur
+            ),
             "rolling_pf_selected_incumbent_pnl_eur": float(rolling_pf_selected_incumbent_pnl_eur),
             "rolling_pf_selected_incumbent_total_pnl_eur": float(rolling_pf_selected_incumbent_pnl_eur),
+            "rolling_pf_selected_vs_hourly_final_pnl_delta_eur": float(
+                rolling_pf_selected_vs_hourly_final_pnl_delta_eur
+            ),
+            "rolling_pf_selected_vs_component_pnl_delta_eur": float(
+                rolling_pf_selected_vs_component_pnl_delta_eur
+            ),
             "rolling_pf_no_market_incumbent_eur": float(rolling_pf_no_market_incumbent_eur),
             "rolling_pf_realized_path_incumbent_eur": float(rolling_pf_realized_path_incumbent_eur),
+            "rolling_pf_solver_dispatch_da_buy_mwh": float(rolling_pf_solver_dispatch_da_buy_mwh),
+            "rolling_pf_solver_dispatch_da_sell_mwh": float(rolling_pf_solver_dispatch_da_sell_mwh),
+            "rolling_pf_solver_settlement_submitted_da_buy_mwh": float(
+                rolling_pf_solver_settlement_submitted_da_buy_mwh
+            ),
+            "rolling_pf_solver_settlement_submitted_da_sell_mwh": float(
+                rolling_pf_solver_settlement_submitted_da_sell_mwh
+            ),
+            "rolling_pf_solver_settlement_accepted_da_buy_mwh": float(
+                rolling_pf_solver_settlement_accepted_da_buy_mwh
+            ),
+            "rolling_pf_solver_settlement_accepted_da_sell_mwh": float(
+                rolling_pf_solver_settlement_accepted_da_sell_mwh
+            ),
+            "rolling_pf_solver_settlement_realized_da_buy_mwh": float(
+                rolling_pf_solver_settlement_realized_da_buy_mwh
+            ),
+            "rolling_pf_solver_settlement_realized_da_sell_mwh": float(
+                rolling_pf_solver_settlement_realized_da_sell_mwh
+            ),
+            "perfect_foresight_da_execution_policy": str(self.da_execution_policy),
+            "perfect_foresight_da_price_taker_mode": float(
+                str(self.da_execution_policy).strip().lower() == "price_taker"
+            ),
+            "perfect_foresight_da_price_rejected_buy_mwh": 0.0
+            if str(self.da_execution_policy).strip().lower() == "price_taker"
+            else float("nan"),
+            "perfect_foresight_da_price_rejected_sell_mwh": 0.0
+            if str(self.da_execution_policy).strip().lower() == "price_taker"
+            else float("nan"),
+            "rolling_pf_solver_selected_no_trade_reason": str(rolling_pf_solver_selected_no_trade_reason),
+            "rolling_pf_da_execution_policy": str(rolling_pf_da_execution_policy),
+            "rolling_pf_da_price_taker_mode": float(rolling_pf_da_price_taker_mode),
+            "rolling_pf_da_actual_independent_clearing_applied": float(
+                rolling_pf_da_actual_independent_clearing_applied
+            ),
+            "rolling_pf_da_limit_robust_guard_applied": float(rolling_pf_da_limit_robust_guard_applied),
+            "rolling_pf_da_truth_price_substitution_applied": float(
+                rolling_pf_da_truth_price_substitution_applied
+            ),
+            "rolling_pf_da_dispatch_buy_mwh": float(rolling_pf_da_dispatch_buy_mwh),
+            "rolling_pf_da_dispatch_sell_mwh": float(rolling_pf_da_dispatch_sell_mwh),
+            "rolling_pf_da_plan_history_rows": float(rolling_pf_da_plan_history_rows),
+            "rolling_pf_da_gate_allowed_rows": float(rolling_pf_da_gate_allowed_rows),
+            "rolling_pf_da_gate_nonzero_candidate_rows": float(rolling_pf_da_gate_nonzero_candidate_rows),
+            "rolling_pf_da_raw_candidate_buy_mwh": float(rolling_pf_da_raw_candidate_buy_mwh),
+            "rolling_pf_da_raw_candidate_sell_mwh": float(rolling_pf_da_raw_candidate_sell_mwh),
+            "rolling_pf_da_sized_candidate_buy_mwh": float(rolling_pf_da_sized_candidate_buy_mwh),
+            "rolling_pf_da_sized_candidate_sell_mwh": float(rolling_pf_da_sized_candidate_sell_mwh),
+            "rolling_pf_da_postlock_candidate_buy_mwh": float(rolling_pf_da_postlock_candidate_buy_mwh),
+            "rolling_pf_da_postlock_candidate_sell_mwh": float(rolling_pf_da_postlock_candidate_sell_mwh),
+            "rolling_pf_da_selected_lockable_buy_mwh": float(rolling_pf_da_selected_lockable_buy_mwh),
+            "rolling_pf_da_selected_lockable_sell_mwh": float(rolling_pf_da_selected_lockable_sell_mwh),
+            "rolling_pf_da_zero_trade_reason": str(rolling_pf_da_zero_trade_reason),
+            "rolling_pf_da_zero_trade_stage": str(rolling_pf_da_zero_trade_stage),
+            "rolling_pf_da_plan_history_zero_reason": str(rolling_pf_da_plan_history_zero_reason),
+            "rolling_pf_da_bid_sizer_status": str(rolling_pf_da_bid_sizer_status),
+            "rolling_pf_da_bid_sizer_error": str(rolling_pf_da_bid_sizer_error),
+            "rolling_pf_da_bid_sizer_method": str(rolling_pf_da_bid_sizer_method),
+            "rolling_pf_da_bid_sizer_objective_eur": float(rolling_pf_da_bid_sizer_objective_eur),
+            "rolling_pf_da_bid_sizer_total_buy_mwh": float(rolling_pf_da_bid_sizer_total_buy_mwh),
+            "rolling_pf_da_bid_sizer_total_sell_mwh": float(rolling_pf_da_bid_sizer_total_sell_mwh),
+            "rolling_pf_da_bid_sizer_projected_soc_min_mwh": float(
+                rolling_pf_da_bid_sizer_projected_soc_min_mwh
+            ),
+            "rolling_pf_da_bid_sizer_projected_soc_max_mwh": float(
+                rolling_pf_da_bid_sizer_projected_soc_max_mwh
+            ),
+            "rolling_pf_da_bid_sizer_projected_final_soc_mwh": float(
+                rolling_pf_da_bid_sizer_projected_final_soc_mwh
+            ),
+            "rolling_pf_da_candidate_selection_invalid_reason": str(
+                rolling_pf_da_candidate_selection_invalid_reason
+            ),
+            "rolling_pf_da_raw_candidate_pnl_eur": float(rolling_pf_da_raw_candidate_pnl_eur),
+            "rolling_pf_da_sized_candidate_pnl_eur": float(rolling_pf_da_sized_candidate_pnl_eur),
+            "rolling_pf_da_sized_zero_reason": str(rolling_pf_da_sized_zero_reason),
+            "rolling_pf_da_first_sized_zero_ts_utc": str(rolling_pf_da_first_sized_zero_ts_utc),
+            "rolling_pf_da_submitted_buy_mwh": float(rolling_pf_da_submitted_buy_mwh),
+            "rolling_pf_da_submitted_sell_mwh": float(rolling_pf_da_submitted_sell_mwh),
+            "rolling_pf_da_auction_accepted_buy_mwh": float(rolling_pf_da_auction_accepted_buy_mwh),
+            "rolling_pf_da_auction_accepted_sell_mwh": float(rolling_pf_da_auction_accepted_sell_mwh),
+            "rolling_pf_da_physical_lockbook_buy_mwh": float(rolling_pf_da_physical_lockbook_buy_mwh),
+            "rolling_pf_da_physical_lockbook_sell_mwh": float(rolling_pf_da_physical_lockbook_sell_mwh),
+            "rolling_pf_da_price_rejected_buy_mwh": float(rolling_pf_da_price_rejected_buy_mwh),
+            "rolling_pf_da_price_rejected_sell_mwh": float(rolling_pf_da_price_rejected_sell_mwh),
+            "rolling_pf_da_realized_buy_mwh": float(rolling_pf_da_realized_buy_mwh),
+            "rolling_pf_da_realized_sell_mwh": float(rolling_pf_da_realized_sell_mwh),
+            "rolling_pf_da_revenue_eur": float(rolling_pf_da_revenue_eur),
+            "rolling_pf_da_cost_eur": float(rolling_pf_da_cost_eur),
+            "rolling_pf_da_gross_eur": float(rolling_pf_da_gross_eur),
+            "rolling_pf_bcm_plan_history_rows": float(rolling_pf_bcm_plan_history_rows),
+            "rolling_pf_bcm_gate_allowed_rows": float(rolling_pf_bcm_gate_allowed_rows),
+            "rolling_pf_bcm_gate_nonzero_candidate_rows": float(
+                rolling_pf_bcm_gate_nonzero_candidate_rows
+            ),
+            "rolling_pf_bcm_candidate_pos_mw": float(rolling_pf_bcm_candidate_pos_mw),
+            "rolling_pf_bcm_candidate_neg_mw": float(rolling_pf_bcm_candidate_neg_mw),
+            "rolling_pf_bcm_precommit_candidate_pos_mw": float(
+                rolling_pf_bcm_precommit_candidate_pos_mw
+            ),
+            "rolling_pf_bcm_precommit_candidate_neg_mw": float(
+                rolling_pf_bcm_precommit_candidate_neg_mw
+            ),
+            "rolling_pf_bcm_locked_pos_mw": float(rolling_pf_bcm_locked_pos_mw),
+            "rolling_pf_bcm_locked_neg_mw": float(rolling_pf_bcm_locked_neg_mw),
+            "rolling_pf_bcm_ev_pos": float(rolling_pf_bcm_ev_pos),
+            "rolling_pf_bcm_ev_neg": float(rolling_pf_bcm_ev_neg),
+            "rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw": float(
+                rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw
+            ),
+            "rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw": float(
+                rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw
+            ),
+            "rolling_pf_bcm_capacity_price_source_column_pos": str(
+                rolling_pf_bcm_capacity_price_source_column_pos
+            ),
+            "rolling_pf_bcm_capacity_price_source_column_neg": str(
+                rolling_pf_bcm_capacity_price_source_column_neg
+            ),
+            "rolling_pf_bcm_zero_reason": str(rolling_pf_bcm_zero_reason),
+            "rolling_pf_bcm_zero_stage": str(rolling_pf_bcm_zero_stage),
+            "rolling_pf_bcm_deterministic_reserve_settlement": float(
+                rolling_pf_bcm_deterministic_reserve_settlement
+            ),
+            "rolling_pf_bcm_truth_price_substitution_applied": float(
+                rolling_pf_bcm_truth_price_substitution_applied
+            ),
+            "rolling_pf_degradation_cost_eur": float(rolling_pf_degradation_cost_eur),
+            "rolling_pf_transaction_cost_eur": float(rolling_pf_transaction_cost_eur),
+            "rolling_pf_aux_cost_eur": float(rolling_pf_aux_cost_eur),
+            "rolling_pf_pnl_eur": float(rolling_pf_pnl_eur),
             "rolling_pf_total_semantics": str(rolling_pf_total_semantics),
             "rolling_pf_no_market_terminal_shortfall_mwh": float(rolling_pf_no_market_terminal_shortfall_mwh),
             "rolling_pf_failure_reason": str(rolling_pf_failure_reason),
@@ -25744,9 +27062,11 @@ class BatteryBacktester:
             "global_hindsight_same_rules_upper_bound_total_pnl_eur": float(global_perfect_foresight_pnl_total) if np.isfinite(global_perfect_foresight_pnl_total) else float("nan"),
             "realized_path_pnl_under_global_upper_bound_rules_eur": float(realized_path_pnl_under_global_upper_bound_rules_eur),
             "global_pf_verified_upper_bound": float(global_pf_verified_upper_bound),
+            "global_pf_is_solver_upper_bound": float(global_pf_is_solver_upper_bound),
+            "global_pf_is_realized_path_fallback": float(global_pf_is_realized_path_fallback),
             "global_pf_available": float(global_perfect_foresight_available_flag),
             "global_pf_solver_status": str(global_pf_solver_status),
-            "global_pf_verified": float(global_pf_verified_upper_bound),
+            "global_pf_verified": float(global_pf_solver_benchmark_verified),
             "global_pf_solver_available": float(global_pf_solver_available),
             "global_pf_solver_feasible": float(global_pf_solver_feasible),
             "global_pf_solver_rejection_reason": str(global_pf_solver_rejection_reason),
@@ -26188,9 +27508,25 @@ class BatteryBacktester:
             & (any_capacity_bid_price <= 1e-9)
             & (total_capacity_revenue <= 1e-9)
         )
-        summary["bcm_capacity_price_missing_for_awarded_capacity_count"] = float(
-            bcm_capacity_price_missing_for_awarded_capacity.sum()
+        bcm_price_missing_diag = self._bcm_capacity_price_missing_diagnostics(
+            timestamps=(
+                hourly[colmap.timestamp]
+                if colmap.timestamp in hourly.columns
+                else pd.Series(pd.NaT, index=hourly.index)
+            ),
+            locked_pos_mw=cap_pos_mw,
+            locked_neg_mw=cap_neg_mw,
+            settlement_price_pos=cap_price_pos,
+            settlement_price_neg=cap_price_neg,
+            revenue_pos_eur=cap_rev_pos,
+            revenue_neg_eur=cap_rev_neg,
+            price_source=(
+                hourly["real_bcm_capacity_price_source"]
+                if "real_bcm_capacity_price_source" in hourly.columns
+                else pd.Series([""] * len(hourly), index=hourly.index)
+            ),
         )
+        summary.update(bcm_price_missing_diag)
         summary["bcm_capacity_price_propagation_check_pass"] = float(
             int(
                 not (
@@ -26357,6 +27693,22 @@ class BatteryBacktester:
             summary["perfect_foresight_total_pnl_eur"] - summary["perfect_foresight_pnl_from_components_plus_terminal_eur"]
         )
         summary["perfect_foresight_pnl_balance_ok"] = float(abs(summary["perfect_foresight_pnl_balance_error_eur"]) <= 1e-6)
+        rolling_pf_selected_vs_component_pnl_delta_eur = (
+            float(
+                summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]
+                - summary["perfect_foresight_pnl_from_components_plus_terminal_eur"]
+            )
+            if np.isfinite(float(summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+            and np.isfinite(float(summary["perfect_foresight_pnl_from_components_plus_terminal_eur"]))
+            else float("nan")
+        )
+        summary["rolling_pf_selected_vs_component_pnl_delta_eur"] = float(
+            rolling_pf_selected_vs_component_pnl_delta_eur
+        )
+        if not hourly.empty:
+            hourly["rolling_pf_selected_vs_component_pnl_delta_eur"] = float(
+                rolling_pf_selected_vs_component_pnl_delta_eur
+            )
         summary["rolling_pf_is_upper_bound"] = 0.0
         summary["global_perfect_foresight_is_upper_bound"] = 0.0
         summary["global_perfect_foresight_validation_status"] = str(global_perfect_foresight_validation_status)
@@ -26962,14 +28314,16 @@ class BatteryBacktester:
             else float("nan")
         )
         summary["realized_vs_global_hindsight_perfect_foresight_upper_bound_pct"] = (
-            float(100.0 * realized_total / global_perfect_foresight_total)
-            if (
-                (summary.get("global_perfect_foresight_available", 0.0) >= 0.5)
-                and np.isfinite(realized_total)
-                and np.isfinite(global_perfect_foresight_total)
-                and abs(global_perfect_foresight_total) > 1e-12
+            self._global_pf_upper_bound_ratio_pct(
+                realized_total_eur=realized_total,
+                global_pf_total_eur=global_perfect_foresight_total,
+                global_perfect_foresight_available=float(
+                    summary.get("global_perfect_foresight_available", 0.0)
+                ),
+                global_pf_verified_upper_bound=float(
+                    summary.get("global_pf_verified_upper_bound", 0.0)
+                ),
             )
-            else float("nan")
         )
         summary["realized_exceeds_global_perfect_foresight"] = float(
             float(summary.get("global_pf_below_realized_incumbent", 0.0)) >= 0.5
@@ -27838,17 +29192,29 @@ class BatteryBacktester:
                     invalid_reasons.append("optimization_failure")
             if float(summary.get("benchmark_same_rules_gate_consistent", 1.0)) < 0.5:
                 invalid_reasons.append("benchmark_gate_mismatch")
-            global_status = str(summary.get("global_perfect_foresight_validation_status", "disabled_unverified"))
-            if bool(enable_global_perfect_foresight) and float(summary.get("global_pf_verified_upper_bound", 0.0)) < 0.5:
-                if float(summary.get("global_perfect_foresight_available", 0.0)) < 0.5:
-                    invalid_reasons.append("global_pf_unavailable")
-                elif "solver" in global_status:
-                    invalid_reasons.append("global_pf_solver_failed")
-                elif float(summary.get("global_pf_below_realized_incumbent", 0.0)) >= 0.5:
-                    invalid_reasons.append("global_pf_below_realized_incumbent")
-                    invalid_reasons.append("realized_exceeds_global_perfect_foresight")
-                else:
-                    invalid_reasons.append("global_pf_unverified")
+            invalid_reasons.extend(
+                self._global_pf_strict_invalid_reason(
+                    enable_global_perfect_foresight=bool(enable_global_perfect_foresight),
+                    global_pf_verified_upper_bound=float(
+                        summary.get("global_pf_verified_upper_bound", 0.0)
+                    ),
+                    global_perfect_foresight_available=float(
+                        summary.get("global_perfect_foresight_available", 0.0)
+                    ),
+                    global_perfect_foresight_validation_status=str(
+                        summary.get(
+                            "global_perfect_foresight_validation_status",
+                            "disabled_unverified",
+                        )
+                    ),
+                    global_pf_below_realized_incumbent=float(
+                        summary.get("global_pf_below_realized_incumbent", 0.0)
+                    ),
+                    global_pf_is_realized_path_fallback=float(
+                        summary.get("global_pf_is_realized_path_fallback", 0.0)
+                    ),
+                )
+            )
             if should_report_rolling_pf_solver_failed(
                 strict_simulation_validity=bool(strict_simulation_validity),
                 rolling_pf_enabled=bool(benchmark_paths.get("rhpf", False)),
@@ -28184,10 +29550,97 @@ class BatteryBacktester:
             ("rolling_pf_solver_solution_eur", float("nan")),
             ("rolling_pf_solver_pnl_eur", float("nan")),
             ("rolling_pf_solver_feasible", 0.0),
+            ("rolling_pf_selected_incumbent_pre_terminal_pnl_eur", float("nan")),
             ("rolling_pf_selected_incumbent_pnl_eur", float("nan")),
             ("rolling_pf_selected_incumbent_total_pnl_eur", float("nan")),
+            ("rolling_pf_selected_vs_hourly_final_pnl_delta_eur", float("nan")),
+            ("rolling_pf_selected_vs_component_pnl_delta_eur", float("nan")),
             ("rolling_pf_no_market_incumbent_eur", float("nan")),
             ("rolling_pf_realized_path_incumbent_eur", float("nan")),
+            ("rolling_pf_solver_dispatch_da_buy_mwh", 0.0),
+            ("rolling_pf_solver_dispatch_da_sell_mwh", 0.0),
+            ("rolling_pf_solver_settlement_submitted_da_buy_mwh", 0.0),
+            ("rolling_pf_solver_settlement_submitted_da_sell_mwh", 0.0),
+            ("rolling_pf_solver_settlement_accepted_da_buy_mwh", 0.0),
+            ("rolling_pf_solver_settlement_accepted_da_sell_mwh", 0.0),
+            ("rolling_pf_solver_settlement_realized_da_buy_mwh", 0.0),
+            ("rolling_pf_solver_settlement_realized_da_sell_mwh", 0.0),
+            ("perfect_foresight_da_execution_policy", ""),
+            ("perfect_foresight_da_price_taker_mode", 0.0),
+            ("perfect_foresight_da_price_rejected_buy_mwh", 0.0),
+            ("perfect_foresight_da_price_rejected_sell_mwh", 0.0),
+            ("rolling_pf_solver_selected_no_trade_reason", ""),
+            ("rolling_pf_da_execution_policy", ""),
+            ("rolling_pf_da_price_taker_mode", 0.0),
+            ("rolling_pf_da_actual_independent_clearing_applied", 0.0),
+            ("rolling_pf_da_limit_robust_guard_applied", 0.0),
+            ("rolling_pf_da_truth_price_substitution_applied", 0.0),
+            ("rolling_pf_da_dispatch_buy_mwh", 0.0),
+            ("rolling_pf_da_dispatch_sell_mwh", 0.0),
+            ("rolling_pf_da_plan_history_rows", 0.0),
+            ("rolling_pf_da_gate_allowed_rows", 0.0),
+            ("rolling_pf_da_gate_nonzero_candidate_rows", 0.0),
+            ("rolling_pf_da_raw_candidate_buy_mwh", 0.0),
+            ("rolling_pf_da_raw_candidate_sell_mwh", 0.0),
+            ("rolling_pf_da_sized_candidate_buy_mwh", 0.0),
+            ("rolling_pf_da_sized_candidate_sell_mwh", 0.0),
+            ("rolling_pf_da_postlock_candidate_buy_mwh", 0.0),
+            ("rolling_pf_da_postlock_candidate_sell_mwh", 0.0),
+            ("rolling_pf_da_selected_lockable_buy_mwh", 0.0),
+            ("rolling_pf_da_selected_lockable_sell_mwh", 0.0),
+            ("rolling_pf_da_zero_trade_reason", ""),
+            ("rolling_pf_da_zero_trade_stage", ""),
+            ("rolling_pf_da_plan_history_zero_reason", ""),
+            ("rolling_pf_da_bid_sizer_status", ""),
+            ("rolling_pf_da_bid_sizer_error", ""),
+            ("rolling_pf_da_bid_sizer_method", ""),
+            ("rolling_pf_da_bid_sizer_objective_eur", float("nan")),
+            ("rolling_pf_da_bid_sizer_total_buy_mwh", 0.0),
+            ("rolling_pf_da_bid_sizer_total_sell_mwh", 0.0),
+            ("rolling_pf_da_bid_sizer_projected_soc_min_mwh", float("nan")),
+            ("rolling_pf_da_bid_sizer_projected_soc_max_mwh", float("nan")),
+            ("rolling_pf_da_bid_sizer_projected_final_soc_mwh", float("nan")),
+            ("rolling_pf_da_candidate_selection_invalid_reason", ""),
+            ("rolling_pf_da_raw_candidate_pnl_eur", float("nan")),
+            ("rolling_pf_da_sized_candidate_pnl_eur", float("nan")),
+            ("rolling_pf_da_sized_zero_reason", ""),
+            ("rolling_pf_da_first_sized_zero_ts_utc", ""),
+            ("rolling_pf_da_submitted_buy_mwh", 0.0),
+            ("rolling_pf_da_submitted_sell_mwh", 0.0),
+            ("rolling_pf_da_auction_accepted_buy_mwh", 0.0),
+            ("rolling_pf_da_auction_accepted_sell_mwh", 0.0),
+            ("rolling_pf_da_physical_lockbook_buy_mwh", 0.0),
+            ("rolling_pf_da_physical_lockbook_sell_mwh", 0.0),
+            ("rolling_pf_da_price_rejected_buy_mwh", 0.0),
+            ("rolling_pf_da_price_rejected_sell_mwh", 0.0),
+            ("rolling_pf_da_realized_buy_mwh", 0.0),
+            ("rolling_pf_da_realized_sell_mwh", 0.0),
+            ("rolling_pf_da_revenue_eur", 0.0),
+            ("rolling_pf_da_cost_eur", 0.0),
+            ("rolling_pf_da_gross_eur", 0.0),
+            ("rolling_pf_bcm_plan_history_rows", 0.0),
+            ("rolling_pf_bcm_gate_allowed_rows", 0.0),
+            ("rolling_pf_bcm_gate_nonzero_candidate_rows", 0.0),
+            ("rolling_pf_bcm_candidate_pos_mw", 0.0),
+            ("rolling_pf_bcm_candidate_neg_mw", 0.0),
+            ("rolling_pf_bcm_precommit_candidate_pos_mw", 0.0),
+            ("rolling_pf_bcm_precommit_candidate_neg_mw", 0.0),
+            ("rolling_pf_bcm_locked_pos_mw", 0.0),
+            ("rolling_pf_bcm_locked_neg_mw", 0.0),
+            ("rolling_pf_bcm_ev_pos", 0.0),
+            ("rolling_pf_bcm_ev_neg", 0.0),
+            ("rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw", 0.0),
+            ("rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw", 0.0),
+            ("rolling_pf_bcm_capacity_price_source_column_pos", ""),
+            ("rolling_pf_bcm_capacity_price_source_column_neg", ""),
+            ("rolling_pf_bcm_zero_reason", ""),
+            ("rolling_pf_bcm_zero_stage", ""),
+            ("rolling_pf_bcm_deterministic_reserve_settlement", 0.0),
+            ("rolling_pf_bcm_truth_price_substitution_applied", 0.0),
+            ("rolling_pf_degradation_cost_eur", 0.0),
+            ("rolling_pf_transaction_cost_eur", 0.0),
+            ("rolling_pf_aux_cost_eur", 0.0),
+            ("rolling_pf_pnl_eur", 0.0),
             ("rolling_pf_total_semantics", "selected_incumbent"),
             ("rolling_pf_no_market_terminal_shortfall_mwh", float("nan")),
             ("rolling_pf_failure_reason", ""),
@@ -28209,6 +29662,8 @@ class BatteryBacktester:
             ("global_hindsight_same_rules_upper_bound_total_pnl_eur", float("nan")),
             ("realized_path_pnl_under_global_upper_bound_rules_eur", float("nan")),
             ("global_pf_verified_upper_bound", 0.0),
+            ("global_pf_is_solver_upper_bound", 0.0),
+            ("global_pf_is_realized_path_fallback", 0.0),
             ("global_pf_same_market_rules", 0.0),
             ("global_pf_realized_path_incumbent_eur", float("nan")),
             ("global_pf_solution_eur", float("nan")),

@@ -102,13 +102,18 @@ MARKET_SPECS = {
     "da_bid_granularity": 0.1,  # Bid steps
     "afrr_min_bid_size": 1.0,  # Minimum bid size in MW (Germany)
     "afrr_bid_granularity": 1.0,  # Bid steps
-    "da_execution_mode": "limit",  # "price_taker" or "limit"
-    # DA limit clearing policy:
-    # - accepted_independent_limit_replay: main thesis policy. Submit independent
+    # Canonical DA execution policy:
+    # - price_taker: main thesis policy. Optimizer-selected DA energy is accepted
+    #   and settled pay-as-clear at the realized DA clearing price.
+    # - accepted_independent_limit_replay: robustness policy. Submit independent
     #   hourly limit orders, clear against realized DA prices, and write only
     #   accepted orders to the physical lockbook.
     # - robust_independent_limit: conservative robustness policy. Keep the
     #   worst-case independent-clearing guard before lockbook write.
+    "da_execution_policy": "price_taker",
+    # Legacy compatibility knobs. If da_execution_policy is absent, the
+    # simulation maps these two fields to the canonical policy.
+    "da_execution_mode": "price_taker",  # "price_taker" or "limit"
     "da_limit_clearing_policy": "accepted_independent_limit_replay",
     "da_arbitrage_mode": "limit",  # mode for non-hedging DA volumes
     "da_link_to_awarded_afrr": True,  # cancel hedges if aFRR capacity was not awarded
@@ -202,6 +207,16 @@ def _validate_config() -> None:
         raise ValueError("da_bid_granularity must be > 0.")
     if MARKET_SPECS["afrr_bid_granularity"] <= 0:
         raise ValueError("afrr_bid_granularity must be > 0.")
+    da_execution_policy = str(MARKET_SPECS.get("da_execution_policy", "")).strip().lower()
+    if da_execution_policy and da_execution_policy not in {
+        "price_taker",
+        "accepted_independent_limit_replay",
+        "robust_independent_limit",
+    }:
+        raise ValueError(
+            "da_execution_policy must be one of "
+            "{'price_taker','accepted_independent_limit_replay','robust_independent_limit'}."
+        )
     if MARKET_SPECS["da_execution_mode"] not in {"price_taker", "limit"}:
         raise ValueError("da_execution_mode must be one of {'price_taker', 'limit'}.")
     if MARKET_SPECS.get("da_limit_clearing_policy", "accepted_independent_limit_replay") not in {

@@ -3395,7 +3395,10 @@ def parse_args() -> argparse.Namespace:
         "--benchmark-mode",
         choices=["full", "model_only", "naive_only", "rhpf_only", "ghpf_only", "selected", "rolling_pf_only", "global_pf_only"],
         default="full",
-        help="Which benchmark paths to compute: full, model_only, naive_only, rhpf_only, ghpf_only, or selected.",
+        help=(
+            "Which benchmark paths to compute. Default full computes model, naive, and RHPF; "
+            "GHPF is opt-in via --enable-ghpf, ghpf_only, or global_pf_only."
+        ),
     )
     p.add_argument("--enable-naive", dest="enable_naive", action="store_true", default=None, help="Enable naive benchmark in --benchmark-mode selected or override modes.")
     p.add_argument("--disable-naive", dest="enable_naive", action="store_false", help="Disable naive benchmark.")
@@ -5016,9 +5019,6 @@ def main() -> None:
                     "PnL Summary",
                     f"realized_total_pnl_eur={_fmt_summary_val('realized_total_pnl_eur')}",
                     f"rolling_perfect_foresight_same_rules_total_pnl_eur={_fmt_summary_val('rolling_perfect_foresight_same_rules_total_pnl_eur')}",
-                    f"global_hindsight_perfect_foresight_upper_bound_total_pnl_eur={_fmt_summary_val('global_hindsight_perfect_foresight_upper_bound_total_pnl_eur')}",
-                    f"global_perfect_foresight_available={_fmt_summary_val('global_perfect_foresight_available')}",
-                    f"global_perfect_foresight_validation_status={outputs.summary.get('global_perfect_foresight_validation_status', '')}",
                 ]) + "\n",
                 encoding="utf-8",
             )
@@ -5162,8 +5162,7 @@ def main() -> None:
         pnl_warn_fields = [
             ("Multi-market realized", "realized_total_pnl_eur"),
             ("Naive realized", "naive_total_pnl_eur"),
-            ("Multi-market rolling_perfect_foresight_same_rules", "rolling_perfect_foresight_same_rules_total_pnl_eur"),
-            ("Multi-market global_hindsight_perfect_foresight_upper_bound", "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"),
+            ("RHPF benchmark rolling_perfect_foresight_same_rules", "rolling_perfect_foresight_same_rules_total_pnl_eur"),
         ]
         for label, key in pnl_warn_fields:
             v = pd.to_numeric(pd.Series([outputs.summary.get(key, float("nan"))]), errors="coerce").iloc[0]
@@ -5177,18 +5176,6 @@ def main() -> None:
             "- realized_vs_perfect_foresight_pct (diagnostic, may exceed 100): "
             f"{(100.0 * float(r_multi)) if pd.notna(r_multi) else float('nan'):.2f}%"
         )
-        global_ratio_pct = outputs.summary.get("realized_vs_global_hindsight_perfect_foresight_upper_bound_pct", float("nan"))
-        global_ok = (
-            float(outputs.summary.get("global_perfect_foresight_available", 0.0)) >= 0.5
-            and float(outputs.summary.get("global_perfect_foresight_dominance_check_pass", 0.0)) >= 0.5
-        )
-        if global_ok:
-            print(
-                "- realized_vs_global_hindsight_perfect_foresight_upper_bound_pct (upper-bound efficiency, should be <=100): "
-                f"{float(global_ratio_pct) if pd.notna(global_ratio_pct) else float('nan'):.2f}%"
-            )
-        else:
-            print("- global perfect_foresight unavailable/unverified")
         final_soc = outputs.summary.get("final_soc_actual_mwh", outputs.summary.get("final_real_soc_mwh", float("nan")))
         final_soc_target = outputs.summary.get("final_soc_target_mwh", outputs.summary.get("final_soc_min_target_mwh", float("nan")))
         final_soc_physical_ok = bool(float(outputs.summary.get("final_soc_physical_check_pass", 0.0)) >= 0.5)
@@ -5434,9 +5421,7 @@ def main() -> None:
                 "trading_strategy",
                 "realized_total_pnl_eur",
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
-                "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
                 "realized_vs_perfect_foresight_pct",
-                "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
                 "simulation_valid",
                 "thesis_reportable",
                 "invalid_reason",
@@ -5448,9 +5433,7 @@ def main() -> None:
             for c in [
                 "realized_total_pnl_eur",
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
-                "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
                 "realized_vs_perfect_foresight_pct",
-                "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
             ]:
                 if c in display_df.columns:
                     display_df[c] = pd.to_numeric(display_df[c], errors="coerce").map(
@@ -5462,9 +5445,7 @@ def main() -> None:
                     "trading_strategy": "strat",
                     "realized_total_pnl_eur": "pnl_real_eur",
                     "rolling_perfect_foresight_same_rules_total_pnl_eur": "pnl_pf_roll_eur",
-                    "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": "pnl_pf_global_ub_eur",
                     "realized_vs_perfect_foresight_pct": "real_vs_pf_roll_pct",
-                    "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct": "real_vs_pf_global_pct",
                 }
             )
             print(display_df.to_string(index=False))
