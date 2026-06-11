@@ -9968,6 +9968,100 @@ def test_da_future_headroom_does_not_cap_recovery_without_future_da_buy() -> Non
     assert float(diag["da_future_headroom_blocked_buy_mwh"]) == pytest.approx(0.0)
 
 
+def test_locked_da_buy_headroom_repair_sells_before_future_da_buy() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    col = BacktestColumnMap()
+    now = pd.Timestamp("2026-01-22T00:00:00Z")
+    repair_ts = pd.Timestamp("2026-01-22T01:00:00Z")
+    da_ts = pd.Timestamp("2026-01-22T02:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [repair_ts, da_ts])
+
+    sell_mwh, diag = bt._required_id_sell_to_create_next_locked_da_buy_headroom(
+        current_ts_utc=now,
+        current_soc_mwh=8.513,
+        future_rows=rows,
+        da_lockbook={da_ts: (10.0, 0.0)},
+        eta_in=bt.eta_in,
+        eta_out=bt.eta_out,
+        soc_max_mwh=bt.soc_max,
+        soc_min_mwh=bt.soc_min,
+    )
+
+    assert sell_mwh > 0.0
+    assert float(diag["da_locked_buy_headroom_repair_applied"]) == pytest.approx(1.0)
+    projected_before_da = float(diag["da_locked_buy_headroom_repair_projected_soc_before_da"])
+    projected_after_repair = projected_before_da - sell_mwh / bt.eta_out
+    assert projected_after_repair + 10.0 * bt.eta_in <= bt.soc_max + 1e-6
+    assert str(diag["da_locked_buy_headroom_repair_blocking_da_ts_utc"]) == da_ts.isoformat()
+    assert str(diag["da_locked_buy_headroom_repair_reason"]) == "preserve_future_locked_da_buy_headroom"
+
+
+def test_locked_da_buy_headroom_repair_noops_when_headroom_exists() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    col = BacktestColumnMap()
+    now = pd.Timestamp("2026-01-22T00:00:00Z")
+    da_ts = pd.Timestamp("2026-01-22T02:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [pd.Timestamp("2026-01-22T01:00:00Z"), da_ts])
+
+    sell_mwh, diag = bt._required_id_sell_to_create_next_locked_da_buy_headroom(
+        current_ts_utc=now,
+        current_soc_mwh=8.49,
+        future_rows=rows,
+        da_lockbook={da_ts: (10.0, 0.0)},
+        eta_in=bt.eta_in,
+        eta_out=bt.eta_out,
+        soc_max_mwh=bt.soc_max,
+        soc_min_mwh=bt.soc_min,
+    )
+
+    assert sell_mwh == pytest.approx(0.0)
+    assert float(diag["da_locked_buy_headroom_repair_needed"]) == pytest.approx(0.0)
+    assert float(diag["da_locked_buy_headroom_repair_applied"]) == pytest.approx(0.0)
+
+
+def test_locked_da_buy_headroom_repair_unresolved_without_prior_repair_hour() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    col = BacktestColumnMap()
+    now = pd.Timestamp("2026-01-22T00:00:00Z")
+    da_ts = pd.Timestamp("2026-01-22T01:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [da_ts])
+
+    sell_mwh, diag = bt._required_id_sell_to_create_next_locked_da_buy_headroom(
+        current_ts_utc=now,
+        current_soc_mwh=8.513,
+        future_rows=rows,
+        da_lockbook={da_ts: (10.0, 0.0)},
+        eta_in=bt.eta_in,
+        eta_out=bt.eta_out,
+        soc_max_mwh=bt.soc_max,
+        soc_min_mwh=bt.soc_min,
+    )
+
+    assert sell_mwh == pytest.approx(0.0)
+    assert float(diag["da_future_locked_buy_exists"]) == pytest.approx(1.0)
+    assert float(diag["da_future_locked_buy_headroom_ok_before_repair"]) == pytest.approx(0.0)
+    assert float(diag["da_future_locked_buy_headroom_ok_after_repair"]) == pytest.approx(0.0)
+    assert float(diag["da_locked_buy_headroom_repair_unresolved"]) == pytest.approx(1.0)
+    assert str(diag["da_locked_buy_headroom_repair_unresolved_reason"]) == (
+        "no_prior_repair_hour_before_locked_da_buy"
+    )
+
+
 def test_da_prelock_guard_derates_later_buy_to_preserve_future_headroom() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -9990,6 +10084,243 @@ def test_da_prelock_guard_derates_later_buy_to_preserve_future_headroom() -> Non
     assert repaired[ts1] == pytest.approx((1.0, 0.0))
     assert float(diag["da_prelock_final_guard_passed"]) == pytest.approx(1.0)
     assert float(by_ts[ts1]["da_prelock_repaired_buy_mwh"]) == pytest.approx(1.0)
+
+
+def test_da_prelock_future_headroom_derates_candidate_before_lockbook_write() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-22T01:00:00Z")
+    ts1 = pd.Timestamp("2026-01-22T02:00:00Z")
+
+    repaired, diag, by_ts = bt._repair_or_reject_da_before_lock(
+        accepted_da={ts0: (7.0, 0.0), ts1: (7.0, 0.0)},
+        current_soc_mwh=10.0,
+        future_rows=_da_hourly_lock_future_rows(col, [ts0, ts1]),
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    accepted_buy_mwh = max(0.0, repaired[ts1][0]) * bt.dt_h
+    projected_soc_before_buy = float(by_ts[ts1]["da_prelock_future_headroom_projected_soc_before_buy"])
+    assert accepted_buy_mwh == pytest.approx(1.0)
+    assert float(diag["da_prelock_final_guard_passed"]) == pytest.approx(1.0)
+    assert float(by_ts[ts1]["da_prelock_future_headroom_check_pass"]) == pytest.approx(1.0)
+    assert float(by_ts[ts1]["da_prelock_future_headroom_candidate_buy_mwh"]) == pytest.approx(7.0)
+    assert float(by_ts[ts1]["da_prelock_future_headroom_accepted_buy_mwh"]) == pytest.approx(1.0)
+    assert float(by_ts[ts1]["da_prelock_future_headroom_derated_mwh"]) == pytest.approx(6.0)
+    assert str(by_ts[ts1]["da_prelock_future_headroom_blocking_ts_utc"]) == str(ts1)
+    assert projected_soc_before_buy + accepted_buy_mwh * bt.eta_in <= bt.soc_max + 1e-9
+
+
+def test_da_final_lockbook_consistency_derates_exact_final_accepted_schedule() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T01:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+
+    ok_before, diag_before, _ = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=17.55,
+        existing_da_lockbook={},
+        candidate_da={ts: (1.0, 0.0)},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+        include_existing_lockbook=True,
+        schedule_source="final_da_lockbook_consistency_guard",
+    )
+    assert ok_before is False
+    assert str(diag_before["da_hourly_lock_infeasible_reason"]) == "locked_da_buy_exceeds_soc_headroom"
+
+    repaired, diag, by_ts = bt._repair_or_reject_da_before_lock(
+        accepted_da={ts: (1.0, 0.0)},
+        current_soc_mwh=17.55,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+    assert repaired[ts] == pytest.approx((0.4, 0.0))
+    assert float(diag["da_prelock_final_guard_passed"]) == pytest.approx(1.0)
+    assert float(by_ts[ts]["da_prelock_future_headroom_check_pass"]) == pytest.approx(1.0)
+
+    ok_after, _, after_by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=17.55,
+        existing_da_lockbook={},
+        candidate_da=repaired,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+        include_existing_lockbook=True,
+        schedule_source="final_da_lockbook_consistency_guard",
+    )
+    assert ok_after is True
+    assert float(after_by_ts[ts]["da_hourly_lock_projected_soc_end_mwh"]) <= bt.soc_max + 1e-9
+
+
+def test_da_realized_anchor_caps_lockbook_candidate_before_write() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.soc_init = 8.84
+    col = BacktestColumnMap()
+    snapshot_ts = pd.Timestamp("2026-01-22T11:00:00Z")
+    prior_ts = snapshot_ts - pd.Timedelta(hours=1)
+    delivery_ts = pd.Timestamp("2026-01-23T00:00:00Z")
+    decisions = [
+        pd.DataFrame(
+            {
+                col.timestamp: [snapshot_ts],
+                "real_soc_start_mwh": [8.86],
+                "real_soc_mwh": [8.84],
+                "executed_soc_mwh": [8.84],
+            }
+        )
+    ]
+    snapshot_plan = pd.DataFrame(
+        {
+            "target_time_utc": [snapshot_ts],
+            "soc_lp_mwh": [8.58],
+        }
+    )
+    id_buy_before_gate_mw = (15.75 - 8.84) / bt.eta_in
+    settlement_anchor, settlement_anchor_diag = bt._replay_da_prelock_settlement_equivalent_soc_anchor(
+        rows=_da_hourly_lock_future_rows(col, [prior_ts]),
+        snapshot_ts=snapshot_ts,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        scheduled_id_by_ts={prior_ts: (id_buy_before_gate_mw, 0.0)},
+    )
+
+    assert settlement_anchor == pytest.approx(15.75)
+    assert float(settlement_anchor_diag["da_prelock_anchor_settlement_replay_rows"]) == pytest.approx(1.0)
+    assert float(settlement_anchor_diag["da_prelock_anchor_realized_settlement_soc_mwh"]) == pytest.approx(15.75)
+
+    anchor, anchor_diag = bt._get_realized_soc_anchor_for_snapshot(
+        snapshot_ts=snapshot_ts,
+        decisions=decisions,
+        current_soc_mwh=8.84,
+        snapshot_plan=snapshot_plan,
+        colmap=col,
+        realized_settlement_soc_mwh=settlement_anchor,
+    )
+
+    assert anchor == pytest.approx(15.75)
+    assert str(anchor_diag["da_prelock_soc_anchor_source"]) == "realized_settlement_soc"
+    assert str(anchor_diag["da_prelock_anchor_source"]) == "realized_settlement_soc"
+    assert float(anchor_diag["da_prelock_anchor_used_current_soc"]) == pytest.approx(0.0)
+    assert float(anchor_diag["da_prelock_anchor_current_soc_mwh"]) == pytest.approx(8.84)
+    assert float(anchor_diag["da_prelock_anchor_exact_decision_soc_mwh"]) == pytest.approx(8.86)
+    assert float(anchor_diag["da_prelock_anchor_realized_settlement_soc_mwh"]) == pytest.approx(15.75)
+    assert float(anchor_diag["da_prelock_anchor_current_vs_realized_delta_mwh"]) == pytest.approx(8.84 - 15.75)
+    assert float(anchor_diag["da_prelock_anchor_decision_vs_realized_delta_mwh"]) == pytest.approx(8.86 - 15.75)
+    assert float(anchor_diag["da_prelock_anchor_stale_state_detected"]) == pytest.approx(1.0)
+    assert float(anchor_diag["da_prelock_planned_soc_at_gate_mwh"]) == pytest.approx(8.58)
+    assert float(anchor_diag["da_prelock_anchor_minus_planned_soc_mwh"]) == pytest.approx(7.17)
+    assert 8.58 + 9.9 * bt.eta_in <= bt.soc_max
+    assert 15.75 + 9.9 * bt.eta_in > bt.soc_max
+
+    repaired, diag, by_ts = bt._repair_or_reject_da_before_lock(
+        accepted_da={delivery_ts: (9.9, 0.0)},
+        current_soc_mwh=anchor,
+        future_rows=_da_hourly_lock_future_rows(col, [delivery_ts]),
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    accepted_buy_mwh = repaired[delivery_ts][0] * bt.dt_h
+    projected_soc_before_buy = float(by_ts[delivery_ts]["da_prelock_future_headroom_projected_soc_before_buy"])
+    assert accepted_buy_mwh == pytest.approx(2.3)
+    assert float(diag["da_prelock_final_guard_passed"]) == pytest.approx(1.0)
+    assert projected_soc_before_buy == pytest.approx(15.75)
+    assert projected_soc_before_buy + accepted_buy_mwh * bt.eta_in <= bt.soc_max + 1e-9
+
+    prior_anchor, prior_diag = bt._get_realized_soc_anchor_for_snapshot(
+        snapshot_ts=snapshot_ts,
+        decisions=[
+            pd.DataFrame(
+                {
+                    col.timestamp: [snapshot_ts - pd.Timedelta(hours=1)],
+                    "soc_mwh": [15.77],
+                }
+            )
+        ],
+        current_soc_mwh=8.84,
+        snapshot_plan=snapshot_plan,
+        colmap=col,
+        realized_settlement_soc_mwh=15.75,
+    )
+    assert prior_anchor == pytest.approx(15.75)
+    assert str(prior_diag["da_prelock_soc_anchor_source"]) == "realized_settlement_soc"
+    assert float(prior_diag["da_prelock_anchor_latest_prior_decision_soc_mwh"]) == pytest.approx(15.77)
+    assert float(prior_diag["da_prelock_anchor_used_current_soc"]) == pytest.approx(0.0)
+    assert float(prior_diag["da_prelock_anchor_stale_state_detected"]) == pytest.approx(1.0)
+
+
+def test_da_settlement_equiv_lockbook_cap_prevents_unexecuted_locked_buy() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-23T00:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+
+    repaired, diag, by_ts = bt._cap_da_lockbook_to_settlement_equivalent_replay(
+        accepted_da={ts: (9.9, 0.0)},
+        current_soc_mwh=15.49,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        scheduled_id_by_ts={},
+    )
+
+    assert repaired[ts][0] == pytest.approx(2.6)
+    assert float(diag["da_settlement_equiv_replay_checked"]) == pytest.approx(1.0)
+    assert float(by_ts[ts]["da_settlement_equiv_replay_candidate_buy_mwh"]) == pytest.approx(9.9)
+    assert float(by_ts[ts]["da_settlement_equiv_replay_max_feasible_buy_mwh"]) == pytest.approx(
+        (bt.soc_max - 15.49) / bt.eta_in
+    )
+    assert float(by_ts[ts]["da_settlement_equiv_replay_final_accepted_buy_mwh"]) == pytest.approx(2.6)
+    assert str(by_ts[ts]["da_settlement_equiv_replay_reason"]) == "derated_buy_to_settlement_equivalent_headroom"
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=15.49,
+        charge=repaired[ts][0],
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        da_charge_mw=repaired[ts][0],
+        da_discharge_mw=0.0,
+    )
+
+    assert soc_next <= bt.soc_max + 1e-9
+    assert float(metrics["da_buy_mwh"]) == pytest.approx(2.6)
+    assert float(metrics["da_unexecuted_buy_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["da_execution_lockbook_physical_infeasible"]) == pytest.approx(0.0)
 
 
 def test_da_prelock_guard_derates_terminal_sell_when_id_recovery_disabled() -> None:
