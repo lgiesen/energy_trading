@@ -1,6 +1,26 @@
 # THESIS_EXECUTION_GUIDE
 
+## 0. Environment Setup
+
+### 0.1 Prerequisites
+
+This project was tested with:
+
+- macOS / Linux shell environment
+- Python 3.10
+- Git
+- Make
+- pip
+- A POSIX-compatible shell
+
+Check Python:
+
+```bash
+python3.10 --version
+```
+
 ## 1. Pipeline Overview & Preflight
+
 This repository uses a DAG-based Makefile architecture (action-model pattern) to guarantee caching, state-awareness, and strict determinism.  
 Each stage is dependency-aware, so unchanged upstream artifacts are not recomputed, while changed inputs correctly trigger downstream rebuilds.
 
@@ -11,10 +31,12 @@ make doctor
 ```
 
 `make doctor` verifies:
+
 - Required Python dependencies are importable.
 - Raw/model input data is present in `data/model_input`.
 
 ## 2. The Smoke Test (Fast-Fail Validation)
+
 Run the smoke test:
 
 ```bash
@@ -22,12 +44,14 @@ make smoke-test
 ```
 
 This executes the full end-to-end pipeline for all three models:
+
 - Tune -> Train -> Simulate -> Audit for XGBoost and Linear.
 - Train -> Simulate -> Audit for TFT.
 
 During smoke runs, `IS_SMOKE_TEST=1` is injected and read by Python via `os.environ`, enabling aggressive reductions (e.g., trials/epochs/data rows) to validate codebase integrity in under ~5 minutes without running full multi-hour training loops.
 
 ## 3. Step 1: Train The Forecast Models
+
 Train the three model families before running final thesis simulations:
 
 ```bash
@@ -37,11 +61,14 @@ make all-tft
 ```
 
 These commands execute the full reproducible DAG for each model family and enforce:
+
 - Fixed random seed behavior.
 - Strictly single-threaded BLAS/OMP settings (from Makefile exports) to maximize exact mathematical reproducibility.
 
 ### HPO Artifact Consumption (Implementation Note)
+
 The pipeline uses direct artifact consumption for tuned hyperparameters:
+
 - `make all-xgb` passes `artifacts/hpo/xgb_optuna_da_target_da_price.json` to training.
 - `make all-linear` passes `artifacts/hpo/linear_sgd_tuning_da_target_da_price.json` to training.
 
@@ -49,6 +76,7 @@ The pipeline uses direct artifact consumption for tuned hyperparameters:
 This replaces fragile shell-level JSON parsing and ensures deterministic, auditable parameter handoff from tuning to training.
 
 ## 4. Step 2: Run Final Thesis Simulations
+
 For the final thesis multi-market benchmark on the server, use:
 
 ```bash
@@ -58,6 +86,7 @@ nohup ./run_final_thesis_multi_3m.sh \
 ```
 
 This script runs:
+
 - Models: `xgb`, `tft`, `linear`
 - Strategy: `multi`
 - Horizon: `2025-03-01T00:00:00Z` to `2025-06-01T00:00:00Z`
@@ -114,6 +143,7 @@ MAX_PARALLEL_JOBS=4 ./run_final_thesis_multi_3m.sh
 Naive and RHPF benchmarks are run once each in separate dedicated folders and can be merged into model/quantile analysis later through their ledger and path outputs. GHPF is intentionally never run in this script.
 
 ## 5. Quantile Sweep Simulation & Reporting
+
 Run the full quantile sweep simulation:
 
 ```bash
@@ -121,6 +151,7 @@ make sim-all-quantiles
 ```
 
 This evaluates BESS trading performance across the following intervals:
+
 - `0.5–0.5`: Baseline median forecast.
 - `0.3–0.7`: Standard symmetric 40% prediction interval.
 - `0.1–0.9`: Wide 80% confidence interval.
@@ -136,9 +167,11 @@ make thesis-report
 ```
 
 This aggregates sweep outputs into:
+
 - `artifacts/thesis_benchmark_report.csv`
 
 ### 5.1 Full Grid (All Models × All Strategies × All DA Roles × All Quantile Pairs)
+
 Best practice for large benchmark campaigns is to run a timestamped grid to avoid accidental overwrites.
 
 Run the complete grid on the full test horizon:
@@ -148,18 +181,21 @@ make sim-grid-full
 ```
 
 This executes:
+
 - Models: `xgboost`, `linear`, `tft`
 - Strategies: `multi`, `da_only`, `afrr_only`
 - DA roles: `low`, `mid`, `high`
 - Quantile pairs: `p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90`
 
 Outputs are written to unique timestamped roots, e.g.:
+
 - `artifacts/simulation_runs/quantile_grid_mid_<stamp>/xgboost/...`
 - `artifacts/simulation_runs/quantile_grid_high_<stamp>/tft/...`
 
 So runs do not overwrite each other unless the same `SIM_GRID_STAMP` is reused.
 
 ### 5.2 Smoke Grid (Fast End-to-End Validation)
+
 Run a short-window version of the same full grid:
 
 ```bash
@@ -173,6 +209,7 @@ make sim-grid-smoke GRID_SMOKE_HOURS=12
 ```
 
 ### 5.3 Useful Overrides
+
 You can customize the grid with Make variables:
 
 ```bash
@@ -184,10 +221,13 @@ make sim-grid-full \
 ```
 
 ## 6. Audit & Output Artifacts
+
 For every successful run, the pipeline automatically produces an immutable deliverable archive:
+
 - `artifacts/model_runs/<run_id>_deliverable.zip`
 
 Each deliverable contains, at minimum:
+
 - Trained run `manifest.json`.
 - Metrics and evaluation outputs.
 - Simulation ledgers and summaries.
