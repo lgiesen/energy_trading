@@ -916,6 +916,15 @@ SETTLEMENT_NUMERIC_COLS = (
     "executed_id_charge_mw_for_soc_feedback",
     "executed_id_discharge_mw_for_soc_feedback",
     "rolling_soc_feedback_included_plan_id_setpoint",
+    "optimizer_id_buy_economic_leakage_flag",
+    "optimizer_id_buy_terminal_shadow_value_eur_per_internal_mwh",
+    "optimizer_id_buy_effective_cost_eur_per_internal_mwh",
+    "local_soc_end_min_target_mwh",
+    "global_final_soc_target_mwh",
+    "terminal_recovery_allowed_for_row",
+    "protected_recovery_actual_violation_mwh",
+    "protected_recovery_obligation_active",
+    "protected_soc_recovery_invalid_without_violation",
     "pnl_id_eur",
     "aFRR_Capacity_Won_MW",
     "DA_Energy_Sold_MW",
@@ -941,6 +950,8 @@ SETTLEMENT_METADATA_COLS = (
     "id_trade_type",
     "id_repair_reason",
     "id_recourse_reason",
+    "optimizer_id_buy_reason_classification_basis",
+    "optimizer_id_buy_allowed_reason",
     "optimizer_row_id_recourse_reason",
     "pending_id_recourse_reason",
     "terminal_soc_not_recoverable_reason",
@@ -1325,7 +1336,24 @@ class BatteryBacktester:
             "rolling_pf_da_sized_zero_reason": "not_evaluated",
             "rolling_pf_da_first_sized_zero_ts_utc": "",
             "rolling_pf_da_first_rejection_ts_utc": "",
+            "rolling_pf_da_first_rejection_delivery_ts_utc": "",
             "rolling_pf_da_first_rejection_reason": "not_evaluated",
+            "rolling_pf_da_first_rejection_stage": "not_evaluated",
+            "rolling_pf_da_first_rejection_candidate_buy_mw": 0.0,
+            "rolling_pf_da_first_rejection_candidate_sell_mw": 0.0,
+            "rolling_pf_da_first_rejection_existing_locked_buy_mw": 0.0,
+            "rolling_pf_da_first_rejection_existing_locked_sell_mw": 0.0,
+            "rolling_pf_da_first_rejection_soc_before_mwh": float("nan"),
+            "rolling_pf_da_first_rejection_soc_after_mwh": float("nan"),
+            "rolling_pf_da_first_rejection_soc_min_mwh": float("nan"),
+            "rolling_pf_da_first_rejection_soc_max_mwh": float("nan"),
+            "rolling_pf_da_first_rejection_soc_violation_mwh": 0.0,
+            "rolling_pf_da_first_rejection_aux_loss_mwh": float("nan"),
+            "rolling_pf_da_first_rejection_efficiency_mode": "",
+            "rolling_pf_da_first_rejection_replay_function": "",
+            "rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh": float("nan"),
+            "rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh": float("nan"),
+            "da_sizer_postlock_replay_mismatch": 0.0,
             "rolling_pf_da_rejection_stage": "not_evaluated",
             "rolling_pf_da_plan_history_stage_used": "none",
         }
@@ -1580,6 +1608,68 @@ class BatteryBacktester:
         defaults["rolling_pf_da_first_rejection_reason"] = (
             reason if stage != "candidate_available" else "none"
         )
+        defaults["rolling_pf_da_first_rejection_stage"] = stage
+        detailed_reason = _first_allowed_text("da_first_rejection_reason")
+        if detailed_reason:
+            defaults["rolling_pf_da_first_rejection_reason"] = detailed_reason
+        detailed_stage = _first_allowed_text("da_first_rejection_stage")
+        if detailed_stage:
+            defaults["rolling_pf_da_first_rejection_stage"] = detailed_stage
+            defaults["rolling_pf_da_rejection_stage"] = detailed_stage
+        defaults["rolling_pf_da_first_rejection_delivery_ts_utc"] = _first_allowed_text(
+            "da_first_rejection_delivery_ts_utc"
+        )
+        defaults["rolling_pf_da_first_rejection_candidate_buy_mw"] = _first_allowed_num(
+            "da_first_rejection_candidate_buy_mw",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_first_rejection_candidate_sell_mw"] = _first_allowed_num(
+            "da_first_rejection_candidate_sell_mw",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_first_rejection_existing_locked_buy_mw"] = _first_allowed_num(
+            "da_first_rejection_existing_locked_buy_mw",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_first_rejection_existing_locked_sell_mw"] = _first_allowed_num(
+            "da_first_rejection_existing_locked_sell_mw",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_first_rejection_soc_before_mwh"] = _first_allowed_num(
+            "da_first_rejection_soc_before_mwh"
+        )
+        defaults["rolling_pf_da_first_rejection_soc_after_mwh"] = _first_allowed_num(
+            "da_first_rejection_soc_after_mwh"
+        )
+        defaults["rolling_pf_da_first_rejection_soc_min_mwh"] = _first_allowed_num(
+            "da_first_rejection_soc_min_mwh"
+        )
+        defaults["rolling_pf_da_first_rejection_soc_max_mwh"] = _first_allowed_num(
+            "da_first_rejection_soc_max_mwh"
+        )
+        defaults["rolling_pf_da_first_rejection_soc_violation_mwh"] = _first_allowed_num(
+            "da_first_rejection_soc_violation_mwh",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_first_rejection_aux_loss_mwh"] = _first_allowed_num(
+            "da_first_rejection_aux_loss_mwh"
+        )
+        defaults["rolling_pf_da_first_rejection_efficiency_mode"] = _first_allowed_text(
+            "da_first_rejection_efficiency_mode"
+        )
+        defaults["rolling_pf_da_first_rejection_replay_function"] = _first_allowed_text(
+            "da_first_rejection_replay_function"
+        )
+        defaults["rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh"] = _first_allowed_num(
+            "da_sizer_vs_postlock_replay_delta_min_soc_mwh"
+        )
+        defaults["rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh"] = _first_allowed_num(
+            "da_sizer_vs_postlock_replay_delta_final_soc_mwh"
+        )
+        defaults["da_sizer_postlock_replay_mismatch"] = _first_allowed_num(
+            "da_sizer_postlock_replay_mismatch",
+            default=0.0,
+        )
         if stage != "candidate_available" and bool(allowed.any()):
             ts_col = "target_time_utc" if "target_time_utc" in frame.columns else "timestamp_utc"
             if ts_col in frame.columns:
@@ -1588,6 +1678,9 @@ class BatteryBacktester:
                 defaults["rolling_pf_da_first_rejection_ts_utc"] = (
                     str(ts.isoformat()) if pd.notna(ts) else str(ts_val)
                 )
+        explicit_rejection_ts = _first_allowed_text("da_first_rejection_ts_utc")
+        if explicit_rejection_ts:
+            defaults["rolling_pf_da_first_rejection_ts_utc"] = explicit_rejection_ts
         return defaults
 
     def _rolling_pf_bcm_plan_history_diagnostics(
@@ -4831,6 +4924,8 @@ class BatteryBacktester:
         current_soc_mwh: float,
         fixed_reserve_pos: dict[pd.Timestamp, float],
         fixed_reserve_neg: dict[pd.Timestamp, float],
+        future_rows: pd.DataFrame | None = None,
+        existing_da_lockbook: dict[pd.Timestamp, tuple[float, float]] | None = None,
         global_end_utc: pd.Timestamp | None = None,
     ) -> tuple[dict[pd.Timestamp, tuple[float, float]], list[dict[str, float | str]]]:
         """Clip D-1 DA lock-in bids before they can become infeasible fixed obligations."""
@@ -5143,6 +5238,18 @@ class BatteryBacktester:
                         sum(dis for _, dis in schedule.values()) * float(self.dt_h)
                     ),
                     "da_bid_sizer_method": "linprog_continuous_per_hour",
+                    "da_bid_sizer_lp_projected_soc_min_mwh": float(
+                        diag.get("projected_soc_min_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_soc_max_mwh": float(
+                        diag.get("projected_soc_max_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_final_soc_mwh": float(
+                        diag.get("projected_final_soc_mwh", np.nan)
+                    ),
+                    "da_bid_sizer_lp_projected_final_soc_shortfall_mwh": float(
+                        diag.get("projected_final_soc_shortfall_mwh", np.nan)
+                    ),
                     "da_terminal_soc_value_enabled": float(
                         shadow_components["da_terminal_soc_value_enabled"]
                     ),
@@ -5182,6 +5289,60 @@ class BatteryBacktester:
             return schedule, bool(feasible), diag
 
         def _evaluate(schedule: dict[pd.Timestamp, tuple[float, float]]) -> tuple[bool, dict[str, float | str]]:
+            if future_rows is not None and not future_rows.empty:
+                combined_lockbook: dict[pd.Timestamp, tuple[float, float]] = {}
+                for ts, pair in dict(existing_da_lockbook or {}).items():
+                    tsu = pd.to_datetime(ts, utc=True, errors="coerce")
+                    if pd.notna(tsu):
+                        combined_lockbook[pd.Timestamp(tsu)] = self._normalize_da_bid(*pair)
+                candidate_timestamps: set[pd.Timestamp] = set()
+                for ts, pair in dict(schedule or {}).items():
+                    tsu = pd.to_datetime(ts, utc=True, errors="coerce")
+                    if pd.notna(tsu):
+                        ts_key = pd.Timestamp(tsu)
+                        combined_lockbook[ts_key] = self._normalize_da_bid(*pair)
+                        candidate_timestamps.add(ts_key)
+                feasible, diag = self._project_da_postlock_future_feasibility(
+                    future_rows=future_rows,
+                    colmap=colmap,
+                    current_soc_mwh=float(current_soc_mwh),
+                    da_lockbook=combined_lockbook,
+                    fixed_reserve_pos=fixed_reserve_pos,
+                    fixed_reserve_neg=fixed_reserve_neg,
+                    global_end_utc=global_end_utc,
+                    candidate_timestamps=candidate_timestamps,
+                )
+                projected_min = float(diag.get("projected_soc_min_mwh", current_soc_mwh))
+                projected_max = float(diag.get("projected_soc_max_mwh", current_soc_mwh))
+                projected_final = float(diag.get("projected_final_soc_mwh", current_soc_mwh))
+                return bool(feasible), {
+                    "projected_soc_min_mwh": float(projected_min),
+                    "projected_soc_max_mwh": float(projected_max),
+                    "projected_final_soc_mwh": float(projected_final),
+                    "projected_power_violation_pos_mw": float(
+                        diag.get("projected_power_violation_pos_mw", 0.0) or 0.0
+                    ),
+                    "projected_power_violation_neg_mw": float(
+                        diag.get("projected_power_violation_neg_mw", 0.0) or 0.0
+                    ),
+                    "expected_auxiliary_losses_mwh": float(
+                        diag.get("expected_auxiliary_losses_mwh", 0.0) or 0.0
+                    ),
+                    "protected_soc_projection_violation_mwh": float(
+                        diag.get("protected_soc_projection_violation_mwh", 0.0) or 0.0
+                    ),
+                    "projected_final_soc_shortfall_mwh": float(
+                        max(0.0, float(self.soc_target_end) - float(projected_final))
+                    ),
+                    "da_bid_sizer_replay_function": "_project_da_postlock_future_feasibility",
+                    "da_bid_sizer_replay_scope": "future_rows_from_gate",
+                    "da_bid_sizer_first_infeasible_timestamp_utc": str(
+                        diag.get("first_infeasible_timestamp_utc", "")
+                    ),
+                    "da_bid_sizer_first_infeasible_reason": str(
+                        diag.get("infeasibility_driver_detail", diag.get("infeasibility_driver", "none"))
+                    ),
+                }
             soc = float(current_soc_mwh)
             min_soc = float(soc)
             max_soc = float(soc)
@@ -8577,6 +8738,62 @@ class BatteryBacktester:
             "rejected",
         }
         final_selected_pnl = float(no_trade_pnl) if final_selected_is_no_trade else float(final_lockable_pnl)
+
+        def _first_finite_audit_value(*cols: str) -> float:
+            for col in cols:
+                vals = pd.to_numeric(
+                    pd.Series([row.get(col, np.nan) for row in da_audit_rows]),
+                    errors="coerce",
+                ).replace([np.inf, -np.inf], np.nan).dropna()
+                if not vals.empty:
+                    return float(vals.iloc[0])
+            return float("nan")
+
+        sizer_projected_min_soc = _first_finite_audit_value(
+            "da_bid_sizer_lp_projected_soc_min_mwh",
+            "projected_soc_min_mwh",
+        )
+        sizer_projected_final_soc = _first_finite_audit_value(
+            "da_bid_sizer_lp_projected_final_soc_mwh",
+            "projected_final_soc_mwh",
+        )
+        postlock_projected_min_soc = float(candidate_failure_diag.get("projected_soc_min_mwh", np.nan))
+        postlock_projected_final_soc = float(candidate_failure_diag.get("projected_final_soc_mwh", np.nan))
+        sizer_postlock_delta_min_soc = (
+            float(postlock_projected_min_soc - sizer_projected_min_soc)
+            if np.isfinite(postlock_projected_min_soc) and np.isfinite(sizer_projected_min_soc)
+            else float("nan")
+        )
+        sizer_postlock_delta_final_soc = (
+            float(postlock_projected_final_soc - sizer_projected_final_soc)
+            if np.isfinite(postlock_projected_final_soc) and np.isfinite(sizer_projected_final_soc)
+            else float("nan")
+        )
+        sizer_postlock_replay_mismatch = float(
+            (
+                np.isfinite(sizer_postlock_delta_min_soc)
+                and abs(float(sizer_postlock_delta_min_soc)) > 1e-6
+            )
+            or (
+                np.isfinite(sizer_postlock_delta_final_soc)
+                and abs(float(sizer_postlock_delta_final_soc)) > 1e-6
+            )
+        )
+        original_postlock_reason = str(
+            candidate_failure_diag.get(
+                "infeasibility_driver_detail",
+                candidate_failure_diag.get("infeasibility_driver", "none"),
+            )
+        )
+        if (
+            float(sizer_postlock_replay_mismatch) > 0.5
+            and not bool(candidate_future_feasible)
+            and candidate_buy_mwh + candidate_sell_mwh > 1e-9
+        ):
+            candidate_failure_diag["original_infeasibility_driver_detail"] = original_postlock_reason
+            candidate_failure_diag["infeasibility_driver"] = "da_sizer_postlock_replay_mismatch"
+            candidate_failure_diag["infeasibility_driver_detail"] = "da_sizer_postlock_replay_mismatch"
+
         updated_rows: list[dict[str, float | str]] = []
         for row in da_audit_rows:
             out = dict(row)
@@ -8593,6 +8810,9 @@ class BatteryBacktester:
             )
             candidate_locked_buy_mwh_t = float(max(0.0, float(candidate_ch)) * float(self.dt_h))
             candidate_locked_sell_mwh_t = float(max(0.0, float(candidate_dis)) * float(self.dt_h))
+            existing_locked_buy_mw, existing_locked_sell_mw = (
+                base_lockbook.get(row_ts, (0.0, 0.0)) if pd.notna(row_ts) else (0.0, 0.0)
+            )
             broadcast_failure_diag = bool(
                 str(candidate_failure_diag.get("failed_timestamp_utc", "")).strip()
                 or str(candidate_failure_diag.get("first_infeasible_timestamp_utc", "")).strip()
@@ -8934,6 +9154,68 @@ class BatteryBacktester:
                     "da_postlock_failed_reason_detail": str(
                         candidate_failure_diag.get("failed_reason_detail", "") if broadcast_failure_diag else ""
                     ),
+                    "da_first_rejection_ts_utc": str(
+                        candidate_failure_diag.get(
+                            "failed_timestamp_utc",
+                            candidate_failure_diag.get("first_infeasible_timestamp_utc", ""),
+                        )
+                        if broadcast_failure_diag
+                        else ""
+                    ),
+                    "da_first_rejection_delivery_ts_utc": str(row_ts) if pd.notna(row_ts) else "",
+                    "da_first_rejection_reason": str(
+                        candidate_failure_diag.get(
+                            "infeasibility_driver_detail",
+                            candidate_failure_diag.get("infeasibility_driver", "none"),
+                        )
+                        if broadcast_failure_diag
+                        else "none"
+                    ),
+                    "da_first_rejection_stage": (
+                        "postlock_guard_zeroed_candidate"
+                        if bool(final_selected_is_no_trade) and candidate_buy_mwh + candidate_sell_mwh > 1e-9
+                        else "none"
+                    ),
+                    "da_first_rejection_candidate_buy_mw": float(candidate_ch),
+                    "da_first_rejection_candidate_sell_mw": float(candidate_dis),
+                    "da_first_rejection_existing_locked_buy_mw": float(existing_locked_buy_mw),
+                    "da_first_rejection_existing_locked_sell_mw": float(existing_locked_sell_mw),
+                    "da_first_rejection_soc_before_mwh": float(
+                        candidate_failure_diag.get("failed_soc_before_mwh", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_first_rejection_soc_after_mwh": float(
+                        candidate_failure_diag.get("failed_soc_after_mwh", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_first_rejection_soc_min_mwh": float(self.soc_min),
+                    "da_first_rejection_soc_max_mwh": float(self.soc_max),
+                    "da_first_rejection_soc_violation_mwh": float(
+                        max(
+                            0.0,
+                            float(self.soc_min)
+                            - float(candidate_failure_diag.get("failed_soc_after_mwh", self.soc_min)),
+                            float(candidate_failure_diag.get("failed_soc_after_mwh", self.soc_max))
+                            - float(self.soc_max),
+                        )
+                        if broadcast_failure_diag
+                        else 0.0
+                    ),
+                    "da_first_rejection_aux_loss_mwh": float(
+                        candidate_failure_diag.get("expected_auxiliary_losses_mwh", np.nan)
+                        if broadcast_failure_diag
+                        else np.nan
+                    ),
+                    "da_first_rejection_efficiency_mode": (
+                        f"eta_in={float(self.eta_in):.12g},eta_out={float(self.eta_out):.12g}"
+                    ),
+                    "da_first_rejection_replay_function": "_project_da_postlock_future_feasibility",
+                    "da_sizer_vs_postlock_replay_delta_min_soc_mwh": float(sizer_postlock_delta_min_soc),
+                    "da_sizer_vs_postlock_replay_delta_final_soc_mwh": float(sizer_postlock_delta_final_soc),
+                    "da_sizer_postlock_replay_mismatch": float(sizer_postlock_replay_mismatch),
+                    "da_sizer_postlock_original_rejection_reason": str(original_postlock_reason),
                     "da_retry_factor_selected": float(
                         locked_buy_mwh / candidate_buy_mwh
                         if candidate_buy_mwh > 1e-9
@@ -12071,9 +12353,12 @@ class BatteryBacktester:
                 for b in range(n_bins):
                     ub[sl["bem_pos_bin"].start + b * n + int(t)] = 0.0
                     ub[sl["bem_neg_bin"].start + b * n + int(t)] = 0.0
-        id_allowed = bool(perms.allow_id)
-        ub[sl["id_buy"]] = self.p_max_mw if id_allowed else 0.0
-        ub[sl["id_sell"]] = self.p_max_mw if id_allowed else 0.0
+        # Generic optimizer ID variables are economic setpoints only. In
+        # technical-repair mode ID must come from the explicit rescue planner,
+        # otherwise terminal SoC shadow value can monetize unrestricted ID buys.
+        id_optimizer_generic_allowed = bool(perms.allow_id_economic)
+        ub[sl["id_buy"]] = self.p_max_mw if id_optimizer_generic_allowed else 0.0
+        ub[sl["id_sell"]] = self.p_max_mw if id_optimizer_generic_allowed else 0.0
         if self.aux_mode == "state_dependent":
             lb[sl["u"]] = max(0.0, self.aux_off_mw)
             ub[sl["u"]] = self.aux_peak_mw
@@ -12748,15 +13033,79 @@ class BatteryBacktester:
         )
         terminal_id_internal_mwh = self.eta_in * id_charge_mw * self.dt_h
         terminal_id_grid_mwh = id_charge_mw * self.dt_h
-        id_reason = np.where(
-            id_charge_mw > 1e-9,
-            np.where(terminal_need > 1e-9, "terminal_soc_recovery", "protected_soc_recovery"),
-            np.where(id_discharge_mw > 1e-9, "upper_soc_relief", "none"),
-        )
         id_technical_repair_energy_cost_eur_per_mwh = (
             id_buy_objective_price
             + float(self.trans_eur_mwh)
             + float(self.deg_eur_mwh) * float(self.eta_in)
+        )
+        physical_lower_violation_mwh = np.maximum(0.0, float(self.soc_min) - soc_start_lp)
+        reserve_or_bem_obligation_active = (
+            (reserve_pos_mw > 1e-9)
+            | (reserve_neg_mw > 1e-9)
+            | (bem_pos_mw > 1e-9)
+            | (bem_neg_mw > 1e-9)
+        )
+        protected_recovery_actual_violation_mwh = np.maximum(
+            physical_lower_violation_mwh,
+            np.where(reserve_or_bem_obligation_active, np.maximum(0.0, -headroom_margin_pos), 0.0),
+        )
+        # Generic optimizer rows do not know the final delivery row in the full
+        # backtest. Terminal technical recovery is scheduled later by the
+        # explicit rescue planner, so it is not an allowed optimizer-row reason.
+        terminal_recovery_allowed_for_row = np.full(
+            n,
+            float(bool(perms.allow_id_economic)),
+            dtype=float,
+        )
+        technical_optimizer_id_leakage = (
+            np.full(n, str(perms.id_mode) == "technical_repair", dtype=bool)
+            & ((id_charge_mw > 1e-9) | (id_discharge_mw > 1e-9))
+        )
+        id_reason = np.full(n, "none", dtype=object)
+        id_reason = np.where(id_discharge_mw > 1e-9, "upper_soc_relief", id_reason)
+        id_reason = np.where(
+            id_charge_mw > 1e-9,
+            np.where(
+                (terminal_need > 1e-9) & (terminal_recovery_allowed_for_row > 0.5),
+                "terminal_soc_recovery",
+                np.where(
+                    (protected_recovery_actual_violation_mwh > 1e-9)
+                    & reserve_or_bem_obligation_active,
+                    "reserve_obligation_recovery",
+                    np.where(
+                        physical_lower_violation_mwh > 1e-9,
+                        "protected_soc_recovery",
+                        np.where(
+                            technical_optimizer_id_leakage,
+                            "invalid_optimizer_id_leakage",
+                            "protected_soc_recovery",
+                        ),
+                    ),
+                ),
+            ),
+            id_reason,
+        )
+        optimizer_id_buy_reason_classification_basis = np.where(
+            (id_charge_mw <= 1e-9) & (id_discharge_mw <= 1e-9),
+            "no_optimizer_id",
+            np.where(
+                technical_optimizer_id_leakage,
+                "technical_optimizer_id_disabled",
+                np.where(
+                    id_reason == "terminal_soc_recovery",
+                    "terminal_shortfall_allowed",
+                    np.where(
+                        id_reason == "reserve_obligation_recovery",
+                        "reserve_or_bem_headroom_gap",
+                        np.where(id_reason == "protected_soc_recovery", "physical_lower_bound_gap", "economic_id"),
+                    ),
+                ),
+            ),
+        )
+        optimizer_id_buy_allowed_reason = np.where(
+            technical_optimizer_id_leakage,
+            "none_generic_id_disabled_in_technical_repair",
+            id_reason,
         )
         effective_bcm_aux_recovery_cost_eur_per_mw = (
             (float(self.aux_standby_mw) / max(float(self.reserve_max_mw), 1e-12))
@@ -12802,6 +13151,26 @@ class BatteryBacktester:
                 "terminal_soc_id_recourse_scheduled_internal_mwh": terminal_id_internal_mwh,
                 "terminal_soc_id_recourse_cost_eur": id_charge_mw * self.dt_h * id_buy_price,
                 "id_recourse_reason": id_reason,
+                "optimizer_id_buy_reason_classification_basis": optimizer_id_buy_reason_classification_basis,
+                "optimizer_id_buy_allowed_reason": optimizer_id_buy_allowed_reason,
+                "optimizer_id_buy_economic_leakage_flag": technical_optimizer_id_leakage.astype(float),
+                "optimizer_id_buy_terminal_shadow_value_eur_per_internal_mwh": np.full(
+                    n,
+                    float(da_soc_shadow_value_eur_per_internal_mwh),
+                    dtype=float,
+                ),
+                "optimizer_id_buy_effective_cost_eur_per_internal_mwh": (
+                    id_technical_repair_energy_cost_eur_per_mwh / max(float(self.eta_in), 1e-12)
+                ),
+                "local_soc_end_min_target_mwh": np.full(
+                    n,
+                    float(terminal_target) if np.isfinite(float(terminal_target)) else np.nan,
+                    dtype=float,
+                ),
+                "global_final_soc_target_mwh": np.full(n, float(self.soc_target_end), dtype=float),
+                "terminal_recovery_allowed_for_row": terminal_recovery_allowed_for_row,
+                "protected_recovery_actual_violation_mwh": protected_recovery_actual_violation_mwh,
+                "protected_recovery_obligation_active": reserve_or_bem_obligation_active.astype(float),
                 "id_price_source": np.full(n, "da_price_plus_spread", dtype=object),
                 "id_da_reference_price_eur_mwh": p_da,
                 "id_spread_eur_mwh": np.full(n, float(self.id_rescue_spread_eur_mwh), dtype=float),
@@ -13791,6 +14160,18 @@ class BatteryBacktester:
         id_slippage_cost_eur = id_trade_mwh * self.id_rescue_spread_eur_mwh
         id_repair_reason = "none"
         id_trade_type = "none"
+        protected_recovery_physical_violation_mwh = max(0.0, float(self.soc_min) - float(soc))
+        protected_recovery_reserve_gap_mwh = max(0.0, float(req_soc_min_for_pos) - float(soc))
+        protected_recovery_obligation_active = float(max(0.0, reserve_pos) > 1e-12 or max(0.0, reserve_neg) > 1e-12)
+        protected_recovery_actual_violation_mwh = max(
+            protected_recovery_physical_violation_mwh,
+            protected_recovery_reserve_gap_mwh if protected_recovery_obligation_active > 0.5 else 0.0,
+        )
+        protected_hint_invalid = float(
+            id_reason_hint_norm == "protected_soc_recovery"
+            and protected_recovery_actual_violation_mwh <= 1e-9
+            and protected_recovery_obligation_active < 0.5
+        )
         if id_trade_mwh > 1e-12:
             if self._strategy_permissions.id_mode == "economic":
                 # Current ID implementation is reserve/SoC rescue logic.
@@ -13802,13 +14183,36 @@ class BatteryBacktester:
                 id_repair_reason = str(id_recourse_reason_hint or "soc_or_obligation_repair").strip().lower()
                 if id_repair_reason in {"", "nan", "none"}:
                     if id_buy_mwh > 1e-12 and id_sell_mwh <= 1e-12:
-                        id_repair_reason = "protected_soc_recovery"
+                        if protected_recovery_actual_violation_mwh > 1e-9:
+                            id_repair_reason = (
+                                "reserve_obligation_recovery"
+                                if protected_recovery_obligation_active > 0.5
+                                else "protected_soc_recovery"
+                            )
+                        else:
+                            id_repair_reason = "invalid_protected_soc_recovery_without_violation"
                     elif id_sell_mwh > 1e-12 and id_buy_mwh <= 1e-12:
                         id_repair_reason = "upper_soc_relief"
                     else:
                         id_repair_reason = "soc_or_obligation_repair"
+                elif id_repair_reason == "protected_soc_recovery" and protected_hint_invalid > 0.5:
+                    id_repair_reason = "invalid_protected_soc_recovery_without_violation"
+                elif (
+                    id_repair_reason == "protected_soc_recovery"
+                    and protected_recovery_obligation_active > 0.5
+                    and protected_recovery_reserve_gap_mwh > 1e-9
+                ):
+                    id_repair_reason = "reserve_obligation_recovery"
                 if id_buy_mwh <= 1e-12 and id_sell_mwh > 1e-12 and id_repair_reason == "terminal_soc_recovery":
                     id_repair_reason = "upper_soc_relief"
+        protected_soc_recovery_invalid_without_violation = float(
+            id_trade_mwh > 1e-12
+            and (
+                protected_hint_invalid > 0.5
+                or id_repair_reason == "invalid_protected_soc_recovery_without_violation"
+            )
+        )
+        optimizer_id_buy_economic_leakage_flag = float(protected_soc_recovery_invalid_without_violation)
 
         # Capacity non-delivery check on post-rescue SoC (ID already applied).
         soc_for_capacity = soc + self.eta_in * id_ch_internal - id_dis_internal / self.eta_out
@@ -14114,6 +14518,29 @@ class BatteryBacktester:
             "id_economic_pnl_eur": float((revenue_id_eur - cost_id_eur) if id_trade_type == "economic" else 0.0),
             "id_technical_repair_pnl_eur": float((revenue_id_eur - cost_id_eur) if id_trade_type == "technical_repair" else 0.0),
             "pnl_id_eur": float(revenue_id_eur - cost_id_eur),
+            "optimizer_id_buy_reason_classification_basis": (
+                "invalid_protected_hint_without_violation"
+                if protected_soc_recovery_invalid_without_violation > 0.5
+                else str(id_repair_reason)
+            ),
+            "optimizer_id_buy_allowed_reason": (
+                "none_invalid_protected_hint"
+                if protected_soc_recovery_invalid_without_violation > 0.5
+                else str(id_repair_reason)
+            ),
+            "optimizer_id_buy_economic_leakage_flag": float(optimizer_id_buy_economic_leakage_flag),
+            "optimizer_id_buy_terminal_shadow_value_eur_per_internal_mwh": 0.0,
+            "optimizer_id_buy_effective_cost_eur_per_internal_mwh": float(
+                id_buy_price_eur_mwh / max(float(self.eta_in), 1e-12)
+            ),
+            "local_soc_end_min_target_mwh": float("nan"),
+            "global_final_soc_target_mwh": float(self.soc_target_end),
+            "terminal_recovery_allowed_for_row": float(id_reason_hint_norm == "terminal_soc_recovery"),
+            "protected_recovery_actual_violation_mwh": float(protected_recovery_actual_violation_mwh),
+            "protected_recovery_obligation_active": float(protected_recovery_obligation_active),
+            "protected_soc_recovery_invalid_without_violation": float(
+                protected_soc_recovery_invalid_without_violation
+            ),
             "aux_power_mw": aux_power_mw,
             "aux_power_mode": str(self.aux_mode),
             "aux_trading_utilization": float(aux_trading_utilization),
@@ -14633,7 +15060,7 @@ class BatteryBacktester:
                 reason = "none"
                 protected_net_internal_mwh = 0.0
             else:
-                reason = "protected_soc_recovery"
+                reason = "reserve_obligation_recovery" if reserve_pos_next_mw > 1e-12 else "protected_soc_recovery"
             self._last_id_rescue_plan_diagnostics.update(
                 {
                     "protected_recovery_required_internal_mwh": float(protected_required_internal_mwh),
@@ -20598,17 +21025,19 @@ class BatteryBacktester:
                 lock_rows = snapshot_plan[
                     canonical_lock_mask.fillna(False).astype(bool)
                 ]
+                future_rows_for_da_guard = df[
+                    pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce") >= snapshot_ts_effective
+                ].copy()
                 accepted_da, da_audit_rows = self._select_feasible_da_lock_schedule(
                     lock_rows=lock_rows,
                     colmap=colmap,
                     current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
                     fixed_reserve_pos=afrr_cap_pos_lockbook,
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
+                    future_rows=future_rows_for_da_guard,
+                    existing_da_lockbook=da_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
                 )
-                future_rows_for_da_guard = df[
-                    pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce") >= snapshot_ts_effective
-                ].copy()
                 accepted_da, da_audit_rows = self._apply_da_postlock_future_guard(
                     selected_da=accepted_da,
                     da_audit_rows=da_audit_rows,
@@ -25012,7 +25441,24 @@ class BatteryBacktester:
         rolling_pf_da_zero_trade_stage = "not_evaluated"
         rolling_pf_da_plan_history_zero_reason = "not_evaluated"
         rolling_pf_da_first_rejection_ts_utc = ""
+        rolling_pf_da_first_rejection_delivery_ts_utc = ""
         rolling_pf_da_first_rejection_reason = "not_evaluated"
+        rolling_pf_da_first_rejection_stage = "not_evaluated"
+        rolling_pf_da_first_rejection_candidate_buy_mw = 0.0
+        rolling_pf_da_first_rejection_candidate_sell_mw = 0.0
+        rolling_pf_da_first_rejection_existing_locked_buy_mw = 0.0
+        rolling_pf_da_first_rejection_existing_locked_sell_mw = 0.0
+        rolling_pf_da_first_rejection_soc_before_mwh = float("nan")
+        rolling_pf_da_first_rejection_soc_after_mwh = float("nan")
+        rolling_pf_da_first_rejection_soc_min_mwh = float("nan")
+        rolling_pf_da_first_rejection_soc_max_mwh = float("nan")
+        rolling_pf_da_first_rejection_soc_violation_mwh = 0.0
+        rolling_pf_da_first_rejection_aux_loss_mwh = float("nan")
+        rolling_pf_da_first_rejection_efficiency_mode = ""
+        rolling_pf_da_first_rejection_replay_function = ""
+        rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh = float("nan")
+        rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh = float("nan")
+        da_sizer_postlock_replay_mismatch = 0.0
         rolling_pf_da_rejection_stage = "not_evaluated"
         rolling_pf_da_submitted_buy_mwh = 0.0
         rolling_pf_da_submitted_sell_mwh = 0.0
@@ -25623,7 +26069,54 @@ class BatteryBacktester:
             rolling_pf_da_sized_zero_reason = str(pf_plan_diag["rolling_pf_da_sized_zero_reason"])
             rolling_pf_da_first_sized_zero_ts_utc = str(pf_plan_diag["rolling_pf_da_first_sized_zero_ts_utc"])
             rolling_pf_da_first_rejection_ts_utc = str(pf_plan_diag["rolling_pf_da_first_rejection_ts_utc"])
+            rolling_pf_da_first_rejection_delivery_ts_utc = str(
+                pf_plan_diag["rolling_pf_da_first_rejection_delivery_ts_utc"]
+            )
             rolling_pf_da_first_rejection_reason = str(pf_plan_diag["rolling_pf_da_first_rejection_reason"])
+            rolling_pf_da_first_rejection_stage = str(pf_plan_diag["rolling_pf_da_first_rejection_stage"])
+            rolling_pf_da_first_rejection_candidate_buy_mw = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_candidate_buy_mw"]
+            )
+            rolling_pf_da_first_rejection_candidate_sell_mw = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_candidate_sell_mw"]
+            )
+            rolling_pf_da_first_rejection_existing_locked_buy_mw = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_existing_locked_buy_mw"]
+            )
+            rolling_pf_da_first_rejection_existing_locked_sell_mw = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_existing_locked_sell_mw"]
+            )
+            rolling_pf_da_first_rejection_soc_before_mwh = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_soc_before_mwh"]
+            )
+            rolling_pf_da_first_rejection_soc_after_mwh = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_soc_after_mwh"]
+            )
+            rolling_pf_da_first_rejection_soc_min_mwh = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_soc_min_mwh"]
+            )
+            rolling_pf_da_first_rejection_soc_max_mwh = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_soc_max_mwh"]
+            )
+            rolling_pf_da_first_rejection_soc_violation_mwh = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_soc_violation_mwh"]
+            )
+            rolling_pf_da_first_rejection_aux_loss_mwh = float(
+                pf_plan_diag["rolling_pf_da_first_rejection_aux_loss_mwh"]
+            )
+            rolling_pf_da_first_rejection_efficiency_mode = str(
+                pf_plan_diag["rolling_pf_da_first_rejection_efficiency_mode"]
+            )
+            rolling_pf_da_first_rejection_replay_function = str(
+                pf_plan_diag["rolling_pf_da_first_rejection_replay_function"]
+            )
+            rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh = float(
+                pf_plan_diag["rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh"]
+            )
+            rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh = float(
+                pf_plan_diag["rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh"]
+            )
+            da_sizer_postlock_replay_mismatch = float(pf_plan_diag["da_sizer_postlock_replay_mismatch"])
             rolling_pf_da_rejection_stage = str(pf_plan_diag["rolling_pf_da_rejection_stage"])
             pf_bcm_plan_diag = self._rolling_pf_bcm_plan_history_diagnostics(
                 perfect_foresight_plan_history,
@@ -26644,6 +27137,49 @@ class BatteryBacktester:
         hourly["rolling_pf_da_sized_candidate_pnl_eur"] = float(rolling_pf_da_sized_candidate_pnl_eur)
         hourly["rolling_pf_da_sized_zero_reason"] = str(rolling_pf_da_sized_zero_reason)
         hourly["rolling_pf_da_first_sized_zero_ts_utc"] = str(rolling_pf_da_first_sized_zero_ts_utc)
+        hourly["rolling_pf_da_first_rejection_ts_utc"] = str(rolling_pf_da_first_rejection_ts_utc)
+        hourly["rolling_pf_da_first_rejection_delivery_ts_utc"] = str(
+            rolling_pf_da_first_rejection_delivery_ts_utc
+        )
+        hourly["rolling_pf_da_first_rejection_reason"] = str(rolling_pf_da_first_rejection_reason)
+        hourly["rolling_pf_da_first_rejection_stage"] = str(rolling_pf_da_first_rejection_stage)
+        hourly["rolling_pf_da_first_rejection_candidate_buy_mw"] = float(
+            rolling_pf_da_first_rejection_candidate_buy_mw
+        )
+        hourly["rolling_pf_da_first_rejection_candidate_sell_mw"] = float(
+            rolling_pf_da_first_rejection_candidate_sell_mw
+        )
+        hourly["rolling_pf_da_first_rejection_existing_locked_buy_mw"] = float(
+            rolling_pf_da_first_rejection_existing_locked_buy_mw
+        )
+        hourly["rolling_pf_da_first_rejection_existing_locked_sell_mw"] = float(
+            rolling_pf_da_first_rejection_existing_locked_sell_mw
+        )
+        hourly["rolling_pf_da_first_rejection_soc_before_mwh"] = float(
+            rolling_pf_da_first_rejection_soc_before_mwh
+        )
+        hourly["rolling_pf_da_first_rejection_soc_after_mwh"] = float(
+            rolling_pf_da_first_rejection_soc_after_mwh
+        )
+        hourly["rolling_pf_da_first_rejection_soc_min_mwh"] = float(rolling_pf_da_first_rejection_soc_min_mwh)
+        hourly["rolling_pf_da_first_rejection_soc_max_mwh"] = float(rolling_pf_da_first_rejection_soc_max_mwh)
+        hourly["rolling_pf_da_first_rejection_soc_violation_mwh"] = float(
+            rolling_pf_da_first_rejection_soc_violation_mwh
+        )
+        hourly["rolling_pf_da_first_rejection_aux_loss_mwh"] = float(rolling_pf_da_first_rejection_aux_loss_mwh)
+        hourly["rolling_pf_da_first_rejection_efficiency_mode"] = str(
+            rolling_pf_da_first_rejection_efficiency_mode
+        )
+        hourly["rolling_pf_da_first_rejection_replay_function"] = str(
+            rolling_pf_da_first_rejection_replay_function
+        )
+        hourly["rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh"] = float(
+            rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh
+        )
+        hourly["rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh"] = float(
+            rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh
+        )
+        hourly["da_sizer_postlock_replay_mismatch"] = float(da_sizer_postlock_replay_mismatch)
         hourly["rolling_pf_da_submitted_buy_mwh"] = float(rolling_pf_da_submitted_buy_mwh)
         hourly["rolling_pf_da_submitted_sell_mwh"] = float(rolling_pf_da_submitted_sell_mwh)
         hourly["rolling_pf_da_auction_accepted_buy_mwh"] = float(rolling_pf_da_auction_accepted_buy_mwh)
@@ -27695,7 +28231,48 @@ class BatteryBacktester:
             "rolling_pf_da_sized_zero_reason": str(rolling_pf_da_sized_zero_reason),
             "rolling_pf_da_first_sized_zero_ts_utc": str(rolling_pf_da_first_sized_zero_ts_utc),
             "rolling_pf_da_first_rejection_ts_utc": str(rolling_pf_da_first_rejection_ts_utc),
+            "rolling_pf_da_first_rejection_delivery_ts_utc": str(
+                rolling_pf_da_first_rejection_delivery_ts_utc
+            ),
             "rolling_pf_da_first_rejection_reason": str(rolling_pf_da_first_rejection_reason),
+            "rolling_pf_da_first_rejection_stage": str(rolling_pf_da_first_rejection_stage),
+            "rolling_pf_da_first_rejection_candidate_buy_mw": float(
+                rolling_pf_da_first_rejection_candidate_buy_mw
+            ),
+            "rolling_pf_da_first_rejection_candidate_sell_mw": float(
+                rolling_pf_da_first_rejection_candidate_sell_mw
+            ),
+            "rolling_pf_da_first_rejection_existing_locked_buy_mw": float(
+                rolling_pf_da_first_rejection_existing_locked_buy_mw
+            ),
+            "rolling_pf_da_first_rejection_existing_locked_sell_mw": float(
+                rolling_pf_da_first_rejection_existing_locked_sell_mw
+            ),
+            "rolling_pf_da_first_rejection_soc_before_mwh": float(
+                rolling_pf_da_first_rejection_soc_before_mwh
+            ),
+            "rolling_pf_da_first_rejection_soc_after_mwh": float(
+                rolling_pf_da_first_rejection_soc_after_mwh
+            ),
+            "rolling_pf_da_first_rejection_soc_min_mwh": float(rolling_pf_da_first_rejection_soc_min_mwh),
+            "rolling_pf_da_first_rejection_soc_max_mwh": float(rolling_pf_da_first_rejection_soc_max_mwh),
+            "rolling_pf_da_first_rejection_soc_violation_mwh": float(
+                rolling_pf_da_first_rejection_soc_violation_mwh
+            ),
+            "rolling_pf_da_first_rejection_aux_loss_mwh": float(rolling_pf_da_first_rejection_aux_loss_mwh),
+            "rolling_pf_da_first_rejection_efficiency_mode": str(
+                rolling_pf_da_first_rejection_efficiency_mode
+            ),
+            "rolling_pf_da_first_rejection_replay_function": str(
+                rolling_pf_da_first_rejection_replay_function
+            ),
+            "rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh": float(
+                rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh
+            ),
+            "rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh": float(
+                rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh
+            ),
+            "da_sizer_postlock_replay_mismatch": float(da_sizer_postlock_replay_mismatch),
             "rolling_pf_da_rejection_stage": str(rolling_pf_da_rejection_stage),
             "rolling_pf_da_volume_loss_stage": str(rolling_pf_da_volume_loss_stage),
             "rolling_pf_da_volume_loss_reason": str(rolling_pf_da_volume_loss_reason),
@@ -28206,6 +28783,30 @@ class BatteryBacktester:
         summary["protected_soc_recovery_id_mwh"] = float(id_buy_mwh.loc[id_reason_series.eq("protected_soc_recovery")].sum())
         summary["reserve_obligation_recovery_id_mwh"] = float(
             id_buy_mwh.loc[id_reason_series.eq("reserve_obligation_recovery")].sum()
+        )
+        summary["invalid_protected_soc_recovery_id_mwh"] = float(
+            id_buy_mwh.loc[id_reason_series.eq("invalid_protected_soc_recovery_without_violation")].sum()
+        )
+        def _hourly_num_any(*cols: str, default: float = 0.0) -> pd.Series:
+            for col_name in cols:
+                if col_name in hourly.columns:
+                    return pd.to_numeric(hourly[col_name], errors="coerce").fillna(float(default))
+            return pd.Series(float(default), index=hourly.index, dtype="float64")
+
+        summary["optimizer_id_buy_economic_leakage_flag"] = float(
+            _hourly_num_any("real_optimizer_id_buy_economic_leakage_flag", "optimizer_id_buy_economic_leakage_flag").max()
+        )
+        summary["protected_soc_recovery_invalid_without_violation"] = float(
+            _hourly_num_any(
+                "real_protected_soc_recovery_invalid_without_violation",
+                "protected_soc_recovery_invalid_without_violation",
+            ).max()
+        )
+        summary["protected_recovery_actual_violation_mwh"] = float(
+            _hourly_num_any("real_protected_recovery_actual_violation_mwh", "protected_recovery_actual_violation_mwh").max()
+        )
+        summary["protected_recovery_obligation_active"] = float(
+            _hourly_num_any("real_protected_recovery_obligation_active", "protected_recovery_obligation_active").max()
         )
         summary["upper_soc_relief_id_mwh"] = float(id_sell_mwh.loc[id_reason_series.eq("upper_soc_relief")].sum())
         summary["realized_total_pnl_excluding_id_eur"] = float(summary["realized_total_pnl_eur"] - summary["total_id_pnl_eur"])
@@ -29917,6 +30518,11 @@ class BatteryBacktester:
                 invalid_reasons.append("unspecified_id_recourse")
             if float(summary.get("terminal_economic_pass_physical_fail", 0.0)) > 0.5:
                 invalid_reasons.append("terminal_economic_repair_without_physical_repair")
+            if (
+                float(summary.get("protected_soc_recovery_invalid_without_violation", 0.0)) > 0.5
+                or float(summary.get("optimizer_id_buy_economic_leakage_flag", 0.0)) > 0.5
+            ):
+                invalid_reasons.append("invalid_protected_soc_recovery")
             if float(summary.get("terminal_recovery_physical_shortfall_after_recovery", 0.0)) > 0.5:
                 invalid_reasons.append("terminal_soc_physical_shortfall_after_recovery")
             if float(summary.get("upper_soc_relief_caused_terminal_shortfall_count", 0.0)) > 0.5:
@@ -30397,7 +31003,24 @@ class BatteryBacktester:
             ("rolling_pf_da_sized_zero_reason", ""),
             ("rolling_pf_da_first_sized_zero_ts_utc", ""),
             ("rolling_pf_da_first_rejection_ts_utc", ""),
+            ("rolling_pf_da_first_rejection_delivery_ts_utc", ""),
             ("rolling_pf_da_first_rejection_reason", ""),
+            ("rolling_pf_da_first_rejection_stage", ""),
+            ("rolling_pf_da_first_rejection_candidate_buy_mw", 0.0),
+            ("rolling_pf_da_first_rejection_candidate_sell_mw", 0.0),
+            ("rolling_pf_da_first_rejection_existing_locked_buy_mw", 0.0),
+            ("rolling_pf_da_first_rejection_existing_locked_sell_mw", 0.0),
+            ("rolling_pf_da_first_rejection_soc_before_mwh", float("nan")),
+            ("rolling_pf_da_first_rejection_soc_after_mwh", float("nan")),
+            ("rolling_pf_da_first_rejection_soc_min_mwh", float("nan")),
+            ("rolling_pf_da_first_rejection_soc_max_mwh", float("nan")),
+            ("rolling_pf_da_first_rejection_soc_violation_mwh", 0.0),
+            ("rolling_pf_da_first_rejection_aux_loss_mwh", float("nan")),
+            ("rolling_pf_da_first_rejection_efficiency_mode", ""),
+            ("rolling_pf_da_first_rejection_replay_function", ""),
+            ("rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh", float("nan")),
+            ("rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh", float("nan")),
+            ("da_sizer_postlock_replay_mismatch", 0.0),
             ("rolling_pf_da_rejection_stage", ""),
             ("rolling_pf_da_volume_loss_stage", ""),
             ("rolling_pf_da_volume_loss_reason", ""),
@@ -30522,6 +31145,17 @@ class BatteryBacktester:
             ("global_perfect_foresight_pnl_reconciliation_error_eur", float("nan")),
             ("pf_failure_reason", ""),
             ("perfect_foresight_total_pnl_eur", float("nan")),
+            ("optimizer_id_buy_reason_classification_basis", ""),
+            ("optimizer_id_buy_allowed_reason", ""),
+            ("optimizer_id_buy_economic_leakage_flag", 0.0),
+            ("optimizer_id_buy_terminal_shadow_value_eur_per_internal_mwh", 0.0),
+            ("optimizer_id_buy_effective_cost_eur_per_internal_mwh", float("nan")),
+            ("local_soc_end_min_target_mwh", float("nan")),
+            ("global_final_soc_target_mwh", float(self.soc_target_end)),
+            ("terminal_recovery_allowed_for_row", 0.0),
+            ("protected_recovery_actual_violation_mwh", 0.0),
+            ("protected_recovery_obligation_active", 0.0),
+            ("protected_soc_recovery_invalid_without_violation", 0.0),
             ("final_soc_handling_mode", "terminal_settlement_to_target"),
             ("terminal_soc_net_adjustment_eur", 0.0),
             ("terminal_price_eur_mwh", 0.0),

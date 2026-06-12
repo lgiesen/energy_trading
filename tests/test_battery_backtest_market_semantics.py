@@ -1010,7 +1010,10 @@ def test_technical_id_repair_penalty_does_not_suppress_positive_bcm_ev() -> None
     )
 
     assert pd.to_numeric(out["reserve_pos_mw"], errors="coerce").fillna(0.0).sum() > 0.0
-    assert pd.to_numeric(out["id_charge_mw"], errors="coerce").fillna(0.0).sum() > 0.0
+    assert pd.to_numeric(out["id_charge_mw"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
+    assert pd.to_numeric(out["id_discharge_mw"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
+    assert pd.to_numeric(out["optimizer_id_buy_economic_leakage_flag"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
+    assert set(out["optimizer_id_buy_allowed_reason"].astype(str)) == {"none"}
     assert pd.to_numeric(out["id_technical_repair_artificial_penalty_applied"], errors="coerce").eq(0.0).all()
     assert pd.to_numeric(out["id_technical_repair_energy_cost_eur_per_mwh"], errors="coerce").max() < 1e17
     assert float(pd.to_numeric(out["soc_lp_mwh"], errors="coerce").iloc[-1]) >= 10.0 - 1e-6
@@ -5731,6 +5734,86 @@ def test_da_rhpf_plan_history_diagnostics_explain_sized_candidate_zeroed() -> No
     assert str(diag["rolling_pf_da_first_sized_zero_ts_utc"]) == "2025-03-02T13:00:00+00:00"
     assert float(diag["rolling_pf_da_raw_candidate_pnl_eur"]) == pytest.approx(50.0)
     assert float(diag["rolling_pf_da_sized_candidate_pnl_eur"]) == pytest.approx(0.0)
+
+
+def test_da_sizer_future_replay_keeps_soc_min_feasible_candidate() -> None:
+    bt = _mk_backtester()
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    df, col = _tiny_backtest_df(hours=1)
+    df[col.pred_da_price] = 250.0
+    lock_rows = df.copy()
+    lock_rows["target_time_utc"] = lock_rows[col.timestamp]
+    lock_rows["charge_mw"] = 0.0
+    lock_rows["discharge_mw"] = 0.1
+
+    selected, audit_rows = bt._select_feasible_da_lock_schedule(
+        lock_rows=lock_rows,
+        colmap=col,
+        current_soc_mwh=2.25,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=df,
+        existing_da_lockbook={},
+        global_end_utc=None,
+    )
+
+    assert selected
+    assert sum(dis for _, dis in selected.values()) > 0.0
+    assert audit_rows
+    assert max(float(row["da_selected_lockable_sell_mw"]) for row in audit_rows) > 0.0
+    assert min(float(row["da_bid_sizer_lp_projected_soc_min_mwh"]) for row in audit_rows) >= bt.soc_min - 1e-6
+
+
+def test_da_rhpf_plan_history_diagnostics_export_postlock_replay_mismatch() -> None:
+    bt = _mk_backtester()
+    plan_history = pd.DataFrame(
+        {
+            "target_time_utc": pd.to_datetime(["2025-03-03T23:00:00Z"]),
+            "plan_history_stage": ["post_precommit"],
+            "da_candidate_allowed_by_gate_window": [1.0],
+            "raw_optimizer_charge_mw_before_da_gate_mask": [0.0],
+            "raw_optimizer_discharge_mw_before_da_gate_mask": [5.0],
+            "da_precommit_da_sized_candidate_buy_mw": [0.0],
+            "da_precommit_da_sized_candidate_sell_mw": [4.0],
+            "da_precommit_da_postlock_candidate_buy_mw": [0.0],
+            "da_precommit_da_postlock_candidate_sell_mw": [0.0],
+            "da_precommit_da_selected_lockable_buy_mw": [0.0],
+            "da_precommit_da_selected_lockable_sell_mw": [0.0],
+            "da_first_rejection_ts_utc": ["2025-03-03T23:00:00+00:00"],
+            "da_first_rejection_delivery_ts_utc": ["2025-03-03T23:00:00+00:00"],
+            "da_first_rejection_reason": ["da_sizer_postlock_replay_mismatch"],
+            "da_first_rejection_stage": ["postlock_guard_zeroed_candidate"],
+            "da_first_rejection_candidate_buy_mw": [0.0],
+            "da_first_rejection_candidate_sell_mw": [4.0],
+            "da_first_rejection_existing_locked_buy_mw": [0.0],
+            "da_first_rejection_existing_locked_sell_mw": [0.0],
+            "da_first_rejection_soc_before_mwh": [2.50],
+            "da_first_rejection_soc_after_mwh": [1.95],
+            "da_first_rejection_soc_min_mwh": [2.0],
+            "da_first_rejection_soc_max_mwh": [18.0],
+            "da_first_rejection_soc_violation_mwh": [0.05],
+            "da_first_rejection_aux_loss_mwh": [0.05],
+            "da_first_rejection_efficiency_mode": ["eta_in=0.92,eta_out=0.92"],
+            "da_first_rejection_replay_function": ["_project_da_postlock_future_feasibility"],
+            "da_sizer_vs_postlock_replay_delta_min_soc_mwh": [-0.1753],
+            "da_sizer_vs_postlock_replay_delta_final_soc_mwh": [-0.1753],
+            "da_sizer_postlock_replay_mismatch": [1.0],
+            "da_bid_sizer_lp_projected_soc_min_mwh": [2.1253],
+            "da_bid_sizer_lp_projected_final_soc_mwh": [2.1253],
+            "da_postlock_infeasibility_driver_detail": ["locked_da_hourly_soc_min_infeasible"],
+        }
+    )
+
+    diag = bt._rolling_pf_da_plan_history_diagnostics(plan_history)
+
+    assert str(diag["rolling_pf_da_zero_trade_stage"]) == "postlock_guard_zeroed_candidate"
+    assert str(diag["rolling_pf_da_first_rejection_reason"]) == "da_sizer_postlock_replay_mismatch"
+    assert str(diag["rolling_pf_da_first_rejection_ts_utc"]) == "2025-03-03T23:00:00+00:00"
+    assert float(diag["rolling_pf_da_first_rejection_candidate_sell_mw"]) == pytest.approx(4.0)
+    assert float(diag["rolling_pf_da_first_rejection_soc_violation_mwh"]) == pytest.approx(0.05)
+    assert float(diag["rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh"]) == pytest.approx(-0.1753)
+    assert float(diag["da_sizer_postlock_replay_mismatch"]) == pytest.approx(1.0)
 
 
 def test_da_rhpf_price_taker_uses_true_da_prices() -> None:
@@ -16839,6 +16922,157 @@ def test_terminal_inventory_main_milp_objective_coefficient_is_negative_lambda()
     assert float(out["terminal_inventory_objective_coef_soc_end"].iloc[0]) == pytest.approx(-100.0)
     assert str(out["terminal_inventory_value_source"].iloc[0]) == "da_liquidation_replacement_proxy"
     assert float(out["da_soc_shadow_value_eur_per_internal_mwh"].iloc[0]) == pytest.approx(100.0)
+
+
+def test_technical_repair_optimizer_id_does_not_monetize_terminal_shadow_value() -> None:
+    bt = _mk_backtester()
+    bt.da_terminal_soc_value_enabled = True
+    bt.da_terminal_value_min_eur_mwh = 1000.0
+    bt.da_terminal_value_max_eur_mwh = 1000.0
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_trading_mw = 0.0
+    df, col = _tiny_backtest_df(hours=2)
+    df[col.pred_da_price] = 50.0
+    df[col.true_da_price] = 50.0
+
+    out = bt.optimize_dispatch(
+        df,
+        col,
+        soc_start=4.07,
+        soc_end_min_target=2.0,
+        allowed_markets=("ID",),
+        strategy_permissions=StrategyPermissions(False, "technical_repair", False, False, False),
+    )
+
+    assert pd.to_numeric(out["id_charge_mw"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
+    assert pd.to_numeric(out["id_discharge_mw"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
+    assert pd.to_numeric(out["optimizer_id_buy_economic_leakage_flag"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
+    assert set(out["optimizer_id_buy_reason_classification_basis"].astype(str)) == {"no_optimizer_id"}
+
+
+def test_terminal_soc_recovery_classified_only_when_terminal_recovery_allowed() -> None:
+    bt = _mk_backtester()
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+
+    charge, discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=4.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=4.0,
+        terminal_recovery_allowed=True,
+        terminal_hard_soc_protection=True,
+    )
+
+    assert charge > 0.0
+    assert discharge == pytest.approx(0.0)
+    assert reason == "terminal_soc_recovery"
+
+
+def test_terminal_shortfall_not_bought_when_terminal_recovery_not_allowed() -> None:
+    bt = _mk_backtester()
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+
+    charge, discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=4.0,
+        reserve_pos_next_mw=0.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=10.0,
+        projected_terminal_soc_without_new_id_mwh=4.0,
+        terminal_recovery_allowed=False,
+        terminal_hard_soc_protection=True,
+    )
+
+    assert charge == pytest.approx(0.0)
+    assert discharge == pytest.approx(0.0)
+    assert reason == "none"
+
+
+def test_settlement_flags_protected_soc_recovery_hint_without_violation() -> None:
+    bt = _mk_backtester()
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=True,
+        id_mode="technical_repair",
+        allow_bcm=False,
+        allow_bcm_activation_obligations=False,
+        allow_bem_only=False,
+    )
+
+    _, metrics = bt._settle_one_hour(
+        soc=4.07,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=1.0,
+        id_recourse_reason_hint="protected_soc_recovery",
+    )
+
+    assert metrics["id_recourse_reason"] == "invalid_protected_soc_recovery_without_violation"
+    assert float(metrics["protected_soc_recovery_invalid_without_violation"]) == pytest.approx(1.0)
+    assert float(metrics["optimizer_id_buy_economic_leakage_flag"]) == pytest.approx(1.0)
+    assert float(metrics["protected_recovery_actual_violation_mwh"]) == pytest.approx(0.0)
+
+
+def test_reserve_obligation_recovery_reason_preserved_for_real_lower_gap() -> None:
+    bt = _mk_backtester()
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    charge, discharge, reason = bt._plan_id_rescue_for_next_hour(
+        soc_next=2.1,
+        reserve_pos_next_mw=4.0,
+        reserve_neg_next_mw=0.0,
+        da_charge_next_mw=0.0,
+        da_discharge_next_mw=0.0,
+        terminal_soc_target_mwh=None,
+    )
+
+    assert charge > 0.0
+    assert discharge == pytest.approx(0.0)
+    assert reason == "reserve_obligation_recovery"
+
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=False,
+        id_mode="technical_repair",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=False,
+    )
+    _, metrics = bt._settle_one_hour(
+        soc=2.1,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=4.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        id_charge_mw=charge,
+        id_recourse_reason_hint="protected_soc_recovery",
+    )
+    assert metrics["id_recourse_reason"] == "reserve_obligation_recovery"
+    assert float(metrics["protected_recovery_obligation_active"]) == pytest.approx(1.0)
+    assert float(metrics["protected_recovery_actual_violation_mwh"]) > 0.0
 
 
 def test_terminal_inventory_da_buy_and_sell_effects_use_execution_probability() -> None:
