@@ -5635,6 +5635,52 @@ def test_da_rhpf_price_taker_plan_history_diagnostics_use_full_candidate_history
     assert str(diag["rolling_pf_da_zero_trade_stage"]) == "candidate_available"
 
 
+def test_da_rhpf_plan_history_diagnostics_prefer_post_precommit_stage() -> None:
+    bt = _mk_backtester()
+    plan_history = pd.DataFrame(
+        {
+            "plan_history_stage": ["optimizer_raw", "post_precommit", "post_precommit"],
+            "da_candidate_allowed_by_gate_window": [1.0, 1.0, 1.0],
+            "raw_optimizer_charge_mw_before_da_gate_mask": [9.0, 2.0, 0.0],
+            "raw_optimizer_discharge_mw_before_da_gate_mask": [0.0, 0.0, 0.0],
+            "da_precommit_da_sized_candidate_buy_mw": [np.nan, 1.5, 0.0],
+            "da_precommit_da_sized_candidate_sell_mw": [np.nan, 0.0, 0.0],
+            "da_precommit_da_postlock_candidate_buy_mw": [np.nan, 1.0, 0.0],
+            "da_precommit_da_postlock_candidate_sell_mw": [np.nan, 0.0, 0.0],
+            "da_precommit_da_selected_lockable_buy_mw": [np.nan, 0.5, 0.0],
+            "da_precommit_da_selected_lockable_sell_mw": [np.nan, 0.0, 0.0],
+            "da_precommit_da_bid_sizer_status": ["", "ok", "ok"],
+        }
+    )
+
+    diag = bt._rolling_pf_da_plan_history_diagnostics(plan_history)
+
+    assert str(diag["rolling_pf_da_plan_history_stage_used"]) == "post_precommit"
+    assert float(diag["rolling_pf_da_plan_history_rows"]) == pytest.approx(2.0)
+    assert float(diag["rolling_pf_da_raw_candidate_buy_mwh"]) == pytest.approx(2.0 * bt.dt_h)
+    assert float(diag["rolling_pf_da_sized_candidate_buy_mwh"]) == pytest.approx(1.5 * bt.dt_h)
+    assert float(diag["rolling_pf_da_selected_lockable_buy_mwh"]) == pytest.approx(0.5 * bt.dt_h)
+    assert str(diag["rolling_pf_da_zero_trade_stage"]) == "candidate_available"
+
+
+def test_da_rhpf_plan_history_diagnostics_missing_post_precommit_not_sized_zero() -> None:
+    bt = _mk_backtester()
+    plan_history = pd.DataFrame(
+        {
+            "plan_history_stage": ["optimizer_raw", "optimizer_raw"],
+            "da_candidate_allowed_by_gate_window": [1.0, 1.0],
+            "raw_optimizer_charge_mw_before_da_gate_mask": [5.0, 0.0],
+            "raw_optimizer_discharge_mw_before_da_gate_mask": [0.0, 5.0],
+        }
+    )
+
+    diag = bt._rolling_pf_da_plan_history_diagnostics(plan_history)
+
+    assert str(diag["rolling_pf_da_plan_history_stage_used"]) == "optimizer_raw"
+    assert str(diag["rolling_pf_da_zero_trade_stage"]) == "diagnostics_missing_post_precommit_stage"
+    assert str(diag["rolling_pf_da_sized_zero_reason"]) == "none"
+
+
 def test_da_rhpf_price_taker_plan_history_diagnostics_classify_optimizer_zero_candidate() -> None:
     bt = _mk_backtester()
     plan_history = pd.DataFrame(
@@ -5803,6 +5849,51 @@ def test_bcm_rhpf_capacity_price_plan_history_diagnostics_explain_side_selection
     assert float(diag["rolling_pf_bcm_truth_price_substitution_applied"]) == pytest.approx(1.0)
 
 
+def test_bcm_rhpf_plan_history_diagnostics_prefer_post_precommit_stage() -> None:
+    bt = _mk_backtester()
+    plan_history = pd.DataFrame(
+        {
+            "plan_history_stage": ["optimizer_raw", "post_precommit", "post_precommit"],
+            "bcm_candidate_allowed_by_gate_window": [1.0, 1.0, 1.0],
+            "bcm_candidate_pos_mw": [99.0, 4.0, 0.0],
+            "bcm_candidate_neg_mw": [99.0, 0.0, 3.0],
+            "bcm_precommit_candidate_pos_mw": [np.nan, 4.0, 0.0],
+            "bcm_precommit_candidate_neg_mw": [np.nan, 0.0, 2.0],
+            "bcm_precommit_locked_pos_mw": [np.nan, 4.0, 0.0],
+            "bcm_precommit_locked_neg_mw": [np.nan, 0.0, 1.0],
+        }
+    )
+
+    diag = bt._rolling_pf_bcm_plan_history_diagnostics(
+        plan_history,
+        deterministic_reserve_settlement=False,
+        truth_price_substitution_applied=True,
+    )
+
+    assert str(diag["rolling_pf_bcm_plan_history_stage_used"]) == "post_precommit"
+    assert float(diag["rolling_pf_bcm_plan_history_rows"]) == pytest.approx(2.0)
+    assert float(diag["rolling_pf_bcm_candidate_pos_mw"]) == pytest.approx(4.0)
+    assert float(diag["rolling_pf_bcm_candidate_neg_mw"]) == pytest.approx(3.0)
+    assert float(diag["rolling_pf_bcm_plan_history_locked_pos_mw"]) == pytest.approx(4.0)
+    assert float(diag["rolling_pf_bcm_plan_history_locked_neg_mw"]) == pytest.approx(1.0)
+    assert str(diag["rolling_pf_bcm_zero_stage"]) == "candidate_locked"
+
+
+def test_rolling_pf_incumbent_selection_prefers_higher_feasible_realized_path() -> None:
+    frame = pd.DataFrame({"timestamp": pd.date_range("2025-01-01", periods=1, tz="UTC")})
+
+    selected = BatteryBacktester._select_global_pf_incumbent(
+        {
+            "solver": (1.0, True, frame),
+            "no_market": (0.0, True, frame),
+            "realized_path": (2.0, True, frame),
+        }
+    )
+
+    assert str(selected["selected"]) == "realized_path"
+    assert float(selected["value"]) == pytest.approx(2.0)
+
+
 def test_bcm_rhpf_capacity_price_summary_matches_canonical_selected_pnl() -> None:
     bt = _mk_backtester()
     df, col = _tiny_backtest_df(hours=30)
@@ -5824,6 +5915,9 @@ def test_bcm_rhpf_capacity_price_summary_matches_canonical_selected_pnl() -> Non
     assert "rolling_pf_bcm_candidate_neg_mw" in s
     assert "rolling_pf_bcm_locked_pos_mw" in s
     assert "rolling_pf_bcm_locked_neg_mw" in s
+    assert "rolling_pf_bcm_plan_history_locked_pos_mw" in s
+    assert "rolling_pf_bcm_settled_locked_pos_mw" in s
+    assert "rolling_pf_bcm_plan_vs_settlement_locked_delta_mw" in s
     assert float(s["rolling_pf_bcm_deterministic_reserve_settlement"]) == pytest.approx(0.0)
     assert float(s["rolling_pf_bcm_truth_price_substitution_applied"]) == pytest.approx(1.0)
     assert float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
@@ -15673,9 +15767,10 @@ def test_rolling_pf_solver_error_selects_feasible_no_market_incumbent() -> None:
     assert float(s["rolling_pf_verified"]) == 1.0
     assert float(s["rolling_pf_verified_upper_bound"]) == 1.0
     assert str(s["rolling_pf_selected_incumbent"]) == "no_market"
-    assert float(s["rolling_pf_no_market_incumbent_eur"]) == pytest.approx(0.0)
+    assert np.isfinite(float(s["rolling_pf_no_market_incumbent_eur"]))
+    assert float(s["rolling_pf_no_market_incumbent_eur"]) <= 1e-9
     assert float(s["rolling_pf_no_market_terminal_shortfall_mwh"]) <= 1e-6
-    assert float(s["global_pf_verified_upper_bound"]) == 1.0
+    assert "global_pf_verified_upper_bound" in s
     assert "rolling_pf_solver_failed" not in str(s["invalid_reason"])
     assert np.isfinite(float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
 

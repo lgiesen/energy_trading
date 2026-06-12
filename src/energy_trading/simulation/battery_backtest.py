@@ -1321,6 +1321,7 @@ class BatteryBacktester:
             "rolling_pf_da_sized_candidate_pnl_eur": float("nan"),
             "rolling_pf_da_sized_zero_reason": "not_evaluated",
             "rolling_pf_da_first_sized_zero_ts_utc": "",
+            "rolling_pf_da_plan_history_stage_used": "none",
         }
         if plan_history is None or plan_history.empty:
             defaults["rolling_pf_da_zero_trade_stage"] = "no_plan_history"
@@ -1329,6 +1330,16 @@ class BatteryBacktester:
             return defaults
 
         frame = plan_history
+        if "plan_history_stage" in frame.columns:
+            stage_vals = frame["plan_history_stage"].fillna("").astype(str)
+            post_frame = frame.loc[stage_vals.eq("post_precommit")].copy()
+            if not post_frame.empty:
+                frame = post_frame
+                defaults["rolling_pf_da_plan_history_stage_used"] = "post_precommit"
+            else:
+                defaults["rolling_pf_da_plan_history_stage_used"] = "optimizer_raw"
+        else:
+            defaults["rolling_pf_da_plan_history_stage_used"] = "legacy_unstaged"
         defaults["rolling_pf_da_plan_history_rows"] = float(len(frame))
         if "da_candidate_allowed_by_gate_window" in frame.columns:
             allowed = (
@@ -1346,14 +1357,51 @@ class BatteryBacktester:
                     return pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
             return pd.Series(0.0, index=frame.index)
 
-        raw_buy = _stage_series("raw_optimizer_charge_mw_before_da_gate_mask")
-        raw_sell = _stage_series("raw_optimizer_discharge_mw_before_da_gate_mask")
-        sized_buy = _stage_series("da_sized_candidate_buy_mw", "da_precommit_da_candidate_buy_mw")
-        sized_sell = _stage_series("da_sized_candidate_sell_mw", "da_precommit_da_candidate_sell_mw")
-        postlock_buy = _stage_series("da_postlock_candidate_buy_mw", "da_precommit_da_postlock_candidate_buy_mw")
-        postlock_sell = _stage_series("da_postlock_candidate_sell_mw", "da_precommit_da_postlock_candidate_sell_mw")
-        selected_buy = _stage_series("da_selected_lockable_buy_mw", "da_accepted_buy_mw", "accepted_buy_mw")
-        selected_sell = _stage_series("da_selected_lockable_sell_mw", "da_accepted_sell_mw", "accepted_sell_mw")
+        raw_buy = _stage_series("raw_optimizer_charge_mw_before_da_gate_mask", "da_precommit_da_raw_candidate_buy_mw")
+        raw_sell = _stage_series("raw_optimizer_discharge_mw_before_da_gate_mask", "da_precommit_da_raw_candidate_sell_mw")
+        sized_candidate_cols_present = any(
+            col in frame.columns
+            for col in (
+                "da_sized_candidate_buy_mw",
+                "da_sized_candidate_sell_mw",
+                "da_precommit_da_sized_candidate_buy_mw",
+                "da_precommit_da_sized_candidate_sell_mw",
+                "da_precommit_da_candidate_buy_mw",
+                "da_precommit_da_candidate_sell_mw",
+            )
+        )
+        sized_buy = _stage_series(
+            "da_sized_candidate_buy_mw",
+            "da_precommit_da_sized_candidate_buy_mw",
+            "da_precommit_da_candidate_buy_mw",
+        )
+        sized_sell = _stage_series(
+            "da_sized_candidate_sell_mw",
+            "da_precommit_da_sized_candidate_sell_mw",
+            "da_precommit_da_candidate_sell_mw",
+        )
+        postlock_buy = _stage_series(
+            "da_postlock_candidate_buy_mw",
+            "da_precommit_da_postlock_candidate_buy_mw",
+        )
+        postlock_sell = _stage_series(
+            "da_postlock_candidate_sell_mw",
+            "da_precommit_da_postlock_candidate_sell_mw",
+        )
+        selected_buy = _stage_series(
+            "da_selected_lockable_buy_mw",
+            "da_precommit_da_selected_lockable_buy_mw",
+            "da_accepted_buy_mw",
+            "da_precommit_da_accepted_buy_mw",
+            "accepted_buy_mw",
+        )
+        selected_sell = _stage_series(
+            "da_selected_lockable_sell_mw",
+            "da_precommit_da_selected_lockable_sell_mw",
+            "da_accepted_sell_mw",
+            "da_precommit_da_accepted_sell_mw",
+            "accepted_sell_mw",
+        )
 
         def _allowed_sum_mwh(series: pd.Series) -> float:
             return float(series.where(allowed, 0.0).sum() * float(self.dt_h))
@@ -1396,41 +1444,62 @@ class BatteryBacktester:
                     return float(vals.iloc[0])
             return float(default)
 
-        defaults["rolling_pf_da_bid_sizer_status"] = _first_allowed_text("da_bid_sizer_status")
-        defaults["rolling_pf_da_bid_sizer_error"] = _first_allowed_text("da_bid_sizer_error")
-        defaults["rolling_pf_da_bid_sizer_method"] = _first_allowed_text("da_bid_sizer_method")
-        defaults["rolling_pf_da_bid_sizer_objective_eur"] = _first_allowed_num("da_bid_sizer_objective_eur")
+        defaults["rolling_pf_da_bid_sizer_status"] = _first_allowed_text(
+            "da_bid_sizer_status",
+            "da_precommit_da_bid_sizer_status",
+        )
+        defaults["rolling_pf_da_bid_sizer_error"] = _first_allowed_text(
+            "da_bid_sizer_error",
+            "da_precommit_da_bid_sizer_error",
+        )
+        defaults["rolling_pf_da_bid_sizer_method"] = _first_allowed_text(
+            "da_bid_sizer_method",
+            "da_precommit_da_bid_sizer_method",
+        )
+        defaults["rolling_pf_da_bid_sizer_objective_eur"] = _first_allowed_num(
+            "da_bid_sizer_objective_eur",
+            "da_precommit_da_bid_sizer_objective_eur",
+        )
         defaults["rolling_pf_da_bid_sizer_total_buy_mwh"] = _first_allowed_num(
             "da_bid_sizer_total_buy_mwh",
+            "da_precommit_da_bid_sizer_total_buy_mwh",
             default=0.0,
         )
         defaults["rolling_pf_da_bid_sizer_total_sell_mwh"] = _first_allowed_num(
             "da_bid_sizer_total_sell_mwh",
+            "da_precommit_da_bid_sizer_total_sell_mwh",
             default=0.0,
         )
         defaults["rolling_pf_da_bid_sizer_projected_soc_min_mwh"] = _first_allowed_num(
             "da_bid_sizer_lp_projected_soc_min_mwh",
+            "da_precommit_da_bid_sizer_lp_projected_soc_min_mwh",
             "projected_soc_min_mwh",
         )
         defaults["rolling_pf_da_bid_sizer_projected_soc_max_mwh"] = _first_allowed_num(
             "da_bid_sizer_lp_projected_soc_max_mwh",
+            "da_precommit_da_bid_sizer_lp_projected_soc_max_mwh",
             "projected_soc_max_mwh",
         )
         defaults["rolling_pf_da_bid_sizer_projected_final_soc_mwh"] = _first_allowed_num(
             "da_bid_sizer_lp_projected_final_soc_mwh",
+            "da_precommit_da_bid_sizer_lp_projected_final_soc_mwh",
             "projected_final_soc_mwh",
         )
         defaults["rolling_pf_da_candidate_selection_invalid_reason"] = _first_allowed_text(
             "da_precommit_selection_invalid_reason",
+            "da_precommit_da_precommit_selection_invalid_reason",
             "selection_error_reason",
             "candidate_rejection_reason",
         )
         defaults["rolling_pf_da_raw_candidate_pnl_eur"] = _first_allowed_num(
             "raw_candidate_pnl_recomputed_eur",
             "raw_candidate_predicted_pnl_eur",
+            "da_precommit_raw_candidate_pnl_recomputed_eur",
+            "da_precommit_raw_candidate_predicted_pnl_eur",
         )
         defaults["rolling_pf_da_sized_candidate_pnl_eur"] = _first_allowed_num(
             "sized_candidate_pnl_eur",
+            "da_precommit_sized_candidate_pnl_eur",
             "candidate_selection_pnl_eur",
             "candidate_predicted_pnl_eur",
         )
@@ -1452,6 +1521,8 @@ class BatteryBacktester:
             stage = "no_da_gate_window_rows"
         elif raw_mwh <= 1e-9:
             stage = "optimizer_zero_da_candidate"
+        elif sized_mwh <= 1e-9 and not sized_candidate_cols_present:
+            stage = "diagnostics_missing_post_precommit_stage"
         elif sized_mwh <= 1e-9:
             stage = "sized_candidate_zeroed"
         elif postlock_mwh <= 1e-9:
@@ -1529,6 +1600,12 @@ class BatteryBacktester:
             "rolling_pf_bcm_zero_stage": "not_evaluated",
             "rolling_pf_bcm_deterministic_reserve_settlement": float(bool(deterministic_reserve_settlement)),
             "rolling_pf_bcm_truth_price_substitution_applied": float(bool(truth_price_substitution_applied)),
+            "rolling_pf_bcm_plan_history_stage_used": "none",
+            "rolling_pf_bcm_plan_history_locked_pos_mw": 0.0,
+            "rolling_pf_bcm_plan_history_locked_neg_mw": 0.0,
+            "rolling_pf_bcm_settled_locked_pos_mw": 0.0,
+            "rolling_pf_bcm_settled_locked_neg_mw": 0.0,
+            "rolling_pf_bcm_plan_vs_settlement_locked_delta_mw": 0.0,
         }
         if plan_history is None or plan_history.empty:
             defaults["rolling_pf_bcm_zero_reason"] = "no_plan_history"
@@ -1536,6 +1613,16 @@ class BatteryBacktester:
             return defaults
 
         frame = plan_history
+        if "plan_history_stage" in frame.columns:
+            stage_vals = frame["plan_history_stage"].fillna("").astype(str)
+            post_frame = frame.loc[stage_vals.eq("post_precommit")].copy()
+            if not post_frame.empty:
+                frame = post_frame
+                defaults["rolling_pf_bcm_plan_history_stage_used"] = "post_precommit"
+            else:
+                defaults["rolling_pf_bcm_plan_history_stage_used"] = "optimizer_raw"
+        else:
+            defaults["rolling_pf_bcm_plan_history_stage_used"] = "legacy_unstaged"
         defaults["rolling_pf_bcm_plan_history_rows"] = float(len(frame))
         if "bcm_candidate_allowed_by_gate_window" in frame.columns:
             allowed = (
@@ -1585,6 +1672,8 @@ class BatteryBacktester:
         defaults["rolling_pf_bcm_precommit_candidate_neg_mw"] = _allowed_sum(pre_neg)
         defaults["rolling_pf_bcm_locked_pos_mw"] = _allowed_sum(locked_pos)
         defaults["rolling_pf_bcm_locked_neg_mw"] = _allowed_sum(locked_neg)
+        defaults["rolling_pf_bcm_plan_history_locked_pos_mw"] = defaults["rolling_pf_bcm_locked_pos_mw"]
+        defaults["rolling_pf_bcm_plan_history_locked_neg_mw"] = defaults["rolling_pf_bcm_locked_neg_mw"]
         defaults["rolling_pf_bcm_ev_pos"] = _allowed_mean(ev_pos)
         defaults["rolling_pf_bcm_ev_neg"] = _allowed_mean(ev_neg)
         defaults["rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw"] = _allowed_mean(coeff_pos)
@@ -18443,6 +18532,50 @@ class BatteryBacktester:
             progress_last_log = now
             progress_last_i = done
 
+        def _snapshot_plan_history_frame(
+            snapshot_plan_in: pd.DataFrame,
+            *,
+            stage: str,
+            audit_maps: dict[str, dict[pd.Timestamp, object]] | None = None,
+        ) -> pd.DataFrame:
+            """Build one plan-history snapshot without losing raw/post-precommit stage semantics."""
+            snapshot_for_history = snapshot_plan_in.copy()
+            snapshot_for_history["plan_history_stage"] = str(stage)
+            if audit_maps and "target_time_utc" in snapshot_for_history.columns:
+                hist_tsu = pd.to_datetime(
+                    snapshot_for_history["target_time_utc"],
+                    utc=True,
+                    errors="coerce",
+                )
+                audit_cols: dict[str, object] = {}
+                for field, mapping in audit_maps.items():
+                    audit_cols[str(field)] = hist_tsu.map(
+                        lambda ts, mm=mapping: mm.get(pd.Timestamp(ts), np.nan) if pd.notna(ts) else np.nan
+                    )
+                if audit_cols:
+                    audit_df = pd.DataFrame(audit_cols, index=snapshot_for_history.index)
+                    overlap = [c for c in audit_df.columns if c in snapshot_for_history.columns]
+                    if overlap:
+                        snapshot_for_history = snapshot_for_history.drop(columns=overlap)
+                    snapshot_for_history = pd.concat([snapshot_for_history, audit_df], axis=1)
+            history_rename_dict = {
+                "charge_mw": "plan_charge_mw",
+                "discharge_mw": "plan_discharge_mw",
+                "reserve_pos_mw": "plan_reserve_pos_mw",
+                "reserve_neg_mw": "plan_reserve_neg_mw",
+                "bem_only_pos_mw": "plan_bem_only_pos_mw",
+                "bem_only_neg_mw": "plan_bem_only_neg_mw",
+                "aFRR_Capacity_Won_MW": "plan_aFRR_Capacity_Won_MW",
+            }
+            legacy_cols = [c for c in snapshot_for_history.columns if c.startswith("planned_")]
+            if legacy_cols:
+                snapshot_for_history = snapshot_for_history.drop(columns=legacy_cols)
+            existing_targets = [v for v in history_rename_dict.values() if v in snapshot_for_history.columns]
+            if existing_targets:
+                snapshot_for_history = snapshot_for_history.drop(columns=existing_targets)
+            snapshot_for_history = snapshot_for_history.rename(columns=history_rename_dict)
+            return snapshot_for_history.copy()
+
         def _terminal_recovery_existing_scheduled_internal_mwh(
             *,
             after_timestamp_utc: pd.Timestamp,
@@ -20363,24 +20496,12 @@ class BatteryBacktester:
                 snapshot_plan["milp_event_type"] = "da_auction"
             else:
                 snapshot_plan["milp_event_type"] = "none"
-            snapshot_for_history = snapshot_plan.copy()
-            history_rename_dict = {
-                "charge_mw": "plan_charge_mw",
-                "discharge_mw": "plan_discharge_mw",
-                "reserve_pos_mw": "plan_reserve_pos_mw",
-                "reserve_neg_mw": "plan_reserve_neg_mw",
-                "bem_only_pos_mw": "plan_bem_only_pos_mw",
-                "bem_only_neg_mw": "plan_bem_only_neg_mw",
-                "aFRR_Capacity_Won_MW": "plan_aFRR_Capacity_Won_MW",
-            }
-            legacy_cols = [c for c in snapshot_for_history.columns if c.startswith("planned_")]
-            if legacy_cols:
-                snapshot_for_history.drop(columns=legacy_cols, inplace=True)
-            existing_targets = [v for v in history_rename_dict.values() if v in snapshot_for_history.columns]
-            if existing_targets:
-                snapshot_for_history.drop(columns=existing_targets, inplace=True)
-            snapshot_for_history.rename(columns=history_rename_dict, inplace=True)
-            plan_history.append(snapshot_for_history)
+            plan_history.append(
+                _snapshot_plan_history_frame(
+                    snapshot_plan,
+                    stage="optimizer_raw",
+                )
+            )
 
             # Phase 1 (D-1 configured aFRR BCM gate hour): clear aFRR capacity in 4h blocks and
             # propagate awarded obligations to delivery intervals.
@@ -21133,6 +21254,17 @@ class BatteryBacktester:
                         da_precommit_audit_by_ts.setdefault(f"da_precommit_{key}", {})[tsu] = value
                         if str(key).startswith("da_postlock_"):
                             da_precommit_audit_by_ts.setdefault(str(key), {})[tsu] = value
+
+            post_precommit_audit_maps: dict[str, dict[pd.Timestamp, object]] = {}
+            post_precommit_audit_maps.update(precommit_audit_by_ts)
+            post_precommit_audit_maps.update(da_precommit_audit_by_ts)
+            plan_history.append(
+                _snapshot_plan_history_frame(
+                    snapshot_plan,
+                    stage="post_precommit",
+                    audit_maps=post_precommit_audit_maps,
+                )
+            )
 
             k = min(reopt_step_hours, len(plan))
             take = plan.iloc[:k].copy()
@@ -24440,6 +24572,12 @@ class BatteryBacktester:
                 "penalty_eur",
                 "act_pos_mwh",
                 "act_neg_mwh",
+                "submitted_bcm_capacity_pos_mw",
+                "submitted_bcm_capacity_neg_mw",
+                "locked_bcm_capacity_pos_mw",
+                "locked_bcm_capacity_neg_mw",
+                "revenue_capacity_eur",
+                "revenue_activation_eur",
             ):
                 out[f"{prefix}_{suffix}"] = np.nan
             return out
@@ -24799,6 +24937,7 @@ class BatteryBacktester:
         rolling_pf_da_dispatch_buy_mwh = 0.0
         rolling_pf_da_dispatch_sell_mwh = 0.0
         rolling_pf_da_plan_history_rows = 0.0
+        rolling_pf_da_plan_history_stage_used = "not_evaluated"
         rolling_pf_da_gate_allowed_rows = 0.0
         rolling_pf_da_gate_nonzero_candidate_rows = 0.0
         rolling_pf_da_raw_candidate_buy_mwh = 0.0
@@ -24830,6 +24969,7 @@ class BatteryBacktester:
         rolling_pf_aux_cost_eur = 0.0
         rolling_pf_pnl_eur = 0.0
         rolling_pf_bcm_plan_history_rows = 0.0
+        rolling_pf_bcm_plan_history_stage_used = "not_evaluated"
         rolling_pf_bcm_gate_allowed_rows = 0.0
         rolling_pf_bcm_gate_nonzero_candidate_rows = 0.0
         rolling_pf_bcm_candidate_pos_mw = 0.0
@@ -24838,6 +24978,11 @@ class BatteryBacktester:
         rolling_pf_bcm_precommit_candidate_neg_mw = 0.0
         rolling_pf_bcm_locked_pos_mw = 0.0
         rolling_pf_bcm_locked_neg_mw = 0.0
+        rolling_pf_bcm_plan_history_locked_pos_mw = 0.0
+        rolling_pf_bcm_plan_history_locked_neg_mw = 0.0
+        rolling_pf_bcm_settled_locked_pos_mw = 0.0
+        rolling_pf_bcm_settled_locked_neg_mw = 0.0
+        rolling_pf_bcm_plan_vs_settlement_locked_delta_mw = 0.0
         rolling_pf_bcm_ev_pos = 0.0
         rolling_pf_bcm_ev_neg = 0.0
         rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw = 0.0
@@ -24851,6 +24996,11 @@ class BatteryBacktester:
         rolling_pf_selected_incumbent_pre_terminal_pnl_eur = float("nan")
         rolling_pf_selected_vs_hourly_final_pnl_delta_eur = float("nan")
         rolling_pf_selected_vs_component_pnl_delta_eur = float("nan")
+        rolling_pf_selection_value_basis = "not_evaluated"
+        rolling_pf_selected_incumbent_pre_normalization = "not_evaluated"
+        rolling_pf_solver_final_pnl_eur = float("nan")
+        rolling_pf_realized_path_final_pnl_eur = float("nan")
+        rolling_pf_solver_vs_realized_path_delta_eur = float("nan")
         global_pf_solver_status = "disabled"
         pf_failure_reason = ""
 
@@ -25229,6 +25379,9 @@ class BatteryBacktester:
             rolling_pf_da_dispatch_sell_mwh = float(rolling_pf_solver_dispatch_da_sell_mwh)
             pf_plan_diag = self._rolling_pf_da_plan_history_diagnostics(perfect_foresight_plan_history)
             rolling_pf_da_plan_history_rows = float(pf_plan_diag["rolling_pf_da_plan_history_rows"])
+            rolling_pf_da_plan_history_stage_used = str(
+                pf_plan_diag.get("rolling_pf_da_plan_history_stage_used", "legacy_unstaged")
+            )
             rolling_pf_da_gate_allowed_rows = float(pf_plan_diag["rolling_pf_da_gate_allowed_rows"])
             rolling_pf_da_gate_nonzero_candidate_rows = float(
                 pf_plan_diag["rolling_pf_da_gate_nonzero_candidate_rows"]
@@ -25279,6 +25432,9 @@ class BatteryBacktester:
                 truth_price_substitution_applied=bool(rolling_pf_da_truth_price_substitution_applied),
             )
             rolling_pf_bcm_plan_history_rows = float(pf_bcm_plan_diag["rolling_pf_bcm_plan_history_rows"])
+            rolling_pf_bcm_plan_history_stage_used = str(
+                pf_bcm_plan_diag.get("rolling_pf_bcm_plan_history_stage_used", "legacy_unstaged")
+            )
             rolling_pf_bcm_gate_allowed_rows = float(pf_bcm_plan_diag["rolling_pf_bcm_gate_allowed_rows"])
             rolling_pf_bcm_gate_nonzero_candidate_rows = float(
                 pf_bcm_plan_diag["rolling_pf_bcm_gate_nonzero_candidate_rows"]
@@ -25293,6 +25449,12 @@ class BatteryBacktester:
             )
             rolling_pf_bcm_locked_pos_mw = float(pf_bcm_plan_diag["rolling_pf_bcm_locked_pos_mw"])
             rolling_pf_bcm_locked_neg_mw = float(pf_bcm_plan_diag["rolling_pf_bcm_locked_neg_mw"])
+            rolling_pf_bcm_plan_history_locked_pos_mw = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_plan_history_locked_pos_mw"]
+            )
+            rolling_pf_bcm_plan_history_locked_neg_mw = float(
+                pf_bcm_plan_diag["rolling_pf_bcm_plan_history_locked_neg_mw"]
+            )
             rolling_pf_bcm_ev_pos = float(pf_bcm_plan_diag["rolling_pf_bcm_ev_pos"])
             rolling_pf_bcm_ev_neg = float(pf_bcm_plan_diag["rolling_pf_bcm_ev_neg"])
             rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw = float(
@@ -25396,6 +25558,22 @@ class BatteryBacktester:
                 rolling_pf_da_revenue_eur = _pf_sum_col("perfect_foresight_revenue_da_eur")
                 rolling_pf_da_cost_eur = _pf_sum_col("perfect_foresight_cost_da_eur")
                 rolling_pf_da_gross_eur = float(rolling_pf_da_revenue_eur - rolling_pf_da_cost_eur)
+                rolling_pf_bcm_settled_locked_pos_mw = _pf_sum_col(
+                    "perfect_foresight_locked_bcm_capacity_pos_mw"
+                )
+                rolling_pf_bcm_settled_locked_neg_mw = _pf_sum_col(
+                    "perfect_foresight_locked_bcm_capacity_neg_mw"
+                )
+                rolling_pf_bcm_plan_vs_settlement_locked_delta_mw = float(
+                    (
+                        rolling_pf_bcm_plan_history_locked_pos_mw
+                        + rolling_pf_bcm_plan_history_locked_neg_mw
+                    )
+                    - (
+                        rolling_pf_bcm_settled_locked_pos_mw
+                        + rolling_pf_bcm_settled_locked_neg_mw
+                    )
+                )
                 rolling_pf_degradation_cost_eur = _pf_sum_col("perfect_foresight_degradation_cost_eur")
                 rolling_pf_transaction_cost_eur = _pf_sum_col("perfect_foresight_transaction_cost_eur")
                 rolling_pf_aux_cost_eur = _pf_sum_col("perfect_foresight_aux_cost_eur")
@@ -25446,11 +25624,21 @@ class BatteryBacktester:
                 else _empty_pf_frame("perfect_foresight")
             )
             rolling_pf_selected_incumbent = str(rolling_selection["selected"])
+            rolling_pf_selected_incumbent_pre_normalization = str(rolling_pf_selected_incumbent)
             rolling_pf_incumbent_selection_reason = str(rolling_selection["selection_reason"])
             rolling_pf_solver_solution_eur = float(rolling_selection["solver_solution_eur"])
+            rolling_pf_solver_final_pnl_eur = float(rolling_pf_solver_solution_eur)
             rolling_pf_solver_feasible = float(rolling_selection["solver_feasible"])
             rolling_pf_no_market_incumbent_eur = float(rolling_selection["no_market_incumbent_eur"])
             rolling_pf_realized_path_incumbent_eur = float(rolling_selection["realized_path_incumbent_eur"])
+            rolling_pf_realized_path_final_pnl_eur = float(rolling_pf_realized_path_incumbent_eur)
+            rolling_pf_solver_vs_realized_path_delta_eur = (
+                float(rolling_pf_solver_final_pnl_eur - rolling_pf_realized_path_final_pnl_eur)
+                if np.isfinite(float(rolling_pf_solver_final_pnl_eur))
+                and np.isfinite(float(rolling_pf_realized_path_final_pnl_eur))
+                else float("nan")
+            )
+            rolling_pf_selection_value_basis = "settled_component_pnl_plus_terminal_target_adjustment"
             rolling_pf_selected_incumbent_pnl_eur = float(rolling_selection["selected_incumbent_pnl_eur"])
             rolling_pf_no_market_terminal_shortfall_mwh = float(rolling_selection["no_market_terminal_shortfall_mwh"])
             rolling_pf_available = float(rolling_selection["verified"])
@@ -25923,6 +26111,42 @@ class BatteryBacktester:
         hourly = _merge_unique(hourly, perfect_foresight_real)
         if not global_perfect_foresight_real.empty:
             hourly = _merge_unique(hourly, global_perfect_foresight_real)
+        for missing_global_pf_col in (
+            "global_perfect_foresight_submitted_bcm_capacity_pos_mw",
+            "global_perfect_foresight_submitted_bcm_capacity_neg_mw",
+            "global_perfect_foresight_locked_bcm_capacity_pos_mw",
+            "global_perfect_foresight_locked_bcm_capacity_neg_mw",
+            "global_perfect_foresight_bcm_activation_bid_price_pos",
+            "global_perfect_foresight_bcm_true_activation_price_pos",
+            "global_perfect_foresight_bcm_precommit_feasibility_pass",
+            "global_perfect_foresight_bcm_precommit_zero_reason",
+            "global_perfect_foresight_bcm_zero_reason",
+        ):
+            if missing_global_pf_col not in hourly.columns:
+                hourly[missing_global_pf_col] = (
+                    "global_pf_unavailable"
+                    if missing_global_pf_col.endswith(("zero_reason",))
+                    else 0.0
+                )
+        pf_alias_sources = {
+            "pf_submitted_bcm_capacity_pos_mw": "perfect_foresight_submitted_bcm_capacity_pos_mw",
+            "pf_submitted_bcm_capacity_neg_mw": "perfect_foresight_submitted_bcm_capacity_neg_mw",
+            "pf_bcm_zero_reason": "perfect_foresight_bcm_zero_reason",
+        }
+        pf_alias_cols: dict[str, object] = {}
+        for alias, source_col in pf_alias_sources.items():
+            if alias in hourly.columns:
+                continue
+            if source_col in hourly.columns:
+                pf_alias_cols[alias] = hourly[source_col]
+            else:
+                pf_alias_cols[alias] = (
+                    pd.Series("not_available", index=hourly.index, dtype=object)
+                    if alias.endswith("zero_reason")
+                    else pd.Series(0.0, index=hourly.index, dtype="float64")
+                )
+        if pf_alias_cols:
+            hourly = pd.concat([hourly, pd.DataFrame(pf_alias_cols, index=hourly.index)], axis=1).copy()
         hourly = hourly.sort_values(colmap.timestamp).reset_index(drop=True)
         for prefix in ("real", "pred", "naive", "perfect_foresight", "global_perfect_foresight"):
             buy_col = f"{prefix}_id_buy_mwh"
@@ -26139,6 +26363,7 @@ class BatteryBacktester:
         hourly["rolling_pf_da_dispatch_buy_mwh"] = float(rolling_pf_da_dispatch_buy_mwh)
         hourly["rolling_pf_da_dispatch_sell_mwh"] = float(rolling_pf_da_dispatch_sell_mwh)
         hourly["rolling_pf_da_plan_history_rows"] = float(rolling_pf_da_plan_history_rows)
+        hourly["rolling_pf_da_plan_history_stage_used"] = str(rolling_pf_da_plan_history_stage_used)
         hourly["rolling_pf_da_gate_allowed_rows"] = float(rolling_pf_da_gate_allowed_rows)
         hourly["rolling_pf_da_gate_nonzero_candidate_rows"] = float(rolling_pf_da_gate_nonzero_candidate_rows)
         hourly["rolling_pf_da_raw_candidate_buy_mwh"] = float(rolling_pf_da_raw_candidate_buy_mwh)
@@ -26192,6 +26417,7 @@ class BatteryBacktester:
         hourly["rolling_pf_aux_cost_eur"] = float(rolling_pf_aux_cost_eur)
         hourly["rolling_pf_pnl_eur"] = float(rolling_pf_pnl_eur)
         hourly["rolling_pf_bcm_plan_history_rows"] = float(rolling_pf_bcm_plan_history_rows)
+        hourly["rolling_pf_bcm_plan_history_stage_used"] = str(rolling_pf_bcm_plan_history_stage_used)
         hourly["rolling_pf_bcm_gate_allowed_rows"] = float(rolling_pf_bcm_gate_allowed_rows)
         hourly["rolling_pf_bcm_gate_nonzero_candidate_rows"] = float(
             rolling_pf_bcm_gate_nonzero_candidate_rows
@@ -26206,6 +26432,13 @@ class BatteryBacktester:
         )
         hourly["rolling_pf_bcm_locked_pos_mw"] = float(rolling_pf_bcm_locked_pos_mw)
         hourly["rolling_pf_bcm_locked_neg_mw"] = float(rolling_pf_bcm_locked_neg_mw)
+        hourly["rolling_pf_bcm_plan_history_locked_pos_mw"] = float(rolling_pf_bcm_plan_history_locked_pos_mw)
+        hourly["rolling_pf_bcm_plan_history_locked_neg_mw"] = float(rolling_pf_bcm_plan_history_locked_neg_mw)
+        hourly["rolling_pf_bcm_settled_locked_pos_mw"] = float(rolling_pf_bcm_settled_locked_pos_mw)
+        hourly["rolling_pf_bcm_settled_locked_neg_mw"] = float(rolling_pf_bcm_settled_locked_neg_mw)
+        hourly["rolling_pf_bcm_plan_vs_settlement_locked_delta_mw"] = float(
+            rolling_pf_bcm_plan_vs_settlement_locked_delta_mw
+        )
         hourly["rolling_pf_bcm_ev_pos"] = float(rolling_pf_bcm_ev_pos)
         hourly["rolling_pf_bcm_ev_neg"] = float(rolling_pf_bcm_ev_neg)
         hourly["rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw"] = float(
@@ -26560,7 +26793,14 @@ class BatteryBacktester:
 
         monthly = aggregate_periodic(hourly, colmap.timestamp, freq="ME")
         yearly = aggregate_periodic(hourly, colmap.timestamp, freq="YE")
-        volatility = calculate_volatility(plan_history)
+        volatility_history = plan_history
+        if "plan_history_stage" in volatility_history.columns:
+            raw_volatility_history = volatility_history[
+                volatility_history["plan_history_stage"].fillna("").astype(str).eq("optimizer_raw")
+            ]
+            if not raw_volatility_history.empty:
+                volatility_history = raw_volatility_history
+        volatility = calculate_volatility(volatility_history)
         naive_volatility = calculate_volatility(naive_plan_history)
 
         terminal_closure_pred_pnl_eur = float(
@@ -26712,6 +26952,14 @@ class BatteryBacktester:
         if rolling_pf_available >= 0.5 and np.isfinite(float(perfect_foresight_pnl_total)):
             rolling_pf_selected_incumbent_pnl_eur = float(perfect_foresight_pnl_total)
             rolling_pf_pnl_eur = float(perfect_foresight_pnl_total)
+            if str(rolling_pf_selected_incumbent) == "solver":
+                rolling_pf_solver_final_pnl_eur = float(perfect_foresight_pnl_total)
+            rolling_pf_solver_vs_realized_path_delta_eur = (
+                float(rolling_pf_solver_final_pnl_eur - rolling_pf_realized_path_final_pnl_eur)
+                if np.isfinite(float(rolling_pf_solver_final_pnl_eur))
+                and np.isfinite(float(rolling_pf_realized_path_final_pnl_eur))
+                else float("nan")
+            )
         rolling_pf_selected_vs_hourly_final_pnl_delta_eur = (
             float(rolling_pf_selected_incumbent_pre_terminal_pnl_eur - perfect_foresight_pnl_total)
             if np.isfinite(float(rolling_pf_selected_incumbent_pre_terminal_pnl_eur))
@@ -26728,6 +26976,15 @@ class BatteryBacktester:
                 rolling_pf_selected_vs_hourly_final_pnl_delta_eur
             )
             hourly["rolling_pf_pnl_eur"] = float(perfect_foresight_pnl_total)
+            hourly["rolling_pf_selection_value_basis"] = str(rolling_pf_selection_value_basis)
+            hourly["rolling_pf_selected_incumbent_pre_normalization"] = str(
+                rolling_pf_selected_incumbent_pre_normalization
+            )
+            hourly["rolling_pf_solver_final_pnl_eur"] = float(rolling_pf_solver_final_pnl_eur)
+            hourly["rolling_pf_realized_path_final_pnl_eur"] = float(rolling_pf_realized_path_final_pnl_eur)
+            hourly["rolling_pf_solver_vs_realized_path_delta_eur"] = float(
+                rolling_pf_solver_vs_realized_path_delta_eur
+            )
         global_perfect_foresight_pnl_raw = (
             _sum_col_zero("global_perfect_foresight_pnl_eur") - terminal_closure_global_pf_pnl_eur
             if enable_global_perfect_foresight and global_perfect_foresight_available_flag >= 0.5
@@ -26891,8 +27148,15 @@ class BatteryBacktester:
             "rolling_pf_verified_upper_bound": float(rolling_pf_verified),
             "rolling_pf_selected_incumbent": str(rolling_pf_selected_incumbent),
             "rolling_pf_incumbent_selection_reason": str(rolling_pf_incumbent_selection_reason),
+            "rolling_pf_selection_value_basis": str(rolling_pf_selection_value_basis),
+            "rolling_pf_selected_incumbent_pre_normalization": str(
+                rolling_pf_selected_incumbent_pre_normalization
+            ),
             "rolling_pf_solver_solution_eur": float(rolling_pf_solver_solution_eur),
             "rolling_pf_solver_pnl_eur": float(rolling_pf_solver_solution_eur),
+            "rolling_pf_solver_final_pnl_eur": float(rolling_pf_solver_final_pnl_eur),
+            "rolling_pf_realized_path_final_pnl_eur": float(rolling_pf_realized_path_final_pnl_eur),
+            "rolling_pf_solver_vs_realized_path_delta_eur": float(rolling_pf_solver_vs_realized_path_delta_eur),
             "rolling_pf_solver_feasible": float(rolling_pf_solver_feasible),
             "rolling_pf_selected_incumbent_pre_terminal_pnl_eur": float(
                 rolling_pf_selected_incumbent_pre_terminal_pnl_eur
@@ -26950,6 +27214,7 @@ class BatteryBacktester:
             "rolling_pf_da_dispatch_buy_mwh": float(rolling_pf_da_dispatch_buy_mwh),
             "rolling_pf_da_dispatch_sell_mwh": float(rolling_pf_da_dispatch_sell_mwh),
             "rolling_pf_da_plan_history_rows": float(rolling_pf_da_plan_history_rows),
+            "rolling_pf_da_plan_history_stage_used": str(rolling_pf_da_plan_history_stage_used),
             "rolling_pf_da_gate_allowed_rows": float(rolling_pf_da_gate_allowed_rows),
             "rolling_pf_da_gate_nonzero_candidate_rows": float(rolling_pf_da_gate_nonzero_candidate_rows),
             "rolling_pf_da_raw_candidate_buy_mwh": float(rolling_pf_da_raw_candidate_buy_mwh),
@@ -26999,6 +27264,7 @@ class BatteryBacktester:
             "rolling_pf_da_cost_eur": float(rolling_pf_da_cost_eur),
             "rolling_pf_da_gross_eur": float(rolling_pf_da_gross_eur),
             "rolling_pf_bcm_plan_history_rows": float(rolling_pf_bcm_plan_history_rows),
+            "rolling_pf_bcm_plan_history_stage_used": str(rolling_pf_bcm_plan_history_stage_used),
             "rolling_pf_bcm_gate_allowed_rows": float(rolling_pf_bcm_gate_allowed_rows),
             "rolling_pf_bcm_gate_nonzero_candidate_rows": float(
                 rolling_pf_bcm_gate_nonzero_candidate_rows
@@ -27013,6 +27279,13 @@ class BatteryBacktester:
             ),
             "rolling_pf_bcm_locked_pos_mw": float(rolling_pf_bcm_locked_pos_mw),
             "rolling_pf_bcm_locked_neg_mw": float(rolling_pf_bcm_locked_neg_mw),
+            "rolling_pf_bcm_plan_history_locked_pos_mw": float(rolling_pf_bcm_plan_history_locked_pos_mw),
+            "rolling_pf_bcm_plan_history_locked_neg_mw": float(rolling_pf_bcm_plan_history_locked_neg_mw),
+            "rolling_pf_bcm_settled_locked_pos_mw": float(rolling_pf_bcm_settled_locked_pos_mw),
+            "rolling_pf_bcm_settled_locked_neg_mw": float(rolling_pf_bcm_settled_locked_neg_mw),
+            "rolling_pf_bcm_plan_vs_settlement_locked_delta_mw": float(
+                rolling_pf_bcm_plan_vs_settlement_locked_delta_mw
+            ),
             "rolling_pf_bcm_ev_pos": float(rolling_pf_bcm_ev_pos),
             "rolling_pf_bcm_ev_neg": float(rolling_pf_bcm_ev_neg),
             "rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw": float(
@@ -29547,8 +29820,13 @@ class BatteryBacktester:
             ("rolling_pf_verified_upper_bound", 0.0),
             ("rolling_pf_selected_incumbent", "none"),
             ("rolling_pf_incumbent_selection_reason", ""),
+            ("rolling_pf_selection_value_basis", ""),
+            ("rolling_pf_selected_incumbent_pre_normalization", ""),
             ("rolling_pf_solver_solution_eur", float("nan")),
             ("rolling_pf_solver_pnl_eur", float("nan")),
+            ("rolling_pf_solver_final_pnl_eur", float("nan")),
+            ("rolling_pf_realized_path_final_pnl_eur", float("nan")),
+            ("rolling_pf_solver_vs_realized_path_delta_eur", float("nan")),
             ("rolling_pf_solver_feasible", 0.0),
             ("rolling_pf_selected_incumbent_pre_terminal_pnl_eur", float("nan")),
             ("rolling_pf_selected_incumbent_pnl_eur", float("nan")),
@@ -29578,6 +29856,7 @@ class BatteryBacktester:
             ("rolling_pf_da_dispatch_buy_mwh", 0.0),
             ("rolling_pf_da_dispatch_sell_mwh", 0.0),
             ("rolling_pf_da_plan_history_rows", 0.0),
+            ("rolling_pf_da_plan_history_stage_used", ""),
             ("rolling_pf_da_gate_allowed_rows", 0.0),
             ("rolling_pf_da_gate_nonzero_candidate_rows", 0.0),
             ("rolling_pf_da_raw_candidate_buy_mwh", 0.0),
@@ -29619,6 +29898,7 @@ class BatteryBacktester:
             ("rolling_pf_da_cost_eur", 0.0),
             ("rolling_pf_da_gross_eur", 0.0),
             ("rolling_pf_bcm_plan_history_rows", 0.0),
+            ("rolling_pf_bcm_plan_history_stage_used", ""),
             ("rolling_pf_bcm_gate_allowed_rows", 0.0),
             ("rolling_pf_bcm_gate_nonzero_candidate_rows", 0.0),
             ("rolling_pf_bcm_candidate_pos_mw", 0.0),
@@ -29627,6 +29907,11 @@ class BatteryBacktester:
             ("rolling_pf_bcm_precommit_candidate_neg_mw", 0.0),
             ("rolling_pf_bcm_locked_pos_mw", 0.0),
             ("rolling_pf_bcm_locked_neg_mw", 0.0),
+            ("rolling_pf_bcm_plan_history_locked_pos_mw", 0.0),
+            ("rolling_pf_bcm_plan_history_locked_neg_mw", 0.0),
+            ("rolling_pf_bcm_settled_locked_pos_mw", 0.0),
+            ("rolling_pf_bcm_settled_locked_neg_mw", 0.0),
+            ("rolling_pf_bcm_plan_vs_settlement_locked_delta_mw", 0.0),
             ("rolling_pf_bcm_ev_pos", 0.0),
             ("rolling_pf_bcm_ev_neg", 0.0),
             ("rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw", 0.0),
