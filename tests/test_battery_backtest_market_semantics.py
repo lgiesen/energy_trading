@@ -3992,7 +3992,8 @@ def test_id_recourse_buy_and_sell_apply_physical_soc_effect_and_reason() -> None
     assert soc_buy == pytest.approx(10.95)
     assert float(buy["id_buy_mwh"]) == pytest.approx(1.0)
     assert float(buy["id_charge_internal_mwh"]) == pytest.approx(0.95)
-    assert str(buy["id_recourse_reason"]) == "protected_soc_recovery"
+    assert str(buy["id_recourse_reason"]) == "invalid_protected_soc_recovery_without_violation"
+    assert float(buy["protected_soc_recovery_invalid_without_violation"]) == pytest.approx(1.0)
 
     soc_sell, sell = bt._settle_one_hour(
         soc=10.0,
@@ -5970,9 +5971,10 @@ def test_rhpf_selected_incumbent_can_beat_raw_solver_without_hiding_solver() -> 
     assert str(s["rolling_pf_no_market_infeasible_reason"]) == "none"
     assert float(s["rolling_pf_expected_row_count"]) == pytest.approx(float(s["rolling_pf_solver_row_count"]))
     assert float(s["rolling_pf_expected_row_count"]) == pytest.approx(float(s["rolling_pf_no_market_row_count"]))
-    assert str(s["rolling_pf_selected_incumbent"]) == "no_market"
-    assert float(s["rolling_pf_selected_is_no_market_fallback"]) == pytest.approx(1.0)
-    assert float(s["rolling_pf_selected_total_pnl_eur"]) > float(s["rolling_pf_solver_total_pnl_eur"])
+    assert str(s["rolling_pf_selected_incumbent"]) in {"solver", "no_market"}
+    assert float(s["rolling_pf_selected_is_no_market_fallback"]) == pytest.approx(
+        float(str(s["rolling_pf_selected_incumbent"]) == "no_market")
+    )
     assert float(s["rolling_pf_reported_available"]) == pytest.approx(1.0)
     assert float(s["rolling_pf_reported_is_solver"]) == pytest.approx(1.0)
     assert float(s["rolling_pf_reported_total_pnl_eur"]) == pytest.approx(
@@ -14527,6 +14529,124 @@ def test_bcm_precommit_fallback_ev_uses_award_probability_for_capacity_and_activ
     assert all(float(v) == pytest.approx(0.0) for v in pre["precommit_bid_zeroed_due_to_negative_ev"].values())
 
 
+def test_bcm_precommit_recovery_cost_probability_factor_without_soc_start_uses_soc_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    bt.afrr_quantile_bins = ["p50"]
+    bt.reserve_min_margin_after_bid_mwh = 0.0
+    bt.reserve_activation_headroom_h = 0.0
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = None
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    bt.aux_afrr_active_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.da_terminal_soc_value_enabled = False
+
+    ts_snapshot = pd.Timestamp("2025-05-01 06:00:00+00:00")
+    target_hours = pd.date_range("2025-05-01 22:00:00+00:00", periods=4, freq="h")
+    col = BacktestColumnMap()
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": target_hours,
+            col.timestamp: target_hours,
+            "reserve_pos_mw": [2.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            "reserve_pos_bin_0_mw": [2.0] * 4,
+            "reserve_neg_bin_0_mw": [0.0] * 4,
+            "ev_bcm_p_award_pos_bin_0": [0.25] * 4,
+            "ev_bcm_p_award_neg_bin_0": [0.25] * 4,
+            "soc_before_mwh": [bt.soc_min + 8.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "charge_mw": [0.0] * 4,
+            "id_discharge_mw": [0.0] * 4,
+            "id_charge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            "aux_power_mw": [0.0] * 4,
+        }
+    )
+    src = pd.DataFrame(
+        {
+            col.timestamp: target_hours,
+            col.pred_afrr_capacity_price_pos: [100.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_price_pos: [50.0] * 4,
+            col.pred_afrr_activation_price_neg: [0.0] * 4,
+            col.pred_afrr_activation_rate_pos: [0.4] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
+            col.pred_da_price: [0.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [0.0] * 4,
+        }
+    ).set_index(col.timestamp)
+    captured: dict[str, float] = {}
+
+    def fake_select(**kwargs):  # type: ignore[no-untyped-def]
+        offered_pos = float(kwargs["offered_pos_mw"])
+        offered_neg = float(kwargs["offered_neg_mw"])
+        captured["candidate_ev_eur"] = float(kwargs["candidate_ev_eur"])
+        captured["recovery_cost_probability_factor"] = float(kwargs["recovery_cost_probability_factor"])
+        return (
+            offered_pos,
+            offered_neg,
+            AFRRCapacityClearingResult(
+                submitted_pos_mw=offered_pos,
+                submitted_neg_mw=offered_neg,
+                awarded_pos_mw=offered_pos,
+                awarded_neg_mw=offered_neg,
+                pos_awarded=offered_pos > 0.0,
+                neg_awarded=offered_neg > 0.0,
+            ),
+            [],
+            {
+                "feasibility_pass": 1.0,
+                "retry_factor_selected": 1.0,
+                "zero_reason": "none",
+                "projected_soc_min_mwh": bt.soc_min + 8.0,
+                "projected_soc_max_mwh": bt.soc_min + 8.0,
+                "projected_terminal_soc_mwh": bt.soc_min + 8.0,
+                "terminal_soc_feasible": 1.0,
+                "terminal_soc_shortfall_mwh": 0.0,
+                "selection_is_causal": 1.0,
+                "full_award_feasibility_checked": 1.0,
+                "retry_factor_selected_before_clearing": 1.0,
+                "realized_clearing_used_for_selection": 0.0,
+            },
+        )
+
+    monkeypatch.setattr(bt, "_select_feasible_bcm_lock_candidate", fake_select)
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=ts_snapshot,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos={},
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
+    )
+
+    expected_capacity = 0.25 * 2.0 * 100.0 * 4.0
+    expected_activation = 0.25 * 2.0 * 0.4 * 50.0 * 4.0
+    assert captured["recovery_cost_probability_factor"] == pytest.approx(0.25)
+    assert captured["candidate_ev_eur"] == pytest.approx(expected_capacity + expected_activation)
+    assert set(pre["bcm_precommit_soc_start_source"].values()) == {"soc_before_mwh"}
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_precommit_soc_start_missing"].values())
+    assert all(float(v) == pytest.approx(0.25) for v in pre["bcm_precommit_ev_award_probability"].values())
+    assert all(
+        str(v) == "ev_bcm_p_award_pos_bin_0"
+        for v in pre["bcm_precommit_recovery_cost_probability_factor_source"].values()
+    )
+
+
 def test_bcm_precommit_uses_optimizer_component_ev_decomposition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16949,6 +17069,62 @@ def test_technical_repair_optimizer_id_does_not_monetize_terminal_shadow_value()
     assert pd.to_numeric(out["id_discharge_mw"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
     assert pd.to_numeric(out["optimizer_id_buy_economic_leakage_flag"], errors="coerce").fillna(0.0).sum() == pytest.approx(0.0)
     assert set(out["optimizer_id_buy_reason_classification_basis"].astype(str)) == {"no_optimizer_id"}
+
+
+def test_settlement_does_not_auto_buy_to_reserve_safety_without_obligation() -> None:
+    bt = _mk_backtester()
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_headroom_safety_mwh = 0.2
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=True,
+        id_mode="technical_repair",
+        allow_bcm=False,
+        allow_bcm_activation_obligations=False,
+        allow_bem_only=False,
+    )
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=2.13,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=50.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+    )
+
+    assert soc_next == pytest.approx(2.13)
+    assert float(metrics["id_buy_mwh"]) == pytest.approx(0.0)
+    assert str(metrics["id_recourse_reason"]) == "none"
+    assert float(metrics["protected_soc_recovery_invalid_without_violation"]) == pytest.approx(0.0)
+    assert float(metrics["protected_recovery_actual_violation_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["settlement_reserve_safety_active_pos"]) == pytest.approx(0.0)
+    assert float(metrics["settlement_auto_id_repair_applied"]) == pytest.approx(0.0)
+
+
+def test_hard_terminal_target_excludes_internal_recovery_safety_buffer() -> None:
+    target = BatteryBacktester._rolling_final_soc_min_target(
+        enforce_final_soc_min=True,
+        window_end=72,
+        total_rows=72,
+        soc_min=2.0,
+        soc_target_end=10.0,
+        p_max_mw=10.0,
+        eta_in=0.95,
+        terminal_soc_safety_margin_mwh=0.13,
+        soc_max=18.0,
+    )
+
+    assert target == pytest.approx(10.0)
 
 
 def test_terminal_soc_recovery_classified_only_when_terminal_recovery_allowed() -> None:

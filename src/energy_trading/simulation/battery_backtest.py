@@ -920,11 +920,20 @@ SETTLEMENT_NUMERIC_COLS = (
     "optimizer_id_buy_terminal_shadow_value_eur_per_internal_mwh",
     "optimizer_id_buy_effective_cost_eur_per_internal_mwh",
     "local_soc_end_min_target_mwh",
+    "optimizer_soc_end_min_target_mwh",
     "global_final_soc_target_mwh",
     "terminal_recovery_allowed_for_row",
+    "hard_terminal_soc_target_mwh",
+    "terminal_repair_safety_margin_mwh",
+    "window_has_actionable_terminal_repair",
+    "terminal_constraint_deferred_to_explicit_repair",
     "protected_recovery_actual_violation_mwh",
     "protected_recovery_obligation_active",
     "protected_soc_recovery_invalid_without_violation",
+    "settlement_auto_id_repair_applied",
+    "settlement_auto_id_repair_blocked_no_obligation",
+    "settlement_reserve_safety_active_pos",
+    "settlement_reserve_safety_active_neg",
     "pnl_id_eur",
     "aFRR_Capacity_Won_MW",
     "DA_Energy_Sold_MW",
@@ -3385,7 +3394,10 @@ class BatteryBacktester:
         if not bool(enforce_final_soc_min):
             return None
         if int(window_end) >= int(total_rows):
-            target = float(soc_target_end) + max(0.0, float(terminal_soc_safety_margin_mwh))
+            # The hard thesis target is the physical final SoC target. Recovery
+            # safety is an internal ID sizing buffer, not an inflated hard MILP
+            # terminal bound.
+            target = float(soc_target_end)
             if soc_max is not None and np.isfinite(float(soc_max)):
                 target = min(target, float(soc_max))
             return float(target)
@@ -13167,10 +13179,21 @@ class BatteryBacktester:
                     float(terminal_target) if np.isfinite(float(terminal_target)) else np.nan,
                     dtype=float,
                 ),
+                "hard_terminal_soc_target_mwh": np.full(n, float(self.soc_target_end), dtype=float),
+                "terminal_repair_safety_margin_mwh": np.full(
+                    n,
+                    float(getattr(self, "terminal_id_recovery_safety_mwh", 0.0)),
+                    dtype=float,
+                ),
+                "window_has_actionable_terminal_repair": terminal_recovery_allowed_for_row.astype(float),
                 "global_final_soc_target_mwh": np.full(n, float(self.soc_target_end), dtype=float),
                 "terminal_recovery_allowed_for_row": terminal_recovery_allowed_for_row,
                 "protected_recovery_actual_violation_mwh": protected_recovery_actual_violation_mwh,
                 "protected_recovery_obligation_active": reserve_or_bem_obligation_active.astype(float),
+                "settlement_auto_id_repair_applied": np.zeros(n, dtype=float),
+                "settlement_auto_id_repair_blocked_no_obligation": np.zeros(n, dtype=float),
+                "settlement_reserve_safety_active_pos": (reserve_pos_mw > 1e-9).astype(float),
+                "settlement_reserve_safety_active_neg": (reserve_neg_mw > 1e-9).astype(float),
                 "id_price_source": np.full(n, "da_price_plus_spread", dtype=object),
                 "id_da_reference_price_eur_mwh": p_da,
                 "id_spread_eur_mwh": np.full(n, float(self.id_rescue_spread_eur_mwh), dtype=float),
@@ -13907,87 +13930,27 @@ class BatteryBacktester:
         stack_without_id_total = float(stack_without_id["total_residual_mw"])
         id_charge = min(id_charge, float(stack_without_id["charge_residual_mw"]), stack_without_id_total)
         id_discharge = min(id_discharge, float(stack_without_id["discharge_residual_mw"]), stack_without_id_total)
-        # Reserve-aware ID rescue is only allowed in strategies that enable ID.
-        if self._strategy_permissions.allow_id:
-            req_soc_min_for_pos = (
-                self.soc_min
-                + (max(0.0, reserve_pos) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
-                + float(self.reserve_headroom_safety_mwh)
-            )
-            req_soc_max_for_neg = (
-                self.soc_max
-                - (max(0.0, reserve_neg) * self.reserve_activation_headroom_h) * self.eta_in
-                - float(self.reserve_headroom_safety_mwh)
-            )
-            soc_after_id = soc + self.eta_in * (id_charge * self.dt_h) - (id_discharge * self.dt_h) / max(self.eta_out, 1e-12)
-            if soc_after_id < req_soc_min_for_pos:
-                need_soc_up = req_soc_min_for_pos - soc_after_id
-                add_id_charge_mw = (need_soc_up / max(self.eta_in, 1e-12)) / max(self.dt_h, 1e-12)
-                add_id_charge_mw = max(
-                    0.0,
-                    min(
-                        add_id_charge_mw,
-                        float(
-                            self._compute_canonical_power_stack(
-                                da_charge_mw=da_charge,
-                                da_discharge_mw=da_discharge,
-                                id_buy_mw=id_charge,
-                                id_sell_mw=0.0,
-                                bcm_neg_obligation_mw=reserve_neg,
-                                bcm_pos_obligation_mw=reserve_pos,
-                            )["charge_residual_mw"]
-                        ),
-                    ),
-                )
-                add_id_charge_mw = min(
-                    add_id_charge_mw,
-                    float(
-                        self._compute_canonical_power_stack(
-                            da_charge_mw=da_charge,
-                            da_discharge_mw=da_discharge,
-                            id_buy_mw=id_charge,
-                            id_sell_mw=0.0,
-                            bcm_neg_obligation_mw=reserve_neg,
-                            bcm_pos_obligation_mw=reserve_pos,
-                        )["total_residual_mw"]
-                    ),
-                )
-                id_charge += add_id_charge_mw
-                id_discharge = 0.0
-            elif soc_after_id > req_soc_max_for_neg:
-                need_soc_down = soc_after_id - req_soc_max_for_neg
-                add_id_discharge_mw = (need_soc_down * max(self.eta_out, 1e-12)) / max(self.dt_h, 1e-12)
-                add_id_discharge_mw = max(
-                    0.0,
-                    min(
-                        add_id_discharge_mw,
-                        float(
-                            self._compute_canonical_power_stack(
-                                da_charge_mw=da_charge,
-                                da_discharge_mw=da_discharge,
-                                id_buy_mw=0.0,
-                                id_sell_mw=id_discharge,
-                                bcm_neg_obligation_mw=reserve_neg,
-                                bcm_pos_obligation_mw=reserve_pos,
-                            )["discharge_residual_mw"]
-                        ),
-                    ),
-                )
-                add_id_discharge_mw = min(
-                    add_id_discharge_mw,
-                    float(
-                        self._compute_canonical_power_stack(
-                            da_charge_mw=da_charge,
-                            da_discharge_mw=da_discharge,
-                            id_buy_mw=0.0,
-                            id_sell_mw=id_discharge,
-                            bcm_neg_obligation_mw=reserve_neg,
-                            bcm_pos_obligation_mw=reserve_pos,
-                        )["total_residual_mw"]
-                    ),
-                )
-                id_discharge += add_id_discharge_mw
-                id_charge = 0.0
+        reserve_pos_active_for_safety = float(max(0.0, reserve_pos) > 1e-12)
+        reserve_neg_active_for_safety = float(max(0.0, reserve_neg) > 1e-12)
+        req_soc_min_for_pos = (
+            self.soc_min
+            + (max(0.0, reserve_pos) * self.reserve_activation_headroom_h) / max(self.eta_out, 1e-12)
+            + (float(self.reserve_headroom_safety_mwh) if reserve_pos_active_for_safety > 0.5 else 0.0)
+        )
+        req_soc_max_for_neg = (
+            self.soc_max
+            - (max(0.0, reserve_neg) * self.reserve_activation_headroom_h) * self.eta_in
+            - (float(self.reserve_headroom_safety_mwh) if reserve_neg_active_for_safety > 0.5 else 0.0)
+        )
+        # Settlement is intentionally passive: it executes explicit DA, reserve,
+        # activation and ID setpoints but does not invent new ID repairs. Technical
+        # recovery must be scheduled before settlement by _plan_id_rescue_for_next_hour.
+        settlement_auto_id_repair_applied = 0.0
+        settlement_auto_id_repair_blocked_no_obligation = float(
+            self._strategy_permissions.allow_id
+            and reserve_pos_active_for_safety < 0.5
+            and reserve_neg_active_for_safety < 0.5
+        )
 
         # Requested activation energy is grid-side market MWh.
         act_pos_grid_req = max(0.0, act_pos_rate) * reserve_pos * self.dt_h
@@ -14534,6 +14497,9 @@ class BatteryBacktester:
                 id_buy_price_eur_mwh / max(float(self.eta_in), 1e-12)
             ),
             "local_soc_end_min_target_mwh": float("nan"),
+            "hard_terminal_soc_target_mwh": float(self.soc_target_end),
+            "terminal_repair_safety_margin_mwh": float(self.terminal_id_recovery_safety_mwh),
+            "window_has_actionable_terminal_repair": float(id_reason_hint_norm == "terminal_soc_recovery"),
             "global_final_soc_target_mwh": float(self.soc_target_end),
             "terminal_recovery_allowed_for_row": float(id_reason_hint_norm == "terminal_soc_recovery"),
             "protected_recovery_actual_violation_mwh": float(protected_recovery_actual_violation_mwh),
@@ -14541,6 +14507,12 @@ class BatteryBacktester:
             "protected_soc_recovery_invalid_without_violation": float(
                 protected_soc_recovery_invalid_without_violation
             ),
+            "settlement_auto_id_repair_applied": float(settlement_auto_id_repair_applied),
+            "settlement_auto_id_repair_blocked_no_obligation": float(
+                settlement_auto_id_repair_blocked_no_obligation
+            ),
+            "settlement_reserve_safety_active_pos": float(reserve_pos_active_for_safety),
+            "settlement_reserve_safety_active_neg": float(reserve_neg_active_for_safety),
             "aux_power_mw": aux_power_mw,
             "aux_power_mode": str(self.aux_mode),
             "aux_trading_utilization": float(aux_trading_utilization),
@@ -17046,18 +17018,24 @@ class BatteryBacktester:
             precommit_headroom_opportunity_cost_eur = 0.0
             precommit_net_capacity_ev_after_headroom_cost_eur = 0.0
             precommit_bid_zeroed_due_to_negative_ev = 0.0
-            expected_capacity_ev_eur = float("nan")
+            bcm_recovery_cost_probability_factor = 1.0
+            bcm_recovery_cost_probability_factor_source = "default_no_award_probability_columns"
+            expected_capacity_ev_eur = 0.0
             expected_capacity_revenue_eur = 0.0
             expected_activation_revenue_eur = 0.0
             expected_standby_cost_eur = 0.0
             expected_activation_cost_eur = 0.0
             expected_aux_cost_eur = 0.0
+            selected_bcm_terminal_inventory_effect_eur = 0.0
+            optimizer_component_ev_available = False
             afrr_rounding_before_pos_mw = 0.0
             afrr_rounding_before_neg_mw = 0.0
             afrr_rounding_after_pos_mw = 0.0
             afrr_rounding_after_neg_mw = 0.0
             afrr_rounding_applied = 0.0
             afrr_rounding_zeroed_below_min = 0.0
+            bcm_precommit_soc_start_source = "self.soc_init"
+            bcm_precommit_soc_start_missing = 1.0
             bcm_precommit_stats: dict[str, float | str] = {
                 "feasibility_pass": 1.0,
                 "retry_factor_selected": 1.0,
@@ -17074,18 +17052,40 @@ class BatteryBacktester:
                 "full_award_feasibility_checked": 1.0,
                 "retry_factor_selected_before_clearing": 1.0,
                 "realized_clearing_used_for_selection": 0.0,
+                "soc_start_source": bcm_precommit_soc_start_source,
+                "soc_start_missing": bcm_precommit_soc_start_missing,
+                "recovery_cost_probability_factor_source": bcm_recovery_cost_probability_factor_source,
             }
 
             # Pre-commitment feasibility clamp for BCM capacity offers:
             # ensure offered reserve is physically supportable across the
             # delivery block under configured headroom assumptions.
-            if "soc_start_lp_mwh" in blk.columns:
+            if not blk.empty:
                 def _blk_series(name: str, fallback: float = 0.0) -> pd.Series:
                     if name in blk.columns:
                         return pd.to_numeric(blk[name], errors="coerce").fillna(fallback)
                     return pd.Series(fallback, index=blk.index, dtype=float)
 
-                soc_start = pd.to_numeric(blk["soc_start_lp_mwh"], errors="coerce").fillna(float(self.soc_init))
+                def _resolve_bcm_precommit_soc_start() -> tuple[pd.Series, str, float]:
+                    for candidate_col in (
+                        "soc_start_lp_mwh",
+                        "soc_before_mwh",
+                        "planned_soc_mwh",
+                        "soc_lp_mwh",
+                        "soc_mwh",
+                    ):
+                        if candidate_col not in blk.columns:
+                            continue
+                        raw = pd.to_numeric(blk[candidate_col], errors="coerce")
+                        if bool(raw.notna().any()):
+                            return raw.fillna(float(self.soc_init)), candidate_col, 0.0
+                    return pd.Series(float(self.soc_init), index=blk.index, dtype=float), "self.soc_init", 1.0
+
+                soc_start, bcm_precommit_soc_start_source, bcm_precommit_soc_start_missing = (
+                    _resolve_bcm_precommit_soc_start()
+                )
+                bcm_precommit_stats["soc_start_source"] = str(bcm_precommit_soc_start_source)
+                bcm_precommit_stats["soc_start_missing"] = float(bcm_precommit_soc_start_missing)
                 dis_mw = _blk_series("discharge_mw", 0.0)
                 ch_mw = _blk_series("charge_mw", 0.0)
                 bem_pos = _blk_series("bem_only_pos_mw", 0.0)
@@ -17281,9 +17281,10 @@ class BatteryBacktester:
                 submitted_reserve_pos_mw_after_retry = float(offered_pos)
                 submitted_reserve_neg_mw_after_retry = float(offered_neg)
 
-                def _selected_bcm_award_probability_factor() -> float:
+                def _selected_bcm_award_probability_factor() -> tuple[float, str]:
                     weights: list[float] = []
                     probs: list[float] = []
+                    sources: list[str] = []
                     for b in range(int(len(self.afrr_quantile_bins))):
                         pos_mw = (
                             float(pd.to_numeric(blk[f"reserve_pos_bin_{b}_mw"], errors="coerce").fillna(0.0).mean())
@@ -17295,6 +17296,7 @@ class BatteryBacktester:
                             if f"reserve_neg_bin_{b}_mw" in blk.columns
                             else 0.0
                         )
+                        p_pos_source = "default_1.0"
                         p_pos = (
                             float(pd.to_numeric(blk[f"ev_bcm_p_award_pos_bin_{b}"], errors="coerce").fillna(1.0).mean())
                             if f"ev_bcm_p_award_pos_bin_{b}" in blk.columns
@@ -17304,6 +17306,11 @@ class BatteryBacktester:
                                 else 1.0
                             )
                         )
+                        if f"ev_bcm_p_award_pos_bin_{b}" in blk.columns:
+                            p_pos_source = f"ev_bcm_p_award_pos_bin_{b}"
+                        elif f"ev_pacc_pos_bin_{b}" in blk.columns:
+                            p_pos_source = f"ev_pacc_pos_bin_{b}"
+                        p_neg_source = "default_1.0"
                         p_neg = (
                             float(pd.to_numeric(blk[f"ev_bcm_p_award_neg_bin_{b}"], errors="coerce").fillna(1.0).mean())
                             if f"ev_bcm_p_award_neg_bin_{b}" in blk.columns
@@ -17313,17 +17320,33 @@ class BatteryBacktester:
                                 else 1.0
                             )
                         )
+                        if f"ev_bcm_p_award_neg_bin_{b}" in blk.columns:
+                            p_neg_source = f"ev_bcm_p_award_neg_bin_{b}"
+                        elif f"ev_pacc_neg_bin_{b}" in blk.columns:
+                            p_neg_source = f"ev_pacc_neg_bin_{b}"
                         if pos_mw > 1e-12:
                             weights.append(float(pos_mw))
                             probs.append(float(np.clip(p_pos, 0.0, 1.0)))
+                            sources.append(p_pos_source)
                         if neg_mw > 1e-12:
                             weights.append(float(neg_mw))
                             probs.append(float(np.clip(p_neg, 0.0, 1.0)))
+                            sources.append(p_neg_source)
                     if weights and sum(weights) > 1e-12:
-                        return float(np.average(np.asarray(probs, dtype=float), weights=np.asarray(weights, dtype=float)))
-                    return 1.0
+                        source = ",".join(sorted(set(sources))) if sources else "selected_award_probability_columns"
+                        return (
+                            float(np.average(np.asarray(probs, dtype=float), weights=np.asarray(weights, dtype=float))),
+                            source,
+                        )
+                    return 1.0, "default_no_selected_bin_mw"
 
-                bcm_recovery_cost_probability_factor = float(_selected_bcm_award_probability_factor())
+                (
+                    bcm_recovery_cost_probability_factor,
+                    bcm_recovery_cost_probability_factor_source,
+                ) = _selected_bcm_award_probability_factor()
+                bcm_precommit_stats["recovery_cost_probability_factor_source"] = str(
+                    bcm_recovery_cost_probability_factor_source
+                )
 
                 # Precommit EV check. Reserve headroom is a hard physical
                 # feasibility constraint, not a handcrafted monetary
@@ -17562,6 +17585,12 @@ class BatteryBacktester:
                 bcm_precommit_stats.setdefault(
                     "expected_activation_revenue_eur",
                     float(expected_activation_revenue_eur),
+                )
+                bcm_precommit_stats.setdefault("soc_start_source", str(bcm_precommit_soc_start_source))
+                bcm_precommit_stats.setdefault("soc_start_missing", float(bcm_precommit_soc_start_missing))
+                bcm_precommit_stats.setdefault(
+                    "recovery_cost_probability_factor_source",
+                    str(bcm_recovery_cost_probability_factor_source),
                 )
                 bcm_precommit_stats.setdefault("expected_standby_cost_eur", float(expected_standby_cost_eur))
                 bcm_precommit_stats.setdefault("expected_activation_cost_eur", float(expected_activation_cost_eur))
@@ -18430,6 +18459,21 @@ class BatteryBacktester:
                     )
                     precommit_audit_by_ts.setdefault("bcm_precommit_ev_nan_component", {})[tsu] = str(
                         bcm_precommit_stats.get("ev_nan_component", "none")
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_soc_start_source", {})[tsu] = str(
+                        bcm_precommit_stats.get("soc_start_source", "unknown")
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_soc_start_missing", {})[tsu] = float(
+                        bcm_precommit_stats.get("soc_start_missing", 0.0)
+                    )
+                    precommit_audit_by_ts.setdefault(
+                        "bcm_precommit_recovery_cost_probability_factor_source",
+                        {},
+                    )[tsu] = str(
+                        bcm_precommit_stats.get(
+                            "recovery_cost_probability_factor_source",
+                            "unknown",
+                        )
                     )
                     precommit_audit_by_ts.setdefault("bcm_precommit_optimizer_validation_exception_class", {})[tsu] = str(
                         bcm_precommit_stats.get("optimizer_validation_exception_class", "none")
@@ -19864,6 +19908,19 @@ class BatteryBacktester:
             if bool(perms.allow_bem_only):
                 disable_bem_row = ~bem_gate_valid_for_row if bool(self.bem_gate_enabled) else np.zeros(len(window), dtype=bool)
                 window["_disable_bem_only_bid"] = disable_bem_row.astype(float)
+            window_has_actionable_terminal_repair = bool(
+                str(self.final_soc_mode) == "hard"
+                and bool(perms.allow_id_technical_repair)
+            )
+            optimizer_enforce_end_min = enforce_end_min
+            terminal_constraint_deferred_to_explicit_repair = 0.0
+            if window_has_actionable_terminal_repair and optimizer_enforce_end_min is not None:
+                # Generic optimizer ID variables are disabled in technical-repair
+                # mode. Do not make the MILP infeasible by enforcing a terminal
+                # floor that only the explicit repair planner may satisfy.
+                if float(self.soc_target_end) <= float(self.soc_max) + 1e-9:
+                    optimizer_enforce_end_min = None
+                    terminal_constraint_deferred_to_explicit_repair = 1.0
 
             def _apply_retry_factor_to_new_obligations(
                 obligations: dict[pd.Timestamp, tuple[float, float]],
@@ -19918,7 +19975,7 @@ class BatteryBacktester:
                             colmap,
                             soc_start=soc,
                             soc_end_target=enforce_end,
-                            soc_end_min_target=enforce_end_min,
+                            soc_end_min_target=optimizer_enforce_end_min,
                             fixed_da_dispatch=da_lockbook,
                             fixed_reserve_obligation=trial_ob,
                             deterministic_reserve_settlement=deterministic_reserve_settlement,
@@ -19929,6 +19986,9 @@ class BatteryBacktester:
                         fixed_reserve_obligation = trial_ob
                         reserve_retry_succeeded = 1.0
                         plan["terminal_constraint_dropped"] = 0.0
+                        plan["terminal_constraint_deferred_to_explicit_repair"] = float(
+                            terminal_constraint_deferred_to_explicit_repair
+                        )
                         if float(fac) <= 1e-12:
                             new_reserve_bids_zeroed_by_retry = 1.0
                         break
@@ -20473,6 +20533,25 @@ class BatteryBacktester:
             snapshot_plan = plan.copy()
             if "terminal_constraint_dropped" not in snapshot_plan.columns:
                 snapshot_plan["terminal_constraint_dropped"] = float(terminal_constraint_dropped)
+            terminal_target_diag_cols = {
+                "hard_terminal_soc_target_mwh": float(self.soc_target_end),
+                "terminal_repair_safety_margin_mwh": float(self.terminal_id_recovery_safety_mwh),
+                "local_soc_end_min_target_mwh": (
+                    float(enforce_end_min) if enforce_end_min is not None else np.nan
+                ),
+                "optimizer_soc_end_min_target_mwh": (
+                    float(optimizer_enforce_end_min) if optimizer_enforce_end_min is not None else np.nan
+                ),
+                "window_has_actionable_terminal_repair": float(window_has_actionable_terminal_repair),
+                "terminal_constraint_deferred_to_explicit_repair": float(
+                    terminal_constraint_deferred_to_explicit_repair
+                ),
+            }
+            terminal_target_diag_df = pd.DataFrame(terminal_target_diag_cols, index=snapshot_plan.index)
+            terminal_target_overlap = [c for c in terminal_target_diag_df.columns if c in snapshot_plan.columns]
+            if terminal_target_overlap:
+                snapshot_plan = snapshot_plan.drop(columns=terminal_target_overlap)
+            snapshot_plan = pd.concat([snapshot_plan, terminal_target_diag_df], axis=1)
             snapshot_plan["snapshot_time_utc"] = snapshot_ts if forecast_warehouse else pd.to_datetime(window.iloc[0][colmap.timestamp], utc=True, errors="coerce")
             snapshot_plan["target_time_utc"] = pd.to_datetime(snapshot_plan[colmap.timestamp], utc=True, errors="coerce")
             if snapshot_plan["target_time_utc"].isna().any():
@@ -21988,6 +22067,9 @@ class BatteryBacktester:
                 "bcm_precommit_recovery_cost_used_in_ev_mode",
                 "bcm_precommit_ev_nan_detected",
                 "bcm_precommit_ev_nan_component",
+                "bcm_precommit_soc_start_source",
+                "bcm_precommit_soc_start_missing",
+                "bcm_precommit_recovery_cost_probability_factor_source",
                 "bcm_precommit_ev_award_probability",
                 "bcm_precommit_bcm_ev_award_probability",
                 "bcm_precommit_expected_capacity_revenue_eur",
@@ -25402,6 +25484,17 @@ class BatteryBacktester:
         rolling_pf_da_volume_loss_stage = "not_evaluated"
         rolling_pf_da_volume_loss_reason = "not_evaluated"
         rolling_pf_total_semantics = "raw_solver_only"
+        rolling_pf_terminal_repair_scheduled_mwh = 0.0
+        rolling_pf_terminal_repair_feasible = 0.0
+        rolling_pf_pre_terminal_final_soc_mwh = float("nan")
+        rolling_pf_post_terminal_final_soc_mwh = float("nan")
+        rolling_pf_terminal_repair_required_mwh = 0.0
+        rolling_pf_terminal_repair_grid_buy_mwh = 0.0
+        rolling_pf_terminal_repair_cost_eur = 0.0
+        rolling_pf_terminal_repair_cost_accounted = 0.0
+        rolling_pf_terminal_repair_physical = 0.0
+        rolling_pf_terminal_repair_clearance_reason = "not_evaluated"
+        rolling_pf_solver_final_soc_mwh = float("nan")
         rolling_pf_no_market_terminal_shortfall_mwh = float("nan")
         rolling_pf_solver_failure_timestamp_utc = ""
         rolling_pf_solver_message = ""
@@ -27167,81 +27260,81 @@ class BatteryBacktester:
             rolling_pf_da_first_rejection_soc_violation_mwh
         )
         hourly["rolling_pf_da_first_rejection_aux_loss_mwh"] = float(rolling_pf_da_first_rejection_aux_loss_mwh)
-        hourly["rolling_pf_da_first_rejection_efficiency_mode"] = str(
-            rolling_pf_da_first_rejection_efficiency_mode
-        )
-        hourly["rolling_pf_da_first_rejection_replay_function"] = str(
-            rolling_pf_da_first_rejection_replay_function
-        )
-        hourly["rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh"] = float(
-            rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh
-        )
-        hourly["rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh"] = float(
-            rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh
-        )
-        hourly["da_sizer_postlock_replay_mismatch"] = float(da_sizer_postlock_replay_mismatch)
-        hourly["rolling_pf_da_submitted_buy_mwh"] = float(rolling_pf_da_submitted_buy_mwh)
-        hourly["rolling_pf_da_submitted_sell_mwh"] = float(rolling_pf_da_submitted_sell_mwh)
-        hourly["rolling_pf_da_auction_accepted_buy_mwh"] = float(rolling_pf_da_auction_accepted_buy_mwh)
-        hourly["rolling_pf_da_auction_accepted_sell_mwh"] = float(rolling_pf_da_auction_accepted_sell_mwh)
-        hourly["rolling_pf_da_physical_lockbook_buy_mwh"] = float(rolling_pf_da_physical_lockbook_buy_mwh)
-        hourly["rolling_pf_da_physical_lockbook_sell_mwh"] = float(rolling_pf_da_physical_lockbook_sell_mwh)
-        hourly["rolling_pf_da_price_rejected_buy_mwh"] = float(rolling_pf_da_price_rejected_buy_mwh)
-        hourly["rolling_pf_da_price_rejected_sell_mwh"] = float(rolling_pf_da_price_rejected_sell_mwh)
-        hourly["rolling_pf_da_realized_buy_mwh"] = float(rolling_pf_da_realized_buy_mwh)
-        hourly["rolling_pf_da_realized_sell_mwh"] = float(rolling_pf_da_realized_sell_mwh)
-        hourly["rolling_pf_da_revenue_eur"] = float(rolling_pf_da_revenue_eur)
-        hourly["rolling_pf_da_cost_eur"] = float(rolling_pf_da_cost_eur)
-        hourly["rolling_pf_da_gross_eur"] = float(rolling_pf_da_gross_eur)
-        hourly["rolling_pf_degradation_cost_eur"] = float(rolling_pf_degradation_cost_eur)
-        hourly["rolling_pf_transaction_cost_eur"] = float(rolling_pf_transaction_cost_eur)
-        hourly["rolling_pf_aux_cost_eur"] = float(rolling_pf_aux_cost_eur)
-        hourly["rolling_pf_pnl_eur"] = float(rolling_pf_pnl_eur)
-        hourly["rolling_pf_bcm_plan_history_rows"] = float(rolling_pf_bcm_plan_history_rows)
-        hourly["rolling_pf_bcm_plan_history_stage_used"] = str(rolling_pf_bcm_plan_history_stage_used)
-        hourly["rolling_pf_bcm_gate_allowed_rows"] = float(rolling_pf_bcm_gate_allowed_rows)
-        hourly["rolling_pf_bcm_gate_nonzero_candidate_rows"] = float(
-            rolling_pf_bcm_gate_nonzero_candidate_rows
-        )
-        hourly["rolling_pf_bcm_candidate_pos_mw"] = float(rolling_pf_bcm_candidate_pos_mw)
-        hourly["rolling_pf_bcm_candidate_neg_mw"] = float(rolling_pf_bcm_candidate_neg_mw)
-        hourly["rolling_pf_bcm_precommit_candidate_pos_mw"] = float(
-            rolling_pf_bcm_precommit_candidate_pos_mw
-        )
-        hourly["rolling_pf_bcm_precommit_candidate_neg_mw"] = float(
-            rolling_pf_bcm_precommit_candidate_neg_mw
-        )
-        hourly["rolling_pf_bcm_locked_pos_mw"] = float(rolling_pf_bcm_locked_pos_mw)
-        hourly["rolling_pf_bcm_locked_neg_mw"] = float(rolling_pf_bcm_locked_neg_mw)
-        hourly["rolling_pf_bcm_plan_history_locked_pos_mw"] = float(rolling_pf_bcm_plan_history_locked_pos_mw)
-        hourly["rolling_pf_bcm_plan_history_locked_neg_mw"] = float(rolling_pf_bcm_plan_history_locked_neg_mw)
-        hourly["rolling_pf_bcm_settled_locked_pos_mw"] = float(rolling_pf_bcm_settled_locked_pos_mw)
-        hourly["rolling_pf_bcm_settled_locked_neg_mw"] = float(rolling_pf_bcm_settled_locked_neg_mw)
-        hourly["rolling_pf_bcm_plan_vs_settlement_locked_delta_mw"] = float(
-            rolling_pf_bcm_plan_vs_settlement_locked_delta_mw
-        )
-        hourly["rolling_pf_bcm_ev_pos"] = float(rolling_pf_bcm_ev_pos)
-        hourly["rolling_pf_bcm_ev_neg"] = float(rolling_pf_bcm_ev_neg)
-        hourly["rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw"] = float(
-            rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw
-        )
-        hourly["rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw"] = float(
-            rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw
-        )
-        hourly["rolling_pf_bcm_capacity_price_source_column_pos"] = str(
-            rolling_pf_bcm_capacity_price_source_column_pos
-        )
-        hourly["rolling_pf_bcm_capacity_price_source_column_neg"] = str(
-            rolling_pf_bcm_capacity_price_source_column_neg
-        )
-        hourly["rolling_pf_bcm_zero_reason"] = str(rolling_pf_bcm_zero_reason)
-        hourly["rolling_pf_bcm_zero_stage"] = str(rolling_pf_bcm_zero_stage)
-        hourly["rolling_pf_bcm_deterministic_reserve_settlement"] = float(
-            rolling_pf_bcm_deterministic_reserve_settlement
-        )
-        hourly["rolling_pf_bcm_truth_price_substitution_applied"] = float(
-            rolling_pf_bcm_truth_price_substitution_applied
-        )
+        rolling_pf_scalar_cols = {
+            "rolling_pf_da_first_rejection_efficiency_mode": str(rolling_pf_da_first_rejection_efficiency_mode),
+            "rolling_pf_da_first_rejection_replay_function": str(rolling_pf_da_first_rejection_replay_function),
+            "rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh": float(
+                rolling_pf_da_sizer_vs_postlock_replay_delta_min_soc_mwh
+            ),
+            "rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh": float(
+                rolling_pf_da_sizer_vs_postlock_replay_delta_final_soc_mwh
+            ),
+            "da_sizer_postlock_replay_mismatch": float(da_sizer_postlock_replay_mismatch),
+            "rolling_pf_da_submitted_buy_mwh": float(rolling_pf_da_submitted_buy_mwh),
+            "rolling_pf_da_submitted_sell_mwh": float(rolling_pf_da_submitted_sell_mwh),
+            "rolling_pf_da_auction_accepted_buy_mwh": float(rolling_pf_da_auction_accepted_buy_mwh),
+            "rolling_pf_da_auction_accepted_sell_mwh": float(rolling_pf_da_auction_accepted_sell_mwh),
+            "rolling_pf_da_physical_lockbook_buy_mwh": float(rolling_pf_da_physical_lockbook_buy_mwh),
+            "rolling_pf_da_physical_lockbook_sell_mwh": float(rolling_pf_da_physical_lockbook_sell_mwh),
+            "rolling_pf_da_price_rejected_buy_mwh": float(rolling_pf_da_price_rejected_buy_mwh),
+            "rolling_pf_da_price_rejected_sell_mwh": float(rolling_pf_da_price_rejected_sell_mwh),
+            "rolling_pf_da_realized_buy_mwh": float(rolling_pf_da_realized_buy_mwh),
+            "rolling_pf_da_realized_sell_mwh": float(rolling_pf_da_realized_sell_mwh),
+            "rolling_pf_da_revenue_eur": float(rolling_pf_da_revenue_eur),
+            "rolling_pf_da_cost_eur": float(rolling_pf_da_cost_eur),
+            "rolling_pf_da_gross_eur": float(rolling_pf_da_gross_eur),
+            "rolling_pf_degradation_cost_eur": float(rolling_pf_degradation_cost_eur),
+            "rolling_pf_transaction_cost_eur": float(rolling_pf_transaction_cost_eur),
+            "rolling_pf_aux_cost_eur": float(rolling_pf_aux_cost_eur),
+            "rolling_pf_pnl_eur": float(rolling_pf_pnl_eur),
+            "rolling_pf_bcm_plan_history_rows": float(rolling_pf_bcm_plan_history_rows),
+            "rolling_pf_bcm_plan_history_stage_used": str(rolling_pf_bcm_plan_history_stage_used),
+            "rolling_pf_bcm_gate_allowed_rows": float(rolling_pf_bcm_gate_allowed_rows),
+            "rolling_pf_bcm_gate_nonzero_candidate_rows": float(rolling_pf_bcm_gate_nonzero_candidate_rows),
+            "rolling_pf_bcm_candidate_pos_mw": float(rolling_pf_bcm_candidate_pos_mw),
+            "rolling_pf_bcm_candidate_neg_mw": float(rolling_pf_bcm_candidate_neg_mw),
+            "rolling_pf_bcm_precommit_candidate_pos_mw": float(rolling_pf_bcm_precommit_candidate_pos_mw),
+            "rolling_pf_bcm_precommit_candidate_neg_mw": float(rolling_pf_bcm_precommit_candidate_neg_mw),
+            "rolling_pf_bcm_locked_pos_mw": float(rolling_pf_bcm_locked_pos_mw),
+            "rolling_pf_bcm_locked_neg_mw": float(rolling_pf_bcm_locked_neg_mw),
+            "rolling_pf_bcm_plan_history_locked_pos_mw": float(rolling_pf_bcm_plan_history_locked_pos_mw),
+            "rolling_pf_bcm_plan_history_locked_neg_mw": float(rolling_pf_bcm_plan_history_locked_neg_mw),
+            "rolling_pf_bcm_settled_locked_pos_mw": float(rolling_pf_bcm_settled_locked_pos_mw),
+            "rolling_pf_bcm_settled_locked_neg_mw": float(rolling_pf_bcm_settled_locked_neg_mw),
+            "rolling_pf_bcm_plan_vs_settlement_locked_delta_mw": float(
+                rolling_pf_bcm_plan_vs_settlement_locked_delta_mw
+            ),
+            "rolling_pf_bcm_ev_pos": float(rolling_pf_bcm_ev_pos),
+            "rolling_pf_bcm_ev_neg": float(rolling_pf_bcm_ev_neg),
+            "rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw": float(
+                rolling_pf_bcm_optimizer_coeff_pos_eur_per_mw
+            ),
+            "rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw": float(
+                rolling_pf_bcm_optimizer_coeff_neg_eur_per_mw
+            ),
+            "rolling_pf_bcm_capacity_price_source_column_pos": str(
+                rolling_pf_bcm_capacity_price_source_column_pos
+            ),
+            "rolling_pf_bcm_capacity_price_source_column_neg": str(
+                rolling_pf_bcm_capacity_price_source_column_neg
+            ),
+            "rolling_pf_bcm_zero_reason": str(rolling_pf_bcm_zero_reason),
+            "rolling_pf_bcm_zero_stage": str(rolling_pf_bcm_zero_stage),
+            "rolling_pf_bcm_deterministic_reserve_settlement": float(
+                rolling_pf_bcm_deterministic_reserve_settlement
+            ),
+            "rolling_pf_bcm_truth_price_substitution_applied": float(
+                rolling_pf_bcm_truth_price_substitution_applied
+            ),
+        }
+        existing_rolling_pf_scalar_cols = [c for c in rolling_pf_scalar_cols if c in hourly.columns]
+        hourly = pd.concat(
+            [
+                hourly.drop(columns=existing_rolling_pf_scalar_cols, errors="ignore"),
+                pd.DataFrame(rolling_pf_scalar_cols, index=hourly.index),
+            ],
+            axis=1,
+        ).copy()
         global_pf_hourly_cols = {
             "global_pf_selected_incumbent": str(global_pf_selected_incumbent),
             "global_pf_is_solver_upper_bound": float(global_pf_is_solver_upper_bound),
@@ -27784,6 +27877,88 @@ class BatteryBacktester:
             np.isfinite(float(rolling_pf_solver_pnl_balance_error_eur))
             and abs(float(rolling_pf_solver_pnl_balance_error_eur)) <= 1e-6
         )
+        pf_terminal_closure = terminal_closure_by_prefix.get("perfect_foresight", {})
+        rolling_pf_pre_terminal_final_soc_mwh = float(
+            pf_terminal_closure.get(
+                "final_soc_before_terminal_closure_mwh",
+                pf_terminal_closure.get("terminal_closure_soc_before_mwh", final_perfect_foresight_soc_mwh),
+            )
+        )
+        rolling_pf_post_terminal_final_soc_mwh = float(
+            pf_terminal_closure.get(
+                "final_soc_after_terminal_closure_mwh",
+                pf_terminal_closure.get("terminal_closure_soc_after_mwh", final_perfect_foresight_soc_mwh),
+            )
+        )
+        if not np.isfinite(float(rolling_pf_pre_terminal_final_soc_mwh)):
+            rolling_pf_pre_terminal_final_soc_mwh = float(final_perfect_foresight_soc_mwh)
+        if not np.isfinite(float(rolling_pf_post_terminal_final_soc_mwh)):
+            rolling_pf_post_terminal_final_soc_mwh = float(final_perfect_foresight_soc_mwh)
+        rolling_pf_terminal_repair_required_mwh = float(
+            max(0.0, float(self.soc_target_end) - float(rolling_pf_pre_terminal_final_soc_mwh))
+        )
+        rolling_pf_terminal_repair_grid_buy_mwh = float(
+            pf_terminal_closure.get(
+                "terminal_closure_id_buy_mwh",
+                rolling_pf_terminal_repair_required_mwh / max(float(self.eta_in), 1e-12),
+            )
+        )
+        if not np.isfinite(float(rolling_pf_terminal_repair_grid_buy_mwh)):
+            rolling_pf_terminal_repair_grid_buy_mwh = 0.0
+        rolling_pf_terminal_repair_scheduled_mwh = float(rolling_pf_terminal_repair_grid_buy_mwh)
+        rolling_pf_terminal_repair_cost_eur = float(
+            pf_terminal_closure.get(
+                "terminal_closure_cost_eur",
+                float(rolling_pf_terminal_repair_grid_buy_mwh) * float(terminal_price_true_eur_mwh),
+            )
+        )
+        terminal_closure_net_pnl_from_components = float(
+            float(pf_terminal_closure.get("terminal_closure_revenue_eur", 0.0) or 0.0)
+            - float(pf_terminal_closure.get("terminal_closure_cost_eur", 0.0) or 0.0)
+            - float(pf_terminal_closure.get("terminal_closure_transaction_cost_eur", 0.0) or 0.0)
+            - float(pf_terminal_closure.get("terminal_closure_degradation_cost_eur", 0.0) or 0.0)
+            - float(pf_terminal_closure.get("terminal_closure_aux_cost_eur", 0.0) or 0.0)
+        )
+        terminal_closure_cost_line_accounted = bool(
+            np.isfinite(float(terminal_closure_pf_pnl_eur))
+            and abs(float(terminal_closure_pf_pnl_eur) - terminal_closure_net_pnl_from_components) <= 1e-6
+        )
+        rolling_pf_terminal_repair_cost_accounted = float(
+            terminal_closure_cost_line_accounted
+            and rolling_pf_solver_pnl_balance_ok >= 0.5
+            and np.isfinite(float(rolling_pf_solver_component_pnl_eur))
+        )
+        rolling_pf_terminal_repair_physical = float(
+            bool(benchmark_paths.get("rhpf", False))
+            and str(pf_terminal_closure.get("terminal_closure_reason", "")).strip().lower()
+            == "shortfall_recovery"
+            and float(pf_terminal_closure.get("terminal_closure_applied", 0.0) or 0.0) >= 0.5
+            and float(pf_terminal_closure.get("terminal_closure_id_buy_mwh", 0.0) or 0.0) > 1e-9
+            and float(pf_terminal_closure.get("final_soc_target_met_after_closure", 0.0) or 0.0) >= 0.5
+            and abs(float(rolling_pf_post_terminal_final_soc_mwh) - float(self.soc_target_end)) <= 1e-6
+        )
+        rolling_pf_terminal_repair_feasible = float(
+            rolling_pf_terminal_repair_physical >= 0.5
+            and rolling_pf_terminal_repair_cost_accounted >= 0.5
+            and rolling_pf_solver_pnl_balance_ok >= 0.5
+        )
+        rolling_pf_solver_final_soc_mwh = float(rolling_pf_post_terminal_final_soc_mwh)
+        if str(rolling_pf_solver_infeasible_reason) == "terminal_soc_shortfall":
+            if rolling_pf_terminal_repair_feasible >= 0.5:
+                rolling_pf_solver_feasible = 1.0
+                rolling_pf_solver_infeasible_reason = "none"
+                rolling_pf_terminal_repair_clearance_reason = "physical_terminal_repair_to_target_cost_accounted"
+                rolling_pf_solver_final_soc_mwh = float(rolling_pf_post_terminal_final_soc_mwh)
+            elif rolling_pf_terminal_repair_physical >= 0.5 and rolling_pf_terminal_repair_cost_accounted < 0.5:
+                rolling_pf_solver_feasible = 0.0
+                rolling_pf_solver_infeasible_reason = "terminal_repair_cost_not_accounted"
+                rolling_pf_terminal_repair_clearance_reason = "physical_repair_cost_not_accounted"
+            else:
+                rolling_pf_solver_feasible = 0.0
+                rolling_pf_solver_infeasible_reason = "terminal_soc_shortfall_after_terminal_closure"
+                rolling_pf_terminal_repair_clearance_reason = "no_physical_terminal_repair_proof"
+        else:
+            rolling_pf_terminal_repair_clearance_reason = "not_terminal_soc_shortfall"
         rolling_pf_solver_minus_realized_path_eur = (
             float(rolling_pf_solver_total_pnl_eur - rolling_pf_realized_path_total_pnl_eur)
             if np.isfinite(float(rolling_pf_solver_total_pnl_eur))
@@ -27899,6 +28074,17 @@ class BatteryBacktester:
                 rolling_pf_selected_incumbent_pre_normalization
             )
             hourly["rolling_pf_solver_final_pnl_eur"] = float(rolling_pf_solver_final_pnl_eur)
+            hourly["rolling_pf_terminal_repair_scheduled_mwh"] = float(rolling_pf_terminal_repair_scheduled_mwh)
+            hourly["rolling_pf_terminal_repair_feasible"] = float(rolling_pf_terminal_repair_feasible)
+            hourly["rolling_pf_pre_terminal_final_soc_mwh"] = float(rolling_pf_pre_terminal_final_soc_mwh)
+            hourly["rolling_pf_post_terminal_final_soc_mwh"] = float(rolling_pf_post_terminal_final_soc_mwh)
+            hourly["rolling_pf_terminal_repair_required_mwh"] = float(rolling_pf_terminal_repair_required_mwh)
+            hourly["rolling_pf_terminal_repair_grid_buy_mwh"] = float(rolling_pf_terminal_repair_grid_buy_mwh)
+            hourly["rolling_pf_terminal_repair_cost_eur"] = float(rolling_pf_terminal_repair_cost_eur)
+            hourly["rolling_pf_terminal_repair_cost_accounted"] = float(rolling_pf_terminal_repair_cost_accounted)
+            hourly["rolling_pf_terminal_repair_physical"] = float(rolling_pf_terminal_repair_physical)
+            hourly["rolling_pf_terminal_repair_clearance_reason"] = str(rolling_pf_terminal_repair_clearance_reason)
+            hourly["rolling_pf_solver_final_soc_mwh"] = float(rolling_pf_solver_final_soc_mwh)
             hourly["rolling_pf_realized_path_final_pnl_eur"] = float(rolling_pf_realized_path_final_pnl_eur)
             hourly["rolling_pf_solver_vs_realized_path_delta_eur"] = float(
                 rolling_pf_solver_vs_realized_path_delta_eur
@@ -28119,6 +28305,17 @@ class BatteryBacktester:
             "rolling_pf_solver_below_realized_path": float(rolling_pf_solver_below_realized_path),
             "rolling_pf_dominance_check_pass": float(rolling_pf_dominance_check_pass),
             "rolling_pf_solver_final_pnl_eur": float(rolling_pf_solver_final_pnl_eur),
+            "rolling_pf_terminal_repair_scheduled_mwh": float(rolling_pf_terminal_repair_scheduled_mwh),
+            "rolling_pf_terminal_repair_feasible": float(rolling_pf_terminal_repair_feasible),
+            "rolling_pf_pre_terminal_final_soc_mwh": float(rolling_pf_pre_terminal_final_soc_mwh),
+            "rolling_pf_post_terminal_final_soc_mwh": float(rolling_pf_post_terminal_final_soc_mwh),
+            "rolling_pf_terminal_repair_required_mwh": float(rolling_pf_terminal_repair_required_mwh),
+            "rolling_pf_terminal_repair_grid_buy_mwh": float(rolling_pf_terminal_repair_grid_buy_mwh),
+            "rolling_pf_terminal_repair_cost_eur": float(rolling_pf_terminal_repair_cost_eur),
+            "rolling_pf_terminal_repair_cost_accounted": float(rolling_pf_terminal_repair_cost_accounted),
+            "rolling_pf_terminal_repair_physical": float(rolling_pf_terminal_repair_physical),
+            "rolling_pf_terminal_repair_clearance_reason": str(rolling_pf_terminal_repair_clearance_reason),
+            "rolling_pf_solver_final_soc_mwh": float(rolling_pf_solver_final_soc_mwh),
             "rolling_pf_realized_path_final_pnl_eur": float(rolling_pf_realized_path_final_pnl_eur),
             "rolling_pf_solver_vs_realized_path_delta_eur": float(rolling_pf_solver_vs_realized_path_delta_eur),
             "rolling_pf_solver_feasible": float(rolling_pf_solver_feasible),
@@ -28807,6 +29004,49 @@ class BatteryBacktester:
         )
         summary["protected_recovery_obligation_active"] = float(
             _hourly_num_any("real_protected_recovery_obligation_active", "protected_recovery_obligation_active").max()
+        )
+        summary["settlement_auto_id_repair_applied"] = float(
+            _hourly_num_any("real_settlement_auto_id_repair_applied", "settlement_auto_id_repair_applied").max()
+        )
+        summary["settlement_auto_id_repair_blocked_no_obligation"] = float(
+            _hourly_num_any(
+                "real_settlement_auto_id_repair_blocked_no_obligation",
+                "settlement_auto_id_repair_blocked_no_obligation",
+            ).max()
+        )
+        summary["settlement_reserve_safety_active_pos"] = float(
+            _hourly_num_any("real_settlement_reserve_safety_active_pos", "settlement_reserve_safety_active_pos").max()
+        )
+        summary["settlement_reserve_safety_active_neg"] = float(
+            _hourly_num_any("real_settlement_reserve_safety_active_neg", "settlement_reserve_safety_active_neg").max()
+        )
+        summary["hard_terminal_soc_target_mwh"] = float(
+            _hourly_num_any("real_hard_terminal_soc_target_mwh", "hard_terminal_soc_target_mwh", default=self.soc_target_end).max()
+        )
+        summary["terminal_repair_safety_margin_mwh"] = float(
+            _hourly_num_any(
+                "real_terminal_repair_safety_margin_mwh",
+                "terminal_repair_safety_margin_mwh",
+                default=self.terminal_id_recovery_safety_mwh,
+            ).max()
+        )
+        summary["window_has_actionable_terminal_repair"] = float(
+            _hourly_num_any("real_window_has_actionable_terminal_repair", "window_has_actionable_terminal_repair").max()
+        )
+        summary["terminal_constraint_deferred_to_explicit_repair"] = float(
+            _hourly_num_any(
+                "real_terminal_constraint_deferred_to_explicit_repair",
+                "terminal_constraint_deferred_to_explicit_repair",
+            ).max()
+        )
+        optimizer_target_series = _hourly_num_any(
+            "real_optimizer_soc_end_min_target_mwh",
+            "optimizer_soc_end_min_target_mwh",
+            default=float("nan"),
+        )
+        finite_optimizer_target = optimizer_target_series[np.isfinite(optimizer_target_series)]
+        summary["optimizer_soc_end_min_target_mwh"] = float(
+            finite_optimizer_target.max() if len(finite_optimizer_target) else float("nan")
         )
         summary["upper_soc_relief_id_mwh"] = float(id_sell_mwh.loc[id_reason_series.eq("upper_soc_relief")].sum())
         summary["realized_total_pnl_excluding_id_eur"] = float(summary["realized_total_pnl_eur"] - summary["total_id_pnl_eur"])
@@ -29719,7 +29959,13 @@ class BatteryBacktester:
         summary["target_final_soc_mwh"] = float(self.soc_target_end)
         summary["final_soc_min_target_mwh"] = float(self.soc_target_end)
         summary["final_soc_target_mwh"] = float(self.soc_target_end)
-        summary["final_soc_constraint_satisfied"] = float(abs(final_real_soc_mwh - float(self.soc_target_end)) <= 1e-6)
+        final_target_physically_reachable = bool(
+            float(self.soc_min) - 1e-9 <= float(self.soc_target_end) <= float(self.soc_max) + 1e-9
+        )
+        summary["final_soc_constraint_satisfied"] = float(
+            final_target_physically_reachable
+            and abs(final_real_soc_mwh - float(self.soc_target_end)) <= 1e-6
+        )
         summary["final_soc_physical_check_pass"] = float(summary["final_soc_constraint_satisfied"])
         summary["final_soc_mode"] = str(self.final_soc_mode)
         summary["final_soc_exact_match_pass"] = float(abs(float(final_real_soc_mwh) - float(self.soc_target_end)) <= 1e-6)
@@ -30915,6 +31161,17 @@ class BatteryBacktester:
             ("rolling_pf_solver_component_pnl_incl_terminal_eur", float("nan")),
             ("rolling_pf_solver_pnl_balance_error_eur", float("nan")),
             ("rolling_pf_solver_pnl_balance_ok", 0.0),
+            ("rolling_pf_terminal_repair_scheduled_mwh", 0.0),
+            ("rolling_pf_terminal_repair_feasible", 0.0),
+            ("rolling_pf_pre_terminal_final_soc_mwh", float("nan")),
+            ("rolling_pf_post_terminal_final_soc_mwh", float("nan")),
+            ("rolling_pf_terminal_repair_required_mwh", 0.0),
+            ("rolling_pf_terminal_repair_grid_buy_mwh", 0.0),
+            ("rolling_pf_terminal_repair_cost_eur", 0.0),
+            ("rolling_pf_terminal_repair_cost_accounted", 0.0),
+            ("rolling_pf_terminal_repair_physical", 0.0),
+            ("rolling_pf_terminal_repair_clearance_reason", "not_evaluated"),
+            ("rolling_pf_solver_final_soc_mwh", float("nan")),
             ("rolling_pf_solver_available", 0.0),
             ("rolling_pf_solver_invalid_reason", "not_evaluated"),
             ("rolling_pf_reported_total_pnl_eur", float("nan")),
@@ -31151,11 +31408,20 @@ class BatteryBacktester:
             ("optimizer_id_buy_terminal_shadow_value_eur_per_internal_mwh", 0.0),
             ("optimizer_id_buy_effective_cost_eur_per_internal_mwh", float("nan")),
             ("local_soc_end_min_target_mwh", float("nan")),
+            ("optimizer_soc_end_min_target_mwh", float("nan")),
+            ("hard_terminal_soc_target_mwh", float(self.soc_target_end)),
+            ("terminal_repair_safety_margin_mwh", float(self.terminal_id_recovery_safety_mwh)),
+            ("window_has_actionable_terminal_repair", 0.0),
+            ("terminal_constraint_deferred_to_explicit_repair", 0.0),
             ("global_final_soc_target_mwh", float(self.soc_target_end)),
             ("terminal_recovery_allowed_for_row", 0.0),
             ("protected_recovery_actual_violation_mwh", 0.0),
             ("protected_recovery_obligation_active", 0.0),
             ("protected_soc_recovery_invalid_without_violation", 0.0),
+            ("settlement_auto_id_repair_applied", 0.0),
+            ("settlement_auto_id_repair_blocked_no_obligation", 0.0),
+            ("settlement_reserve_safety_active_pos", 0.0),
+            ("settlement_reserve_safety_active_neg", 0.0),
             ("final_soc_handling_mode", "terminal_settlement_to_target"),
             ("terminal_soc_net_adjustment_eur", 0.0),
             ("terminal_price_eur_mwh", 0.0),
