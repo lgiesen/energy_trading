@@ -63,19 +63,12 @@ if str(SRC_DIR) not in sys.path:
 
 from energy_trading.config import MARKET_SPECS, MODEL_SPECS
 from energy_trading.simulation.battery_backtest import (
-    AFRR_QUANTILE_BINS,
-    BacktestColumnMap,
-    BatteryBacktester,
-    PhaseTimeoutError,
-    _write_checkpoint_run_status,
-    canonicalize_market_frame,
-    load_and_align_market_data,
-    load_prediction_warehouse_long,
-    normalize_predicted_pnl_aliases,
-    resolve_benchmark_paths,
-)
-from energy_trading.visualization.style import apply_geo_style, get_backtest_line_style
-
+    AFRR_QUANTILE_BINS, BacktestColumnMap, BatteryBacktester,
+    PhaseTimeoutError, _write_checkpoint_run_status, canonicalize_market_frame,
+    load_and_align_market_data, load_prediction_warehouse_long,
+    normalize_predicted_pnl_aliases, resolve_benchmark_paths)
+from energy_trading.visualization.style import (apply_geo_style,
+                                                get_backtest_line_style)
 
 INPUT_CACHE_SCHEMA_VERSION = "simulation_input_cache_v1"
 SIMULATION_EVAL_START_UTC = pd.Timestamp("2025-01-14T00:00:00Z")
@@ -453,6 +446,38 @@ def optional_numeric_series(
         numeric=True,
         default=default,
     )
+
+
+def _add_benchmark_comparison_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add model/naive/RHPF comparison metrics used in console and overview outputs."""
+    out = df.copy()
+    model = pd.to_numeric(out.get("realized_total_pnl_eur", np.nan), errors="coerce")
+    naive = pd.to_numeric(out.get("naive_total_pnl_eur", np.nan), errors="coerce")
+    rhpf = pd.to_numeric(
+        out.get(
+            "rolling_perfect_foresight_same_rules_total_pnl_eur",
+            out.get("rhpf_total_pnl_eur", np.nan),
+        ),
+        errors="coerce",
+    )
+    rhpf_minus_naive = rhpf - naive
+    out["value_of_foresight_ratio"] = np.where(
+        rhpf_minus_naive.abs() > 1e-12,
+        (model - naive) / rhpf_minus_naive,
+        np.nan,
+    )
+    out["value_of_foresight_pct"] = out["value_of_foresight_ratio"] * 100.0
+    out["model_vs_naive_pct_minus_100"] = np.where(
+        naive.abs() > 1e-12,
+        (model / naive - 1.0) * 100.0,
+        np.nan,
+    )
+    out["model_vs_rhpf_pct"] = np.where(
+        rhpf.abs() > 1e-12,
+        (model / rhpf) * 100.0,
+        np.nan,
+    )
+    return out
 
 
 def _suspected_infeasibility_driver_from_row(row: pd.Series) -> tuple[str, str]:
@@ -5377,6 +5402,7 @@ def main() -> None:
                 (r / g) * 100.0,
                 np.nan,
             )
+        overview = _add_benchmark_comparison_columns(overview)
         overview = overview.sort_values([c for c in ["scenario", "trading_strategy"] if c in overview.columns]).reset_index(drop=True)
         overview.to_csv(overview_csv, index=False)
         overview_json.write_text(overview.to_json(orient="records", indent=2), encoding="utf-8")
@@ -5419,9 +5445,12 @@ def main() -> None:
             for c in [
                 "scenario",
                 "trading_strategy",
+                "naive_total_pnl_eur",
                 "realized_total_pnl_eur",
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
-                "realized_vs_perfect_foresight_pct",
+                "value_of_foresight_pct",
+                "model_vs_naive_pct_minus_100",
+                "model_vs_rhpf_pct",
                 "simulation_valid",
                 "thesis_reportable",
                 "invalid_reason",
@@ -5431,9 +5460,12 @@ def main() -> None:
         if show_cols:
             display_df = overview[show_cols].copy()
             for c in [
+                "naive_total_pnl_eur",
                 "realized_total_pnl_eur",
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
-                "realized_vs_perfect_foresight_pct",
+                "value_of_foresight_pct",
+                "model_vs_naive_pct_minus_100",
+                "model_vs_rhpf_pct",
             ]:
                 if c in display_df.columns:
                     display_df[c] = pd.to_numeric(display_df[c], errors="coerce").map(
@@ -5443,9 +5475,12 @@ def main() -> None:
                 columns={
                     "scenario": "scen",
                     "trading_strategy": "strat",
-                    "realized_total_pnl_eur": "pnl_real_eur",
-                    "rolling_perfect_foresight_same_rules_total_pnl_eur": "pnl_pf_roll_eur",
-                    "realized_vs_perfect_foresight_pct": "real_vs_pf_roll_pct",
+                    "naive_total_pnl_eur": "PnL Naive (€)",
+                    "realized_total_pnl_eur": "PnL Model (€)",
+                    "rolling_perfect_foresight_same_rules_total_pnl_eur": "PnL RHPF (€)",
+                    "value_of_foresight_pct": "VoF (%)",
+                    "model_vs_naive_pct_minus_100": "Model vs Naive (%)",
+                    "model_vs_rhpf_pct": "Model vs RHPF (%)",
                 }
             )
             print(display_df.to_string(index=False))

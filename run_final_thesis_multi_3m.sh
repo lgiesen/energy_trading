@@ -36,9 +36,6 @@ set -Eeuo pipefail
 # RUN_ROOT="artifacts/simulation_runs/thesis_final_multi_3m_YYYYmmddTHHMMSSZ"
 # tail -f "$RUN_ROOT/logs/MODEL_QUANTILE/stdout.log"
 
-# RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_3m_20260609T205217Z \
-# ./run_final_thesis_multi_3m.sh
-
 MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
 
 START="2025-03-01T00:00:00Z"

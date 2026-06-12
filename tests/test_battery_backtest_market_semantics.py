@@ -49,6 +49,7 @@ from scripts.run_battery_backtest import (  # noqa: E402
     _build_performance_metrics,
     _build_performance_paths_long,
     _build_performance_reconciliation_debug,
+    _add_benchmark_comparison_columns,
     _validate_performance_metrics,
     _build_optimization_infeasibility_attribution,
     _prepare_scenario_output_dir,
@@ -60,6 +61,7 @@ from scripts.run_battery_backtest import (  # noqa: E402
     require_numeric_series,
 )
 from scripts import validate_simulation_outputs as validate_outputs  # noqa: E402
+from scripts import validate_rhpf_outputs  # noqa: E402
 
 
 def _mk_backtester(forecast_value_mode: str = "raw_signed") -> BatteryBacktester:
@@ -5789,6 +5791,63 @@ def test_da_rhpf_price_taker_summary_matches_hourly_final_cum_pnl() -> None:
     assert float(out.summary["rolling_pf_pnl_eur"]) == pytest.approx(
         float(pd.to_numeric(out.hourly["rolling_pf_pnl_eur"], errors="coerce").iloc[-1])
     )
+    assert "rolling_pf_solver_raw_total_pnl_eur" in out.summary
+    for col_name in [
+        "rolling_pf_solver_total_pnl_eur",
+        "rolling_pf_solver_component_pnl_eur",
+        "rolling_pf_solver_pnl_balance_error_eur",
+        "rolling_pf_solver_pnl_balance_ok",
+        "rolling_pf_solver_available",
+        "rolling_pf_solver_invalid_reason",
+        "rolling_pf_reported_total_pnl_eur",
+        "rolling_pf_reported_available",
+        "rolling_pf_reported_is_solver",
+        "rolling_pf_reported_invalid_reason",
+        "rolling_pf_realized_path_total_pnl_eur",
+        "rolling_pf_no_market_total_pnl_eur",
+        "rolling_pf_solver_minus_realized_path_eur",
+        "rolling_pf_solver_below_realized_path",
+        "rolling_pf_dominance_check_pass",
+        "rolling_pf_selected_total_pnl_eur",
+        "rolling_pf_selected_component_pnl_eur",
+        "rolling_pf_selected_pnl_balance_error_eur",
+        "rolling_pf_selected_pnl_balance_ok",
+        "rolling_pf_selected_is_solver",
+        "rolling_pf_selected_is_realized_path_fallback",
+        "rolling_pf_selected_is_no_market_fallback",
+        "rolling_pf_no_market_feasible",
+        "rolling_pf_realized_path_feasible",
+        "rolling_pf_solver_infeasible_reason",
+        "rolling_pf_no_market_infeasible_reason",
+        "rolling_pf_realized_path_infeasible_reason",
+        "rolling_pf_expected_row_count",
+        "rolling_pf_solver_row_count",
+        "rolling_pf_no_market_row_count",
+        "rolling_pf_realized_path_row_count",
+    ]:
+        assert col_name in out.summary
+    if float(out.summary["rolling_pf_reported_available"]) >= 0.5:
+        assert float(out.summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
+            float(out.summary["rolling_pf_reported_total_pnl_eur"])
+        )
+        assert float(out.summary["same_rules_rolling_pf_total_pnl_eur"]) == pytest.approx(
+            float(out.summary["rolling_pf_reported_total_pnl_eur"])
+        )
+        if "rhpf_total_pnl_eur" in out.summary:
+            assert float(out.summary["rhpf_total_pnl_eur"]) == pytest.approx(
+                float(out.summary["rolling_pf_reported_total_pnl_eur"])
+            )
+    else:
+        assert np.isnan(float(out.summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+        assert str(out.summary["rolling_pf_reported_invalid_reason"]) != "none"
+    selected = str(out.summary["rolling_pf_selected_incumbent"])
+    assert float(out.summary["rolling_pf_selected_is_solver"]) == pytest.approx(float(selected == "solver"))
+    assert float(out.summary["rolling_pf_selected_is_realized_path_fallback"]) == pytest.approx(
+        float(selected == "realized_path")
+    )
+    assert float(out.summary["rolling_pf_selected_is_no_market_fallback"]) == pytest.approx(
+        float(selected == "no_market")
+    )
     for col_name in [
         "rolling_pf_da_plan_history_rows",
         "rolling_pf_da_gate_allowed_rows",
@@ -5800,10 +5859,48 @@ def test_da_rhpf_price_taker_summary_matches_hourly_final_cum_pnl() -> None:
         assert float(out.summary[col_name]) == pytest.approx(
             float(pd.to_numeric(out.hourly[col_name], errors="coerce").iloc[-1])
         )
-    if str(out.summary.get("rolling_pf_selected_incumbent", "")) == "solver":
+    if float(out.summary.get("rolling_pf_reported_available", 0.0)) >= 0.5:
         assert float(out.summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
-            float(out.summary["rolling_pf_selected_incumbent_pnl_eur"])
+            float(out.summary["rolling_pf_reported_total_pnl_eur"])
         )
+
+
+def test_rhpf_selected_incumbent_can_beat_raw_solver_without_hiding_solver() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=30)
+
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=24,
+        reopt_step_hours=1,
+        allowed_markets=("DA",),
+        strategy_name="da",
+        strict_simulation_validity=False,
+    )
+    s = out.summary
+
+    assert float(s["rolling_pf_solver_feasible"]) >= 0.5
+    assert float(s["rolling_pf_no_market_feasible"]) >= 0.5
+    assert str(s["rolling_pf_solver_infeasible_reason"]) == "none"
+    assert str(s["rolling_pf_no_market_infeasible_reason"]) == "none"
+    assert float(s["rolling_pf_expected_row_count"]) == pytest.approx(float(s["rolling_pf_solver_row_count"]))
+    assert float(s["rolling_pf_expected_row_count"]) == pytest.approx(float(s["rolling_pf_no_market_row_count"]))
+    assert str(s["rolling_pf_selected_incumbent"]) == "no_market"
+    assert float(s["rolling_pf_selected_is_no_market_fallback"]) == pytest.approx(1.0)
+    assert float(s["rolling_pf_selected_total_pnl_eur"]) > float(s["rolling_pf_solver_total_pnl_eur"])
+    assert float(s["rolling_pf_reported_available"]) == pytest.approx(1.0)
+    assert float(s["rolling_pf_reported_is_solver"]) == pytest.approx(1.0)
+    assert float(s["rolling_pf_reported_total_pnl_eur"]) == pytest.approx(
+        float(s["rolling_pf_solver_total_pnl_eur"])
+    )
+    assert float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
+        float(s["rolling_pf_reported_total_pnl_eur"])
+    )
+    assert float(s["rolling_pf_dominance_check_pass"]) == pytest.approx(1.0)
+    assert np.isfinite(float(s["rolling_pf_solver_total_pnl_eur"]))
+    assert np.isfinite(float(s["rolling_pf_solver_component_pnl_eur"]))
 
 
 def test_bcm_rhpf_capacity_price_plan_history_diagnostics_explain_side_selection() -> None:
@@ -5918,14 +6015,26 @@ def test_bcm_rhpf_capacity_price_summary_matches_canonical_selected_pnl() -> Non
     assert "rolling_pf_bcm_plan_history_locked_pos_mw" in s
     assert "rolling_pf_bcm_settled_locked_pos_mw" in s
     assert "rolling_pf_bcm_plan_vs_settlement_locked_delta_mw" in s
+    assert "rolling_pf_bcm_first_plan_settlement_mismatch_ts_utc" in s
+    assert "rolling_pf_bcm_plan_settlement_mismatch_reason" in s
+    assert "rolling_pf_bcm_solver_capacity_revenue_eur" in s
+    assert "rolling_pf_bcm_solver_activation_revenue_eur" in s
+    assert "rolling_pf_bcm_solver_component_includes_capacity_revenue" in s
+    assert "rolling_pf_bcm_solver_component_includes_activation_revenue" in s
     assert float(s["rolling_pf_bcm_deterministic_reserve_settlement"]) == pytest.approx(0.0)
     assert float(s["rolling_pf_bcm_truth_price_substitution_applied"]) == pytest.approx(1.0)
-    assert float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
-        float(s["same_rules_rolling_pf_total_pnl_eur"])
-    )
-    assert float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
-        float(s["rolling_pf_selected_incumbent_pnl_eur"])
-    )
+    assert "rolling_pf_reported_total_pnl_eur" in s
+    assert "rolling_pf_reported_available" in s
+    if float(s["rolling_pf_reported_available"]) >= 0.5:
+        assert float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
+            float(s["same_rules_rolling_pf_total_pnl_eur"])
+        )
+        assert float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]) == pytest.approx(
+            float(s["rolling_pf_reported_total_pnl_eur"])
+        )
+    else:
+        assert np.isnan(float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+        assert str(s["rolling_pf_reported_invalid_reason"]) != "none"
     assert "rolling_pf_selected_incumbent_pre_terminal_pnl_eur" in s
     assert "rolling_pf_selected_vs_hourly_final_pnl_delta_eur" in s
     assert "rolling_pf_selected_vs_component_pnl_delta_eur" in s
@@ -15771,8 +15880,13 @@ def test_rolling_pf_solver_error_selects_feasible_no_market_incumbent() -> None:
     assert float(s["rolling_pf_no_market_incumbent_eur"]) <= 1e-9
     assert float(s["rolling_pf_no_market_terminal_shortfall_mwh"]) <= 1e-6
     assert "global_pf_verified_upper_bound" in s
-    assert "rolling_pf_solver_failed" not in str(s["invalid_reason"])
-    assert np.isfinite(float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+    assert "rolling_pf_solver_failed" in str(s["invalid_reason"])
+    assert float(s["rolling_pf_reported_available"]) == pytest.approx(0.0)
+    assert np.isnan(float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+    assert "rolling_pf_solver_raw_total_pnl_eur" in s
+    assert str(s["rolling_pf_reported_invalid_reason"]) != "none"
+    assert np.isnan(float(s["same_rules_rolling_pf_total_pnl_eur"]))
+    assert np.isnan(float(s["rhpf_total_pnl_eur"]))
 
 
 def test_rolling_pf_solver_error_selects_feasible_incumbent_without_invalidating() -> None:
@@ -15805,9 +15919,9 @@ def test_rolling_pf_solver_error_selects_feasible_incumbent_without_invalidating
     s = out.summary
     assert str(s["rolling_pf_solver_status"]) == "solver_failed"
     assert float(s["rolling_pf_available"]) == 1.0
-    assert float(s["rolling_pf_verified_upper_bound"]) == 1.0
+    assert float(s["rolling_pf_reported_available"]) == 0.0
     assert str(s["rolling_pf_selected_incumbent"]) in {"no_market", "realized_path"}
-    assert "rolling_pf_solver_failed" not in str(s["invalid_reason"])
+    assert "rolling_pf_solver_failed" in str(s["invalid_reason"])
 
 
 def test_no_obligation_protected_soc_equals_physical_bounds() -> None:
@@ -15996,6 +16110,25 @@ def test_performance_metrics_prefers_predicted_pnl_and_accepts_legacy_planned_al
     )
 
     assert float(perf_df.iloc[0]["predicted_net_revenue_eur"]) == pytest.approx(42.0)
+
+
+def test_strategy_overview_benchmark_comparison_columns() -> None:
+    overview = pd.DataFrame(
+        {
+            "realized_total_pnl_eur": [85.0, 120.0],
+            "naive_total_pnl_eur": [25.0, 0.0],
+            "rolling_perfect_foresight_same_rules_total_pnl_eur": [145.0, 240.0],
+        }
+    )
+
+    out = _add_benchmark_comparison_columns(overview)
+
+    assert float(out.loc[0, "value_of_foresight_ratio"]) == pytest.approx((85.0 - 25.0) / (145.0 - 25.0))
+    assert float(out.loc[0, "value_of_foresight_pct"]) == pytest.approx(50.0)
+    assert float(out.loc[0, "model_vs_naive_pct_minus_100"]) == pytest.approx((85.0 / 25.0 - 1.0) * 100.0)
+    assert float(out.loc[0, "model_vs_rhpf_pct"]) == pytest.approx((85.0 / 145.0) * 100.0)
+    assert np.isnan(float(out.loc[1, "model_vs_naive_pct_minus_100"]))
+    assert float(out.loc[1, "model_vs_rhpf_pct"]) == pytest.approx(50.0)
 
 
 def test_daily_to_scenario_reconciliation_uses_hourly_real_pnl() -> None:
@@ -16428,6 +16561,168 @@ def test_benchmark_mode_full_can_enable_ghpf_explicitly() -> None:
     assert paths == {"model": True, "naive": True, "rhpf": True, "ghpf": True}
     assert summary["global_pf_available"] == 1.0
     assert summary["ghpf_total_pnl_eur"] == pytest.approx(4.0)
+
+
+def test_rhpf_aliases_use_reported_raw_solver_not_selected_fallback() -> None:
+    mode, paths = resolve_benchmark_paths("full", enable_global_perfect_foresight=False)
+    summary = apply_benchmark_availability_to_summary(
+        {
+            "realized_total_pnl_eur": 1.0,
+            "naive_total_pnl_eur": 0.0,
+            "rolling_pf_reported_total_pnl_eur": 10.0,
+            "rolling_pf_reported_available": 1.0,
+            "rolling_pf_reported_is_solver": 1.0,
+            "rolling_pf_selected_total_pnl_eur": 25.0,
+            "rolling_pf_selected_is_realized_path_fallback": 1.0,
+            "rolling_perfect_foresight_same_rules_total_pnl_eur": 10.0,
+            "same_rules_rolling_pf_total_pnl_eur": 10.0,
+            "rolling_pf_available": 1.0,
+        },
+        benchmark_mode=mode,
+        benchmark_paths=paths,
+    )
+
+    assert summary["rhpf_total_pnl_eur"] == pytest.approx(10.0)
+    assert summary["rhpf_total_pnl_eur"] != pytest.approx(25.0)
+
+
+def test_validate_rhpf_outputs_fails_fallback_benchmark_by_default(tmp_path: Path) -> None:
+    scenario = tmp_path / "p50_p50"
+    scenario.mkdir()
+    summary = {
+        "rolling_pf_available": 1.0,
+        "rolling_pf_reported_available": 1.0,
+        "rolling_pf_reported_is_solver": 1.0,
+        "rolling_pf_reported_total_pnl_eur": 10.0,
+        "rolling_pf_solver_total_pnl_eur": 10.0,
+        "rolling_pf_solver_component_pnl_eur": 10.0,
+        "rolling_pf_solver_pnl_balance_error_eur": 0.0,
+        "rolling_pf_solver_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_total_pnl_eur": 25.0,
+        "rolling_pf_selected_component_pnl_eur": 25.0,
+        "rolling_pf_selected_pnl_balance_error_eur": 0.0,
+        "rolling_pf_selected_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_incumbent": "realized_path",
+        "rolling_pf_selected_is_solver": 0.0,
+        "rolling_pf_selected_is_realized_path_fallback": 1.0,
+        "rolling_pf_selected_is_no_market_fallback": 0.0,
+        "rolling_pf_incumbent_selection_reason": "diagnostic_realized_path_higher",
+        "rolling_perfect_foresight_same_rules_total_pnl_eur": 10.0,
+        "same_rules_rolling_pf_total_pnl_eur": 10.0,
+        "rhpf_total_pnl_eur": 10.0,
+    }
+    (scenario / "backtest_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+    strict = validate_rhpf_outputs.validate_scenario(scenario, 1e-6)
+    exploratory = validate_rhpf_outputs.validate_scenario(
+        scenario,
+        1e-6,
+        allow_fallback_benchmark=True,
+    )
+
+    assert strict.status == "FAIL"
+    assert any("not pure solver RHPF" in msg for msg in strict.failures)
+    assert exploratory.status == "PASS"
+    assert any("not pure solver RHPF" in msg for msg in exploratory.warnings)
+
+
+def test_validate_rhpf_outputs_fails_aliases_equaling_selected_fallback(tmp_path: Path) -> None:
+    scenario = tmp_path / "p50_p50"
+    scenario.mkdir()
+    summary = {
+        "rolling_pf_available": 1.0,
+        "rolling_pf_reported_available": 1.0,
+        "rolling_pf_reported_is_solver": 1.0,
+        "rolling_pf_reported_total_pnl_eur": 10.0,
+        "rolling_pf_solver_total_pnl_eur": 10.0,
+        "rolling_pf_solver_component_pnl_eur": 10.0,
+        "rolling_pf_solver_pnl_balance_error_eur": 0.0,
+        "rolling_pf_solver_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_total_pnl_eur": 25.0,
+        "rolling_pf_selected_component_pnl_eur": 25.0,
+        "rolling_pf_selected_pnl_balance_error_eur": 0.0,
+        "rolling_pf_selected_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_incumbent": "solver",
+        "rolling_pf_selected_is_solver": 1.0,
+        "rolling_pf_selected_is_realized_path_fallback": 0.0,
+        "rolling_pf_selected_is_no_market_fallback": 0.0,
+        "rolling_perfect_foresight_same_rules_total_pnl_eur": 25.0,
+        "same_rules_rolling_pf_total_pnl_eur": 25.0,
+        "rhpf_total_pnl_eur": 25.0,
+    }
+    (scenario / "backtest_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+    result = validate_rhpf_outputs.validate_scenario(scenario, 1e-6)
+
+    assert result.status == "FAIL"
+    assert any("differs from reported" in msg for msg in result.failures)
+
+
+def test_validate_rhpf_outputs_fails_nonzero_solver_balance_marked_ok(tmp_path: Path) -> None:
+    scenario = tmp_path / "p50_p50"
+    scenario.mkdir()
+    summary = {
+        "rolling_pf_available": 1.0,
+        "rolling_pf_reported_available": 1.0,
+        "rolling_pf_reported_is_solver": 1.0,
+        "rolling_pf_reported_total_pnl_eur": -364.310450282,
+        "rolling_pf_solver_total_pnl_eur": -364.310450282,
+        "rolling_pf_solver_component_pnl_eur": -759.561464562,
+        "rolling_pf_solver_pnl_balance_error_eur": 395.251014280,
+        "rolling_pf_solver_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_total_pnl_eur": -364.310450282,
+        "rolling_pf_selected_component_pnl_eur": -364.310450282,
+        "rolling_pf_selected_pnl_balance_error_eur": 0.0,
+        "rolling_pf_selected_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_incumbent": "solver",
+        "rolling_pf_selected_is_solver": 1.0,
+        "rolling_pf_selected_is_realized_path_fallback": 0.0,
+        "rolling_pf_selected_is_no_market_fallback": 0.0,
+        "rolling_perfect_foresight_same_rules_total_pnl_eur": -364.310450282,
+        "same_rules_rolling_pf_total_pnl_eur": -364.310450282,
+        "rhpf_total_pnl_eur": -364.310450282,
+    }
+    (scenario / "backtest_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+    result = validate_rhpf_outputs.validate_scenario(scenario, 1e-6)
+
+    assert result.status == "FAIL"
+    assert any("marked OK" in msg for msg in result.failures)
+
+
+def test_validate_rhpf_outputs_passes_terminal_inclusive_solver_basis(tmp_path: Path) -> None:
+    scenario = tmp_path / "p50_p50"
+    scenario.mkdir()
+    summary = {
+        "rolling_pf_available": 1.0,
+        "rolling_pf_reported_available": 1.0,
+        "rolling_pf_reported_is_solver": 1.0,
+        "rolling_pf_reported_total_pnl_eur": -364.310450282,
+        "rolling_pf_solver_total_pnl_eur": -364.310450282,
+        "rolling_pf_solver_component_pnl_eur": -364.310450282,
+        "rolling_pf_solver_component_pnl_excl_terminal_eur": -759.561464562,
+        "rolling_pf_solver_terminal_closure_pnl_eur": 0.0,
+        "rolling_pf_solver_terminal_adjustment_eur": 395.251014280,
+        "rolling_pf_solver_component_pnl_incl_terminal_eur": -364.310450282,
+        "rolling_pf_solver_pnl_balance_error_eur": 0.0,
+        "rolling_pf_solver_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_total_pnl_eur": -364.310450282,
+        "rolling_pf_selected_component_pnl_eur": -364.310450282,
+        "rolling_pf_selected_pnl_balance_error_eur": 0.0,
+        "rolling_pf_selected_pnl_balance_ok": 1.0,
+        "rolling_pf_selected_incumbent": "solver",
+        "rolling_pf_selected_is_solver": 1.0,
+        "rolling_pf_selected_is_realized_path_fallback": 0.0,
+        "rolling_pf_selected_is_no_market_fallback": 0.0,
+        "rolling_perfect_foresight_same_rules_total_pnl_eur": -364.310450282,
+        "same_rules_rolling_pf_total_pnl_eur": -364.310450282,
+        "rhpf_total_pnl_eur": -364.310450282,
+    }
+    (scenario / "backtest_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+    result = validate_rhpf_outputs.validate_scenario(scenario, 1e-6)
+
+    assert result.status == "PASS"
 
 
 def test_benchmark_mode_naive_rhpf_ghpf_only() -> None:
