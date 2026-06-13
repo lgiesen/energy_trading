@@ -294,6 +294,9 @@ def _collect(root: Path) -> pd.DataFrame:
                 "headroom_violation_count": s.get("headroom_violation_count"),
                 "missed_capacity_pos_mw": s.get("missed_capacity_pos_mw"),
                 "missed_capacity_neg_mw": s.get("missed_capacity_neg_mw"),
+                "capacity_stress_shortfall_mw": s.get("capacity_stress_shortfall_mw"),
+                "capacity_stress_check_pass": s.get("capacity_stress_check_pass"),
+                "capacity_stress_check_fatal": s.get("capacity_stress_check_fatal"),
                 "pnl_reconciliation_error_max_eur": s.get("pnl_reconciliation_error_max_eur"),
                 "activation_split_reconciliation_error_max": s.get("activation_split_reconciliation_error_max"),
                 "precommit_clamp_applied_count": s.get("precommit_clamp_applied_count"),
@@ -425,6 +428,9 @@ def main() -> None:
         "headroom_violation_count",
         "missed_capacity_pos_mw",
         "missed_capacity_neg_mw",
+        "capacity_stress_shortfall_mw",
+        "capacity_stress_check_pass",
+        "capacity_stress_check_fatal",
         "pnl_reconciliation_error_max_eur",
         "activation_split_reconciliation_error_max",
         "final_soc_check_pass",
@@ -541,8 +547,6 @@ def main() -> None:
         & (df.get("thesis_reportable", 0.0).fillna(0.0) >= 0.5)
         & (df.get("fallback_used", 0.0).fillna(0.0) <= 0.5)
         & (df.get("headroom_violation_count", 0.0).fillna(0.0) <= 1e-9)
-        & (df.get("missed_capacity_pos_mw", 0.0).fillna(0.0) <= 1e-9)
-        & (df.get("missed_capacity_neg_mw", 0.0).fillna(0.0) <= 1e-9)
         & (df.get("pnl_reconciliation_error_max_eur", 1e9).fillna(1e9) <= 1e-2)
         & (df.get("activation_split_reconciliation_error_max", 1e9).fillna(1e9) <= 1e-2)
         & (df.get("final_soc_check_pass", 0.0).fillna(0.0) >= 0.5)

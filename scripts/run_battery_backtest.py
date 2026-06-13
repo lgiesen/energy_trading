@@ -49,7 +49,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -518,6 +518,11 @@ def _suspected_infeasibility_driver_from_row(row: pd.Series) -> tuple[str, str]:
         abs(_f(k))
         for k in ("da_charge_mw", "da_discharge_mw", "bem_only_pos_mw", "bem_only_neg_mw", "id_charge_mw", "id_discharge_mw")
     )
+    fixed_driver = str(row.get("fixed_obligation_driver", "") or "").strip().lower()
+    if fixed_driver and fixed_driver not in {"none", "nan"}:
+        return fixed_driver, str(row.get("fixed_obligation_infeasible_timestamp_utc", "") or fixed_driver)
+    if _f("fixed_obligation_replay_milp_mismatch") > 0.5:
+        return "fixed_obligation_replay_milp_mismatch", "fixed obligation replay passed but accepted MILP failed"
 
     if pviol_pos > 1e-9 or pviol_neg > 1e-9:
         return "power_stack_violation", f"power_violation_pos={pviol_pos:.4f},neg={pviol_neg:.4f}"
@@ -554,7 +559,10 @@ def _build_optimization_infeasibility_attribution(
     ts = pd.to_datetime(h.get("timestamp_utc", pd.Series(index=h.index, dtype="datetime64[ns, UTC]")), utc=True, errors="coerce")
     err = h.get("optimization_error_code", pd.Series(["ok"] * len(h), index=h.index)).astype(str).fillna("ok")
     fb = h.get("optimization_fallback", pd.Series(["none"] * len(h), index=h.index)).astype(str).fillna("none")
-    fb_hour = pd.to_numeric(h.get("is_fallback_hour", 0.0), errors="coerce").fillna(0.0)
+    fb_hour = pd.to_numeric(
+        h.get("is_fallback_hour", pd.Series(0.0, index=h.index, dtype=float)),
+        errors="coerce",
+    ).fillna(0.0)
     fail_mask = err.str.lower().ne("ok") | fb.str.lower().ne("none") | fb_hour.gt(0.5)
     failing = h.loc[fail_mask].copy()
     if failing.empty:
@@ -840,6 +848,43 @@ def _resolve_out_dir(
     return out
 
 
+def _can_skip_model_manifest_for_benchmark(
+    *,
+    predictions_path: str,
+    benchmark_paths: dict[str, bool],
+    run_manifest: str = "",
+    run_id: str | None = None,
+) -> bool:
+    """Return True when benchmark execution can use direct truth input without model artifacts."""
+    if str(predictions_path or "").strip():
+        return False
+    if bool(benchmark_paths.get("model", False)):
+        return False
+    if str(run_manifest or "").strip() or str(run_id or "").strip():
+        return False
+    return True
+
+
+def _overview_validity_fields(summary: Mapping[str, object], benchmark_mode: str) -> dict[str, object]:
+    """Return validity fields to display in scenario overviews for the selected benchmark mode."""
+    mode = str(benchmark_mode or summary.get("benchmark_mode", "") or "").strip().lower()
+    use_active_path = mode in {"naive_only", "rhpf_only"}
+    return {
+        "simulation_valid": (
+            summary.get("active_path_simulation_valid") if use_active_path else summary.get("simulation_valid")
+        ),
+        "thesis_reportable": (
+            summary.get("active_path_thesis_reportable") if use_active_path else summary.get("thesis_reportable")
+        ),
+        "invalid_reason": (
+            summary.get("active_path_invalid_reason") if use_active_path else summary.get("invalid_reason")
+        ),
+        "legacy_simulation_valid": summary.get("simulation_valid"),
+        "legacy_thesis_reportable": summary.get("thesis_reportable"),
+        "legacy_invalid_reason": summary.get("invalid_reason"),
+    }
+
+
 def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     if col in df.columns:
         return pd.to_numeric(df[col], errors="coerce").fillna(default)
@@ -961,9 +1006,13 @@ def _path_throughput_recomputed_from_sources(hourly: pd.DataFrame, prefix: str) 
     return (computed - direct).abs().gt(1e-9).astype(float)
 
 
-def _ensure_hourly_throughput(hourly: pd.DataFrame) -> pd.DataFrame:
+def _ensure_hourly_throughput(hourly: pd.DataFrame, *, strict_missing_real_sources: bool = True) -> pd.DataFrame:
     out = hourly.copy()
-    out["real_throughput_mwh"] = _compute_hourly_throughput_mwh(out)
+    out["real_throughput_mwh"] = _compute_path_hourly_throughput_mwh(
+        out,
+        "real",
+        strict_missing_real_sources=bool(strict_missing_real_sources),
+    )
     return out
 
 
@@ -979,7 +1028,13 @@ def _build_performance_metrics(
 ) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
     summary = normalize_predicted_pnl_aliases(summary)
-    hourly = _ensure_hourly_throughput(hourly)
+    model_path_executed = float(
+        pd.to_numeric(pd.Series([summary.get("model_path_executed", 1.0)]), errors="coerce").fillna(1.0).iloc[0]
+    ) >= 0.5
+    hourly = _ensure_hourly_throughput(
+        hourly,
+        strict_missing_real_sources=bool(model_path_executed),
+    )
     dt_h = _infer_dt_hours(hourly)
     ts = pd.to_datetime(hourly.get("timestamp_utc", pd.Series(dtype="datetime64[ns, UTC]")), utc=True, errors="coerce")
     if ts.notna().any():
@@ -1106,7 +1161,7 @@ def _build_performance_metrics(
     id_net_mwh_total = id_sell_mwh_total - id_buy_mwh_total
     id_abs_mwh_total = abs(id_buy_mwh_total) + abs(id_sell_mwh_total)
 
-    throughput_mwh_total = float(_compute_hourly_throughput_mwh(hourly).sum())
+    throughput_mwh_total = float(_num_series(hourly, "real_throughput_mwh").sum())
     eq_cycles_total = float(throughput_mwh_total / (2.0 * cap_mwh)) if np.isfinite(cap_mwh) and cap_mwh > 0 else float("nan")
     mean_soc_mwh = float(_num_series(hourly, "real_soc_mwh").mean()) if "real_soc_mwh" in hourly.columns else float("nan")
     min_soc_mwh = float(_num_series(hourly, "real_soc_mwh").min()) if "real_soc_mwh" in hourly.columns else float("nan")
@@ -1275,10 +1330,11 @@ def _build_daily_performance_metrics(
     *,
     hourly: pd.DataFrame,
     perf_row: pd.Series,
+    strict_missing_real_sources: bool = True,
 ) -> pd.DataFrame:
     if hourly.empty:
         return pd.DataFrame()
-    d = _ensure_hourly_throughput(hourly)
+    d = _ensure_hourly_throughput(hourly, strict_missing_real_sources=bool(strict_missing_real_sources))
     d["date_utc"] = pd.to_datetime(d.get("timestamp_utc"), utc=True, errors="coerce").dt.date.astype(str)
     grp = d.groupby("date_utc", dropna=False)
     dt_h = _infer_dt_hours(d)
@@ -1860,8 +1916,22 @@ def _build_bcm_block_consistency_violations(
     rows: list[dict[str, object]] = []
     grp = hourly.groupby("bcm_capacity_block_id", dropna=False)
     for block_id, g in grp:
-        part_start = float(pd.to_numeric(g.get("bcm_capacity_block_partial_start", 0.0), errors="coerce").fillna(0.0).max())
-        part_end = float(pd.to_numeric(g.get("bcm_capacity_block_partial_end", 0.0), errors="coerce").fillna(0.0).max())
+        part_start = float(
+            pd.to_numeric(
+                g.get("bcm_capacity_block_partial_start", pd.Series(0.0, index=g.index, dtype=float)),
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .max()
+        )
+        part_end = float(
+            pd.to_numeric(
+                g.get("bcm_capacity_block_partial_end", pd.Series(0.0, index=g.index, dtype=float)),
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .max()
+        )
         for c in checked_cols:
             if c not in g.columns:
                 continue
@@ -3499,6 +3569,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--enable-naive", dest="enable_naive", action="store_true", default=None, help="Enable naive benchmark in --benchmark-mode selected or override modes.")
     p.add_argument("--disable-naive", dest="enable_naive", action="store_false", help="Disable naive benchmark.")
+    p.add_argument(
+        "--naive-forecast-mode",
+        choices=["same_weekday_last_week", "causal_day_before_gate", "shift_24h_delivery"],
+        default=str(MODEL_SPECS.get("naive_forecast_mode", "same_weekday_last_week")),
+        help=(
+            "Naive benchmark forecast source. same_weekday_last_week is causal and preserves weekly seasonality; "
+            "shift_24h_delivery reproduces the legacy row-lag baseline."
+        ),
+    )
+    p.add_argument(
+        "--strict-naive-weekly-source",
+        action="store_true",
+        help=(
+            "Fail a same_weekday_last_week naive run if any evaluated row cannot use delivery_ts - 7 days "
+            "from the loaded source history."
+        ),
+    )
     p.add_argument("--enable-rhpf", "--enable-rolling-pf", dest="enable_rhpf", action="store_true", default=None, help="Enable rolling hindsight/perfect-foresight benchmark.")
     p.add_argument("--disable-rhpf", "--disable-rolling-pf", dest="enable_rhpf", action="store_false", help="Disable rolling hindsight/perfect-foresight benchmark.")
     p.add_argument("--enable-ghpf", "--enable-global-pf", dest="enable_ghpf", action="store_true", default=None, help="Enable global hindsight/perfect-foresight benchmark.")
@@ -3906,35 +3993,66 @@ def main() -> None:
     ground_truth_path = args.ground_truth.strip()
     payload: dict[str, object] = {}
     manifest_path: Path | None = None
+    resolved_run_id: str | None = None
+    normalized_benchmark_mode, requested_benchmark_paths = resolve_benchmark_paths(
+        str(args.benchmark_mode),
+        enable_naive=args.enable_naive,
+        enable_rolling_pf=args.enable_rhpf,
+        enable_global_pf=args.enable_ghpf,
+        enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
+    )
+    model_path_requested = bool(requested_benchmark_paths.get("model", False))
+    model_manifest_loaded = False
+    model_predictions_loaded = False
+    model_prediction_loading_skipped_reason = ""
 
     target_value_modes: dict[str, str] = {}
+    skip_model_manifest = _can_skip_model_manifest_for_benchmark(
+        predictions_path=predictions_path,
+        benchmark_paths=requested_benchmark_paths,
+        run_manifest=args.run_manifest.strip(),
+        run_id=run_id,
+    )
 
     if not predictions_path:
-        if not args.run_manifest.strip() and not run_id and not args.model_key:
+        if skip_model_manifest:
+            fallback_truth = Path("data/features/all_data_features.parquet")
+            if not ground_truth_path and fallback_truth.exists():
+                ground_truth_path = str(fallback_truth)
+            if not ground_truth_path:
+                raise ValueError(
+                    "Model-disabled benchmark mode requires --ground-truth or "
+                    "data/features/all_data_features.parquet when --predictions is omitted."
+                )
+            manifest_dir = Path.cwd()
+            model_prediction_loading_skipped_reason = "model_path_disabled_direct_truth_input"
+        elif not args.run_manifest.strip() and not run_id and not args.model_key:
             raise ValueError("Missing model selector or manifest. Provide --model, --model-key, --run-id, or --run-manifest.")
-        manifest_path, payload, resolved_run_id = _resolve_model_manifest(
-            run_manifest_arg=args.run_manifest.strip(),
-            run_id=run_id,
-            model_key=args.model_key.strip(),
-            split=args.split,
-        )
-        run_id = resolved_run_id or run_id or payload.get("run_id") or (args.run_id.strip() or None)
-        manifest_dir = manifest_path.parent
+        else:
+            manifest_path, payload, resolved_run_id = _resolve_model_manifest(
+                run_manifest_arg=args.run_manifest.strip(),
+                run_id=run_id,
+                model_key=args.model_key.strip(),
+                split=args.split,
+            )
+            model_manifest_loaded = True
+            run_id = resolved_run_id or run_id or payload.get("run_id") or (args.run_id.strip() or None)
+            manifest_dir = manifest_path.parent
 
-        # Strict fail-fast preflight for thesis reproducibility:
-        # verify manifest and complete P01..P99 quantile grid before simulation allocation.
-        _preflight_manifest_and_quantiles(
-            manifest_path=manifest_path,
-            manifest_payload=payload,
-            split=args.split,
-            model_key=args.model_key.strip(),
-            manifest_dir=manifest_dir,
-            expected_quantiles=required_quantiles,
-            afrr_activation_rate_guard_quantile=(
-                afrr_activation_rate_guard_quantiles_required if strategy_uses_afrr else None
-            ),
-        )
-        target_value_modes = _target_value_modes_from_manifest(payload)
+            # Strict fail-fast preflight for thesis reproducibility:
+            # verify manifest and complete P01..P99 quantile grid before simulation allocation.
+            _preflight_manifest_and_quantiles(
+                manifest_path=manifest_path,
+                manifest_payload=payload,
+                split=args.split,
+                model_key=args.model_key.strip(),
+                manifest_dir=manifest_dir,
+                expected_quantiles=required_quantiles,
+                afrr_activation_rate_guard_quantile=(
+                    afrr_activation_rate_guard_quantiles_required if strategy_uses_afrr else None
+                ),
+            )
+            target_value_modes = _target_value_modes_from_manifest(payload)
     else:
         manifest_dir = Path.cwd()
 
@@ -3946,7 +4064,7 @@ def main() -> None:
     input_cache_used = False
     input_cache_path = ""
 
-    if not predictions_path:
+    if not predictions_path and payload:
         if not ground_truth_path:
             ground_truth_path = str(_resolve_existing_file(payload["ground_truth"]["default_path"], manifest_dir=manifest_dir))
         da_long = payload.get("bundles", {}).get("da", {}).get("predictions_long", {}).get(args.split, {})
@@ -3980,6 +4098,7 @@ def main() -> None:
                     target_value_modes=target_value_modes,
                     allow_p50_materialization_from_predicted_value=bool(args.allow_p50_from_predicted_value),
                 )
+                model_predictions_loaded = True
                 print(f"[INFO] Long-format forecast warehouse loaded for split='{args.split}' with {len(long_map)} files.")
                 cov_min_list: list[pd.Timestamp] = []
                 cov_max_list: list[pd.Timestamp] = []
@@ -4007,6 +4126,7 @@ def main() -> None:
             predictions_path = str((out_dir / f"backtest_table_{args.split}.parquet").resolve())
             da_df = pd.read_parquet(da_pred)
             afrr_df = pd.read_parquet(afrr_pred)
+            model_predictions_loaded = True
             backtest_table = da_df.merge(afrr_df, on="timestamp_utc", how="inner")
             backtest_table.to_parquet(predictions_path, index=False)
             print(f"[INFO] Backtest table created: {predictions_path}")
@@ -4076,6 +4196,7 @@ def main() -> None:
         horizon_hours=int(args.horizon_hours),
         expected_quantiles=required_quantiles,
     )
+    naive_source_df = df.copy()
     df = df[df[colmap.timestamp] >= effective_start_utc].copy()
     df = df[df[colmap.timestamp] < effective_end_utc].copy()
     if df.empty:
@@ -4084,25 +4205,29 @@ def main() -> None:
         ("default", forecast_warehouse, list(AFRR_QUANTILE_BINS))
     ]
     if quantile_pairs:
-        if forecast_warehouse is None:
+        if forecast_warehouse is None and model_path_requested:
             raise ValueError("--quantile-pairs requires long-format predictions from --run-manifest.")
         scenarios = []
         for q_low, q_high in quantile_pairs:
             name = _scenario_suffix(q_low, q_high)
-            wh = _apply_quantile_pair_to_warehouse(
-                forecast_warehouse,
-                q_low=q_low,
-                q_high=q_high,
-                da_role=args.da_quantile_role,
+            wh = (
+                _apply_quantile_pair_to_warehouse(
+                    forecast_warehouse,
+                    q_low=q_low,
+                    q_high=q_high,
+                    da_role=args.da_quantile_role,
+                )
+                if forecast_warehouse is not None
+                else None
             )
             scenarios.append((name, wh, list(scenario_bin_map[name])))
-
-    normalized_benchmark_mode, requested_benchmark_paths = resolve_benchmark_paths(
-        str(args.benchmark_mode),
-        enable_naive=args.enable_naive,
-        enable_rolling_pf=args.enable_rhpf,
-        enable_global_pf=args.enable_ghpf,
-        enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
+    print(
+        "[INFO] Benchmark paths: "
+        f"mode={normalized_benchmark_mode}, "
+        f"enabled={','.join([p for p, enabled in requested_benchmark_paths.items() if enabled]) or '<none>'}, "
+        f"disabled={','.join([p for p, enabled in requested_benchmark_paths.items() if not enabled]) or '<none>'}, "
+        f"model_manifest_loaded={int(model_manifest_loaded)}, "
+        f"model_predictions_loaded={int(model_predictions_loaded)}"
     )
 
     MODEL_SPECS["reserve_activation_headroom_h"] = float(args.reserve_activation_headroom_h)
@@ -4160,6 +4285,7 @@ def main() -> None:
     MODEL_SPECS["forecast_value_mode"] = str(args.forecast_value_mode).strip().lower()
     MODEL_SPECS["final_soc_mode"] = str(args.final_soc_mode)
     MODEL_SPECS["debug_dumps"] = str(args.debug_dumps).strip().lower()
+    MODEL_SPECS["naive_forecast_mode"] = str(args.naive_forecast_mode).strip().lower()
     enforce_final_soc_min = _resolve_final_soc_policy(
         strict_simulation_validity=bool(args.strict_simulation_validity),
         final_soc_mode=str(args.final_soc_mode),
@@ -4277,6 +4403,8 @@ def main() -> None:
                     write_checkpoints=bool(args.write_checkpoints),
                     checkpoint_detail=str(args.checkpoint_detail),
                     checkpoint_metadata=checkpoint_metadata,
+                    naive_source_df=naive_source_df,
+                    strict_naive_weekly_source=bool(args.strict_naive_weekly_source),
                 )
         except Exception as exc:
             if bool(args.write_checkpoints):
@@ -4291,7 +4419,13 @@ def main() -> None:
                 except Exception as status_exc:
                     print(f"[WARN] failed to write checkpoint failure status: {status_exc}")
             raise
-        outputs = replace(outputs, hourly=_ensure_hourly_throughput(outputs.hourly))
+        outputs = replace(
+            outputs,
+            hourly=_ensure_hourly_throughput(
+                outputs.hourly,
+                strict_missing_real_sources=bool(requested_benchmark_paths.get("model", False)),
+            ),
+        )
 
         hourly_path = scenario_out_dir / "backtest_hourly.parquet"
         planned_ledger_path = scenario_out_dir / "planned_ledger.parquet"
@@ -4539,25 +4673,26 @@ def main() -> None:
                 out_df["scenario"] = str(scenario_name)
                 # Normalize directional and core reserve commitment fields for traceability.
                 if "reserve_submitted_pos_mw" in out_df.columns or "reserve_submitted_neg_mw" in out_df.columns:
+                    reserve_submitted_pos = optional_numeric_series(out_df, "reserve_submitted_pos_mw")
+                    reserve_submitted_neg = optional_numeric_series(out_df, "reserve_submitted_neg_mw")
                     out_df["submitted_mw"] = np.maximum(
-                        pd.to_numeric(out_df.get("reserve_submitted_pos_mw", 0.0), errors="coerce").fillna(0.0),
-                        pd.to_numeric(out_df.get("reserve_submitted_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                        reserve_submitted_pos,
+                        reserve_submitted_neg,
                     )
                     out_df["direction"] = np.where(
-                        pd.to_numeric(out_df.get("reserve_submitted_pos_mw", 0.0), errors="coerce").fillna(0.0)
-                        >= pd.to_numeric(out_df.get("reserve_submitted_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                        reserve_submitted_pos >= reserve_submitted_neg,
                         "pos",
                         "neg",
                     )
                 if "reserve_awarded_pos_mw" in out_df.columns or "reserve_awarded_neg_mw" in out_df.columns:
                     out_df["awarded_mw"] = np.maximum(
-                        pd.to_numeric(out_df.get("reserve_awarded_pos_mw", 0.0), errors="coerce").fillna(0.0),
-                        pd.to_numeric(out_df.get("reserve_awarded_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                        optional_numeric_series(out_df, "reserve_awarded_pos_mw"),
+                        optional_numeric_series(out_df, "reserve_awarded_neg_mw"),
                     )
                 if "fixed_reserve_obligation_pos_mw" in out_df.columns or "fixed_reserve_obligation_neg_mw" in out_df.columns:
                     out_df["locked_obligation_mw"] = np.maximum(
-                        pd.to_numeric(out_df.get("fixed_reserve_obligation_pos_mw", 0.0), errors="coerce").fillna(0.0),
-                        pd.to_numeric(out_df.get("fixed_reserve_obligation_neg_mw", 0.0), errors="coerce").fillna(0.0),
+                        optional_numeric_series(out_df, "fixed_reserve_obligation_pos_mw"),
+                        optional_numeric_series(out_df, "fixed_reserve_obligation_neg_mw"),
                     )
                 if {"reserve_projected_soc_start_mwh", "real_soc_start_mwh"}.issubset(out_df.columns):
                     out_df["reserve_projected_vs_realized_soc_delta_mwh"] = (
@@ -4578,15 +4713,18 @@ def main() -> None:
                 out_df["aux_energy_mwh_between_commit_and_delivery"] = 0.0
                 out_df["terminal_adjustment_pressure_eur"] = float(outputs.summary.get("terminal_soc_net_adjustment_eur", 0.0))
                 # Aliases requested by audit task.
-                out_df["required_headroom_mwh"] = pd.to_numeric(
-                    out_df.get("real_required_headroom_pos_mwh", 0.0), errors="coerce"
-                ).fillna(0.0)
-                out_df["available_headroom_mwh"] = pd.to_numeric(
-                    out_df.get("real_available_headroom_pos_mwh", 0.0), errors="coerce"
-                ).fillna(0.0)
-                out_df["headroom_violation_mwh"] = pd.to_numeric(
-                    out_df.get("real_headroom_violation_pos_mwh", 0.0), errors="coerce"
-                ).fillna(0.0)
+                out_df["required_headroom_mwh"] = optional_numeric_series(
+                    out_df,
+                    "real_required_headroom_pos_mwh",
+                )
+                out_df["available_headroom_mwh"] = optional_numeric_series(
+                    out_df,
+                    "real_available_headroom_pos_mwh",
+                )
+                out_df["headroom_violation_mwh"] = optional_numeric_series(
+                    out_df,
+                    "real_headroom_violation_pos_mwh",
+                )
 
                 # Precompute dispatch magnitudes from full hourly table for interval sums.
                 all_ts = pd.to_datetime(
@@ -4595,37 +4733,37 @@ def main() -> None:
                     errors="coerce",
                 )
 
-                da_charge = require_numeric_series(
+                da_charge = optional_numeric_series(
                     h,
                     "real_executed_charge_mw",
                     aliases=["real_da_charge_mw", "executed_charge_mw", "da_charge_mw"],
                 )
-                da_discharge = require_numeric_series(
+                da_discharge = optional_numeric_series(
                     h,
                     "real_executed_discharge_mw",
                     aliases=["real_da_discharge_mw", "executed_discharge_mw", "da_discharge_mw"],
                 )
-                id_charge = require_numeric_series(
+                id_charge = optional_numeric_series(
                     h,
                     "real_id_charge_mw",
                     aliases=["id_charge_mw"],
                 )
-                id_discharge = require_numeric_series(
+                id_discharge = optional_numeric_series(
                     h,
                     "real_id_discharge_mw",
                     aliases=["id_discharge_mw"],
                 )
-                bem_pos = require_numeric_series(
+                bem_pos = optional_numeric_series(
                     h,
                     "real_bem_only_submitted_pos_mw",
                     aliases=["bem_only_submitted_pos_mw"],
                 )
-                bem_neg = require_numeric_series(
+                bem_neg = optional_numeric_series(
                     h,
                     "real_bem_only_submitted_neg_mw",
                     aliases=["bem_only_submitted_neg_mw"],
                 )
-                aux_e = require_numeric_series(
+                aux_e = optional_numeric_series(
                     h,
                     "real_aux_energy_mwh",
                     aliases=["aux_energy_mwh"],
@@ -4635,6 +4773,15 @@ def main() -> None:
                 id_disp = id_charge.abs() + id_discharge.abs()
                 bem_disp = bem_pos.abs() + bem_neg.abs()
 
+                if "reserve_commitment_id" not in out_df.columns:
+                    out_df["reserve_commitment_id"] = pd.Series(pd.NA, index=out_df.index, dtype="object")
+                for c in [
+                    "reserve_projected_soc_start_mwh",
+                    "real_soc_start_mwh",
+                    "headroom_violation_mwh",
+                ]:
+                    if c not in out_df.columns:
+                        out_df[c] = 0.0
                 by_commit = (
                     out_df.loc[out_df["reserve_commitment_id"].notna(), ["reserve_commitment_id", "reserve_projected_soc_start_mwh", "real_soc_start_mwh", "headroom_violation_mwh"]]
                     .groupby("reserve_commitment_id", dropna=False)
@@ -4685,8 +4832,16 @@ def main() -> None:
                     )
                     da_debug.to_csv(da_precommit_debug_path, index=False)
 
-            hv_pos = pd.to_numeric(h.get("real_headroom_violation_pos_mwh", h.get("headroom_violation_pos_mwh", 0.0)), errors="coerce").fillna(0.0)
-            hv_neg = pd.to_numeric(h.get("real_headroom_violation_neg_mwh", h.get("headroom_violation_neg_mwh", 0.0)), errors="coerce").fillna(0.0)
+            hv_pos = optional_numeric_series(
+                h,
+                "real_headroom_violation_pos_mwh",
+                aliases=["headroom_violation_pos_mwh"],
+            )
+            hv_neg = optional_numeric_series(
+                h,
+                "real_headroom_violation_neg_mwh",
+                aliases=["headroom_violation_neg_mwh"],
+            )
             bad_headroom = h.loc[(hv_pos + hv_neg) > 1e-9, reserve_debug_cols].copy() if reserve_debug_cols else pd.DataFrame()
             if not bad_headroom.empty:
                 bad_headroom.to_csv(invalid_headroom_debug_path, index=False)
@@ -4698,14 +4853,16 @@ def main() -> None:
                     bad_opt.to_csv(optimization_failure_debug_path, index=False)
             invalid_reason_txt = str(outputs.summary.get("invalid_reason", "") or "")
             if "protected_soc" in invalid_reason_txt:
-                psv_pos = pd.to_numeric(
-                    h.get("real_protected_soc_violation_pos_mwh", h.get("protected_soc_violation_pos_mwh", 0.0)),
-                    errors="coerce",
-                ).fillna(0.0)
-                psv_neg = pd.to_numeric(
-                    h.get("real_protected_soc_violation_neg_mwh", h.get("protected_soc_violation_neg_mwh", 0.0)),
-                    errors="coerce",
-                ).fillna(0.0)
+                psv_pos = optional_numeric_series(
+                    h,
+                    "real_protected_soc_violation_pos_mwh",
+                    aliases=["protected_soc_violation_pos_mwh"],
+                )
+                psv_neg = optional_numeric_series(
+                    h,
+                    "real_protected_soc_violation_neg_mwh",
+                    aliases=["protected_soc_violation_neg_mwh"],
+                )
                 psv = psv_pos + psv_neg
                 bad_ps = h.loc[psv > 1e-9].copy()
                 if not bad_ps.empty:
@@ -4720,23 +4877,23 @@ def main() -> None:
                             "timestamp_utc": pd.to_datetime(bad_ps[colmap.timestamp], utc=True, errors="coerce"),
                             "direction": direction,
                             "violation_mwh": psv.loc[bad_ps.index].to_numpy(dtype=float),
-                            "soc_start_mwh": pd.to_numeric(bad_ps.get("real_soc_start_mwh", bad_ps.get("soc_start_mwh", 0.0)), errors="coerce").fillna(0.0),
-                            "soc_after_executed_mwh": pd.to_numeric(bad_ps.get("real_soc_mwh", bad_ps.get("soc_mwh", 0.0)), errors="coerce").fillna(0.0),
-                            "protected_soc_min_mwh": pd.to_numeric(bad_ps.get("real_protected_soc_min_mwh", bad_ps.get("protected_soc_min_mwh", 0.0)), errors="coerce").fillna(0.0),
-                            "protected_soc_max_mwh": pd.to_numeric(bad_ps.get("real_protected_soc_max_mwh", bad_ps.get("protected_soc_max_mwh", 0.0)), errors="coerce").fillna(0.0),
-                            "locked_reserve_pos_mw": pd.to_numeric(bad_ps.get("real_locked_reserve_pos_mw", bad_ps.get("locked_reserve_pos_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "locked_reserve_neg_mw": pd.to_numeric(bad_ps.get("real_locked_reserve_neg_mw", bad_ps.get("locked_reserve_neg_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "awarded_or_executed_reserve_pos_mw": pd.to_numeric(bad_ps.get("real_reserve_pos_mw", bad_ps.get("reserve_pos_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "awarded_or_executed_reserve_neg_mw": pd.to_numeric(bad_ps.get("real_reserve_neg_mw", bad_ps.get("reserve_neg_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "bem_only_pos_mw": pd.to_numeric(bad_ps.get("real_bem_only_submitted_pos_mw", bad_ps.get("bem_only_submitted_pos_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "bem_only_neg_mw": pd.to_numeric(bad_ps.get("real_bem_only_submitted_neg_mw", bad_ps.get("bem_only_submitted_neg_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "da_charge_mw": pd.to_numeric(bad_ps.get("real_da_charge_mw", bad_ps.get("da_charge_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "da_discharge_mw": pd.to_numeric(bad_ps.get("real_da_discharge_mw", bad_ps.get("da_discharge_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "id_charge_mw": pd.to_numeric(bad_ps.get("real_id_charge_mw", bad_ps.get("id_charge_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "id_discharge_mw": pd.to_numeric(bad_ps.get("real_id_discharge_mw", bad_ps.get("id_discharge_mw", 0.0)), errors="coerce").fillna(0.0),
-                            "act_pos_mwh": pd.to_numeric(bad_ps.get("real_act_pos_mwh", bad_ps.get("act_pos_mwh", 0.0)), errors="coerce").fillna(0.0),
-                            "act_neg_mwh": pd.to_numeric(bad_ps.get("real_act_neg_mwh", bad_ps.get("act_neg_mwh", 0.0)), errors="coerce").fillna(0.0),
-                            "aux_energy_mwh": pd.to_numeric(bad_ps.get("real_aux_energy_mwh", bad_ps.get("aux_energy_mwh", 0.0)), errors="coerce").fillna(0.0),
+                            "soc_start_mwh": optional_numeric_series(bad_ps, "real_soc_start_mwh", aliases=["soc_start_mwh"]),
+                            "soc_after_executed_mwh": optional_numeric_series(bad_ps, "real_soc_mwh", aliases=["soc_mwh"]),
+                            "protected_soc_min_mwh": optional_numeric_series(bad_ps, "real_protected_soc_min_mwh", aliases=["protected_soc_min_mwh"]),
+                            "protected_soc_max_mwh": optional_numeric_series(bad_ps, "real_protected_soc_max_mwh", aliases=["protected_soc_max_mwh"]),
+                            "locked_reserve_pos_mw": optional_numeric_series(bad_ps, "real_locked_reserve_pos_mw", aliases=["locked_reserve_pos_mw"]),
+                            "locked_reserve_neg_mw": optional_numeric_series(bad_ps, "real_locked_reserve_neg_mw", aliases=["locked_reserve_neg_mw"]),
+                            "awarded_or_executed_reserve_pos_mw": optional_numeric_series(bad_ps, "real_reserve_pos_mw", aliases=["reserve_pos_mw"]),
+                            "awarded_or_executed_reserve_neg_mw": optional_numeric_series(bad_ps, "real_reserve_neg_mw", aliases=["reserve_neg_mw"]),
+                            "bem_only_pos_mw": optional_numeric_series(bad_ps, "real_bem_only_submitted_pos_mw", aliases=["bem_only_submitted_pos_mw"]),
+                            "bem_only_neg_mw": optional_numeric_series(bad_ps, "real_bem_only_submitted_neg_mw", aliases=["bem_only_submitted_neg_mw"]),
+                            "da_charge_mw": optional_numeric_series(bad_ps, "real_da_charge_mw", aliases=["da_charge_mw"]),
+                            "da_discharge_mw": optional_numeric_series(bad_ps, "real_da_discharge_mw", aliases=["da_discharge_mw"]),
+                            "id_charge_mw": optional_numeric_series(bad_ps, "real_id_charge_mw", aliases=["id_charge_mw"]),
+                            "id_discharge_mw": optional_numeric_series(bad_ps, "real_id_discharge_mw", aliases=["id_discharge_mw"]),
+                            "act_pos_mwh": optional_numeric_series(bad_ps, "real_act_pos_mwh", aliases=["act_pos_mwh"]),
+                            "act_neg_mwh": optional_numeric_series(bad_ps, "real_act_neg_mwh", aliases=["act_neg_mwh"]),
+                            "aux_energy_mwh": optional_numeric_series(bad_ps, "real_aux_energy_mwh", aliases=["aux_energy_mwh"]),
                             "suspected_cause": "submitted_without_locked_obligation" ,
                         }
                     )
@@ -4949,6 +5106,13 @@ def main() -> None:
             "rhpf_available": float(requested_benchmark_paths.get("rhpf", False)),
             "global_pf_available": float(requested_benchmark_paths.get("ghpf", False)),
             "ghpf_available": float(requested_benchmark_paths.get("ghpf", False)),
+            "model_path_executed": float(bool(requested_benchmark_paths.get("model", False))),
+            "naive_path_executed": float(bool(requested_benchmark_paths.get("naive", False))),
+            "rhpf_path_executed": float(bool(requested_benchmark_paths.get("rhpf", False))),
+            "ghpf_path_executed": float(bool(requested_benchmark_paths.get("ghpf", False))),
+            "model_manifest_loaded": float(bool(model_manifest_loaded)),
+            "model_predictions_loaded": float(bool(model_predictions_loaded)),
+            "model_prediction_loading_skipped_reason": str(model_prediction_loading_skipped_reason),
             "output_write_seconds": 0.0,
         }
         defaulted_fields: list[str] = []
@@ -5015,7 +5179,11 @@ def main() -> None:
                 scenario_start_utc=scenario_start_utc,
                 scenario_end_utc=scenario_end_utc,
             )
-            daily_df = _build_daily_performance_metrics(hourly=outputs.hourly, perf_row=perf_df.iloc[0])
+            daily_df = _build_daily_performance_metrics(
+                hourly=outputs.hourly,
+                perf_row=perf_df.iloc[0],
+                strict_missing_real_sources=bool(outputs.summary.get("model_path_executed", 1.0)),
+            )
             checks = _validate_performance_metrics(perf_row=perf_df.iloc[0], daily_df=daily_df)
             recon_debug_df = _build_performance_reconciliation_debug(
                 scenario=str(scenario_name),
@@ -5146,8 +5314,8 @@ def main() -> None:
             else:
                 hp["expected_act_neg_mwh_from_objective"] = 0.0
             hp["expected_act_total_mwh_from_objective"] = hp["expected_act_pos_mwh_from_objective"] + hp["expected_act_neg_mwh_from_objective"]
-            hp["realized_act_total_mwh"] = pd.to_numeric(hp.get("real_act_pos_mwh", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(hp.get("real_act_neg_mwh", 0.0), errors="coerce").fillna(0.0)
-            hp["perfect_foresight_act_total_mwh"] = pd.to_numeric(hp.get("perfect_foresight_act_pos_mwh", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(hp.get("perfect_foresight_act_neg_mwh", 0.0), errors="coerce").fillna(0.0)
+            hp["realized_act_total_mwh"] = optional_numeric_series(hp, "real_act_pos_mwh") + optional_numeric_series(hp, "real_act_neg_mwh")
+            hp["perfect_foresight_act_total_mwh"] = optional_numeric_series(hp, "perfect_foresight_act_pos_mwh") + optional_numeric_series(hp, "perfect_foresight_act_neg_mwh")
             keep = [
                 colmap.timestamp,
                 "real_pnl_eur",
@@ -5299,29 +5467,50 @@ def main() -> None:
             f"thesis_reportable={float(outputs.summary.get('thesis_reportable', float('nan'))):.0f}, "
             f"invalid_reason={str(outputs.summary.get('invalid_reason', '')) or 'none'}"
         )
+        if str(outputs.summary.get("active_path", "model")) != "model":
+            print(
+                "- active_path_validity: "
+                f"path={outputs.summary.get('active_path')}, "
+                f"simulation_valid={float(outputs.summary.get('active_path_simulation_valid', float('nan'))):.0f}, "
+                f"thesis_reportable={float(outputs.summary.get('active_path_thesis_reportable', float('nan'))):.0f}, "
+                f"invalid_reason={str(outputs.summary.get('active_path_invalid_reason', '')) or 'none'}"
+            )
         print(
             "- fallback/solver: "
             f"fallback_used={float(outputs.summary.get('fallback_used', 0.0)):.0f}, "
             f"optimization_error_code_counts={outputs.summary.get('optimization_error_code_counts', '{}')}"
         )
         missed_cap_pos = pd.to_numeric(
-            pd.Series([outputs.summary.get("total_missed_capacity_pos_mw", 0.0)]),
+            pd.Series([
+                outputs.summary.get(
+                    "capacity_stress_shortfall_pos_mw",
+                    outputs.summary.get("total_missed_capacity_pos_mw", 0.0),
+                )
+            ]),
             errors="coerce",
         ).iloc[0]
         missed_cap_neg = pd.to_numeric(
-            pd.Series([outputs.summary.get("total_missed_capacity_neg_mw", 0.0)]),
+            pd.Series([
+                outputs.summary.get(
+                    "capacity_stress_shortfall_neg_mw",
+                    outputs.summary.get("total_missed_capacity_neg_mw", 0.0),
+                )
+            ]),
             errors="coerce",
         ).iloc[0]
         if (pd.notna(missed_cap_pos) and float(missed_cap_pos) > 0.0) or (
             pd.notna(missed_cap_neg) and float(missed_cap_neg) > 0.0
         ):
             print(
-                "[WARN] missed_capacity_afrr: "
+                "[WARN] capacity_full_activation_stress_afrr: "
                 f"pos={float(missed_cap_pos):.4f} MW, "
-                f"neg={float(missed_cap_neg):.4f} MW"
+                f"neg={float(missed_cap_neg):.4f} MW "
+                "(diagnostic only; thesis validity is based on delivered activation energy)"
             )
         print(f"- output_dir: {scenario_out_dir}")
 
+        benchmark_mode_for_row = str(outputs.summary.get("benchmark_mode", normalized_benchmark_mode) or "")
+        overview_validity = _overview_validity_fields(outputs.summary, benchmark_mode_for_row)
         row: dict[str, object] = {
             "scenario": scenario_name,
             "trading_strategy": args.trading_strategy,
@@ -5337,8 +5526,26 @@ def main() -> None:
             "rolling_pf_available": outputs.summary.get("rolling_pf_available"),
             "global_pf_available": outputs.summary.get("global_pf_available"),
             "benchmark_mode": outputs.summary.get("benchmark_mode", normalized_benchmark_mode),
+            "active_path": outputs.summary.get("active_path"),
+            "active_path_simulation_valid": outputs.summary.get("active_path_simulation_valid"),
+            "active_path_thesis_reportable": outputs.summary.get("active_path_thesis_reportable"),
+            "active_path_invalid_reason": outputs.summary.get("active_path_invalid_reason"),
+            "legacy_simulation_valid": overview_validity.get("legacy_simulation_valid"),
+            "legacy_thesis_reportable": overview_validity.get("legacy_thesis_reportable"),
+            "legacy_invalid_reason": overview_validity.get("legacy_invalid_reason"),
+            "naive_simulation_valid": outputs.summary.get("naive_simulation_valid"),
+            "naive_thesis_reportable": outputs.summary.get("naive_thesis_reportable"),
+            "naive_invalid_reason": outputs.summary.get("naive_invalid_reason"),
+            "rhpf_simulation_valid": outputs.summary.get("rhpf_simulation_valid"),
+            "rhpf_thesis_reportable": outputs.summary.get("rhpf_thesis_reportable"),
+            "rhpf_invalid_reason": outputs.summary.get("rhpf_invalid_reason"),
             "enabled_paths": outputs.summary.get("enabled_paths"),
             "disabled_paths": outputs.summary.get("disabled_paths"),
+            "model_path_executed": outputs.summary.get("model_path_executed"),
+            "naive_path_executed": outputs.summary.get("naive_path_executed"),
+            "rhpf_path_executed": outputs.summary.get("rhpf_path_executed"),
+            "model_manifest_loaded": outputs.summary.get("model_manifest_loaded"),
+            "model_predictions_loaded": outputs.summary.get("model_predictions_loaded"),
             "naive_total_pnl_eur": outputs.summary.get("naive_total_pnl_eur"),
             "rolling_perfect_foresight_same_rules_total_pnl_eur": outputs.summary.get(
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
@@ -5357,9 +5564,9 @@ def main() -> None:
             "pnl_gap_total_eur": outputs.summary.get("pnl_gap_total_eur"),
             "economic_opportunity_gap_ratio": outputs.summary.get("economic_opportunity_gap_ratio"),
             "roi_on_max_capital": outputs.summary.get("roi_on_max_capital"),
-            "simulation_valid": outputs.summary.get("simulation_valid"),
-            "thesis_reportable": outputs.summary.get("thesis_reportable"),
-            "invalid_reason": outputs.summary.get("invalid_reason"),
+            "simulation_valid": overview_validity.get("simulation_valid"),
+            "thesis_reportable": overview_validity.get("thesis_reportable"),
+            "invalid_reason": overview_validity.get("invalid_reason"),
             "fallback_used": outputs.summary.get("fallback_used"),
             "output_dir": str(scenario_out_dir),
             "realized_net_revenue_eur": float(perf_df.iloc[0].get("realized_net_revenue_eur", float("nan"))),
@@ -5467,8 +5674,8 @@ def main() -> None:
         if {"realized_total_pnl_eur", "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"}.issubset(overview.columns):
             r = pd.to_numeric(overview["realized_total_pnl_eur"], errors="coerce")
             g = pd.to_numeric(overview["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"], errors="coerce")
-            avail = pd.to_numeric(overview.get("global_perfect_foresight_available", 0.0), errors="coerce").fillna(0.0)
-            dom = pd.to_numeric(overview.get("global_perfect_foresight_dominance_check_pass", 0.0), errors="coerce").fillna(0.0)
+            avail = optional_numeric_series(overview, "global_perfect_foresight_available")
+            dom = optional_numeric_series(overview, "global_perfect_foresight_dominance_check_pass")
             overview["realized_vs_global_hindsight_perfect_foresight_upper_bound_pct"] = np.where(
                 (avail >= 0.5) & (dom >= 0.5) & (g.abs() > 1e-12),
                 (r / g) * 100.0,
@@ -5496,7 +5703,7 @@ def main() -> None:
         invalid_rate_pct = float(100.0 * invalid_scenarios / total_scenarios) if total_scenarios > 0 else float("nan")
         invalid_by_reason: dict[str, int] = {}
         if "invalid_reason" in overview.columns and invalid_scenarios > 0:
-            invalid_rows = overview.loc[pd.to_numeric(overview.get("simulation_valid", 0.0), errors="coerce").fillna(0.0) < 0.5]
+            invalid_rows = overview.loc[optional_numeric_series(overview, "simulation_valid") < 0.5]
             for txt in invalid_rows["invalid_reason"].fillna("").astype(str):
                 for reason in [r.strip() for r in txt.split(",") if r.strip()]:
                     invalid_by_reason[reason] = invalid_by_reason.get(reason, 0) + 1

@@ -22,6 +22,12 @@ MODEL_SPECS = {
     "terminal_value_buy_quantile": 0.70,
     "terminal_value_sell_quantile": 0.30,
     "terminal_value_require_recovery_cost_for_shortfall": True,
+    "terminal_recovery_lookahead_h": 48.0,
+    "da_terminal_recovery_lookahead_h": 48.0,
+    # Naive benchmark forecast construction. The thesis default is causal and
+    # preserves weekly/hourly seasonality; the old delivery-row 24h shift
+    # remains available as "shift_24h_delivery" for legacy artifact comparison.
+    "naive_forecast_mode": "same_weekday_last_week",
     # Hard headroom assumptions for reserve/activation deliverability (hours).
     # 0.5h means full awarded MW must be energetically deliverable for 30 minutes.
     "reserve_activation_headroom_h": 0.5,

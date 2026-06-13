@@ -232,6 +232,7 @@ class BidBuilder:
         q90: float | None = None,
         is_perfect_foresight: bool = False,
         true_act_price: float | None = None,
+        perfect_foresight_bid_at_true_price: bool = False,
     ) -> float:
         """T-25 dynamic energy bid update based on latest forecast + current SoC."""
         # Keep the physical-headroom diagnostic visible, but do not alter the
@@ -273,6 +274,14 @@ class BidBuilder:
             "activation_price_guard_out_of_merit": 0.0,
             "activation_price_guard_reason": str(reason),
         }
+
+        if (
+            is_perfect_foresight
+            and bool(perfect_foresight_bid_at_true_price)
+            and true_act_price is not None
+            and math.isfinite(float(true_act_price))
+        ):
+            return float(true_act_price)
 
         if is_perfect_foresight and true_act_price is not None and math.isfinite(float(true_act_price)):
             # Oracle still avoids knowingly uneconomic activation prices.
