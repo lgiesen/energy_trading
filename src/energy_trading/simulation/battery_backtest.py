@@ -1021,6 +1021,17 @@ SETTLEMENT_METADATA_COLS = (
 
 SETTLEMENT_CLEARING_COLS = SETTLEMENT_NUMERIC_COLS + SETTLEMENT_METADATA_COLS
 
+OK_OPTIMIZATION_ERROR_CODES = frozenset(
+    {
+        "",
+        "none",
+        "ok",
+        "ok_deterministic_noop",
+        "ok_terminal_recovery_fallback",
+        "ok_fixed_obligation_replay_proof",
+    }
+)
+
 SETTLEMENT_RENAME_MAP_REAL = {
     # Canonicalize realized execution primitives into stable physical names.
     "real_executed_charge_mw": "real_charge_mw",
@@ -4063,10 +4074,10 @@ class BatteryBacktester:
         accepted_mask = pd.Series(False, index=hourly.index)
         if "real_optimization_error_code" in hourly.columns:
             ec = hourly["real_optimization_error_code"].fillna("ok").astype(str).str.strip().str.lower()
-            accepted_mask |= ~ec.isin(["ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""])
+            accepted_mask |= ~ec.isin(OK_OPTIMIZATION_ERROR_CODES)
         elif "optimization_error_code" in hourly.columns:
             ec = hourly["optimization_error_code"].fillna("ok").astype(str).str.strip().str.lower()
-            accepted_mask |= ~ec.isin(["ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""])
+            accepted_mask |= ~ec.isin(OK_OPTIMIZATION_ERROR_CODES)
         if "real_optimization_fallback" in hourly.columns:
             fb = hourly["real_optimization_fallback"].fillna("none").astype(str).str.strip().str.lower()
             accepted_mask |= fb.ne("none")
@@ -4108,7 +4119,7 @@ class BatteryBacktester:
         if hourly is None or hourly.empty or timestamp_col not in hourly.columns:
             return ""
         mask = pd.Series(False, index=hourly.index)
-        ok_codes = {"", "none", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"}
+        ok_codes = OK_OPTIMIZATION_ERROR_CODES
         for col in ("real_optimization_error_code", "optimization_error_code"):
             if col in hourly.columns:
                 codes = hourly[col].fillna("ok").astype(str).str.strip().str.lower()
@@ -4219,6 +4230,46 @@ class BatteryBacktester:
         if float(current_soc_mwh) + 1e-9 < float(final_soc_target_mwh):
             return "terminal_soc_conflict"
         return "hard_final_soc_infeasible"
+
+    @staticmethod
+    def _terminal_repair_mass_balance_physical_mask(
+        *,
+        id_reason_text: pd.Series,
+        actual_soc_mwh: pd.Series,
+        target_soc_mwh: float,
+        real_id_charge_mw: pd.Series,
+        terminal_closure_reason: pd.Series,
+        terminal_closure_applied: pd.Series,
+        terminal_closure_target_met: pd.Series,
+        terminal_closure_id_buy_mwh: pd.Series,
+        terminal_closure_cost_accounted: pd.Series | None = None,
+        tolerance_mwh: float = 1e-6,
+    ) -> pd.Series:
+        """Rows where terminal closure is physical proof for mass-balance replay."""
+        idx = actual_soc_mwh.index
+        id_reason = id_reason_text.reindex(idx).fillna("").astype(str)
+        closure_reason = terminal_closure_reason.reindex(idx).fillna("").astype(str)
+        actual = pd.to_numeric(actual_soc_mwh.reindex(idx), errors="coerce").fillna(float("nan"))
+        id_charge = pd.to_numeric(real_id_charge_mw.reindex(idx), errors="coerce").fillna(0.0)
+        closure_applied = pd.to_numeric(terminal_closure_applied.reindex(idx), errors="coerce").fillna(0.0)
+        closure_met = pd.to_numeric(terminal_closure_target_met.reindex(idx), errors="coerce").fillna(0.0)
+        closure_buy = pd.to_numeric(terminal_closure_id_buy_mwh.reindex(idx), errors="coerce").fillna(0.0)
+        if terminal_closure_cost_accounted is None:
+            closure_cost_accounted = pd.Series(False, index=idx, dtype=bool)
+        else:
+            closure_cost_accounted = terminal_closure_cost_accounted.reindex(idx).fillna(False).astype(bool)
+        terminal_target_met = actual.sub(float(target_soc_mwh)).abs() <= float(tolerance_mwh)
+        return (
+            id_reason.isin({"shortfall_recovery", "terminal_soc_recovery"})
+            & terminal_target_met
+            & (id_charge > 1e-12)
+        ) | (
+            closure_reason.eq("shortfall_recovery")
+            & (closure_applied > 0.5)
+            & (closure_met > 0.5)
+            & (closure_buy > 1e-12)
+            & closure_cost_accounted
+        )
 
     @staticmethod
     def _da_precommit_replay_invariants(
@@ -21704,7 +21755,7 @@ class BatteryBacktester:
     ) -> str:
         """Stable accepted-path infeasibility attribution for diagnostics."""
         code = str(optimization_error_code or "").strip().lower()
-        if code in {"", "none", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"}:
+        if code in OK_OPTIMIZATION_ERROR_CODES:
             return "none"
         fixed_reserve = (
             max(0.0, float(fixed_reserve_obligation_pos_mw))
@@ -23527,12 +23578,83 @@ class BatteryBacktester:
                                     root_cause="milp_infeasible"
                                 )
                                 self._hard_final_soc_debug_rows.append(debug_row)
-                                optimization_fallback = str(
+                                root_cause_classification = str(
                                     debug_row.get(
                                         "root_cause_classification",
                                         "hard_final_soc_infeasible",
                                     )
                                 )
+                                replay_passed_for_false_infeasible = (
+                                    float(
+                                        fixed_obligation_diag.get(
+                                            "fixed_obligation_replay_pass",
+                                            0.0,
+                                        )
+                                        or 0.0
+                                    )
+                                    > 0.5
+                                )
+                                if (
+                                    root_cause_classification
+                                    == "hard_final_soc_false_infeasible"
+                                    and replay_passed_for_false_infeasible
+                                ):
+                                    plan["optimizer_fallback_used"] = 0.0
+                                    plan["objective_unavailable_due_to_infeasible_or_fallback"] = 0.0
+                                    plan["objective_unavailable_due_to_solver_failure"] = 1.0
+                                    plan["fixed_obligation_replay_proof_used"] = 1.0
+                                    plan["hard_final_soc_false_infeasible_replay_proof"] = 1.0
+                                    optimization_fallback = "none"
+                                    optimization_error = ""
+                                    optimization_status_code = "ok_fixed_obligation_replay_proof"
+                                    reserve_retry_succeeded = 1.0
+                                    fixed_obligation_diag[
+                                        "fixed_obligation_replay_milp_mismatch"
+                                    ] = 1.0
+                                    fixed_obligation_diag[
+                                        "fixed_obligation_driver"
+                                    ] = "fixed_obligation_replay_milp_mismatch"
+                                    fixed_obligation_diag[
+                                        "fixed_obligation_replay_proof_used"
+                                    ] = 1.0
+                                    fixed_obligation_diag[
+                                        "hard_final_soc_false_infeasible_replay_proof"
+                                    ] = 1.0
+                                elif root_cause_classification in {
+                                    "terminal_soc_conflict",
+                                    "hard_final_soc_infeasible",
+                                }:
+                                    terminal_recovery_plan, terminal_recovery_diag = (
+                                        _terminal_recovery_fallback_with_id()
+                                    )
+                                    if terminal_recovery_plan is not None:
+                                        plan = terminal_recovery_plan
+                                        for k, v in terminal_recovery_diag.items():
+                                            plan[k] = v
+                                        plan["optimizer_fallback_used"] = 0.0
+                                        plan[
+                                            "objective_unavailable_due_to_infeasible_or_fallback"
+                                        ] = 0.0
+                                        plan[
+                                            "objective_unavailable_due_to_solver_failure"
+                                        ] = 1.0
+                                        plan["terminal_recovery_fallback_proof_used"] = 1.0
+                                        optimization_fallback = "none"
+                                        optimization_error = ""
+                                        optimization_status_code = "ok_terminal_recovery_fallback"
+                                        reserve_retry_succeeded = 1.0
+                                        fixed_obligation_diag[
+                                            "terminal_recovery_fallback_proof_used"
+                                        ] = 1.0
+                                        fixed_obligation_diag[
+                                            "terminal_recovery_fallback_success"
+                                        ] = 1.0
+                                    else:
+                                        for k, v in terminal_recovery_diag.items():
+                                            plan[k] = v
+                                        optimization_fallback = root_cause_classification
+                                else:
+                                    optimization_fallback = root_cause_classification
                             else:
                                 optimization_fallback = "reserve_feasibility_repair" if has_fixed_reserve_obligation else "safe_hold_plan_under_infeasible_soft_final_soc"
                     else:
@@ -23560,8 +23682,18 @@ class BatteryBacktester:
                 or ("solver" in opt_code_l)
                 or ("numerical" in opt_code_l)
             )
+            existing_replay_milp_mismatch = (
+                float(
+                    fixed_obligation_diag.get(
+                        "fixed_obligation_replay_milp_mismatch",
+                        0.0,
+                    )
+                    or 0.0
+                )
+                > 0.5
+            )
             fixed_obligation_diag["fixed_obligation_replay_milp_mismatch"] = float(
-                replay_passed and accepted_solve_failed
+                existing_replay_milp_mismatch or (replay_passed and accepted_solve_failed)
             )
             if (
                 float(fixed_obligation_diag["fixed_obligation_replay_milp_mismatch"]) > 0.5
@@ -24724,7 +24856,7 @@ class BatteryBacktester:
                     or fallback_for_da_lock not in {"", "none"}
                     or (
                         opt_code_for_da_lock
-                        not in {"", "none", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"}
+                        not in OK_OPTIMIZATION_ERROR_CODES
                     )
                 )
                 stale_anchor_requires_replay = (
@@ -26601,11 +26733,7 @@ class BatteryBacktester:
                 .str.lower()
             )
             take_has_failed_code = bool(
-                (
-                    ~take_opt_codes.isin(
-                        {"", "none", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"}
-                    )
-                ).any()
+                (~take_opt_codes.isin(OK_OPTIMIZATION_ERROR_CODES)).any()
             )
             if bool(take_fallback_used) or bool(take_has_failed_code):
                 accepted_path_fallback_contaminated = True
@@ -27978,6 +28106,44 @@ class BatteryBacktester:
             theor_next = float(np.clip(theor_next, self.soc_min, self.soc_max))
             got_next = float(row["real_soc_mwh"])
             if not np.isfinite(got_next) or abs(theor_next - got_next) > max(epsilon, 1e-6):
+                closure_after = np.nan
+                for closure_after_col in (
+                    "real_terminal_recovery_soc_after_mwh",
+                    "terminal_recovery_soc_after_mwh",
+                    "final_soc_after_terminal_closure_mwh",
+                    "terminal_closure_soc_after_mwh",
+                ):
+                    if closure_after_col in realized.columns:
+                        closure_after = pd.to_numeric(
+                            pd.Series([row.get(closure_after_col, np.nan)]),
+                            errors="coerce",
+                        ).iloc[0]
+                        if np.isfinite(float(closure_after)):
+                            break
+                closure_cost_accounted = any(
+                    c in realized.columns
+                    and np.isfinite(
+                        pd.to_numeric(pd.Series([row.get(c, np.nan)]), errors="coerce").iloc[0]
+                    )
+                    for c in (
+                        "terminal_closure_net_pnl_eur",
+                        "terminal_closure_cost_eur",
+                        "terminal_soc_net_adjustment_eur",
+                    )
+                )
+                terminal_closure_physical = bool(
+                    str(row.get("terminal_closure_reason", "")).strip() == "shortfall_recovery"
+                    and float(row.get("terminal_closure_applied", 0.0) or 0.0) > 0.5
+                    and float(row.get("final_soc_target_met_after_closure", 0.0) or 0.0) > 0.5
+                    and float(row.get("terminal_closure_id_buy_mwh", 0.0) or 0.0) > 1e-12
+                    and closure_cost_accounted
+                    and np.isfinite(float(closure_after))
+                    and abs(float(closure_after) - float(self.soc_target_end)) <= max(epsilon, 1e-6)
+                    and abs(float(closure_after) - got_next) <= max(epsilon, 1e-6)
+                )
+                if terminal_closure_physical:
+                    soc_prev = got_next
+                    continue
                 ts = pd.to_datetime(row[ts_col], utc=True, errors="coerce")
                 self._write_soc_mass_balance_debug(
                     realized=realized,
@@ -29992,7 +30158,7 @@ class BatteryBacktester:
                 code_col = f"{prefix}_optimization_error_code"
                 if require_ok_codes and code_col in frame.columns:
                     codes = frame[code_col].fillna("ok").astype(str).str.strip().str.lower()
-                    bad_codes = codes[~codes.isin({"", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"})]
+                    bad_codes = codes[~codes.isin(OK_OPTIMIZATION_ERROR_CODES)]
                     if not bad_codes.empty:
                         return False, "non_ok_optimization_status", terminal_shortfall
                 if not np.isfinite(float(value_eur)):
@@ -30997,18 +31163,43 @@ class BatteryBacktester:
                 id_reason_text = hourly["id_recourse_reason"].fillna("").astype(str)
             else:
                 id_reason_text = pd.Series("", index=hourly.index, dtype="string")
-            terminal_repair_reason = id_reason_text.isin({"shortfall_recovery", "terminal_soc_recovery"})
-            terminal_target_met = actual_soc.sub(float(self.soc_target_end)).abs() <= 1e-6
-            terminal_repair_physical = terminal_repair_reason & terminal_target_met & (real_id_charge_mw > 1e-12)
-            terminal_soc_after = (
-                _hourly_num_col("real_terminal_recovery_soc_after_mwh")
-                if "real_terminal_recovery_soc_after_mwh" in hourly.columns
-                else (
-                    _hourly_num_col("terminal_recovery_soc_after_mwh")
-                    if "terminal_recovery_soc_after_mwh" in hourly.columns
-                    else actual_soc
-                )
+            terminal_closure_reason = (
+                hourly["terminal_closure_reason"].fillna("").astype(str)
+                if "terminal_closure_reason" in hourly.columns
+                else pd.Series("", index=hourly.index, dtype="string")
             )
+            terminal_closure_cost_accounted = pd.Series(False, index=hourly.index, dtype=bool)
+            for _closure_cost_col in (
+                "terminal_closure_net_pnl_eur",
+                "terminal_closure_cost_eur",
+                "terminal_soc_net_adjustment_eur",
+            ):
+                if _closure_cost_col in hourly.columns:
+                    terminal_closure_cost_accounted |= pd.to_numeric(
+                        hourly[_closure_cost_col],
+                        errors="coerce",
+                    ).replace([np.inf, -np.inf], np.nan).notna()
+            terminal_repair_physical = self._terminal_repair_mass_balance_physical_mask(
+                id_reason_text=id_reason_text,
+                actual_soc_mwh=actual_soc,
+                target_soc_mwh=float(self.soc_target_end),
+                real_id_charge_mw=real_id_charge_mw,
+                terminal_closure_reason=terminal_closure_reason,
+                terminal_closure_applied=_hourly_num_col("terminal_closure_applied"),
+                terminal_closure_target_met=_hourly_num_col("final_soc_target_met_after_closure"),
+                terminal_closure_id_buy_mwh=_hourly_num_col("terminal_closure_id_buy_mwh"),
+                terminal_closure_cost_accounted=terminal_closure_cost_accounted,
+            )
+            if "real_terminal_recovery_soc_after_mwh" in hourly.columns:
+                terminal_soc_after = _hourly_num_col("real_terminal_recovery_soc_after_mwh")
+            elif "terminal_recovery_soc_after_mwh" in hourly.columns:
+                terminal_soc_after = _hourly_num_col("terminal_recovery_soc_after_mwh")
+            elif "final_soc_after_terminal_closure_mwh" in hourly.columns:
+                terminal_soc_after = _hourly_num_col("final_soc_after_terminal_closure_mwh")
+            elif "terminal_closure_soc_after_mwh" in hourly.columns:
+                terminal_soc_after = _hourly_num_col("terminal_closure_soc_after_mwh")
+            else:
+                terminal_soc_after = actual_soc
             expected_soc = expected_soc.where(~terminal_repair_physical, terminal_soc_after)
             id_action = (_hourly_num_col("real_id_buy_mwh").abs() + _hourly_num_col("real_id_sell_mwh").abs()) > 1e-12
             id_setpoint_action = (real_id_charge_mw.abs() + real_id_discharge_mw.abs()) > 1e-12
@@ -33663,7 +33854,7 @@ class BatteryBacktester:
             else:
                 ec = pd.Series(dtype=str)
             if len(ec) > 0:
-                fb_like = ec[~ec.isin(["", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none"])]
+                fb_like = ec[~ec.isin(OK_OPTIMIZATION_ERROR_CODES)]
                 if not fb_like.empty:
                     fb_counts = fb_like.value_counts(dropna=False).to_dict()
                     summary["fallback_mode_counts"] = json.dumps(
@@ -33697,7 +33888,7 @@ class BatteryBacktester:
             opt_codes_series = hourly["real_optimization_error_code"].fillna("ok").astype(str).str.lower().str.strip()
         elif "optimization_error_code" in hourly.columns:
             opt_codes_series = hourly["optimization_error_code"].fillna("ok").astype(str).str.lower().str.strip()
-        ok_optimizer_codes = {"ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""}
+        ok_optimizer_codes = OK_OPTIMIZATION_ERROR_CODES
         ts_series = (
             pd.to_datetime(hourly[colmap.timestamp], utc=True, errors="coerce")
             if colmap.timestamp in hourly.columns
@@ -34522,7 +34713,7 @@ class BatteryBacktester:
         summary["infeasibility_driver"] = str(infeasibility_driver)
         if "optimization_error_code" in hourly.columns:
             drv = np.full(len(hourly), "none", dtype=object)
-            ok_codes = {"ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback", "none", ""}
+            ok_codes = OK_OPTIMIZATION_ERROR_CODES
             opt_code_for_rows = hourly["optimization_error_code"].fillna("ok").astype(str).str.lower()
             mask_bad = ~opt_code_for_rows.isin(ok_codes)
             if bool(mask_bad.any()):

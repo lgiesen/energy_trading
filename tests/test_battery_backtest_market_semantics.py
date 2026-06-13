@@ -4458,6 +4458,97 @@ def test_soc_mass_balance_audit_id_buy_grid_energy_visible_to_audit() -> None:
         bt._audit_backtest_results(realized=realized_bad, dispatch=dispatch, df_input=df_input, colmap=col)
 
 
+def test_terminal_closure_fields_prove_physical_mass_balance_repair() -> None:
+    idx = pd.Index([0, 1])
+    mask = BatteryBacktester._terminal_repair_mass_balance_physical_mask(
+        id_reason_text=pd.Series(["none", "none"], index=idx),
+        actual_soc_mwh=pd.Series([3.0, 10.0], index=idx),
+        target_soc_mwh=10.0,
+        real_id_charge_mw=pd.Series([0.0, 0.0], index=idx),
+        terminal_closure_reason=pd.Series(["none", "shortfall_recovery"], index=idx),
+        terminal_closure_applied=pd.Series([0.0, 1.0], index=idx),
+        terminal_closure_target_met=pd.Series([0.0, 1.0], index=idx),
+        terminal_closure_id_buy_mwh=pd.Series([0.0, 7.0], index=idx),
+        terminal_closure_cost_accounted=pd.Series([False, True], index=idx),
+    )
+    assert list(mask.astype(bool)) == [False, True]
+
+
+def test_terminal_closure_without_cost_accounting_does_not_mask_mass_balance() -> None:
+    idx = pd.Index([0])
+    mask = BatteryBacktester._terminal_repair_mass_balance_physical_mask(
+        id_reason_text=pd.Series(["none"], index=idx),
+        actual_soc_mwh=pd.Series([10.0], index=idx),
+        target_soc_mwh=10.0,
+        real_id_charge_mw=pd.Series([0.0], index=idx),
+        terminal_closure_reason=pd.Series(["shortfall_recovery"], index=idx),
+        terminal_closure_applied=pd.Series([1.0], index=idx),
+        terminal_closure_target_met=pd.Series([1.0], index=idx),
+        terminal_closure_id_buy_mwh=pd.Series([7.0], index=idx),
+        terminal_closure_cost_accounted=pd.Series([False], index=idx),
+    )
+
+    assert list(mask.astype(bool)) == [False]
+
+
+def test_soc_mass_balance_audit_accepts_costed_physical_terminal_closure() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-05-01T23:00:00Z")
+    bt.soc_init = 8.4
+    realized = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "real_soc_mwh": [10.0],
+            "real_charge_mw": [0.0],
+            "real_discharge_mw": [0.0],
+            "real_act_pos_mwh": [0.0],
+            "real_act_neg_mwh": [0.0],
+            "real_aux_energy_mwh": [0.0],
+            "real_pnl_eur": [-100.0],
+            "terminal_closure_reason": ["shortfall_recovery"],
+            "terminal_closure_applied": [1.0],
+            "final_soc_target_met_after_closure": [1.0],
+            "terminal_closure_id_buy_mwh": [1.6842105263],
+            "terminal_closure_soc_after_mwh": [10.0],
+            "terminal_closure_net_pnl_eur": [-100.0],
+        }
+    )
+    dispatch = pd.DataFrame({col.timestamp: [ts]})
+    df_input = pd.DataFrame({col.timestamp: [ts]})
+
+    bt._audit_backtest_results(realized=realized, dispatch=dispatch, df_input=df_input, colmap=col)
+
+
+def test_soc_mass_balance_audit_rejects_terminal_closure_without_cost_accounting() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-05-01T23:00:00Z")
+    bt.soc_init = 8.4
+    realized = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "real_soc_mwh": [10.0],
+            "real_charge_mw": [0.0],
+            "real_discharge_mw": [0.0],
+            "real_act_pos_mwh": [0.0],
+            "real_act_neg_mwh": [0.0],
+            "real_aux_energy_mwh": [0.0],
+            "real_pnl_eur": [0.0],
+            "terminal_closure_reason": ["shortfall_recovery"],
+            "terminal_closure_applied": [1.0],
+            "final_soc_target_met_after_closure": [1.0],
+            "terminal_closure_id_buy_mwh": [1.6842105263],
+            "terminal_closure_soc_after_mwh": [10.0],
+        }
+    )
+    dispatch = pd.DataFrame({col.timestamp: [ts]})
+    df_input = pd.DataFrame({col.timestamp: [ts]})
+
+    with pytest.raises(RuntimeError, match="SoC mass-balance mismatch"):
+        bt._audit_backtest_results(realized=realized, dispatch=dispatch, df_input=df_input, colmap=col)
+
+
 def test_id_recourse_buy_and_sell_apply_physical_soc_effect_and_reason() -> None:
     bt = _mk_backtester()
     bt.eta_in = 0.95
@@ -17421,6 +17512,25 @@ def test_accepted_fallback_hour_marks_dump_as_accepted_and_invalidating() -> Non
     assert len(candidate) == 0
 
 
+def test_replay_proven_false_infeasible_status_keeps_dump_candidate_only() -> None:
+    bt = _mk_backtester()
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": [pd.Timestamp("2025-05-01T09:00:00Z")],
+            "optimization_error_code": ["ok_fixed_obligation_replay_proof"],
+            "optimization_fallback": ["none"],
+            "optimizer_fallback_used": [0.0],
+            "fixed_obligation_replay_milp_mismatch": [1.0],
+        }
+    )
+    dumps = [{"timestamp_utc": "20250501T090000Z", "path": "x.npz"}]
+
+    accepted, candidate = bt._classify_infeasible_debug_dumps(dumps, hourly, timestamp_col="timestamp_utc")
+
+    assert len(accepted) == 0
+    assert len(candidate) == 1
+
+
 def test_accepted_infeasible_dump_count_requires_first_timestamp() -> None:
     bt = _mk_backtester()
     df, col = _tiny_backtest_df(hours=6)
@@ -17436,7 +17546,7 @@ def test_first_infeasible_timestamp_ignores_initial_deterministic_noop() -> None
             "timestamp_utc": pd.date_range("2025-05-01T06:00:00Z", periods=3, freq="h"),
             "optimization_error_code": [
                 "ok_deterministic_noop",
-                "ok",
+                "ok_fixed_obligation_replay_proof",
                 "rolling_window_nonterminal_infeasible",
             ],
             "optimization_fallback": ["none", "none", "safe_hold_plan"],
@@ -17447,6 +17557,15 @@ def test_first_infeasible_timestamp_ignores_initial_deterministic_noop() -> None
     ts = BatteryBacktester._first_actual_infeasible_timestamp(hourly)
 
     assert ts == pd.Timestamp("2025-05-01T08:00:00Z").isoformat()
+
+
+def test_replay_proven_false_infeasible_has_no_infeasibility_driver() -> None:
+    driver = BatteryBacktester._infer_infeasibility_driver_for_row(
+        optimization_error_code="ok_fixed_obligation_replay_proof",
+        fixed_reserve_obligation_pos_mw=4.0,
+    )
+
+    assert driver == "none"
 
 
 def test_invalid_reason_includes_infeasible_debug_dump_only_for_accepted_path() -> None:
@@ -18414,6 +18533,78 @@ def test_not_set_final_window_uses_terminal_id_recovery_without_fallback(
     assert pd.to_numeric(h["optimizer_fallback_used"], errors="coerce").fillna(1.0).eq(0.0).all()
     assert pd.to_numeric(h["real_id_charge_mw"], errors="coerce").fillna(0.0).gt(0.0).any()
     assert pd.to_numeric(h["terminal_recovery_fallback_success"], errors="coerce").fillna(0.0).eq(1.0).all()
+
+
+def test_hard_final_infeasible_final_window_uses_terminal_id_recovery_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    df, col = _tiny_backtest_df(hours=1)
+    bt = _mk_backtester("canonical_economic")
+    bt.soc_init = 9.0
+    bt.soc_target_end = 10.0
+    bt.final_soc_mode = "hard"
+
+    def _infeasible(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError(
+            "MIP optimization failed: The problem is infeasible. "
+            "(HiGHS Status 8: model_status is Infeasible)"
+        )
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _infeasible)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=1,
+        reopt_step_hours=1,
+        allowed_markets=("aFRR", "ID"),
+        strategy_name="bcm",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+        id_recourse_mode="common",
+    )
+    h = out.hourly
+    assert set(h["optimization_error_code"].astype(str)) == {"ok_terminal_recovery_fallback"}
+    assert float(out.summary["fallback_used"]) == 0.0
+    assert float(out.summary["simulation_valid"]) == 1.0
+    assert float(out.summary["final_soc_check_pass"]) == 1.0
+    assert pd.to_numeric(h["optimizer_fallback_used"], errors="coerce").fillna(1.0).eq(0.0).all()
+    assert pd.to_numeric(h["real_id_charge_mw"], errors="coerce").fillna(0.0).gt(0.0).any()
+    assert pd.to_numeric(h["terminal_recovery_fallback_success"], errors="coerce").fillna(0.0).eq(1.0).all()
+
+
+def test_hard_final_infeasible_with_id_disabled_remains_invalid_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    df, col = _tiny_backtest_df(hours=1)
+    bt = _mk_backtester("canonical_economic")
+    bt.soc_init = 9.0
+    bt.soc_target_end = 10.0
+    bt.final_soc_mode = "hard"
+
+    def _infeasible(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError(
+            "MIP optimization failed: The problem is infeasible. "
+            "(HiGHS Status 8: model_status is Infeasible)"
+        )
+
+    monkeypatch.setattr(bt, "optimize_dispatch", _infeasible)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=1,
+        reopt_step_hours=1,
+        allowed_markets=("aFRR", "ID"),
+        strategy_name="bcm",
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+        id_recourse_mode="disabled",
+    )
+    assert set(out.hourly["optimization_error_code"].astype(str)) == {"terminal_soc_conflict"}
+    assert float(out.summary["fallback_used"]) == 1.0
+    assert float(out.summary["simulation_valid"]) == 0.0
+    assert "optimization_infeasible" in str(out.summary["invalid_reason"])
 
 
 def test_not_set_final_window_with_id_disabled_remains_invalid_fallback(
