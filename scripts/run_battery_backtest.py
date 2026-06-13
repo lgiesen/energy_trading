@@ -872,22 +872,93 @@ THROUGHPUT_SOURCE_COLUMNS = [
     "real_act_pos_mwh",
     "real_act_neg_mwh",
 ]
+THROUGHPUT_INTERNAL_SUFFIXES = [
+    "da_charge_internal_mwh",
+    "da_discharge_internal_mwh",
+    "id_charge_internal_mwh",
+    "id_discharge_internal_mwh",
+    "act_pos_internal_mwh",
+    "act_neg_internal_mwh",
+]
+THROUGHPUT_GRID_SUFFIXES = [
+    "da_buy_mwh",
+    "da_sell_mwh",
+    "id_buy_mwh",
+    "id_sell_mwh",
+    "act_pos_mwh",
+    "act_neg_mwh",
+]
+
+
+def _sum_prefixed_columns(hourly: pd.DataFrame, prefix: str, suffixes: list[str]) -> tuple[pd.Series, list[str]]:
+    cols = [f"{prefix}_{suffix}" for suffix in suffixes]
+    missing = [c for c in cols if c not in hourly.columns]
+    total = pd.Series(0.0, index=hourly.index, dtype=float)
+    for c in cols:
+        if c in hourly.columns:
+            total = total + pd.to_numeric(hourly[c], errors="coerce").fillna(0.0).abs()
+    return total.astype(float), missing
+
+
+def _compute_path_hourly_throughput_mwh(
+    hourly: pd.DataFrame,
+    prefix: str,
+    *,
+    strict_missing_real_sources: bool = True,
+) -> pd.Series:
+    """Path-aware internal battery throughput, with grid-side fallback for legacy outputs."""
+    direct_col = f"{prefix}_throughput_mwh"
+    direct: pd.Series | None = None
+    if direct_col in hourly.columns:
+        direct = pd.to_numeric(hourly[direct_col], errors="coerce").fillna(0.0).astype(float)
+
+    internal_total, internal_missing = _sum_prefixed_columns(hourly, prefix, THROUGHPUT_INTERNAL_SUFFIXES)
+    if not internal_missing:
+        if direct is None:
+            return internal_total
+        reconciliation_error = (direct - internal_total).abs()
+        direct_is_stale_zero = direct.abs().le(1e-12) & internal_total.abs().gt(1e-12)
+        if bool((direct_is_stale_zero | reconciliation_error.gt(1e-9)).any()):
+            return internal_total
+        return direct
+
+    if direct is not None and bool(direct.abs().gt(1e-12).any()):
+        return direct
+
+    grid_total, grid_missing = _sum_prefixed_columns(hourly, prefix, THROUGHPUT_GRID_SUFFIXES)
+    if grid_missing:
+        if prefix == "real" and bool(strict_missing_real_sources):
+            raise ValueError(
+                "Cannot compute real_throughput_mwh: missing required source columns "
+                f"{grid_missing}. Required columns: {THROUGHPUT_SOURCE_COLUMNS}"
+            )
+        return direct if direct is not None else pd.Series(0.0, index=hourly.index, dtype=float)
+    return grid_total
 
 
 def _compute_hourly_throughput_mwh(hourly: pd.DataFrame) -> pd.Series:
     """Canonical realized physical throughput used by scenario, daily and hourly reports."""
-    if "real_throughput_mwh" in hourly.columns:
-        return pd.to_numeric(hourly["real_throughput_mwh"], errors="coerce").fillna(0.0).astype(float)
-    missing = [c for c in THROUGHPUT_SOURCE_COLUMNS if c not in hourly.columns]
-    if missing:
-        raise ValueError(
-            "Cannot compute real_throughput_mwh: missing required source columns "
-            f"{missing}. Required columns: {THROUGHPUT_SOURCE_COLUMNS}"
-        )
-    total = pd.Series(0.0, index=hourly.index, dtype=float)
-    for c in THROUGHPUT_SOURCE_COLUMNS:
-        total = total + pd.to_numeric(hourly[c], errors="coerce").fillna(0.0).abs()
-    return total.astype(float)
+    return _compute_path_hourly_throughput_mwh(hourly, "real")
+
+
+def _path_throughput_reconciliation_error_mwh(hourly: pd.DataFrame, prefix: str) -> pd.Series:
+    direct_col = f"{prefix}_throughput_mwh"
+    if direct_col not in hourly.columns:
+        return pd.Series(0.0, index=hourly.index, dtype=float)
+    internal_total, internal_missing = _sum_prefixed_columns(hourly, prefix, THROUGHPUT_INTERNAL_SUFFIXES)
+    if internal_missing:
+        return pd.Series(0.0, index=hourly.index, dtype=float)
+    direct = pd.to_numeric(hourly[direct_col], errors="coerce").fillna(0.0).astype(float)
+    return (direct - internal_total).astype(float)
+
+
+def _path_throughput_recomputed_from_sources(hourly: pd.DataFrame, prefix: str) -> pd.Series:
+    direct_col = f"{prefix}_throughput_mwh"
+    if direct_col not in hourly.columns:
+        return pd.Series(1.0, index=hourly.index, dtype=float)
+    computed = _compute_path_hourly_throughput_mwh(hourly, prefix, strict_missing_real_sources=False)
+    direct = pd.to_numeric(hourly[direct_col], errors="coerce").fillna(0.0).astype(float)
+    return (computed - direct).abs().gt(1e-9).astype(float)
 
 
 def _ensure_hourly_throughput(hourly: pd.DataFrame) -> pd.DataFrame:
@@ -1400,6 +1471,7 @@ def _build_performance_paths_long(
         cost_da = col("cost_da_eur")
         revenue_id = col("revenue_id_eur")
         cost_id = col("cost_id_eur")
+        throughput_mwh = _compute_path_hourly_throughput_mwh(h, prefix, strict_missing_real_sources=False)
         out = pd.DataFrame(
             {
                 "scenario": str(scenario_name),
@@ -1427,7 +1499,7 @@ def _build_performance_paths_long(
                 "degradation_cost_eur": col("degradation_cost_eur"),
                 "transaction_cost_eur": col("transaction_cost_eur"),
                 "penalty_cost_eur": col("penalty_eur"),
-                "throughput_mwh": col("throughput_mwh"),
+                "throughput_mwh": throughput_mwh,
                 "soc_mwh": col("soc_mwh"),
                 "validity_flag": float(pd.to_numeric(pd.Series([summary.get("simulation_valid", np.nan)]), errors="coerce").iloc[0]),
                 "available": available,

@@ -9,9 +9,11 @@ import pandas as pd
 from energy_trading.simulation.battery_backtest import BacktestOutputs
 from scripts.run_battery_backtest import (
     _build_daily_performance_metrics,
+    _build_performance_paths_long,
     _build_performance_reconciliation_debug,
     _build_performance_metrics,
     _compute_hourly_throughput_mwh,
+    _compute_path_hourly_throughput_mwh,
     _ensure_hourly_throughput,
     _performance_reconciliation_failure_detail,
     _validate_performance_metrics,
@@ -114,6 +116,52 @@ def test_hourly_throughput_helper_reproduces_existing_formula_without_existing_c
     )
     assert throughput.tolist() == expected.tolist()
     assert float(throughput.sum()) == pytest.approx(float(expected.sum()))
+
+
+def test_path_throughput_helper_prefers_internal_activation_basis_when_present():
+    hourly = pd.DataFrame(
+        {
+            "perfect_foresight_throughput_mwh": [0.0],
+            "perfect_foresight_da_charge_internal_mwh": [0.0],
+            "perfect_foresight_da_discharge_internal_mwh": [0.0],
+            "perfect_foresight_id_charge_internal_mwh": [0.0],
+            "perfect_foresight_id_discharge_internal_mwh": [0.0],
+            "perfect_foresight_act_pos_internal_mwh": [0.4],
+            "perfect_foresight_act_neg_internal_mwh": [0.6],
+            "perfect_foresight_act_pos_mwh": [0.1],
+            "perfect_foresight_act_neg_mwh": [0.1],
+        }
+    )
+    throughput = _compute_path_hourly_throughput_mwh(hourly, "perfect_foresight")
+    assert float(throughput.iloc[0]) == pytest.approx(1.0)
+
+
+def test_performance_paths_long_recomputes_stale_bem_activation_throughput():
+    ts = pd.date_range("2025-05-01T00:00:00Z", periods=1, freq="h", tz="UTC")
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "perfect_foresight_pnl_eur": [1.0],
+            "perfect_foresight_throughput_mwh": [0.0],
+            "perfect_foresight_da_charge_internal_mwh": [0.0],
+            "perfect_foresight_da_discharge_internal_mwh": [0.0],
+            "perfect_foresight_id_charge_internal_mwh": [0.0],
+            "perfect_foresight_id_discharge_internal_mwh": [0.0],
+            "perfect_foresight_act_pos_internal_mwh": [0.25],
+            "perfect_foresight_act_neg_internal_mwh": [0.75],
+            "perfect_foresight_bem_only_activation_revenue_eur": [10.0],
+            "perfect_foresight_degradation_cost_eur": [15.0],
+        }
+    )
+    paths = _build_performance_paths_long(
+        isolated_hourly={"rhpf": hourly},
+        summary={"rhpf_available": 1.0, "simulation_valid": 1.0},
+        args=_args(),
+        scenario_name="p70_p70",
+        scenario_bins=["p70"],
+    )
+    row = paths.loc[paths["path_type"].eq("rhpf")].iloc[0]
+    assert float(row["throughput_mwh"]) == pytest.approx(1.0)
 
 
 def test_frozen_backtest_outputs_hourly_throughput_uses_replace():

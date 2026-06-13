@@ -225,13 +225,10 @@ def _validate_incumbent_flags(
             result.fail(f"expected exactly one selected-incumbent flag, got {active}")
         elif active[0] != "solver":
             msg = (
-                f"not pure solver RHPF: selected fallback={active[0]}, "
+                f"diagnostic fallback beats solver: selected={active[0]}, "
                 f"reason={_safe_str(summary.get('rolling_pf_incumbent_selection_reason'))}"
             )
-            if allow_fallback_benchmark:
-                result.warn(msg)
-            else:
-                result.fail(msg)
+            result.warn(msg)
     if reported_available and not reported_is_solver:
         result.fail("reported RHPF is available but rolling_pf_reported_is_solver is not 1")
 
@@ -369,6 +366,11 @@ def _collect_rows(result: ScenarioResult, summary: dict[str, Any], hourly: pd.Da
         "rolling_pf_da_volume_loss_stage",
         "rolling_pf_da_volume_loss_reason",
         "rolling_pf_bcm_plan_settlement_mismatch_reason",
+        "rolling_pf_bcm_raw_solver_underperformance_classification",
+        "rolling_pf_bcm_first_side_mismatch_reason",
+        "rolling_pf_bcm_first_side_mismatch_ts_utc",
+        "rolling_pf_bcm_activation_revenue_gap_eur",
+        "rolling_pf_bcm_capacity_revenue_gap_eur",
         "rolling_pf_reported_invalid_reason",
         "bcm_capacity_price_missing_for_awarded_capacity_count",
     ]

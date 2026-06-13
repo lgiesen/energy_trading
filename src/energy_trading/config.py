@@ -18,6 +18,10 @@ MODEL_SPECS = {
     "da_terminal_value_margin_eur_mwh": 0.0,
     "da_terminal_value_min_eur_mwh": 0.0,
     "da_terminal_value_max_eur_mwh": 500.0,
+    "terminal_value_mode": "terminal_recovery_aware",
+    "terminal_value_buy_quantile": 0.70,
+    "terminal_value_sell_quantile": 0.30,
+    "terminal_value_require_recovery_cost_for_shortfall": True,
     # Hard headroom assumptions for reserve/activation deliverability (hours).
     # 0.5h means full awarded MW must be energetically deliverable for 30 minutes.
     "reserve_activation_headroom_h": 0.5,
