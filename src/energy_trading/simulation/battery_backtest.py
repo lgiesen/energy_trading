@@ -942,6 +942,13 @@ SETTLEMENT_NUMERIC_COLS = (
     "terminal_repair_safety_margin_mwh",
     "window_has_actionable_terminal_repair",
     "terminal_constraint_deferred_to_explicit_repair",
+    "fixed_obligation_replay_pass",
+    "fixed_obligation_safety_shortfall_mwh",
+    "fixed_obligation_physical_shortfall_mwh",
+    "fixed_obligation_id_repair_scheduled_mwh",
+    "locked_bcm_safety_buffer_shortfall",
+    "locked_bcm_physical_headroom_shortfall",
+    "terminal_recovery_unreachable",
     "protected_recovery_actual_violation_mwh",
     "protected_recovery_obligation_active",
     "protected_soc_recovery_invalid_without_violation",
@@ -7876,9 +7883,18 @@ class BatteryBacktester:
             "fixed_obligation_replay_pass": 1.0,
             "fixed_obligation_infeasible_at": "",
             "fixed_obligation_infeasible_driver": "none",
+            "fixed_obligation_driver": "none",
             "fixed_obligation_replay_min_soc_mwh": float(current_soc_mwh),
             "fixed_obligation_replay_max_soc_mwh": float(current_soc_mwh),
             "fixed_obligation_replay_final_soc_mwh": float(current_soc_mwh),
+            "fixed_obligation_safety_shortfall_mwh": 0.0,
+            "fixed_obligation_physical_shortfall_mwh": 0.0,
+            "fixed_obligation_safety_pos_shortfall_mwh": 0.0,
+            "fixed_obligation_safety_neg_shortfall_mwh": 0.0,
+            "fixed_obligation_id_repair_scheduled_mwh": 0.0,
+            "fixed_obligation_repair_target_ts_utc": "",
+            "locked_bcm_safety_buffer_shortfall": 0.0,
+            "locked_bcm_physical_headroom_shortfall": 0.0,
             "fixed_da_buy_exceeds_headroom": 0.0,
             "fixed_da_sell_below_soc_min": 0.0,
             "reserve_obligation_conflicts_with_da_lockbook": 0.0,
@@ -7920,6 +7936,7 @@ class BatteryBacktester:
                 diag["fixed_obligation_replay_pass"] = 0.0
                 diag["fixed_obligation_infeasible_at"] = pd.Timestamp(ts).isoformat()
                 diag["fixed_obligation_infeasible_driver"] = str(driver)
+                diag["fixed_obligation_driver"] = str(driver)
                 diag[str(driver)] = 1.0
 
         soc = float(current_soc_mwh)
@@ -7941,11 +7958,47 @@ class BatteryBacktester:
 
             reserve_pos_need = max(0.0, float(ob_pos)) * float(self.reserve_activation_headroom_h) / max(float(self.eta_out), 1e-12)
             reserve_neg_need = max(0.0, float(ob_neg)) * float(self.reserve_activation_headroom_h) * max(float(self.eta_in), 1e-12)
-            if (
-                reserve_pos_need > max(0.0, soc - float(self.soc_min)) + float(tol_mwh)
-                or reserve_neg_need > max(0.0, float(self.soc_max) - soc) + float(tol_mwh)
-            ):
-                _fail(ts, "reserve_obligation_conflicts_with_da_lockbook")
+            reserve_pos_safety_need = reserve_pos_need + (
+                float(self.reserve_headroom_safety_mwh) + float(self.reserve_soc_projection_safety_mwh)
+                if float(ob_pos) > 1e-12
+                else 0.0
+            )
+            reserve_neg_safety_need = reserve_neg_need + (
+                float(self.reserve_headroom_safety_mwh) + float(self.reserve_soc_projection_safety_mwh)
+                if float(ob_neg) > 1e-12
+                else 0.0
+            )
+            avail_pos = max(0.0, soc - float(self.soc_min))
+            avail_neg = max(0.0, float(self.soc_max) - soc)
+            physical_pos_shortfall = max(0.0, reserve_pos_need - avail_pos)
+            physical_neg_shortfall = max(0.0, reserve_neg_need - avail_neg)
+            safety_pos_shortfall = max(0.0, reserve_pos_safety_need - avail_pos)
+            safety_neg_shortfall = max(0.0, reserve_neg_safety_need - avail_neg)
+            physical_shortfall = max(physical_pos_shortfall, physical_neg_shortfall)
+            safety_shortfall = max(safety_pos_shortfall, safety_neg_shortfall)
+            if physical_shortfall > float(tol_mwh):
+                diag["fixed_obligation_physical_shortfall_mwh"] = max(
+                    float(diag["fixed_obligation_physical_shortfall_mwh"]),
+                    float(physical_shortfall),
+                )
+                diag["reserve_obligation_conflicts_with_da_lockbook"] = 1.0
+                _fail(ts, "locked_bcm_physical_headroom_shortfall")
+            elif safety_shortfall > float(tol_mwh):
+                diag["fixed_obligation_safety_shortfall_mwh"] = max(
+                    float(diag["fixed_obligation_safety_shortfall_mwh"]),
+                    float(safety_shortfall),
+                )
+                diag["fixed_obligation_safety_pos_shortfall_mwh"] = max(
+                    float(diag["fixed_obligation_safety_pos_shortfall_mwh"]),
+                    float(safety_pos_shortfall),
+                )
+                diag["fixed_obligation_safety_neg_shortfall_mwh"] = max(
+                    float(diag["fixed_obligation_safety_neg_shortfall_mwh"]),
+                    float(safety_neg_shortfall),
+                )
+                if not str(diag.get("fixed_obligation_repair_target_ts_utc", "")).strip():
+                    diag["fixed_obligation_repair_target_ts_utc"] = pd.Timestamp(ts).isoformat()
+                _fail(ts, "locked_bcm_safety_buffer_shortfall")
 
             rate_pos = _row_float(row, colmap.pred_afrr_activation_rate_pos)
             rate_neg = _row_float(row, colmap.pred_afrr_activation_rate_neg)
@@ -7985,6 +8038,139 @@ class BatteryBacktester:
         diag["fixed_obligation_replay_max_soc_mwh"] = float(max_soc)
         diag["fixed_obligation_replay_final_soc_mwh"] = float(soc)
         return diag
+
+    def _plan_fixed_obligation_presolve_id_repair(
+        self,
+        *,
+        current_soc_mwh: float,
+        fixed_obligation_diag: Mapping[str, float | str],
+        existing_id_charge_mw: float = 0.0,
+        existing_id_discharge_mw: float = 0.0,
+        allow_technical_id_repair: bool = True,
+        current_timestamp_utc: pd.Timestamp | None = None,
+    ) -> tuple[float, float, float, dict[str, float | str]]:
+        """Schedule explicit technical ID before the MILP for locked reserve safety gaps.
+
+        Generic ID variables stay disabled in ``technical_repair`` mode. This
+        helper only bridges the handoff gap where a locked BCM reserve is
+        physically feasible but the next rolling MILP's stricter safety buffer
+        would otherwise be infeasible.
+        """
+        diag: dict[str, float | str] = {
+            "fixed_obligation_id_repair_scheduled_mwh": 0.0,
+            "fixed_obligation_id_repair_scheduled_internal_mwh": 0.0,
+            "fixed_obligation_id_repair_scheduled_grid_mwh": 0.0,
+            "fixed_obligation_id_repair_scheduled_direction": "none",
+            "fixed_obligation_id_repair_reason": "none",
+            "fixed_obligation_id_repair_feasible": 0.0,
+            "fixed_obligation_id_repair_blocked_reason": "none",
+            "fixed_obligation_soc_after_id_repair_mwh": float(current_soc_mwh),
+        }
+        driver = str(
+            fixed_obligation_diag.get(
+                "fixed_obligation_driver",
+                fixed_obligation_diag.get("fixed_obligation_infeasible_driver", "none"),
+            )
+        )
+        physical_shortfall = float(
+            pd.to_numeric(
+                pd.Series([fixed_obligation_diag.get("fixed_obligation_physical_shortfall_mwh", 0.0)]),
+                errors="coerce",
+            ).fillna(0.0).iloc[0]
+        )
+        if (
+            not bool(allow_technical_id_repair)
+            or driver != "locked_bcm_safety_buffer_shortfall"
+            or physical_shortfall > 1e-9
+        ):
+            if not bool(allow_technical_id_repair):
+                diag["fixed_obligation_id_repair_blocked_reason"] = "technical_id_repair_disabled"
+            elif physical_shortfall > 1e-9:
+                diag["fixed_obligation_id_repair_blocked_reason"] = "physical_shortfall_not_repairable_as_safety"
+            else:
+                diag["fixed_obligation_id_repair_blocked_reason"] = "no_safety_buffer_shortfall"
+            return 0.0, 0.0, float(current_soc_mwh), diag
+
+        target_ts = pd.to_datetime(
+            fixed_obligation_diag.get("fixed_obligation_repair_target_ts_utc", ""),
+            utc=True,
+            errors="coerce",
+        )
+        current_ts = pd.to_datetime(current_timestamp_utc, utc=True, errors="coerce")
+        if pd.notna(target_ts) and pd.notna(current_ts) and pd.Timestamp(target_ts) <= pd.Timestamp(current_ts):
+            diag["fixed_obligation_id_repair_blocked_reason"] = "safety_shortfall_at_current_hour_not_presolvable"
+            return 0.0, 0.0, float(current_soc_mwh), diag
+
+        pos_shortfall = float(
+            pd.to_numeric(
+                pd.Series([fixed_obligation_diag.get("fixed_obligation_safety_pos_shortfall_mwh", 0.0)]),
+                errors="coerce",
+            ).fillna(0.0).iloc[0]
+        )
+        neg_shortfall = float(
+            pd.to_numeric(
+                pd.Series([fixed_obligation_diag.get("fixed_obligation_safety_neg_shortfall_mwh", 0.0)]),
+                errors="coerce",
+            ).fillna(0.0).iloc[0]
+        )
+        existing_charge = max(0.0, float(existing_id_charge_mw))
+        existing_discharge = max(0.0, float(existing_id_discharge_mw))
+        residual_charge_mw = max(0.0, float(self.p_max_mw) - existing_charge)
+        residual_discharge_mw = max(0.0, float(self.p_max_mw) - existing_discharge)
+        if pos_shortfall >= neg_shortfall and pos_shortfall > 1e-9:
+            room_grid_mwh = max(0.0, float(self.soc_max) - float(current_soc_mwh)) / max(float(self.eta_in), 1e-12)
+            needed_grid_mwh = float(pos_shortfall) / max(float(self.eta_in), 1e-12)
+            scheduled_grid_mwh = min(
+                needed_grid_mwh,
+                residual_charge_mw * max(float(self.dt_h), 1e-12),
+                room_grid_mwh,
+            )
+            if scheduled_grid_mwh + 1e-9 < needed_grid_mwh:
+                diag["fixed_obligation_id_repair_blocked_reason"] = "insufficient_charge_headroom_for_safety_repair"
+                return 0.0, 0.0, float(current_soc_mwh), diag
+            scheduled_mw = scheduled_grid_mwh / max(float(self.dt_h), 1e-12)
+            internal_gain = scheduled_grid_mwh * max(float(self.eta_in), 1e-12)
+            repaired_soc = min(float(self.soc_max), float(current_soc_mwh) + internal_gain)
+            diag.update(
+                {
+                    "fixed_obligation_id_repair_scheduled_mwh": float(scheduled_grid_mwh),
+                    "fixed_obligation_id_repair_scheduled_internal_mwh": float(internal_gain),
+                    "fixed_obligation_id_repair_scheduled_grid_mwh": float(scheduled_grid_mwh),
+                    "fixed_obligation_id_repair_scheduled_direction": "charge",
+                    "fixed_obligation_id_repair_reason": "reserve_obligation_recovery",
+                    "fixed_obligation_id_repair_feasible": 1.0,
+                    "fixed_obligation_soc_after_id_repair_mwh": float(repaired_soc),
+                }
+            )
+            return float(scheduled_mw), 0.0, float(repaired_soc), diag
+        if neg_shortfall > 1e-9:
+            room_grid_mwh = max(0.0, float(current_soc_mwh) - float(self.soc_min)) * max(float(self.eta_out), 1e-12)
+            needed_grid_mwh = float(neg_shortfall) * max(float(self.eta_out), 1e-12)
+            scheduled_grid_mwh = min(
+                needed_grid_mwh,
+                residual_discharge_mw * max(float(self.dt_h), 1e-12),
+                room_grid_mwh,
+            )
+            if scheduled_grid_mwh + 1e-9 < needed_grid_mwh:
+                diag["fixed_obligation_id_repair_blocked_reason"] = "insufficient_discharge_footroom_for_safety_repair"
+                return 0.0, 0.0, float(current_soc_mwh), diag
+            scheduled_mw = scheduled_grid_mwh / max(float(self.dt_h), 1e-12)
+            internal_drop = scheduled_grid_mwh / max(float(self.eta_out), 1e-12)
+            repaired_soc = max(float(self.soc_min), float(current_soc_mwh) - internal_drop)
+            diag.update(
+                {
+                    "fixed_obligation_id_repair_scheduled_mwh": float(scheduled_grid_mwh),
+                    "fixed_obligation_id_repair_scheduled_internal_mwh": float(internal_drop),
+                    "fixed_obligation_id_repair_scheduled_grid_mwh": float(scheduled_grid_mwh),
+                    "fixed_obligation_id_repair_scheduled_direction": "discharge",
+                    "fixed_obligation_id_repair_reason": "reserve_obligation_recovery",
+                    "fixed_obligation_id_repair_feasible": 1.0,
+                    "fixed_obligation_soc_after_id_repair_mwh": float(repaired_soc),
+                }
+            )
+            return 0.0, float(scheduled_mw), float(repaired_soc), diag
+        diag["fixed_obligation_id_repair_blocked_reason"] = "zero_safety_shortfall"
+        return 0.0, 0.0, float(current_soc_mwh), diag
 
     def _cap_da_limit_schedule_for_independent_clearing(
         self,
@@ -20910,9 +21096,48 @@ class BatteryBacktester:
                 if pd.notna(snapshot_current_ts)
                 else {},
                 enforce_final_soc_mwh=(
-                    float(self.soc_target_end) if bool(rolling_window_contains_global_end) else None
+                    float(self.soc_target_end)
+                    if bool(rolling_window_contains_global_end)
+                    and not bool(window_has_actionable_terminal_repair)
+                    else None
                 ),
             )
+            fixed_obligation_repair_diag: dict[str, float | str] = {}
+            if (
+                str(fixed_obligation_diag.get("fixed_obligation_driver", "")).strip()
+                == "locked_bcm_safety_buffer_shortfall"
+                and bool(perms.allow_id_technical_repair)
+            ):
+                repair_ch_mw, repair_dis_mw, repaired_soc, fixed_obligation_repair_diag = (
+                    self._plan_fixed_obligation_presolve_id_repair(
+                        current_soc_mwh=float(soc),
+                        fixed_obligation_diag=fixed_obligation_diag,
+                        existing_id_charge_mw=float(pending_id_charge_mw),
+                        existing_id_discharge_mw=float(pending_id_discharge_mw),
+                        allow_technical_id_repair=bool(perms.allow_id_technical_repair),
+                        current_timestamp_utc=snapshot_current_ts,
+                    )
+                )
+                if float(fixed_obligation_repair_diag.get("fixed_obligation_id_repair_feasible", 0.0)) > 0.5:
+                    pending_id_charge_mw += float(repair_ch_mw)
+                    pending_id_discharge_mw += float(repair_dis_mw)
+                    pending_id_reason = str(
+                        fixed_obligation_repair_diag.get(
+                            "fixed_obligation_id_repair_reason",
+                            "reserve_obligation_recovery",
+                        )
+                    )
+                    soc = float(repaired_soc)
+                    fixed_obligation_diag = self._replay_fixed_obligations_diagnostic(
+                        current_soc_mwh=float(soc),
+                        future_rows=window,
+                        colmap=colmap,
+                        da_lockbook=da_lockbook,
+                        fixed_reserve_obligation=fixed_reserve_obligation,
+                        scheduled_id_by_ts={},
+                        enforce_final_soc_mwh=None,
+                    )
+                fixed_obligation_diag.update(fixed_obligation_repair_diag)
 
             def _apply_retry_factor_to_new_obligations(
                 obligations: dict[pd.Timestamp, tuple[float, float]],

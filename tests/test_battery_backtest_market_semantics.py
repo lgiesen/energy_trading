@@ -12203,6 +12203,121 @@ def test_fixed_obligation_replay_diagnostic_classifies_da_buy_headroom_conflict(
     assert float(diag["fixed_da_buy_exceeds_headroom"]) == pytest.approx(1.0)
 
 
+def test_fixed_obligation_replay_classifies_locked_bcm_safety_buffer_shortfall() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.25
+    bt.reserve_soc_projection_safety_mwh = 0.5
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-23T09:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+
+    diag = bt._replay_fixed_obligations_diagnostic(
+        current_soc_mwh=6.3883,
+        future_rows=rows,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_obligation={ts: (7.0, 0.0)},
+        scheduled_id_by_ts={},
+        enforce_final_soc_mwh=None,
+    )
+
+    assert float(diag["fixed_obligation_replay_pass"]) == pytest.approx(0.0)
+    assert str(diag["fixed_obligation_driver"]) == "locked_bcm_safety_buffer_shortfall"
+    assert float(diag["locked_bcm_safety_buffer_shortfall"]) == pytest.approx(1.0)
+    assert float(diag["fixed_obligation_physical_shortfall_mwh"]) == pytest.approx(0.0)
+    assert float(diag["fixed_obligation_safety_shortfall_mwh"]) > 0.0
+
+
+def test_fixed_obligation_presolve_repair_schedules_id_for_locked_bcm_safety_shortfall() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.25
+    bt.reserve_soc_projection_safety_mwh = 0.5
+    col = BacktestColumnMap()
+    current_ts = pd.Timestamp("2026-01-23T08:00:00Z")
+    target_ts = pd.Timestamp("2026-01-23T09:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [target_ts])
+    diag = bt._replay_fixed_obligations_diagnostic(
+        current_soc_mwh=6.3883,
+        future_rows=rows,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_obligation={target_ts: (7.0, 0.0)},
+        scheduled_id_by_ts={},
+        enforce_final_soc_mwh=None,
+    )
+
+    ch_mw, dis_mw, repaired_soc, repair_diag = bt._plan_fixed_obligation_presolve_id_repair(
+        current_soc_mwh=6.3883,
+        fixed_obligation_diag=diag,
+        existing_id_charge_mw=0.0,
+        existing_id_discharge_mw=0.0,
+        allow_technical_id_repair=True,
+        current_timestamp_utc=current_ts,
+    )
+
+    assert ch_mw > 0.0
+    assert dis_mw == pytest.approx(0.0)
+    assert repaired_soc > 6.3883
+    assert float(repair_diag["fixed_obligation_id_repair_feasible"]) == pytest.approx(1.0)
+    assert str(repair_diag["fixed_obligation_id_repair_reason"]) == "reserve_obligation_recovery"
+
+
+def test_fixed_obligation_replay_classifies_locked_bcm_physical_headroom_shortfall() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.25
+    bt.reserve_soc_projection_safety_mwh = 0.5
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-23T09:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+
+    diag = bt._replay_fixed_obligations_diagnostic(
+        current_soc_mwh=5.0,
+        future_rows=rows,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_obligation={ts: (7.0, 0.0)},
+        scheduled_id_by_ts={},
+        enforce_final_soc_mwh=None,
+    )
+    ch_mw, dis_mw, repaired_soc, repair_diag = bt._plan_fixed_obligation_presolve_id_repair(
+        current_soc_mwh=5.0,
+        fixed_obligation_diag=diag,
+        existing_id_charge_mw=0.0,
+        existing_id_discharge_mw=0.0,
+        allow_technical_id_repair=True,
+        current_timestamp_utc=pd.Timestamp("2026-01-23T08:00:00Z"),
+    )
+
+    assert float(diag["fixed_obligation_replay_pass"]) == pytest.approx(0.0)
+    assert str(diag["fixed_obligation_driver"]) == "locked_bcm_physical_headroom_shortfall"
+    assert float(diag["locked_bcm_physical_headroom_shortfall"]) == pytest.approx(1.0)
+    assert float(diag["fixed_obligation_physical_shortfall_mwh"]) > 0.0
+    assert ch_mw == pytest.approx(0.0)
+    assert dis_mw == pytest.approx(0.0)
+    assert repaired_soc == pytest.approx(5.0)
+    assert str(repair_diag["fixed_obligation_id_repair_blocked_reason"]) == (
+        "physical_shortfall_not_repairable_as_safety"
+    )
+
+
 def test_da_actual_independent_limit_clearing_rejects_uncleared_buy() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)

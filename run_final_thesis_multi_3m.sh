@@ -20,10 +20,10 @@ set -Eeuo pipefail
 #   out-dir because aggregate files inside an out-dir are overwritten by design.
 #
 # Server usage:
-#   chmod +x run_final_thesis_multi_3m.sh
-#   nohup ./run_final_thesis_multi_3m.sh \
-#     > artifacts/simulation_runs/final_thesis_multi_3m_launcher.out 2>&1 &
-#   tail -f artifacts/simulation_runs/final_thesis_multi_3m_launcher.out
+chmod +x run_final_thesis_multi_3m.sh
+nohup ./run_final_thesis_multi_3m.sh \
+  > artifacts/simulation_runs/final_thesis_multi_3m_launcher.out 2>&1 &
+tail -f artifacts/simulation_runs/final_thesis_multi_3m_launcher.out
 #
 # Resume a specific existing launcher root:
 #   RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_3m_YYYYmmddTHHMMSSZ \
@@ -38,8 +38,8 @@ set -Eeuo pipefail
 
 MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
 
-START="2025-03-01T00:00:00Z"
-END="2025-06-01T00:00:00Z"
+START="2025-04-01T00:00:00Z"
+END="2025-07-01T00:00:00Z"
 SPLIT="test"
 STRATEGY="multi"
 
