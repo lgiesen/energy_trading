@@ -965,6 +965,14 @@ SETTLEMENT_NUMERIC_COLS = (
     "fixed_obligation_safety_shortfall_mwh",
     "fixed_obligation_physical_shortfall_mwh",
     "fixed_obligation_id_repair_scheduled_mwh",
+    "fixed_obligation_reserve_pos_mw_sum",
+    "fixed_obligation_reserve_neg_mw_sum",
+    "fixed_obligation_reserve_pos_mw_max",
+    "fixed_obligation_reserve_neg_mw_max",
+    "terminal_presolve_repair_attempted",
+    "terminal_presolve_repair_scheduled_mwh",
+    "terminal_presolve_repair_feasible",
+    "terminal_repair_scheduled_mwh",
     "locked_bcm_safety_buffer_shortfall",
     "locked_bcm_physical_headroom_shortfall",
     "terminal_recovery_unreachable",
@@ -1007,6 +1015,7 @@ SETTLEMENT_METADATA_COLS = (
     "optimizer_row_id_recourse_reason",
     "pending_id_recourse_reason",
     "terminal_soc_not_recoverable_reason",
+    "terminal_presolve_repair_reason",
     "terminal_day_upper_soc_relief_reason",
 )
 
@@ -4117,11 +4126,6 @@ class BatteryBacktester:
                 hourly["accepted_path_infeasible_debug_dump"],
                 errors="coerce",
             ).fillna(0.0).gt(0.5)
-        if "accepted_path_infeasible_debug_dump_count" in hourly.columns:
-            mask |= pd.to_numeric(
-                hourly["accepted_path_infeasible_debug_dump_count"],
-                errors="coerce",
-            ).fillna(0.0).gt(0.5)
         ts = pd.to_datetime(hourly.loc[mask, timestamp_col], utc=True, errors="coerce").dropna()
         if ts.empty:
             return ""
@@ -6105,7 +6109,43 @@ class BatteryBacktester:
             locked_sell_mwh = float(sell_mw) * float(self.dt_h)
             row_has_lock = float((locked_buy_mwh + locked_sell_mwh) > 1e-12)
             prior_candidate_mwh = _prior_candidate_mwh(out_row)
-            row_lost_after_postlock = bool(prior_candidate_mwh > 1e-9 and row_has_lock <= 0.5)
+            postlock_candidate_mwh = float(
+                (
+                    _row_float(out_row, "da_postlock_candidate_buy_mw")
+                    + _row_float(out_row, "da_postlock_candidate_sell_mw")
+                )
+                * float(self.dt_h)
+            )
+            postlock_selected_for_row = str(
+                out_row.get(
+                    "da_postlock_selected_after_future_check",
+                    out_row.get("final_selected_incumbent", out_row.get("selected_incumbent", "")),
+                )
+                or ""
+            ).strip().lower() in {"candidate", "optimized"}
+            final_incumbent_before_lockbook = str(
+                out_row.get("final_selected_incumbent", out_row.get("selected_incumbent", ""))
+                or ""
+            ).strip().lower()
+            economic_no_trade_reason = str(
+                out_row.get(
+                    "candidate_rejection_reason",
+                    out_row.get("selection_reason", out_row.get("da_final_selection_reason", "")),
+                )
+                or ""
+            ).strip().lower()
+            economic_no_trade = final_incumbent_before_lockbook == "no_trade" or economic_no_trade_reason in {
+                "candidate_pnl_below_no_trade",
+                "no_trade_incumbent_selected",
+                "locked_candidate_pnl_below_no_trade",
+                "accepted_lockbook_pnl_below_no_trade",
+            }
+            row_lost_after_postlock = bool(
+                postlock_candidate_mwh > 1e-9
+                and postlock_selected_for_row
+                and row_has_lock <= 0.5
+                and not economic_no_trade
+            )
             row_zero_reason = (
                 _specific_zero_reason(out_row, row_lost_after_postlock=row_lost_after_postlock)
                 if accepted_energy_mwh <= 1e-12 or row_lost_after_postlock
@@ -6236,12 +6276,7 @@ class BatteryBacktester:
                         else out_row.get("da_volume_loss_reason", "none")
                     ),
                     "da_zeroed_all_bids": float(accepted_energy_mwh <= 1e-12),
-                    "da_handoff_lost_postlock_candidate": float(
-                        max(
-                            _row_float(out_row, "da_handoff_lost_postlock_candidate"),
-                            float(row_lost_after_postlock),
-                        )
-                    ),
+                    "da_handoff_lost_postlock_candidate": float(row_lost_after_postlock),
                     "da_handoff_loss_explained_by_market_rounding": float(
                         max(
                             _row_float(out_row, "da_handoff_loss_explained_by_market_rounding"),
@@ -6251,7 +6286,11 @@ class BatteryBacktester:
                     "da_handoff_lost_postlock_candidate_reason": (
                         row_zero_reason
                         if row_lost_after_postlock
-                        else str(out_row.get("da_handoff_lost_postlock_candidate_reason", "none") or "none")
+                        else (
+                            "none"
+                            if economic_no_trade
+                            else str(out_row.get("da_handoff_lost_postlock_candidate_reason", "none") or "none")
+                        )
                     ),
                     "selected_lockable_deprecated": 0.0,
                     "selected_lockable_deprecated_reason": "equals_accepted_lockbook_replay_after_rounding",
@@ -8655,6 +8694,7 @@ class BatteryBacktester:
             "da_settlement_equiv_replay_bem_neg_mw": 0.0,
             "da_settlement_equiv_replay_reserve_pos_mw": 0.0,
             "da_settlement_equiv_replay_reserve_neg_mw": 0.0,
+            "da_settlement_equiv_replay_fallback_contaminated_anchor": 0.0,
             "da_settlement_equiv_replay_act_pos_rate": 0.0,
             "da_settlement_equiv_replay_act_neg_rate": 0.0,
             "da_settlement_equiv_replay_rejected": 0.0,
@@ -8971,6 +9011,10 @@ class BatteryBacktester:
             "fixed_obligation_safety_pos_shortfall_mwh": 0.0,
             "fixed_obligation_safety_neg_shortfall_mwh": 0.0,
             "fixed_obligation_id_repair_scheduled_mwh": 0.0,
+            "fixed_obligation_reserve_pos_mw_sum": 0.0,
+            "fixed_obligation_reserve_neg_mw_sum": 0.0,
+            "fixed_obligation_reserve_pos_mw_max": 0.0,
+            "fixed_obligation_reserve_neg_mw_max": 0.0,
             "rolling_window_aux_soc_repair_scheduled_mwh": 0.0,
             "fixed_obligation_repair_target_ts_utc": "",
             "locked_bcm_safety_buffer_shortfall": 0.0,
@@ -9027,7 +9071,53 @@ class BatteryBacktester:
         for _, row in rows.iterrows():
             ts = pd.Timestamp(row[colmap.timestamp])
             ch_mw, dis_mw = self._normalize_da_bid(*lockbook.get(ts, (0.0, 0.0)))
-            ob_pos, ob_neg = reserve_book.get(ts, (0.0, 0.0))
+            ob_pos, ob_neg = reserve_book.get(ts, (np.nan, np.nan))
+            row_ob_pos = _row_float(
+                row,
+                "fixed_reserve_obligation_pos_mw",
+                "real_fixed_reserve_obligation_pos_mw",
+                "locked_bcm_capacity_pos_mw",
+                "real_locked_bcm_capacity_pos_mw",
+                "reserve_lockbook_pos_mw",
+                "real_locked_reserve_pos_mw",
+            )
+            row_ob_neg = _row_float(
+                row,
+                "fixed_reserve_obligation_neg_mw",
+                "real_fixed_reserve_obligation_neg_mw",
+                "locked_bcm_capacity_neg_mw",
+                "real_locked_bcm_capacity_neg_mw",
+                "reserve_lockbook_neg_mw",
+                "real_locked_reserve_neg_mw",
+            )
+            if not np.isfinite(float(ob_pos)) or not np.isfinite(float(ob_neg)):
+                # Use the same row-level fixed-obligation diagnostics as the
+                # MILP/hard-final debug path when the lockbook map is not
+                # populated for this replay scope.
+                ob_pos = row_ob_pos
+                ob_neg = row_ob_neg
+            else:
+                # Some debug paths expose a richer row-level fixed-obligation
+                # view than the sparse lockbook map. Use the per-timestamp max
+                # so replay cannot understate obligations that the MILP sees.
+                ob_pos = max(float(ob_pos), float(row_ob_pos))
+                ob_neg = max(float(ob_neg), float(row_ob_neg))
+            ob_pos = max(0.0, float(ob_pos))
+            ob_neg = max(0.0, float(ob_neg))
+            diag["fixed_obligation_reserve_pos_mw_sum"] = float(
+                diag["fixed_obligation_reserve_pos_mw_sum"]
+            ) + float(ob_pos)
+            diag["fixed_obligation_reserve_neg_mw_sum"] = float(
+                diag["fixed_obligation_reserve_neg_mw_sum"]
+            ) + float(ob_neg)
+            diag["fixed_obligation_reserve_pos_mw_max"] = max(
+                float(diag["fixed_obligation_reserve_pos_mw_max"]),
+                float(ob_pos),
+            )
+            diag["fixed_obligation_reserve_neg_mw_max"] = max(
+                float(diag["fixed_obligation_reserve_neg_mw_max"]),
+                float(ob_neg),
+            )
             id_ch_mw, id_dis_mw = scheduled_id.get(ts, (0.0, 0.0))
             buy_mwh = max(0.0, float(ch_mw)) * float(self.dt_h)
             sell_mwh = max(0.0, float(dis_mw)) * float(self.dt_h)
@@ -21776,6 +21866,7 @@ class BatteryBacktester:
         terminal_recovery_ledger: list[dict[str, object]] = []
         reopt_restart_done: set[pd.Timestamp] = set()
         asof_right_cache: dict[tuple[int, str], dict[int, pd.DataFrame]] = {}
+        accepted_path_fallback_contaminated = False
         i = 0
         progress_start = time.monotonic()
         progress_last_log = progress_start
@@ -22765,6 +22856,90 @@ class BatteryBacktester:
                         enforce_final_soc_mwh=None,
                     )
                 fixed_obligation_diag.update(fixed_obligation_repair_diag)
+
+            terminal_presolve_repair_diag: dict[str, float | str] = {
+                "terminal_presolve_repair_attempted": 0.0,
+                "terminal_presolve_repair_scheduled_mwh": 0.0,
+                "terminal_presolve_repair_feasible": 0.0,
+                "terminal_presolve_repair_reason": "not_attempted",
+            }
+            if (
+                bool(rolling_window_contains_global_end)
+                and bool(window_has_actionable_terminal_repair)
+                and bool(perms.allow_id_technical_repair)
+                and float(fixed_obligation_diag.get("fixed_obligation_replay_pass", 1.0) or 0.0) > 0.5
+            ):
+                projected_final_without_terminal_id = float(
+                    fixed_obligation_diag.get("fixed_obligation_replay_final_soc_mwh", soc)
+                    or soc
+                )
+                terminal_shortfall = max(
+                    0.0,
+                    float(self.soc_target_end) - float(projected_final_without_terminal_id),
+                )
+                if terminal_shortfall > 1e-9:
+                    terminal_presolve_repair_diag["terminal_presolve_repair_attempted"] = 1.0
+                    residual_charge_mw = max(0.0, float(self.p_max_mw) - float(pending_id_charge_mw))
+                    terminal_repair_diag = self._schedule_terminal_id_recovery(
+                        projected_terminal_soc_without_new_id_mwh=float(projected_final_without_terminal_id),
+                        current_soc_mwh=float(soc),
+                        terminal_soc_target_mwh=float(self.soc_target_end),
+                        residual_charge_mw=float(residual_charge_mw),
+                        terminal_soc_safety_margin_mwh=0.0,
+                        terminal_repair_known_future_aux_mwh=0.0,
+                        terminal_repair_recovery_aux_mwh=0.0,
+                        terminal_repair_aux_without_recovery_mwh=0.0,
+                    )
+                    scheduled_grid_mwh = float(
+                        terminal_repair_diag.get("terminal_soc_id_recourse_scheduled_grid_mwh", 0.0)
+                        or 0.0
+                    )
+                    scheduled_internal_mwh = float(
+                        terminal_repair_diag.get("terminal_soc_id_recourse_scheduled_internal_mwh", 0.0)
+                        or 0.0
+                    )
+                    repair_feasible = (
+                        float(terminal_repair_diag.get("terminal_soc_recovery_feasible", 0.0) or 0.0) > 0.5
+                        and scheduled_grid_mwh > 1e-12
+                    )
+                    terminal_presolve_repair_diag.update(
+                        {
+                            **terminal_repair_diag,
+                            "terminal_presolve_repair_scheduled_mwh": float(scheduled_grid_mwh),
+                            "terminal_repair_scheduled_mwh": float(scheduled_grid_mwh),
+                            "terminal_presolve_repair_feasible": float(repair_feasible),
+                            "terminal_presolve_repair_reason": (
+                                "terminal_soc_recovery"
+                                if repair_feasible
+                                else str(
+                                    terminal_repair_diag.get(
+                                        "terminal_soc_not_recoverable_reason",
+                                        "terminal_recovery_unreachable",
+                                    )
+                                    or "terminal_recovery_unreachable"
+                                )
+                            ),
+                        }
+                    )
+                    if repair_feasible:
+                        pending_id_charge_mw += scheduled_grid_mwh / max(float(self.dt_h), 1e-12)
+                        pending_id_reason = "terminal_soc_recovery"
+                        soc = min(float(self.soc_max), float(soc) + scheduled_internal_mwh)
+                        fixed_obligation_diag = self._replay_fixed_obligations_diagnostic(
+                            current_soc_mwh=float(soc),
+                            future_rows=window,
+                            colmap=colmap,
+                            da_lockbook=da_lockbook,
+                            fixed_reserve_obligation=fixed_reserve_obligation,
+                            scheduled_id_by_ts={},
+                            enforce_final_soc_mwh=None,
+                        )
+                    else:
+                        fixed_obligation_diag["terminal_recovery_unreachable"] = 1.0
+                        fixed_obligation_diag["fixed_obligation_driver"] = "terminal_recovery_unreachable"
+                else:
+                    terminal_presolve_repair_diag["terminal_presolve_repair_reason"] = "no_terminal_shortfall"
+            fixed_obligation_diag.update(terminal_presolve_repair_diag)
 
             def _apply_retry_factor_to_new_obligations(
                 obligations: dict[pd.Timestamp, tuple[float, float]],
@@ -24083,9 +24258,8 @@ class BatteryBacktester:
                     "da_handoff_postlock_candidate_sell_mwh": float(postlock_candidate_sell_mwh_total),
                     "da_handoff_physical_check_input_buy_mwh": float(physical_check_input_buy_mwh_total),
                     "da_handoff_physical_check_input_sell_mwh": float(physical_check_input_sell_mwh_total),
-                    "da_handoff_lost_postlock_candidate": float(handoff_lost_postlock_candidate),
-                    "da_handoff_loss_explained_by_market_rounding": float(handoff_loss_explained_by_rounding),
-                    "da_handoff_lost_postlock_candidate_reason": (
+                    "da_gate_handoff_lost_postlock_candidate": float(handoff_lost_postlock_candidate),
+                    "da_gate_handoff_lost_postlock_candidate_reason": (
                         "market_rounding_zeroed_below_min"
                         if handoff_loss_explained_by_rounding > 0.5
                         else (
@@ -24094,6 +24268,9 @@ class BatteryBacktester:
                             else "none"
                         )
                     ),
+                    "da_handoff_loss_explained_by_market_rounding": float(handoff_loss_explained_by_rounding),
+                    "da_handoff_lost_postlock_candidate": 0.0,
+                    "da_handoff_lost_postlock_candidate_reason": "none",
                 }
                 if handoff_diag:
                     da_audit_rows = [{**dict(row), **handoff_diag} for row in da_audit_rows]
@@ -24540,6 +24717,16 @@ class BatteryBacktester:
                         scheduled_id_by_ts=scheduled_id_for_da_replay,
                     )
                 )
+                opt_code_for_da_lock = str(optimization_status_code or "").strip().lower()
+                fallback_for_da_lock = str(optimization_fallback or "").strip().lower()
+                da_lockbook_write_fallback_contaminated = bool(
+                    accepted_path_fallback_contaminated
+                    or fallback_for_da_lock not in {"", "none"}
+                    or (
+                        opt_code_for_da_lock
+                        not in {"", "none", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"}
+                    )
+                )
                 stale_anchor_requires_replay = (
                     float(da_prelock_soc_anchor_diag.get("da_prelock_anchor_stale_state_detected", 0.0) or 0.0)
                     > 0.5
@@ -24549,7 +24736,19 @@ class BatteryBacktester:
                     for ts in accepted_da
                     if pd.Timestamp(ts) not in settlement_equiv_by_ts
                 ]
-                if stale_anchor_requires_replay and missing_settlement_equiv_proof:
+                if accepted_da and da_lockbook_write_fallback_contaminated:
+                    rejected_ts = sorted(pd.Timestamp(ts) for ts in accepted_da)[0]
+                    accepted_da = {}
+                    settlement_equiv_diag.update(
+                        {
+                            "da_settlement_equiv_replay_pass": 0.0,
+                            "da_settlement_equiv_replay_rejected": 1.0,
+                            "da_settlement_equiv_replay_delivery_ts_utc": rejected_ts.isoformat(),
+                            "da_settlement_equiv_replay_fallback_contaminated_anchor": 1.0,
+                            "da_settlement_equiv_replay_reason": "stale_prelock_anchor_not_reportable",
+                        }
+                    )
+                elif stale_anchor_requires_replay and missing_settlement_equiv_proof:
                     rejected_ts = sorted(missing_settlement_equiv_proof)[0]
                     accepted_da = {}
                     settlement_equiv_diag.update(
@@ -24557,6 +24756,7 @@ class BatteryBacktester:
                             "da_settlement_equiv_replay_pass": 0.0,
                             "da_settlement_equiv_replay_rejected": 1.0,
                             "da_settlement_equiv_replay_delivery_ts_utc": rejected_ts.isoformat(),
+                            "da_settlement_equiv_replay_fallback_contaminated_anchor": 0.0,
                             "da_settlement_equiv_replay_reason": "stale_prelock_anchor_not_reportable",
                         }
                     )
@@ -25064,6 +25264,7 @@ class BatteryBacktester:
                 "da_precommit_da_settlement_equiv_replay_bem_neg_mw",
                 "da_precommit_da_settlement_equiv_replay_reserve_pos_mw",
                 "da_precommit_da_settlement_equiv_replay_reserve_neg_mw",
+                "da_precommit_da_settlement_equiv_replay_fallback_contaminated_anchor",
                 "da_precommit_da_settlement_equiv_replay_act_pos_rate",
                 "da_precommit_da_settlement_equiv_replay_act_neg_rate",
                 "da_precommit_da_settlement_equiv_replay_rejected",
@@ -25081,6 +25282,8 @@ class BatteryBacktester:
                 "da_precommit_da_handoff_postlock_candidate_sell_mwh",
                 "da_precommit_da_handoff_physical_check_input_buy_mwh",
                 "da_precommit_da_handoff_physical_check_input_sell_mwh",
+                "da_precommit_da_gate_handoff_lost_postlock_candidate",
+                "da_precommit_da_gate_handoff_lost_postlock_candidate_reason",
                 "da_precommit_da_handoff_lost_postlock_candidate",
                 "da_precommit_da_handoff_loss_explained_by_market_rounding",
                 "da_precommit_da_handoff_lost_postlock_candidate_reason",
@@ -25544,6 +25747,7 @@ class BatteryBacktester:
                 "da_settlement_equiv_replay_bem_neg_mw": "da_precommit_da_settlement_equiv_replay_bem_neg_mw",
                 "da_settlement_equiv_replay_reserve_pos_mw": "da_precommit_da_settlement_equiv_replay_reserve_pos_mw",
                 "da_settlement_equiv_replay_reserve_neg_mw": "da_precommit_da_settlement_equiv_replay_reserve_neg_mw",
+                "da_settlement_equiv_replay_fallback_contaminated_anchor": "da_precommit_da_settlement_equiv_replay_fallback_contaminated_anchor",
                 "da_settlement_equiv_replay_act_pos_rate": "da_precommit_da_settlement_equiv_replay_act_pos_rate",
                 "da_settlement_equiv_replay_act_neg_rate": "da_precommit_da_settlement_equiv_replay_act_neg_rate",
                 "da_settlement_equiv_replay_rejected": "da_precommit_da_settlement_equiv_replay_rejected",
@@ -25623,6 +25827,8 @@ class BatteryBacktester:
                 "da_handoff_postlock_candidate_sell_mwh": "da_precommit_da_handoff_postlock_candidate_sell_mwh",
                 "da_handoff_physical_check_input_buy_mwh": "da_precommit_da_handoff_physical_check_input_buy_mwh",
                 "da_handoff_physical_check_input_sell_mwh": "da_precommit_da_handoff_physical_check_input_sell_mwh",
+                "da_gate_handoff_lost_postlock_candidate": "da_precommit_da_gate_handoff_lost_postlock_candidate",
+                "da_gate_handoff_lost_postlock_candidate_reason": "da_precommit_da_gate_handoff_lost_postlock_candidate_reason",
                 "da_handoff_lost_postlock_candidate": "da_precommit_da_handoff_lost_postlock_candidate",
                 "da_handoff_loss_explained_by_market_rounding": "da_precommit_da_handoff_loss_explained_by_market_rounding",
                 "da_handoff_lost_postlock_candidate_reason": "da_precommit_da_handoff_lost_postlock_candidate_reason",
@@ -26377,6 +26583,32 @@ class BatteryBacktester:
                 if overlap:
                     take = take.drop(columns=overlap)
                 take = pd.concat([take, clr_df], axis=1).copy()
+
+            take_fallback_used = (
+                pd.to_numeric(
+                    take.get("optimizer_fallback_used", pd.Series(0.0, index=take.index)),
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .gt(0.5)
+                .any()
+            )
+            take_opt_codes = (
+                take.get("optimization_error_code", pd.Series("ok", index=take.index))
+                .fillna("ok")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            take_has_failed_code = bool(
+                (
+                    ~take_opt_codes.isin(
+                        {"", "none", "ok", "ok_deterministic_noop", "ok_terminal_recovery_fallback"}
+                    )
+                ).any()
+            )
+            if bool(take_fallback_used) or bool(take_has_failed_code):
+                accepted_path_fallback_contaminated = True
 
             # Boundary: keep internal raw names, export plan_* names to dispatch output.
             take_for_output = take.copy()
@@ -33680,6 +33912,10 @@ class BatteryBacktester:
             "stale_prelock_anchor_not_reportable",
             "settlement_equiv_replay_rejected",
             "accepted_lockbook_row_zeroed_after_postlock",
+            "candidate_pnl_below_no_trade",
+            "no_trade_incumbent_selected",
+            "locked_candidate_pnl_below_no_trade",
+            "accepted_lockbook_pnl_below_no_trade",
         }
 
         def _reason_is_explained(reason: pd.Series) -> pd.Series:
@@ -33700,6 +33936,11 @@ class BatteryBacktester:
             (handoff_lost.gt(0.5) & (handoff_explained.gt(0.5) | explained_by_reason)).sum()
         )
         summary["da_handoff_lost_postlock_candidate_unexplained_count"] = float(unexplained_handoff.sum())
+        gate_handoff_lost = _summary_num_series(
+            "da_gate_handoff_lost_postlock_candidate",
+            "da_precommit_da_gate_handoff_lost_postlock_candidate",
+        )
+        summary["da_gate_handoff_lost_postlock_candidate_count"] = float(gate_handoff_lost.gt(0.5).sum())
         da_terminal_sensitive = _summary_num_series(
             "da_terminal_sensitive_window",
             "da_precommit_da_terminal_sensitive_window",

@@ -49,7 +49,9 @@ from scripts.run_battery_backtest import (  # noqa: E402
     _build_performance_metrics,
     _build_performance_paths_long,
     _build_performance_reconciliation_debug,
+    build_bem_activity_daily,
     _add_benchmark_comparison_columns,
+    _overview_invalid_reason,
     _validate_performance_metrics,
     _build_optimization_infeasibility_attribution,
     _can_skip_model_manifest_for_benchmark,
@@ -12642,6 +12644,51 @@ def test_da_accepted_lockbook_partial_gate_loss_exports_row_reason() -> None:
     assert float(lost_row["da_handoff_lost_postlock_candidate"]) == pytest.approx(1.0)
 
 
+def test_da_economic_no_trade_does_not_preserve_stale_handoff_loss_flag() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T23:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+    rows[col.pred_da_price] = [1_000.0]
+
+    accepted, audit = bt._apply_da_accepted_lockbook_replay_to_audit_rows(
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(ts),
+                "da_candidate_buy_mw": 0.0,
+                "da_candidate_sell_mw": 1.7,
+                "da_sized_candidate_buy_mw": 0.0,
+                "da_sized_candidate_sell_mw": 1.7,
+                "da_postlock_candidate_buy_mw": 0.0,
+                "da_postlock_candidate_sell_mw": 0.0,
+                "selected_incumbent": "no_trade",
+                "final_selected_incumbent": "no_trade",
+                "selection_reason": "no_trade_incumbent_selected",
+                "candidate_rejection_reason": "candidate_pnl_below_no_trade",
+                "candidate_minus_incumbent_eur": -48.55,
+                "da_handoff_lost_postlock_candidate": 1.0,
+                "da_handoff_lost_postlock_candidate_reason": "postlock_candidate_missing_before_physical_replay",
+                "da_zero_reason": "none",
+                "zero_reason": "none",
+            }
+        ],
+        accepted_da={},
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=ts,
+    )
+
+    assert accepted == {}
+    row = audit[0]
+    assert str(row["final_selected_incumbent"]) == "no_trade"
+    assert float(row["da_handoff_lost_postlock_candidate"]) == pytest.approx(0.0)
+    assert str(row["da_handoff_lost_postlock_candidate_reason"]) == "none"
+
+
 def test_da_prelock_guard_derates_buy_to_available_headroom() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -13488,6 +13535,37 @@ def test_da_lockbook_settlement_equiv_replay_includes_scheduled_bem_activation_b
     assert str(by_ts[ts1]["da_settlement_equiv_replay_reason"]) == "derated_buy_to_settlement_equivalent_headroom"
 
 
+def test_da_lockbook_settlement_equiv_replay_includes_scheduled_bem_activation_before_later_sell() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.da_bid_granularity_mw = 0.1
+    bt.da_min_bid_size_mw = 0.1
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-23T00:00:00Z")
+    ts1 = pd.Timestamp("2026-01-23T01:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts0, ts1])
+    rows.loc[rows[col.timestamp] == ts0, col.pred_afrr_activation_rate_pos] = 1.0
+
+    repaired, _, by_ts = bt._cap_da_lockbook_to_settlement_equivalent_replay(
+        accepted_da={ts1: (0.0, 3.5)},
+        current_soc_mwh=10.0,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        scheduled_id_by_ts={},
+        scheduled_bem_by_ts={ts0: (5.0, 0.0)},
+    )
+
+    assert float(by_ts[ts0]["da_settlement_equiv_replay_bem_pos_mw"]) == pytest.approx(5.0)
+    assert float(by_ts[ts1]["da_settlement_equiv_replay_soc_before_delivery_mwh"]) == pytest.approx(5.0)
+    assert float(by_ts[ts1]["da_settlement_equiv_replay_candidate_sell_mwh"]) == pytest.approx(3.5)
+    assert float(by_ts[ts1]["da_settlement_equiv_replay_max_feasible_sell_mwh"]) == pytest.approx(3.0)
+    assert repaired[ts1][1] == pytest.approx(3.0)
+    assert str(by_ts[ts1]["da_settlement_equiv_replay_reason"]) == "derated_sell_to_settlement_equivalent_footroom"
+
+
 def test_fixed_obligation_replay_diagnostic_classifies_da_buy_headroom_conflict() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -13542,6 +13620,68 @@ def test_fixed_obligation_replay_classifies_locked_bcm_safety_buffer_shortfall()
     assert float(diag["locked_bcm_safety_buffer_shortfall"]) == pytest.approx(1.0)
     assert float(diag["fixed_obligation_physical_shortfall_mwh"]) == pytest.approx(0.0)
     assert float(diag["fixed_obligation_safety_shortfall_mwh"]) > 0.0
+
+
+def test_fixed_obligation_replay_uses_row_level_bcm_lockbook_when_map_missing() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.25
+    bt.reserve_soc_projection_safety_mwh = 0.5
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-23T09:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+    rows["locked_bcm_capacity_neg_mw"] = [9.0]
+
+    diag = bt._replay_fixed_obligations_diagnostic(
+        current_soc_mwh=13.3,
+        future_rows=rows,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_obligation={},
+        scheduled_id_by_ts={},
+        enforce_final_soc_mwh=None,
+    )
+
+    assert float(diag["fixed_obligation_reserve_neg_mw_sum"]) == pytest.approx(9.0)
+    assert float(diag["fixed_obligation_reserve_neg_mw_max"]) == pytest.approx(9.0)
+    assert float(diag["fixed_obligation_replay_pass"]) == pytest.approx(0.0)
+    assert str(diag["fixed_obligation_driver"]) == "locked_bcm_safety_buffer_shortfall"
+
+
+def test_fixed_obligation_replay_uses_row_level_bcm_lockbook_when_map_understates_obligation() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.25
+    bt.reserve_soc_projection_safety_mwh = 0.5
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-23T09:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+    rows["fixed_reserve_obligation_neg_mw"] = [9.0]
+
+    diag = bt._replay_fixed_obligations_diagnostic(
+        current_soc_mwh=13.3,
+        future_rows=rows,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_obligation={ts: (0.0, 0.0)},
+        scheduled_id_by_ts={},
+        enforce_final_soc_mwh=None,
+    )
+
+    assert float(diag["fixed_obligation_reserve_neg_mw_sum"]) == pytest.approx(9.0)
+    assert float(diag["fixed_obligation_reserve_neg_mw_max"]) == pytest.approx(9.0)
+    assert float(diag["fixed_obligation_replay_pass"]) == pytest.approx(0.0)
+    assert str(diag["fixed_obligation_driver"]) == "locked_bcm_safety_buffer_shortfall"
 
 
 def test_fixed_obligation_presolve_repair_schedules_id_for_locked_bcm_safety_shortfall() -> None:
@@ -19287,7 +19427,7 @@ def test_overview_uses_active_path_validity_for_naive_only() -> None:
 
     assert fields["simulation_valid"] == 1.0
     assert fields["thesis_reportable"] == 1.0
-    assert fields["invalid_reason"] == ""
+    assert fields["invalid_reason"] == "none"
     assert fields["legacy_invalid_reason"] == "disabled_model_terminal_soc"
 
 
@@ -19308,7 +19448,7 @@ def test_overview_uses_active_path_validity_for_rhpf_only() -> None:
 
     assert fields["simulation_valid"] == 1.0
     assert fields["thesis_reportable"] == 1.0
-    assert fields["invalid_reason"] == ""
+    assert fields["invalid_reason"] == "none"
     assert fields["legacy_simulation_valid"] == 0.0
 
 
@@ -19329,6 +19469,63 @@ def test_overview_keeps_legacy_validity_for_model_modes() -> None:
     assert fields["simulation_valid"] == 0.0
     assert fields["thesis_reportable"] == 0.0
     assert fields["invalid_reason"] == "model_invalid"
+
+
+def test_overview_invalid_reason_normalizes_blank_for_csv_display() -> None:
+    assert _overview_invalid_reason("") == "none"
+    assert _overview_invalid_reason(None) == "none"
+    assert _overview_invalid_reason(float("nan")) == "none"
+    assert _overview_invalid_reason("missed_activation") == "missed_activation"
+
+
+def test_bem_activity_daily_classifies_rejected_model_and_oracle_rhpf() -> None:
+    ts = pd.date_range("2025-06-13", periods=2, freq="h", tz="UTC")
+    model = pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "real_bem_only_submitted_pos_mw": [5.0, 5.0],
+            "real_bem_only_submitted_neg_mw": [10.0, 10.0],
+            "real_bem_rejected_pos_mw": [0.0, 5.0],
+            "real_bem_rejected_neg_mw": [10.0, 0.0],
+            "real_bem_only_executed_pos_mwh": [0.1, 0.0],
+            "real_bem_only_executed_neg_mwh": [0.0, 0.2],
+            "real_bem_only_pos_activation_revenue_eur": [10.0, 0.0],
+            "real_bem_only_neg_activation_revenue_eur": [0.0, 20.0],
+            "real_bem_submitted_activation_price_pos_eur_per_mwh": [100.0, 150.0],
+            "real_bem_submitted_activation_price_neg_eur_per_mwh": [200.0, 100.0],
+            "true_activation_price_pos": [100.0, 125.0],
+            "true_activation_price_neg": [150.0, 100.0],
+        }
+    )
+    rhpf = pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "perfect_foresight_bem_only_submitted_pos_mw": [10.0, 10.0],
+            "perfect_foresight_bem_only_submitted_neg_mw": [10.0, 10.0],
+            "perfect_foresight_bem_rejected_pos_mw": [0.0, 0.0],
+            "perfect_foresight_bem_rejected_neg_mw": [0.0, 0.0],
+            "perfect_foresight_bem_only_executed_pos_mwh": [0.1, 0.2],
+            "perfect_foresight_bem_only_executed_neg_mwh": [0.3, 0.4],
+            "perfect_foresight_bem_only_pos_activation_revenue_eur": [10.0, 20.0],
+            "perfect_foresight_bem_only_neg_activation_revenue_eur": [30.0, 40.0],
+            "perfect_foresight_bem_submitted_activation_price_pos_eur_per_mwh": [100.0, 125.0],
+            "perfect_foresight_bem_submitted_activation_price_neg_eur_per_mwh": [150.0, 100.0],
+            "perfect_foresight_true_activation_price_pos": [100.0, 125.0],
+            "perfect_foresight_true_activation_price_neg": [150.0, 100.0],
+        }
+    )
+
+    daily = build_bem_activity_daily({"model": model, "rhpf": rhpf})
+    model_row = daily.loc[daily["path_type"].eq("model")].iloc[0]
+    rhpf_row = daily.loc[daily["path_type"].eq("rhpf")].iloc[0]
+
+    assert float(model_row["submitted_pos_mw"]) == pytest.approx(10.0)
+    assert float(model_row["rejected_neg_mw"]) == pytest.approx(10.0)
+    assert float(model_row["bid_price_mismatch_count"]) == pytest.approx(2.0)
+    assert model_row["bem_activity_classification"] == "trading_but_price_rejected"
+    assert float(rhpf_row["rejected_pos_mw"] + rhpf_row["rejected_neg_mw"]) == pytest.approx(0.0)
+    assert float(rhpf_row["bid_price_mismatch_count"]) == pytest.approx(0.0)
+    assert rhpf_row["bem_activity_classification"] == "trading_and_accepted"
 
 
 def test_infeasible_debug_dump_records_naive_context_without_writing_file() -> None:

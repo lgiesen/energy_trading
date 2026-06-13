@@ -869,6 +869,7 @@ def _overview_validity_fields(summary: Mapping[str, object], benchmark_mode: str
     """Return validity fields to display in scenario overviews for the selected benchmark mode."""
     mode = str(benchmark_mode or summary.get("benchmark_mode", "") or "").strip().lower()
     use_active_path = mode in {"naive_only", "rhpf_only"}
+    invalid_reason = summary.get("active_path_invalid_reason") if use_active_path else summary.get("invalid_reason")
     return {
         "simulation_valid": (
             summary.get("active_path_simulation_valid") if use_active_path else summary.get("simulation_valid")
@@ -876,19 +877,38 @@ def _overview_validity_fields(summary: Mapping[str, object], benchmark_mode: str
         "thesis_reportable": (
             summary.get("active_path_thesis_reportable") if use_active_path else summary.get("thesis_reportable")
         ),
-        "invalid_reason": (
-            summary.get("active_path_invalid_reason") if use_active_path else summary.get("invalid_reason")
-        ),
+        "invalid_reason": _overview_invalid_reason(invalid_reason),
         "legacy_simulation_valid": summary.get("simulation_valid"),
         "legacy_thesis_reportable": summary.get("thesis_reportable"),
-        "legacy_invalid_reason": summary.get("invalid_reason"),
+        "legacy_invalid_reason": _overview_invalid_reason(summary.get("invalid_reason")),
     }
+
+
+def _overview_invalid_reason(value: object) -> str:
+    """Normalize blank human-facing invalid reasons so CSV readers do not show NaN."""
+    if value is None:
+        return "none"
+    try:
+        if pd.isna(value):
+            return "none"
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if text == "" or text.lower() == "nan":
+        return "none"
+    return text
 
 
 def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     if col in df.columns:
         return pd.to_numeric(df[col], errors="coerce").fillna(default)
     return pd.Series(default, index=df.index, dtype=float)
+
+
+def _optional_text_series(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+    if col in df.columns:
+        return df[col].fillna(default).astype(str)
+    return pd.Series(default, index=df.index, dtype=str)
 
 
 def _safe_ratio(num: float, den: float) -> float:
@@ -907,6 +927,191 @@ def _infer_dt_hours(hourly: pd.DataFrame) -> float:
         return 1.0
     dt_h = float(diffs_h.median())
     return dt_h if dt_h > 0.0 else 1.0
+
+
+def _first_existing_col(df: pd.DataFrame, names: Iterable[str]) -> str | None:
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _bem_activity_for_path(hourly: pd.DataFrame, *, path_type: str, timestamp_col: str = "timestamp_utc") -> pd.DataFrame:
+    """Aggregate BEM submission, rejection and execution diagnostics by day for one path."""
+    if not isinstance(hourly, pd.DataFrame) or hourly.empty or timestamp_col not in hourly.columns:
+        return pd.DataFrame()
+    prefix = _PATH_PREFIX.get(path_type, path_type)
+    df = hourly.copy()
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True, errors="coerce")
+    df = df.loc[df[timestamp_col].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    def c(*suffixes: str) -> str | None:
+        names: list[str] = []
+        for suffix in suffixes:
+            names.append(f"{prefix}_{suffix}")
+            names.append(suffix)
+        return _first_existing_col(df, names)
+
+    cols = {
+        "submitted_pos_mw": c("bem_only_submitted_pos_mw"),
+        "submitted_neg_mw": c("bem_only_submitted_neg_mw"),
+        "rejected_pos_mw": c("bem_rejected_pos_mw"),
+        "rejected_neg_mw": c("bem_rejected_neg_mw"),
+        "executed_pos_mwh": c("bem_only_executed_pos_mwh"),
+        "executed_neg_mwh": c("bem_only_executed_neg_mwh"),
+        "pos_activation_revenue_eur": c("bem_only_pos_activation_revenue_eur"),
+        "neg_activation_revenue_eur": c("bem_only_neg_activation_revenue_eur"),
+        "activation_revenue_eur": c("bem_only_activation_revenue_eur"),
+        "accepted_pos_flag": c("afrr_act_pos_accepted"),
+        "accepted_neg_flag": c("afrr_act_neg_accepted"),
+        "bid_price_pos_eur_per_mwh": c("bem_submitted_activation_price_pos_eur_per_mwh"),
+        "bid_price_neg_eur_per_mwh": c("bem_submitted_activation_price_neg_eur_per_mwh"),
+        "true_price_pos_eur_per_mwh": c("true_activation_price_pos", "bcm_true_activation_price_pos"),
+        "true_price_neg_eur_per_mwh": c("true_activation_price_neg", "bcm_true_activation_price_neg"),
+        "guard_applied": c("bem_activation_energy_guard_applied", "bem_only_headroom_guard_applied"),
+        "derated_pos_mw": c("bem_pos_derated_by_activation_energy_guard_mw", "bem_only_pos_reduced_by_headroom_mw"),
+        "derated_neg_mw": c("bem_neg_derated_by_activation_energy_guard_mw", "bem_only_neg_reduced_by_headroom_mw"),
+    }
+
+    work = pd.DataFrame({"timestamp_utc": df[timestamp_col], "date": df[timestamp_col].dt.date.astype(str)})
+    for out_col, src_col in cols.items():
+        if src_col is None:
+            work[out_col] = np.nan if out_col.startswith(("true_price", "bid_price")) else 0.0
+        elif out_col.startswith(("true_price", "bid_price")):
+            work[out_col] = pd.to_numeric(df[src_col], errors="coerce")
+        else:
+            work[out_col] = pd.to_numeric(df[src_col], errors="coerce").fillna(0.0)
+    work["accepted_pos_mw"] = (work["submitted_pos_mw"] - work["rejected_pos_mw"]).clip(lower=0.0)
+    work["accepted_neg_mw"] = (work["submitted_neg_mw"] - work["rejected_neg_mw"]).clip(lower=0.0)
+    if cols["activation_revenue_eur"] is None:
+        work["activation_revenue_eur"] = work["pos_activation_revenue_eur"] + work["neg_activation_revenue_eur"]
+    work["bid_price_mismatch_pos_count"] = (
+        work["submitted_pos_mw"].gt(1e-12)
+        & work["bid_price_pos_eur_per_mwh"].notna()
+        & work["true_price_pos_eur_per_mwh"].notna()
+        & (work["bid_price_pos_eur_per_mwh"] - work["true_price_pos_eur_per_mwh"]).abs().gt(1e-6)
+    ).astype(float)
+    work["bid_price_mismatch_neg_count"] = (
+        work["submitted_neg_mw"].gt(1e-12)
+        & work["bid_price_neg_eur_per_mwh"].notna()
+        & work["true_price_neg_eur_per_mwh"].notna()
+        & (work["bid_price_neg_eur_per_mwh"] - work["true_price_neg_eur_per_mwh"]).abs().gt(1e-6)
+    ).astype(float)
+    work["bid_price_gap_pos_eur_per_mwh_sum"] = (
+        work["bid_price_pos_eur_per_mwh"] - work["true_price_pos_eur_per_mwh"]
+    ).where(work["submitted_pos_mw"].gt(1e-12), 0.0)
+    work["bid_price_gap_neg_eur_per_mwh_sum"] = (
+        work["bid_price_neg_eur_per_mwh"] - work["true_price_neg_eur_per_mwh"]
+    ).where(work["submitted_neg_mw"].gt(1e-12), 0.0)
+    work["submitted_any_mw"] = work["submitted_pos_mw"] + work["submitted_neg_mw"]
+    work["rejected_any_mw"] = work["rejected_pos_mw"] + work["rejected_neg_mw"]
+    work["accepted_any_mw"] = work["accepted_pos_mw"] + work["accepted_neg_mw"]
+    work["executed_any_mwh"] = work["executed_pos_mwh"] + work["executed_neg_mwh"]
+    work["derated_any_mw"] = work["derated_pos_mw"] + work["derated_neg_mw"]
+
+    agg_cols = [
+        "submitted_pos_mw",
+        "submitted_neg_mw",
+        "rejected_pos_mw",
+        "rejected_neg_mw",
+        "accepted_pos_mw",
+        "accepted_neg_mw",
+        "executed_pos_mwh",
+        "executed_neg_mwh",
+        "pos_activation_revenue_eur",
+        "neg_activation_revenue_eur",
+        "activation_revenue_eur",
+        "accepted_pos_flag",
+        "accepted_neg_flag",
+        "guard_applied",
+        "derated_pos_mw",
+        "derated_neg_mw",
+        "bid_price_mismatch_pos_count",
+        "bid_price_mismatch_neg_count",
+        "bid_price_gap_pos_eur_per_mwh_sum",
+        "bid_price_gap_neg_eur_per_mwh_sum",
+        "submitted_any_mw",
+        "rejected_any_mw",
+        "accepted_any_mw",
+        "executed_any_mwh",
+        "derated_any_mw",
+    ]
+    daily = work.groupby("date", dropna=False)[agg_cols].sum(min_count=1).reset_index()
+    daily.insert(0, "path_type", path_type)
+    daily["bid_price_mismatch_count"] = daily["bid_price_mismatch_pos_count"] + daily["bid_price_mismatch_neg_count"]
+
+    def classify(row: pd.Series) -> str:
+        if float(row.get("submitted_any_mw", 0.0)) <= 1e-12:
+            return "no_submission"
+        if float(row.get("derated_any_mw", 0.0)) > 1e-12 or float(row.get("guard_applied", 0.0)) > 0.5:
+            return "physical_guard_derated"
+        if float(row.get("rejected_any_mw", 0.0)) > 1e-12:
+            return "trading_but_price_rejected"
+        return "trading_and_accepted"
+
+    daily["bem_activity_classification"] = daily.apply(classify, axis=1)
+    return daily
+
+
+def build_bem_activity_daily(
+    hourly_by_path: Mapping[str, pd.DataFrame],
+    *,
+    timestamp_col: str = "timestamp_utc",
+) -> pd.DataFrame:
+    frames = [
+        _bem_activity_for_path(frame, path_type=path_type, timestamp_col=timestamp_col)
+        for path_type, frame in hourly_by_path.items()
+        if isinstance(frame, pd.DataFrame)
+    ]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def summarize_bem_activity(daily: pd.DataFrame) -> dict[str, object]:
+    if not isinstance(daily, pd.DataFrame) or daily.empty or "path_type" not in daily.columns:
+        return {}
+    out: dict[str, object] = {}
+    for path_type, group in daily.groupby("path_type", dropna=False):
+        path = str(path_type)
+        for col in [
+            "submitted_pos_mw",
+            "submitted_neg_mw",
+            "rejected_pos_mw",
+            "rejected_neg_mw",
+            "accepted_pos_mw",
+            "accepted_neg_mw",
+            "executed_pos_mwh",
+            "executed_neg_mwh",
+            "activation_revenue_eur",
+            "bid_price_mismatch_count",
+            "guard_applied",
+            "derated_pos_mw",
+            "derated_neg_mw",
+        ]:
+            series = group[col] if col in group.columns else pd.Series(0.0, index=group.index)
+            out[f"{path}_bem_{col}_sum"] = float(
+                pd.to_numeric(series, errors="coerce").fillna(0.0).sum()
+            )
+        no_submission_days = group.loc[group["bem_activity_classification"].astype(str).eq("no_submission"), "date"]
+        out[f"{path}_bem_no_submission_day_count"] = float(len(no_submission_days))
+        submitted_any = group["submitted_any_mw"] if "submitted_any_mw" in group.columns else pd.Series(0.0, index=group.index)
+        submitted_days = group.loc[
+            pd.to_numeric(submitted_any, errors="coerce").fillna(0.0).gt(1e-12),
+            "date",
+        ]
+        out[f"{path}_bem_last_submission_date"] = str(submitted_days.iloc[-1]) if len(submitted_days) else ""
+        out[f"{path}_bem_stopped_submitting_before_end"] = float(
+            len(submitted_days) > 0 and str(submitted_days.iloc[-1]) != str(group["date"].iloc[-1])
+        )
+        out[f"{path}_bem_daily_classification_counts"] = json.dumps(
+            group["bem_activity_classification"].astype(str).value_counts().sort_index().to_dict(),
+            sort_keys=True,
+        )
+    return out
 
 
 THROUGHPUT_SOURCE_COLUMNS = [
@@ -5380,6 +5585,32 @@ def main() -> None:
                 summary=outputs.summary,
             )
 
+        with _phase_watchdog("write_bem_activity_daily"):
+            hourly_by_path: dict[str, pd.DataFrame] = {}
+            isolated = outputs.isolated_hourly or {}
+            for path_type in ("model", "naive", "rhpf"):
+                available = float(
+                    pd.to_numeric(
+                        pd.Series([outputs.summary.get(f"{path_type}_available", 0.0)]),
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    .iloc[0]
+                )
+                frame = isolated.get(path_type)
+                if path_type == "model" and not isinstance(frame, pd.DataFrame) and available >= 0.5:
+                    frame = outputs.hourly
+                if available >= 0.5 and isinstance(frame, pd.DataFrame) and not frame.empty:
+                    hourly_by_path[path_type] = frame
+            bem_activity_daily = build_bem_activity_daily(hourly_by_path, timestamp_col=colmap.timestamp)
+            if not bem_activity_daily.empty:
+                bem_activity_daily_path = scenario_out_dir / "bem_activity_daily.csv"
+                bem_activity_daily.to_csv(bem_activity_daily_path, index=False)
+                outputs.summary.update(summarize_bem_activity(bem_activity_daily))
+                outputs.summary["bem_activity_daily_path"] = str(bem_activity_daily_path)
+            else:
+                outputs.summary["bem_activity_daily_path"] = ""
+
         outputs.summary["output_write_seconds"] = float(max(0.0, time.monotonic() - output_write_started))
         with _phase_watchdog("write_summary_json"):
             summary_path.write_text(json.dumps(outputs.summary, indent=2), encoding="utf-8")
@@ -5529,16 +5760,16 @@ def main() -> None:
             "active_path": outputs.summary.get("active_path"),
             "active_path_simulation_valid": outputs.summary.get("active_path_simulation_valid"),
             "active_path_thesis_reportable": outputs.summary.get("active_path_thesis_reportable"),
-            "active_path_invalid_reason": outputs.summary.get("active_path_invalid_reason"),
+            "active_path_invalid_reason": _overview_invalid_reason(outputs.summary.get("active_path_invalid_reason")),
             "legacy_simulation_valid": overview_validity.get("legacy_simulation_valid"),
             "legacy_thesis_reportable": overview_validity.get("legacy_thesis_reportable"),
             "legacy_invalid_reason": overview_validity.get("legacy_invalid_reason"),
             "naive_simulation_valid": outputs.summary.get("naive_simulation_valid"),
             "naive_thesis_reportable": outputs.summary.get("naive_thesis_reportable"),
-            "naive_invalid_reason": outputs.summary.get("naive_invalid_reason"),
+            "naive_invalid_reason": _overview_invalid_reason(outputs.summary.get("naive_invalid_reason")),
             "rhpf_simulation_valid": outputs.summary.get("rhpf_simulation_valid"),
             "rhpf_thesis_reportable": outputs.summary.get("rhpf_thesis_reportable"),
-            "rhpf_invalid_reason": outputs.summary.get("rhpf_invalid_reason"),
+            "rhpf_invalid_reason": _overview_invalid_reason(outputs.summary.get("rhpf_invalid_reason")),
             "enabled_paths": outputs.summary.get("enabled_paths"),
             "disabled_paths": outputs.summary.get("disabled_paths"),
             "model_path_executed": outputs.summary.get("model_path_executed"),
@@ -5567,6 +5798,7 @@ def main() -> None:
             "simulation_valid": overview_validity.get("simulation_valid"),
             "thesis_reportable": overview_validity.get("thesis_reportable"),
             "invalid_reason": overview_validity.get("invalid_reason"),
+            "bem_activity_daily_path": outputs.summary.get("bem_activity_daily_path", ""),
             "fallback_used": outputs.summary.get("fallback_used"),
             "output_dir": str(scenario_out_dir),
             "realized_net_revenue_eur": float(perf_df.iloc[0].get("realized_net_revenue_eur", float("nan"))),
@@ -5580,6 +5812,29 @@ def main() -> None:
             "equivalent_full_cycles_total": float(perf_df.iloc[0].get("equivalent_full_cycles_total", float("nan"))),
             "total_costs_eur": float(perf_df.iloc[0].get("total_costs_eur", float("nan"))),
         }
+        for path_type in ("model", "naive", "rhpf"):
+            for key in [
+                "submitted_pos_mw",
+                "submitted_neg_mw",
+                "rejected_pos_mw",
+                "rejected_neg_mw",
+                "accepted_pos_mw",
+                "accepted_neg_mw",
+                "executed_pos_mwh",
+                "executed_neg_mwh",
+                "activation_revenue_eur",
+                "bid_price_mismatch_count",
+                "no_submission_day_count",
+                "stopped_submitting_before_end",
+            ]:
+                row[f"{path_type}_bem_{key}_sum" if not key.endswith("_count") and key not in {"stopped_submitting_before_end", "no_submission_day_count"} else f"{path_type}_bem_{key}"] = outputs.summary.get(
+                    f"{path_type}_bem_{key}_sum",
+                    outputs.summary.get(f"{path_type}_bem_{key}", float("nan")),
+                )
+            row[f"{path_type}_bem_last_submission_date"] = outputs.summary.get(f"{path_type}_bem_last_submission_date", "")
+            row[f"{path_type}_bem_daily_classification_counts"] = outputs.summary.get(
+                f"{path_type}_bem_daily_classification_counts", "{}"
+            )
         if scenario_name != "default":
             q_lo, q_hi = scenario_name.split("_", 1)
             row["quantile_low"] = q_lo
@@ -5663,6 +5918,15 @@ def main() -> None:
         dedup_keys = [k for k in ["scenario", "trading_strategy"] if k in overview.columns]
         if dedup_keys:
             overview = overview.drop_duplicates(subset=dedup_keys, keep="last")
+        for reason_col in [
+            "invalid_reason",
+            "legacy_invalid_reason",
+            "active_path_invalid_reason",
+            "naive_invalid_reason",
+            "rhpf_invalid_reason",
+        ]:
+            if reason_col in overview.columns:
+                overview[reason_col] = overview[reason_col].map(_overview_invalid_reason)
         if {"realized_total_pnl_eur", "rolling_perfect_foresight_same_rules_total_pnl_eur"}.issubset(overview.columns):
             r = pd.to_numeric(overview["realized_total_pnl_eur"], errors="coerce")
             o = pd.to_numeric(overview["rolling_perfect_foresight_same_rules_total_pnl_eur"], errors="coerce")
