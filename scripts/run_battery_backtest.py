@@ -64,7 +64,7 @@ if str(SRC_DIR) not in sys.path:
 from energy_trading.config import MARKET_SPECS, MODEL_SPECS
 from energy_trading.simulation.battery_backtest import (
     AFRR_QUANTILE_BINS, BacktestColumnMap, BatteryBacktester,
-    PhaseTimeoutError, _write_checkpoint_run_status, canonicalize_market_frame,
+    OK_OPTIMIZATION_ERROR_CODES, PhaseTimeoutError, _write_checkpoint_run_status, canonicalize_market_frame,
     load_and_align_market_data, load_prediction_warehouse_long,
     normalize_predicted_pnl_aliases, resolve_benchmark_paths)
 from energy_trading.visualization.style import (apply_geo_style,
@@ -477,6 +477,56 @@ def _add_benchmark_comparison_columns(df: pd.DataFrame) -> pd.DataFrame:
         (model / rhpf) * 100.0,
         np.nan,
     )
+    if "rhpf_thesis_reportable" in out.columns or "rhpf_simulation_valid" in out.columns:
+        rhpf_valid = _path_valid_mask(out, "rhpf")
+        for col in ["model_vs_rhpf_pct", "value_of_foresight_ratio", "value_of_foresight_pct"]:
+            if col in out.columns:
+                out.loc[~rhpf_valid, col] = np.nan
+    if "naive_thesis_reportable" in out.columns or "naive_simulation_valid" in out.columns:
+        naive_valid = _path_valid_mask(out, "naive")
+        for col in ["model_vs_naive_pct_minus_100", "value_of_foresight_ratio", "value_of_foresight_pct"]:
+            if col in out.columns:
+                out.loc[~naive_valid, col] = np.nan
+    return out
+
+
+def _path_valid_mask(df: pd.DataFrame, path: str) -> pd.Series:
+    """Return path reportability mask, falling back to simulation validity."""
+    thesis_col = f"{path}_thesis_reportable"
+    valid_col = f"{path}_simulation_valid"
+    if thesis_col in df.columns:
+        return pd.to_numeric(df[thesis_col], errors="coerce").fillna(0.0) >= 0.5
+    if valid_col in df.columns:
+        return pd.to_numeric(df[valid_col], errors="coerce").fillna(0.0) >= 0.5
+    return pd.Series(True, index=df.index)
+
+
+def _mask_invalid_benchmark_comparisons(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove invalid benchmark PnLs and dependent ratios from valid-only outputs."""
+    out = df.copy()
+    naive_valid = _path_valid_mask(out, "naive")
+    rhpf_valid = _path_valid_mask(out, "rhpf")
+    if "naive_total_pnl_eur" in out.columns:
+        out.loc[~naive_valid, "naive_total_pnl_eur"] = np.nan
+    for col in ["rolling_perfect_foresight_same_rules_total_pnl_eur", "rhpf_total_pnl_eur"]:
+        if col in out.columns:
+            out.loc[~rhpf_valid, col] = np.nan
+    for col in [
+        "model_vs_naive_ratio",
+        "model_vs_naive_pct_minus_100",
+        "value_of_foresight_ratio",
+        "value_of_foresight_pct",
+    ]:
+        if col in out.columns:
+            out.loc[~naive_valid, col] = np.nan
+    for col in [
+        "model_vs_rhpf_ratio",
+        "model_vs_rhpf_pct",
+        "value_of_foresight_ratio",
+        "value_of_foresight_pct",
+    ]:
+        if col in out.columns:
+            out.loc[~rhpf_valid, col] = np.nan
     return out
 
 
@@ -563,7 +613,8 @@ def _build_optimization_infeasibility_attribution(
         h.get("is_fallback_hour", pd.Series(0.0, index=h.index, dtype=float)),
         errors="coerce",
     ).fillna(0.0)
-    fail_mask = err.str.lower().ne("ok") | fb.str.lower().ne("none") | fb_hour.gt(0.5)
+    err_norm = err.str.lower().str.strip()
+    fail_mask = ~err_norm.isin(OK_OPTIMIZATION_ERROR_CODES) | fb.str.lower().ne("none") | fb_hour.gt(0.5)
     failing = h.loc[fail_mask].copy()
     if failing.empty:
         return pd.DataFrame()
@@ -1112,6 +1163,164 @@ def summarize_bem_activity(daily: pd.DataFrame) -> dict[str, object]:
             sort_keys=True,
         )
     return out
+
+
+def _bcm_activity_for_path(
+    frame: pd.DataFrame,
+    *,
+    path_type: str,
+    timestamp_col: str = "timestamp_utc",
+) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame) or frame.empty or timestamp_col not in frame.columns:
+        return pd.DataFrame()
+    prefix = {
+        "model": "real",
+        "naive": "naive",
+        "rhpf": "perfect_foresight",
+    }.get(str(path_type), str(path_type))
+
+    def pick_numeric(*names: str, default: float = 0.0) -> pd.Series:
+        for name in names:
+            if name in frame.columns:
+                return pd.to_numeric(frame[name], errors="coerce").fillna(default)
+        return pd.Series(default, index=frame.index, dtype=float)
+
+    def pick_text(*names: str, default: str = "none") -> pd.Series:
+        for name in names:
+            if name in frame.columns:
+                return frame[name].fillna(default).astype(str)
+        return pd.Series(default, index=frame.index, dtype=object)
+
+    ts = pd.to_datetime(frame[timestamp_col], utc=True, errors="coerce")
+    work = pd.DataFrame(
+        {
+            "timestamp_utc": ts,
+            "date": ts.dt.date.astype(str),
+            "product_block_start_hour_utc": (ts.dt.hour // 4 * 4).astype("Int64"),
+            "capacity_revenue_eur": pick_numeric(
+                f"{prefix}_revenue_capacity_eur",
+                f"{prefix}_capacity_revenue_eur",
+                "real_revenue_capacity_eur" if path_type == "model" else "",
+            ),
+            "activation_revenue_eur": pick_numeric(
+                f"{prefix}_revenue_activation_eur",
+                f"{prefix}_activation_revenue_eur",
+                "real_revenue_activation_eur" if path_type == "model" else "",
+            ),
+            "locked_pos_mw": pick_numeric(
+                f"{prefix}_locked_bcm_capacity_pos_mw",
+                f"{prefix}_locked_reserve_pos_mw",
+                f"{prefix}_awarded_capacity_pos_mw",
+                "real_locked_bcm_capacity_pos_mw" if path_type == "model" else "",
+                "real_awarded_capacity_pos_mw" if path_type == "model" else "",
+                "locked_bcm_capacity_pos_mw" if path_type == "model" else "",
+            ),
+            "locked_neg_mw": pick_numeric(
+                f"{prefix}_locked_bcm_capacity_neg_mw",
+                f"{prefix}_locked_reserve_neg_mw",
+                f"{prefix}_awarded_capacity_neg_mw",
+                "real_locked_bcm_capacity_neg_mw" if path_type == "model" else "",
+                "real_awarded_capacity_neg_mw" if path_type == "model" else "",
+                "locked_bcm_capacity_neg_mw" if path_type == "model" else "",
+            ),
+            "bid_price_pos_eur_per_mw_h": pick_numeric(
+                f"{prefix}_bcm_capacity_bid_price_pos_eur_per_mw_h",
+                f"{prefix}_bcm_lockbook_capacity_bid_price_pos_eur_per_mw_h",
+                "bcm_capacity_bid_price_pos_eur_per_mw_h",
+            ),
+            "bid_price_neg_eur_per_mw_h": pick_numeric(
+                f"{prefix}_bcm_capacity_bid_price_neg_eur_per_mw_h",
+                f"{prefix}_bcm_lockbook_capacity_bid_price_neg_eur_per_mw_h",
+                "bcm_capacity_bid_price_neg_eur_per_mw_h",
+            ),
+            "true_cutoff_pos_eur_per_mw_h": pick_numeric(
+                "bcm_capacity_true_cutoff_price_pos_eur_per_mw_h",
+                "bcm_capacity_cutoff_price_pos_eur_per_mw_h",
+                "true_afrr_capacity_price_pos",
+            ),
+            "true_cutoff_neg_eur_per_mw_h": pick_numeric(
+                "bcm_capacity_true_cutoff_price_neg_eur_per_mw_h",
+                "bcm_capacity_cutoff_price_neg_eur_per_mw_h",
+                "true_afrr_capacity_price_neg",
+            ),
+            "precommit_zero_reason": pick_text(
+                f"{prefix}_bcm_precommit_zero_reason",
+                "bcm_precommit_zero_reason",
+            ),
+            "expected_delivery_guard_reason": pick_text(
+                f"{prefix}_bcm_precommit_expected_delivery_guard_reason",
+                "bcm_precommit_expected_delivery_guard_reason",
+            ),
+        }
+    )
+    work = work.loc[work["timestamp_utc"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+    agg = {
+        "capacity_revenue_eur": "sum",
+        "activation_revenue_eur": "sum",
+        "locked_pos_mw": "sum",
+        "locked_neg_mw": "sum",
+        "bid_price_pos_eur_per_mw_h": "mean",
+        "bid_price_neg_eur_per_mw_h": "mean",
+        "true_cutoff_pos_eur_per_mw_h": "mean",
+        "true_cutoff_neg_eur_per_mw_h": "mean",
+    }
+    out = work.groupby(["date", "product_block_start_hour_utc"], dropna=False).agg(agg).reset_index()
+    out.insert(0, "path_type", str(path_type))
+    reason_cols = work.groupby(["date", "product_block_start_hour_utc"], dropna=False)[
+        ["precommit_zero_reason", "expected_delivery_guard_reason"]
+    ].agg(lambda s: ",".join(sorted({str(v) for v in s if str(v) not in {"", "none", "nan"}})) or "none")
+    out = out.merge(reason_cols.reset_index(), on=["date", "product_block_start_hour_utc"], how="left")
+    out["locked_total_mw"] = out["locked_pos_mw"] + out["locked_neg_mw"]
+    return out
+
+
+def build_bcm_model_vs_naive_audit(
+    hourly_by_path: Mapping[str, pd.DataFrame],
+    *,
+    timestamp_col: str = "timestamp_utc",
+) -> pd.DataFrame:
+    frames = [
+        _bcm_activity_for_path(frame, path_type=path_type, timestamp_col=timestamp_col)
+        for path_type, frame in hourly_by_path.items()
+        if path_type in {"model", "naive", "rhpf"} and isinstance(frame, pd.DataFrame)
+    ]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    audit = pd.concat(frames, ignore_index=True, sort=False)
+    audit["classification"] = "path_activity"
+    group_cols = ["date", "product_block_start_hour_utc"]
+    for _, grp in audit.groupby(group_cols, dropna=False):
+        model = grp.loc[grp["path_type"].eq("model")]
+        naive = grp.loc[grp["path_type"].eq("naive")]
+        if model.empty or naive.empty:
+            continue
+        model_row = model.iloc[0]
+        naive_row = naive.iloc[0]
+        model_total = float(model_row.get("capacity_revenue_eur", 0.0)) + float(
+            model_row.get("activation_revenue_eur", 0.0)
+        )
+        naive_total = float(naive_row.get("capacity_revenue_eur", 0.0)) + float(
+            naive_row.get("activation_revenue_eur", 0.0)
+        )
+        if naive_total <= model_total + 1e-9:
+            classification = "model_revenue_ge_naive"
+        elif any(
+            token in str(model_row.get(col, "")).lower()
+            for col in ("precommit_zero_reason", "expected_delivery_guard_reason")
+            for token in ("headroom", "infeasible", "derate", "zero")
+        ):
+            classification = "model_guard_or_precommit_derate"
+        elif float(naive_row.get("locked_pos_mw", 0.0)) > float(model_row.get("locked_pos_mw", 0.0)) + 1e-9:
+            classification = "naive_more_pos_exposure"
+        elif float(naive_row.get("locked_neg_mw", 0.0)) > float(model_row.get("locked_neg_mw", 0.0)) + 1e-9:
+            classification = "naive_more_neg_exposure"
+        else:
+            classification = "model_forecast_or_side_choice"
+        audit.loc[grp.index, "classification"] = classification
+    return audit
 
 
 THROUGHPUT_SOURCE_COLUMNS = [
@@ -4083,8 +4292,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--write-checkpoints",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Write staged checkpoint artifacts under each scenario output directory (default: enabled).",
+        default=False,
+        help="Write staged checkpoint artifacts under each scenario output directory (default: disabled).",
     )
     p.add_argument(
         "--checkpoint-detail",
@@ -5610,6 +5819,13 @@ def main() -> None:
                 outputs.summary["bem_activity_daily_path"] = str(bem_activity_daily_path)
             else:
                 outputs.summary["bem_activity_daily_path"] = ""
+            bcm_audit = build_bcm_model_vs_naive_audit(hourly_by_path, timestamp_col=colmap.timestamp)
+            if not bcm_audit.empty:
+                bcm_audit_path = scenario_out_dir / "bcm_model_vs_naive_audit.csv"
+                bcm_audit.to_csv(bcm_audit_path, index=False)
+                outputs.summary["bcm_model_vs_naive_audit_path"] = str(bcm_audit_path)
+            else:
+                outputs.summary["bcm_model_vs_naive_audit_path"] = ""
 
         outputs.summary["output_write_seconds"] = float(max(0.0, time.monotonic() - output_write_started))
         with _phase_watchdog("write_summary_json"):
@@ -5799,6 +6015,7 @@ def main() -> None:
             "thesis_reportable": overview_validity.get("thesis_reportable"),
             "invalid_reason": overview_validity.get("invalid_reason"),
             "bem_activity_daily_path": outputs.summary.get("bem_activity_daily_path", ""),
+            "bcm_model_vs_naive_audit_path": outputs.summary.get("bcm_model_vs_naive_audit_path", ""),
             "fallback_used": outputs.summary.get("fallback_used"),
             "output_dir": str(scenario_out_dir),
             "realized_net_revenue_eur": float(perf_df.iloc[0].get("realized_net_revenue_eur", float("nan"))),
@@ -5957,6 +6174,7 @@ def main() -> None:
         elif "simulation_valid" in valid_only.columns:
             sv = pd.to_numeric(valid_only["simulation_valid"], errors="coerce").fillna(0.0)
             valid_only = valid_only.loc[sv >= 0.5].copy()
+        valid_only = _mask_invalid_benchmark_comparisons(valid_only)
         valid_csv = out_dir / "strategy_overview_valid_only.csv"
         valid_json = out_dir / "strategy_overview_valid_only.json"
         valid_only.to_csv(valid_csv, index=False)
@@ -5997,6 +6215,10 @@ def main() -> None:
                 "simulation_valid",
                 "thesis_reportable",
                 "invalid_reason",
+                "naive_simulation_valid",
+                "naive_invalid_reason",
+                "rhpf_simulation_valid",
+                "rhpf_invalid_reason",
             ]
             if c in overview.columns
         ]

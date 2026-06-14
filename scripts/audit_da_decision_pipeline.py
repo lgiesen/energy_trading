@@ -131,6 +131,96 @@ def _summary_float(summary: dict[str, object], names: Iterable[str], default: fl
     return float(default)
 
 
+def _sum_first_existing(df: pd.DataFrame, cols: Iterable[str]) -> float:
+    for col in cols:
+        if col in df.columns:
+            return float(pd.to_numeric(df[col], errors="coerce").fillna(0.0).sum())
+    return 0.0
+
+
+def _pnl_components(df: pd.DataFrame, prefix: str) -> dict[str, float]:
+    if df.empty:
+        return {}
+    if prefix == "real":
+        pnl_cols = ["real_pnl_eur", "real_total_pnl_eur", "realized_total_pnl_eur"]
+        da_pnl_cols = ["real_da_pnl_eur"]
+        da_revenue_cols = ["real_revenue_da_eur"]
+        da_cost_cols = ["real_cost_da_eur"]
+        id_pnl_cols = ["real_pnl_id_eur", "real_id_pnl_eur"]
+    elif prefix == "naive":
+        pnl_cols = ["naive_pnl_eur", "naive_total_pnl_eur"]
+        da_pnl_cols = ["naive_da_pnl_eur"]
+        da_revenue_cols = ["naive_revenue_da_eur"]
+        da_cost_cols = ["naive_cost_da_eur"]
+        id_pnl_cols = ["naive_pnl_id_eur", "naive_id_pnl_eur"]
+    else:
+        pnl_cols = ["perfect_foresight_pnl_eur", "rolling_pf_reported_total_pnl_eur"]
+        da_pnl_cols = ["perfect_foresight_da_pnl_eur", "rolling_pf_da_pnl_eur"]
+        da_revenue_cols = ["perfect_foresight_revenue_da_eur"]
+        da_cost_cols = ["perfect_foresight_cost_da_eur"]
+        id_pnl_cols = ["perfect_foresight_pnl_id_eur", "rolling_pf_id_pnl_eur"]
+    da_pnl = _sum_first_existing(df, da_pnl_cols)
+    da_revenue = _sum_first_existing(df, da_revenue_cols)
+    da_cost = _sum_first_existing(df, da_cost_cols)
+    if abs(float(da_pnl)) <= TOL and (abs(float(da_revenue)) > TOL or abs(float(da_cost)) > TOL):
+        da_pnl = float(da_revenue) - float(da_cost)
+    return {
+        "pnl_eur": _sum_first_existing(df, pnl_cols),
+        "da_pnl_eur": float(da_pnl),
+        "da_revenue_eur": float(da_revenue),
+        "da_cost_eur": float(da_cost),
+        "id_pnl_eur": _sum_first_existing(df, id_pnl_cols),
+        "degradation_cost_eur": _sum_first_existing(df, [f"{prefix}_degradation_cost_eur"]),
+        "transaction_cost_eur": _sum_first_existing(df, [f"{prefix}_transaction_cost_eur"]),
+        "aux_cost_eur": _sum_first_existing(df, [f"{prefix}_aux_cost_eur"]),
+    }
+
+
+def _forecast_quality(hourly: pd.DataFrame) -> dict[str, float | str]:
+    if hourly.empty:
+        return {"status": "unavailable_empty_hourly"}
+    pred_col = "pred_da_price" if "pred_da_price" in hourly.columns else ""
+    true_col = ""
+    for candidate in ("target_da_price", "true_da_price", "da_price"):
+        if candidate in hourly.columns:
+            true_col = candidate
+            break
+    if not pred_col or not true_col:
+        return {"status": "unavailable_missing_columns"}
+    pred = pd.to_numeric(hourly[pred_col], errors="coerce")
+    true = pd.to_numeric(hourly[true_col], errors="coerce")
+    valid = pred.notna() & true.notna()
+    if not bool(valid.any()):
+        return {"status": "unavailable_nonfinite"}
+    err = pred[valid].astype(float) - true[valid].astype(float)
+    corr = pred[valid].corr(true[valid]) if int(valid.sum()) > 1 else np.nan
+    out: dict[str, float | str] = {
+        "status": "ok",
+        "rows": float(valid.sum()),
+        "mae_eur_mwh": float(err.abs().mean()),
+        "bias_eur_mwh": float(err.mean()),
+        "corr": float(corr) if np.isfinite(corr) else float("nan"),
+        "true_col": true_col,
+    }
+    lag_col = "pred_da_price_naive_source_lag_hours"
+    fallback_col = "pred_da_price_naive_fallback_used"
+    mode_col = "pred_da_price_naive_source_mode"
+    if lag_col in hourly.columns:
+        lags = pd.to_numeric(hourly[lag_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if not lags.empty:
+            out["naive_source_min_lag_hours"] = float(lags.min())
+            out["naive_source_median_lag_hours"] = float(lags.median())
+    if fallback_col in hourly.columns:
+        out["naive_source_fallback_rows"] = float(
+            pd.to_numeric(hourly[fallback_col], errors="coerce").fillna(0.0).sum()
+        )
+    if mode_col in hourly.columns:
+        modes = hourly[mode_col].dropna().astype(str)
+        if not modes.empty:
+            out["naive_source_modes"] = ",".join(sorted(set(modes.tolist()))[:5])
+    return out
+
+
 def _diagnostic_global_da_oracle(hourly: pd.DataFrame, summary: dict[str, object]) -> dict[str, float | str]:
     """Simple full-horizon DA-only oracle using true prices.
 
@@ -243,6 +333,50 @@ def _scenario_audit(scenario_dir: Path, max_gates: int) -> tuple[bool, list[str]
             f"accepted={totals.get('accepted_buy', 0.0):.3f}/{totals.get('accepted_sell', 0.0):.3f} "
             f"realized={totals.get('realized_buy', 0.0):.3f}/{totals.get('realized_sell', 0.0):.3f}"
         )
+    component_rows: list[dict[str, object]] = []
+    for label, df, prefix in [
+        ("model", hourly, "real"),
+        ("naive", naive, "naive"),
+        ("rhpf", rhpf, "perfect_foresight"),
+    ]:
+        component_source = hourly if any(col.startswith(f"{prefix}_") for col in hourly.columns) else df
+        comps = _pnl_components(component_source, prefix)
+        if comps:
+            component_rows.append({"path": label, **comps})
+    if component_rows:
+        component_df = pd.DataFrame(component_rows)
+        lines.append("DA PnL component audit:")
+        lines.append(component_df.to_string(index=False))
+        if {"model", "naive"}.issubset(set(component_df["path"].astype(str))):
+            model_row = component_df.loc[component_df["path"].astype(str) == "model"].iloc[0]
+            naive_row = component_df.loc[component_df["path"].astype(str) == "naive"].iloc[0]
+            gap = float(model_row["pnl_eur"]) - float(naive_row["pnl_eur"])
+            spread_gap = float(model_row["da_pnl_eur"]) - float(naive_row["da_pnl_eur"])
+            id_gap = float(model_row["id_pnl_eur"]) - float(naive_row["id_pnl_eur"])
+            lines.append(
+                "Model minus naive: "
+                f"total={gap:.2f} EUR, DA_PnL={spread_gap:.2f} EUR, ID_PnL={id_gap:.2f} EUR"
+            )
+    forecast = _forecast_quality(hourly)
+    if str(forecast.get("status", "")) == "ok":
+        lines.append(
+            "Model DA forecast quality: "
+            f"rows={float(forecast['rows']):.0f} "
+            f"MAE={float(forecast['mae_eur_mwh']):.2f} EUR/MWh "
+            f"bias={float(forecast['bias_eur_mwh']):.2f} EUR/MWh "
+            f"corr={float(forecast['corr']):.3f} "
+            f"target={forecast.get('true_col')}"
+        )
+        if "naive_source_min_lag_hours" in forecast:
+            lines.append(
+                "Naive DA source lineage: "
+                f"min_lag={float(forecast['naive_source_min_lag_hours']):.1f}h "
+                f"median_lag={float(forecast.get('naive_source_median_lag_hours', np.nan)):.1f}h "
+                f"fallback_rows={float(forecast.get('naive_source_fallback_rows', np.nan)):.0f} "
+                f"modes={forecast.get('naive_source_modes', 'unknown')}"
+            )
+    else:
+        lines.append(f"Model DA forecast quality: unavailable status={forecast.get('status')}")
     oracle = _diagnostic_global_da_oracle(hourly, summary)
     if str(oracle.get("status", "")) == "ok":
         lines.append(

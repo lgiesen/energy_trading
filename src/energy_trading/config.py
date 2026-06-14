@@ -22,8 +22,12 @@ MODEL_SPECS = {
     "terminal_value_buy_quantile": 0.70,
     "terminal_value_sell_quantile": 0.30,
     "terminal_value_require_recovery_cost_for_shortfall": True,
-    "terminal_recovery_lookahead_h": 48.0,
-    "da_terminal_recovery_lookahead_h": 48.0,
+    # Explicit terminal-recovery economics are opt-in before a DA candidate
+    # actually reaches the global end. A nonzero lookahead can be used for
+    # stress tests, but making it the default causes ordinary clipped
+    # evaluation windows to reject profitable DA candidates as terminal repairs.
+    "terminal_recovery_lookahead_h": 0.0,
+    "da_terminal_recovery_lookahead_h": 0.0,
     # Naive benchmark forecast construction. The thesis default is causal and
     # preserves weekly/hourly seasonality; the old delivery-row 24h shift
     # remains available as "shift_24h_delivery" for legacy artifact comparison.
