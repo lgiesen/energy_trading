@@ -2619,12 +2619,13 @@ def _resolve_final_soc_policy(
     enforce_final_soc_min_flag: bool,
     allow_terminal_soc_repair_in_strict: bool,
 ) -> bool:
-    if bool(strict_simulation_validity) and str(final_soc_mode) == "terminal_repair" and not bool(allow_terminal_soc_repair_in_strict):
+    mode = str(final_soc_mode).strip().lower()
+    if bool(strict_simulation_validity) and mode == "terminal_repair" and not bool(allow_terminal_soc_repair_in_strict):
         raise ValueError(
-            "Strict mode requires --final-soc-mode hard for thesis-reportable runs. "
+            "Strict mode requires --final-soc-mode hard or hard_min for thesis-reportable runs. "
             "Set --allow-terminal-soc-repair-in-strict only for diagnostic runs."
         )
-    return bool(enforce_final_soc_min_flag) or (str(final_soc_mode) == "hard")
+    return bool(enforce_final_soc_min_flag) or (mode in {"hard", "hard_min"})
 
 
 def _prepare_scenario_output_dir(
@@ -4164,9 +4165,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--final-soc-mode",
-        choices=["terminal_repair", "hard"],
+        choices=["terminal_repair", "hard", "hard_min"],
         default="hard",
-        help="Final SoC policy: hard physical minimum (default) or terminal_repair.",
+        help="Final SoC policy: hard exact target (default), hard_min lower bound, or terminal_repair.",
     )
     p.add_argument(
         "--enforce-final-soc-min",
@@ -4777,11 +4778,11 @@ def main() -> None:
     backtester = BatteryBacktester()
     if (
         bool(args.strict_simulation_validity)
-        and str(args.final_soc_mode).strip().lower() == "hard"
+        and str(args.final_soc_mode).strip().lower() in {"hard", "hard_min"}
         and float(getattr(backtester, "milp_time_limit_seconds", 30.0)) < 30.0
     ):
         print(
-            "[WARN] BACKTEST_MILP_TIME_LIMIT_S is below 30s for strict hard-final-SoC mode; "
+            "[WARN] BACKTEST_MILP_TIME_LIMIT_S is below 30s for strict final-SoC mode; "
             "solver Not Set statuses are more likely. Recommended thesis default: 30s or higher."
         )
     sweep_rows: list[dict[str, object]] = []
@@ -5961,15 +5962,16 @@ def main() -> None:
         final_soc_physical_ok = bool(float(outputs.summary.get("final_soc_physical_check_pass", 0.0)) >= 0.5)
         final_soc_economic_ok = bool(float(outputs.summary.get("final_soc_economic_repair_check_pass", 0.0)) >= 0.5)
         final_soc_shortfall = outputs.summary.get("final_soc_shortfall_mwh", float("nan"))
+        final_soc_label = "min_target" if str(outputs.summary.get("final_soc_mode", "")).strip().lower() == "hard_min" else "target"
         if final_soc_physical_ok:
             print(
                 "- final_soc_physical_check: OK "
-                f"(actual/target={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh)"
+                f"(actual/{final_soc_label}={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh)"
             )
         else:
             print(
                 "[WARN] final_soc_physical_check: NOT MET "
-                f"(actual/target={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh, "
+                f"(actual/{final_soc_label}={float(final_soc):.4f}/{float(final_soc_target):.4f} MWh, "
                 f"shortfall={float(final_soc_shortfall):.4f} MWh)"
             )
         if final_soc_economic_ok:

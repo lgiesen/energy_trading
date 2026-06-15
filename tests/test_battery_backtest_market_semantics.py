@@ -498,7 +498,7 @@ def test_bem_activation_energy_guard_derates_pos_at_soc_min() -> None:
     assert str(guard["bem_guard_zero_reason_pos"]) == "none"
 
 
-def test_bem_activation_energy_guard_uses_expected_hourly_delivery_not_full_headroom() -> None:
+def test_bem_activation_energy_guard_floors_expected_delivery_to_configured_headroom() -> None:
     bt = _mk_backtester()
     bt.afrr_bid_granularity_mw = 0.1
     bt.afrr_step_mw = 0.1
@@ -521,10 +521,11 @@ def test_bem_activation_energy_guard_uses_expected_hourly_delivery_not_full_head
         activation_rate_neg=0.0,
     )
 
-    assert float(guard["submitted_bem_only_pos_mw"]) == pytest.approx(10.0)
+    assert float(guard["submitted_bem_only_pos_mw"]) == pytest.approx(2.0)
     assert str(guard["bem_activation_energy_guard_basis"]) == "expected_activation_energy"
     assert float(guard["bem_expected_delivery_duration_h"]) == pytest.approx(1.0)
     assert float(guard["bem_expected_delivery_pos_mwh"]) == pytest.approx(1.0)
+    assert float(guard["bem_activation_energy_guard_rate_pos"]) == pytest.approx(0.5)
 
 
 def test_bem_guard_uses_settlement_soc_anchor_when_planned_anchor_is_stale() -> None:
@@ -1490,7 +1491,7 @@ def test_manifest_target_value_modes_applied_to_loader_post_load(tmp_path: Path)
 
 
 def test_resolve_final_soc_policy_strict_terminal_repair_refused() -> None:
-    with pytest.raises(ValueError, match="Strict mode requires --final-soc-mode hard"):
+    with pytest.raises(ValueError, match="Strict mode requires --final-soc-mode hard or hard_min"):
         _resolve_final_soc_policy(
             strict_simulation_validity=True,
             final_soc_mode="terminal_repair",
@@ -1503,6 +1504,12 @@ def test_resolve_final_soc_policy_hard_or_enforce_flag() -> None:
     assert _resolve_final_soc_policy(
         strict_simulation_validity=True,
         final_soc_mode="hard",
+        enforce_final_soc_min_flag=False,
+        allow_terminal_soc_repair_in_strict=False,
+    )
+    assert _resolve_final_soc_policy(
+        strict_simulation_validity=True,
+        final_soc_mode="hard_min",
         enforce_final_soc_min_flag=False,
         allow_terminal_soc_repair_in_strict=False,
     )
@@ -3133,8 +3140,8 @@ def test_bcm_capacity_lockbook_uses_active_quantile_price_when_point_price_missi
         global_end_utc=target_hours[-1],
     )
 
-    assert lock_pos and all(float(v) == pytest.approx(2.0) for v in lock_pos.values())
-    assert lock_neg and all(float(v) == pytest.approx(3.0) for v in lock_neg.values())
+    assert lock_pos and all(float(v) == pytest.approx(1.0) for v in lock_pos.values())
+    assert lock_neg and all(float(v) == pytest.approx(2.0) for v in lock_neg.values())
     assert lock_price_pos and all(float(v) == pytest.approx(8.75) for v in lock_price_pos.values())
     assert lock_price_neg and all(float(v) == pytest.approx(4.75) for v in lock_price_neg.values())
 
@@ -11854,6 +11861,34 @@ def test_hard_final_soc_mode_invalidates_shortfall() -> None:
         assert float(s.get("simulation_valid", 1.0)) == 0.0
 
 
+def test_hard_min_final_soc_mode_accepts_surplus_without_liquidation() -> None:
+    bt = _mk_backtester()
+    bt.final_soc_mode = "hard_min"
+    bt.soc_init = 12.0
+    bt.soc_target_end = 10.0
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.aux_active_mw = 0.0
+    df, col = _tiny_backtest_df(hours=4)
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=False,
+        strict_simulation_validity=True,
+        enforce_final_soc_min=True,
+        allowed_markets=(),
+    )
+    s = out.summary
+    assert str(s.get("final_soc_mode")) == "hard_min"
+    assert str(s.get("final_soc_check_mode")) == "minimum_target"
+    assert float(s.get("final_soc_actual_mwh")) == pytest.approx(12.0)
+    assert float(s.get("final_soc_surplus_mwh")) == pytest.approx(2.0)
+    assert float(s.get("terminal_soc_liquidation_revenue_eur")) == pytest.approx(0.0)
+    assert float(s.get("final_soc_physical_check_pass")) == pytest.approx(1.0)
+    assert float(s.get("final_soc_check_pass")) == pytest.approx(1.0)
+
+
 def test_hard_mode_final_soc_slack_not_used() -> None:
     bt = _mk_backtester()
     bt.final_soc_mode = "hard"
@@ -12072,6 +12107,92 @@ def test_da_precommit_zeroes_when_no_nonzero_schedule_feasible() -> None:
         for r in audit
     )
     assert all(str(r["selected_incumbent"]) in {"zeroed_candidate", "no_trade"} for r in audit)
+
+
+def test_canonical_da_prewrite_derates_early_sell_before_lockbook() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    rows = _da_lock_rows(hours=3, soc_start=3.0)
+    ts = pd.to_datetime(rows[col.timestamp], utc=True)
+
+    accepted, diag, by_ts = bt._canonical_da_lockbook_prewrite_replay(
+        accepted_da={
+            pd.Timestamp(ts.iloc[0]): (0.0, 2.0),
+            pd.Timestamp(ts.iloc[1]): (5.0, 0.0),
+            pd.Timestamp(ts.iloc[2]): (0.0, 1.0),
+        },
+        current_soc_mwh=3.0,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert float(diag["da_canonical_prewrite_replay_checked"]) == pytest.approx(1.0)
+    assert float(diag["da_canonical_prewrite_invariant_pass"]) == pytest.approx(1.0)
+    assert accepted[pd.Timestamp(ts.iloc[0])] == pytest.approx((0.0, 1.0))
+    assert accepted[pd.Timestamp(ts.iloc[1])] == pytest.approx((5.0, 0.0))
+    assert accepted[pd.Timestamp(ts.iloc[2])] == pytest.approx((0.0, 1.0))
+    assert float(diag["da_canonical_prewrite_replay_derated_sell_mwh"]) == pytest.approx(1.0)
+    assert str(by_ts[pd.Timestamp(ts.iloc[0])]["da_settlement_equiv_replay_reason"]) == (
+        "derated_sell_to_settlement_equivalent_footroom"
+    )
+
+
+def test_canonical_da_prewrite_derates_buy_near_soc_max_before_lockbook() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    rows = _da_lock_rows(hours=1, soc_start=17.8)
+    ts = pd.Timestamp(pd.to_datetime(rows[col.timestamp].iloc[0], utc=True))
+
+    accepted, diag, by_ts = bt._canonical_da_lockbook_prewrite_replay(
+        accepted_da={ts: (1.0, 0.0)},
+        current_soc_mwh=17.8,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert accepted[ts] == pytest.approx((0.2, 0.0))
+    assert float(diag["da_canonical_prewrite_replay_derated_buy_mwh"]) == pytest.approx(0.8)
+    assert str(by_ts[ts]["da_settlement_equiv_replay_reason"]) == "derated_buy_to_settlement_equivalent_headroom"
+
+
+def test_canonical_da_prewrite_rejects_terminal_shortfall_without_repair() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    bt.final_soc_mode = "hard"
+    bt.soc_target_end = 10.0
+    rows = _da_lock_rows(hours=1, soc_start=10.0)
+    ts = pd.Timestamp(pd.to_datetime(rows[col.timestamp].iloc[0], utc=True))
+    global_end = ts
+
+    accepted, diag, _ = bt._canonical_da_lockbook_prewrite_replay(
+        accepted_da={ts: (0.0, 1.0)},
+        current_soc_mwh=10.0,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=global_end,
+    )
+
+    assert accepted == {}
+    assert float(diag["da_canonical_prewrite_replay_rejected_no_feasible_subset"]) == pytest.approx(1.0)
+    assert str(diag["da_canonical_prewrite_replay_reason"]) in {
+        "derated_sell_to_hard_final_soc",
+        "terminal_repair_missing",
+        "prelock_repair_no_feasible_subset",
+    }
 
 
 def test_da_postlock_future_guard_rejects_future_infeasible_candidate_and_accepts_feasible() -> None:
@@ -14199,6 +14320,53 @@ def test_fixed_obligation_replay_allows_da_buy_when_same_hour_aux_preserves_soc_
     assert float(diag["fixed_obligation_replay_max_soc_mwh"]) == pytest.approx(17.982919)
 
 
+def test_fixed_obligation_replay_multi2_shape_uses_executed_soc_anchor() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.94365
+    bt.eta_out = 0.94365
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    col = BacktestColumnMap()
+    timestamps = list(pd.date_range("2025-06-03T11:00:00Z", "2025-06-04T23:00:00Z", freq="h"))
+    rows = _da_hourly_lock_future_rows(col, timestamps)
+    da_lockbook = {
+        pd.Timestamp("2025-06-03T11:00:00Z"): (9.9, 0.0),
+        pd.Timestamp("2025-06-03T17:00:00Z"): (0.0, 4.7),
+        pd.Timestamp("2025-06-04T05:00:00Z"): (0.0, 7.0),
+        pd.Timestamp("2025-06-04T10:00:00Z"): (7.5, 0.0),
+        pd.Timestamp("2025-06-04T12:00:00Z"): (5.1, 0.0),
+        pd.Timestamp("2025-06-04T17:00:00Z"): (0.0, 7.5),
+        pd.Timestamp("2025-06-04T18:00:00Z"): (0.0, 3.6),
+    }
+
+    executed_anchor_diag = bt._replay_fixed_obligations_diagnostic(
+        current_soc_mwh=7.926810,
+        future_rows=rows,
+        colmap=col,
+        da_lockbook=da_lockbook,
+        fixed_reserve_obligation={},
+        scheduled_id_by_ts={},
+        enforce_final_soc_mwh=None,
+    )
+    stale_anchor_diag = bt._replay_fixed_obligations_diagnostic(
+        current_soc_mwh=13.637137,
+        future_rows=rows,
+        colmap=col,
+        da_lockbook=da_lockbook,
+        fixed_reserve_obligation={},
+        scheduled_id_by_ts={},
+        enforce_final_soc_mwh=None,
+    )
+
+    assert float(executed_anchor_diag["fixed_obligation_replay_pass"]) == pytest.approx(1.0)
+    assert float(executed_anchor_diag["fixed_obligation_replay_max_soc_mwh"]) < bt.soc_max + 1e-9
+    assert str(executed_anchor_diag["fixed_obligation_infeasible_driver"]) == "none"
+    assert float(stale_anchor_diag["fixed_obligation_replay_pass"]) == pytest.approx(0.0)
+    assert str(stale_anchor_diag["fixed_obligation_infeasible_driver"]) == "fixed_da_buy_exceeds_headroom"
+    assert float(stale_anchor_diag["fixed_obligation_replay_max_soc_mwh"]) > bt.soc_max
+
+
 def test_fixed_obligation_replay_classifies_locked_bcm_safety_buffer_shortfall() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -16089,6 +16257,32 @@ def test_terminal_closure_surplus_sells_id_to_target() -> None:
     assert float(diag["terminal_closure_net_pnl_eur"]) == pytest.approx(69.2)
 
 
+def test_terminal_closure_hard_min_retains_surplus_without_liquidation() -> None:
+    bt = _mk_backtester()
+    bt.eta_in = 0.95
+    bt.eta_out = 0.90
+    bt.trans_eur_mwh = 2.0
+    bt.deg_eur_mwh = 10.0
+    bt.aux_trading_mw = 0.0
+
+    diag = bt._terminal_closure_components(
+        final_soc_before_mwh=11.0,
+        buy_price_eur_mwh=100.0,
+        sell_price_eur_mwh=90.0,
+        aux_settlement_price_eur_mwh=80.0,
+        existing_aux_mwh=0.0,
+        allow_surplus_liquidation=False,
+    )
+
+    assert str(diag["terminal_closure_reason"]) == "surplus_retained"
+    assert float(diag["terminal_closure_applied"]) == pytest.approx(0.0)
+    assert float(diag["terminal_closure_id_sell_mwh"]) == pytest.approx(0.0)
+    assert float(diag["terminal_closure_soc_after_mwh"]) == pytest.approx(11.0)
+    assert float(diag["final_soc_target_met_after_closure"]) == pytest.approx(1.0)
+    assert float(diag["terminal_closure_revenue_eur"]) == pytest.approx(0.0)
+    assert float(diag["terminal_closure_net_pnl_eur"]) == pytest.approx(0.0)
+
+
 def test_terminal_closure_includes_recovery_induced_aux_delta() -> None:
     bt = _mk_backtester()
     bt.eta_in = 0.95
@@ -17909,6 +18103,55 @@ def test_bcm_naive_rejects_pos_capacity_when_soc_at_min_and_activation_requested
     )
 
 
+def test_bcm_reserve_buffer_id_repair_keeps_pos_capacity_when_prior_repair_feasible() -> None:
+    bt = _configure_bcm_naive_guard_test_backtester()
+    bt.reserve_activation_headroom_h = 0.5
+    bt.aux_off_mw = 0.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    col, snapshot_ts, target_hours, snap, src = _bcm_naive_guard_inputs(
+        bt,
+        reserve_pos_mw=4.0,
+        reserve_neg_mw=0.0,
+        rate_pos=0.0,
+        rate_neg=0.0,
+    )
+    repair_ts = pd.Timestamp(target_hours[0]) - pd.Timedelta(hours=1)
+    repair_row = src.iloc[[0]].copy()
+    repair_row.index = pd.DatetimeIndex([repair_ts])
+    src = pd.concat([repair_row, src]).sort_index()
+    lock_pos: dict[pd.Timestamp, float] = {}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    repairs: dict[pd.Timestamp, dict[str, object]] = {}
+
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=False,
+        global_end_utc=target_hours[-1],
+        current_soc_mwh=bt.soc_min,
+        reserve_buffer_repair_by_ts=repairs,
+    )
+
+    assert all(float(v) == pytest.approx(4.0) for v in lock_pos.values())
+    assert repair_ts in repairs
+    assert float(repairs[repair_ts]["charge_mw"]) >= 4.0
+    assert float(repairs[repair_ts]["charge_mw"]) <= bt.p_max_mw
+    assert str(repairs[repair_ts]["reason"]) == "reserve_buffer_recovery"
+    assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_reserve_buffer_repair_attempted"].values())
+    assert all(float(v) >= 4.0 for v in pre["bcm_reserve_buffer_repair_scheduled_mwh"].values())
+    assert all(str(v) == "reserve_buffer_repair_scheduled" for v in pre["bcm_reserve_buffer_repair_reason"].values())
+    assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_reserve_buffer_replay_pass"].values())
+
+
 def test_bcm_naive_uses_executed_soc_and_activation_headroom_floor() -> None:
     bt = _configure_bcm_naive_guard_test_backtester()
     bt.reserve_activation_headroom_h = 0.5
@@ -17989,8 +18232,8 @@ def test_bcm_naive_derates_pos_capacity_to_deliverable_energy() -> None:
         current_soc_mwh=bt.soc_min + 2.0,
     )
 
-    assert all(float(v) == pytest.approx(1.0) for v in lock_pos.values())
-    assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_precommit_locked_pos_mw"].values())
+    assert all(float(v) == pytest.approx(0.0) for v in lock_pos.values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_precommit_locked_pos_mw"].values())
     assert all(float(v) == pytest.approx(8.0) for v in pre["bcm_replay_required_pos_internal_mwh"].values())
     assert all(float(v) == pytest.approx(2.0) for v in pre["bcm_replay_available_pos_internal_mwh"].values())
     assert all(
@@ -18000,6 +18243,10 @@ def test_bcm_naive_derates_pos_capacity_to_deliverable_energy() -> None:
     assert all(
         float(v) == pytest.approx(0.0)
         for v in pre["bcm_capacity_rejected_missed_activation_pos_mw"].values()
+    )
+    assert all(
+        float(v) == pytest.approx(4.0)
+        for v in pre["bcm_capacity_rejected_protected_soc_pos_mw"].values()
     )
 
 
@@ -18160,9 +18407,9 @@ def test_bcm_rhpf_derates_pos_capacity_to_protected_soc_feasible_level() -> None
         current_soc_mwh=bt.soc_min + 2.0,
     )
 
-    assert all(float(v) == pytest.approx(3.0) for v in lock_pos.values())
+    assert all(float(v) == pytest.approx(2.0) for v in lock_pos.values())
     assert all(
-        float(v) == pytest.approx(3.0)
+        float(v) == pytest.approx(4.0)
         for v in pre["bcm_capacity_derated_protected_soc_pos_mw"].values()
     )
     assert all(
@@ -18582,8 +18829,8 @@ def test_bcm_precommit_expected_delivery_guard_uses_reserve_headroom_floor() -> 
         current_soc_mwh=bt.soc_min + 2.0,
     )
 
-    assert all(float(v) == pytest.approx(3.0) for v in pre["bcm_precommit_locked_pos_mw"].values())
-    assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_pos_derated_by_expected_delivery_guard_mw"].values())
+    assert all(float(v) == pytest.approx(2.0) for v in pre["bcm_precommit_locked_pos_mw"].values())
+    assert all(float(v) == pytest.approx(2.0) for v in pre["bcm_pos_derated_by_expected_delivery_guard_mw"].values())
     assert all(
         str(v) == "pos_expected_activation_not_deliverable"
         for v in pre["bcm_precommit_expected_delivery_guard_reason"].values()
