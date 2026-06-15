@@ -67,9 +67,7 @@ BACKTEST_LINE_STYLES: Dict[str, Dict[str, object]] = {
     "naive": {"color": THESIS_PALETTE["naive"], "linestyle": "-", "linewidth": 2.0},
     "rolling_perfect_foresight": {
         "color": THESIS_PALETTE["perfect_foresight"],
-        "linestyle": ":",
-        "marker": ".",
-        "markevery": 12,
+        "linestyle": "--",
         "linewidth": 2.0,
     },
     "global_hindsight_perfect_foresight": {

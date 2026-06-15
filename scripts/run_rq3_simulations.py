@@ -47,7 +47,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--allow-partial-results", action="store_true")
     ap.add_argument("--allow-missing-models", action="store_true")
     ap.add_argument("--da-quantile-role", default="mid")
-    ap.add_argument("--final-soc-mode", default="hard")
+    ap.add_argument("--final-soc-mode", default="hard_min")
     ap.add_argument("--strict-simulation-validity", dest="strict_simulation_validity", action="store_true")
     ap.add_argument("--no-strict-simulation-validity", dest="strict_simulation_validity", action="store_false")
     ap.set_defaults(strict_simulation_validity=True)

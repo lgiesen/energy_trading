@@ -40,7 +40,7 @@ MODEL_SPECS = {
     "reserve_power_safety_mw": 0.05,
     "reserve_bid_derate": 1.0,
     "max_reserve_bid_mw": None,
-    "final_soc_mode": "terminal_repair",
+    "final_soc_mode": "hard_min",
     # DA postlock guard:
     # - recoverability_aware rejects hard local infeasibility but allows terminal
     #   shortfall that can be recovered by future DA/ID/terminal recourse.

@@ -71,7 +71,7 @@ def test_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.da_quantile_role == "mid"
     assert args.quantile_pairs == "p50-p50"
     assert args.strict_simulation_validity is True
-    assert args.final_soc_mode == "hard"
+    assert args.final_soc_mode == "hard_min"
     assert args.clean_output is True
     assert args.enable_global_perfect_foresight is True
 
@@ -191,7 +191,7 @@ def test_cumulative_pnl_plot_includes_validated_global_perfect_foresight(tmp_pat
 def test_cumulative_pnl_uses_thesis_benchmark_styles() -> None:
     assert get_backtest_line_style("naive")["color"] == THESIS_PALETTE["naive"]
     assert get_backtest_line_style("rolling_perfect_foresight")["color"] == THESIS_PALETTE["perfect_foresight"]
-    assert get_backtest_line_style("rolling_perfect_foresight")["linestyle"] == ":"
+    assert get_backtest_line_style("rolling_perfect_foresight")["linestyle"] == "--"
     assert get_backtest_line_style("global_hindsight_perfect_foresight")["color"] == THESIS_PALETTE["perfect_foresight"]
     assert get_backtest_line_style("global_hindsight_perfect_foresight")["linestyle"] == "--"
 

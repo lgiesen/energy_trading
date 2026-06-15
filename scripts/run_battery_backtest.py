@@ -752,41 +752,17 @@ def _plot_cumulative_pnl(
     d["model_cum_pnl_eur"] = pd.to_numeric(d["real_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
     d["naive_cum_pnl_eur"] = pd.to_numeric(d["naive_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
     d["perfect_foresight_cum_pnl_eur"] = pd.to_numeric(d["perfect_foresight_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
-    show_global_pf = False
-    if "global_perfect_foresight_pnl_eur" in d.columns:
-        global_pnl = pd.to_numeric(d["global_perfect_foresight_pnl_eur"], errors="coerce")
-        if summary is None:
-            show_global_pf = bool(global_pnl.notna().any())
-        else:
-            available = float(
-                pd.to_numeric(
-                    pd.Series([summary.get("global_perfect_foresight_available", 0.0)]),
-                    errors="coerce",
-                )
-                .fillna(0.0)
-                .iloc[0]
-            )
-            show_global_pf = bool(available >= 0.5 and global_pnl.notna().any())
-        if show_global_pf:
-            d["global_perfect_foresight_cum_pnl_eur"] = global_pnl.fillna(0.0).cumsum()
 
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(d[ts_col], d["model_cum_pnl_eur"], label="Model", **get_backtest_line_style("model"))
-    ax.plot(d[ts_col], d["naive_cum_pnl_eur"], label="Naive 24h", **get_backtest_line_style("naive"))
+    ax.plot(d[ts_col], d["naive_cum_pnl_eur"], label="Naive", **get_backtest_line_style("naive"))
     ax.plot(
         d[ts_col],
         d["perfect_foresight_cum_pnl_eur"],
-        label="RollingPerfectForesightSameRules",
+        label="RHPF",
         **get_backtest_line_style("rolling_perfect_foresight"),
     )
-    if show_global_pf:
-        ax.plot(
-            d[ts_col],
-            d["global_perfect_foresight_cum_pnl_eur"],
-            label="GlobalHindsightPerfectForesight",
-            **get_backtest_line_style("global_hindsight_perfect_foresight"),
-        )
     ax.set_title("Cumulative PnL Contribution")
     ax.set_xlabel("Time (UTC)")
     ax.set_ylabel("Cumulative PnL [EUR]")
@@ -4166,8 +4142,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--final-soc-mode",
         choices=["terminal_repair", "hard", "hard_min"],
-        default="hard",
-        help="Final SoC policy: hard exact target (default), hard_min lower bound, or terminal_repair.",
+        default="hard_min",
+        help="Final SoC policy: hard_min lower bound (default), hard exact target, or terminal_repair.",
     )
     p.add_argument(
         "--enforce-final-soc-min",
