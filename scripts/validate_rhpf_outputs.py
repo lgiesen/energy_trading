@@ -277,6 +277,32 @@ def _validate_bcm(result: ScenarioResult, summary: dict[str, Any], hourly: pd.Da
             result.fail("RHPF awarded/locked BCM MW exists but capacity revenue is zero/non-positive")
 
 
+def _validate_rhpf_bcm_protected_diagnostics(
+    result: ScenarioResult,
+    summary: dict[str, Any],
+    hourly: pd.DataFrame,
+    rolling_pf: pd.DataFrame,
+) -> None:
+    reasons = ",".join(
+        [
+            _safe_str(summary.get("rhpf_invalid_reason")),
+            _safe_str(summary.get("rolling_pf_reported_invalid_reason")),
+            _safe_str(summary.get("rolling_pf_solver_invalid_reason")),
+        ]
+    )
+    if "protected_soc" not in reasons:
+        return
+    required_cols = {
+        "rolling_pf_bcm_protected_forward_replay_pass",
+        "rolling_pf_bcm_protected_soc_replay_pass",
+    }
+    has_summary_diag = any(col in summary for col in required_cols)
+    has_hourly_diag = not hourly.empty and any(col in hourly.columns for col in required_cols)
+    has_pf_diag = not rolling_pf.empty and any(col in rolling_pf.columns for col in required_cols)
+    if not (has_summary_diag or has_hourly_diag or has_pf_diag):
+        result.fail("RHPF protected_soc invalidity lacks rolling_pf BCM protected prelock diagnostics")
+
+
 def _validate_bem(result: ScenarioResult, hourly: pd.DataFrame, tol: float) -> None:
     if hourly.empty:
         result.warn("cannot validate BEM activation reconciliation because backtest_hourly.parquet is missing")
@@ -359,6 +385,8 @@ def _collect_rows(result: ScenarioResult, summary: dict[str, Any], hourly: pd.Da
         "simulation_valid",
         "thesis_reportable",
         "invalid_reason",
+        "rhpf_simulation_valid",
+        "rhpf_invalid_reason",
         "fallback_used",
         "optimization_error_code_counts",
         "rolling_pf_da_zero_trade_reason",
@@ -371,6 +399,10 @@ def _collect_rows(result: ScenarioResult, summary: dict[str, Any], hourly: pd.Da
         "rolling_pf_bcm_first_side_mismatch_ts_utc",
         "rolling_pf_bcm_activation_revenue_gap_eur",
         "rolling_pf_bcm_capacity_revenue_gap_eur",
+        "rolling_pf_bcm_protected_forward_replay_pass",
+        "rolling_pf_bcm_protected_soc_replay_pass",
+        "rolling_pf_bcm_first_protected_soc_violation_ts_utc",
+        "rolling_pf_bcm_protected_soc_rejection_reason",
         "rolling_pf_reported_invalid_reason",
         "bcm_capacity_price_missing_for_awarded_capacity_count",
     ]
@@ -404,6 +436,7 @@ def validate_scenario(scenario_dir: Path, tol: float, *, allow_fallback_benchmar
         _validate_da(result, summary)
     if "bcm" in strategy or "afrr" in strategy or strategy == "multi":
         _validate_bcm(result, summary, hourly)
+        _validate_rhpf_bcm_protected_diagnostics(result, summary, hourly, rolling_pf)
     if "bem" in strategy or strategy == "multi":
         _validate_bem(result, hourly, tol)
     if strategy == "multi":

@@ -215,6 +215,57 @@ def test_validation_collect_reports_exact_summary_paths_and_power_stack(tmp_path
     assert float(df.loc[df["quantile_pair"].eq("p10_p10"), "max_real_power_violation_discharge_mw"].iloc[0]) == 0.25
 
 
+def test_collect_missing_scenario_artifacts_from_strategy_overview(tmp_path: Path) -> None:
+    scenario_dir = tmp_path / "multi" / "p90_p90"
+    scenario_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "scenario": "p90_p90",
+                "trading_strategy": "multi",
+                "output_dir": str(scenario_dir),
+                "naive_simulation_valid": 1.0,
+                "naive_invalid_reason": "none",
+            }
+        ]
+    ).to_csv(tmp_path / "strategy_overview.csv", index=False)
+
+    rows = validate_outputs._collect_missing_scenario_artifacts(tmp_path)
+
+    assert len(rows) == 1
+    assert rows[0]["scenario_path"] == str(scenario_dir)
+    assert "scenario_artifacts_missing" in rows[0]["missing_fields"]
+    assert "naive_hourly.parquet" in rows[0]["missing_fields"]
+
+
+def test_collect_path_validity_mismatch_flags_naive_global_validity_leak(tmp_path: Path) -> None:
+    pd.DataFrame(
+        [
+            {
+                "scenario": "p90_p90",
+                "simulation_valid": 0.0,
+                "active_path_simulation_valid": 0.0,
+                "naive_simulation_valid": 1.0,
+                "rhpf_simulation_valid": 0.0,
+            }
+        ]
+    ).to_csv(tmp_path / "strategy_overview.csv", index=False)
+    pd.DataFrame(
+        [
+            {"scenario": "p90_p90", "path_type": "model", "validity_flag": 0.0},
+            {"scenario": "p90_p90", "path_type": "naive", "validity_flag": 0.0},
+            {"scenario": "p90_p90", "path_type": "rhpf", "validity_flag": 0.0},
+        ]
+    ).to_parquet(tmp_path / "performance_paths_long.parquet", index=False)
+
+    rows = validate_outputs._collect_path_validity_mismatches(tmp_path)
+
+    assert len(rows) == 1
+    assert rows[0]["path_type"] == "naive"
+    assert rows[0]["expected_validity_flag"] == 1.0
+    assert rows[0]["actual_validity_flag"] == "0.0"
+
+
 def test_validation_collect_surfaces_global_pf_component_gap(tmp_path: Path) -> None:
     gap = {
         "bcm_capacity_revenue": {

@@ -1876,6 +1876,7 @@ PERFORMANCE_PATHS_LONG_COLUMNS = [
     "throughput_mwh",
     "soc_mwh",
     "validity_flag",
+    "path_invalid_reason",
     "available",
 ]
 
@@ -1916,6 +1917,57 @@ def _build_performance_paths_long(
 ) -> pd.DataFrame:
     rows: list[pd.DataFrame] = []
     q_low, q_high = _quantile_low_high(scenario_name, scenario_bins)
+
+    def _summary_float(*keys: str, default: float = np.nan) -> float:
+        for key in keys:
+            if key not in summary:
+                continue
+            val = pd.to_numeric(pd.Series([summary.get(key)]), errors="coerce").iloc[0]
+            if pd.notna(val):
+                return float(val)
+        return float(default)
+
+    def _summary_reason(*keys: str) -> str:
+        for key in keys:
+            if key not in summary:
+                continue
+            val = summary.get(key)
+            if val is None:
+                continue
+            txt = str(val).strip()
+            if txt and txt.lower() not in {"nan", "none"}:
+                return txt
+        return "none"
+
+    def _path_validity(path_type: str) -> tuple[float, str]:
+        if path_type == "model":
+            valid = _summary_float("active_path_simulation_valid", "simulation_valid")
+            reason = _summary_reason("active_path_invalid_reason", "invalid_reason")
+        elif path_type == "naive":
+            valid = _summary_float("naive_simulation_valid")
+            reason = _summary_reason("naive_invalid_reason")
+        elif path_type == "rhpf":
+            valid = _summary_float("rhpf_simulation_valid")
+            reason = _summary_reason("rhpf_invalid_reason", "rolling_pf_reported_invalid_reason")
+        elif path_type == "ghpf":
+            valid = _summary_float(
+                "global_pf_simulation_valid",
+                "global_perfect_foresight_simulation_valid",
+                "global_pf_available",
+                "global_perfect_foresight_available",
+            )
+            reason = _summary_reason(
+                "global_pf_invalid_reason",
+                "global_perfect_foresight_invalid_reason",
+                "global_pf_failure_reason",
+            )
+        else:
+            valid = _summary_float("simulation_valid")
+            reason = _summary_reason("invalid_reason")
+        if pd.isna(valid):
+            valid = _summary_float("simulation_valid")
+        return float(valid), reason
+
     for path_type, prefix in _PATH_PREFIX.items():
         available = float(pd.to_numeric(pd.Series([summary.get(f"{path_type}_available", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
         if available < 0.5:
@@ -1942,6 +1994,7 @@ def _build_performance_paths_long(
         revenue_id = col("revenue_id_eur")
         cost_id = col("cost_id_eur")
         throughput_mwh = _compute_path_hourly_throughput_mwh(h, prefix, strict_missing_real_sources=False)
+        path_validity_flag, path_invalid_reason = _path_validity(path_type)
         out = pd.DataFrame(
             {
                 "scenario": str(scenario_name),
@@ -1971,7 +2024,8 @@ def _build_performance_paths_long(
                 "penalty_cost_eur": col("penalty_eur"),
                 "throughput_mwh": throughput_mwh,
                 "soc_mwh": col("soc_mwh"),
-                "validity_flag": float(pd.to_numeric(pd.Series([summary.get("simulation_valid", np.nan)]), errors="coerce").iloc[0]),
+                "validity_flag": float(path_validity_flag),
+                "path_invalid_reason": str(path_invalid_reason),
                 "available": available,
             }
         )
@@ -2008,12 +2062,26 @@ def _build_daily_performance_paths_long(paths_long: pd.DataFrame) -> pd.DataFram
     for c in sum_cols + ["soc_mwh", "validity_flag", "available"]:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
-    agg = d.groupby(group_cols, dropna=False).agg(
-        {**{c: "sum" for c in sum_cols}, "soc_mwh": ["mean", "last"], "validity_flag": "last", "available": "last"}
-    )
+    agg_spec = {
+        **{c: "sum" for c in sum_cols},
+        "soc_mwh": ["mean", "last"],
+        "validity_flag": "last",
+        "available": "last",
+    }
+    if "path_invalid_reason" in d.columns:
+        agg_spec["path_invalid_reason"] = "last"
+    agg = d.groupby(group_cols, dropna=False).agg(agg_spec)
     agg.columns = ["_".join([x for x in tup if x]) for tup in agg.columns.to_flat_index()]
     agg = agg.reset_index()
-    agg = agg.rename(columns={"soc_mwh_mean": "soc_mean_mwh", "soc_mwh_last": "soc_end_mwh", "validity_flag_last": "validity_flag", "available_last": "available"})
+    agg = agg.rename(
+        columns={
+            "soc_mwh_mean": "soc_mean_mwh",
+            "soc_mwh_last": "soc_end_mwh",
+            "validity_flag_last": "validity_flag",
+            "path_invalid_reason_last": "path_invalid_reason",
+            "available_last": "available",
+        }
+    )
     agg["cum_pnl_eur"] = agg.groupby(["scenario", "strategy", "model_key", "split", "quantile_low", "quantile_high", "path_type"], dropna=False)["pnl_eur_sum"].cumsum()
     agg = agg.rename(columns={f"{c}_sum": c for c in sum_cols})
     return agg

@@ -1174,6 +1174,49 @@ def test_da_price_taker_policy_accepts_submitted_quantity_without_price_rejectio
     assert str(out["da_settlement_price_source"]) == "true_da_clearing_price"
 
 
+def test_da_price_taker_sell_bypasses_standalone_margin_filter() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.da_execution_policy = "price_taker"
+    bt.da_execution_mode = "price_taker"
+    bt.bid_builder.da_mode = "price_taker"
+    bt.market_clearing_engine.da_mode_default = "price_taker"
+    # Accepted DA packages can require an individually low-margin sell to create
+    # headroom for later lockbook buys. Price-taker execution must submit it.
+    bt.bid_builder.mc_neg = 60.0
+
+    out = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2026-01-01T00:00:00Z"),
+        planned_charge_mw=0.0,
+        planned_discharge_mw=9.5,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        pred_da_price=14.0,
+        true_da_price=7.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=0.0,
+        true_act_pos=0.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=0.0,
+        true_rate_neg=0.0,
+        soc_now=12.0,
+    )
+
+    assert str(out["da_execution_policy"]) == "price_taker"
+    assert float(out["da_price_taker_mode"]) == pytest.approx(1.0)
+    assert float(out["submitted_da_sell_mw"]) == pytest.approx(9.5)
+    assert float(out["da_submitted_sell_mwh"]) == pytest.approx(9.5)
+    assert float(out["executed_discharge_mw"]) == pytest.approx(9.5)
+    assert float(out["da_auction_accepted_sell_mwh"]) == pytest.approx(9.5)
+    assert float(out["da_physical_lockbook_sell_mwh"]) == pytest.approx(9.5)
+    assert float(out["da_price_rejected_sell_mwh"]) == pytest.approx(0.0)
+    assert str(out["da_sell_reason"]) == "price_taker"
+
+
 def test_bcm_award_probability_convention_uses_one_minus_quantile() -> None:
     bt = _mk_backtester()
     bt.afrr_quantile_bins = ["p30", "p90"]
@@ -6447,6 +6490,49 @@ def test_da_sizer_rejects_local_profit_when_terminal_recovery_cost_makes_incumbe
     assert str(audit[0]["da_precommit_final_selection_reason"]) != (
         "optimized_predicted_replay_dominates_or_incumbent_infeasible"
     )
+
+
+def test_da_full_window_sizer_can_trade_future_rows_outside_candidate_support() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.soc_min = 0.0
+    bt.soc_max = 10.0
+    bt.p_max_mw = 10.0
+    ts = pd.date_range("2025-01-02T00:00:00Z", periods=3, freq="h")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            col.pred_da_price: [0.0, -100.0, 100.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0],
+        }
+    )
+    lock_rows = future_rows.iloc[[0]].copy()
+    lock_rows["charge_mw"] = [0.1]
+    lock_rows["discharge_mw"] = [0.0]
+    lock_rows["predicted_objective_eur"] = [0.0]
+
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=lock_rows,
+        colmap=col,
+        current_soc_mwh=5.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=future_rows,
+        existing_da_lockbook={},
+        allow_full_window_sizer=True,
+    )
+
+    assert str(audit[0]["da_bid_sizer_method"]) == "linprog_full_window_continuous_per_hour"
+    assert selected[pd.Timestamp(ts[1])][0] > 0.0
+    assert selected[pd.Timestamp(ts[2])][1] > 0.0
 
 
 def test_negative_activation_delivered_revenue_sign_convention() -> None:
@@ -18129,6 +18215,68 @@ def test_bcm_rhpf_derates_pos_capacity_for_sequential_block_drain() -> None:
     )
 
 
+def test_bcm_rhpf_protected_forward_replay_includes_da_lockbook_effects() -> None:
+    bt = _configure_bcm_rhpf_protected_soc_test_backtester()
+    col, snapshot_ts, target_hours, snap, src = _bcm_naive_guard_inputs(
+        bt,
+        reserve_pos_mw=2.0,
+        reserve_neg_mw=0.0,
+        rate_pos=0.0,
+        rate_neg=0.0,
+    )
+    baseline_lock_pos: dict[pd.Timestamp, float] = {}
+    baseline_pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=baseline_lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=baseline_pre,
+        is_perfect_foresight=True,
+        global_end_utc=target_hours[-1],
+        current_soc_mwh=bt.soc_min + 2.0,
+    )
+    assert all(float(v) == pytest.approx(2.0) for v in baseline_lock_pos.values())
+    assert all(str(v) == "none" for v in baseline_pre["bcm_protected_soc_rejection_reason"].values())
+
+    lock_pos: dict[pd.Timestamp, float] = {}
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    da_lockbook = {pd.Timestamp(target_hours[0]): (0.0, 1.5)}
+
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=True,
+        global_end_utc=target_hours[-1],
+        current_soc_mwh=bt.soc_min + 2.0,
+        da_lockbook=da_lockbook,
+    )
+
+    assert all(0.0 <= float(v) < 2.0 for v in lock_pos.values())
+    assert any(
+        float(v) > 0.0 for v in pre["bcm_capacity_derated_protected_soc_pos_mw"].values()
+    )
+    assert all(
+        str(v) == "protected_soc_prevented_pos"
+        for v in pre["bcm_protected_soc_rejection_reason"].values()
+    )
+    assert any(
+        str(v) == pd.Timestamp(target_hours[0]).isoformat()
+        for v in pre["bcm_first_protected_soc_violation_ts_utc"].values()
+    )
+
+
 def test_bcm_rhpf_existing_pos_obligations_consume_protected_soc_capacity() -> None:
     bt = _configure_bcm_rhpf_protected_soc_test_backtester()
     col, snapshot_ts, target_hours, snap, src = _bcm_naive_guard_inputs(
@@ -18250,6 +18398,59 @@ def test_bcm_rhpf_valid_capacity_survives_protected_soc_guard() -> None:
     assert all(float(v) == pytest.approx(2.0) for v in lock_neg.values())
     assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_protected_soc_replay_pass"].values())
     assert all(str(v) == "none" for v in pre["bcm_protected_soc_rejection_reason"].values())
+
+
+def test_bcm_rhpf_protected_final_award_guard_caps_unsafe_clearing_award(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _configure_bcm_rhpf_protected_soc_test_backtester()
+    col, snapshot_ts, target_hours, snap, src = _bcm_naive_guard_inputs(
+        bt,
+        reserve_pos_mw=9.0,
+        reserve_neg_mw=0.0,
+        rate_pos=0.0,
+        rate_neg=0.0,
+    )
+    lock_pos: dict[pd.Timestamp, float] = {}
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+
+    def _unsafe_clear(*args, **kwargs) -> AFRRCapacityClearingResult:
+        return AFRRCapacityClearingResult(
+            submitted_pos_mw=6.0,
+            submitted_neg_mw=0.0,
+            awarded_pos_mw=9.0,
+            awarded_neg_mw=0.0,
+            pos_awarded=True,
+            neg_awarded=False,
+        )
+
+    monkeypatch.setattr(bt, "_clear_afrr_capacity_block_against_truth", _unsafe_clear)
+
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=True,
+        global_end_utc=target_hours[-1],
+        current_soc_mwh=bt.soc_min + 3.0,
+    )
+
+    assert all(0.0 < float(v) < 9.0 for v in lock_pos.values())
+    assert all(float(v) <= 6.0 + 1e-9 for v in pre["bcm_precommit_locked_pos_mw"].values())
+    assert all(
+        str(v) == "protected_soc_prevented_pos"
+        for v in pre["bcm_protected_soc_rejection_reason"].values()
+    )
+    assert all(
+        float(v) >= 3.0
+        for v in pre["bcm_capacity_derated_protected_soc_pos_mw"].values()
+    )
 
 
 def test_bcm_rhpf_precommit_expected_delivery_guard_uses_true_activation_rate() -> None:
@@ -21404,17 +21605,39 @@ def test_performance_paths_long_contains_only_enabled_paths_and_stable_schema() 
             "naive_soc_mwh": [10.0, 10.0],
         }
     )
+    hourly_rhpf = pd.DataFrame(
+        {
+            "timestamp_utc": pd.date_range("2025-01-01", periods=2, freq="h", tz="UTC"),
+            "perfect_foresight_pnl_eur": [2.0, 3.0],
+            "perfect_foresight_revenue_da_eur": [3.0, 4.0],
+            "perfect_foresight_cost_da_eur": [1.0, 1.0],
+            "perfect_foresight_soc_mwh": [9.0, 9.5],
+        }
+    )
     args = argparse.Namespace(trading_strategy="da", model_key="linear", model="linear", split="test")
     paths = _build_performance_paths_long(
-        isolated_hourly={"model": hourly_model, "naive": hourly_naive},
-        summary={"model_available": 1.0, "naive_available": 1.0, "rhpf_available": 0.0, "ghpf_available": 0.0, "simulation_valid": 1.0},
+        isolated_hourly={"model": hourly_model, "naive": hourly_naive, "rhpf": hourly_rhpf},
+        summary={
+            "model_available": 1.0,
+            "naive_available": 1.0,
+            "rhpf_available": 1.0,
+            "ghpf_available": 0.0,
+            "simulation_valid": 0.0,
+            "invalid_reason": "fallback_used",
+            "active_path_simulation_valid": 0.0,
+            "active_path_invalid_reason": "fallback_used",
+            "naive_simulation_valid": 1.0,
+            "naive_invalid_reason": "none",
+            "rhpf_simulation_valid": 0.0,
+            "rhpf_invalid_reason": "protected_soc",
+        },
         args=args,
         scenario_name="p50_p50",
         scenario_bins=["p50"],
     )
 
-    assert set(paths["path_type"]) == {"model", "naive"}
-    assert len(paths) == 4
+    assert set(paths["path_type"]) == {"model", "naive", "rhpf"}
+    assert len(paths) == 6
     for col in [
         "scenario",
         "strategy",
@@ -21427,17 +21650,29 @@ def test_performance_paths_long_contains_only_enabled_paths_and_stable_schema() 
         "pnl_eur",
         "cum_pnl_eur",
         "net_da_eur",
+        "validity_flag",
+        "path_invalid_reason",
         "available",
     ]:
         assert col in paths.columns
     model = paths.loc[paths["path_type"].eq("model")].sort_values("timestamp_utc")
+    naive = paths.loc[paths["path_type"].eq("naive")].sort_values("timestamp_utc")
+    rhpf = paths.loc[paths["path_type"].eq("rhpf")].sort_values("timestamp_utc")
     assert model["cum_pnl_eur"].iloc[-1] == pytest.approx(3.0)
     assert model["net_da_eur"].iloc[0] == pytest.approx(6.0)
+    assert set(model["validity_flag"]) == {0.0}
+    assert set(model["path_invalid_reason"]) == {"fallback_used"}
+    assert set(naive["validity_flag"]) == {1.0}
+    assert set(naive["path_invalid_reason"]) == {"none"}
+    assert set(rhpf["validity_flag"]) == {0.0}
+    assert set(rhpf["path_invalid_reason"]) == {"protected_soc"}
 
     daily = _build_daily_performance_paths_long(paths)
-    assert set(daily["path_type"]) == {"model", "naive"}
+    assert set(daily["path_type"]) == {"model", "naive", "rhpf"}
     assert "soc_mean_mwh" in daily.columns
     assert "soc_end_mwh" in daily.columns
+    assert float(daily.loc[daily["path_type"].eq("naive"), "validity_flag"].iloc[0]) == pytest.approx(1.0)
+    assert str(daily.loc[daily["path_type"].eq("naive"), "path_invalid_reason"].iloc[0]) == "none"
 
 
 def test_terminal_inventory_main_milp_objective_coefficient_is_negative_lambda() -> None:

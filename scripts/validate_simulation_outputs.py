@@ -349,6 +349,102 @@ def _collect(root: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _collect_missing_scenario_artifacts(root: Path) -> list[dict[str, object]]:
+    missing_rows: list[dict[str, object]] = []
+    required = [
+        "backtest_summary.json",
+        "backtest_hourly.parquet",
+        "naive_hourly.parquet",
+        "rolling_pf_hourly.parquet",
+    ]
+    for overview_path in root.rglob("strategy_overview.csv"):
+        try:
+            overview = pd.read_csv(overview_path)
+        except Exception:
+            continue
+        if overview.empty or "output_dir" not in overview.columns:
+            continue
+        for _, rec in overview.iterrows():
+            raw_dir = str(rec.get("output_dir", "")).strip()
+            if not raw_dir:
+                continue
+            scenario_dir = Path(raw_dir)
+            if not scenario_dir.is_absolute():
+                scenario_dir = (Path.cwd() / scenario_dir).resolve()
+            missing = [name for name in required if not (scenario_dir / name).exists()]
+            if missing:
+                missing_rows.append(
+                    {
+                        "scenario_path": str(scenario_dir),
+                        "scenario": rec.get("scenario", scenario_dir.name),
+                        "trading_strategy": rec.get("trading_strategy", ""),
+                        "missing_fields": ["scenario_artifacts_missing", *missing],
+                    }
+                )
+    return missing_rows
+
+
+def _collect_path_validity_mismatches(root: Path) -> list[dict[str, object]]:
+    mismatches: list[dict[str, object]] = []
+    for paths_path in root.rglob("performance_paths_long.parquet"):
+        overview_path = paths_path.parent / "strategy_overview.csv"
+        if not overview_path.exists():
+            continue
+        try:
+            paths = pd.read_parquet(paths_path)
+            overview = pd.read_csv(overview_path)
+        except Exception:
+            continue
+        if paths.empty or overview.empty or "validity_flag" not in paths.columns:
+            continue
+        for _, rec in overview.iterrows():
+            scenario = str(rec.get("scenario", "")).strip()
+            if not scenario:
+                continue
+            expected_by_path = {
+                "model": _safe_float(
+                    rec.get("active_path_simulation_valid", rec.get("simulation_valid")),
+                    default=float("nan"),
+                ),
+                "naive": _safe_float(rec.get("naive_simulation_valid"), default=float("nan")),
+                "rhpf": _safe_float(rec.get("rhpf_simulation_valid"), default=float("nan")),
+            }
+            for path_type, expected in expected_by_path.items():
+                if pd.isna(expected):
+                    continue
+                rows = paths.loc[
+                    paths.get("scenario", pd.Series("", index=paths.index)).astype(str).eq(scenario)
+                    & paths.get("path_type", pd.Series("", index=paths.index)).astype(str).eq(path_type)
+                ]
+                if rows.empty:
+                    continue
+                actual_vals = pd.to_numeric(rows["validity_flag"], errors="coerce").dropna().unique()
+                if len(actual_vals) == 0:
+                    mismatches.append(
+                        {
+                            "scenario_path": str(paths_path),
+                            "scenario": scenario,
+                            "path_type": path_type,
+                            "missing_fields": ["path_validity_mismatch"],
+                            "expected_validity_flag": float(expected),
+                            "actual_validity_flag": "missing",
+                        }
+                    )
+                    continue
+                if any(abs(float(actual) - float(expected)) > 1e-9 for actual in actual_vals):
+                    mismatches.append(
+                        {
+                            "scenario_path": str(paths_path),
+                            "scenario": scenario,
+                            "path_type": path_type,
+                            "missing_fields": ["path_validity_mismatch"],
+                            "expected_validity_flag": float(expected),
+                            "actual_validity_flag": ",".join(str(float(v)) for v in actual_vals),
+                        }
+                    )
+    return mismatches
+
+
 REQUIRED_SUMMARY_FIELDS = [
     "simulation_schema_version",
     "required_summary_fields_version",
@@ -416,7 +512,36 @@ def main() -> None:
         raise FileNotFoundError(f"Output dir not found: {root}")
 
     df = _collect(root)
+    missing_artifact_rows = _collect_missing_scenario_artifacts(root)
+    path_validity_mismatch_rows = _collect_path_validity_mismatches(root)
     if df.empty:
+        if missing_artifact_rows:
+            print(f"[FAIL] scenario_artifacts_missing under: {root}")
+            for row in missing_artifact_rows:
+                print(f"[FAIL] {row['scenario_path']}: missing {row['missing_fields']}")
+            payload = {
+                "total_scenarios": 0,
+                "valid_scenarios": 0,
+                "invalid_scenarios": 0,
+                "thesis_reportable_scenarios": 0,
+                "invalid_rate_pct": float("nan"),
+                "invalid_by_reason": {"scenario_artifacts_missing": len(missing_artifact_rows)},
+                "invalid_by_quantile": {},
+                "stale_scenarios": missing_artifact_rows,
+                "stale_scenario_count": len(missing_artifact_rows),
+                "required_fields_ok": False,
+                "required_fields_check_pass_rate": float("nan"),
+                "consistency_errors": [],
+            }
+            if args.out_json:
+                Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.out_json).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            if args.out_csv:
+                Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(missing_artifact_rows).to_csv(args.out_csv, index=False)
+            if not args.allow_stale:
+                raise SystemExit("scenario_artifacts_missing")
+            return
         print(f"[WARN] No backtest_summary.json files found under: {root}")
         return
 
@@ -629,6 +754,15 @@ def main() -> None:
     )
     stale_rows = []
     missing_field_errors = []
+    for row in missing_artifact_rows:
+        stale_rows.append(row)
+        missing_field_errors.append(f"{row.get('scenario_path','')}: missing {row.get('missing_fields', [])}")
+    for row in path_validity_mismatch_rows:
+        stale_rows.append(row)
+        missing_field_errors.append(
+            f"{row.get('scenario_path','')}: {row.get('scenario')} {row.get('path_type')} "
+            f"validity_flag={row.get('actual_validity_flag')} expected={row.get('expected_validity_flag')}"
+        )
     for _, r in df.iterrows():
         missing = [f for f in REQUIRED_SUMMARY_FIELDS if (f not in r.index) or _is_missing_required_value(r.get(f))]
         if missing:
@@ -637,6 +771,10 @@ def main() -> None:
     required_fields_ok = (len(stale_rows) == 0) and bool((df["required_fields_check_pass"] >= 0.5).all())
     if not required_fields_ok:
         by_reason["missing_required_fields"] = len(stale_rows)
+        if missing_artifact_rows:
+            by_reason["scenario_artifacts_missing"] = len(missing_artifact_rows)
+        if path_validity_mismatch_rows:
+            by_reason["path_validity_mismatch"] = len(path_validity_mismatch_rows)
         if args.allow_stale:
             thesis = 0
             if "thesis_reportable" in df.columns:
