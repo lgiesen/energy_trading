@@ -5757,7 +5757,9 @@ class BatteryBacktester:
             continuation_value_eur_per_internal_mwh=float(lambda_soc),
             is_terminal_sensitive_window=bool(terminal_sensitive),
             basis=str(terminal_value_mode),
-            price_source=str(colmap.pred_da_price),
+            price_source="causal_da_price_forecast",
+            path_label="model",
+            is_perfect_foresight=False,
         )
         target_relative_terminal_credit = float(terminal_components.terminal_value_eur)
         # DA candidate selection must use the same terminal inventory
@@ -6839,7 +6841,13 @@ class BatteryBacktester:
                 continuation_value_eur_per_internal_mwh=float(lambda_soc),
                 is_terminal_sensitive_window=bool(terminal_sensitive),
                 basis=str(terminal_value_mode),
-                price_source=str(colmap.true_da_price if bool(is_perfect_foresight) else colmap.pred_da_price),
+                price_source=(
+                    "truth_materialized_da_price_for_rhpf"
+                    if bool(is_perfect_foresight)
+                    else "causal_da_price_forecast"
+                ),
+                path_label="rhpf" if bool(is_perfect_foresight) else "model",
+                is_perfect_foresight=bool(is_perfect_foresight),
             )
             explicit_terminal_sizer = bool(
                 bool(terminal_sensitive)

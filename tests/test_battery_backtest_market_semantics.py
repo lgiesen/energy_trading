@@ -6528,9 +6528,55 @@ def test_da_sizer_terminal_sensitive_uses_explicit_recovery_cost_not_scalar_lamb
     assert selected[pd.Timestamp(ts[0])] == pytest.approx((1.0, 0.0))
     assert float(audit[0]["da_bid_sizer_scalar_lambda_disabled_for_terminal_recovery"]) == pytest.approx(1.0)
     assert str(audit[0]["da_bid_sizer_terminal_recovery_cost_units"]) == "eur_per_internal_mwh"
-    assert str(audit[0]["da_bid_sizer_terminal_recovery_cost_price_source"]) == col.pred_da_price
+    assert str(audit[0]["da_bid_sizer_terminal_recovery_cost_price_source"]) == "causal_da_price_forecast"
     assert float(audit[0]["da_bid_sizer_terminal_recovery_cost_eur_per_internal_mwh"]) == pytest.approx(8.5)
     assert float(audit[0]["candidate_selection_pnl_eur"]) > float(audit[0]["incumbent_selection_pnl_eur"])
+
+
+def test_da_terminal_recovery_uses_causal_semantic_source_when_forecast_column_is_target_named() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap(pred_da_price="target_da_price")
+    bt.terminal_value_mode = "terminal_recovery_aware"
+    bt.da_terminal_recovery_lookahead_h = 72.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    ts = pd.date_range("2025-01-02T00:00:00Z", periods=2, freq="h")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            "charge_mw": [1.0, 0.0],
+            "discharge_mw": [0.0, 0.0],
+            col.pred_da_price: [5.0, 10.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+            "predicted_objective_eur": [0.0, 0.0],
+        }
+    )
+
+    replay = bt._replay_da_candidate_cashflow(
+        rows=rows,
+        schedule={pd.Timestamp(ts[0]): (1.0, 0.0)},
+        colmap=col,
+        current_soc_mwh=9.0,
+        global_end_utc=pd.Timestamp("2025-01-04T00:00:00Z"),
+    )
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=9.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=pd.Timestamp("2025-01-04T00:00:00Z"),
+    )
+
+    assert selected
+    assert str(replay["da_terminal_recovery_price_source"]) == "causal_da_price_forecast"
+    assert str(audit[0]["da_bid_sizer_terminal_recovery_cost_price_source"]) == "causal_da_price_forecast"
 
 
 def test_da_sizer_rejects_local_profit_when_terminal_recovery_cost_makes_incumbent_better() -> None:
