@@ -23341,6 +23341,56 @@ def test_bcm_model_hourly_preserves_activation_rate_source_of_truth() -> None:
     assert bt._missing_critical_source_fields == []
 
 
+def test_model_hourly_preserves_canonical_activation_rate_source() -> None:
+    bt = _mk_backtester()
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-01T00:00:00Z")
+    ts1 = pd.Timestamp("2026-01-01T01:00:00Z")
+    combined_hourly_source = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            col.pred_afrr_activation_rate_pos: [0.12, 0.34],
+            col.pred_afrr_activation_rate_neg: [0.21, 0.43],
+        }
+    )
+    model_hourly_export = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            "target_afrr_activation_rate_pos": [0.9, 0.9],
+            "target_afrr_activation_rate_neg": [0.8, 0.8],
+            "real_fixed_reserve_obligation_pos_mw": [1.0, 0.0],
+            "real_fixed_reserve_obligation_neg_mw": [0.0, 1.0],
+        }
+    )
+
+    preserved = bt._preserve_activation_rate_source_of_truth(
+        model_hourly_export,
+        combined_hourly_source,
+        col,
+        context="model_hourly",
+        reserve_active=True,
+    )
+
+    assert preserved[col.pred_afrr_activation_rate_pos].tolist() == pytest.approx([0.12, 0.34])
+    assert preserved[col.pred_afrr_activation_rate_neg].tolist() == pytest.approx([0.21, 0.43])
+    assert not (preserved[col.pred_afrr_activation_rate_pos] == 0.0).any()
+    assert not (preserved[col.pred_afrr_activation_rate_neg] == 0.0).any()
+    assert preserved["target_afrr_activation_rate_pos"].tolist() == pytest.approx([0.9, 0.9])
+    assert bt._missing_critical_source_fields == []
+
+    inactive_export = bt._preserve_activation_rate_source_of_truth(
+        model_hourly_export[[col.timestamp]].copy(),
+        pd.DataFrame({col.timestamp: [ts0, ts1]}),
+        col,
+        context="model_hourly",
+        reserve_active=False,
+    )
+    assert col.pred_afrr_activation_rate_pos not in inactive_export.columns
+    assert col.pred_afrr_activation_rate_neg not in inactive_export.columns
+
+
 def test_bem_settlement_anchor_guard_carries_fixed_reserve_obligation_source() -> None:
     bt = _mk_backtester()
     bt._strategy_permissions = BatteryBacktester.resolve_strategy_permissions(

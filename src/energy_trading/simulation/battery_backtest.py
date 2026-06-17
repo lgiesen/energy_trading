@@ -41891,6 +41891,19 @@ class BatteryBacktester:
             benchmark_paths=benchmark_paths,
         )
         summary = normalize_predicted_pnl_aliases(summary)
+        model_isolated_hourly = real
+        if benchmark_paths.get("model", False):
+            model_isolated_hourly = self._preserve_activation_rate_source_of_truth(
+                model_isolated_hourly,
+                hourly,
+                colmap,
+                context="model_hourly",
+                reserve_active=bool(
+                    getattr(run_strategy_permissions, "allow_bcm", False)
+                    or getattr(run_strategy_permissions, "allow_bem_only", False)
+                    or getattr(run_strategy_permissions, "allow_bcm_activation_obligations", False)
+                ),
+            )
         _safe_write_checkpoint("stage_05_final", frame=None, summary=summary, final_complete=True)
         if checkpoint_path is not None:
             _write_checkpoint_run_status(checkpoint_path, status="complete", metadata=checkpoint_meta)
@@ -41902,7 +41915,7 @@ class BatteryBacktester:
             volatility=volatility,
             summary=summary,
             isolated_hourly={
-                **({"model": real} if benchmark_paths.get("model", False) else {}),
+                **({"model": model_isolated_hourly} if benchmark_paths.get("model", False) else {}),
                 **({"naive": naive_real} if benchmark_paths.get("naive", False) else {}),
                 **({"rhpf": perfect_foresight_real} if benchmark_paths.get("rhpf", False) else {}),
                 "realized_da_only": realized_da_only_hourly,
