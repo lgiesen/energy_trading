@@ -23871,6 +23871,51 @@ def test_bcm_model_hourly_preserves_activation_rate_source_of_truth() -> None:
 
     bt._missing_critical_source_fields = []
     bt._missing_critical_source_reasons = set()
+    ev_alias_source = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            "ev_pred_act_rate_pos_p90": [0.56, 0.78],
+            "ev_pred_act_rate_neg_p90": [0.65, 0.87],
+            "afrr_activation_rate_guard_source_column_pos": [
+                f"{col.pred_afrr_activation_rate_pos}_p90",
+                f"{col.pred_afrr_activation_rate_pos}_p90",
+            ],
+            "afrr_activation_rate_guard_source_column_neg": [
+                f"{col.pred_afrr_activation_rate_neg}_p90",
+                f"{col.pred_afrr_activation_rate_neg}_p90",
+            ],
+            "afrr_activation_rate_guard_quantile_resolved": ["p90", "p90"],
+        }
+    )
+    ev_alias_preserved = bt._preserve_activation_rate_source_of_truth(
+        model_hourly,
+        ev_alias_source,
+        col,
+        context="model_hourly",
+        reserve_active=True,
+    )
+    assert ev_alias_preserved[col.pred_afrr_activation_rate_pos].tolist() == pytest.approx([0.56, 0.78])
+    assert ev_alias_preserved[col.pred_afrr_activation_rate_neg].tolist() == pytest.approx([0.65, 0.87])
+    assert bt._missing_critical_source_fields == []
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    ev_alias_row = pd.Series(
+        {
+            "ev_pred_act_rate_pos_p90": 0.91,
+            "ev_pred_act_rate_neg_p90": 0.92,
+            "afrr_activation_rate_guard_source_column_pos": f"{col.pred_afrr_activation_rate_pos}_p90",
+            "afrr_activation_rate_guard_source_column_neg": f"{col.pred_afrr_activation_rate_neg}_p90",
+            "afrr_activation_rate_guard_quantile_resolved": "p90",
+        }
+    )
+    assert bt._required_activation_rates_from_row(ev_alias_row, col, reserve_pos_mw=1.0) == pytest.approx(
+        (0.91, 0.92)
+    )
+    assert bt._missing_critical_source_fields == []
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
     da_only = pd.DataFrame({col.timestamp: [ts0], "real_fixed_reserve_obligation_pos_mw": [0.0]})
     da_only_source = pd.DataFrame({col.timestamp: [ts0]})
     inactive = bt._preserve_activation_rate_source_of_truth(

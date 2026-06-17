@@ -3296,7 +3296,7 @@ class BatteryBacktester:
         """Return the active forecast activation-rate source columns without defaulting values."""
         columns = set(source.columns if isinstance(source, pd.DataFrame) else source.index)
 
-        def _from_meta(meta_col: str, canonical_col: str) -> str:
+        def _source_meta_value(meta_col: str) -> str:
             candidate = ""
             if meta_col in columns:
                 if isinstance(source, pd.DataFrame):
@@ -3305,13 +3305,54 @@ class BatteryBacktester:
                     candidate = str(values.iloc[0]) if not values.empty else ""
                 else:
                     candidate = self._nonempty_str(source.get(meta_col))
-            if candidate and candidate in columns:
-                return candidate
+            return candidate
+
+        def _quantile_meta_value() -> str:
+            for meta_col in (
+                "afrr_activation_rate_guard_quantile_resolved",
+                "afrr_activation_rate_guard_quantile",
+            ):
+                value = _source_meta_value(meta_col)
+                if value:
+                    return value
+            return ""
+
+        def _activation_rate_source_aliases(candidate: str, canonical_col: str, side: str) -> list[str]:
+            """Map guard metadata names to the actual optimizer/export aliases present in rows."""
+            aliases: list[str] = []
+
+            def _add(name: str) -> None:
+                name_s = str(name or "").strip()
+                if name_s and name_s not in aliases:
+                    aliases.append(name_s)
+
+            _add(candidate)
+            quantile = ""
+            if candidate.startswith(f"{canonical_col}_"):
+                quantile = candidate[len(canonical_col) + 1 :]
+            if not quantile:
+                quantile = _quantile_meta_value()
+            if quantile:
+                q = str(quantile).strip()
+                _add(f"{canonical_col}_{q}")
+                _add(f"ev_pred_act_rate_{side}_{q}")
+                _add(f"afrr_{q}_act_rate_{side}")
+            _add(f"{canonical_col}_guard")
+            _add(f"ev_pred_act_rate_{side}_guard")
+            _add(canonical_col)
+            _add(f"ev_pred_act_rate_{side}")
+            return aliases
+
+        def _from_meta(meta_col: str, canonical_col: str, side: str) -> str:
+            candidate = _source_meta_value(meta_col)
+            for alias in _activation_rate_source_aliases(candidate, canonical_col, side):
+                if alias in columns:
+                    return alias
             return canonical_col
 
         return (
-            _from_meta("afrr_activation_rate_guard_source_column_pos", colmap.pred_afrr_activation_rate_pos),
-            _from_meta("afrr_activation_rate_guard_source_column_neg", colmap.pred_afrr_activation_rate_neg),
+            _from_meta("afrr_activation_rate_guard_source_column_pos", colmap.pred_afrr_activation_rate_pos, "pos"),
+            _from_meta("afrr_activation_rate_guard_source_column_neg", colmap.pred_afrr_activation_rate_neg, "neg"),
         )
 
     def _required_activation_rates_from_row(
@@ -3471,41 +3512,37 @@ class BatteryBacktester:
         source = source.drop_duplicates(subset=["_source_ts_utc"], keep="last").set_index("_source_ts_utc")
         out_ts = pd.to_datetime(out[timestamp_col], utc=True, errors="coerce")
 
-        canonical_cols = [
-            colmap.pred_afrr_activation_rate_pos,
-            colmap.pred_afrr_activation_rate_neg,
+        resolved_pos_col, resolved_neg_col = self._resolved_activation_rate_columns(source, colmap)
+        source_truth_cols = [
+            (resolved_pos_col, colmap.pred_afrr_activation_rate_pos, f"{context}.activation_rate_pos"),
+            (resolved_neg_col, colmap.pred_afrr_activation_rate_neg, f"{context}.activation_rate_neg"),
         ]
-        for col in canonical_cols:
-            if col in out.columns:
-                existing = pd.to_numeric(out[col], errors="coerce")
+        for source_col, canonical_col, label in source_truth_cols:
+            if canonical_col in out.columns:
+                existing = pd.to_numeric(out[canonical_col], errors="coerce")
             else:
                 existing = pd.Series(np.nan, index=out.index, dtype=float)
             needs_source = active_mask & (
                 existing.isna() | ~np.isfinite(existing.to_numpy(dtype=float, na_value=np.nan))
             )
-            if bool(needs_source.any()) and col in source.columns:
-                mapped = pd.to_numeric(out_ts.map(source[col]), errors="coerce")
-                out[col] = existing.where(~needs_source, mapped)
-            elif col not in out.columns:
-                out[col] = existing
+            if bool(needs_source.any()) and source_col in source.columns:
+                mapped = pd.to_numeric(out_ts.map(source[source_col]), errors="coerce")
+                out[canonical_col] = existing.where(~needs_source, mapped)
+            elif canonical_col not in out.columns:
+                out[canonical_col] = existing
 
-            final_values = pd.to_numeric(out[col], errors="coerce")
+            final_values = pd.to_numeric(out[canonical_col], errors="coerce")
             bad_active = active_mask & (
                 final_values.isna() | ~np.isfinite(final_values.to_numpy(dtype=float, na_value=np.nan))
             )
             if bool(bad_active.any()):
-                label = (
-                    f"{context}.activation_rate_pos"
-                    if col == colmap.pred_afrr_activation_rate_pos
-                    else f"{context}.activation_rate_neg"
-                )
                 self._record_missing_critical_source_field(
                     label,
                     "missing_source_of_truth_activation_rate",
                 )
 
-            if col in source.columns:
-                source_mapped = pd.to_numeric(out_ts.map(source[col]), errors="coerce")
+            if source_col in source.columns:
+                source_mapped = pd.to_numeric(out_ts.map(source[source_col]), errors="coerce")
                 source_finite = active_mask & source_mapped.notna() & np.isfinite(
                     source_mapped.to_numpy(dtype=float, na_value=np.nan)
                 )
@@ -3515,7 +3552,7 @@ class BatteryBacktester:
                 if bool(source_finite.any()) and bool((source_finite & ~output_finite).any()):
                     raise ValueError(
                         "activation_rate_source_of_truth_lost_during_model_output: "
-                        f"context={context}; column={col}"
+                        f"context={context}; source_column={source_col}; canonical_column={canonical_col}"
                     )
 
         provenance_cols = [
@@ -34297,6 +34334,35 @@ class BatteryBacktester:
                     clearing_rec[c] = str(getattr(row, c))
                 else:
                     clearing_rec[c] = float(getattr(row, c))
+        if not bool(getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False)):
+            reserve_pos = 0.0
+            reserve_neg = 0.0
+            for c in (
+                "fixed_reserve_obligation_pos_mw",
+                "fixed_reserve_obligation_neg_mw",
+                "real_fixed_reserve_obligation_pos_mw",
+                "real_fixed_reserve_obligation_neg_mw",
+                "submitted_bcm_capacity_pos_mw",
+                "submitted_bcm_capacity_neg_mw",
+                "real_submitted_bcm_capacity_pos_mw",
+                "real_submitted_bcm_capacity_neg_mw",
+                "locked_bcm_capacity_pos_mw",
+                "locked_bcm_capacity_neg_mw",
+                "real_locked_bcm_capacity_pos_mw",
+                "real_locked_bcm_capacity_neg_mw",
+                "executed_bcm_capacity_pos_mw",
+                "executed_bcm_capacity_neg_mw",
+                "real_executed_bcm_capacity_pos_mw",
+                "real_executed_bcm_capacity_neg_mw",
+                "awarded_capacity_pos_mw",
+                "awarded_capacity_neg_mw",
+                "real_awarded_capacity_pos_mw",
+                "real_awarded_capacity_neg_mw",
+                "bcm_awarded_capacity_pos_mw",
+                "bcm_awarded_capacity_neg_mw",
+            ):
+                if c in clearing_rec:
+                    clearing_rec[c] = 0.0
         return {
             "charge": charge,
             "discharge": discharge,
@@ -34442,8 +34508,16 @@ class BatteryBacktester:
             pred_act_neg_q10=float(getattr(row, "pred_afrr_activation_price_neg_p10")) if hasattr(row, "pred_afrr_activation_price_neg_p10") else np.nan,
             pred_act_neg_q50=float(getattr(row, "pred_afrr_activation_price_neg_p50")) if hasattr(row, "pred_afrr_activation_price_neg_p50") else np.nan,
             pred_act_neg_q90=float(getattr(row, "pred_afrr_activation_price_neg_p90")) if hasattr(row, "pred_afrr_activation_price_neg_p90") else np.nan,
-            obligation_pos_mw=getf("aFRR_Capacity_Won_Pos_MW", 0.0),
-            obligation_neg_mw=getf("aFRR_Capacity_Won_Neg_MW", 0.0),
+            obligation_pos_mw=(
+                getf("aFRR_Capacity_Won_Pos_MW", 0.0)
+                if bool(getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False))
+                else 0.0
+            ),
+            obligation_neg_mw=(
+                getf("aFRR_Capacity_Won_Neg_MW", 0.0)
+                if bool(getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False))
+                else 0.0
+            ),
             obligation_capacity_price_pos=obligation_capacity_price_pos,
             obligation_capacity_price_neg=obligation_capacity_price_neg,
             obligation_energy_pos=float(getattr(row, "aFRR_Energy_Price_EUR_MWh_Pos")) if hasattr(row, "aFRR_Energy_Price_EUR_MWh_Pos") else np.nan,
