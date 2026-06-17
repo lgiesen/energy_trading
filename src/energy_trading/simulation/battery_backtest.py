@@ -12873,6 +12873,90 @@ class BatteryBacktester:
                 global_end_utc=global_end_utc,
             )
 
+        terminal_shortfall_reasons = {
+            "locked_da_terminal_shortfall_candidate_infeasible",
+            "terminal_shortfall_under_hard_min",
+            "terminal_repair_missing",
+            "terminal_repair_unreachable",
+        }
+
+        def _stats_float(stats: Mapping[str, object], *keys: str, default: float = 0.0) -> float:
+            for key in keys:
+                if key not in stats:
+                    continue
+                val = pd.to_numeric(pd.Series([stats.get(key)]), errors="coerce").iloc[0]
+                if pd.notna(val) and np.isfinite(float(val)):
+                    return float(val)
+            return float(default)
+
+        def _stats_reason(stats: Mapping[str, object]) -> str:
+            for key in (
+                "infeasibility_driver_detail",
+                "infeasibility_driver",
+                "final_soc_feasibility_reason",
+                "da_terminal_replay_failure_reason",
+                "da_postlock_infeasibility_driver_detail",
+                "da_postlock_infeasibility_driver",
+            ):
+                reason = str(stats.get(key, "") or "").strip()
+                if reason and reason.lower() not in {"none", "nan", "nat", "not_evaluated"}:
+                    return reason
+            return "none"
+
+        def _is_nonfinal_terminal_shortfall_only(stats: Mapping[str, object]) -> bool:
+            reason = _stats_reason(stats).strip().lower()
+            if reason not in terminal_shortfall_reasons:
+                return False
+            terminal_sensitive_flag = max(
+                _stats_float(stats, "da_terminal_sensitive_window", default=0.0),
+                _stats_float(stats, "da_bid_sizer_terminal_sensitive_window", default=0.0),
+            )
+            if terminal_sensitive_flag >= 0.5:
+                return False
+            projected_min = _stats_float(
+                stats,
+                "projected_soc_min_mwh",
+                "da_canonical_sizer_projected_min_soc_mwh",
+                "da_bid_sizer_lp_projected_soc_min_mwh",
+                default=float(current_soc_mwh),
+            )
+            projected_max = _stats_float(
+                stats,
+                "projected_soc_max_mwh",
+                "da_canonical_sizer_projected_max_soc_mwh",
+                "da_bid_sizer_lp_projected_soc_max_mwh",
+                default=float(current_soc_mwh),
+            )
+            power_pos = _stats_float(stats, "projected_power_violation_pos_mw", default=0.0)
+            power_neg = _stats_float(stats, "projected_power_violation_neg_mw", default=0.0)
+            protected = _stats_float(stats, "protected_soc_projection_violation_mwh", default=0.0)
+            return bool(
+                projected_min >= float(self.soc_min) - 1e-9
+                and projected_max <= float(self.soc_max) + 1e-9
+                and power_pos <= 1e-9
+                and power_neg <= 1e-9
+                and protected <= 1e-9
+            )
+
+        def _mark_deferred_terminal_nonfatal(
+            stats: Mapping[str, object],
+            *,
+            source: str,
+        ) -> dict[str, float | str]:
+            out = dict(stats)
+            out["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
+            out["da_canonical_sizer_status"] = "ok_deferred_terminal_nonfatal"
+            out["da_canonical_sizer_failure_reason"] = "none"
+            out["da_canonical_sizer_rounded_replay_pass"] = 1.0
+            out["da_bid_sizer_zero_reason"] = "none"
+            out["da_bid_sizer_replay_override_reason"] = "nonfinal_terminal_shortfall_diagnostic_only"
+            out["da_nonfinal_terminal_shortfall_nonfatal"] = 1.0
+            out["da_candidate_support_sizer_used_as_authority"] = 0.0
+            out["da_deferred_terminal_nonfatal_source"] = str(source)
+            out.setdefault("da_terminal_sensitive_window", 0.0)
+            out.setdefault("da_terminal_sensitive_reason", "not_terminal_window")
+            return out
+
         candidate_buy_mwh = float(sum(max(0.0, ch) for ch, _ in selected_da.values()) * float(self.dt_h))
         candidate_sell_mwh = float(sum(max(0.0, dis) for _, dis in selected_da.values()) * float(self.dt_h))
         candidate_timestamps = {pd.to_datetime(ts, utc=True, errors="coerce") for ts in selected_da.keys()}
@@ -32164,6 +32248,9 @@ class BatteryBacktester:
         resolved_rate_transport_cols = [
             "afrr_activation_rate_guard_source_column_pos",
             "afrr_activation_rate_guard_source_column_neg",
+            "afrr_activation_rate_guard_quantile",
+            "afrr_activation_rate_guard_policy",
+            "afrr_activation_rate_guard_mode",
             colmap.pred_afrr_activation_rate_pos,
             colmap.pred_afrr_activation_rate_neg,
             "pred_afrr_activation_rate_pos_guard",
@@ -32226,109 +32313,107 @@ class BatteryBacktester:
             dict.fromkeys(dispatch_cols + [c for c in required_dispatch_defaults if c in dispatch.columns])
         )
 
-        if predicted_settlement and all(c in dispatch.columns for c in [da_col, cap_pos_col, cap_neg_col, act_pos_col, act_neg_col, rate_pos_col, rate_neg_col]):
-            selected_cols = list(
-                dict.fromkeys(
-                    dispatch_cols
-                    + [
-                        da_col,
-                        cap_pos_col,
-                        cap_neg_col,
-                        act_pos_col,
-                        act_neg_col,
-                        rate_pos_col,
-                        rate_neg_col,
-                    ]
-                    + [c for c in resolved_rate_transport_cols if c in dispatch.columns]
-                )
+        # Settlement intent comes from dispatch, but market prices/rates come
+        # from canonical df-side data. Do not use dispatch-side pred_/true_
+        # placeholders as source of truth for predicted settlement.
+        base_cols = [
+            colmap.timestamp,
+            da_col,
+            cap_pos_col,
+            cap_neg_col,
+            act_pos_col,
+            act_neg_col,
+            rate_pos_col,
+            rate_neg_col,
+        ]
+        base_cols.extend([c for c in resolved_rate_transport_cols if c in df.columns])
+        # For realized settlement with clearing, also need prediction-side bid references.
+        if apply_market_clearing and not predicted_settlement:
+            base_cols.extend(
+                [
+                    colmap.pred_da_price,
+                    f"{colmap.pred_da_price}_p05",
+                    f"{colmap.pred_da_price}_p10",
+                    f"{colmap.pred_da_price}_p90",
+                    f"{colmap.pred_da_price}_p95",
+                    colmap.pred_afrr_capacity_price_pos,
+                    colmap.pred_afrr_capacity_price_neg,
+                    colmap.pred_afrr_activation_price_pos,
+                    colmap.pred_afrr_activation_price_neg,
+                    colmap.pred_afrr_activation_rate_pos,
+                    colmap.pred_afrr_activation_rate_neg,
+                    "pred_afrr_activation_rate_pos_guard",
+                    "pred_afrr_activation_rate_neg_guard",
+                    "afrr_activation_rate_guard_source_column_pos",
+                    "afrr_activation_rate_guard_source_column_neg",
+                ]
             )
-            merged = dispatch[selected_cols].copy()
-            expected_rows = len(dispatch)
-            if len(merged) != expected_rows:
-                raise ValueError(
-                    f"Merge row count mismatch! Expected {expected_rows}, got {len(merged)}."
-                )
+        base_cols = [c for c in dict.fromkeys(base_cols) if c in df.columns]
+        market_side = df[base_cols].copy()
+        # Decision-driven, strict boundary: settlement intent comes from
+        # dispatch; market prices come from canonical market_side only.
+        dispatch_clean = dispatch[[c for c in dispatch_cols if c in dispatch.columns]].copy()
+        # Hard guard against namespace contamination from optimizer output.
+        contaminating_cols = [
+            c for c in dispatch_clean.columns
+            if c.startswith("pred_") or c.startswith("true_")
+        ]
+        if contaminating_cols:
+            dispatch_clean = dispatch_clean.drop(columns=contaminating_cols)
+        if "is_precleared" in dispatch_clean.columns:
+            dispatch_clean["is_precleared"] = dispatch_clean["is_precleared"].astype(bool)
         else:
-            base_cols = [
-                colmap.timestamp,
-                da_col,
-                cap_pos_col,
-                cap_neg_col,
-                act_pos_col,
-                act_neg_col,
-                rate_pos_col,
-                rate_neg_col,
-            ]
-            # For realized settlement with clearing, also need prediction-side bid references.
-            if apply_market_clearing and not predicted_settlement:
-                base_cols.extend(
-                    [
-                        colmap.pred_da_price,
-                        f"{colmap.pred_da_price}_p05",
-                        f"{colmap.pred_da_price}_p10",
-                        f"{colmap.pred_da_price}_p90",
-                        f"{colmap.pred_da_price}_p95",
-                        colmap.pred_afrr_capacity_price_pos,
-                        colmap.pred_afrr_capacity_price_neg,
-                        colmap.pred_afrr_activation_price_pos,
-                        colmap.pred_afrr_activation_price_neg,
-                        colmap.pred_afrr_activation_rate_pos,
-                        colmap.pred_afrr_activation_rate_neg,
-                        "pred_afrr_activation_rate_pos_guard",
-                        "pred_afrr_activation_rate_neg_guard",
-                        "afrr_activation_rate_guard_source_column_pos",
-                        "afrr_activation_rate_guard_source_column_neg",
-                    ]
+            dispatch_clean["is_precleared"] = pd.Series(False, index=dispatch_clean.index, dtype=bool)
+        # Dynamic overlap pruning: dispatch intent is source of truth.
+        # If upstream mutated df with decision-like columns, drop overlaps
+        # from right side to prevent duplicate labels/collisions.
+        overlap = [
+            c for c in market_side.columns
+            if c in dispatch_clean.columns and c != colmap.timestamp
+        ]
+        if overlap:
+            df_safe = market_side.drop(columns=overlap)
+        else:
+            df_safe = market_side
+        # Settlement must be decision-driven: only timestamps that exist in
+        # dispatch are financially settled (prevents lookback/initialization
+        # rows from df entering realized reclearing with missing decision data).
+        merged = self._guarded_merge(
+            dispatch_clean,
+            df_safe,
+            on=colmap.timestamp,
+            how="left",
+            validate_row_count=True,
+        )
+        # Data-loss check: only meaningful when canonical pred price already
+        # existed on df side before merge. If it did, left-merge must not
+        # increase missingness.
+        if colmap.pred_da_price in market_side.columns:
+            before = pd.to_numeric(df[colmap.pred_da_price], errors="coerce")
+            before_bad = int((before.isna() | ~np.isfinite(before.to_numpy(dtype=float))).sum())
+            after = pd.to_numeric(merged[colmap.pred_da_price], errors="coerce")
+            after_bad = int((after.isna() | ~np.isfinite(after.to_numpy(dtype=float))).sum())
+            if after_bad > before_bad:
+                raise ValueError(
+                    "Data loss! Canonical prices were overwritten or lost "
+                    f"(pred_da_price bad before={before_bad}, after={after_bad})."
                 )
-            base_cols = [c for c in dict.fromkeys(base_cols) if c in df.columns]
-            market_side = df[base_cols].copy()
-            # Decision-driven, strict boundary: settlement intent comes from
-            # dispatch; market prices come from canonical market_side only.
-            dispatch_clean = dispatch[[c for c in dispatch_cols if c in dispatch.columns]].copy()
-            # Hard guard against namespace contamination from optimizer output.
-            contaminating_cols = [
-                c for c in dispatch_clean.columns
-                if c.startswith("pred_") or c.startswith("true_")
-            ]
-            if contaminating_cols:
-                dispatch_clean = dispatch_clean.drop(columns=contaminating_cols)
-            if "is_precleared" in dispatch_clean.columns:
-                dispatch_clean["is_precleared"] = dispatch_clean["is_precleared"].astype(bool)
-            else:
-                dispatch_clean["is_precleared"] = pd.Series(False, index=dispatch_clean.index, dtype=bool)
-            # Dynamic overlap pruning: dispatch intent is source of truth.
-            # If upstream mutated df with decision-like columns, drop overlaps
-            # from right side to prevent duplicate labels/collisions.
-            overlap = [
-                c for c in market_side.columns
-                if c in dispatch_clean.columns and c != colmap.timestamp
-            ]
-            if overlap:
-                df_safe = market_side.drop(columns=overlap)
-            else:
-                df_safe = market_side
-            # Settlement must be decision-driven: only timestamps that exist in
-            # dispatch are financially settled (prevents lookback/initialization
-            # rows from df entering realized reclearing with missing decision data).
-            merged = self._guarded_merge(
-                dispatch_clean,
-                df_safe,
-                on=colmap.timestamp,
-                how="left",
-                validate_row_count=True,
-            )
-            # Data-loss check: only meaningful when canonical pred price already
-            # existed on df side before merge. If it did, left-merge must not
-            # increase missingness.
-            if colmap.pred_da_price in market_side.columns:
-                before = pd.to_numeric(df[colmap.pred_da_price], errors="coerce")
+        if predicted_settlement:
+            df_by_ts = df.set_index(colmap.timestamp)
+            merged_ts = merged[colmap.timestamp]
+            for rate_col in [rate_pos_col, rate_neg_col]:
+                if rate_col not in df_by_ts.columns or rate_col not in merged.columns:
+                    continue
+                before = pd.to_numeric(merged_ts.map(df_by_ts[rate_col]), errors="coerce")
                 before_bad = int((before.isna() | ~np.isfinite(before.to_numpy(dtype=float))).sum())
-                after = pd.to_numeric(merged[colmap.pred_da_price], errors="coerce")
+                after = pd.to_numeric(merged[rate_col], errors="coerce")
                 after_bad = int((after.isna() | ~np.isfinite(after.to_numpy(dtype=float))).sum())
-                if after_bad > before_bad:
+                if before_bad == 0 and after_bad > 0:
                     raise ValueError(
-                        "Data loss! Canonical prices were overwritten or lost "
-                        f"(pred_da_price bad before={before_bad}, after={after_bad})."
+                        "activation_rate_source_of_truth_lost_during_predicted_settlement_merge: "
+                        f"column={rate_col}; bad_before={before_bad}; bad_after={after_bad}; "
+                        "predicted_settlement=True; dispatch-side placeholders must not override "
+                        "df-side canonical market data"
                     )
         merged = self._preserve_activation_rate_source_of_truth(
             merged,

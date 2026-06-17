@@ -79,6 +79,64 @@ def _mk_backtester(forecast_value_mode: str = "raw_signed") -> BatteryBacktester
     return BatteryBacktester()
 
 
+def test_predicted_settlement_uses_df_activation_rate_when_dispatch_placeholder_nan() -> None:
+    col = BacktestColumnMap()
+    bt = _mk_backtester()
+    ts = pd.date_range("2025-04-01T00:00:00Z", periods=2, freq="h")
+    df = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [80.0, 81.0],
+            col.pred_afrr_capacity_price_pos: [10.0, 11.0],
+            col.pred_afrr_capacity_price_neg: [9.0, 9.5],
+            col.pred_afrr_activation_price_pos: [120.0, 121.0],
+            col.pred_afrr_activation_price_neg: [-20.0, -21.0],
+            col.pred_afrr_activation_rate_pos: [0.25, 0.35],
+            col.pred_afrr_activation_rate_neg: [0.15, 0.20],
+            "pred_afrr_activation_rate_pos_guard": [0.25, 0.35],
+            "pred_afrr_activation_rate_neg_guard": [0.15, 0.20],
+            "afrr_activation_rate_guard_source_column_pos": [
+                col.pred_afrr_activation_rate_pos,
+                col.pred_afrr_activation_rate_pos,
+            ],
+            "afrr_activation_rate_guard_source_column_neg": [
+                col.pred_afrr_activation_rate_neg,
+                col.pred_afrr_activation_rate_neg,
+            ],
+            "afrr_activation_rate_guard_quantile": ["p50", "p50"],
+            "afrr_activation_rate_guard_policy": ["causal", "causal"],
+            "afrr_activation_rate_guard_mode": ["source", "source"],
+        }
+    )
+    dispatch = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "plan_charge_mw": [0.0, 0.0],
+            "plan_discharge_mw": [0.0, 0.0],
+            "plan_reserve_pos_mw": [1.0, 2.0],
+            "plan_reserve_neg_mw": [0.0, 0.0],
+            "id_charge_mw": [0.0, 0.0],
+            "id_discharge_mw": [0.0, 0.0],
+            "is_precleared": [True, True],
+            # Placeholder columns from optimizer output must not override df-side source of truth.
+            col.pred_afrr_activation_rate_pos: [np.nan, np.nan],
+            col.pred_afrr_activation_rate_neg: [np.nan, np.nan],
+        }
+    )
+
+    settled = bt.settle_dispatch(df, dispatch, col, predicted_settlement=True)
+
+    assert settled[col.pred_afrr_activation_rate_pos].tolist() == pytest.approx([0.25, 0.35])
+    assert settled[col.pred_afrr_activation_rate_neg].tolist() == pytest.approx([0.15, 0.20])
+    assert not (settled[col.pred_afrr_activation_rate_pos] == 0.0).any()
+    assert not (settled[col.pred_afrr_activation_rate_neg] == 0.0).any()
+    assert settled["pred_plan_reserve_pos_mw"].tolist() == pytest.approx([1.0, 2.0])
+    assert settled["afrr_activation_rate_guard_source_column_pos"].tolist() == [
+        col.pred_afrr_activation_rate_pos,
+        col.pred_afrr_activation_rate_pos,
+    ]
+
+
 def test_checkpoint_atomic_json_write(tmp_path: Path) -> None:
     path = tmp_path / "checkpoints" / "stage_summary.json"
 
