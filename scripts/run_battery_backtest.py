@@ -4019,11 +4019,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument(
         "--benchmark-mode",
-        choices=["full", "model_only", "naive_only", "rhpf_only", "ghpf_only", "selected", "rolling_pf_only", "global_pf_only"],
+        choices=["full", "model_only", "naive_only", "rhpf_only", "selected", "rolling_pf_only"],
         default="full",
         help=(
-            "Which benchmark paths to compute. Default full computes model, naive, and RHPF; "
-            "GHPF is opt-in via --enable-ghpf, ghpf_only, or global_pf_only."
+            "Which benchmark paths to compute. Default full computes model, naive, and RHPF."
         ),
     )
     p.add_argument("--enable-naive", dest="enable_naive", action="store_true", default=None, help="Enable naive benchmark in --benchmark-mode selected or override modes.")
@@ -4047,8 +4046,21 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--enable-rhpf", "--enable-rolling-pf", dest="enable_rhpf", action="store_true", default=None, help="Enable rolling hindsight/perfect-foresight benchmark.")
     p.add_argument("--disable-rhpf", "--disable-rolling-pf", dest="enable_rhpf", action="store_false", help="Disable rolling hindsight/perfect-foresight benchmark.")
-    p.add_argument("--enable-ghpf", "--enable-global-pf", dest="enable_ghpf", action="store_true", default=None, help="Enable global hindsight/perfect-foresight benchmark.")
-    p.add_argument("--disable-ghpf", "--disable-global-pf", dest="enable_ghpf", action="store_false", help="Disable global hindsight/perfect-foresight benchmark.")
+    p.add_argument(
+        "--enable-ghpf",
+        "--enable-global-pf",
+        dest="enable_ghpf",
+        action="store_true",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--disable-ghpf",
+        "--disable-global-pf",
+        dest="enable_ghpf",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
 
     p.add_argument("--timestamp-col", default="timestamp_utc")
     p.add_argument("--pred-da-col", default="pred_da_price")
@@ -4311,11 +4323,9 @@ def parse_args() -> argparse.Namespace:
         "--enable-global-perfect_foresight",
         "--enable-global-perfect-foresight",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Enable global_hindsight_perfect_foresight_upper_bound computation. "
-            "Enabled by default for thesis runs; use --no-enable-global-perfect-foresight "
-            "for faster debug runs."
+            "Deprecated and ignored: global hindsight perfect-foresight was removed."
         ),
     )
     p.add_argument(
@@ -4338,7 +4348,7 @@ def parse_args() -> argparse.Namespace:
         "--write-checkpoints",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Write staged checkpoint artifacts under each scenario output directory (default: disabled).",
+        help="Deprecated and ignored: simulation checkpoints are disabled.",
     )
     p.add_argument(
         "--checkpoint-detail",
@@ -4834,7 +4844,8 @@ def main() -> None:
             "start_utc": str(effective_start_utc.isoformat()) if effective_start_utc is not None else "",
             "end_utc": str(effective_end_utc.isoformat()) if effective_end_utc is not None else "",
         }
-        checkpoint_dir = scenario_out_dir / "checkpoints"
+        checkpoints_enabled = False
+        checkpoint_dir = None
         try:
             with _phase_watchdog("backtester_run"):
                 outputs = backtester.run(
@@ -4859,14 +4870,14 @@ def main() -> None:
                     enable_global_pf=args.enable_ghpf,
                     bcm_bid_hour_local=int(args.bcm_bid_hour_local),
                     checkpoint_dir=checkpoint_dir,
-                    write_checkpoints=bool(args.write_checkpoints),
+                    write_checkpoints=checkpoints_enabled,
                     checkpoint_detail=str(args.checkpoint_detail),
                     checkpoint_metadata=checkpoint_metadata,
                     naive_source_df=naive_source_df,
                     strict_naive_weekly_source=bool(args.strict_naive_weekly_source),
                 )
         except Exception as exc:
-            if bool(args.write_checkpoints):
+            if checkpoints_enabled:
                 try:
                     _write_checkpoint_run_status(
                         checkpoint_dir,

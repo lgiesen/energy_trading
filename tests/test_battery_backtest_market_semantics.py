@@ -7087,6 +7087,28 @@ def test_source_truth_alias_group_present_fails_missing_active_fields() -> None:
     )
 
 
+def test_missing_runtime_critical_source_field_fails_closed() -> None:
+    bt = _mk_backtester()
+    row = pd.Series({"target_time_utc": pd.Timestamp("2025-04-01T00:00:00Z")})
+
+    value = bt._required_number_from_row(
+        row,
+        "pred_da_price",
+        label="da.price",
+        reason="missing_source_of_truth_da_price",
+        fallback=999.0,
+    )
+    missing: list[str] = []
+    reasons: set[str] = set()
+    path_missing: dict[str, list[str]] = {"naive": [], "rhpf": []}
+    bt._append_runtime_missing_source_truth(missing, reasons, path_missing)
+
+    assert value == pytest.approx(999.0)
+    assert missing == ["da.price"]
+    assert "missing_source_of_truth_da_price" in reasons
+    assert len(missing) == 1
+
+
 def test_da_zero_selection_exports_concrete_zero_reason(monkeypatch) -> None:
     bt = _mk_backtester()
     col = BacktestColumnMap()
@@ -8367,7 +8389,7 @@ def test_bcm_rhpf_plan_history_diagnostics_keep_raw_duplicate_and_aligned_totals
 def test_rolling_pf_incumbent_selection_prefers_higher_feasible_realized_path() -> None:
     frame = pd.DataFrame({"timestamp": pd.date_range("2025-01-01", periods=1, tz="UTC")})
 
-    selected = BatteryBacktester._select_global_pf_incumbent(
+    selected = BatteryBacktester._select_highest_feasible_incumbent(
         {
             "solver": (1.0, True, frame),
             "no_market": (0.0, True, frame),
@@ -17995,172 +18017,10 @@ def test_perfect_foresight_bcm_participates_and_exports_same_rules_columns() -> 
         assert bool((reasons != "").all())
 
 
-def test_global_pf_benchmark_uses_solver_only_when_solver_dominates() -> None:
-    solver_frame = pd.DataFrame({"x": [1]})
-    result = BatteryBacktester._evaluate_global_pf_solver_benchmark(
-        solver_value_eur=50.0,
-        solver_feasible=True,
-        solver_available=True,
-        solver_frame=solver_frame,
-        lower_bound_candidates={
-            "realized_path": (40.0, True, pd.DataFrame({"x": [2]})),
-            "no_market": (0.0, True, pd.DataFrame({"x": [3]})),
-        },
-    )
-
-    assert result["selected"] == "solver"
-    assert float(result["benchmark_value_eur"]) == pytest.approx(50.0)
-    assert result["frame"].equals(solver_frame)
-    assert float(result["verified"]) == pytest.approx(1.0)
-    assert result["failure_reason"] == "none"
-    assert result["best_feasible_lower_bound_name"] == "realized_path"
-    assert float(result["best_feasible_lower_bound_eur"]) == pytest.approx(40.0)
-    assert float(result["is_solver_upper_bound"]) == pytest.approx(1.0)
-    assert float(result["is_realized_path_fallback"]) == pytest.approx(0.0)
-
-
-def test_global_pf_benchmark_selects_realized_path_when_it_is_best_feasible() -> None:
-    solver_frame = pd.DataFrame({"x": [1]})
-    result = BatteryBacktester._evaluate_global_pf_solver_benchmark(
-        solver_value_eur=0.0,
-        solver_feasible=True,
-        solver_available=True,
-        solver_frame=solver_frame,
-        lower_bound_candidates={
-            "realized_path": (100.0, True, pd.DataFrame({"x": [2]})),
-            "no_market": (0.0, True, pd.DataFrame({"x": [3]})),
-        },
-    )
-
-    assert result["selected"] == "realized_path"
-    assert float(result["benchmark_value_eur"]) == pytest.approx(100.0)
-    assert result["frame"].equals(pd.DataFrame({"x": [2]}))
-    assert float(result["available"]) == pytest.approx(1.0)
-    assert float(result["verified"]) == pytest.approx(1.0)
-    assert result["failure_reason"] == "none"
-    assert result["best_feasible_lower_bound_name"] == "realized_path"
-    assert float(result["best_feasible_lower_bound_eur"]) == pytest.approx(100.0)
-    assert float(result["is_solver_upper_bound"]) == pytest.approx(0.0)
-    assert float(result["is_realized_path_fallback"]) == pytest.approx(1.0)
-
-
-def test_da_global_perfect_foresight_diagnostics_realized_path_fallback_is_not_solver_upper_bound() -> None:
-    result = BatteryBacktester._evaluate_global_pf_solver_benchmark(
-        solver_value_eur=0.0,
-        solver_feasible=True,
-        solver_available=True,
-        solver_frame=pd.DataFrame({"x": [1]}),
-        lower_bound_candidates={
-            "realized_path": (5.0, True, pd.DataFrame({"x": [2]})),
-            "no_market": (0.0, True, pd.DataFrame({"x": [3]})),
-        },
-    )
-
-    assert result["selected"] == "realized_path"
-    assert float(result["is_solver_upper_bound"]) == pytest.approx(0.0)
-    assert float(result["is_realized_path_fallback"]) == pytest.approx(1.0)
-
-
-def test_global_pf_realized_path_fallback_is_not_strict_model_invalidity() -> None:
-    reasons = BatteryBacktester._global_pf_strict_invalid_reason(
-        enable_global_perfect_foresight=True,
-        global_pf_verified_upper_bound=0.0,
-        global_perfect_foresight_available=1.0,
-        global_perfect_foresight_validation_status="solver_below_realized_path_incumbent",
-        global_pf_below_realized_incumbent=1.0,
-        global_pf_is_realized_path_fallback=1.0,
-    )
-
-    assert reasons == []
-
-
-def test_global_pf_unavailable_without_fallback_remains_strict_invalidity() -> None:
-    reasons = BatteryBacktester._global_pf_strict_invalid_reason(
-        enable_global_perfect_foresight=True,
-        global_pf_verified_upper_bound=0.0,
-        global_perfect_foresight_available=0.0,
-        global_perfect_foresight_validation_status="global_pf_unavailable",
-        global_pf_below_realized_incumbent=0.0,
-        global_pf_is_realized_path_fallback=0.0,
-    )
-
-    assert reasons == ["global_pf_unavailable"]
-
-
-def test_global_pf_solver_below_realized_without_fallback_remains_strict_invalidity() -> None:
-    reasons = BatteryBacktester._global_pf_strict_invalid_reason(
-        enable_global_perfect_foresight=True,
-        global_pf_verified_upper_bound=0.0,
-        global_perfect_foresight_available=1.0,
-        global_perfect_foresight_validation_status="solver_below_realized_path_incumbent",
-        global_pf_below_realized_incumbent=1.0,
-        global_pf_is_realized_path_fallback=0.0,
-    )
-
-    assert reasons == ["global_pf_solver_failed"]
-
-
-def test_global_pf_upper_bound_ratio_requires_verified_solver_upper_bound() -> None:
-    fallback_ratio = BatteryBacktester._global_pf_upper_bound_ratio_pct(
-        realized_total_eur=159.0,
-        global_pf_total_eur=159.0,
-        global_perfect_foresight_available=1.0,
-        global_pf_verified_upper_bound=0.0,
-    )
-    verified_ratio = BatteryBacktester._global_pf_upper_bound_ratio_pct(
-        realized_total_eur=50.0,
-        global_pf_total_eur=100.0,
-        global_perfect_foresight_available=1.0,
-        global_pf_verified_upper_bound=1.0,
-    )
-
-    assert np.isnan(fallback_ratio)
-    assert verified_ratio == pytest.approx(50.0)
-
-
-def test_global_pf_benchmark_selects_no_market_when_solver_infeasible() -> None:
-    result = BatteryBacktester._evaluate_global_pf_solver_benchmark(
-        solver_value_eur=float("nan"),
-        solver_feasible=False,
-        solver_available=False,
-        solver_frame=pd.DataFrame(),
-        lower_bound_candidates={
-            "no_market": (5.0, True, pd.DataFrame({"x": [1]})),
-            "realized_path": (10.0, False, pd.DataFrame({"x": [2]})),
-        },
-        solver_unavailable_reason="solver_unavailable:test",
-    )
-
-    assert result["selected"] == "no_market"
-    assert float(result["benchmark_value_eur"]) == pytest.approx(5.0)
-    assert float(result["available"]) == pytest.approx(1.0)
-    assert float(result["verified"]) == pytest.approx(1.0)
-    assert result["failure_reason"] == "none"
-    assert result["best_feasible_lower_bound_name"] == "no_market"
-    assert float(result["best_feasible_lower_bound_eur"]) == pytest.approx(5.0)
-
-
-def test_global_pf_benchmark_selects_no_market_when_solver_infeasible_and_realized_negative() -> None:
-    no_market_frame = pd.DataFrame({"x": [1]})
-    result = BatteryBacktester._evaluate_global_pf_solver_benchmark(
-        solver_value_eur=-8.145,
-        solver_feasible=False,
-        solver_available=True,
-        solver_frame=pd.DataFrame({"x": [0]}),
-        lower_bound_candidates={
-            "no_market": (0.0, True, no_market_frame),
-            "realized_path": (-282.2286, True, pd.DataFrame({"x": [2]})),
-        },
-        solver_unavailable_reason="terminal_soc_shortfall",
-    )
-
-    assert result["selected"] == "no_market"
-    assert float(result["benchmark_value_eur"]) == pytest.approx(0.0)
-    assert result["frame"].equals(no_market_frame)
-    assert float(result["available"]) == pytest.approx(1.0)
-    assert float(result["verified"]) == pytest.approx(1.0)
-    assert result["failure_reason"] == "none"
-    assert result["selection_reason"] == "no_market_has_highest_feasible_pnl"
+def test_global_pf_benchmark_mode_is_removed() -> None:
+    for mode in ("ghpf_only", "global_pf_only", "global_pf", "global_perfect_foresight"):
+        with pytest.raises(ValueError, match="global perfect-foresight benchmark has been removed"):
+            resolve_benchmark_paths(mode, enable_global_perfect_foresight=True)
 
 
 def test_global_pf_bcm_partial_product_disable_mask_uses_evaluated_window() -> None:
@@ -22610,23 +22470,12 @@ def test_validate_rhpf_outputs_passes_terminal_inclusive_solver_basis(tmp_path: 
     assert result.status == "PASS"
 
 
-def test_benchmark_mode_naive_rhpf_ghpf_only() -> None:
+def test_benchmark_mode_naive_rhpf_only_and_global_pf_removed() -> None:
     assert resolve_benchmark_paths("naive_only")[1] == {"model": False, "naive": True, "rhpf": False, "ghpf": False}
     assert resolve_benchmark_paths("rhpf_only")[1] == {"model": False, "naive": False, "rhpf": True, "ghpf": False}
-    assert resolve_benchmark_paths("ghpf_only", enable_global_perfect_foresight=True)[1] == {
-        "model": False,
-        "naive": False,
-        "rhpf": False,
-        "ghpf": True,
-    }
     assert resolve_benchmark_paths("rolling_pf_only")[0] == "rhpf_only"
-    assert resolve_benchmark_paths("global_pf_only")[0] == "ghpf_only"
-    assert resolve_benchmark_paths("global_pf_only")[1] == {
-        "model": False,
-        "naive": False,
-        "rhpf": False,
-        "ghpf": True,
-    }
+    with pytest.raises(ValueError, match="global perfect-foresight benchmark has been removed"):
+        resolve_benchmark_paths("global_pf_only")
 
 
 def test_naive_only_can_skip_model_manifest_even_with_model_selector() -> None:

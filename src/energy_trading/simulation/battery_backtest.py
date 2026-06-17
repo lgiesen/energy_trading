@@ -130,36 +130,35 @@ def resolve_benchmark_paths(
         "rolling_pf_only": "rhpf_only",
         "perfect_foresight": "rhpf",
         "perfect_foresight_only": "rhpf_only",
-        "global_pf": "ghpf",
-        "global_pf_only": "ghpf_only",
-        "global_perfect_foresight": "ghpf",
-        "global_perfect_foresight_only": "ghpf_only",
     }
     mode = mode_alias.get(raw_mode, raw_mode)
-    if mode not in {"full", "model_only", "naive_only", "rhpf_only", "ghpf_only", "selected"}:
+    if mode in {"global_pf", "global_pf_only", "global_perfect_foresight", "global_perfect_foresight_only", "ghpf", "ghpf_only"}:
+        raise ValueError("global perfect-foresight benchmark has been removed; use rolling PF/RHPF instead")
+    if mode not in {"full", "model_only", "naive_only", "rhpf_only", "selected"}:
         raise ValueError(
-            "benchmark_mode must be one of: full, model_only, naive_only, rhpf_only, ghpf_only, selected"
+            "benchmark_mode must be one of: full, model_only, naive_only, rhpf_only, selected"
         )
     if mode == "selected":
         paths = {
             "model": True,
             "naive": True if enable_naive is None else bool(enable_naive),
             "rhpf": True if enable_rolling_pf is None else bool(enable_rolling_pf),
-            "ghpf": False if enable_global_pf is None else bool(enable_global_pf),
+            "ghpf": False,
         }
     else:
         paths = {
             "model": mode in {"full", "model_only"},
             "naive": mode in {"full", "naive_only"},
             "rhpf": mode in {"full", "rhpf_only"},
-            "ghpf": mode in {"ghpf_only"},
+            "ghpf": False,
         }
         if enable_naive is not None:
             paths["naive"] = bool(enable_naive)
         if enable_rolling_pf is not None:
             paths["rhpf"] = bool(enable_rolling_pf)
-        if enable_global_pf is not None:
-            paths["ghpf"] = bool(enable_global_pf)
+        # Global hindsight PF has been removed. Keep the key false for schema
+        # compatibility, but never execute or report a GHPF path.
+        paths["ghpf"] = False
     return mode, {k: bool(paths.get(k, False)) for k in BENCHMARK_PATH_TYPES}
 
 
@@ -331,10 +330,6 @@ CHECKPOINT_STAGE_FILES = {
     "stage_03_rolling_pf": (
         "stage_03_rolling_pf_hourly.parquet",
         "stage_03_rolling_pf_summary.json",
-    ),
-    "stage_04_global_pf": (
-        "stage_04_global_pf_hourly.parquet",
-        "stage_04_global_pf_summary.json",
     ),
     "stage_05_final": (
         "",
@@ -1236,10 +1231,10 @@ class BatteryBacktester:
     """Linear-programming dispatch optimizer + realized settlement engine."""
 
     @staticmethod
-    def _select_global_pf_incumbent(
+    def _select_highest_feasible_incumbent(
         candidates: dict[str, tuple[float, bool, pd.DataFrame]]
     ) -> dict[str, object]:
-        """Select the highest-PnL feasible global-PF incumbent."""
+        """Select the highest-PnL feasible incumbent for diagnostics."""
         priority = {"solver": 0, "no_market": 1, "realized_path": 2}
         feasible: list[tuple[str, float, pd.DataFrame]] = []
         for name, (value, is_feasible, frame) in candidates.items():
@@ -1317,75 +1312,6 @@ class BatteryBacktester:
             "selected_is_realized_path_fallback": float(str(selected) == "realized_path"),
             "selected_is_no_market_fallback": float(str(selected) == "no_market"),
             "selection_reason": f"{selected}_has_highest_feasible_pnl",
-        }
-
-    @staticmethod
-    def _evaluate_global_pf_solver_benchmark(
-        *,
-        solver_value_eur: float,
-        solver_feasible: bool,
-        solver_available: bool,
-        solver_frame: pd.DataFrame,
-        lower_bound_candidates: dict[str, tuple[float, bool, pd.DataFrame]],
-        tolerance_eur: float = 1e-2,
-        solver_unavailable_reason: str = "solver_unavailable",
-    ) -> dict[str, object]:
-        """Select the highest-PnL feasible global-PF incumbent.
-
-        Solver, no-market, and realized-path candidates are all evaluated with
-        explicit feasibility flags. A feasible no-market candidate must remain
-        available when the solver candidate is infeasible.
-        """
-        solver_value_f = float(solver_value_eur)
-        solver_is_usable = bool(solver_available) and bool(solver_feasible) and np.isfinite(solver_value_f)
-
-        feasible_lower_bounds: list[tuple[str, float, pd.DataFrame]] = []
-        for name, (value, feasible, frame) in lower_bound_candidates.items():
-            value_f = float(value)
-            if bool(feasible) and np.isfinite(value_f):
-                feasible_lower_bounds.append((str(name), value_f, frame))
-
-        if feasible_lower_bounds:
-            best_name, best_value, _best_frame = max(feasible_lower_bounds, key=lambda item: item[1])
-        else:
-            best_name = "none"
-            best_value = float("nan")
-
-        all_candidates: dict[str, tuple[float, bool, pd.DataFrame]] = dict(lower_bound_candidates)
-        all_candidates["solver"] = (solver_value_f, solver_is_usable, solver_frame)
-        selected = BatteryBacktester._select_global_pf_incumbent(all_candidates)
-
-        if str(selected["selected"]) == "none":
-            failure = str(solver_unavailable_reason) if not bool(solver_available) else "no_feasible_incumbent"
-            return {
-                "selected": "none",
-                "benchmark_value_eur": float("nan"),
-                "value": float("nan"),
-                "frame": pd.DataFrame(),
-                "available": 0.0,
-                "verified": 0.0,
-                "is_solver_upper_bound": 0.0,
-                "is_realized_path_fallback": 0.0,
-                "failure_reason": failure,
-                "selection_reason": "no_solver_benchmark_available",
-                "best_feasible_lower_bound_name": best_name,
-                "best_feasible_lower_bound_eur": float(best_value),
-            }
-
-        selected_name = str(selected["selected"])
-        return {
-            "selected": selected_name,
-            "benchmark_value_eur": float(selected["value"]),
-            "value": float(selected["value"]),
-            "frame": selected["frame"],
-            "available": 1.0,
-            "verified": 1.0,
-            "is_solver_upper_bound": float(selected_name == "solver"),
-            "is_realized_path_fallback": float(selected_name == "realized_path"),
-            "failure_reason": "none",
-            "selection_reason": str(selected["selection_reason"]),
-            "best_feasible_lower_bound_name": best_name,
-            "best_feasible_lower_bound_eur": float(best_value),
         }
 
     @staticmethod
@@ -3087,6 +3013,96 @@ class BatteryBacktester:
             if name in summary and pd.notna(summary.get(name)):
                 return True
         return False
+
+    def _record_missing_critical_source_field(self, label: str, reason: str) -> None:
+        """Record a missing active source-of-truth field without silently legitimizing zero."""
+        fields = getattr(self, "_missing_critical_source_fields", None)
+        if fields is None:
+            fields = []
+            self._missing_critical_source_fields = fields
+        reasons = getattr(self, "_missing_critical_source_reasons", None)
+        if reasons is None:
+            reasons = set()
+            self._missing_critical_source_reasons = reasons
+        label_s = str(label)
+        if label_s and label_s not in fields:
+            fields.append(label_s)
+        if str(reason):
+            reasons.add(str(reason))
+
+    def _append_runtime_missing_source_truth(
+        self,
+        source_truth_missing: list[str],
+        source_truth_reason_flags: set[str],
+        path_source_truth_missing: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Merge fail-closed runtime source-field reads into summary validation."""
+        for label in getattr(self, "_missing_critical_source_fields", []) or []:
+            label_s = str(label)
+            source_truth_missing.append(label_s)
+            if path_source_truth_missing is not None:
+                if label_s.startswith("naive."):
+                    path_source_truth_missing.setdefault("naive", []).append(label_s)
+                elif label_s.startswith(("rhpf.", "rolling_pf.", "perfect_foresight.")):
+                    path_source_truth_missing.setdefault("rhpf", []).append(label_s)
+        for reason in getattr(self, "_missing_critical_source_reasons", set()) or set():
+            source_truth_reason_flags.add(str(reason))
+
+    def _required_number_from_row(
+        self,
+        row: pd.Series,
+        column: str,
+        *,
+        label: str,
+        reason: str,
+        fallback: float = 0.0,
+    ) -> float:
+        """Read an active row field; missing/NaN is invalid, not a real zero."""
+        if column not in row.index:
+            self._record_missing_critical_source_field(label, reason)
+            return float(fallback)
+        value = pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
+        if pd.isna(value) or not np.isfinite(float(value)):
+            self._record_missing_critical_source_field(label, reason)
+            return float(fallback)
+        return float(value)
+
+    def _required_number_from_mapping(
+        self,
+        mapping: Mapping[str, object],
+        key: str,
+        *,
+        label: str,
+        reason: str,
+        fallback: float = 0.0,
+    ) -> float:
+        """Read an active mapping field; missing/NaN is invalid, not a real zero."""
+        if key not in mapping:
+            self._record_missing_critical_source_field(label, reason)
+            return float(fallback)
+        value = pd.to_numeric(pd.Series([mapping.get(key)]), errors="coerce").iloc[0]
+        if pd.isna(value) or not np.isfinite(float(value)):
+            self._record_missing_critical_source_field(label, reason)
+            return float(fallback)
+        return float(value)
+
+    def _required_numeric_series_from_frame(
+        self,
+        frame: pd.DataFrame,
+        column: str,
+        *,
+        label: str,
+        reason: str,
+        fallback: float = 0.0,
+    ) -> pd.Series:
+        """Read an active frame field; missing/all-NaN is invalid, not a real zero series."""
+        if column not in frame.columns:
+            self._record_missing_critical_source_field(label, reason)
+            return pd.Series(float(fallback), index=frame.index, dtype=float)
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.isna().all():
+            self._record_missing_critical_source_field(label, reason)
+        return values.fillna(float(fallback)).astype(float)
 
     @staticmethod
     def _parse_reserve_retry_ladder(raw: object) -> list[float]:
@@ -5778,15 +5794,19 @@ class BatteryBacktester:
 
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = float(
-                pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce")
-                .fillna(0.0)
-                .iloc[0]
+            rate_pos = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_pos,
+                label="afrr.activation_rate_pos",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
-            rate_neg = float(
-                pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce")
-                .fillna(0.0)
-                .iloc[0]
+            rate_neg = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_neg,
+                label="afrr.activation_rate_neg",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
@@ -6998,15 +7018,19 @@ class BatteryBacktester:
                 prices.append(float(pred_da))
                 ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                 ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                rate_pos = float(
-                    pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce")
-                    .fillna(0.0)
-                    .iloc[0]
+                rate_pos = self._required_number_from_row(
+                    row,
+                    colmap.pred_afrr_activation_rate_pos,
+                    label="afrr.activation_rate_pos",
+                    reason="missing_source_of_truth_activation_rate",
+                    fallback=0.0,
                 )
-                rate_neg = float(
-                    pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce")
-                    .fillna(0.0)
-                    .iloc[0]
+                rate_neg = self._required_number_from_row(
+                    row,
+                    colmap.pred_afrr_activation_rate_neg,
+                    label="afrr.activation_rate_neg",
+                    reason="missing_source_of_truth_activation_rate",
+                    fallback=0.0,
                 )
                 aux_power_mw, _ = self._state_aux_power_mw(
                     charge_mw=float(existing_buy_mw),
@@ -7227,21 +7251,19 @@ class BatteryBacktester:
                     ch_mw, dis_mw = clipped.get(ts, (0.0, 0.0))
                     ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                     ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                    rate_pos = float(
-                        pd.to_numeric(
-                            pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]),
-                            errors="coerce",
-                        )
-                        .fillna(0.0)
-                        .iloc[0]
+                    rate_pos = self._required_number_from_row(
+                        row,
+                        colmap.pred_afrr_activation_rate_pos,
+                        label="afrr.activation_rate_pos",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
                     )
-                    rate_neg = float(
-                        pd.to_numeric(
-                            pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]),
-                            errors="coerce",
-                        )
-                        .fillna(0.0)
-                        .iloc[0]
+                    rate_neg = self._required_number_from_row(
+                        row,
+                        colmap.pred_afrr_activation_rate_neg,
+                        label="afrr.activation_rate_neg",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
                     )
 
                     def _next_soc(ch_val: float, dis_val: float) -> float:
@@ -7550,8 +7572,20 @@ class BatteryBacktester:
                 ch_mw, dis_mw = schedule.get(ts, (0.0, 0.0))
                 ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                 ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                rate_pos = float(pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-                rate_neg = float(pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                rate_pos = self._required_number_from_row(
+                    row,
+                    colmap.pred_afrr_activation_rate_pos,
+                    label="afrr.activation_rate_pos",
+                    reason="missing_source_of_truth_activation_rate",
+                    fallback=0.0,
+                )
+                rate_neg = self._required_number_from_row(
+                    row,
+                    colmap.pred_afrr_activation_rate_neg,
+                    label="afrr.activation_rate_neg",
+                    reason="missing_source_of_truth_activation_rate",
+                    fallback=0.0,
+                )
                 aux_power_mw, _ = self._state_aux_power_mw(
                     charge_mw=float(ch_mw),
                     discharge_mw=float(dis_mw),
@@ -9000,15 +9034,19 @@ class BatteryBacktester:
             id_ch_mw, id_dis_mw = scheduled_id_by_ts.get(ts, (0.0, 0.0))
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = float(
-                pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce")
-                .fillna(0.0)
-                .iloc[0]
+            rate_pos = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_pos,
+                label="afrr.activation_rate_pos",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
-            rate_neg = float(
-                pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce")
-                .fillna(0.0)
-                .iloc[0]
+            rate_neg = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_neg,
+                label="afrr.activation_rate_neg",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
@@ -9331,8 +9369,20 @@ class BatteryBacktester:
 
                 ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                 ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                rate_pos = float(pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-                rate_neg = float(pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                rate_pos = self._required_number_from_row(
+                    row,
+                    colmap.pred_afrr_activation_rate_pos,
+                    label="afrr.activation_rate_pos",
+                    reason="missing_source_of_truth_activation_rate",
+                    fallback=0.0,
+                )
+                rate_neg = self._required_number_from_row(
+                    row,
+                    colmap.pred_afrr_activation_rate_neg,
+                    label="afrr.activation_rate_neg",
+                    reason="missing_source_of_truth_activation_rate",
+                    fallback=0.0,
+                )
                 aux_power_mw, _ = self._state_aux_power_mw(
                     charge_mw=float(ch_mw),
                     discharge_mw=float(dis_mw),
@@ -11099,21 +11149,19 @@ class BatteryBacktester:
         ) -> float:
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = float(
-                pd.to_numeric(
-                    pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]),
-                    errors="coerce",
-                )
-                .fillna(0.0)
-                .iloc[0]
+            rate_pos = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_pos,
+                label="afrr.activation_rate_pos",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
-            rate_neg = float(
-                pd.to_numeric(
-                    pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]),
-                    errors="coerce",
-                )
-                .fillna(0.0)
-                .iloc[0]
+            rate_neg = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_neg,
+                label="afrr.activation_rate_neg",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
@@ -12284,15 +12332,19 @@ class BatteryBacktester:
             ch_mw, dis_mw = self._normalize_da_bid(*(da_lockbook.get(ts, (0.0, 0.0))))
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = float(
-                pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_pos, 0.0)]), errors="coerce")
-                .fillna(0.0)
-                .iloc[0]
+            rate_pos = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_pos,
+                label="afrr.activation_rate_pos",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
-            rate_neg = float(
-                pd.to_numeric(pd.Series([row.get(colmap.pred_afrr_activation_rate_neg, 0.0)]), errors="coerce")
-                .fillna(0.0)
-                .iloc[0]
+            rate_neg = self._required_number_from_row(
+                row,
+                colmap.pred_afrr_activation_rate_neg,
+                label="afrr.activation_rate_neg",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
             )
             stack = self._compute_canonical_power_stack(
                 da_charge_mw=float(ch_mw),
@@ -14524,10 +14576,13 @@ class BatteryBacktester:
                     ),
                 )
                 terminal_recovery_residual_grid_mwh += residual_charge_for_terminal * float(self.dt_h)
-                row_da_price = pd.to_numeric(
-                    pd.Series([rows.iloc[i].get(colmap.pred_da_price, 0.0)]),
-                    errors="coerce",
-                ).fillna(0.0).iloc[0]
+                row_da_price = self._required_number_from_row(
+                    rows.iloc[i],
+                    colmap.pred_da_price,
+                    label="da.price",
+                    reason="missing_source_of_truth_da_price",
+                    fallback=float(self.id_buy_price_cap_eur_mwh),
+                )
                 row_id_buy_price = max(
                     0.0,
                     min(
@@ -20524,8 +20579,26 @@ class BatteryBacktester:
             clearing_rec.get("bem_guard_soc_anchor_mwh", settlement_soc_start_mwh)
             or settlement_soc_start_mwh
         )
-        locked_pos = max(0.0, float(clearing_rec.get("fixed_reserve_obligation_pos_mw", 0.0) or 0.0))
-        locked_neg = max(0.0, float(clearing_rec.get("fixed_reserve_obligation_neg_mw", 0.0) or 0.0))
+        locked_pos = max(
+            0.0,
+            self._required_number_from_mapping(
+                clearing_rec,
+                "fixed_reserve_obligation_pos_mw",
+                label="bcm.fixed_reserve_obligation_pos_mw",
+                reason="missing_source_of_truth_bcm_lockbook",
+                fallback=0.0,
+            ),
+        )
+        locked_neg = max(
+            0.0,
+            self._required_number_from_mapping(
+                clearing_rec,
+                "fixed_reserve_obligation_neg_mw",
+                label="bcm.fixed_reserve_obligation_neg_mw",
+                reason="missing_source_of_truth_bcm_lockbook",
+                fallback=0.0,
+            ),
+        )
         if locked_pos <= 1e-12:
             locked_pos = max(0.0, float(reserve_pos_mw) - old_exec_pos)
         if locked_neg <= 1e-12:
@@ -26943,13 +27016,19 @@ class BatteryBacktester:
                         terminal_repair_recovery_aux_mwh=0.0,
                         terminal_repair_aux_without_recovery_mwh=0.0,
                     )
-                    scheduled_grid_mwh = float(
-                        terminal_repair_diag.get("terminal_soc_id_recourse_scheduled_grid_mwh", 0.0)
-                        or 0.0
+                    scheduled_grid_mwh = self._required_number_from_mapping(
+                        terminal_repair_diag,
+                        "terminal_soc_id_recourse_scheduled_grid_mwh",
+                        label="terminal.id_recourse_scheduled_grid_mwh",
+                        reason="missing_source_of_truth_terminal_repair",
+                        fallback=0.0,
                     )
-                    scheduled_internal_mwh = float(
-                        terminal_repair_diag.get("terminal_soc_id_recourse_scheduled_internal_mwh", 0.0)
-                        or 0.0
+                    scheduled_internal_mwh = self._required_number_from_mapping(
+                        terminal_repair_diag,
+                        "terminal_soc_id_recourse_scheduled_internal_mwh",
+                        label="terminal.id_recourse_scheduled_internal_mwh",
+                        reason="missing_source_of_truth_terminal_repair",
+                        fallback=0.0,
                     )
                     repair_feasible = (
                         float(terminal_repair_diag.get("terminal_soc_recovery_feasible", 0.0) or 0.0) > 0.5
@@ -27151,12 +27230,20 @@ class BatteryBacktester:
                         hold["reserve_neg_mw"] = neg_vals
                     # Maintain SoC against auxiliary losses during fallback,
                     # especially when reserve obligations are locked.
-                    rate_pos_series = pd.to_numeric(
-                        window.get(colmap.pred_afrr_activation_rate_pos, 0.0), errors="coerce"
-                    ).fillna(0.0).to_numpy(dtype=float)
-                    rate_neg_series = pd.to_numeric(
-                        window.get(colmap.pred_afrr_activation_rate_neg, 0.0), errors="coerce"
-                    ).fillna(0.0).to_numpy(dtype=float)
+                    rate_pos_series = self._required_numeric_series_from_frame(
+                        window,
+                        colmap.pred_afrr_activation_rate_pos,
+                        label="afrr.activation_rate_pos",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
+                    ).to_numpy(dtype=float)
+                    rate_neg_series = self._required_numeric_series_from_frame(
+                        window,
+                        colmap.pred_afrr_activation_rate_neg,
+                        label="afrr.activation_rate_neg",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
+                    ).to_numpy(dtype=float)
                     ch_vals = np.zeros(len(hold), dtype=float)
                     for i in range(len(hold)):
                         aux_p, _ = self._state_aux_power_mw(
@@ -27227,12 +27314,20 @@ class BatteryBacktester:
                     hold["terminal_recovery_fallback_aux_mwh"] = 0.0
 
                     ts_vals = pd.to_datetime(hold[colmap.timestamp], utc=True, errors="coerce")
-                    rate_pos_series = pd.to_numeric(
-                        window.get(colmap.pred_afrr_activation_rate_pos, 0.0), errors="coerce"
-                    ).fillna(0.0).to_numpy(dtype=float)
-                    rate_neg_series = pd.to_numeric(
-                        window.get(colmap.pred_afrr_activation_rate_neg, 0.0), errors="coerce"
-                    ).fillna(0.0).to_numpy(dtype=float)
+                    rate_pos_series = self._required_numeric_series_from_frame(
+                        window,
+                        colmap.pred_afrr_activation_rate_pos,
+                        label="afrr.activation_rate_pos",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
+                    ).to_numpy(dtype=float)
+                    rate_neg_series = self._required_numeric_series_from_frame(
+                        window,
+                        colmap.pred_afrr_activation_rate_neg,
+                        label="afrr.activation_rate_neg",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
+                    ).to_numpy(dtype=float)
                     da_price_series = self._finite_numeric_series(
                         window,
                         colmap.pred_da_price,
@@ -27542,12 +27637,20 @@ class BatteryBacktester:
                     fixed_da_discharge_mwh = 0.0
                     fixed_reserve_pos_mw = 0.0
                     fixed_reserve_neg_mw = 0.0
-                    rate_pos_series = pd.to_numeric(
-                        window.get(colmap.pred_afrr_activation_rate_pos, 0.0), errors="coerce"
-                    ).fillna(0.0).to_numpy(dtype=float)
-                    rate_neg_series = pd.to_numeric(
-                        window.get(colmap.pred_afrr_activation_rate_neg, 0.0), errors="coerce"
-                    ).fillna(0.0).to_numpy(dtype=float)
+                    rate_pos_series = self._required_numeric_series_from_frame(
+                        window,
+                        colmap.pred_afrr_activation_rate_pos,
+                        label="afrr.activation_rate_pos",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
+                    ).to_numpy(dtype=float)
+                    rate_neg_series = self._required_numeric_series_from_frame(
+                        window,
+                        colmap.pred_afrr_activation_rate_neg,
+                        label="afrr.activation_rate_neg",
+                        reason="missing_source_of_truth_activation_rate",
+                        fallback=0.0,
+                    ).to_numpy(dtype=float)
                     for j, tsw in enumerate(ts_vals):
                         if pd.isna(tsw):
                             continue
@@ -29849,8 +29952,12 @@ class BatteryBacktester:
             )
             take["bem_submitted_price_quantile"] = self._active_afrr_quantile_label()
             take["bem_optimizer_bin_quantile"] = self._active_afrr_quantile_label()
-            take["settlement_cap_bid_price_pos_eur_mw"] = tsu_take.map(lambda ts: float(afrr_capacity_price_pos_lockbook.get(ts, 0.0)))
-            take["settlement_cap_bid_price_neg_eur_mw"] = tsu_take.map(lambda ts: float(afrr_capacity_price_neg_lockbook.get(ts, 0.0)))
+            take["settlement_cap_bid_price_pos_eur_mw"] = tsu_take.map(
+                lambda ts: float(afrr_capacity_price_pos_lockbook.get(ts, np.nan))
+            )
+            take["settlement_cap_bid_price_neg_eur_mw"] = tsu_take.map(
+                lambda ts: float(afrr_capacity_price_neg_lockbook.get(ts, np.nan))
+            )
             take["bcm_capacity_bid_price_pos_eur_per_mw_h"] = take["settlement_cap_bid_price_pos_eur_mw"]
             take["bcm_capacity_bid_price_neg_eur_per_mw_h"] = take["settlement_cap_bid_price_neg_eur_mw"]
             take["bcm_lockbook_capacity_bid_price_pos_eur_per_mw_h"] = take["settlement_cap_bid_price_pos_eur_mw"]
@@ -29861,10 +29968,35 @@ class BatteryBacktester:
             take["bcm_settlement_capacity_price_resolved_neg_eur_per_mw_h"] = take["settlement_cap_bid_price_neg_eur_mw"]
             fixed_pos_for_price = tsu_take.map(lambda ts: float(afrr_cap_pos_lockbook.get(ts, 0.0)))
             fixed_neg_for_price = tsu_take.map(lambda ts: float(afrr_cap_neg_lockbook.get(ts, 0.0)))
+            pos_price_missing = pd.to_numeric(
+                take["settlement_cap_bid_price_pos_eur_mw"], errors="coerce"
+            ).isna()
+            neg_price_missing = pd.to_numeric(
+                take["settlement_cap_bid_price_neg_eur_mw"], errors="coerce"
+            ).isna()
             take["bcm_capacity_price_missing_with_awarded_mw"] = (
-                ((fixed_pos_for_price > 1e-12) & (take["settlement_cap_bid_price_pos_eur_mw"].abs() <= 1e-12))
-                | ((fixed_neg_for_price > 1e-12) & (take["settlement_cap_bid_price_neg_eur_mw"].abs() <= 1e-12))
+                ((fixed_pos_for_price > 1e-12) & pos_price_missing)
+                | ((fixed_neg_for_price > 1e-12) & neg_price_missing)
             ).astype(float)
+            if bool(take["bcm_capacity_price_missing_with_awarded_mw"].gt(0.5).any()):
+                self._record_missing_critical_source_field(
+                    "bcm.capacity_price_lockbook",
+                    "missing_source_of_truth_bcm_lockbook",
+                )
+            take["settlement_cap_bid_price_pos_eur_mw"] = pd.to_numeric(
+                take["settlement_cap_bid_price_pos_eur_mw"], errors="coerce"
+            ).fillna(0.0)
+            take["settlement_cap_bid_price_neg_eur_mw"] = pd.to_numeric(
+                take["settlement_cap_bid_price_neg_eur_mw"], errors="coerce"
+            ).fillna(0.0)
+            take["bcm_capacity_bid_price_pos_eur_per_mw_h"] = take["settlement_cap_bid_price_pos_eur_mw"]
+            take["bcm_capacity_bid_price_neg_eur_per_mw_h"] = take["settlement_cap_bid_price_neg_eur_mw"]
+            take["bcm_lockbook_capacity_bid_price_pos_eur_per_mw_h"] = take["settlement_cap_bid_price_pos_eur_mw"]
+            take["bcm_lockbook_capacity_bid_price_neg_eur_per_mw_h"] = take["settlement_cap_bid_price_neg_eur_mw"]
+            take["bcm_obligation_capacity_bid_price_pos_eur_per_mw_h"] = take["settlement_cap_bid_price_pos_eur_mw"]
+            take["bcm_obligation_capacity_bid_price_neg_eur_per_mw_h"] = take["settlement_cap_bid_price_neg_eur_mw"]
+            take["bcm_settlement_capacity_price_resolved_pos_eur_per_mw_h"] = take["settlement_cap_bid_price_pos_eur_mw"]
+            take["bcm_settlement_capacity_price_resolved_neg_eur_per_mw_h"] = take["settlement_cap_bid_price_neg_eur_mw"]
             take["bcm_capacity_price_lost_before_settlement"] = take[
                 "bcm_capacity_price_missing_with_awarded_mw"
             ]
@@ -31233,8 +31365,20 @@ class BatteryBacktester:
                         )
                         fut_bem_pos = float(pd.to_numeric(pd.Series([fut.get("bem_only_pos_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                         fut_bem_neg = float(pd.to_numeric(pd.Series([fut.get("bem_only_neg_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-                        fut_rate_pos = float(pd.to_numeric(pd.Series([base_fut.get(colmap.true_afrr_activation_rate_pos, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-                        fut_rate_neg = float(pd.to_numeric(pd.Series([base_fut.get(colmap.true_afrr_activation_rate_neg, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+                        fut_rate_pos = self._required_number_from_row(
+                            base_fut,
+                            colmap.true_afrr_activation_rate_pos,
+                            label="rhpf.afrr.true_activation_rate_pos",
+                            reason="missing_source_of_truth_activation_rate",
+                            fallback=0.0,
+                        )
+                        fut_rate_neg = self._required_number_from_row(
+                            base_fut,
+                            colmap.true_afrr_activation_rate_neg,
+                            label="rhpf.afrr.true_activation_rate_neg",
+                            reason="missing_source_of_truth_activation_rate",
+                            fallback=0.0,
+                        )
                         modeled_aux_power, _ = self._state_aux_power_mw(
                             charge_mw=fut_charge,
                             discharge_mw=fut_discharge,
@@ -32074,8 +32218,30 @@ class BatteryBacktester:
             committed_bem_neg_mw = float(clearing_rec.get("bem_only_submitted_neg_mw", 0.0))
             avail_pos_mwh = max(0.0, soc_start_hour - self.soc_min)
             avail_neg_mwh = max(0.0, self.soc_max - soc_start_hour)
-            locked_reserve_pos_mw = float(clearing_rec.get("fixed_reserve_obligation_pos_mw", 0.0))
-            locked_reserve_neg_mw = float(clearing_rec.get("fixed_reserve_obligation_neg_mw", 0.0))
+            reserve_fields_expected = (
+                "fixed_reserve_obligation_pos_mw" in clearing_rec
+                or "fixed_reserve_obligation_neg_mw" in clearing_rec
+                or float(committed_bem_pos_mw) > 1e-12
+                or float(committed_bem_neg_mw) > 1e-12
+            )
+            if reserve_fields_expected:
+                locked_reserve_pos_mw = self._required_number_from_mapping(
+                    clearing_rec,
+                    "fixed_reserve_obligation_pos_mw",
+                    label="bcm.fixed_reserve_obligation_pos_mw",
+                    reason="missing_source_of_truth_bcm_lockbook",
+                    fallback=0.0,
+                )
+                locked_reserve_neg_mw = self._required_number_from_mapping(
+                    clearing_rec,
+                    "fixed_reserve_obligation_neg_mw",
+                    label="bcm.fixed_reserve_obligation_neg_mw",
+                    reason="missing_source_of_truth_bcm_lockbook",
+                    fallback=0.0,
+                )
+            else:
+                locked_reserve_pos_mw = 0.0
+                locked_reserve_neg_mw = 0.0
             # Protected-SoC validity must be obligation-driven:
             # use locked/awarded reserve obligations only (not merely submitted volume).
             req_pos_mwh = (
@@ -32678,8 +32844,20 @@ class BatteryBacktester:
     def _calculate_realized_soc_delta_from_series(self, row: pd.Series) -> tuple[float, dict[str, object]]:
         charge_mw = float(row["real_charge_mw"])
         discharge_mw = float(row["real_discharge_mw"])
-        id_charge_mw = float(row.get("real_id_charge_mw", 0.0))
-        id_discharge_mw = float(row.get("real_id_discharge_mw", 0.0))
+        id_charge_mw = self._required_number_from_row(
+            row,
+            "real_id_charge_mw",
+            label="id.real_charge_mw",
+            reason="missing_source_of_truth_id_repair",
+            fallback=0.0,
+        )
+        id_discharge_mw = self._required_number_from_row(
+            row,
+            "real_id_discharge_mw",
+            label="id.real_discharge_mw",
+            reason="missing_source_of_truth_id_repair",
+            fallback=0.0,
+        )
         act_pos_mwh = float(row["real_act_pos_mwh"])
         act_neg_mwh = float(row["real_act_neg_mwh"])
         aux_mwh = float(row["real_aux_energy_mwh"])
@@ -33213,6 +33391,12 @@ class BatteryBacktester:
         run_started_monotonic = time.monotonic()
         if horizon_hours <= 0 or reopt_step_hours <= 0:
             raise ValueError("horizon_hours and reopt_step_hours must be > 0")
+        # Simulation checkpoints are disabled to avoid large intermediate
+        # artifacts during thesis runs.
+        write_checkpoints = False
+        checkpoint_dir = None
+        self._missing_critical_source_fields = []
+        self._missing_critical_source_reasons = set()
         self._infeasible_debug_dumps = []
         self._hard_final_soc_debug_rows = []
         self._solver_failure_diagnostics = []
@@ -33256,15 +33440,11 @@ class BatteryBacktester:
             enable_global_pf=enable_global_pf,
             enable_global_perfect_foresight=bool(enable_global_perfect_foresight),
         )
-        enable_global_perfect_foresight = bool(
-            benchmark_paths["ghpf"]
-            and (
-                bool(enable_global_perfect_foresight)
-                or bool(enable_global_pf)
-                or normalized_benchmark_mode == "ghpf_only"
-            )
-        )
-        benchmark_paths["ghpf"] = bool(enable_global_perfect_foresight)
+        # Global hindsight PF has been removed. Keep legacy summary defaults,
+        # but never build solver/no-market/realized-path GHPF candidates.
+        enable_global_perfect_foresight = False
+        enable_global_pf = False
+        benchmark_paths["ghpf"] = False
 
         def _empty_prefixed_frame(prefix: str) -> pd.DataFrame:
             ts = (
@@ -33688,7 +33868,7 @@ class BatteryBacktester:
         # Rolling perfect-foresight same-rules benchmark.
         # This remains a receding-horizon diagnostic benchmark and is not a
         # global-hindsight upper bound.
-        perfect_foresight_df = self._materialize_perfect_foresight_quantile_columns(df, colmap=colmap) if (benchmark_paths["rhpf"] or benchmark_paths["ghpf"]) else df
+        perfect_foresight_df = self._materialize_perfect_foresight_quantile_columns(df, colmap=colmap) if benchmark_paths["rhpf"] else df
         rolling_pf_available = 1.0 if benchmark_paths["rhpf"] else 0.0
         rolling_pf_verified = 1.0
         rolling_pf_solver_status = "ok"
@@ -34234,7 +34414,7 @@ class BatteryBacktester:
                 missing_count=realized_missing_count,
                 align_reason=realized_align_reason,
             )
-            selected = self._select_global_pf_incumbent(
+            selected = self._select_highest_feasible_incumbent(
                 {
                     "solver": (solver_value, solver_feasible, solver_frame_aligned),
                     "no_market": (no_market_value, no_market_feasible, no_market_frame_aligned),
@@ -35024,361 +35204,7 @@ class BatteryBacktester:
             0.0,
             float(da_true_for_global_pf.iloc[-1]) if len(da_true_for_global_pf) else 0.0,
         )
-        if enable_global_perfect_foresight:
-            expected_ts_source = real if isinstance(real, pd.DataFrame) and colmap.timestamp in real.columns else df
-            expected_global_pf_ts = pd.to_datetime(
-                expected_ts_source[colmap.timestamp],
-                utc=True,
-                errors="coerce",
-            ).reset_index(drop=True)
-            global_pf_candidate_timestamp_diagnostics: dict[str, dict[str, object]] = {}
-
-            def _missing_timestamp_reason(timestamp_diag: dict[str, object]) -> str:
-                return (
-                    "missing_timestamps:"
-                    f"missing_count={int(float(timestamp_diag.get('missing_timestamp_count', 0.0)))},"
-                    f"first_missing={timestamp_diag.get('first_missing_timestamp_utc', '')},"
-                    f"extra_count={int(float(timestamp_diag.get('extra_timestamp_count', 0.0)))},"
-                    f"first_extra={timestamp_diag.get('first_extra_timestamp_utc', '')},"
-                    f"expected_rows={int(float(timestamp_diag.get('expected_rows', timestamp_diag.get('expected_row_count', 0.0))))},"
-                    f"actual_rows={int(float(timestamp_diag.get('actual_rows', timestamp_diag.get('actual_row_count', 0.0))))}"
-                )
-
-            def _validate_global_pf_candidate(
-                frame: pd.DataFrame,
-                *,
-                candidate_label: str,
-                prefix: str,
-                value_eur: float,
-                require_ok_codes: bool,
-            ) -> tuple[bool, str, float]:
-                if frame is None or frame.empty:
-                    return False, "empty_candidate", float("nan")
-                if colmap.timestamp not in frame.columns:
-                    return False, "missing_timestamps:timestamp_column_absent", float("nan")
-                candidate_ts = pd.to_datetime(frame[colmap.timestamp], utc=True, errors="coerce").reset_index(drop=True)
-                timestamp_diag = self._timestamp_coverage_diagnostics(expected_global_pf_ts, candidate_ts)
-                global_pf_candidate_timestamp_diagnostics[str(candidate_label)] = timestamp_diag
-                if float(timestamp_diag.get("aligned", 0.0)) < 0.5:
-                    return False, _missing_timestamp_reason(timestamp_diag), float("nan")
-                soc_col = f"{prefix}_soc_mwh"
-                if soc_col not in frame.columns:
-                    return False, "missing_soc", float("nan")
-                soc_vals = pd.to_numeric(frame[soc_col], errors="coerce")
-                if soc_vals.isna().any():
-                    return False, "nonfinite_soc", float("nan")
-                soc_min_violation = float((float(self.soc_min) - soc_vals).clip(lower=0.0).max())
-                soc_max_violation = float((soc_vals - float(self.soc_max)).clip(lower=0.0).max())
-                terminal_shortfall = max(0.0, float(self.soc_target_end) - float(soc_vals.iloc[-1]))
-                if soc_min_violation > 1e-6:
-                    return False, "soc_bounds_violation", terminal_shortfall
-                if soc_max_violation > 1e-6:
-                    return False, "soc_bounds_violation", terminal_shortfall
-                if terminal_shortfall > 1e-6:
-                    return False, "terminal_soc_shortfall", terminal_shortfall
-                for c in (
-                    f"{prefix}_power_violation_charge_mw",
-                    f"{prefix}_power_violation_discharge_mw",
-                    f"{prefix}_power_violation_neg_mw",
-                    f"{prefix}_power_violation_pos_mw",
-                    f"{prefix}_power_violation_total_mw",
-                ):
-                    if c in frame.columns:
-                        max_violation = float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).clip(lower=0.0).max())
-                        if max_violation > 1e-6:
-                            return False, "power_stack_violation", terminal_shortfall
-                fallback_col = f"{prefix}_optimizer_fallback_used"
-                if fallback_col in frame.columns:
-                    fallback_used = float(pd.to_numeric(frame[fallback_col], errors="coerce").fillna(0.0).max())
-                    if fallback_used > 0.5:
-                        return False, "fallback_used", terminal_shortfall
-                repair_col = f"{prefix}_reserve_feasibility_repair_used"
-                if repair_col in frame.columns:
-                    repair_used = float(pd.to_numeric(frame[repair_col], errors="coerce").fillna(0.0).max())
-                    if repair_used > 0.5:
-                        return False, "reserve_feasibility_repair", terminal_shortfall
-                missed_cols = (
-                    f"{prefix}_missed_capacity_pos_mw",
-                    f"{prefix}_missed_capacity_neg_mw",
-                    f"{prefix}_missed_capacity_mw",
-                )
-                for c in missed_cols:
-                    if c in frame.columns:
-                        missed = float(pd.to_numeric(frame[c], errors="coerce").fillna(0.0).clip(lower=0.0).max())
-                        if missed > 1e-6:
-                            return False, "missed_capacity", terminal_shortfall
-                dump_col = f"{prefix}_accepted_path_infeasible_debug_dump_count"
-                if dump_col in frame.columns:
-                    dump_count = float(pd.to_numeric(frame[dump_col], errors="coerce").fillna(0.0).max())
-                    if dump_count > 0.5:
-                        return False, "accepted_path_infeasible_debug_dump", terminal_shortfall
-                code_col = f"{prefix}_optimization_error_code"
-                if require_ok_codes and code_col in frame.columns:
-                    codes = frame[code_col].fillna("ok").astype(str).str.strip().str.lower()
-                    bad_codes = codes[~codes.isin(OK_OPTIMIZATION_ERROR_CODES)]
-                    if not bad_codes.empty:
-                        return False, "non_ok_optimization_status", terminal_shortfall
-                if not np.isfinite(float(value_eur)):
-                    return False, "nonfinite_pnl", terminal_shortfall
-                return True, "none", terminal_shortfall
-
-            no_trade_input = self._filter_frame_to_expected_timestamps(
-                perfect_foresight_df,
-                timestamp_col=colmap.timestamp,
-                expected_timestamps=expected_global_pf_ts,
-            )
-            no_trade_real, no_trade_diag = _build_no_market_terminal_id_incumbent(no_trade_input)
-            no_trade_global = _rename_realized_frame(no_trade_real, "global_perfect_foresight")
-            global_pf_no_trade_final_soc_mwh = float(no_trade_diag.get("final_soc_mwh", float("nan")))
-            global_pf_no_trade_terminal_shortfall_mwh = float(no_trade_diag.get("terminal_shortfall_mwh", float("nan")))
-            global_pf_no_trade_id_buy_mwh = float(no_trade_diag.get("id_buy_mwh", 0.0))
-            global_pf_no_trade_incumbent_eur = _pnl_total_for_realized_frame(
-                no_trade_global,
-                "global_perfect_foresight",
-                terminal_price_for_global_pf,
-            )
-            no_trade_valid, no_trade_rejection_reason, _no_trade_shortfall_checked = _validate_global_pf_candidate(
-                no_trade_global,
-                candidate_label="no_market",
-                prefix="global_perfect_foresight",
-                value_eur=global_pf_no_trade_incumbent_eur,
-                require_ok_codes=False,
-            )
-            no_trade_feasible = bool(float(no_trade_diag.get("feasible", 0.0)) >= 0.5 and no_trade_valid)
-            global_pf_no_market_feasible = float(no_trade_feasible)
-            global_pf_no_market_rejection_reason = "none" if no_trade_feasible else str(no_trade_rejection_reason)
-
-            solver_global = _empty_pf_frame("global_perfect_foresight")
-            solver_feasible = False
-            solver_available = False
-            try:
-                if bool(run_strategy_permissions.allow_bcm):
-                    raise NotImplementedError("global_solver_missing_bcm_lockbook_semantics")
-                expected_idx = pd.DatetimeIndex(pd.to_datetime(expected_global_pf_ts, utc=True, errors="coerce").dropna())
-                solver_input = perfect_foresight_df.copy()
-                solver_input_ts = pd.to_datetime(solver_input[colmap.timestamp], utc=True, errors="coerce")
-                solver_input = solver_input.loc[solver_input_ts.isin(expected_idx)].reset_index(drop=True)
-                if solver_input.empty:
-                    raise ValueError("global PF solver input is empty after evaluated-window clamp")
-                ghpf_true_pairs = [
-                    (colmap.pred_da_price, colmap.true_da_price),
-                    (colmap.pred_afrr_capacity_price_pos, colmap.true_afrr_capacity_price_pos),
-                    (colmap.pred_afrr_capacity_price_neg, colmap.true_afrr_capacity_price_neg),
-                    (colmap.pred_afrr_activation_price_pos, colmap.true_afrr_activation_price_pos),
-                    (colmap.pred_afrr_activation_price_neg, colmap.true_afrr_activation_price_neg),
-                    (colmap.pred_afrr_activation_rate_pos, colmap.true_afrr_activation_rate_pos),
-                    (colmap.pred_afrr_activation_rate_neg, colmap.true_afrr_activation_rate_neg),
-                ]
-                ghpf_added_cols: dict[str, pd.Series | np.ndarray | float] = {}
-                for pred_col, true_col in ghpf_true_pairs:
-                    if true_col not in solver_input.columns:
-                        continue
-                    true_vals = pd.to_numeric(solver_input[true_col], errors="coerce")
-                    ghpf_added_cols[pred_col] = true_vals
-                    for q in QUANTILE_COLUMNS:
-                        q_col = f"{pred_col}_{q}"
-                        ghpf_added_cols[q_col] = true_vals
-                for b in range(len(self.afrr_quantile_bins)):
-                    for pacc_col in (f"pacc_pos_bin_{b}", f"pacc_neg_bin_{b}"):
-                        ghpf_added_cols[pacc_col] = np.ones(len(solver_input), dtype=float)
-                if bool(run_strategy_permissions.allow_bcm):
-                    ghpf_added_cols["_disable_bcm_product_bid"] = (
-                        self._bcm_partial_product_disable_mask(solver_input[colmap.timestamp]).to_numpy(dtype=float)
-                    )
-                if ghpf_added_cols:
-                    solver_input = pd.concat(
-                        [
-                            solver_input.drop(columns=[c for c in ghpf_added_cols if c in solver_input.columns]),
-                            pd.DataFrame(ghpf_added_cols, index=solver_input.index),
-                        ],
-                        axis=1,
-                    ).copy()
-                _orig_tl_global = float(self.milp_time_limit_seconds)
-                _orig_gap_global = float(self.milp_rel_gap)
-                self.milp_time_limit_seconds = max(_orig_tl_global, 300.0)
-                self.milp_rel_gap = min(_orig_gap_global, 1e-5)
-                try:
-                    global_pf_dispatch = self.optimize_dispatch(
-                        solver_input,
-                        colmap,
-                        soc_start=self.soc_init,
-                        soc_end_target=None,
-                        soc_end_min_target=self.soc_target_end if enforce_final_soc_min else None,
-                        deterministic_reserve_settlement=False,
-                        allowed_markets=allowed_markets,
-                        strategy_permissions=run_strategy_permissions,
-                        strict_input_validation=True,
-                    )
-                finally:
-                    self.milp_time_limit_seconds = _orig_tl_global
-                    self.milp_rel_gap = _orig_gap_global
-                if bool(run_strategy_permissions.allow_bcm):
-                    global_pf_dispatch = self._map_global_bcm_reserves_to_product_obligations(
-                        dispatch=global_pf_dispatch,
-                        market_input=solver_input,
-                        colmap=colmap,
-                    )
-                global_perfect_foresight_dispatch_rows = float(len(global_pf_dispatch))
-                global_perfect_foresight_bem_only_included = float(
-                    ("plan_bem_only_pos_mw" in global_pf_dispatch.columns)
-                    and ("plan_bem_only_neg_mw" in global_pf_dispatch.columns)
-                )
-                with _phase_watchdog("settlement_global_perfect_foresight_realized"):
-                    solver_real = self.settle_dispatch(
-                        solver_input,
-                        global_pf_dispatch,
-                        colmap,
-                        predicted_settlement=False,
-                        apply_market_clearing=True,
-                        perfect_foresight_mode=True,
-                    )
-                solver_global = _rename_realized_frame(solver_real, "global_perfect_foresight")
-                global_pf_solver_status = "ok"
-                solver_available = True
-                global_pf_solver_available = 1.0
-                solver_soc_vals = (
-                    pd.to_numeric(solver_global["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
-                    if "global_perfect_foresight_soc_mwh" in solver_global.columns
-                    else pd.Series(dtype=float)
-                )
-                solver_final_soc = float(solver_soc_vals.iloc[-1]) if not solver_soc_vals.empty else float(self.soc_init)
-                global_pf_candidate_terminal_shortfall_mwh = max(
-                    0.0,
-                    float(self.soc_target_end) - float(solver_final_soc),
-                )
-                global_pf_solver_terminal_shortfall_mwh = float(global_pf_candidate_terminal_shortfall_mwh)
-                global_pf_solver_solution_eur = _pnl_total_for_realized_frame(
-                    solver_global,
-                    "global_perfect_foresight",
-                    terminal_price_for_global_pf,
-                )
-                solver_feasible, global_pf_solver_rejection_reason, global_pf_solver_terminal_shortfall_mwh = (
-                    _validate_global_pf_candidate(
-                        solver_global,
-                        candidate_label="solver",
-                        prefix="global_perfect_foresight",
-                        value_eur=global_pf_solver_solution_eur,
-                        require_ok_codes=True,
-                    )
-                )
-                global_pf_solver_feasible = float(solver_feasible)
-                if not solver_feasible:
-                    global_pf_solver_status = f"unverified:{global_pf_solver_rejection_reason}"
-            except (RuntimeError, ValueError, NotImplementedError) as exc:
-                if isinstance(exc, NotImplementedError):
-                    global_pf_solver_status = str(exc)
-                    pf_failure_reason = pf_failure_reason or f"global_pf_solver_unavailable:{global_pf_solver_status}"
-                    global_pf_solver_rejection_reason = f"solver_unavailable:{global_pf_solver_status}"
-                else:
-                    global_pf_solver_status = _pf_failure_status(exc) if isinstance(exc, RuntimeError) else "solver_failed"
-                    pf_failure_reason = pf_failure_reason or f"global_pf_solver_failed:{global_pf_solver_status}"
-                    global_pf_solver_rejection_reason = f"solver_unavailable:{global_pf_solver_status}:{exc}"
-
-            realized_global = _rename_realized_frame(real, "global_perfect_foresight")
-            global_pf_realized_path_incumbent_eur = _pnl_total_for_realized_frame(
-                realized_global,
-                "global_perfect_foresight",
-                terminal_price_for_global_pf,
-            )
-            realized_global_feasible, _realized_rejection_reason, _realized_shortfall_checked = (
-                _validate_global_pf_candidate(
-                    realized_global,
-                    candidate_label="realized_path",
-                    prefix="global_perfect_foresight",
-                    value_eur=global_pf_realized_path_incumbent_eur,
-                    require_ok_codes=False,
-                )
-            )
-            realized_ts_diag = global_pf_candidate_timestamp_diagnostics.get("realized_path", {})
-            global_pf_realized_path_missing_timestamp_count = float(
-                realized_ts_diag.get("missing_timestamp_count", 0.0)
-            )
-            global_pf_realized_path_first_missing_timestamp_utc = str(
-                realized_ts_diag.get("first_missing_timestamp_utc", "")
-            )
-            global_pf_realized_path_extra_timestamp_count = float(
-                realized_ts_diag.get("extra_timestamp_count", 0.0)
-            )
-            global_pf_realized_path_first_extra_timestamp_utc = str(
-                realized_ts_diag.get("first_extra_timestamp_utc", "")
-            )
-            global_pf_realized_path_expected_rows = float(
-                realized_ts_diag.get("expected_rows", realized_ts_diag.get("expected_row_count", 0.0))
-            )
-            global_pf_realized_path_actual_rows = float(
-                realized_ts_diag.get("actual_rows", realized_ts_diag.get("actual_row_count", 0.0))
-            )
-            global_pf_realized_path_expected_row_count = float(global_pf_realized_path_expected_rows)
-            global_pf_realized_path_actual_row_count = float(global_pf_realized_path_actual_rows)
-            global_pf_realized_path_feasible = float(realized_global_feasible)
-            global_pf_realized_path_rejection_reason = (
-                "none" if realized_global_feasible else str(_realized_rejection_reason)
-            )
-
-            selection = self._evaluate_global_pf_solver_benchmark(
-                solver_value_eur=global_pf_solver_solution_eur,
-                solver_feasible=solver_feasible,
-                solver_available=solver_available,
-                solver_frame=solver_global,
-                lower_bound_candidates={
-                    "no_market": (global_pf_no_trade_incumbent_eur, no_trade_feasible, no_trade_global),
-                    "realized_path": (global_pf_realized_path_incumbent_eur, realized_global_feasible, realized_global),
-                },
-                solver_unavailable_reason=str(global_pf_solver_rejection_reason),
-            )
-            global_pf_selected_incumbent = str(selection["selected"])
-            global_pf_incumbent_selection_reason = str(selection["selection_reason"])
-            global_pf_best_feasible_lower_bound_name = str(selection["best_feasible_lower_bound_name"])
-            global_pf_best_feasible_lower_bound_eur = float(selection["best_feasible_lower_bound_eur"])
-            global_pf_solver_benchmark_verified = float(selection["verified"])
-            global_pf_is_solver_upper_bound = float(selection.get("is_solver_upper_bound", 0.0))
-            global_pf_is_realized_path_fallback = float(selection.get("is_realized_path_fallback", 0.0))
-            if str(selection["failure_reason"]) != "none":
-                pf_failure_reason = pf_failure_reason or str(selection["failure_reason"])
-            global_perfect_foresight_real = selection["frame"] if isinstance(selection["frame"], pd.DataFrame) else pd.DataFrame()
-            global_perfect_foresight_available_flag = float(selection["available"])
-            global_perfect_foresight_settlement_rows = float(len(global_perfect_foresight_real))
-
-            selected_soc_vals = (
-                pd.to_numeric(global_perfect_foresight_real["global_perfect_foresight_soc_mwh"], errors="coerce").dropna()
-                if "global_perfect_foresight_soc_mwh" in global_perfect_foresight_real.columns
-                else pd.Series(dtype=float)
-            )
-            global_pf_selected_final_soc_mwh = (
-                float(selected_soc_vals.iloc[-1]) if not selected_soc_vals.empty else float("nan")
-            )
-            global_pf_selected_terminal_shortfall_mwh = (
-                max(0.0, float(self.soc_target_end) - float(global_pf_selected_final_soc_mwh))
-                if np.isfinite(global_pf_selected_final_soc_mwh)
-                else float("nan")
-            )
-
-            if global_perfect_foresight_available_flag >= 0.5:
-                if float(selection["verified"]) >= 0.5:
-                    global_perfect_foresight_validation_status = f"verified_{global_pf_selected_incumbent}"
-                else:
-                    global_perfect_foresight_validation_status = str(selection["failure_reason"])
-            else:
-                global_perfect_foresight_real = _empty_pf_frame("global_perfect_foresight")
-                global_perfect_foresight_validation_status = str(selection["failure_reason"])
-                pf_failure_reason = pf_failure_reason or str(selection["failure_reason"])
-
-        if enable_global_perfect_foresight:
-            _safe_write_checkpoint(
-                "stage_04_global_pf",
-                frame=global_perfect_foresight_real,
-                summary={
-                    "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": float(global_pf_solver_solution_eur),
-                    "global_pf_available": float(global_perfect_foresight_available_flag),
-                    "global_pf_verified_upper_bound": float(global_pf_is_solver_upper_bound),
-                    "global_pf_is_solver_upper_bound": float(global_pf_is_solver_upper_bound),
-                    "global_pf_is_realized_path_fallback": float(global_pf_is_realized_path_fallback),
-                    "global_pf_solver_status": str(global_pf_solver_status),
-                    "global_pf_failure_reason": str(pf_failure_reason),
-                    "global_pf_selected_incumbent": str(global_pf_selected_incumbent),
-                },
-            )
-
+        # Global hindsight PF removed: do not build solver, no-market, or realized-path GHPF candidates.
         # Legacy isolated-market retrospective accounting removed.
         realized_da_only_feasible = True
         perfect_foresight_da_only_feasible = True
@@ -35634,6 +35460,20 @@ class BatteryBacktester:
         for _prefix in ("pred", "real", "naive", "perfect_foresight", "global_perfect_foresight"):
             terminal_closure_by_prefix[_prefix] = _apply_final_terminal_closure(_prefix)
         real_terminal_closure = terminal_closure_by_prefix.get("real", {})
+        required_terminal_closure_fields = (
+            "terminal_closure_applied",
+            "terminal_closure_reason",
+            "terminal_closure_id_buy_mwh",
+            "terminal_closure_id_sell_mwh",
+            "terminal_closure_cost_eur",
+            "final_soc_after_terminal_closure_mwh",
+        )
+        for field in required_terminal_closure_fields:
+            if field not in real_terminal_closure:
+                self._record_missing_critical_source_field(
+                    f"terminal.{field}",
+                    "missing_source_of_truth_terminal_repair",
+                )
         if not hourly.empty:
             final_idx = int(hourly.index[-1])
             for field in terminal_closure_fields:
@@ -36142,6 +35982,15 @@ class BatteryBacktester:
                 return pd.to_numeric(hourly[name], errors="coerce").fillna(0.0).astype(float)
             return pd.Series(0.0, index=hourly.index, dtype=float)
 
+        def _hourly_required_num_col(name: str, *, label: str, reason: str) -> pd.Series:
+            return self._required_numeric_series_from_frame(
+                hourly,
+                name,
+                label=label,
+                reason=reason,
+                fallback=0.0,
+            )
+
         if "real_soc_mwh" in hourly.columns:
             real_soc_start = _hourly_num_col("real_soc_start_mwh")
             soc_audit_cols: dict[str, object] = {}
@@ -36150,8 +35999,16 @@ class BatteryBacktester:
                 soc_audit_cols["real_soc_start_mwh"] = real_soc_start
             real_charge_mw = _hourly_num_col("real_charge_mw")
             real_discharge_mw = _hourly_num_col("real_discharge_mw")
-            real_id_charge_mw = _hourly_num_col("real_id_charge_mw")
-            real_id_discharge_mw = _hourly_num_col("real_id_discharge_mw")
+            real_id_charge_mw = _hourly_required_num_col(
+                "real_id_charge_mw",
+                label="id.real_charge_mw",
+                reason="missing_source_of_truth_id_repair",
+            )
+            real_id_discharge_mw = _hourly_required_num_col(
+                "real_id_discharge_mw",
+                label="id.real_discharge_mw",
+                reason="missing_source_of_truth_id_repair",
+            )
             real_act_pos_mwh = _hourly_num_col("real_act_pos_mwh")
             real_act_neg_mwh = _hourly_num_col("real_act_neg_mwh")
             real_aux_mwh = _hourly_num_col("real_aux_energy_mwh")
@@ -39890,6 +39747,11 @@ class BatteryBacktester:
         _require_groups(bem_source_groups, active=active_bem_market)
         _require_groups(rhpf_bem_source_groups, active=active_bem_market and rhpf_enabled, path="rhpf")
         _require_groups(terminal_source_groups, active=terminal_repair_claimed)
+        self._append_runtime_missing_source_truth(
+            source_truth_missing,
+            source_truth_reason_flags,
+            path_source_truth_missing,
+        )
         source_truth_missing = list(dict.fromkeys(source_truth_missing))
         summary["missing_source_of_truth_fields"] = json.dumps(source_truth_missing, sort_keys=True)
         summary["missing_source_of_truth_field_count"] = float(len(source_truth_missing))
@@ -41177,7 +41039,6 @@ class BatteryBacktester:
                 **({"model": real} if benchmark_paths.get("model", False) else {}),
                 **({"naive": naive_real} if benchmark_paths.get("naive", False) else {}),
                 **({"rhpf": perfect_foresight_real} if benchmark_paths.get("rhpf", False) else {}),
-                **({"ghpf": global_perfect_foresight_real} if benchmark_paths.get("ghpf", False) else {}),
                 "realized_da_only": realized_da_only_hourly,
                 "realized_afrr_only": realized_afrr_only_hourly,
                 "perfect_foresight_da_only": perfect_foresight_da_only_hourly,
