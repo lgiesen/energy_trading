@@ -8107,6 +8107,33 @@ class BatteryBacktester:
             out.setdefault("da_terminal_sensitive_reason", "not_terminal_window")
             return out
 
+        def _select_physical_driver_stats(
+            *stats_candidates: tuple[str, Mapping[str, object] | None],
+        ) -> tuple[str, dict[str, float | str], str]:
+            fallback_source = "none"
+            fallback_stats: dict[str, float | str] = {}
+            fallback_reason = "none"
+            for source, stats in stats_candidates:
+                if stats is None:
+                    continue
+                candidate_stats = _with_physical_reason_precedence(dict(stats))
+                if not fallback_stats:
+                    fallback_source = str(source)
+                    fallback_stats = dict(candidate_stats)
+                    fallback_reason = _physical_replay_failure_reason(candidate_stats)
+                reason = _physical_replay_failure_reason(candidate_stats)
+                if reason in {
+                    "da_candidate_projected_soc_below_min",
+                    "da_candidate_projected_soc_above_max",
+                }:
+                    candidate_stats["da_physical_derate_driver"] = str(reason)
+                    candidate_stats["da_physical_derate_source_stats"] = str(source)
+                    return str(source), candidate_stats, str(reason)
+            if fallback_stats:
+                fallback_stats["da_physical_derate_driver"] = str(fallback_reason)
+                fallback_stats["da_physical_derate_source_stats"] = str(fallback_source)
+            return fallback_source, fallback_stats, fallback_reason
+
         def _scale_schedule_side(
             schedule: Mapping[pd.Timestamp, tuple[float, float]],
             *,
@@ -8146,10 +8173,17 @@ class BatteryBacktester:
                 )
             )
             if side_total <= 1e-9:
-                return None, False, _with_physical_reason_precedence(
+                zero_stats = _with_physical_reason_precedence(
                     stats,
                     zero_reason=no_feasible_reason,
                 )
+                zero_stats["da_physical_derate_attempted"] = 1.0
+                zero_stats["da_physical_derate_side"] = str(side)
+                zero_stats["da_physical_derate_source"] = str(source)
+                zero_stats["da_physical_derate_driver"] = str(reason)
+                zero_stats["da_physical_derate_success"] = 0.0
+                zero_stats["da_physical_derate_final_zero_reason"] = str(no_feasible_reason)
+                return None, False, zero_stats
 
             best_schedule: dict[pd.Timestamp, tuple[float, float]] | None = None
             best_stats: dict[str, float | str] | None = None
@@ -8182,6 +8216,9 @@ class BatteryBacktester:
                 zero_stats["da_physical_derate_attempted"] = 1.0
                 zero_stats["da_physical_derate_side"] = str(side)
                 zero_stats["da_physical_derate_source"] = str(source)
+                zero_stats["da_physical_derate_driver"] = str(reason)
+                zero_stats["da_physical_derate_success"] = 0.0
+                zero_stats["da_physical_derate_final_zero_reason"] = str(no_feasible_reason)
                 return None, False, zero_stats
 
             best_total = float(sum(ch + dis for ch, dis in best_schedule.values()))
@@ -8196,6 +8233,9 @@ class BatteryBacktester:
                 zero_stats["da_physical_derate_side"] = str(side)
                 zero_stats["da_physical_derate_source"] = str(source)
                 zero_stats["da_physical_derate_factor"] = float(low)
+                zero_stats["da_physical_derate_driver"] = str(reason)
+                zero_stats["da_physical_derate_success"] = 0.0
+                zero_stats["da_physical_derate_final_zero_reason"] = str(no_feasible_reason)
                 return None, False, zero_stats
 
             best_stats["da_bid_sizer_status"] = "ok_after_physical_derate"
@@ -8214,6 +8254,9 @@ class BatteryBacktester:
             best_stats["da_physical_derate_side"] = str(side)
             best_stats["da_physical_derate_source"] = str(source)
             best_stats["da_physical_derate_factor"] = float(low)
+            best_stats["da_physical_derate_driver"] = str(reason)
+            best_stats["da_physical_derate_success"] = 1.0
+            best_stats["da_physical_derate_final_zero_reason"] = "none"
             best_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
             return best_schedule, True, best_stats
 
@@ -8344,10 +8387,29 @@ class BatteryBacktester:
                     selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
                 selected_factor = 1.0
             else:
+                raw_candidate_physical_feasible_for_driver, raw_candidate_physical_stats_for_driver = _evaluate(
+                    candidates
+                )
+                del raw_candidate_physical_feasible_for_driver
+                physical_driver_source, physical_driver_stats, physical_driver = _select_physical_driver_stats(
+                    ("lp_stats", lp_stats),
+                    ("candidate_support_stats", candidate_support_stats),
+                    ("raw_candidate_physical_stats", raw_candidate_physical_stats_for_driver),
+                    ("raw_candidate_terminal_stats", raw_candidate_terminal_stats),
+                )
+                if physical_driver in {
+                    "da_candidate_projected_soc_below_min",
+                    "da_candidate_projected_soc_above_max",
+                }:
+                    derate_input_stats = physical_driver_stats
+                    derate_source = f"raw_candidate_after_sizer_failure_{physical_driver_source}"
+                else:
+                    derate_input_stats = raw_candidate_terminal_stats
+                    derate_source = "raw_candidate_after_sizer_failure"
                 derated_schedule, derated_feasible, derated_stats = _try_derate_candidate_for_physical_replay(
                     candidates,
-                    raw_candidate_terminal_stats,
-                    source="raw_candidate_after_sizer_failure",
+                    derate_input_stats,
+                    source=derate_source,
                 )
                 if derated_schedule is not None and bool(derated_feasible):
                     selected = dict(derated_schedule)
@@ -8387,7 +8449,7 @@ class BatteryBacktester:
                             "da_bid_sizer_zero_reason",
                             derated_stats.get(
                                 "da_canonical_sizer_failure_reason",
-                                _infeasibility_reason(raw_candidate_terminal_stats),
+                                _infeasibility_reason(derate_input_stats),
                             ),
                         )
                     )
@@ -8821,6 +8883,24 @@ class BatteryBacktester:
                     ),
                     "da_bid_sizer_error": str(selected_stats.get("da_bid_sizer_error", "none")),
                     "da_bid_sizer_zero_reason": str(selected_stats.get("da_bid_sizer_zero_reason", "none")),
+                    "da_physical_derate_attempted": float(
+                        selected_stats.get("da_physical_derate_attempted", 0.0)
+                    ),
+                    "da_physical_derate_side": str(
+                        selected_stats.get("da_physical_derate_side", "none")
+                    ),
+                    "da_physical_derate_source": str(
+                        selected_stats.get("da_physical_derate_source", "none")
+                    ),
+                    "da_physical_derate_driver": str(
+                        selected_stats.get("da_physical_derate_driver", "none")
+                    ),
+                    "da_physical_derate_success": float(
+                        selected_stats.get("da_physical_derate_success", 0.0)
+                    ),
+                    "da_physical_derate_final_zero_reason": str(
+                        selected_stats.get("da_physical_derate_final_zero_reason", "none")
+                    ),
                     "da_recovered_profitable_feasible_raw_candidate_after_zero_sizer": float(
                         selected_stats.get(
                             "da_recovered_profitable_feasible_raw_candidate_after_zero_sizer",

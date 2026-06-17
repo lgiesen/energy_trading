@@ -15111,6 +15111,97 @@ def test_da_sizer_derates_soc_min_candidate_before_zeroing(monkeypatch: pytest.M
     } != {"locked_da_terminal_shortfall_candidate_infeasible"}
 
 
+def test_da_sizer_physical_driver_overrides_terminal_stats_in_production_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 10.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.da_min_bid_size_mw = 0.1
+    bt.da_bid_granularity_mw = 0.1
+    bt.final_soc_mode = "hard_min"
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-03-05T00:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "target_time_utc": [ts],
+            "charge_mw": [0.0],
+            "discharge_mw": [1.0],
+            col.pred_da_price: [100.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+
+    monkeypatch.setattr(
+        battery_backtest_module,
+        "linprog",
+        lambda *args, **kwargs: argparse.Namespace(success=False, message="forced support sizer failure"),
+    )
+
+    def terminal_labeled_soc_min_failure(**_: object) -> tuple[bool, dict[str, float | str]]:
+        return False, {
+            "first_infeasible_timestamp_utc": str(ts),
+            "infeasibility_driver": "locked_da_terminal_shortfall_candidate_infeasible",
+            "infeasibility_driver_detail": "locked_da_terminal_shortfall_candidate_infeasible",
+            "final_soc_feasibility_reason": "locked_da_terminal_shortfall_candidate_infeasible",
+            "da_terminal_replay_failure_reason": "locked_da_terminal_shortfall_candidate_infeasible",
+            "projected_soc_min_mwh": 1.858,
+            "projected_soc_max_mwh": 10.0,
+            "projected_final_soc_mwh": 1.858,
+            "projected_power_violation_pos_mw": 0.0,
+            "projected_power_violation_neg_mw": 0.0,
+            "protected_soc_projection_violation_mwh": 0.0,
+            "da_terminal_sensitive_window": 1.0,
+            "da_terminal_sensitive_reason": "last_da_delivery_before_global_end",
+        }
+
+    monkeypatch.setattr(
+        bt,
+        "_project_da_postlock_future_feasibility",
+        terminal_labeled_soc_min_failure,
+    )
+
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=2.05,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=rows,
+        existing_da_lockbook={},
+        global_end_utc=ts,
+    )
+
+    assert sum(ch + dis for ch, dis in selected.values()) == pytest.approx(0.0)
+    assert audit
+    assert {str(row["da_bid_sizer_zero_reason"]) for row in audit} == {
+        "candidate_infeasible_soc_min_no_feasible_derate"
+    }
+    assert {str(row["da_canonical_sizer_failure_reason"]) for row in audit} == {
+        "candidate_infeasible_soc_min_no_feasible_derate"
+    }
+    assert {str(row["da_physical_derate_driver"]) for row in audit} == {
+        "da_candidate_projected_soc_below_min"
+    }
+    assert {str(row["da_physical_derate_side"]) for row in audit} == {"sell"}
+    assert {float(row["da_physical_derate_attempted"]) for row in audit} == {1.0}
+    assert {float(row["da_physical_derate_success"]) for row in audit} == {0.0}
+    assert {str(row["da_physical_derate_final_zero_reason"]) for row in audit} == {
+        "candidate_infeasible_soc_min_no_feasible_derate"
+    }
+    assert {
+        str(row["da_bid_sizer_zero_reason"]) for row in audit
+    } != {"locked_da_terminal_shortfall_candidate_infeasible"}
+
+
 def test_da_handoff_nonzero_candidate_not_silently_zeroed() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
