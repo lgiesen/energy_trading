@@ -14197,6 +14197,55 @@ def test_da_accepted_lockbook_reconstructs_generic_zeroed_postlock_candidate() -
     assert str(row["da_handoff_lost_postlock_candidate_reason"]) == "none"
 
 
+def test_da_handoff_selected_nonzero_reaches_lockbook() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T02:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+    rows[col.pred_da_price] = [1_000.0]
+
+    accepted, audit = bt._apply_da_accepted_lockbook_replay_to_audit_rows(
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(ts),
+                "da_handoff_postlock_selected_candidate": 1.0,
+                "da_postlock_candidate_buy_mw": 0.0,
+                "da_postlock_candidate_sell_mw": 1.0,
+                "da_sized_candidate_buy_mw": 0.0,
+                "da_sized_candidate_sell_mw": 1.0,
+                "selected_incumbent": "optimized",
+                "final_selected_incumbent": "optimized",
+                "da_handoff_lost_postlock_candidate_reason": "handoff_bug_candidate_nonzero_but_accepted_zero",
+                "da_zero_reason": "handoff_bug_candidate_nonzero_but_accepted_zero",
+                "zero_reason": "handoff_bug_candidate_nonzero_but_accepted_zero",
+                "candidate_rejection_reason": "none",
+                "candidate_minus_incumbent_eur": 100.0,
+            }
+        ],
+        accepted_da={},
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert accepted == {ts: pytest.approx((0.0, 1.0))}
+    row = audit[0]
+    assert float(row["da_handoff_selected_sell_mw"]) == pytest.approx(1.0)
+    assert float(row["da_handoff_accepted_sell_mw"]) == pytest.approx(1.0)
+    assert float(row["da_handoff_delta_sell_mw"]) == pytest.approx(0.0)
+    assert float(row["da_handoff_pass"]) == pytest.approx(1.0)
+    assert str(row["da_handoff_reason"]) == "none"
+    assert float(row["da_accepted_sell_mw"]) == pytest.approx(1.0)
+    assert float(row["da_selected_lockable_sell_mw"]) == pytest.approx(1.0)
+    assert float(row["accepted_lockbook_row_sell_mwh"]) == pytest.approx(1.0)
+    assert str(row["final_selected_incumbent"]) == "optimized"
+    assert str(row["da_handoff_lost_postlock_candidate_reason"]) == "none"
+
+
 def test_da_reduced_to_feasible_without_blocker_reconstructs_postlock_schedule() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -15005,6 +15054,106 @@ def test_da_precommit_bid_sizer_uses_physical_current_soc_not_stale_lp_soc() -> 
         current_soc_mwh=17.0,
     )
     assert float(replay["final_soc_mwh"]) == pytest.approx(18.0)
+
+
+def test_da_sizer_derates_soc_min_candidate_before_zeroing(monkeypatch: pytest.MonkeyPatch) -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 2.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.da_min_bid_size_mw = 0.1
+    bt.da_bid_granularity_mw = 0.1
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-03-05T00:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "target_time_utc": [ts],
+            "charge_mw": [0.0],
+            "discharge_mw": [1.0],
+            col.pred_da_price: [100.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+
+    monkeypatch.setattr(
+        battery_backtest_module,
+        "linprog",
+        lambda *args, **kwargs: argparse.Namespace(success=False, message="forced support sizer failure"),
+    )
+
+    accepted, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=2.2,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=rows,
+        existing_da_lockbook={},
+        global_end_utc=None,
+    )
+
+    assert accepted
+    accepted_sell = float(accepted[ts][1])
+    assert 0.0 < accepted_sell <= 0.2 + 1e-6
+    assert audit
+    assert {str(row["da_bid_sizer_status"]) for row in audit} == {"ok_after_physical_derate"}
+    assert {str(row["da_canonical_sizer_failure_reason"]) for row in audit} == {"none"}
+    assert max(float(row["projected_soc_min_mwh"]) for row in audit) >= bt.soc_min - 1e-6
+    assert {
+        str(row["da_bid_sizer_zero_reason"]) for row in audit
+    } != {"locked_da_terminal_shortfall_candidate_infeasible"}
+
+
+def test_da_handoff_nonzero_candidate_not_silently_zeroed() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 2.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.da_min_bid_size_mw = 0.1
+    bt.da_bid_granularity_mw = 0.1
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-03-05T01:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "target_time_utc": [ts],
+            "charge_mw": [0.5],
+            "discharge_mw": [0.0],
+            col.pred_da_price: [-100.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+
+    accepted, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=rows,
+        existing_da_lockbook={},
+        global_end_utc=None,
+    )
+
+    assert accepted
+    assert sum(ch + dis for ch, dis in accepted.values()) > 0.0
+    assert audit
+    assert max(float(row["da_selected_lockable_buy_mw"]) + float(row["da_selected_lockable_sell_mw"]) for row in audit) > 0.0
+    assert {float(row["da_handoff_candidate_nonzero_but_accepted_zero"]) for row in audit} == {0.0}
+    assert {float(row["da_no_silent_zero_violation"]) for row in audit} == {0.0}
 
 
 def test_da_settlement_equiv_lockbook_cap_prevents_unexecuted_locked_buy() -> None:

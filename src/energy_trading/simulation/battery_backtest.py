@@ -6544,6 +6544,7 @@ class BatteryBacktester:
             "unknown",
             "accepted_lockbook_zeroed_after_postlock",
             "accepted_lockbook_row_zeroed_after_postlock",
+            "handoff_bug_candidate_nonzero_but_accepted_zero",
             "reduced_to_feasible_da_schedule",
             "prelock_repair_derated_to_feasible",
         }
@@ -6856,6 +6857,18 @@ class BatteryBacktester:
             sell_mw = 0.0
             if pd.notna(tsu):
                 buy_mw, sell_mw = normalized_da.get(pd.Timestamp(tsu), (0.0, 0.0))
+            handoff_selected_buy_mw = max(0.0, _row_float(out_row, "da_postlock_candidate_buy_mw"))
+            handoff_selected_sell_mw = max(0.0, _row_float(out_row, "da_postlock_candidate_sell_mw"))
+            if handoff_selected_buy_mw + handoff_selected_sell_mw <= 1e-12:
+                for buy_key, sell_key in (
+                    ("da_sized_candidate_buy_mw", "da_sized_candidate_sell_mw"),
+                    ("da_candidate_buy_mw", "da_candidate_sell_mw"),
+                    ("candidate_buy_mw", "candidate_sell_mw"),
+                ):
+                    handoff_selected_buy_mw = max(0.0, _row_float(out_row, buy_key))
+                    handoff_selected_sell_mw = max(0.0, _row_float(out_row, sell_key))
+                    if handoff_selected_buy_mw + handoff_selected_sell_mw > 1e-12:
+                        break
             locked_buy_mwh = float(buy_mw) * float(self.dt_h)
             locked_sell_mwh = float(sell_mw) * float(self.dt_h)
             row_has_lock = float((locked_buy_mwh + locked_sell_mwh) > 1e-12)
@@ -6928,6 +6941,13 @@ class BatteryBacktester:
             row_handoff_loss_explained_by_rounding = float(
                 row_lost_after_postlock and row_zero_reason == "market_bid_below_min"
             )
+            handoff_delta_buy_mw = float(handoff_selected_buy_mw) - float(buy_mw)
+            handoff_delta_sell_mw = float(handoff_selected_sell_mw) - float(sell_mw)
+            handoff_reason = "none"
+            handoff_pass = True
+            if abs(handoff_delta_buy_mw) > 1e-9 or abs(handoff_delta_sell_mw) > 1e-9:
+                handoff_reason = str(row_zero_reason)
+                handoff_pass = bool(handoff_reason != "handoff_bug_candidate_nonzero_but_accepted_zero")
 
             out_row.update(
                 {
@@ -6941,6 +6961,14 @@ class BatteryBacktester:
                     "schedule_stage_used_for_lockbook": "accepted_lockbook",
                     "da_precommit_selection_valid": 1.0,
                     "da_precommit_selection_invalid_reason": "none",
+                    "da_handoff_selected_buy_mw": float(handoff_selected_buy_mw),
+                    "da_handoff_selected_sell_mw": float(handoff_selected_sell_mw),
+                    "da_handoff_accepted_buy_mw": float(buy_mw),
+                    "da_handoff_accepted_sell_mw": float(sell_mw),
+                    "da_handoff_delta_buy_mw": float(handoff_delta_buy_mw),
+                    "da_handoff_delta_sell_mw": float(handoff_delta_sell_mw),
+                    "da_handoff_pass": float(bool(handoff_pass)),
+                    "da_handoff_reason": str(handoff_reason),
                     "da_accepted_buy_mw": float(buy_mw),
                     "da_accepted_sell_mw": float(sell_mw),
                     "accepted_buy_mw": float(buy_mw),
@@ -7169,6 +7197,9 @@ class BatteryBacktester:
             return {}, []
 
         def _infeasibility_reason(stats: Mapping[str, object]) -> str:
+            physical_reason = _physical_replay_failure_reason(stats)
+            if physical_reason != "none":
+                return physical_reason
             generic_replay_reason = "none"
             for key in (
                 "da_bid_sizer_first_infeasible_reason",
@@ -7972,6 +8003,53 @@ class BatteryBacktester:
                     return float(val)
             return float(default)
 
+        def _physical_replay_failure_reason(stats: Mapping[str, object]) -> str:
+            projected_min = _stats_float(
+                stats,
+                "projected_soc_min_mwh",
+                "da_canonical_sizer_projected_min_soc_mwh",
+                "da_bid_sizer_lp_projected_soc_min_mwh",
+                default=float(current_soc_mwh),
+            )
+            projected_max = _stats_float(
+                stats,
+                "projected_soc_max_mwh",
+                "da_canonical_sizer_projected_max_soc_mwh",
+                "da_bid_sizer_lp_projected_soc_max_mwh",
+                default=float(current_soc_mwh),
+            )
+            power_pos = _stats_float(stats, "projected_power_violation_pos_mw", default=0.0)
+            power_neg = _stats_float(stats, "projected_power_violation_neg_mw", default=0.0)
+            protected = _stats_float(stats, "protected_soc_projection_violation_mwh", default=0.0)
+            if projected_min < float(self.soc_min) - 1e-9:
+                return "da_candidate_projected_soc_below_min"
+            if projected_max > float(self.soc_max) + 1e-9:
+                return "da_candidate_projected_soc_above_max"
+            if power_pos > 1e-9 or power_neg > 1e-9:
+                return "da_power_stack_violation"
+            if protected > 1e-9:
+                return "protected_soc_prevented_da_candidate"
+            return "none"
+
+        def _with_physical_reason_precedence(
+            stats: Mapping[str, object],
+            *,
+            zero_reason: str | None = None,
+        ) -> dict[str, float | str]:
+            out = dict(stats)
+            reason = _physical_replay_failure_reason(out)
+            if reason == "none":
+                return out
+            final_reason = str(zero_reason or reason)
+            out["da_bid_sizer_first_infeasible_reason"] = final_reason
+            out["da_bid_sizer_zero_reason"] = final_reason
+            out["da_canonical_sizer_failure_reason"] = final_reason
+            out["infeasibility_driver"] = final_reason
+            out["infeasibility_driver_detail"] = final_reason
+            out.setdefault("final_soc_feasibility_reason", final_reason)
+            out.setdefault("da_terminal_replay_failure_reason", "none")
+            return out
+
         def _stats_reason(stats: Mapping[str, object]) -> str:
             return str(_infeasibility_reason(stats)).strip()
 
@@ -8028,6 +8106,116 @@ class BatteryBacktester:
             out.setdefault("da_terminal_sensitive_window", 0.0)
             out.setdefault("da_terminal_sensitive_reason", "not_terminal_window")
             return out
+
+        def _scale_schedule_side(
+            schedule: Mapping[pd.Timestamp, tuple[float, float]],
+            *,
+            side: str,
+            factor: float,
+        ) -> dict[pd.Timestamp, tuple[float, float]]:
+            out: dict[pd.Timestamp, tuple[float, float]] = {}
+            bounded_factor = max(0.0, min(1.0, float(factor)))
+            for ts, (ch, dis) in schedule.items():
+                if side == "sell":
+                    out[ts] = self._normalize_da_bid(float(ch), float(dis) * bounded_factor)
+                elif side == "buy":
+                    out[ts] = self._normalize_da_bid(float(ch) * bounded_factor, float(dis))
+                else:
+                    out[ts] = self._normalize_da_bid(float(ch), float(dis))
+            return out
+
+        def _try_derate_candidate_for_physical_replay(
+            schedule: Mapping[pd.Timestamp, tuple[float, float]],
+            stats: Mapping[str, object],
+            *,
+            source: str,
+        ) -> tuple[dict[pd.Timestamp, tuple[float, float]] | None, bool, dict[str, float | str]]:
+            reason = _physical_replay_failure_reason(stats)
+            if reason == "da_candidate_projected_soc_below_min":
+                side = "sell"
+                no_feasible_reason = "candidate_infeasible_soc_min_no_feasible_derate"
+            elif reason == "da_candidate_projected_soc_above_max":
+                side = "buy"
+                no_feasible_reason = "candidate_infeasible_soc_max_no_feasible_derate"
+            else:
+                return None, False, {}
+            side_total = float(
+                sum(
+                    max(0.0, dis if side == "sell" else ch)
+                    for ch, dis in schedule.values()
+                )
+            )
+            if side_total <= 1e-9:
+                return None, False, _with_physical_reason_precedence(
+                    stats,
+                    zero_reason=no_feasible_reason,
+                )
+
+            best_schedule: dict[pd.Timestamp, tuple[float, float]] | None = None
+            best_stats: dict[str, float | str] | None = None
+            low, high = 0.0, 1.0
+            for _ in range(32):
+                mid = (low + high) / 2.0
+                trial = _scale_schedule_side(schedule, side=side, factor=mid)
+                trial_feasible, trial_stats_raw = _evaluate(trial)
+                trial_stats = _with_physical_reason_precedence(trial_stats_raw)
+                terminal_nonfatal = _is_nonfinal_terminal_shortfall_only(trial_stats)
+                if bool(trial_feasible) or bool(terminal_nonfatal):
+                    low = mid
+                    best_schedule = trial
+                    best_stats = (
+                        _mark_deferred_terminal_nonfatal(
+                            trial_stats,
+                            source=f"{source}_physical_derate",
+                        )
+                        if bool(terminal_nonfatal) and not bool(trial_feasible)
+                        else dict(trial_stats)
+                    )
+                else:
+                    high = mid
+
+            if best_schedule is None or best_stats is None:
+                zero_stats = _with_physical_reason_precedence(
+                    stats,
+                    zero_reason=no_feasible_reason,
+                )
+                zero_stats["da_physical_derate_attempted"] = 1.0
+                zero_stats["da_physical_derate_side"] = str(side)
+                zero_stats["da_physical_derate_source"] = str(source)
+                return None, False, zero_stats
+
+            best_total = float(sum(ch + dis for ch, dis in best_schedule.values()))
+            min_lot = max(float(self.da_min_bid_size_mw), float(self.da_bid_granularity_mw), 0.0)
+            if best_total <= 1e-9 or best_total + 1e-9 < min_lot:
+                zero_stats = dict(best_stats)
+                zero_stats = _with_physical_reason_precedence(
+                    zero_stats,
+                    zero_reason=no_feasible_reason,
+                )
+                zero_stats["da_physical_derate_attempted"] = 1.0
+                zero_stats["da_physical_derate_side"] = str(side)
+                zero_stats["da_physical_derate_source"] = str(source)
+                zero_stats["da_physical_derate_factor"] = float(low)
+                return None, False, zero_stats
+
+            best_stats["da_bid_sizer_status"] = "ok_after_physical_derate"
+            best_stats["da_canonical_sizer_status"] = "ok_after_physical_derate"
+            best_stats["da_canonical_sizer_failure_reason"] = "none"
+            best_stats["da_canonical_sizer_rounded_replay_pass"] = 1.0
+            best_stats["da_bid_sizer_zero_reason"] = "none"
+            best_stats["da_bid_sizer_method"] = f"{source}_{side}_derated_to_physical_replay"
+            best_stats["da_bid_sizer_total_buy_mwh"] = float(
+                sum(ch for ch, _ in best_schedule.values()) * float(self.dt_h)
+            )
+            best_stats["da_bid_sizer_total_sell_mwh"] = float(
+                sum(dis for _, dis in best_schedule.values()) * float(self.dt_h)
+            )
+            best_stats["da_physical_derate_attempted"] = 1.0
+            best_stats["da_physical_derate_side"] = str(side)
+            best_stats["da_physical_derate_source"] = str(source)
+            best_stats["da_physical_derate_factor"] = float(low)
+            best_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
+            return best_schedule, True, best_stats
 
         selected_factor = 0.0
         selected = _scaled_schedule(0.0)
@@ -8129,7 +8317,7 @@ class BatteryBacktester:
             selected_factor = float(sized_total / raw_total) if raw_total > 1e-12 else 0.0
         else:
             raw_candidate_feasible_for_terminal, raw_candidate_terminal_stats = _evaluate(candidates)
-            raw_candidate_terminal_stats = dict(raw_candidate_terminal_stats)
+            raw_candidate_terminal_stats = _with_physical_reason_precedence(raw_candidate_terminal_stats)
             if raw_total > 1e-9 and _is_nonfinal_terminal_shortfall_only(raw_candidate_terminal_stats):
                 selected_sizing_method = "raw_candidate_deferred_terminal_nonfatal"
                 selected = dict(candidates)
@@ -8156,33 +8344,71 @@ class BatteryBacktester:
                     selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
                 selected_factor = 1.0
             else:
-                selected_sizing_method = "linprog_full_window_continuous_per_hour"
-                selected_factor = 0.0
-                selected = _scaled_schedule(0.0)
-                selected_feasible, selected_stats = _evaluate(selected)
-                selected_stats = dict(selected_stats)
-                selected_stats["da_bid_sizer_status"] = str(
-                    lp_stats.get("da_bid_sizer_status", "canonical_da_sizer_infeasible")
+                derated_schedule, derated_feasible, derated_stats = _try_derate_candidate_for_physical_replay(
+                    candidates,
+                    raw_candidate_terminal_stats,
+                    source="raw_candidate_after_sizer_failure",
                 )
-                selected_stats["da_bid_sizer_method"] = "linprog_full_window_continuous_per_hour"
-                selected_stats["da_bid_sizer_zero_reason"] = "canonical_da_sizer_no_positive_feasible_schedule"
-                selected_stats["da_canonical_sizer_status"] = str(
-                    lp_stats.get("da_canonical_sizer_status", "canonical_da_sizer_infeasible")
-                )
-                selected_stats["da_canonical_sizer_failure_reason"] = str(
-                    lp_stats.get(
-                        "da_canonical_sizer_failure_reason",
-                        lp_stats.get(
-                            "da_bid_sizer_first_infeasible_reason",
-                            lp_stats.get("da_bid_sizer_error", "canonical_da_sizer_infeasible"),
-                        ),
+                if derated_schedule is not None and bool(derated_feasible):
+                    selected = dict(derated_schedule)
+                    selected_feasible = True
+                    selected_stats = dict(derated_stats)
+                    selected_sizing_method = str(
+                        selected_stats.get(
+                            "da_bid_sizer_method",
+                            "raw_candidate_after_sizer_failure_physical_derate",
+                        )
                     )
-                )
-                selected_stats["da_canonical_sizer_rounded_replay_pass"] = 0.0
-                for key, value in lp_stats.items():
-                    selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
-                if "da_bid_sizer_error" in lp_stats:
-                    selected_stats.setdefault("da_bid_sizer_error", str(lp_stats.get("da_bid_sizer_error")))
+                    sized_total = float(sum(ch + dis for ch, dis in selected.values()))
+                    selected_factor = float(sized_total / raw_total) if raw_total > 1e-12 else 0.0
+                    selected_stats["da_bid_sizer_candidate_support_status"] = str(
+                        candidate_support_stats.get("da_bid_sizer_status", "unknown")
+                    )
+                    selected_stats["da_bid_sizer_candidate_support_error"] = str(
+                        candidate_support_stats.get("da_bid_sizer_error", "")
+                    )
+                    selected_stats["da_bid_sizer_candidate_support_feasible"] = float(
+                        bool(candidate_support_feasible)
+                    )
+                    selected_stats["da_full_window_sizer_diagnostic_status"] = str(full_window_diag_status)
+                    selected_stats["da_full_window_sizer_diagnostic_reason"] = str(full_window_diag_reason)
+                    selected_stats["da_full_window_sizer_diagnostic_feasible"] = float(full_window_diag_feasible)
+                    selected_stats["da_path_price_semantics"] = str(path_price_semantics)
+                    for key, value in lp_stats.items():
+                        selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
+                else:
+                    selected_sizing_method = "linprog_full_window_continuous_per_hour"
+                    selected_factor = 0.0
+                    selected = _scaled_schedule(0.0)
+                    selected_feasible, selected_stats = _evaluate(selected)
+                    selected_stats = dict(selected_stats)
+                    concrete_zero_reason = str(
+                        derated_stats.get(
+                            "da_bid_sizer_zero_reason",
+                            derated_stats.get(
+                                "da_canonical_sizer_failure_reason",
+                                _infeasibility_reason(raw_candidate_terminal_stats),
+                            ),
+                        )
+                    )
+                    if concrete_zero_reason.strip().lower() in {"", "none", "nan"}:
+                        concrete_zero_reason = "canonical_da_sizer_no_positive_feasible_schedule"
+                    selected_stats["da_bid_sizer_status"] = str(
+                        lp_stats.get("da_bid_sizer_status", "canonical_da_sizer_infeasible")
+                    )
+                    selected_stats["da_bid_sizer_method"] = "linprog_full_window_continuous_per_hour"
+                    selected_stats["da_bid_sizer_zero_reason"] = str(concrete_zero_reason)
+                    selected_stats["da_canonical_sizer_status"] = str(
+                        lp_stats.get("da_canonical_sizer_status", "canonical_da_sizer_infeasible")
+                    )
+                    selected_stats["da_canonical_sizer_failure_reason"] = str(concrete_zero_reason)
+                    selected_stats["da_canonical_sizer_rounded_replay_pass"] = 0.0
+                    for key, value in lp_stats.items():
+                        selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
+                    for key, value in derated_stats.items():
+                        selected_stats.setdefault(key, value)
+                    if "da_bid_sizer_error" in lp_stats:
+                        selected_stats.setdefault("da_bid_sizer_error", str(lp_stats.get("da_bid_sizer_error")))
 
         optimized_schedule = dict(selected)
         optimized_factor = float(selected_factor)
@@ -8498,7 +8724,11 @@ class BatteryBacktester:
             "candidate_below_min_lot_after_rounding",
             "candidate_derated_to_zero",
             "candidate_infeasible_after_replay",
+            "candidate_infeasible_soc_max_no_feasible_derate",
+            "candidate_infeasible_soc_min_no_feasible_derate",
             "candidate_rounding_to_zero",
+            "da_candidate_projected_soc_above_max",
+            "da_candidate_projected_soc_below_min",
             "da_buy_exceeds_soc_max",
             "da_power_stack_violation",
             "da_sell_below_soc_min",
@@ -8801,6 +9031,9 @@ class BatteryBacktester:
                         "profitable_replay_eligible_candidate_zeroed_without_concrete_blocker"
                         if bool(no_silent_zero_violation)
                         else "none"
+                    ),
+                    "da_handoff_candidate_nonzero_but_accepted_zero": float(
+                        bool(str(zero_reason) == "handoff_bug_candidate_nonzero_but_accepted_zero")
                     ),
                     "projected_soc_min_mwh": float(selected_stats.get("projected_soc_min_mwh", np.nan)),
                     "projected_soc_max_mwh": float(selected_stats.get("projected_soc_max_mwh", np.nan)),
@@ -29740,6 +29973,8 @@ class BatteryBacktester:
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
                 )
+                if da_execution_policy == "price_taker":
+                    submitted_da_schedule_for_policy = dict(accepted_da)
                 da_audit_rows = [
                     {**dict(row), **final_lockbook_consistency_diag}
                     for row in da_audit_rows
@@ -30026,6 +30261,8 @@ class BatteryBacktester:
                             out_row["final_selected_incumbent"] = "no_trade"
                     patched_da_audit_rows.append(out_row)
                 da_audit_rows = patched_da_audit_rows
+                if da_execution_policy == "price_taker":
+                    submitted_da_schedule_for_policy = dict(accepted_da)
                 for row in da_audit_rows:
                     tsu = pd.to_datetime(row.get("timestamp_utc", ""), utc=True, errors="coerce")
                     if pd.isna(tsu):
