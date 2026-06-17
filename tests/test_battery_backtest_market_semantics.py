@@ -23127,3 +23127,111 @@ def test_bem_terminal_inventory_diagnostics_not_double_counted_in_full_objective
     assert float(out["bem_terminal_inventory_effect_neg_bin_0_eur_per_mw"].iloc[0]) == pytest.approx(expected_neg)
     assert float(out["bem_terminal_inventory_shadow_value_already_in_full_objective"].iloc[0]) == pytest.approx(1.0)
     assert float(out["terminal_inventory_shadow_value_eur_per_internal_mwh"].iloc[0]) == pytest.approx(100.0)
+
+
+def test_settlement_numeric_cols_registry_contract() -> None:
+    validation_sources = battery_backtest_module.VALIDATION_SOURCE_COLS
+    flat_validation_sources = battery_backtest_module.flatten_validation_source_cols()
+
+    assert validation_sources
+    assert flat_validation_sources
+    assert set(battery_backtest_module.SETTLEMENT_NUMERIC_COLS) != set(flat_validation_sources)
+
+    settlement_numeric_cols = set(battery_backtest_module.SETTLEMENT_NUMERIC_COLS)
+    prefixed_aliases = tuple(
+        col for col in flat_validation_sources
+        if col.startswith(("perfect_foresight_", "real_", "naive_", "rolling_pf_"))
+    )
+    missing_unprefixed = [
+        col for col in flat_validation_sources
+        if col not in settlement_numeric_cols and col not in prefixed_aliases
+    ]
+    assert missing_unprefixed == []
+
+    diagnostic_cols = set(battery_backtest_module.DIAGNOSTIC_NUMERIC_COLS)
+    assert diagnostic_cols.isdisjoint(flat_validation_sources)
+    assert "submitted_da_buy_mw" in validation_sources["da"]
+    assert "locked_bcm_capacity_pos_mw" in validation_sources["bcm"]
+
+
+def test_activation_rate_source_of_truth_only_required_for_active_reserve() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    row = pd.Series({col.timestamp: pd.Timestamp("2026-01-01T00:00:00Z")})
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    inactive_rates = bt._required_activation_rates_from_row(
+        row,
+        col,
+        reserve_pos_mw=0.0,
+        reserve_neg_mw=0.0,
+        bem_pos_mw=0.0,
+        bem_neg_mw=0.0,
+    )
+    assert inactive_rates == (0.0, 0.0)
+    assert bt._missing_critical_source_fields == []
+    assert bt._missing_critical_source_reasons == set()
+
+    active_rates = bt._required_activation_rates_from_row(
+        row,
+        col,
+        reserve_pos_mw=1.0,
+        reserve_neg_mw=0.0,
+    )
+    assert active_rates == (0.0, 0.0)
+    assert bt._missing_critical_source_fields == [
+        "afrr.activation_rate_pos",
+        "afrr.activation_rate_neg",
+    ]
+    assert bt._missing_critical_source_reasons == {"missing_source_of_truth_activation_rate"}
+
+    resolved = pd.Series(
+        {
+            "afrr_activation_rate_guard_source_column_pos": "pred_afrr_activation_rate_pos_guard",
+            "afrr_activation_rate_guard_source_column_neg": "pred_afrr_activation_rate_neg_guard",
+            "pred_afrr_activation_rate_pos_guard": 0.25,
+            "pred_afrr_activation_rate_neg_guard": 0.5,
+        }
+    )
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    assert bt._required_activation_rates_from_row(resolved, col, reserve_neg_mw=1.0) == (0.25, 0.5)
+    assert bt._missing_critical_source_fields == []
+
+
+def test_bem_settlement_anchor_guard_carries_fixed_reserve_obligation_source() -> None:
+    bt = _mk_backtester()
+    bt._strategy_permissions = BatteryBacktester.resolve_strategy_permissions(
+        strategy_name="multi",
+        allowed_markets=("da", "afrr", "bem"),
+    )
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+
+    updated, reserve_pos, reserve_neg = bt._apply_bem_settlement_anchor_guard_to_clearing_record(
+        clearing_rec={
+            "bem_only_submitted_pos_mw": 0.0,
+            "bem_only_submitted_neg_mw": 1.0,
+            "bem_only_executed_pos_mw": 0.0,
+            "bem_only_executed_neg_mw": 1.0,
+        },
+        settlement_soc_start_mwh=10.0,
+        charge_mw=0.0,
+        discharge_mw=0.0,
+        id_charge_mw=0.0,
+        id_discharge_mw=0.0,
+        reserve_pos_mw=3.0,
+        reserve_neg_mw=4.0,
+        act_rate_pos=0.01,
+        act_rate_neg=0.01,
+    )
+
+    assert float(updated["fixed_reserve_obligation_pos_mw"]) == pytest.approx(3.0)
+    assert float(updated["fixed_reserve_obligation_neg_mw"]) == pytest.approx(4.0)
+    assert float(updated["real_fixed_reserve_obligation_pos_mw"]) == pytest.approx(3.0)
+    assert float(updated["real_fixed_reserve_obligation_neg_mw"]) == pytest.approx(4.0)
+    assert reserve_pos >= 3.0
+    assert reserve_neg >= 4.0
+    assert bt._missing_critical_source_fields == []
+    assert bt._missing_critical_source_reasons == set()

@@ -737,6 +737,11 @@ DISPATCH_METADATA_COLS = (
     "da_sell_reason",
 )
 
+# WARNING: SETTLEMENT_NUMERIC_COLS is a wide transport/export compatibility registry.
+# It intentionally mixes actual settlement inputs, lockbook fields, guard fields,
+# diagnostics, missing-price flags, and reporting aliases. Do not use this tuple as
+# validation source-of-truth. Validators must use market-specific authority maps such
+# as VALIDATION_SOURCE_COLS below.
 SETTLEMENT_NUMERIC_COLS = (
     "plan_charge_mw",
     "plan_discharge_mw",
@@ -995,6 +1000,89 @@ SETTLEMENT_NUMERIC_COLS = (
     "Obligation_Fulfilled",
     "aFRR_Energy_Gate_Closure_Min",
 )
+
+SETTLEMENT_AUTHORITY_NUMERIC_COLS = (
+    "submitted_da_buy_mw",
+    "submitted_da_sell_mw",
+    "executed_charge_mw",
+    "executed_discharge_mw",
+    "executed_rate_pos",
+    "executed_rate_neg",
+    "bem_only_executed_pos_mw",
+    "bem_only_executed_neg_mw",
+    "settlement_soc_start_mwh",
+    "soc_before_mwh",
+    "soc_after_executed_mwh",
+)
+
+LOCKBOOK_AUTHORITY_NUMERIC_COLS = (
+    "locked_bcm_capacity_pos_mw",
+    "locked_bcm_capacity_neg_mw",
+    "bcm_locked_pos_mw",
+    "bcm_locked_neg_mw",
+    "bcm_lockbook_capacity_bid_price_pos_eur_per_mw_h",
+    "bcm_lockbook_capacity_bid_price_neg_eur_per_mw_h",
+)
+
+GUARD_NUMERIC_COLS = (
+    "safe_bem_only_pos_mw",
+    "safe_bem_only_neg_mw",
+    "bem_guard_submitted_pos_bem_mw",
+    "bem_guard_submitted_neg_bem_mw",
+    "bem_activation_energy_guard_applied",
+    "bem_guard_stale_soc_anchor",
+    "bem_guard_vs_settlement_soc_delta_mwh",
+)
+
+DIAGNOSTIC_NUMERIC_COLS = (
+    "multi_stack_combined_replay_pass",
+    "fixed_obligation_replay_pass",
+    "terminal_soc_projection_base_soc_mwh",
+    "terminal_soc_projection_remaining_aux_losses_mwh",
+)
+
+VALIDATION_SOURCE_COLS = {
+    "da": (
+        "submitted_da_buy_mw",
+        "submitted_da_sell_mw",
+        "da_buy_accepted",
+        "da_sell_accepted",
+        "da_auction_accepted_buy_mwh",
+        "da_auction_accepted_sell_mwh",
+    ),
+    "bcm": (
+        "locked_bcm_capacity_pos_mw",
+        "locked_bcm_capacity_neg_mw",
+        "bcm_locked_pos_mw",
+        "bcm_locked_neg_mw",
+    ),
+    "bem": (
+        "bem_only_submitted_pos_mw",
+        "bem_only_submitted_neg_mw",
+        "bem_only_executed_pos_mw",
+        "bem_only_executed_neg_mw",
+    ),
+    "soc": (
+        "settlement_soc_start_mwh",
+        "executed_charge_mw",
+        "executed_discharge_mw",
+    ),
+    "rhpf": (
+        "perfect_foresight_locked_bcm_capacity_pos_mw",
+        "perfect_foresight_locked_bcm_capacity_neg_mw",
+        "perfect_foresight_bem_only_submitted_pos_mw",
+        "perfect_foresight_bem_only_submitted_neg_mw",
+    ),
+}
+
+
+def flatten_validation_source_cols() -> frozenset[str]:
+    return frozenset(
+        col
+        for cols in VALIDATION_SOURCE_COLS.values()
+        for col in cols
+    )
+
 
 SETTLEMENT_METADATA_COLS = (
     "da_buy_reason",
@@ -3103,6 +3191,105 @@ class BatteryBacktester:
         if values.isna().all():
             self._record_missing_critical_source_field(label, reason)
         return values.fillna(float(fallback)).astype(float)
+
+    @staticmethod
+    def _nonempty_str(value: object) -> str:
+        text = str(value or "").strip()
+        return "" if text.lower() in {"", "none", "nan"} else text
+
+    def _resolved_activation_rate_columns(
+        self,
+        source: pd.DataFrame | pd.Series,
+        colmap: BacktestColumnMap,
+    ) -> tuple[str, str]:
+        """Return the active forecast activation-rate source columns without defaulting values."""
+        columns = set(source.columns if isinstance(source, pd.DataFrame) else source.index)
+
+        def _from_meta(meta_col: str, canonical_col: str) -> str:
+            candidate = ""
+            if meta_col in columns:
+                if isinstance(source, pd.DataFrame):
+                    values = source[meta_col].dropna().astype(str).map(str.strip)
+                    values = values.loc[~values.str.lower().isin(["", "none", "nan"])]
+                    candidate = str(values.iloc[0]) if not values.empty else ""
+                else:
+                    candidate = self._nonempty_str(source.get(meta_col))
+            if candidate and candidate in columns:
+                return candidate
+            return canonical_col
+
+        return (
+            _from_meta("afrr_activation_rate_guard_source_column_pos", colmap.pred_afrr_activation_rate_pos),
+            _from_meta("afrr_activation_rate_guard_source_column_neg", colmap.pred_afrr_activation_rate_neg),
+        )
+
+    def _required_activation_rates_from_row(
+        self,
+        row: pd.Series,
+        colmap: BacktestColumnMap,
+        *,
+        reserve_pos_mw: float = 0.0,
+        reserve_neg_mw: float = 0.0,
+        bem_pos_mw: float = 0.0,
+        bem_neg_mw: float = 0.0,
+        label_prefix: str = "afrr",
+    ) -> tuple[float, float]:
+        """Read activation rates only when an active reserve/BEM obligation needs them."""
+        active = (
+            max(0.0, float(reserve_pos_mw)) > 1e-12
+            or max(0.0, float(reserve_neg_mw)) > 1e-12
+            or max(0.0, float(bem_pos_mw)) > 1e-12
+            or max(0.0, float(bem_neg_mw)) > 1e-12
+        )
+        if not active:
+            return 0.0, 0.0
+        pos_col, neg_col = self._resolved_activation_rate_columns(row, colmap)
+        return (
+            self._required_number_from_row(
+                row,
+                pos_col,
+                label=f"{label_prefix}.activation_rate_pos",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
+            ),
+            self._required_number_from_row(
+                row,
+                neg_col,
+                label=f"{label_prefix}.activation_rate_neg",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
+            ),
+        )
+
+    def _required_activation_rate_series_from_frame(
+        self,
+        frame: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        *,
+        active: bool,
+        label_prefix: str = "afrr",
+    ) -> tuple[pd.Series, pd.Series]:
+        """Read resolved activation-rate series for active reserve paths; inactive paths are zero."""
+        if not bool(active):
+            zeros = pd.Series(0.0, index=frame.index, dtype=float)
+            return zeros, zeros.copy()
+        pos_col, neg_col = self._resolved_activation_rate_columns(frame, colmap)
+        return (
+            self._required_numeric_series_from_frame(
+                frame,
+                pos_col,
+                label=f"{label_prefix}.activation_rate_pos",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
+            ),
+            self._required_numeric_series_from_frame(
+                frame,
+                neg_col,
+                label=f"{label_prefix}.activation_rate_neg",
+                reason="missing_source_of_truth_activation_rate",
+                fallback=0.0,
+            ),
+        )
 
     @staticmethod
     def _parse_reserve_retry_ladder(raw: object) -> list[float]:
@@ -5794,19 +5981,11 @@ class BatteryBacktester:
 
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = self._required_number_from_row(
+            rate_pos, rate_neg = self._required_activation_rates_from_row(
                 row,
-                colmap.pred_afrr_activation_rate_pos,
-                label="afrr.activation_rate_pos",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
-            )
-            rate_neg = self._required_number_from_row(
-                row,
-                colmap.pred_afrr_activation_rate_neg,
-                label="afrr.activation_rate_neg",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
+                colmap,
+                reserve_pos_mw=float(ob_pos),
+                reserve_neg_mw=float(ob_neg),
             )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
@@ -7018,19 +7197,11 @@ class BatteryBacktester:
                 prices.append(float(pred_da))
                 ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                 ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                rate_pos = self._required_number_from_row(
+                rate_pos, rate_neg = self._required_activation_rates_from_row(
                     row,
-                    colmap.pred_afrr_activation_rate_pos,
-                    label="afrr.activation_rate_pos",
-                    reason="missing_source_of_truth_activation_rate",
-                    fallback=0.0,
-                )
-                rate_neg = self._required_number_from_row(
-                    row,
-                    colmap.pred_afrr_activation_rate_neg,
-                    label="afrr.activation_rate_neg",
-                    reason="missing_source_of_truth_activation_rate",
-                    fallback=0.0,
+                    colmap,
+                    reserve_pos_mw=float(ob_pos),
+                    reserve_neg_mw=float(ob_neg),
                 )
                 aux_power_mw, _ = self._state_aux_power_mw(
                     charge_mw=float(existing_buy_mw),
@@ -7251,19 +7422,11 @@ class BatteryBacktester:
                     ch_mw, dis_mw = clipped.get(ts, (0.0, 0.0))
                     ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                     ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                    rate_pos = self._required_number_from_row(
+                    rate_pos, rate_neg = self._required_activation_rates_from_row(
                         row,
-                        colmap.pred_afrr_activation_rate_pos,
-                        label="afrr.activation_rate_pos",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
-                    )
-                    rate_neg = self._required_number_from_row(
-                        row,
-                        colmap.pred_afrr_activation_rate_neg,
-                        label="afrr.activation_rate_neg",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
+                        colmap,
+                        reserve_pos_mw=float(ob_pos),
+                        reserve_neg_mw=float(ob_neg),
                     )
 
                     def _next_soc(ch_val: float, dis_val: float) -> float:
@@ -7572,19 +7735,11 @@ class BatteryBacktester:
                 ch_mw, dis_mw = schedule.get(ts, (0.0, 0.0))
                 ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                 ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                rate_pos = self._required_number_from_row(
+                rate_pos, rate_neg = self._required_activation_rates_from_row(
                     row,
-                    colmap.pred_afrr_activation_rate_pos,
-                    label="afrr.activation_rate_pos",
-                    reason="missing_source_of_truth_activation_rate",
-                    fallback=0.0,
-                )
-                rate_neg = self._required_number_from_row(
-                    row,
-                    colmap.pred_afrr_activation_rate_neg,
-                    label="afrr.activation_rate_neg",
-                    reason="missing_source_of_truth_activation_rate",
-                    fallback=0.0,
+                    colmap,
+                    reserve_pos_mw=float(ob_pos),
+                    reserve_neg_mw=float(ob_neg),
                 )
                 aux_power_mw, _ = self._state_aux_power_mw(
                     charge_mw=float(ch_mw),
@@ -9034,19 +9189,11 @@ class BatteryBacktester:
             id_ch_mw, id_dis_mw = scheduled_id_by_ts.get(ts, (0.0, 0.0))
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = self._required_number_from_row(
+            rate_pos, rate_neg = self._required_activation_rates_from_row(
                 row,
-                colmap.pred_afrr_activation_rate_pos,
-                label="afrr.activation_rate_pos",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
-            )
-            rate_neg = self._required_number_from_row(
-                row,
-                colmap.pred_afrr_activation_rate_neg,
-                label="afrr.activation_rate_neg",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
+                colmap,
+                reserve_pos_mw=float(ob_pos),
+                reserve_neg_mw=float(ob_neg),
             )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
@@ -9369,19 +9516,11 @@ class BatteryBacktester:
 
                 ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
                 ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-                rate_pos = self._required_number_from_row(
+                rate_pos, rate_neg = self._required_activation_rates_from_row(
                     row,
-                    colmap.pred_afrr_activation_rate_pos,
-                    label="afrr.activation_rate_pos",
-                    reason="missing_source_of_truth_activation_rate",
-                    fallback=0.0,
-                )
-                rate_neg = self._required_number_from_row(
-                    row,
-                    colmap.pred_afrr_activation_rate_neg,
-                    label="afrr.activation_rate_neg",
-                    reason="missing_source_of_truth_activation_rate",
-                    fallback=0.0,
+                    colmap,
+                    reserve_pos_mw=float(ob_pos),
+                    reserve_neg_mw=float(ob_neg),
                 )
                 aux_power_mw, _ = self._state_aux_power_mw(
                     charge_mw=float(ch_mw),
@@ -11149,19 +11288,11 @@ class BatteryBacktester:
         ) -> float:
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = self._required_number_from_row(
+            rate_pos, rate_neg = self._required_activation_rates_from_row(
                 row,
-                colmap.pred_afrr_activation_rate_pos,
-                label="afrr.activation_rate_pos",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
-            )
-            rate_neg = self._required_number_from_row(
-                row,
-                colmap.pred_afrr_activation_rate_neg,
-                label="afrr.activation_rate_neg",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
+                colmap,
+                reserve_pos_mw=float(ob_pos),
+                reserve_neg_mw=float(ob_neg),
             )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
@@ -12332,19 +12463,11 @@ class BatteryBacktester:
             ch_mw, dis_mw = self._normalize_da_bid(*(da_lockbook.get(ts, (0.0, 0.0))))
             ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
             ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
-            rate_pos = self._required_number_from_row(
+            rate_pos, rate_neg = self._required_activation_rates_from_row(
                 row,
-                colmap.pred_afrr_activation_rate_pos,
-                label="afrr.activation_rate_pos",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
-            )
-            rate_neg = self._required_number_from_row(
-                row,
-                colmap.pred_afrr_activation_rate_neg,
-                label="afrr.activation_rate_neg",
-                reason="missing_source_of_truth_activation_rate",
-                fallback=0.0,
+                colmap,
+                reserve_pos_mw=float(ob_pos),
+                reserve_neg_mw=float(ob_neg),
             )
             stack = self._compute_canonical_power_stack(
                 da_charge_mw=float(ch_mw),
@@ -20579,6 +20702,11 @@ class BatteryBacktester:
             clearing_rec.get("bem_guard_soc_anchor_mwh", settlement_soc_start_mwh)
             or settlement_soc_start_mwh
         )
+        clearing_rec = dict(clearing_rec)
+        clearing_rec.setdefault("fixed_reserve_obligation_pos_mw", float(max(0.0, reserve_pos_mw)))
+        clearing_rec.setdefault("fixed_reserve_obligation_neg_mw", float(max(0.0, reserve_neg_mw)))
+        clearing_rec.setdefault("real_fixed_reserve_obligation_pos_mw", float(max(0.0, reserve_pos_mw)))
+        clearing_rec.setdefault("real_fixed_reserve_obligation_neg_mw", float(max(0.0, reserve_neg_mw)))
         locked_pos = max(
             0.0,
             self._required_number_from_mapping(
@@ -27230,20 +27358,13 @@ class BatteryBacktester:
                         hold["reserve_neg_mw"] = neg_vals
                     # Maintain SoC against auxiliary losses during fallback,
                     # especially when reserve obligations are locked.
-                    rate_pos_series = self._required_numeric_series_from_frame(
+                    rate_pos_series, rate_neg_series = self._required_activation_rate_series_from_frame(
                         window,
-                        colmap.pred_afrr_activation_rate_pos,
-                        label="afrr.activation_rate_pos",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
-                    ).to_numpy(dtype=float)
-                    rate_neg_series = self._required_numeric_series_from_frame(
-                        window,
-                        colmap.pred_afrr_activation_rate_neg,
-                        label="afrr.activation_rate_neg",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
-                    ).to_numpy(dtype=float)
+                        colmap,
+                        active=bool(fixed_reserve_obligation),
+                    )
+                    rate_pos_series = rate_pos_series.to_numpy(dtype=float)
+                    rate_neg_series = rate_neg_series.to_numpy(dtype=float)
                     ch_vals = np.zeros(len(hold), dtype=float)
                     for i in range(len(hold)):
                         aux_p, _ = self._state_aux_power_mw(
@@ -27314,20 +27435,13 @@ class BatteryBacktester:
                     hold["terminal_recovery_fallback_aux_mwh"] = 0.0
 
                     ts_vals = pd.to_datetime(hold[colmap.timestamp], utc=True, errors="coerce")
-                    rate_pos_series = self._required_numeric_series_from_frame(
+                    rate_pos_series, rate_neg_series = self._required_activation_rate_series_from_frame(
                         window,
-                        colmap.pred_afrr_activation_rate_pos,
-                        label="afrr.activation_rate_pos",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
-                    ).to_numpy(dtype=float)
-                    rate_neg_series = self._required_numeric_series_from_frame(
-                        window,
-                        colmap.pred_afrr_activation_rate_neg,
-                        label="afrr.activation_rate_neg",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
-                    ).to_numpy(dtype=float)
+                        colmap,
+                        active=bool(fixed_reserve_obligation),
+                    )
+                    rate_pos_series = rate_pos_series.to_numpy(dtype=float)
+                    rate_neg_series = rate_neg_series.to_numpy(dtype=float)
                     da_price_series = self._finite_numeric_series(
                         window,
                         colmap.pred_da_price,
@@ -27637,20 +27751,13 @@ class BatteryBacktester:
                     fixed_da_discharge_mwh = 0.0
                     fixed_reserve_pos_mw = 0.0
                     fixed_reserve_neg_mw = 0.0
-                    rate_pos_series = self._required_numeric_series_from_frame(
+                    rate_pos_series, rate_neg_series = self._required_activation_rate_series_from_frame(
                         window,
-                        colmap.pred_afrr_activation_rate_pos,
-                        label="afrr.activation_rate_pos",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
-                    ).to_numpy(dtype=float)
-                    rate_neg_series = self._required_numeric_series_from_frame(
-                        window,
-                        colmap.pred_afrr_activation_rate_neg,
-                        label="afrr.activation_rate_neg",
-                        reason="missing_source_of_truth_activation_rate",
-                        fallback=0.0,
-                    ).to_numpy(dtype=float)
+                        colmap,
+                        active=bool(fixed_reserve_obligation),
+                    )
+                    rate_pos_series = rate_pos_series.to_numpy(dtype=float)
+                    rate_neg_series = rate_neg_series.to_numpy(dtype=float)
                     for j, tsw in enumerate(ts_vals):
                         if pd.isna(tsw):
                             continue
@@ -31365,20 +31472,29 @@ class BatteryBacktester:
                         )
                         fut_bem_pos = float(pd.to_numeric(pd.Series([fut.get("bem_only_pos_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
                         fut_bem_neg = float(pd.to_numeric(pd.Series([fut.get("bem_only_neg_mw", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-                        fut_rate_pos = self._required_number_from_row(
-                            base_fut,
-                            colmap.true_afrr_activation_rate_pos,
-                            label="rhpf.afrr.true_activation_rate_pos",
-                            reason="missing_source_of_truth_activation_rate",
-                            fallback=0.0,
-                        )
-                        fut_rate_neg = self._required_number_from_row(
-                            base_fut,
-                            colmap.true_afrr_activation_rate_neg,
-                            label="rhpf.afrr.true_activation_rate_neg",
-                            reason="missing_source_of_truth_activation_rate",
-                            fallback=0.0,
-                        )
+                        if (
+                            fut_res_pos > 1e-12
+                            or fut_res_neg > 1e-12
+                            or fut_bem_pos > 1e-12
+                            or fut_bem_neg > 1e-12
+                        ):
+                            fut_rate_pos = self._required_number_from_row(
+                                base_fut,
+                                colmap.true_afrr_activation_rate_pos,
+                                label="rhpf.afrr.true_activation_rate_pos",
+                                reason="missing_source_of_truth_activation_rate",
+                                fallback=0.0,
+                            )
+                            fut_rate_neg = self._required_number_from_row(
+                                base_fut,
+                                colmap.true_afrr_activation_rate_neg,
+                                label="rhpf.afrr.true_activation_rate_neg",
+                                reason="missing_source_of_truth_activation_rate",
+                                fallback=0.0,
+                            )
+                        else:
+                            fut_rate_pos = 0.0
+                            fut_rate_neg = 0.0
                         modeled_aux_power, _ = self._state_aux_power_mw(
                             charge_mw=fut_charge,
                             discharge_mw=fut_discharge,
@@ -31833,6 +31949,15 @@ class BatteryBacktester:
             rate_neg_col = colmap.true_afrr_activation_rate_neg
             kind = "real"
 
+        resolved_rate_transport_cols = [
+            "afrr_activation_rate_guard_source_column_pos",
+            "afrr_activation_rate_guard_source_column_neg",
+            colmap.pred_afrr_activation_rate_pos,
+            colmap.pred_afrr_activation_rate_neg,
+            "pred_afrr_activation_rate_pos_guard",
+            "pred_afrr_activation_rate_neg_guard",
+        ]
+
         dispatch_cols = [colmap.timestamp]
         dispatch_cols += [c for c in DISPATCH_DECISION_COLS if c in dispatch.columns]
         dispatch_metadata_cols = [c for c in DISPATCH_METADATA_COLS if c in dispatch.columns]
@@ -31892,7 +32017,17 @@ class BatteryBacktester:
         if predicted_settlement and all(c in dispatch.columns for c in [da_col, cap_pos_col, cap_neg_col, act_pos_col, act_neg_col, rate_pos_col, rate_neg_col]):
             selected_cols = list(
                 dict.fromkeys(
-                    dispatch_cols + [da_col, cap_pos_col, cap_neg_col, act_pos_col, act_neg_col, rate_pos_col, rate_neg_col]
+                    dispatch_cols
+                    + [
+                        da_col,
+                        cap_pos_col,
+                        cap_neg_col,
+                        act_pos_col,
+                        act_neg_col,
+                        rate_pos_col,
+                        rate_neg_col,
+                    ]
+                    + [c for c in resolved_rate_transport_cols if c in dispatch.columns]
                 )
             )
             merged = dispatch[selected_cols].copy()
@@ -31927,6 +32062,10 @@ class BatteryBacktester:
                         colmap.pred_afrr_activation_price_neg,
                         colmap.pred_afrr_activation_rate_pos,
                         colmap.pred_afrr_activation_rate_neg,
+                        "pred_afrr_activation_rate_pos_guard",
+                        "pred_afrr_activation_rate_neg_guard",
+                        "afrr_activation_rate_guard_source_column_pos",
+                        "afrr_activation_rate_guard_source_column_neg",
                     ]
                 )
             base_cols = [c for c in dict.fromkeys(base_cols) if c in df.columns]
@@ -31990,6 +32129,15 @@ class BatteryBacktester:
         # Expanded post-merge critical schema assertions.
         pred_critical_cols = [getattr(colmap, k) for k in CRITICAL_PRED_COL_KEYS]
         true_critical_cols = [getattr(colmap, k) for k in CRITICAL_TRUE_COL_KEYS]
+        if self._is_da_only_permissions(self._strategy_permissions):
+            activation_rate_cols = {
+                colmap.pred_afrr_activation_rate_pos,
+                colmap.pred_afrr_activation_rate_neg,
+                colmap.true_afrr_activation_rate_pos,
+                colmap.true_afrr_activation_rate_neg,
+            }
+            pred_critical_cols = [c for c in pred_critical_cols if c not in activation_rate_cols]
+            true_critical_cols = [c for c in true_critical_cols if c not in activation_rate_cols]
         # Predicted inputs are strictly required for predicted settlement.
         # For realized settlement with clearing, pred_* checks are performed in the
         # per-row reclearing branch only when precleared execution columns are absent.
@@ -32128,6 +32276,10 @@ class BatteryBacktester:
             )
             soc_start_hour = float(soc)
             if apply_market_clearing and not predicted_settlement:
+                clearing_rec["fixed_reserve_obligation_pos_mw"] = float(max(0.0, reserve_pos))
+                clearing_rec["fixed_reserve_obligation_neg_mw"] = float(max(0.0, reserve_neg))
+                clearing_rec["real_fixed_reserve_obligation_pos_mw"] = float(max(0.0, reserve_pos))
+                clearing_rec["real_fixed_reserve_obligation_neg_mw"] = float(max(0.0, reserve_neg))
                 clearing_rec, reserve_pos, reserve_neg = self._apply_bem_settlement_anchor_guard_to_clearing_record(
                     clearing_rec=clearing_rec,
                     settlement_soc_start_mwh=float(soc_start_hour),
