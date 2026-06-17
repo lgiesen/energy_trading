@@ -1474,10 +1474,23 @@ class BatteryBacktester:
             "rolling_pf_da_bid_sizer_status": "not_evaluated",
             "rolling_pf_da_bid_sizer_error": "",
             "rolling_pf_da_bid_sizer_method": "",
+            "rolling_pf_da_bid_sizer_zero_reason": "not_evaluated",
             "rolling_pf_da_candidate_support_sizer_used_as_authority": 0.0,
             "rolling_pf_da_full_window_sizer_diagnostic_status": "not_run",
             "rolling_pf_da_full_window_sizer_diagnostic_reason": "not_run",
             "rolling_pf_da_path_price_semantics": "",
+            "rolling_pf_da_physical_derate_attempted": 0.0,
+            "rolling_pf_da_physical_derate_side": "not_evaluated",
+            "rolling_pf_da_physical_derate_driver": "not_evaluated",
+            "rolling_pf_da_physical_derate_method": "not_evaluated",
+            "rolling_pf_da_physical_derate_success": 0.0,
+            "rolling_pf_da_physical_derate_final_zero_reason": "not_evaluated",
+            "rolling_pf_da_physical_derate_original_buy_mwh": float("nan"),
+            "rolling_pf_da_physical_derate_original_sell_mwh": float("nan"),
+            "rolling_pf_da_physical_derate_final_buy_mwh": float("nan"),
+            "rolling_pf_da_physical_derate_final_sell_mwh": float("nan"),
+            "rolling_pf_da_physical_derate_replay_pass": 0.0,
+            "rolling_pf_da_physical_reason_authority_source": "not_evaluated",
             "rolling_pf_da_bid_sizer_objective_eur": float("nan"),
             "rolling_pf_da_bid_sizer_total_buy_mwh": 0.0,
             "rolling_pf_da_bid_sizer_total_sell_mwh": 0.0,
@@ -1635,6 +1648,16 @@ class BatteryBacktester:
                     return float(vals.iloc[0])
             return float(default)
 
+        def _is_concrete_reason(value: object) -> bool:
+            text = str(value or "").strip()
+            return text.lower() not in {"", "none", "nan", "not_evaluated", "not_run"}
+
+        def _first_concrete_reason(*values: object) -> str:
+            for value in values:
+                if _is_concrete_reason(value):
+                    return str(value)
+            return ""
+
         defaults["rolling_pf_da_bid_sizer_status"] = _first_allowed_text(
             "da_bid_sizer_status",
             "da_precommit_da_bid_sizer_status",
@@ -1646,6 +1669,10 @@ class BatteryBacktester:
         defaults["rolling_pf_da_bid_sizer_method"] = _first_allowed_text(
             "da_bid_sizer_method",
             "da_precommit_da_bid_sizer_method",
+        )
+        defaults["rolling_pf_da_bid_sizer_zero_reason"] = _first_allowed_text(
+            "da_bid_sizer_zero_reason",
+            "da_precommit_da_bid_sizer_zero_reason",
         )
         defaults["rolling_pf_da_candidate_support_sizer_used_as_authority"] = _first_allowed_num(
             "da_candidate_support_sizer_used_as_authority",
@@ -1663,6 +1690,57 @@ class BatteryBacktester:
         defaults["rolling_pf_da_path_price_semantics"] = _first_allowed_text(
             "da_path_price_semantics",
             "da_precommit_da_path_price_semantics",
+        )
+        defaults["rolling_pf_da_physical_derate_attempted"] = _first_allowed_num(
+            "da_physical_derate_attempted",
+            "da_precommit_da_physical_derate_attempted",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_physical_derate_side"] = _first_allowed_text(
+            "da_physical_derate_side",
+            "da_precommit_da_physical_derate_side",
+        )
+        defaults["rolling_pf_da_physical_derate_driver"] = _first_allowed_text(
+            "da_physical_derate_driver",
+            "da_precommit_da_physical_derate_driver",
+        )
+        defaults["rolling_pf_da_physical_derate_method"] = _first_allowed_text(
+            "da_physical_derate_method",
+            "da_precommit_da_physical_derate_method",
+        )
+        defaults["rolling_pf_da_physical_derate_success"] = _first_allowed_num(
+            "da_physical_derate_success",
+            "da_precommit_da_physical_derate_success",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_physical_derate_final_zero_reason"] = _first_allowed_text(
+            "da_physical_derate_final_zero_reason",
+            "da_precommit_da_physical_derate_final_zero_reason",
+        )
+        defaults["rolling_pf_da_physical_derate_original_buy_mwh"] = _first_allowed_num(
+            "da_physical_derate_original_buy_mwh",
+            "da_precommit_da_physical_derate_original_buy_mwh",
+        )
+        defaults["rolling_pf_da_physical_derate_original_sell_mwh"] = _first_allowed_num(
+            "da_physical_derate_original_sell_mwh",
+            "da_precommit_da_physical_derate_original_sell_mwh",
+        )
+        defaults["rolling_pf_da_physical_derate_final_buy_mwh"] = _first_allowed_num(
+            "da_physical_derate_final_buy_mwh",
+            "da_precommit_da_physical_derate_final_buy_mwh",
+        )
+        defaults["rolling_pf_da_physical_derate_final_sell_mwh"] = _first_allowed_num(
+            "da_physical_derate_final_sell_mwh",
+            "da_precommit_da_physical_derate_final_sell_mwh",
+        )
+        defaults["rolling_pf_da_physical_derate_replay_pass"] = _first_allowed_num(
+            "da_physical_derate_replay_pass",
+            "da_precommit_da_physical_derate_replay_pass",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_physical_reason_authority_source"] = _first_allowed_text(
+            "da_physical_reason_authority_source",
+            "da_precommit_da_physical_reason_authority_source",
         )
         defaults["rolling_pf_da_bid_sizer_objective_eur"] = _first_allowed_num(
             "da_bid_sizer_objective_eur",
@@ -1760,7 +1838,16 @@ class BatteryBacktester:
             if status_reason.lower() in {"", "none", "nan", "not_evaluated"}:
                 status_reason = "sized_candidate_zeroed"
             sized_zero_reason = (
-                _first_allowed_text("da_bid_sizer_zero_reason")
+                _first_concrete_reason(
+                    defaults["rolling_pf_da_bid_sizer_zero_reason"],
+                    defaults["rolling_pf_da_physical_derate_final_zero_reason"],
+                    defaults["rolling_pf_da_physical_derate_driver"],
+                    _first_allowed_text(
+                        "da_physical_replay_failure_reason",
+                        "da_precommit_da_physical_replay_failure_reason",
+                        "physical_replay_failure_reason",
+                    ),
+                )
                 or _first_allowed_text("da_zero_reason", "zero_reason")
                 or status_reason
             )
@@ -1778,6 +1865,8 @@ class BatteryBacktester:
             defaults["rolling_pf_da_sized_zero_reason"] = "none"
 
         reason = stage
+        if stage == "sized_candidate_zeroed":
+            reason = str(defaults["rolling_pf_da_sized_zero_reason"])
         for col in (
             "da_precommit_selection_invalid_reason",
             "da_candidate_disabled_reason",
@@ -1790,7 +1879,9 @@ class BatteryBacktester:
             vals = frame.loc[allowed, col].dropna().astype(str)
             vals = vals[~vals.str.lower().isin({"", "none", "nan"})]
             if not vals.empty:
-                reason = str(vals.iloc[0])
+                candidate_reason = str(vals.iloc[0])
+                if stage != "sized_candidate_zeroed" or not _is_concrete_reason(reason):
+                    reason = candidate_reason
                 break
         defaults["rolling_pf_da_plan_history_zero_reason"] = reason
         defaults["rolling_pf_da_rejection_stage"] = stage
@@ -4746,10 +4837,10 @@ class BatteryBacktester:
         actual = pd.to_numeric(actual_soc_mwh.reindex(idx), errors="coerce").astype(float)
         selected = pd.Series(np.nan, index=idx, dtype=float)
         for col in (
-            "real_terminal_recovery_soc_after_mwh",
-            "terminal_recovery_soc_after_mwh",
             "final_soc_after_terminal_closure_mwh",
             "terminal_closure_soc_after_mwh",
+            "real_terminal_recovery_soc_after_mwh",
+            "terminal_recovery_soc_after_mwh",
         ):
             if col not in frame.columns:
                 continue
@@ -7977,8 +8068,24 @@ class BatteryBacktester:
         def _predicted_replay(
             schedule: dict[pd.Timestamp, tuple[float, float]],
         ) -> dict[str, float | str]:
+            replay_rows = rows
+            if future_rows is not None and not future_rows.empty:
+                replay_rows = future_rows.copy()
+                if "target_time_utc" not in replay_rows.columns:
+                    replay_rows["target_time_utc"] = pd.to_datetime(
+                        replay_rows.get(colmap.timestamp),
+                        utc=True,
+                        errors="coerce",
+                    )
+                else:
+                    replay_rows["target_time_utc"] = pd.to_datetime(
+                        replay_rows["target_time_utc"],
+                        utc=True,
+                        errors="coerce",
+                    )
+                replay_rows = replay_rows.dropna(subset=["target_time_utc"]).sort_values("target_time_utc")
             return self._replay_da_candidate_cashflow(
-                rows=rows,
+                rows=replay_rows,
                 schedule=schedule,
                 colmap=colmap,
                 current_soc_mwh=float(current_soc_mwh),
@@ -8128,10 +8235,12 @@ class BatteryBacktester:
                 }:
                     candidate_stats["da_physical_derate_driver"] = str(reason)
                     candidate_stats["da_physical_derate_source_stats"] = str(source)
+                    candidate_stats["da_physical_reason_authority_source"] = str(source)
                     return str(source), candidate_stats, str(reason)
             if fallback_stats:
                 fallback_stats["da_physical_derate_driver"] = str(fallback_reason)
                 fallback_stats["da_physical_derate_source_stats"] = str(fallback_source)
+                fallback_stats["da_physical_reason_authority_source"] = str(fallback_source)
             return fallback_source, fallback_stats, fallback_reason
 
         def _scale_schedule_side(
@@ -8157,15 +8266,86 @@ class BatteryBacktester:
             *,
             source: str,
         ) -> tuple[dict[pd.Timestamp, tuple[float, float]] | None, bool, dict[str, float | str]]:
+            def _schedule_totals(
+                trial_schedule: Mapping[pd.Timestamp, tuple[float, float]],
+            ) -> tuple[float, float, float]:
+                buy_mwh = float(sum(max(0.0, ch) for ch, _ in trial_schedule.values()) * float(self.dt_h))
+                sell_mwh = float(sum(max(0.0, dis) for _, dis in trial_schedule.values()) * float(self.dt_h))
+                return buy_mwh, sell_mwh, float(buy_mwh + sell_mwh)
+
+            original_buy_mwh, original_sell_mwh, _original_total_mwh = _schedule_totals(schedule)
+
+            def _with_derate_diag(
+                trial_stats: Mapping[str, object],
+                *,
+                method: str,
+                success: bool,
+                final_zero_reason: str,
+                factor: float | None = None,
+                trial_schedule: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+            ) -> dict[str, float | str]:
+                out = dict(trial_stats)
+                final_buy_mwh, final_sell_mwh, _final_total_mwh = _schedule_totals(trial_schedule or {})
+                out["da_physical_derate_attempted"] = 1.0
+                out["da_physical_derate_side"] = str(side)
+                out["da_physical_derate_source"] = str(source)
+                out["da_physical_derate_driver"] = str(reason)
+                out["da_physical_derate_method"] = str(method)
+                out["da_physical_derate_success"] = float(bool(success))
+                out["da_physical_derate_final_zero_reason"] = str(final_zero_reason)
+                out["da_physical_derate_original_buy_mwh"] = float(original_buy_mwh)
+                out["da_physical_derate_original_sell_mwh"] = float(original_sell_mwh)
+                out["da_physical_derate_final_buy_mwh"] = float(final_buy_mwh)
+                out["da_physical_derate_final_sell_mwh"] = float(final_sell_mwh)
+                out["da_physical_derate_replay_pass"] = float(bool(success))
+                out["da_physical_reason_authority_source"] = str(
+                    out.get("da_physical_reason_authority_source", stats.get("da_physical_reason_authority_source", source))
+                )
+                if factor is not None:
+                    out["da_physical_derate_factor"] = float(factor)
+                return out
+
             reason = _physical_replay_failure_reason(stats)
             if reason == "da_candidate_projected_soc_below_min":
                 side = "sell"
+                opposite_side = "buy"
                 no_feasible_reason = "candidate_infeasible_soc_min_no_feasible_derate"
             elif reason == "da_candidate_projected_soc_above_max":
                 side = "buy"
+                opposite_side = "sell"
                 no_feasible_reason = "candidate_infeasible_soc_max_no_feasible_derate"
             else:
                 return None, False, {}
+
+            original_feasible, original_stats_raw = _evaluate(dict(schedule))
+            original_stats = _with_physical_reason_precedence(original_stats_raw)
+            original_terminal_nonfatal = _is_nonfinal_terminal_shortfall_only(original_stats)
+            if bool(original_feasible) or bool(original_terminal_nonfatal):
+                accepted_stats = (
+                    _mark_deferred_terminal_nonfatal(
+                        original_stats,
+                        source=f"{source}_physical_derate_original",
+                    )
+                    if bool(original_terminal_nonfatal) and not bool(original_feasible)
+                    else dict(original_stats)
+                )
+                accepted_stats["da_bid_sizer_status"] = "ok_after_physical_derate"
+                accepted_stats["da_canonical_sizer_status"] = "ok_after_physical_derate"
+                accepted_stats["da_canonical_sizer_failure_reason"] = "none"
+                accepted_stats["da_canonical_sizer_rounded_replay_pass"] = 1.0
+                accepted_stats["da_bid_sizer_zero_reason"] = "none"
+                accepted_stats["da_bid_sizer_method"] = f"{source}_original_replay_valid"
+                accepted_stats = _with_derate_diag(
+                    accepted_stats,
+                    method="original_replay",
+                    success=True,
+                    final_zero_reason="none",
+                    factor=1.0,
+                    trial_schedule=schedule,
+                )
+                accepted_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
+                return dict(schedule), True, accepted_stats
+
             side_total = float(
                 sum(
                     max(0.0, dis if side == "sell" else ch)
@@ -8177,65 +8357,209 @@ class BatteryBacktester:
                     stats,
                     zero_reason=no_feasible_reason,
                 )
-                zero_stats["da_physical_derate_attempted"] = 1.0
-                zero_stats["da_physical_derate_side"] = str(side)
-                zero_stats["da_physical_derate_source"] = str(source)
-                zero_stats["da_physical_derate_driver"] = str(reason)
-                zero_stats["da_physical_derate_success"] = 0.0
-                zero_stats["da_physical_derate_final_zero_reason"] = str(no_feasible_reason)
+                zero_stats = _with_derate_diag(
+                    zero_stats,
+                    method="missing_failing_side_volume",
+                    success=False,
+                    final_zero_reason=no_feasible_reason,
+                    trial_schedule={},
+                )
                 return None, False, zero_stats
 
             best_schedule: dict[pd.Timestamp, tuple[float, float]] | None = None
             best_stats: dict[str, float | str] | None = None
-            low, high = 0.0, 1.0
-            for _ in range(32):
-                mid = (low + high) / 2.0
-                trial = _scale_schedule_side(schedule, side=side, factor=mid)
-                trial_feasible, trial_stats_raw = _evaluate(trial)
+            min_lot = max(float(self.da_min_bid_size_mw), float(self.da_bid_granularity_mw), 0.0)
+            best_pnl = -float("inf")
+            best_volume = 0.0
+            best_method = "none"
+            best_factor = float("nan")
+
+            def _consider_trial(
+                trial_schedule: Mapping[pd.Timestamp, tuple[float, float]],
+                *,
+                method: str,
+                factor: float | None = None,
+            ) -> None:
+                nonlocal best_schedule, best_stats, best_pnl, best_volume, best_method, best_factor
+                trial_buy_mwh, trial_sell_mwh, trial_total_mwh = _schedule_totals(trial_schedule)
+                if trial_total_mwh <= 1e-9 or trial_total_mwh + 1e-9 < min_lot:
+                    return
+                trial_feasible, trial_stats_raw = _evaluate(dict(trial_schedule))
                 trial_stats = _with_physical_reason_precedence(trial_stats_raw)
                 terminal_nonfatal = _is_nonfinal_terminal_shortfall_only(trial_stats)
-                if bool(trial_feasible) or bool(terminal_nonfatal):
-                    low = mid
-                    best_schedule = trial
-                    best_stats = (
-                        _mark_deferred_terminal_nonfatal(
-                            trial_stats,
-                            source=f"{source}_physical_derate",
-                        )
-                        if bool(terminal_nonfatal) and not bool(trial_feasible)
-                        else dict(trial_stats)
+                if not bool(trial_feasible) and not bool(terminal_nonfatal):
+                    return
+                accepted_stats = (
+                    _mark_deferred_terminal_nonfatal(
+                        trial_stats,
+                        source=f"{source}_{method}",
                     )
+                    if bool(terminal_nonfatal) and not bool(trial_feasible)
+                    else dict(trial_stats)
+                )
+                replay = _predicted_replay(dict(trial_schedule))
+                replay_pnl = pd.to_numeric(
+                    pd.Series([replay.get("selection_pnl_eur", np.nan)]),
+                    errors="coerce",
+                ).iloc[0]
+                pnl = float(replay_pnl) if pd.notna(replay_pnl) and np.isfinite(float(replay_pnl)) else 0.0
+                # Prefer economic value first; volume breaks ties so feasible
+                # nonzero candidates are not collapsed to a tiny derate.
+                if (
+                    best_schedule is None
+                    or pnl > best_pnl + 1e-9
+                    or (abs(pnl - best_pnl) <= 1e-9 and trial_total_mwh > best_volume + 1e-9)
+                ):
+                    best_schedule = dict(trial_schedule)
+                    best_stats = dict(accepted_stats)
+                    best_pnl = float(pnl)
+                    best_volume = float(trial_total_mwh)
+                    best_method = str(method)
+                    best_factor = float(factor) if factor is not None else float("nan")
+                    best_stats["da_physical_derate_final_buy_mwh"] = float(trial_buy_mwh)
+                    best_stats["da_physical_derate_final_sell_mwh"] = float(trial_sell_mwh)
+
+            def _binary_scale(
+                base_schedule: Mapping[pd.Timestamp, tuple[float, float]],
+                *,
+                scale_side: str,
+                method: str,
+            ) -> None:
+                low, high = 0.0, 1.0
+                local_best: tuple[float, dict[pd.Timestamp, tuple[float, float]]] | None = None
+                for _ in range(32):
+                    mid = (low + high) / 2.0
+                    trial = _scale_schedule_side(base_schedule, side=scale_side, factor=mid)
+                    trial_feasible, trial_stats_raw = _evaluate(trial)
+                    trial_stats = _with_physical_reason_precedence(trial_stats_raw)
+                    terminal_nonfatal = _is_nonfinal_terminal_shortfall_only(trial_stats)
+                    if bool(trial_feasible) or bool(terminal_nonfatal):
+                        low = mid
+                        local_best = (float(mid), trial)
+                    else:
+                        high = mid
+                if local_best is not None:
+                    _consider_trial(local_best[1], method=method, factor=local_best[0])
+
+            def _zero_side(
+                base_schedule: Mapping[pd.Timestamp, tuple[float, float]],
+                *,
+                drop_side: str,
+            ) -> dict[pd.Timestamp, tuple[float, float]]:
+                out: dict[pd.Timestamp, tuple[float, float]] = {}
+                for ts, (ch, dis) in base_schedule.items():
+                    if drop_side == "sell":
+                        out[ts] = self._normalize_da_bid(float(ch), 0.0)
+                    elif drop_side == "buy":
+                        out[ts] = self._normalize_da_bid(0.0, float(dis))
+                    else:
+                        out[ts] = self._normalize_da_bid(float(ch), float(dis))
+                return out
+
+            price_by_ts: dict[pd.Timestamp, float] = {}
+            if colmap.pred_da_price in rows.columns:
+                for _, row in rows.iterrows():
+                    ts = pd.to_datetime(row.get("target_time_utc"), utc=True, errors="coerce")
+                    price = pd.to_numeric(pd.Series([row.get(colmap.pred_da_price)]), errors="coerce").iloc[0]
+                    if pd.notna(ts) and pd.notna(price) and np.isfinite(float(price)):
+                        price_by_ts[pd.Timestamp(ts)] = float(price)
+
+            def _drop_priority(
+                item: tuple[pd.Timestamp, tuple[float, float]],
+                *,
+                drop_side: str,
+            ) -> tuple[float, float, str]:
+                ts, (ch, dis) = item
+                price = float(price_by_ts.get(pd.Timestamp(ts), 0.0))
+                if drop_side == "sell":
+                    mw = max(0.0, float(dis))
+                    damage = mw / max(float(self.eta_out), 1e-12)
+                    value = price * mw * float(self.dt_h)
                 else:
-                    high = mid
+                    mw = max(0.0, float(ch))
+                    damage = mw * float(self.eta_in)
+                    value = -price * mw * float(self.dt_h)
+                return (-float(damage), float(value), str(ts))
+
+            def _drop_side_progressively(
+                base_schedule: Mapping[pd.Timestamp, tuple[float, float]],
+                *,
+                drop_side: str,
+                method_prefix: str,
+                depth: int = 0,
+            ) -> None:
+                if int(depth) > 1:
+                    return
+                mutable = dict(base_schedule)
+                ordered = [
+                    ts
+                    for ts, _pair in sorted(
+                        mutable.items(),
+                        key=lambda item: _drop_priority(item, drop_side=drop_side),
+                    )
+                    if (
+                        (drop_side == "sell" and mutable[ts][1] > 1e-9)
+                        or (drop_side == "buy" and mutable[ts][0] > 1e-9)
+                    )
+                ]
+                for idx, ts in enumerate(ordered, start=1):
+                    ch, dis = mutable[ts]
+                    mutable[ts] = (
+                        self._normalize_da_bid(float(ch), 0.0)
+                        if drop_side == "sell"
+                        else self._normalize_da_bid(0.0, float(dis))
+                    )
+                    _consider_trial(mutable, method=f"{method_prefix}_drop_{drop_side}_{idx}")
+                    trial_feasible, trial_stats_raw = _evaluate(mutable)
+                    trial_reason = _physical_replay_failure_reason(
+                        _with_physical_reason_precedence(trial_stats_raw)
+                    )
+                    if trial_reason in {
+                        "da_candidate_projected_soc_below_min",
+                        "da_candidate_projected_soc_above_max",
+                    }:
+                        _binary_scale(
+                            mutable,
+                            scale_side="sell" if trial_reason == "da_candidate_projected_soc_below_min" else "buy",
+                            method=f"{method_prefix}_drop_{drop_side}_{idx}_then_binary",
+                        )
+                    if not bool(trial_feasible):
+                        opposite_reason = (
+                            "da_candidate_projected_soc_above_max"
+                            if drop_side == "sell"
+                            else "da_candidate_projected_soc_below_min"
+                        )
+                        if trial_reason == opposite_reason:
+                            _drop_side_progressively(
+                                mutable,
+                                drop_side="buy" if drop_side == "sell" else "sell",
+                                method_prefix=f"{method_prefix}_drop_{drop_side}_{idx}_opposite",
+                                depth=int(depth) + 1,
+                            )
+
+            _binary_scale(schedule, scale_side=side, method="binary_side_scale")
+            opposite_zero = _zero_side(schedule, drop_side=opposite_side)
+            _consider_trial(opposite_zero, method=f"drop_{opposite_side}_preserve_{side}")
+            _binary_scale(
+                opposite_zero,
+                scale_side=side,
+                method=f"drop_{opposite_side}_then_binary_{side}",
+            )
+            _drop_side_progressively(schedule, drop_side=side, method_prefix="subset")
+            _drop_side_progressively(opposite_zero, drop_side=side, method_prefix=f"subset_without_{opposite_side}")
 
             if best_schedule is None or best_stats is None:
                 zero_stats = _with_physical_reason_precedence(
                     stats,
                     zero_reason=no_feasible_reason,
                 )
-                zero_stats["da_physical_derate_attempted"] = 1.0
-                zero_stats["da_physical_derate_side"] = str(side)
-                zero_stats["da_physical_derate_source"] = str(source)
-                zero_stats["da_physical_derate_driver"] = str(reason)
-                zero_stats["da_physical_derate_success"] = 0.0
-                zero_stats["da_physical_derate_final_zero_reason"] = str(no_feasible_reason)
-                return None, False, zero_stats
-
-            best_total = float(sum(ch + dis for ch, dis in best_schedule.values()))
-            min_lot = max(float(self.da_min_bid_size_mw), float(self.da_bid_granularity_mw), 0.0)
-            if best_total <= 1e-9 or best_total + 1e-9 < min_lot:
-                zero_stats = dict(best_stats)
-                zero_stats = _with_physical_reason_precedence(
+                zero_stats = _with_derate_diag(
                     zero_stats,
-                    zero_reason=no_feasible_reason,
+                    method="binary_and_subset_search_no_feasible_schedule",
+                    success=False,
+                    final_zero_reason=no_feasible_reason,
+                    trial_schedule={},
                 )
-                zero_stats["da_physical_derate_attempted"] = 1.0
-                zero_stats["da_physical_derate_side"] = str(side)
-                zero_stats["da_physical_derate_source"] = str(source)
-                zero_stats["da_physical_derate_factor"] = float(low)
-                zero_stats["da_physical_derate_driver"] = str(reason)
-                zero_stats["da_physical_derate_success"] = 0.0
-                zero_stats["da_physical_derate_final_zero_reason"] = str(no_feasible_reason)
                 return None, False, zero_stats
 
             best_stats["da_bid_sizer_status"] = "ok_after_physical_derate"
@@ -8243,20 +8567,21 @@ class BatteryBacktester:
             best_stats["da_canonical_sizer_failure_reason"] = "none"
             best_stats["da_canonical_sizer_rounded_replay_pass"] = 1.0
             best_stats["da_bid_sizer_zero_reason"] = "none"
-            best_stats["da_bid_sizer_method"] = f"{source}_{side}_derated_to_physical_replay"
+            best_stats["da_bid_sizer_method"] = f"{source}_{best_method}_physical_replay"
             best_stats["da_bid_sizer_total_buy_mwh"] = float(
                 sum(ch for ch, _ in best_schedule.values()) * float(self.dt_h)
             )
             best_stats["da_bid_sizer_total_sell_mwh"] = float(
                 sum(dis for _, dis in best_schedule.values()) * float(self.dt_h)
             )
-            best_stats["da_physical_derate_attempted"] = 1.0
-            best_stats["da_physical_derate_side"] = str(side)
-            best_stats["da_physical_derate_source"] = str(source)
-            best_stats["da_physical_derate_factor"] = float(low)
-            best_stats["da_physical_derate_driver"] = str(reason)
-            best_stats["da_physical_derate_success"] = 1.0
-            best_stats["da_physical_derate_final_zero_reason"] = "none"
+            best_stats = _with_derate_diag(
+                best_stats,
+                method=best_method,
+                success=True,
+                final_zero_reason="none",
+                factor=None if pd.isna(best_factor) else float(best_factor),
+                trial_schedule=best_schedule,
+            )
             best_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
             return best_schedule, True, best_stats
 
@@ -8895,11 +9220,32 @@ class BatteryBacktester:
                     "da_physical_derate_driver": str(
                         selected_stats.get("da_physical_derate_driver", "none")
                     ),
+                    "da_physical_derate_method": str(
+                        selected_stats.get("da_physical_derate_method", "none")
+                    ),
                     "da_physical_derate_success": float(
                         selected_stats.get("da_physical_derate_success", 0.0)
                     ),
+                    "da_physical_reason_authority_source": str(
+                        selected_stats.get("da_physical_reason_authority_source", "none")
+                    ),
                     "da_physical_derate_final_zero_reason": str(
                         selected_stats.get("da_physical_derate_final_zero_reason", "none")
+                    ),
+                    "da_physical_derate_original_buy_mwh": float(
+                        selected_stats.get("da_physical_derate_original_buy_mwh", np.nan)
+                    ),
+                    "da_physical_derate_original_sell_mwh": float(
+                        selected_stats.get("da_physical_derate_original_sell_mwh", np.nan)
+                    ),
+                    "da_physical_derate_final_buy_mwh": float(
+                        selected_stats.get("da_physical_derate_final_buy_mwh", np.nan)
+                    ),
+                    "da_physical_derate_final_sell_mwh": float(
+                        selected_stats.get("da_physical_derate_final_sell_mwh", np.nan)
+                    ),
+                    "da_physical_derate_replay_pass": float(
+                        selected_stats.get("da_physical_derate_replay_pass", 0.0)
                     ),
                     "da_recovered_profitable_feasible_raw_candidate_after_zero_sizer": float(
                         selected_stats.get(
@@ -9130,6 +9476,9 @@ class BatteryBacktester:
                     "raw_candidate_predicted_pnl_eur": float(raw_candidate_replay.get("pnl_eur", np.nan)),
                     "incumbent_predicted_pnl_eur": float(incumbent_replay.get("pnl_eur", np.nan)),
                     "candidate_minus_incumbent_eur": float(candidate_minus_incumbent),
+                    "sized_candidate_minus_incumbent_eur": float(sized_candidate_minus_incumbent),
+                    "da_selection_comparison_pnl_eur": float(sized_candidate_pnl),
+                    "da_selection_comparison_minus_incumbent_eur": float(sized_candidate_minus_incumbent),
                     "candidate_projected_final_soc_mwh": float(
                         candidate_replay.get("final_soc_mwh", np.nan)
                     ),
@@ -9162,6 +9511,9 @@ class BatteryBacktester:
                     ),
                     "candidate_selection_pnl_eur_after_terminal_recovery": float(
                         candidate_replay.get("selection_pnl_eur", np.nan)
+                    ),
+                    "sized_candidate_selection_pnl_eur_after_terminal_recovery": float(
+                        sized_candidate_replay.get("selection_pnl_eur", np.nan)
                     ),
                     "incumbent_selection_pnl_eur_after_terminal_recovery": float(
                         incumbent_replay.get("selection_pnl_eur", np.nan)
@@ -9236,10 +9588,14 @@ class BatteryBacktester:
                     "candidate_gross_spread_eur": float(
                         candidate_replay.get("da_candidate_gross_spread_eur", np.nan)
                     ),
-                    "sized_candidate_revenue_eur": float(candidate_replay.get("da_candidate_revenue_eur", np.nan)),
-                    "sized_candidate_cost_eur": float(candidate_replay.get("da_candidate_cost_eur", np.nan)),
+                    "sized_candidate_revenue_eur": float(
+                        sized_candidate_replay.get("da_candidate_revenue_eur", np.nan)
+                    ),
+                    "sized_candidate_cost_eur": float(
+                        sized_candidate_replay.get("da_candidate_cost_eur", np.nan)
+                    ),
                     "sized_candidate_gross_spread_eur": float(
-                        candidate_replay.get("da_candidate_gross_spread_eur", np.nan)
+                        sized_candidate_replay.get("da_candidate_gross_spread_eur", np.nan)
                     ),
                     "selected_lockable_revenue_eur": float("nan"),
                     "selected_lockable_cost_eur": float("nan"),
@@ -9259,13 +9615,13 @@ class BatteryBacktester:
                     "candidate_pnl_recomputed_eur": float(
                         candidate_replay.get("da_candidate_pnl_recomputed_eur", np.nan)
                     ),
-                    "sized_candidate_pnl_eur": float(candidate_replay.get("selection_pnl_eur", np.nan)),
+                    "sized_candidate_pnl_eur": float(sized_candidate_replay.get("selection_pnl_eur", np.nan)),
                     "selected_lockable_pnl_eur": float("nan"),
                     "candidate_pnl_reconciliation_error_eur": float(
                         candidate_replay.get("da_candidate_pnl_reconciliation_error_eur", np.nan)
                     ),
                     "sized_candidate_reconciliation_error_eur": float(
-                        candidate_replay.get("da_candidate_pnl_reconciliation_error_eur", np.nan)
+                        sized_candidate_replay.get("da_candidate_pnl_reconciliation_error_eur", np.nan)
                     ),
                     "selected_lockable_reconciliation_error_eur": float("nan"),
                     "selected_lockable_deprecated": 1.0,
@@ -9642,6 +9998,71 @@ class BatteryBacktester:
             "optimizer_decision_vs_realized_soc_delta_mwh": float(decision_delta),
             "optimizer_soc_stale_state_detected": float(stale_state_detected),
         }
+
+    def _optimizer_soc_feedback_with_settlement_anchor(
+        self,
+        *,
+        rows: pd.DataFrame,
+        snapshot_ts: pd.Timestamp,
+        colmap: BacktestColumnMap,
+        optimizer_soc_feedback_mwh: float,
+        optimizer_soc_feedback_diag: dict[str, float | str],
+        da_lockbook: dict[pd.Timestamp, tuple[float, float]] | None = None,
+        fixed_reserve_pos: dict[pd.Timestamp, float] | None = None,
+        fixed_reserve_neg: dict[pd.Timestamp, float] | None = None,
+        scheduled_id_by_ts: dict[pd.Timestamp, tuple[float, float]] | None = None,
+    ) -> tuple[float, dict[str, float | str]]:
+        """Prefer settlement-equivalent fixed-obligation replay over stale planned SoC."""
+        has_settlement_anchor_obligations = bool(
+            da_lockbook
+            or fixed_reserve_pos
+            or fixed_reserve_neg
+            or scheduled_id_by_ts
+        )
+        if not has_settlement_anchor_obligations:
+            return float(optimizer_soc_feedback_mwh), dict(optimizer_soc_feedback_diag)
+
+        settlement_anchor_mwh, settlement_anchor_diag = (
+            self._replay_da_prelock_settlement_equivalent_soc_anchor(
+                rows=rows,
+                snapshot_ts=snapshot_ts,
+                colmap=colmap,
+                da_lockbook=da_lockbook,
+                fixed_reserve_pos=fixed_reserve_pos,
+                fixed_reserve_neg=fixed_reserve_neg,
+                scheduled_id_by_ts=scheduled_id_by_ts,
+            )
+        )
+        replay_rows_used = float(
+            settlement_anchor_diag.get("da_prelock_anchor_settlement_replay_rows", 0.0)
+            or 0.0
+        )
+        if replay_rows_used <= 0.5 or not np.isfinite(float(settlement_anchor_mwh)):
+            return float(optimizer_soc_feedback_mwh), dict(optimizer_soc_feedback_diag)
+
+        planned_anchor_mwh = float(optimizer_soc_feedback_mwh)
+        out_diag = dict(optimizer_soc_feedback_diag)
+        out_diag.update(settlement_anchor_diag)
+        out_diag.update(
+            {
+                "optimizer_current_soc_mwh": float(settlement_anchor_mwh),
+                "optimizer_current_soc_source": "settlement_equivalent_lockbook_replay",
+                "optimizer_current_soc_source_timestamp_utc": (
+                    "" if pd.isna(snapshot_ts) else pd.Timestamp(snapshot_ts).isoformat()
+                ),
+                "optimizer_current_vs_realized_soc_delta_mwh": float(
+                    planned_anchor_mwh - float(settlement_anchor_mwh)
+                ),
+                "optimizer_soc_stale_state_detected": float(
+                    abs(planned_anchor_mwh - float(settlement_anchor_mwh)) > 1e-6
+                ),
+                "optimizer_settlement_anchor_overrode_planned_soc": float(
+                    abs(planned_anchor_mwh - float(settlement_anchor_mwh)) > 1e-6
+                ),
+                "optimizer_planned_soc_before_settlement_anchor_mwh": float(planned_anchor_mwh),
+            }
+        )
+        return float(settlement_anchor_mwh), out_diag
 
     def _replay_da_prelock_settlement_equivalent_soc_anchor(
         self,
@@ -27498,6 +27919,57 @@ class BatteryBacktester:
                 current_soc_mwh=float(soc),
                 colmap=colmap,
             )
+            optimizer_anchor_scheduled_id_by_ts: dict[pd.Timestamp, tuple[float, float]] = {}
+            if pd.notna(snapshot_current_ts) and (
+                abs(float(pending_id_charge_mw)) > 1e-12
+                or abs(float(pending_id_discharge_mw)) > 1e-12
+            ):
+                optimizer_anchor_scheduled_id_by_ts[pd.Timestamp(snapshot_current_ts)] = (
+                    float(pending_id_charge_mw),
+                    float(pending_id_discharge_mw),
+                )
+            for repair_ts, repair_entry in reserve_buffer_repair_by_ts.items():
+                if str(repair_entry.get("status", "scheduled")).strip().lower() != "scheduled":
+                    continue
+                repair_tsu = pd.to_datetime(repair_ts, utc=True, errors="coerce")
+                if pd.isna(repair_tsu):
+                    continue
+                optimizer_anchor_scheduled_id_by_ts[pd.Timestamp(repair_tsu)] = (
+                    float(repair_entry.get("charge_mw", 0.0) or 0.0),
+                    float(repair_entry.get("discharge_mw", 0.0) or 0.0),
+                )
+            for rec in terminal_recovery_ledger:
+                if str(rec.get("terminal_recovery_status", "")).strip().lower() != "scheduled":
+                    continue
+                rec_ts = pd.to_datetime(
+                    rec.get("terminal_recovery_delivery_timestamp_utc", pd.NaT),
+                    utc=True,
+                    errors="coerce",
+                )
+                if pd.isna(rec_ts):
+                    continue
+                scheduled_internal_mwh = max(
+                    0.0,
+                    float(rec.get("terminal_recovery_remaining_internal_mwh", 0.0) or 0.0),
+                )
+                scheduled_grid_mwh = scheduled_internal_mwh / max(float(self.eta_in), 1e-12)
+                optimizer_anchor_scheduled_id_by_ts[pd.Timestamp(rec_ts)] = (
+                    scheduled_grid_mwh / max(float(self.dt_h), 1e-12),
+                    0.0,
+                )
+            optimizer_soc_feedback_mwh, optimizer_soc_feedback_diag = (
+                self._optimizer_soc_feedback_with_settlement_anchor(
+                    rows=df,
+                    snapshot_ts=snapshot_current_ts,
+                    colmap=colmap,
+                    optimizer_soc_feedback_mwh=float(optimizer_soc_feedback_mwh),
+                    optimizer_soc_feedback_diag=optimizer_soc_feedback_diag,
+                    da_lockbook=da_lockbook,
+                    fixed_reserve_pos=afrr_cap_pos_lockbook,
+                    fixed_reserve_neg=afrr_cap_neg_lockbook,
+                    scheduled_id_by_ts=optimizer_anchor_scheduled_id_by_ts,
+                )
+            )
             if np.isfinite(float(optimizer_soc_feedback_mwh)):
                 soc = float(optimizer_soc_feedback_mwh)
             hard_final_replay_executed_soc_anchor_mwh = float(soc)
@@ -29457,9 +29929,13 @@ class BatteryBacktester:
                 lock_rows = snapshot_plan[
                     canonical_lock_mask.fillna(False).astype(bool)
                 ]
-                future_rows_for_da_guard = df[
-                    pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce") >= snapshot_ts_effective
+                future_rows_for_da_guard = snapshot_plan[
+                    pd.to_datetime(snapshot_plan["target_time_utc"], utc=True, errors="coerce") >= snapshot_ts_effective
                 ].copy()
+                if future_rows_for_da_guard.empty:
+                    future_rows_for_da_guard = df[
+                        pd.to_datetime(df[colmap.timestamp], utc=True, errors="coerce") >= snapshot_ts_effective
+                    ].copy()
                 accepted_da, da_audit_rows = self._select_feasible_da_lock_schedule(
                     lock_rows=lock_rows,
                     colmap=colmap,
@@ -30397,6 +30873,8 @@ class BatteryBacktester:
                         candidate_minus_no_trade = float(candidate_selection_pnl - no_trade_selection_pnl)
                     else:
                         candidate_minus_no_trade = _trace_num(
+                            "da_selection_comparison_minus_incumbent_eur",
+                            "sized_candidate_minus_incumbent_eur",
                             "candidate_minus_incumbent_after_terminal_recovery_eur",
                             "candidate_minus_incumbent_eur",
                             default=np.nan,
@@ -31210,6 +31688,9 @@ class BatteryBacktester:
                 "da_precommit_candidate_predicted_pnl_eur",
                 "da_precommit_incumbent_predicted_pnl_eur",
                 "da_precommit_candidate_minus_incumbent_eur",
+                "da_precommit_sized_candidate_minus_incumbent_eur",
+                "da_precommit_da_selection_comparison_pnl_eur",
+                "da_precommit_da_selection_comparison_minus_incumbent_eur",
                 "da_precommit_selected_incumbent",
                 "da_precommit_selection_reason",
                 "da_precommit_candidate_replay_valid",
@@ -31235,6 +31716,7 @@ class BatteryBacktester:
                 "da_precommit_replay_scope",
                 "da_precommit_selection_pnl_basis",
                 "da_precommit_candidate_selection_pnl_eur",
+                "da_precommit_sized_candidate_selection_pnl_eur_after_terminal_recovery",
                 "da_precommit_incumbent_selection_pnl_eur",
                 "da_precommit_local_terminal_credit_ignored_eur",
                 "da_precommit_terminal_credit_eur",
@@ -31294,6 +31776,7 @@ class BatteryBacktester:
                 "da_postlock_terminal_recovery_cost_estimate_available",
                 "da_terminal_shortfall_missing_recovery_cost_estimate",
                 "candidate_selection_pnl_eur_after_terminal_recovery",
+                "sized_candidate_selection_pnl_eur_after_terminal_recovery",
                 "incumbent_selection_pnl_eur_after_terminal_recovery",
                 "candidate_minus_incumbent_after_terminal_recovery_eur",
                 "da_postlock_candidate_pnl_before_recovery_cost_eur",
@@ -35123,10 +35606,23 @@ class BatteryBacktester:
         rolling_pf_da_bid_sizer_status = "not_evaluated"
         rolling_pf_da_bid_sizer_error = ""
         rolling_pf_da_bid_sizer_method = ""
+        rolling_pf_da_bid_sizer_zero_reason = "not_evaluated"
         rolling_pf_da_candidate_support_sizer_used_as_authority = 0.0
         rolling_pf_da_full_window_sizer_diagnostic_status = "not_run"
         rolling_pf_da_full_window_sizer_diagnostic_reason = "not_run"
         rolling_pf_da_path_price_semantics = ""
+        rolling_pf_da_physical_derate_attempted = 0.0
+        rolling_pf_da_physical_derate_side = "not_evaluated"
+        rolling_pf_da_physical_derate_driver = "not_evaluated"
+        rolling_pf_da_physical_derate_method = "not_evaluated"
+        rolling_pf_da_physical_derate_success = 0.0
+        rolling_pf_da_physical_derate_final_zero_reason = "not_evaluated"
+        rolling_pf_da_physical_derate_original_buy_mwh = float("nan")
+        rolling_pf_da_physical_derate_original_sell_mwh = float("nan")
+        rolling_pf_da_physical_derate_final_buy_mwh = float("nan")
+        rolling_pf_da_physical_derate_final_sell_mwh = float("nan")
+        rolling_pf_da_physical_derate_replay_pass = 0.0
+        rolling_pf_da_physical_reason_authority_source = "not_evaluated"
         rolling_pf_da_bid_sizer_objective_eur = float("nan")
         rolling_pf_da_bid_sizer_total_buy_mwh = 0.0
         rolling_pf_da_bid_sizer_total_sell_mwh = 0.0
@@ -35763,6 +36259,7 @@ class BatteryBacktester:
             rolling_pf_da_bid_sizer_status = str(pf_plan_diag["rolling_pf_da_bid_sizer_status"])
             rolling_pf_da_bid_sizer_error = str(pf_plan_diag["rolling_pf_da_bid_sizer_error"])
             rolling_pf_da_bid_sizer_method = str(pf_plan_diag["rolling_pf_da_bid_sizer_method"])
+            rolling_pf_da_bid_sizer_zero_reason = str(pf_plan_diag["rolling_pf_da_bid_sizer_zero_reason"])
             rolling_pf_da_candidate_support_sizer_used_as_authority = float(
                 pf_plan_diag["rolling_pf_da_candidate_support_sizer_used_as_authority"]
             )
@@ -35773,6 +36270,34 @@ class BatteryBacktester:
                 pf_plan_diag["rolling_pf_da_full_window_sizer_diagnostic_reason"]
             )
             rolling_pf_da_path_price_semantics = str(pf_plan_diag["rolling_pf_da_path_price_semantics"])
+            rolling_pf_da_physical_derate_attempted = float(
+                pf_plan_diag["rolling_pf_da_physical_derate_attempted"]
+            )
+            rolling_pf_da_physical_derate_side = str(pf_plan_diag["rolling_pf_da_physical_derate_side"])
+            rolling_pf_da_physical_derate_driver = str(pf_plan_diag["rolling_pf_da_physical_derate_driver"])
+            rolling_pf_da_physical_derate_method = str(pf_plan_diag["rolling_pf_da_physical_derate_method"])
+            rolling_pf_da_physical_derate_success = float(pf_plan_diag["rolling_pf_da_physical_derate_success"])
+            rolling_pf_da_physical_derate_final_zero_reason = str(
+                pf_plan_diag["rolling_pf_da_physical_derate_final_zero_reason"]
+            )
+            rolling_pf_da_physical_derate_original_buy_mwh = float(
+                pf_plan_diag["rolling_pf_da_physical_derate_original_buy_mwh"]
+            )
+            rolling_pf_da_physical_derate_original_sell_mwh = float(
+                pf_plan_diag["rolling_pf_da_physical_derate_original_sell_mwh"]
+            )
+            rolling_pf_da_physical_derate_final_buy_mwh = float(
+                pf_plan_diag["rolling_pf_da_physical_derate_final_buy_mwh"]
+            )
+            rolling_pf_da_physical_derate_final_sell_mwh = float(
+                pf_plan_diag["rolling_pf_da_physical_derate_final_sell_mwh"]
+            )
+            rolling_pf_da_physical_derate_replay_pass = float(
+                pf_plan_diag["rolling_pf_da_physical_derate_replay_pass"]
+            )
+            rolling_pf_da_physical_reason_authority_source = str(
+                pf_plan_diag["rolling_pf_da_physical_reason_authority_source"]
+            )
             rolling_pf_da_bid_sizer_objective_eur = float(pf_plan_diag["rolling_pf_da_bid_sizer_objective_eur"])
             rolling_pf_da_bid_sizer_total_buy_mwh = float(pf_plan_diag["rolling_pf_da_bid_sizer_total_buy_mwh"])
             rolling_pf_da_bid_sizer_total_sell_mwh = float(pf_plan_diag["rolling_pf_da_bid_sizer_total_sell_mwh"])
@@ -36687,6 +37212,7 @@ class BatteryBacktester:
         hourly["rolling_pf_da_bid_sizer_status"] = str(rolling_pf_da_bid_sizer_status)
         hourly["rolling_pf_da_bid_sizer_error"] = str(rolling_pf_da_bid_sizer_error)
         hourly["rolling_pf_da_bid_sizer_method"] = str(rolling_pf_da_bid_sizer_method)
+        hourly["rolling_pf_da_bid_sizer_zero_reason"] = str(rolling_pf_da_bid_sizer_zero_reason)
         hourly["rolling_pf_da_candidate_support_sizer_used_as_authority"] = float(
             rolling_pf_da_candidate_support_sizer_used_as_authority
         )
@@ -36697,6 +37223,32 @@ class BatteryBacktester:
             rolling_pf_da_full_window_sizer_diagnostic_reason
         )
         hourly["rolling_pf_da_path_price_semantics"] = str(rolling_pf_da_path_price_semantics)
+        hourly["rolling_pf_da_physical_derate_attempted"] = float(rolling_pf_da_physical_derate_attempted)
+        hourly["rolling_pf_da_physical_derate_side"] = str(rolling_pf_da_physical_derate_side)
+        hourly["rolling_pf_da_physical_derate_driver"] = str(rolling_pf_da_physical_derate_driver)
+        hourly["rolling_pf_da_physical_derate_method"] = str(rolling_pf_da_physical_derate_method)
+        hourly["rolling_pf_da_physical_derate_success"] = float(rolling_pf_da_physical_derate_success)
+        hourly["rolling_pf_da_physical_derate_final_zero_reason"] = str(
+            rolling_pf_da_physical_derate_final_zero_reason
+        )
+        hourly["rolling_pf_da_physical_derate_original_buy_mwh"] = float(
+            rolling_pf_da_physical_derate_original_buy_mwh
+        )
+        hourly["rolling_pf_da_physical_derate_original_sell_mwh"] = float(
+            rolling_pf_da_physical_derate_original_sell_mwh
+        )
+        hourly["rolling_pf_da_physical_derate_final_buy_mwh"] = float(
+            rolling_pf_da_physical_derate_final_buy_mwh
+        )
+        hourly["rolling_pf_da_physical_derate_final_sell_mwh"] = float(
+            rolling_pf_da_physical_derate_final_sell_mwh
+        )
+        hourly["rolling_pf_da_physical_derate_replay_pass"] = float(
+            rolling_pf_da_physical_derate_replay_pass
+        )
+        hourly["rolling_pf_da_physical_reason_authority_source"] = str(
+            rolling_pf_da_physical_reason_authority_source
+        )
         hourly["rolling_pf_da_bid_sizer_objective_eur"] = float(rolling_pf_da_bid_sizer_objective_eur)
         hourly["rolling_pf_da_bid_sizer_total_buy_mwh"] = float(rolling_pf_da_bid_sizer_total_buy_mwh)
         hourly["rolling_pf_da_bid_sizer_total_sell_mwh"] = float(rolling_pf_da_bid_sizer_total_sell_mwh)
@@ -38096,6 +38648,7 @@ class BatteryBacktester:
             "rolling_pf_da_bid_sizer_status": str(rolling_pf_da_bid_sizer_status),
             "rolling_pf_da_bid_sizer_error": str(rolling_pf_da_bid_sizer_error),
             "rolling_pf_da_bid_sizer_method": str(rolling_pf_da_bid_sizer_method),
+            "rolling_pf_da_bid_sizer_zero_reason": str(rolling_pf_da_bid_sizer_zero_reason),
             "rolling_pf_da_candidate_support_sizer_used_as_authority": float(
                 rolling_pf_da_candidate_support_sizer_used_as_authority
             ),
@@ -38106,6 +38659,32 @@ class BatteryBacktester:
                 rolling_pf_da_full_window_sizer_diagnostic_reason
             ),
             "rolling_pf_da_path_price_semantics": str(rolling_pf_da_path_price_semantics),
+            "rolling_pf_da_physical_derate_attempted": float(rolling_pf_da_physical_derate_attempted),
+            "rolling_pf_da_physical_derate_side": str(rolling_pf_da_physical_derate_side),
+            "rolling_pf_da_physical_derate_driver": str(rolling_pf_da_physical_derate_driver),
+            "rolling_pf_da_physical_derate_method": str(rolling_pf_da_physical_derate_method),
+            "rolling_pf_da_physical_derate_success": float(rolling_pf_da_physical_derate_success),
+            "rolling_pf_da_physical_derate_final_zero_reason": str(
+                rolling_pf_da_physical_derate_final_zero_reason
+            ),
+            "rolling_pf_da_physical_derate_original_buy_mwh": float(
+                rolling_pf_da_physical_derate_original_buy_mwh
+            ),
+            "rolling_pf_da_physical_derate_original_sell_mwh": float(
+                rolling_pf_da_physical_derate_original_sell_mwh
+            ),
+            "rolling_pf_da_physical_derate_final_buy_mwh": float(
+                rolling_pf_da_physical_derate_final_buy_mwh
+            ),
+            "rolling_pf_da_physical_derate_final_sell_mwh": float(
+                rolling_pf_da_physical_derate_final_sell_mwh
+            ),
+            "rolling_pf_da_physical_derate_replay_pass": float(
+                rolling_pf_da_physical_derate_replay_pass
+            ),
+            "rolling_pf_da_physical_reason_authority_source": str(
+                rolling_pf_da_physical_reason_authority_source
+            ),
             "rolling_pf_da_bid_sizer_objective_eur": float(rolling_pf_da_bid_sizer_objective_eur),
             "rolling_pf_da_bid_sizer_total_buy_mwh": float(rolling_pf_da_bid_sizer_total_buy_mwh),
             "rolling_pf_da_bid_sizer_total_sell_mwh": float(rolling_pf_da_bid_sizer_total_sell_mwh),
@@ -41905,10 +42484,23 @@ class BatteryBacktester:
             ("rolling_pf_da_bid_sizer_status", ""),
             ("rolling_pf_da_bid_sizer_error", ""),
             ("rolling_pf_da_bid_sizer_method", ""),
+            ("rolling_pf_da_bid_sizer_zero_reason", ""),
             ("rolling_pf_da_candidate_support_sizer_used_as_authority", 0.0),
             ("rolling_pf_da_full_window_sizer_diagnostic_status", ""),
             ("rolling_pf_da_full_window_sizer_diagnostic_reason", ""),
             ("rolling_pf_da_path_price_semantics", ""),
+            ("rolling_pf_da_physical_derate_attempted", 0.0),
+            ("rolling_pf_da_physical_derate_side", ""),
+            ("rolling_pf_da_physical_derate_driver", ""),
+            ("rolling_pf_da_physical_derate_method", ""),
+            ("rolling_pf_da_physical_derate_success", 0.0),
+            ("rolling_pf_da_physical_derate_final_zero_reason", ""),
+            ("rolling_pf_da_physical_derate_original_buy_mwh", float("nan")),
+            ("rolling_pf_da_physical_derate_original_sell_mwh", float("nan")),
+            ("rolling_pf_da_physical_derate_final_buy_mwh", float("nan")),
+            ("rolling_pf_da_physical_derate_final_sell_mwh", float("nan")),
+            ("rolling_pf_da_physical_derate_replay_pass", 0.0),
+            ("rolling_pf_da_physical_reason_authority_source", ""),
             ("rolling_pf_da_bid_sizer_objective_eur", float("nan")),
             ("rolling_pf_da_bid_sizer_total_buy_mwh", 0.0),
             ("rolling_pf_da_bid_sizer_total_sell_mwh", 0.0),
@@ -41948,10 +42540,23 @@ class BatteryBacktester:
             ("naive_da_bid_sizer_status", ""),
             ("naive_da_bid_sizer_error", ""),
             ("naive_da_bid_sizer_method", ""),
+            ("naive_da_bid_sizer_zero_reason", ""),
             ("naive_da_candidate_support_sizer_used_as_authority", 0.0),
             ("naive_da_full_window_sizer_diagnostic_status", ""),
             ("naive_da_full_window_sizer_diagnostic_reason", ""),
             ("naive_da_path_price_semantics", ""),
+            ("naive_da_physical_derate_attempted", 0.0),
+            ("naive_da_physical_derate_side", ""),
+            ("naive_da_physical_derate_driver", ""),
+            ("naive_da_physical_derate_method", ""),
+            ("naive_da_physical_derate_success", 0.0),
+            ("naive_da_physical_derate_final_zero_reason", ""),
+            ("naive_da_physical_derate_original_buy_mwh", float("nan")),
+            ("naive_da_physical_derate_original_sell_mwh", float("nan")),
+            ("naive_da_physical_derate_final_buy_mwh", float("nan")),
+            ("naive_da_physical_derate_final_sell_mwh", float("nan")),
+            ("naive_da_physical_derate_replay_pass", 0.0),
+            ("naive_da_physical_reason_authority_source", ""),
             ("naive_da_terminal_recovery_actually_written", 0.0),
             ("naive_da_terminal_recovery_cost_included", 0.0),
             ("naive_da_terminal_binding_id_repair_written", 0.0),

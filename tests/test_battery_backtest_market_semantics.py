@@ -4982,6 +4982,39 @@ def test_soc_mass_balance_audit_uses_terminal_closure_after_soc_when_recovery_af
     bt._audit_backtest_results(realized=realized, dispatch=dispatch, df_input=df_input, colmap=col)
 
 
+def test_soc_mass_balance_audit_prefers_terminal_closure_after_soc_over_recovery_projection() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2025-05-01T23:00:00Z")
+    realized = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            "real_soc_mwh": [10.0],
+            "real_charge_mw": [0.0],
+            "real_discharge_mw": [0.0],
+            "real_act_pos_mwh": [0.0],
+            "real_act_neg_mwh": [0.0],
+            "real_aux_energy_mwh": [0.0],
+            "real_pnl_eur": [-100.0],
+            "terminal_closure_reason": ["shortfall_recovery"],
+            "terminal_closure_applied": [1.0],
+            "final_soc_target_met_after_closure": [1.0],
+            "terminal_closure_id_buy_mwh": [0.1359044802],
+            "terminal_recovery_soc_after_mwh": [10.0689325804],
+            "final_soc_after_terminal_closure_mwh": [10.0],
+            "terminal_closure_soc_after_mwh": [10.0],
+            "terminal_closure_net_pnl_eur": [-100.0],
+        }
+    )
+
+    after_soc = BatteryBacktester._terminal_repair_mass_balance_after_soc(
+        frame=realized,
+        actual_soc_mwh=realized["real_soc_mwh"],
+    )
+
+    assert float(after_soc.iloc[0]) == pytest.approx(10.0)
+
+
 def test_soc_mass_balance_audit_rejects_terminal_closure_without_cost_accounting() -> None:
     bt = _mk_backtester()
     col = BacktestColumnMap()
@@ -14246,6 +14279,49 @@ def test_da_handoff_selected_nonzero_reaches_lockbook() -> None:
     assert str(row["da_handoff_lost_postlock_candidate_reason"]) == "none"
 
 
+def test_da_handoff_profitable_candidate_not_left_as_no_trade() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T02:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [ts])
+    rows[col.pred_da_price] = [1_000.0]
+
+    accepted, audit = bt._apply_da_accepted_lockbook_replay_to_audit_rows(
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(ts),
+                "da_handoff_postlock_selected_candidate": 1.0,
+                "da_postlock_candidate_buy_mw": 0.0,
+                "da_postlock_candidate_sell_mw": 1.0,
+                "da_sized_candidate_buy_mw": 0.0,
+                "da_sized_candidate_sell_mw": 1.0,
+                "selected_incumbent": "no_trade",
+                "final_selected_incumbent": "no_trade",
+                "selection_reason": "no_trade_economically_better",
+                "da_handoff_lost_postlock_candidate_reason": "handoff_bug_candidate_nonzero_but_accepted_zero",
+                "da_zero_reason": "handoff_bug_candidate_nonzero_but_accepted_zero",
+                "zero_reason": "handoff_bug_candidate_nonzero_but_accepted_zero",
+                "candidate_rejection_reason": "none",
+                "candidate_minus_incumbent_eur": 100.0,
+            }
+        ],
+        accepted_da={},
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert accepted == {ts: pytest.approx((0.0, 1.0))}
+    row = audit[0]
+    assert float(row["accepted_lockbook_row_sell_mwh"]) == pytest.approx(1.0)
+    assert str(row["final_selected_incumbent"]) == "optimized"
+    assert str(row["da_handoff_lost_postlock_candidate_reason"]) == "none"
+
+
 def test_da_reduced_to_feasible_without_blocker_reconstructs_postlock_schedule() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -14828,6 +14904,92 @@ def test_da_soc_feedback_uses_latest_settled_real_soc_before_gate() -> None:
     assert float(diag["optimizer_soc_stale_state_detected"]) == pytest.approx(1.0)
 
 
+def test_da_optimizer_soc_anchor_prefers_settlement_replay_with_fixed_da_lockbook() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.eta_in = 0.95
+    bt.eta_out = 0.95
+    bt.soc_init = 8.86
+    bt.soc_target_end = 10.0
+    col = BacktestColumnMap()
+    snapshot_ts = pd.Timestamp("2025-04-09T10:00:00Z")
+    buy_ts = pd.Timestamp("2025-04-09T13:00:00Z")
+    sell_ts = pd.Timestamp("2025-04-09T17:00:00Z")
+    rows = _da_hourly_lock_future_rows(
+        col,
+        [
+            pd.Timestamp("2025-04-09T09:00:00Z"),
+            snapshot_ts,
+            buy_ts,
+            sell_ts,
+            pd.Timestamp("2025-04-09T18:00:00Z"),
+        ],
+    )
+    fixed_da_lockbook = {
+        buy_ts: (6.9, 0.0),
+        sell_ts: (0.0, 4.9),
+    }
+    stale_planned_soc = 11.67
+    stale_ok, stale_diag, _ = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows.loc[rows[col.timestamp] >= snapshot_ts].copy(),
+        colmap=col,
+        current_soc_mwh=stale_planned_soc,
+        existing_da_lockbook=fixed_da_lockbook,
+        candidate_da={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=rows[col.timestamp].iloc[-1],
+        include_existing_lockbook=True,
+        schedule_source="fixed_da_lockbook_stale_planned_anchor",
+    )
+
+    anchor, anchor_diag = bt._optimizer_soc_feedback_with_settlement_anchor(
+        rows=rows,
+        snapshot_ts=snapshot_ts,
+        colmap=col,
+        optimizer_soc_feedback_mwh=stale_planned_soc,
+        optimizer_soc_feedback_diag={
+            "optimizer_current_soc_mwh": stale_planned_soc,
+            "optimizer_current_soc_source": "executed_soc_carry_state",
+        },
+        da_lockbook=fixed_da_lockbook,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        scheduled_id_by_ts={},
+    )
+    settled_ok, settled_diag, _ = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows.loc[rows[col.timestamp] >= snapshot_ts].copy(),
+        colmap=col,
+        current_soc_mwh=anchor,
+        existing_da_lockbook=fixed_da_lockbook,
+        candidate_da={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=rows[col.timestamp].iloc[-1],
+        include_existing_lockbook=True,
+        schedule_source="fixed_da_lockbook_settlement_anchor",
+    )
+    classification = BatteryBacktester._classify_hard_final_soc_infeasibility(
+        current_soc_mwh=float(anchor),
+        final_soc_target_mwh=float(bt.soc_target_end),
+        rolling_window_contains_global_end=True,
+        safe_hold_feasible=bool(settled_ok),
+        fixed_da_charge_mwh=6.9,
+        fixed_da_discharge_mwh=4.9,
+    )
+
+    assert stale_ok is False
+    assert str(stale_diag["da_hourly_lock_infeasible_reason"]) == "locked_da_buy_exceeds_soc_headroom"
+    assert anchor == pytest.approx(8.86)
+    assert str(anchor_diag["optimizer_current_soc_source"]) == "settlement_equivalent_lockbook_replay"
+    assert float(anchor_diag["optimizer_settlement_anchor_overrode_planned_soc"]) == pytest.approx(1.0)
+    assert float(anchor_diag["optimizer_planned_soc_before_settlement_anchor_mwh"]) == pytest.approx(stale_planned_soc)
+    assert settled_ok is True
+    assert float(settled_diag["da_lockbook_physical_replay_projected_final_soc_mwh"]) >= bt.soc_target_end - 1e-9
+    assert classification != "hard_final_soc_infeasible"
+    assert classification == "hard_final_soc_false_infeasible"
+
+
 def test_da_soc_feedback_settlement_exports_executed_da_buy_for_soc_increase() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -15109,9 +15271,148 @@ def test_da_sizer_derates_soc_min_candidate_before_zeroing(monkeypatch: pytest.M
     assert {
         str(row["da_bid_sizer_zero_reason"]) for row in audit
     } != {"locked_da_terminal_shortfall_candidate_infeasible"}
+    assert {float(row["da_physical_derate_success"]) for row in audit} == {1.0}
+    assert {float(row["da_physical_derate_replay_pass"]) for row in audit} == {1.0}
+    assert min(float(row["da_physical_derate_final_sell_mwh"]) for row in audit) > 0.0
 
 
-def test_da_sizer_physical_driver_overrides_terminal_stats_in_production_path(
+def test_da_sizer_subset_search_recovers_nonzero_when_one_sided_scale_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.p_max_mw = 20.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 2.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.da_min_bid_size_mw = 0.1
+    bt.da_bid_granularity_mw = 0.1
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-03-05T00:00:00Z", periods=2, freq="h")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            "charge_mw": [0.0, 17.0],
+            "discharge_mw": [16.0, 0.0],
+            col.pred_da_price: [100.0, 1.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+        }
+    )
+
+    monkeypatch.setattr(
+        battery_backtest_module,
+        "linprog",
+        lambda *args, **kwargs: argparse.Namespace(success=False, message="forced support sizer failure"),
+    )
+
+    accepted, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=17.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=rows,
+        existing_da_lockbook={},
+        global_end_utc=None,
+    )
+
+    assert audit
+    assert accepted
+    assert sum(ch for ch, _ in accepted.values()) == pytest.approx(0.0)
+    accepted_sell = sum(dis for _, dis in accepted.values())
+    assert accepted_sell >= 14.0
+    replay = bt._replay_da_candidate_cashflow(
+        rows=rows,
+        schedule=accepted,
+        colmap=col,
+        current_soc_mwh=17.0,
+    )
+    assert float(replay["final_soc_mwh"]) >= bt.soc_min - 1e-9
+    assert {str(row["da_bid_sizer_status"]) for row in audit} == {"ok_after_physical_derate"}
+    assert {str(row["da_physical_derate_driver"]) for row in audit} == {
+        "da_candidate_projected_soc_below_min"
+    }
+    assert {float(row["da_physical_derate_success"]) for row in audit} == {1.0}
+    assert {float(row["da_physical_derate_replay_pass"]) for row in audit} == {1.0}
+    assert {
+        str(row["da_physical_derate_method"]).startswith("drop_buy_then_binary_sell")
+        or str(row["da_physical_derate_method"]).startswith("subset")
+        for row in audit
+    } == {True}
+    assert {str(row["da_physical_derate_final_zero_reason"]) for row in audit} == {"none"}
+
+
+def test_da_selection_uses_future_terminal_recovery_cost_for_sell_candidate() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.p_max_mw = 10.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 10.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.da_min_bid_size_mw = 0.1
+    bt.da_bid_granularity_mw = 0.1
+    bt.final_soc_mode = "hard_min"
+    bt.terminal_value_mode = "terminal_recovery_aware"
+    col = BacktestColumnMap()
+    delivery_ts = pd.Timestamp("2025-03-05T00:00:00Z")
+    final_delivery_ts = delivery_ts + pd.Timedelta(hours=1)
+    global_end = final_delivery_ts + pd.Timedelta(hours=1)
+    lock_rows = pd.DataFrame(
+        {
+            col.timestamp: [delivery_ts],
+            "target_time_utc": [delivery_ts],
+            "charge_mw": [0.0],
+            "discharge_mw": [5.0],
+            col.pred_da_price: [100.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+        }
+    )
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: [delivery_ts, final_delivery_ts],
+            "target_time_utc": [delivery_ts, final_delivery_ts],
+            "charge_mw": [0.0, 0.0],
+            "discharge_mw": [5.0, 0.0],
+            col.pred_da_price: [100.0, 200.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+        }
+    )
+
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=lock_rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=future_rows,
+        existing_da_lockbook={},
+        global_end_utc=global_end,
+    )
+
+    assert audit
+    assert sum(ch + dis for ch, dis in selected.values()) == pytest.approx(0.0)
+    assert {str(row["selected_incumbent"]) for row in audit} == {"no_trade"}
+    assert {
+        str(row["selection_reason"]) for row in audit
+    } <= {"no_trade_economically_better", "no_trade_incumbent_predicted_replay_dominates"}
+    assert max(float(row["da_terminal_sensitive_window"]) for row in audit) == pytest.approx(1.0)
+    assert min(float(row["candidate_terminal_recovery_cost_eur"]) for row in audit) > 0.0
+    assert max(float(row["candidate_minus_incumbent_eur"]) for row in audit) < 0.0
+
+
+def test_da_sizer_physical_reason_overrides_terminal_shortfall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bt = _mk_backtester()
@@ -15194,6 +15495,9 @@ def test_da_sizer_physical_driver_overrides_terminal_stats_in_production_path(
     assert {str(row["da_physical_derate_side"]) for row in audit} == {"sell"}
     assert {float(row["da_physical_derate_attempted"]) for row in audit} == {1.0}
     assert {float(row["da_physical_derate_success"]) for row in audit} == {0.0}
+    assert {str(row["da_physical_reason_authority_source"]) for row in audit} == {
+        "raw_candidate_physical_stats"
+    }
     assert {str(row["da_physical_derate_final_zero_reason"]) for row in audit} == {
         "candidate_infeasible_soc_min_no_feasible_derate"
     }
