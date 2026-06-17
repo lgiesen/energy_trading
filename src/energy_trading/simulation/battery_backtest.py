@@ -1460,6 +1460,10 @@ class BatteryBacktester:
             "rolling_pf_da_bid_sizer_status": "not_evaluated",
             "rolling_pf_da_bid_sizer_error": "",
             "rolling_pf_da_bid_sizer_method": "",
+            "rolling_pf_da_candidate_support_sizer_used_as_authority": 0.0,
+            "rolling_pf_da_full_window_sizer_diagnostic_status": "not_run",
+            "rolling_pf_da_full_window_sizer_diagnostic_reason": "not_run",
+            "rolling_pf_da_path_price_semantics": "",
             "rolling_pf_da_bid_sizer_objective_eur": float("nan"),
             "rolling_pf_da_bid_sizer_total_buy_mwh": 0.0,
             "rolling_pf_da_bid_sizer_total_sell_mwh": 0.0,
@@ -1625,6 +1629,23 @@ class BatteryBacktester:
         defaults["rolling_pf_da_bid_sizer_method"] = _first_allowed_text(
             "da_bid_sizer_method",
             "da_precommit_da_bid_sizer_method",
+        )
+        defaults["rolling_pf_da_candidate_support_sizer_used_as_authority"] = _first_allowed_num(
+            "da_candidate_support_sizer_used_as_authority",
+            "da_precommit_da_candidate_support_sizer_used_as_authority",
+            default=0.0,
+        )
+        defaults["rolling_pf_da_full_window_sizer_diagnostic_status"] = _first_allowed_text(
+            "da_full_window_sizer_diagnostic_status",
+            "da_precommit_da_full_window_sizer_diagnostic_status",
+        ) or "not_run"
+        defaults["rolling_pf_da_full_window_sizer_diagnostic_reason"] = _first_allowed_text(
+            "da_full_window_sizer_diagnostic_reason",
+            "da_precommit_da_full_window_sizer_diagnostic_reason",
+        ) or "not_run"
+        defaults["rolling_pf_da_path_price_semantics"] = _first_allowed_text(
+            "da_path_price_semantics",
+            "da_precommit_da_path_price_semantics",
         )
         defaults["rolling_pf_da_bid_sizer_objective_eur"] = _first_allowed_num(
             "da_bid_sizer_objective_eur",
@@ -1818,6 +1839,40 @@ class BatteryBacktester:
         if explicit_rejection_ts:
             defaults["rolling_pf_da_first_rejection_ts_utc"] = explicit_rejection_ts
         return defaults
+
+    def _path_da_plan_history_diagnostics(
+        self,
+        plan_history: pd.DataFrame,
+        *,
+        prefix: str,
+    ) -> dict[str, float | str]:
+        """Return DA prewrite diagnostics with a path-specific prefix.
+
+        The DA gate itself is shared by all rolling run modes. This helper keeps
+        benchmark exports comparable by projecting the same plan-history
+        diagnostics onto each path namespace.
+        """
+        pf_diag = self._rolling_pf_da_plan_history_diagnostics(plan_history)
+        out: dict[str, float | str] = {}
+        for key, value in pf_diag.items():
+            if key.startswith("rolling_pf_da_"):
+                out[f"{prefix}_da_{key[len('rolling_pf_da_'):]}"] = value
+            elif key == "da_sizer_postlock_replay_mismatch":
+                out[f"{prefix}_da_sizer_postlock_replay_mismatch"] = value
+            else:
+                out[f"{prefix}_{key}"] = value
+        zero_reason_key = f"{prefix}_da_zero_trade_reason"
+        if zero_reason_key not in out:
+            out[zero_reason_key] = str(out.get(f"{prefix}_da_plan_history_zero_reason", "not_evaluated"))
+        replay_pass_key = f"{prefix}_da_replay_pass"
+        if replay_pass_key not in out:
+            mismatch = out.get(f"{prefix}_da_sizer_postlock_replay_mismatch", 0.0)
+            try:
+                mismatch_num = float(mismatch)
+            except (TypeError, ValueError):
+                mismatch_num = 1.0
+            out[replay_pass_key] = float(mismatch_num <= 0.5)
+        return out
 
     def _rolling_pf_bcm_plan_history_diagnostics(
         self,
@@ -4736,11 +4791,13 @@ class BatteryBacktester:
             return False, "missing_delivery_timestamps"
         end_ts = pd.Timestamp(pd.to_datetime(global_end_utc, utc=True))
         max_ts = pd.Timestamp(ts.max())
-        if max_ts >= end_ts:
-            return True, "window_end_reaches_global_end"
-        lookahead_h = max(0.0, float(getattr(self, "da_terminal_recovery_lookahead_h", 0.0)))
-        if lookahead_h > 0.0 and max_ts >= end_ts - pd.Timedelta(hours=lookahead_h):
-            return True, "terminal_recovery_lookahead_window"
+        terminal_cutoff = end_ts - pd.Timedelta(hours=max(float(getattr(self, "dt_h", 1.0)), 1e-9))
+        if max_ts >= terminal_cutoff - pd.Timedelta(microseconds=1):
+            return True, "last_da_delivery_before_global_end"
+        if bool(getattr(self, "da_terminal_lookahead_marks_sensitive", False)):
+            lookahead_h = max(0.0, float(getattr(self, "da_terminal_recovery_lookahead_h", 0.0)))
+            if lookahead_h > 0.0 and max_ts >= end_ts - pd.Timedelta(hours=lookahead_h):
+                return True, "terminal_recovery_lookahead_window"
         return False, "not_terminal_window"
 
     def _terminal_value_components_for_candidate(
@@ -6185,6 +6242,22 @@ class BatteryBacktester:
                 continue
             buy = max(0.0, _audit_row_float(audit_row, "da_postlock_candidate_buy_mw"))
             sell = max(0.0, _audit_row_float(audit_row, "da_postlock_candidate_sell_mw"))
+            if buy + sell <= 1e-12:
+                # Some legacy paths zeroed the postlock aliases before this
+                # final audit layer even though the row was still marked as a
+                # selected candidate. Fall back to the earlier canonical
+                # candidate aliases so generic handoff loss cannot erase trades.
+                for buy_key, sell_key in (
+                    ("da_sized_candidate_buy_mw", "da_sized_candidate_sell_mw"),
+                    ("da_candidate_buy_mw", "da_candidate_sell_mw"),
+                    ("candidate_buy_mw", "candidate_sell_mw"),
+                    ("da_raw_candidate_buy_mw", "da_raw_candidate_sell_mw"),
+                ):
+                    fallback_buy = max(0.0, _audit_row_float(audit_row, buy_key))
+                    fallback_sell = max(0.0, _audit_row_float(audit_row, sell_key))
+                    if fallback_buy + fallback_sell > 1e-12:
+                        buy, sell = fallback_buy, fallback_sell
+                        break
             buy, sell = self._normalize_da_bid(buy, sell)
             if not _postlock_selected(audit_row) or buy + sell <= 1e-12:
                 continue
@@ -6563,6 +6636,7 @@ class BatteryBacktester:
         global_end_utc: pd.Timestamp | None = None,
         allow_full_window_sizer: bool = False,
         is_perfect_foresight: bool = False,
+        da_path_price_semantics: str | None = None,
     ) -> tuple[dict[pd.Timestamp, tuple[float, float]], list[dict[str, float | str]]]:
         """Build the canonical physically feasible D-1 DA lock-in schedule."""
         if lock_rows.empty:
@@ -7370,12 +7444,55 @@ class BatteryBacktester:
         selected = _scaled_schedule(0.0)
         selected_stats: dict[str, float | str] = {}
         selected_feasible = False
-        selected_sizing_method = "linprog_full_window_continuous_per_hour"
+        path_price_semantics = str(
+            da_path_price_semantics
+            or ("rhpf_true_price" if bool(is_perfect_foresight) else "model")
+        )
+        selected_sizing_method = "linprog_continuous_per_hour"
         candidate_support_schedule, candidate_support_feasible, candidate_support_stats = _lp_size_schedule(
             full_window=False
         )
-        lp_schedule, lp_feasible, lp_stats = _lp_size_schedule(full_window=True)
-        lp_stats = dict(lp_stats)
+        candidate_support_stats = dict(candidate_support_stats)
+        full_window_diag_status = "not_run"
+        full_window_diag_reason = "disabled"
+        full_window_diag_feasible = 0.0
+        if bool(allow_full_window_sizer):
+            lp_schedule, lp_feasible, lp_stats = _lp_size_schedule(full_window=True)
+            lp_stats = dict(lp_stats)
+            full_window_diag_status = str(
+                lp_stats.get(
+                    "da_canonical_sizer_status",
+                    lp_stats.get("da_bid_sizer_status", "unknown"),
+                )
+            )
+            full_window_diag_reason = str(
+                lp_stats.get(
+                    "da_canonical_sizer_failure_reason",
+                    lp_stats.get(
+                        "da_bid_sizer_first_infeasible_reason",
+                        lp_stats.get("da_bid_sizer_error", "none"),
+                    ),
+                )
+            )
+            full_window_diag_feasible = float(bool(lp_feasible))
+        else:
+            lp_schedule = candidate_support_schedule
+            lp_feasible = bool(candidate_support_feasible)
+            lp_stats = dict(candidate_support_stats)
+            lp_stats["da_bid_sizer_method"] = "linprog_continuous_per_hour"
+            lp_stats.setdefault(
+                "da_canonical_sizer_status",
+                lp_stats.get("da_bid_sizer_status", "canonical_da_sizer_infeasible"),
+            )
+            lp_stats.setdefault(
+                "da_canonical_sizer_failure_reason",
+                "none" if bool(candidate_support_feasible) else str(
+                    lp_stats.get(
+                        "da_bid_sizer_first_infeasible_reason",
+                        lp_stats.get("da_bid_sizer_error", "canonical_da_sizer_infeasible"),
+                    )
+                ),
+            )
         lp_stats["da_bid_sizer_candidate_support_status"] = str(
             candidate_support_stats.get("da_bid_sizer_status", "unknown")
         )
@@ -7383,6 +7500,13 @@ class BatteryBacktester:
             candidate_support_stats.get("da_bid_sizer_error", "")
         )
         lp_stats["da_bid_sizer_candidate_support_feasible"] = float(bool(candidate_support_feasible))
+        lp_stats["da_full_window_sizer_diagnostic_status"] = str(full_window_diag_status)
+        lp_stats["da_full_window_sizer_diagnostic_reason"] = str(full_window_diag_reason)
+        lp_stats["da_full_window_sizer_diagnostic_feasible"] = float(full_window_diag_feasible)
+        lp_stats["da_candidate_support_sizer_used_as_authority"] = float(
+            not bool(allow_full_window_sizer)
+        )
+        lp_stats["da_path_price_semantics"] = str(path_price_semantics)
         if lp_schedule is None:
             lp_stats.setdefault("da_canonical_sizer_status", "canonical_da_sizer_infeasible")
             lp_stats.setdefault(
@@ -7447,14 +7571,20 @@ class BatteryBacktester:
         optimized_factor = float(selected_factor)
         optimized_feasible = bool(selected_feasible)
         optimized_stats = dict(selected_stats)
+        sized_schedule_zero = bool(all((ch <= 1e-9 and dis <= 1e-9) for ch, dis in optimized_schedule.values()))
         incumbent_schedule = _scaled_schedule(0.0)
         incumbent_feasible, incumbent_stats = _evaluate(incumbent_schedule)
+        raw_candidate_physical_feasible, raw_candidate_physical_stats = _evaluate(candidates)
         sized_candidate_replay = _predicted_replay(optimized_schedule)
         raw_candidate_replay = _predicted_replay(candidates)
-        # Canonical pre-lock selection replay is the schedule that can actually
-        # be locked after bid sizing. Raw optimizer candidates remain exported
-        # separately for audit, but they must not drive lockbook economics.
-        candidate_replay = sized_candidate_replay
+        # Candidate economics are raw-candidate-first. If the LP/full-window
+        # sizer collapses to zero, the raw replay remains the candidate used
+        # for the no-trade comparison and possible recovery.
+        candidate_replay = (
+            raw_candidate_replay
+            if bool(sized_schedule_zero) and raw_total > 1e-9
+            else sized_candidate_replay
+        )
         incumbent_replay = _predicted_replay(incumbent_schedule)
         candidate_pnl = float(candidate_replay.get("selection_pnl_eur", float("nan")))
         sized_candidate_pnl = float(sized_candidate_replay.get("selection_pnl_eur", float("nan")))
@@ -7496,6 +7626,77 @@ class BatteryBacktester:
         # candidates with their own missing shortfall estimate are rejected.
         if bool(incumbent_missing_recovery_cost):
             incumbent_replay_error_reason = "terminal_shortfall_missing_recovery_cost_estimate"
+        raw_candidate_pnl = float(raw_candidate_replay.get("selection_pnl_eur", float("nan")))
+        raw_candidate_replay_error = float(raw_candidate_replay.get("da_cashflow_replay_error", 1.0))
+        raw_candidate_replay_error_reason = str(
+            raw_candidate_replay.get("da_cashflow_replay_error_reason", "unknown")
+        )
+        raw_candidate_missing_recovery_cost = _missing_terminal_recovery_estimate(raw_candidate_replay)
+        raw_candidate_replay_valid = bool(
+            raw_candidate_replay_error <= 0.5
+            and np.isfinite(raw_candidate_pnl)
+            and bool(raw_candidate_physical_feasible)
+            and not bool(raw_candidate_missing_recovery_cost)
+        )
+        raw_candidate_minus_incumbent = (
+            float(raw_candidate_pnl - incumbent_pnl)
+            if bool(raw_candidate_replay_valid) and bool(incumbent_replay_valid)
+            else float("nan")
+        )
+        recover_raw_candidate_after_zero_sizer = bool(
+            bool(sized_schedule_zero)
+            and raw_total > 1e-9
+            and bool(raw_candidate_replay_valid)
+            and bool(incumbent_replay_valid)
+            and np.isfinite(float(raw_candidate_minus_incumbent))
+            and float(raw_candidate_minus_incumbent) > float(DA_PRECOMMIT_REPLAY_TOL_EUR)
+        )
+        if bool(recover_raw_candidate_after_zero_sizer):
+            selected = dict(candidates)
+            selected_factor = 1.0
+            selected_feasible = True
+            selected_sizing_method = "raw_candidate_recovered_after_zero_sizer"
+            selected_stats = dict(raw_candidate_physical_stats)
+            selected_stats.update(
+                {
+                    "da_bid_sizer_status": "ok_raw_candidate_recovered_after_zero_sizer",
+                    "da_canonical_sizer_status": "ok_raw_candidate_recovered_after_zero_sizer",
+                    "da_bid_sizer_method": "raw_candidate_recovered_after_zero_sizer",
+                    "da_bid_sizer_zero_reason": "none",
+                    "da_sizer_lp_zero_reason": "recovered_by_raw_candidate",
+                    "da_sizer_lp_zero_recovered_by_candidate_support": 1.0,
+                    "da_bid_sizer_candidate_support_feasible": 1.0,
+                    "da_candidate_support_sizer_used_as_authority": float(
+                        not bool(allow_full_window_sizer)
+                    ),
+                    "da_full_window_sizer_diagnostic_status": str(full_window_diag_status),
+                    "da_full_window_sizer_diagnostic_reason": str(full_window_diag_reason),
+                    "da_full_window_sizer_diagnostic_feasible": float(full_window_diag_feasible),
+                    "da_path_price_semantics": str(path_price_semantics),
+                    "da_bid_sizer_candidate_support_total_mwh": float(raw_total * float(self.dt_h)),
+                    "da_bid_sizer_candidate_support_pnl_eur": float(raw_candidate_pnl),
+                    "da_bid_sizer_candidate_support_incumbent_pnl_eur": float(incumbent_pnl),
+                    "da_bid_sizer_candidate_support_replay_error": float(raw_candidate_replay_error),
+                    "da_canonical_sizer_failure_reason": "none",
+                    "da_canonical_sizer_rounded_replay_pass": 1.0,
+                    "da_recovered_profitable_feasible_raw_candidate_after_zero_sizer": 1.0,
+                }
+            )
+            optimized_schedule = dict(selected)
+            optimized_factor = float(selected_factor)
+            optimized_feasible = True
+            optimized_stats = dict(selected_stats)
+            sized_candidate_replay = raw_candidate_replay
+            candidate_replay = raw_candidate_replay
+            candidate_pnl = float(raw_candidate_pnl)
+            sized_candidate_pnl = float(raw_candidate_pnl)
+            candidate_replay_error = float(raw_candidate_replay_error)
+            sized_candidate_replay_error = float(raw_candidate_replay_error)
+            candidate_replay_error_reason = str(raw_candidate_replay_error_reason)
+            sized_candidate_replay_error_reason = str(raw_candidate_replay_error_reason)
+            candidate_replay_valid = True
+            sized_candidate_replay_valid = True
+            sized_schedule_zero = False
         candidate_minus_incumbent = (
             float(candidate_pnl - incumbent_pnl)
             if bool(candidate_replay_valid) and bool(incumbent_replay_valid)
@@ -7540,8 +7741,6 @@ class BatteryBacktester:
         da_precommit_selection_blocked_by_replay_error = 0.0
         candidate_zeroed_due_to_invalid_replay = 0.0
         candidate_zeroed_due_to_negative_valid_replay = 0.0
-
-        sized_schedule_zero = bool(all((ch <= 1e-9 and dis <= 1e-9) for ch, dis in optimized_schedule.values()))
 
         if (
             (not bool(candidate_replay_valid) or not bool(sized_candidate_replay_valid))
@@ -7632,6 +7831,14 @@ class BatteryBacktester:
             for key, value in lp_stats.items():
                 selected_stats.setdefault(key, value)
             selected_stats.setdefault("da_bid_sizer_method", selected_sizing_method)
+        selected_stats.setdefault(
+            "da_candidate_support_sizer_used_as_authority",
+            float(str(selected_sizing_method) != "linprog_full_window_continuous_per_hour"),
+        )
+        selected_stats.setdefault("da_full_window_sizer_diagnostic_status", str(full_window_diag_status))
+        selected_stats.setdefault("da_full_window_sizer_diagnostic_reason", str(full_window_diag_reason))
+        selected_stats.setdefault("da_full_window_sizer_diagnostic_feasible", float(full_window_diag_feasible))
+        selected_stats.setdefault("da_path_price_semantics", str(path_price_semantics))
 
         zeroed = float(all((ch <= 1e-9 and dis <= 1e-9) for ch, dis in selected.values()))
         zero_reason = "none"
@@ -7678,6 +7885,21 @@ class BatteryBacktester:
                     "realized_sell_mwh_by_hour": float(acc_dis) * float(self.dt_h),
                     "da_retry_factor_selected": float(selected_factor),
                     "da_bid_sizer_method": str(selected_sizing_method),
+                    "da_candidate_support_sizer_used_as_authority": float(
+                        selected_stats.get("da_candidate_support_sizer_used_as_authority", np.nan)
+                    ),
+                    "da_full_window_sizer_diagnostic_status": str(
+                        selected_stats.get("da_full_window_sizer_diagnostic_status", "not_run")
+                    ),
+                    "da_full_window_sizer_diagnostic_reason": str(
+                        selected_stats.get("da_full_window_sizer_diagnostic_reason", "disabled")
+                    ),
+                    "da_full_window_sizer_diagnostic_feasible": float(
+                        selected_stats.get("da_full_window_sizer_diagnostic_feasible", 0.0)
+                    ),
+                    "da_path_price_semantics": str(
+                        selected_stats.get("da_path_price_semantics", path_price_semantics)
+                    ),
                     "da_bid_sizer_price_source_column": str(
                         selected_stats.get(
                             "da_bid_sizer_price_source_column",
@@ -7699,6 +7921,15 @@ class BatteryBacktester:
                     ),
                     "da_bid_sizer_error": str(selected_stats.get("da_bid_sizer_error", "none")),
                     "da_bid_sizer_zero_reason": str(selected_stats.get("da_bid_sizer_zero_reason", "none")),
+                    "da_recovered_profitable_feasible_raw_candidate_after_zero_sizer": float(
+                        selected_stats.get(
+                            "da_recovered_profitable_feasible_raw_candidate_after_zero_sizer",
+                            0.0,
+                        )
+                    ),
+                    "da_sizer_lp_zero_recovered_by_candidate_support": float(
+                        selected_stats.get("da_sizer_lp_zero_recovered_by_candidate_support", 0.0)
+                    ),
                     "da_canonical_sizer_status": str(
                         selected_stats.get(
                             "da_canonical_sizer_status",
@@ -8870,6 +9101,36 @@ class BatteryBacktester:
                         }
                     )
                     return _fail(ts, reason, rec)
+
+            if (
+                bool(terminal_sensitive_window)
+                and str(self.final_soc_mode) in {"hard", "hard_min"}
+                and soc < float(self.soc_target_end) - float(tol_mwh)
+            ):
+                terminal_ts = max(candidate_ts) if candidate_ts else (pd.Timestamp(rows[colmap.timestamp].max()))
+                terminal_shortfall_mwh = max(0.0, float(self.soc_target_end) - float(soc))
+                rec = {
+                    "da_hourly_lock_terminal_shortfall_mwh": float(terminal_shortfall_mwh),
+                    "da_hourly_lock_terminal_shortfall_recoverable": 0.0,
+                    "da_hourly_lock_terminal_shortfall_recovery_assumed": 0.0,
+                    "da_terminal_repair_required_mwh": float(terminal_shortfall_mwh),
+                    "da_terminal_repair_scheduled_mwh": 0.0,
+                    "da_terminal_replay_pass": 0.0,
+                    "da_terminal_replay_failure_reason": "terminal_shortfall_under_hard_min",
+                    "da_terminal_replay_first_failure_ts_utc": str(terminal_ts),
+                    "da_hourly_lock_projected_soc_start_mwh": float(soc),
+                    "da_hourly_lock_projected_soc_end_mwh": float(soc),
+                    "da_hourly_lock_max_feasible_buy_mwh": 0.0,
+                    "da_hourly_lock_max_feasible_sell_mwh": 0.0,
+                    "da_hourly_lock_infeasible_buy_mwh": 0.0,
+                    "da_hourly_lock_infeasible_sell_mwh": 0.0,
+                    "da_lockbook_physical_replay_schedule_source": str(schedule_source),
+                    "da_lockbook_physical_replay_existing_lockbook_included": float(bool(include_existing_lockbook)),
+                    "da_lockbook_physical_replay_candidate_included": float(bool(candidate_included)),
+                    "da_terminal_sensitive_window": float(bool(terminal_sensitive_window)),
+                    "da_terminal_sensitive_reason": str(terminal_sensitive_reason),
+                }
+                return _fail(pd.Timestamp(terminal_ts), "terminal_shortfall_under_hard_min", rec)
 
             diag = dict(base_diag)
             diag["da_lockbook_physical_replay_candidate_included"] = float(bool(candidate_included))
@@ -11852,6 +12113,28 @@ class BatteryBacktester:
                         return True, terminal_diag
                     return False, terminal_diag
 
+        if (
+            bool(terminal_sensitive_window)
+            and str(self.final_soc_mode) in {"hard", "hard_min"}
+            and soc + 1e-9 < float(self.soc_target_end)
+        ):
+            terminal_ts = (
+                pd.Timestamp(candidate_last_ts)
+                if candidate_last_ts is not None
+                else (pd.Timestamp(all_ts[-1]) if all_ts else pd.Timestamp(pd.Timestamp.utcnow()))
+            )
+            terminal_diag = _terminal_diag(terminal_ts, soc, 0.0, 0.0)
+            terminal_diag["infeasibility_driver"] = "terminal_shortfall_under_hard_min"
+            terminal_diag["infeasibility_driver_detail"] = "terminal_shortfall_under_hard_min"
+            terminal_diag["final_soc_feasibility_reason"] = "terminal_shortfall_under_hard_min"
+            terminal_diag["da_terminal_replay_failure_reason"] = "terminal_shortfall_under_hard_min"
+            terminal_diag["da_terminal_replay_pass"] = 0.0
+            terminal_diag["terminal_shortfall_recoverable"] = 0.0
+            terminal_diag["terminal_shortfall_unrecoverable"] = float(
+                float(terminal_diag.get("terminal_shortfall_mwh", 0.0) or 0.0) > 1e-9
+            )
+            return False, terminal_diag
+
         diag = _base_diag()
         diag.update(
             {
@@ -11931,6 +12214,164 @@ class BatteryBacktester:
         candidate_sell_mwh = float(sum(max(0.0, dis) for _, dis in selected_da.values()) * float(self.dt_h))
         candidate_timestamps = {pd.to_datetime(ts, utc=True, errors="coerce") for ts in selected_da.keys()}
         candidate_timestamps = {ts for ts in candidate_timestamps if pd.notna(ts)}
+
+        def _terminal_topup_schedule(
+            schedule: dict[pd.Timestamp, tuple[float, float]],
+        ) -> tuple[dict[pd.Timestamp, tuple[float, float]], dict[str, float | str]]:
+            topup_diag: dict[str, float | str] = {
+                "da_terminal_recovery_source": "none",
+                "da_terminal_buy_scheduled_mwh": 0.0,
+                "da_terminal_buy_first_delivery_ts_utc": "",
+                "da_terminal_buy_weighted_price_eur_mwh": float("nan"),
+                "da_terminal_id_repair_remaining_mwh": 0.0,
+            }
+            if str(self.final_soc_mode) != "hard_min" or not schedule:
+                return schedule, topup_diag
+            schedule_ts = {
+                pd.to_datetime(ts, utc=True, errors="coerce")
+                for ts in schedule.keys()
+            }
+            schedule_ts = {ts for ts in schedule_ts if pd.notna(ts)}
+            terminal_sensitive, _ = self._is_da_terminal_sensitive_window(
+                pd.DataFrame({"target_time_utc": sorted(schedule_ts)}),
+                global_end_utc=global_end_utc,
+            )
+            if not bool(terminal_sensitive):
+                return schedule, topup_diag
+
+            def _check(
+                trial_schedule: dict[pd.Timestamp, tuple[float, float]],
+            ) -> tuple[bool, dict[str, float | str]]:
+                return self._project_da_postlock_future_feasibility(
+                    future_rows=future_rows,
+                    colmap=colmap,
+                    current_soc_mwh=float(current_soc_mwh),
+                    da_lockbook=_with_candidate(trial_schedule),
+                    fixed_reserve_pos=fixed_reserve_pos,
+                    fixed_reserve_neg=fixed_reserve_neg,
+                    global_end_utc=global_end_utc,
+                    candidate_timestamps=set(trial_schedule.keys()),
+                )
+
+            feasible_before, diag_before = _check(schedule)
+            projected_final = float(diag_before.get("projected_final_soc_mwh", current_soc_mwh) or current_soc_mwh)
+            if bool(feasible_before) and projected_final >= float(self.soc_target_end) - 1e-9:
+                return schedule, topup_diag
+
+            candidate_rows = replay_rows.copy()
+            if candidate_rows.empty:
+                return schedule, topup_diag
+            if "target_time_utc" not in candidate_rows.columns:
+                return schedule, topup_diag
+            candidate_rows["target_time_utc"] = pd.to_datetime(
+                candidate_rows["target_time_utc"],
+                utc=True,
+                errors="coerce",
+            )
+            candidate_rows = candidate_rows.dropna(subset=["target_time_utc"])
+            if candidate_rows.empty:
+                return schedule, topup_diag
+            if global_end_utc is not None and pd.notna(global_end_utc):
+                end_ts = pd.Timestamp(pd.to_datetime(global_end_utc, utc=True))
+                candidate_rows = candidate_rows.loc[candidate_rows["target_time_utc"] < end_ts].copy()
+            if candidate_rows.empty:
+                return schedule, topup_diag
+
+            price_col = colmap.pred_da_price if colmap.pred_da_price in candidate_rows.columns else None
+            if price_col is None:
+                candidate_rows["_terminal_topup_price"] = 0.0
+            else:
+                candidate_rows["_terminal_topup_price"] = pd.to_numeric(
+                    candidate_rows[price_col],
+                    errors="coerce",
+                ).replace([np.inf, -np.inf], np.nan).fillna(float("inf"))
+            candidate_rows = candidate_rows.sort_values(["_terminal_topup_price", "target_time_utc"])
+            step_mw = max(float(getattr(self, "da_bid_granularity_mw", 0.1)), 1e-9)
+            max_steps = int(max(1, min(5000, np.ceil(float(self.p_max_mw) / step_mw) * max(1, len(candidate_rows)))))
+            trial = {pd.Timestamp(ts): self._normalize_da_bid(*qty) for ts, qty in schedule.items()}
+            scheduled_grid_mwh = 0.0
+            scheduled_cost = 0.0
+            first_delivery = ""
+            best_projected_final = projected_final
+            for _ in range(max_steps):
+                if best_projected_final >= float(self.soc_target_end) - 1e-9:
+                    break
+                accepted_one_step = False
+                for _, row in candidate_rows.iterrows():
+                    ts = pd.Timestamp(row["target_time_utc"])
+                    current_buy, current_sell = self._normalize_da_bid(*trial.get(ts, (0.0, 0.0)))
+                    if current_sell > 1e-9:
+                        continue
+                    existing_buy, existing_sell = self._normalize_da_bid(*base_lockbook.get(ts, (0.0, 0.0)))
+                    if existing_sell > 1e-9:
+                        continue
+                    reserve_mw = max(
+                        float(fixed_reserve_pos.get(ts, 0.0)),
+                        float(fixed_reserve_neg.get(ts, 0.0)),
+                    )
+                    max_buy_mw = max(0.0, float(self.p_max_mw) - max(0.0, reserve_mw) - max(0.0, existing_buy))
+                    if current_buy + step_mw > max_buy_mw + 1e-9:
+                        continue
+                    proposed = dict(trial)
+                    proposed[ts] = self._normalize_da_bid(float(current_buy) + step_mw, 0.0)
+                    ok, proposed_diag = _check(proposed)
+                    proposed_final = float(
+                        proposed_diag.get("projected_final_soc_mwh", best_projected_final)
+                        or best_projected_final
+                    )
+                    proposed_reason = str(
+                        proposed_diag.get(
+                            "infeasibility_driver_detail",
+                            proposed_diag.get("infeasibility_driver", "none"),
+                        )
+                    )
+                    if (
+                        bool(ok)
+                        or proposed_reason in {
+                            "terminal_shortfall_under_hard_min",
+                            "terminal_repair_missing",
+                            "terminal_repair_unreachable",
+                        }
+                    ) and proposed_final > best_projected_final + 1e-9:
+                        trial = proposed
+                        best_projected_final = proposed_final
+                        price = float(row.get("_terminal_topup_price", 0.0))
+                        if not np.isfinite(price):
+                            price = 0.0
+                        scheduled_grid_mwh += step_mw * float(self.dt_h)
+                        scheduled_cost += step_mw * float(self.dt_h) * price
+                        if not first_delivery:
+                            first_delivery = str(ts)
+                        accepted_one_step = True
+                        break
+                if not accepted_one_step:
+                    break
+
+            if scheduled_grid_mwh > 1e-9:
+                topup_diag.update(
+                    {
+                        "da_terminal_recovery_source": (
+                            "da"
+                            if best_projected_final >= float(self.soc_target_end) - 1e-9
+                            else "da_partial"
+                        ),
+                        "da_terminal_buy_scheduled_mwh": float(scheduled_grid_mwh),
+                        "da_terminal_buy_first_delivery_ts_utc": str(first_delivery),
+                        "da_terminal_buy_weighted_price_eur_mwh": float(
+                            scheduled_cost / max(scheduled_grid_mwh, 1e-12)
+                        ),
+                        "da_terminal_id_repair_remaining_mwh": float(
+                            max(0.0, float(self.soc_target_end) - best_projected_final)
+                        ),
+                    }
+                )
+            return trial, topup_diag
+
+        selected_da, terminal_topup_diag = _terminal_topup_schedule(dict(selected_da))
+        candidate_timestamps = {pd.to_datetime(ts, utc=True, errors="coerce") for ts in selected_da.keys()}
+        candidate_timestamps = {ts for ts in candidate_timestamps if pd.notna(ts)}
+        candidate_buy_mwh = float(sum(max(0.0, ch) for ch, _ in selected_da.values()) * float(self.dt_h))
+        candidate_sell_mwh = float(sum(max(0.0, dis) for _, dis in selected_da.values()) * float(self.dt_h))
         zero_schedule = {ts: (0.0, 0.0) for ts in selected_da.keys()}
         zero_feasible, zero_diag = self._project_da_postlock_future_feasibility(
             future_rows=future_rows,
@@ -12062,37 +12503,13 @@ class BatteryBacktester:
             and terminal_recovery_cost > 0.0
         ):
             postlock_candidate_pnl_after_recovery -= float(terminal_recovery_cost)
-        if bool(missing_terminal_recovery_estimate) and bool(zero_feasible):
-            final_schedule = zero_schedule
-            final_diag = dict(zero_diag)
-            feasible = True
-            final_selected_future_feasible = True
-            selected_after_check = "no_trade_after_missing_terminal_recovery_cost_estimate"
-            rejected_due_to_future = 1.0
+        if bool(missing_terminal_recovery_estimate):
             candidate_failure_diag["infeasibility_driver_detail"] = "terminal_shortfall_missing_recovery_cost_estimate"
             candidate_failure_diag["infeasibility_driver"] = "terminal_shortfall_missing_recovery_cost_estimate"
         if (
             bool(zero_feasible)
-            and candidate_future_feasible
-            and str(candidate_failure_diag.get("infeasibility_driver_detail", ""))
-            == "locked_da_terminal_shortfall_recoverable"
-            and replay_terminal_sensitive >= 0.5
-            and terminal_recovery_cost_available >= 0.5
-            and np.isfinite(postlock_candidate_pnl_after_recovery)
-            and np.isfinite(no_trade_pnl)
-            and postlock_candidate_pnl_after_recovery <= no_trade_pnl + 1e-6
-        ):
-            final_schedule = zero_schedule
-            final_diag = dict(zero_diag)
-            feasible = True
-            final_selected_future_feasible = True
-            selected_after_check = "no_trade_after_terminal_recovery_cost"
-            rejected_due_to_future = 1.0
-            candidate_failure_diag["infeasibility_driver_detail"] = "locked_da_terminal_recovery_cost_negative_pnl"
-            candidate_failure_diag["infeasibility_driver"] = "locked_da_terminal_recovery_cost_negative_pnl"
-        if (
-            bool(zero_feasible)
             and any(ch > 1e-9 or dis > 1e-9 for ch, dis in postlock_candidate_schedule.values())
+            and float(terminal_topup_diag.get("da_terminal_buy_scheduled_mwh", 0.0) or 0.0) <= 1e-9
             and np.isfinite(postlock_candidate_pnl_after_recovery)
             and np.isfinite(no_trade_pnl)
             and postlock_candidate_pnl_after_recovery <= no_trade_pnl + 1e-6
@@ -12577,6 +12994,21 @@ class BatteryBacktester:
                     ),
                     "da_terminal_shortfall_missing_recovery_cost_estimate": float(
                         bool(missing_terminal_recovery_estimate)
+                    ),
+                    "da_terminal_recovery_source": str(
+                        terminal_topup_diag.get("da_terminal_recovery_source", "none")
+                    ),
+                    "da_terminal_buy_scheduled_mwh": float(
+                        terminal_topup_diag.get("da_terminal_buy_scheduled_mwh", 0.0) or 0.0
+                    ),
+                    "da_terminal_buy_first_delivery_ts_utc": str(
+                        terminal_topup_diag.get("da_terminal_buy_first_delivery_ts_utc", "")
+                    ),
+                    "da_terminal_buy_weighted_price_eur_mwh": float(
+                        terminal_topup_diag.get("da_terminal_buy_weighted_price_eur_mwh", np.nan)
+                    ),
+                    "da_terminal_id_repair_remaining_mwh": float(
+                        terminal_topup_diag.get("da_terminal_id_repair_remaining_mwh", 0.0) or 0.0
                     ),
                     "da_terminal_sensitive_window": float(
                         final_lockable_replay.get(
@@ -27570,8 +28002,13 @@ class BatteryBacktester:
                     future_rows=future_rows_for_da_guard,
                     existing_da_lockbook=da_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
-                    allow_full_window_sizer=bool(is_perfect_foresight),
+                    allow_full_window_sizer=False,
                     is_perfect_foresight=bool(is_perfect_foresight),
+                    da_path_price_semantics=(
+                        "rhpf_true_price"
+                        if bool(is_perfect_foresight)
+                        else ("naive" if str(run_mode).strip().lower() == "naive" else "model")
+                    ),
                 )
                 accepted_da, da_audit_rows = self._apply_da_postlock_future_guard(
                     selected_da=accepted_da,
@@ -27669,51 +28106,17 @@ class BatteryBacktester:
                     except Exception:
                         return False
 
-                da_milp_rejected_ts: set[pd.Timestamp] = set()
-                if accepted_da and not _da_schedule_milp_equivalent(accepted_da):
-                    nonzero_items = [
-                        (ts_key, qty_pair)
-                        for ts_key, qty_pair in accepted_da.items()
-                        if max(0.0, float(qty_pair[0])) + max(0.0, float(qty_pair[1])) > 1e-12
-                    ]
-                    best_repaired: dict[pd.Timestamp, tuple[float, float]] | None = None
-                    best_repaired_volume = -1.0
-                    for remove_ts, _ in nonzero_items:
-                        candidate_schedule = {
-                            ts_key: qty_pair
-                            for ts_key, qty_pair in accepted_da.items()
-                            if pd.Timestamp(ts_key) != pd.Timestamp(remove_ts)
-                        }
-                        if not _da_schedule_milp_equivalent(candidate_schedule):
-                            continue
-                        candidate_volume = float(
-                            sum(
-                                max(0.0, float(ch)) + max(0.0, float(dis))
-                                for ch, dis in candidate_schedule.values()
-                            )
+                da_milp_equivalent = _da_schedule_milp_equivalent(accepted_da)
+                if accepted_da and not bool(da_milp_equivalent):
+                    for row in da_audit_rows:
+                        row["da_prelock_milp_equivalence_warning"] = 1.0
+                        row["da_prelock_milp_equivalence_warning_reason"] = (
+                            "milp_equivalence_failed_but_settlement_replay_is_authority"
                         )
-                        if candidate_volume > best_repaired_volume:
-                            best_repaired = candidate_schedule
-                            best_repaired_volume = candidate_volume
-                    if best_repaired is None:
-                        da_milp_rejected_ts = {pd.Timestamp(ts_key) for ts_key in accepted_da.keys()}
-                        accepted_da = {}
-                    else:
-                        da_milp_rejected_ts = {
-                            pd.Timestamp(ts_key)
-                            for ts_key in accepted_da.keys()
-                            if pd.Timestamp(ts_key) not in {pd.Timestamp(k) for k in best_repaired.keys()}
-                        }
-                        accepted_da = best_repaired
-                    if da_milp_rejected_ts:
-                        for row in da_audit_rows:
-                            row_ts = pd.to_datetime(row.get("timestamp_utc", pd.NaT), utc=True, errors="coerce")
-                            if pd.notna(row_ts) and pd.Timestamp(row_ts) in da_milp_rejected_ts:
-                                row["da_prelock_repair_reason"] = "prelock_removed_milp_infeasible_candidate_row"
-                                row["da_zero_reason"] = "prelock_removed_milp_infeasible_candidate_row"
-                                row["da_lockbook_replay_pass"] = 0.0
-                                row["da_lockbook_replay_failure_reason"] = "prelock_milp_equivalence_rejected"
-                                row["da_prelock_rejected_no_feasible_schedule"] = float(not accepted_da)
+                else:
+                    for row in da_audit_rows:
+                        row["da_prelock_milp_equivalence_warning"] = 0.0
+                        row["da_prelock_milp_equivalence_warning_reason"] = "none"
                 physical_check_input_buy_mwh_total = float(
                     sum(max(0.0, float(ch)) * float(self.dt_h) for ch, _ in accepted_da.values())
                 )
@@ -28031,8 +28434,6 @@ class BatteryBacktester:
                     ),
                     "da_hourly_soc_min_resize_reason": str(prelock_guard_diag.get("da_prelock_repair_reason", "none")),
                 }
-                if not bool(lock_phys_ok):
-                    accepted_da = {}
                 annotated_da_audit_rows: list[dict[str, float | str]] = []
                 for audit_row in da_audit_rows:
                     out_row = dict(audit_row)
@@ -28041,19 +28442,16 @@ class BatteryBacktester:
                     for key, value in {**lock_phys_diag, **row_diag, **resize_diag}.items():
                         out_row.setdefault(str(key), value)
                     if not bool(lock_phys_ok):
-                        out_row["da_zero_reason"] = "hourly_lock_physical_infeasible_no_trade_selected"
-                        out_row["zero_reason"] = "hourly_lock_physical_infeasible_no_trade_selected"
-                        out_row["final_selected_incumbent"] = "no_trade"
-                        out_row["da_accepted_buy_mw"] = 0.0
-                        out_row["da_accepted_sell_mw"] = 0.0
-                        out_row["da_selected_lockable_buy_mw"] = 0.0
-                        out_row["da_selected_lockable_sell_mw"] = 0.0
-                        out_row["da_postlock_candidate_buy_mw"] = 0.0
-                        out_row["da_postlock_candidate_sell_mw"] = 0.0
-                        out_row["locked_buy_mwh_by_hour"] = 0.0
-                        out_row["locked_sell_mwh_by_hour"] = 0.0
-                        out_row["candidate_pnl_after_recovery_cost_eur"] = float(
-                            out_row.get("no_trade_pnl", 0.0) or 0.0
+                        out_row["da_prewrite_replay_warning"] = 1.0
+                        out_row["da_prewrite_replay_warning_reason"] = str(
+                            lock_phys_diag.get(
+                                "da_combined_lockbook_physical_infeasible_reason",
+                                lock_phys_diag.get(
+                                    "da_hourly_lock_infeasible_reason",
+                                    "physical_replay_failed_before_repair",
+                                ),
+                            )
+                            or "physical_replay_failed_before_repair"
                         )
                     annotated_da_audit_rows.append(out_row)
                 da_audit_rows = annotated_da_audit_rows
@@ -28099,8 +28497,6 @@ class BatteryBacktester:
                         schedule_source="final_da_lockbook_consistency_guard",
                     )
                 )
-                if not bool(final_lockbook_ok):
-                    accepted_da = {}
                 final_blocking_ts = pd.to_datetime(
                     final_lockbook_diag.get("da_hourly_lock_infeasible_timestamp_utc", ""),
                     utc=True,
@@ -28167,9 +28563,17 @@ class BatteryBacktester:
                         out_row["locked_buy_mwh_by_hour"] = 0.0
                         out_row["locked_sell_mwh_by_hour"] = 0.0
                         if not bool(final_lockbook_ok):
-                            out_row["da_zero_reason"] = "final_lockbook_consistency_infeasible_no_trade_selected"
-                            out_row["zero_reason"] = "final_lockbook_consistency_infeasible_no_trade_selected"
-                            out_row["final_selected_incumbent"] = "no_trade"
+                            out_row["da_final_lockbook_consistency_warning"] = 1.0
+                            out_row["da_final_lockbook_consistency_warning_reason"] = str(
+                                final_lockbook_diag.get(
+                                    "da_combined_lockbook_physical_infeasible_reason",
+                                    final_lockbook_diag.get(
+                                        "da_hourly_lock_infeasible_reason",
+                                        "final_lockbook_replay_failed_before_canonical_prewrite",
+                                    ),
+                                )
+                                or "final_lockbook_replay_failed_before_canonical_prewrite"
+                            )
                     patched_da_audit_rows.append(out_row)
                 da_audit_rows = patched_da_audit_rows
                 accepted_da, da_audit_rows = self._apply_da_accepted_lockbook_replay_to_audit_rows(
@@ -28218,27 +28622,23 @@ class BatteryBacktester:
                     if pd.Timestamp(ts) not in settlement_equiv_by_ts
                 ]
                 if accepted_da and da_lockbook_write_fallback_contaminated:
-                    rejected_ts = sorted(pd.Timestamp(ts) for ts in accepted_da)[0]
-                    accepted_da = {}
                     settlement_equiv_diag.update(
                         {
-                            "da_settlement_equiv_replay_pass": 0.0,
-                            "da_settlement_equiv_replay_rejected": 1.0,
-                            "da_settlement_equiv_replay_delivery_ts_utc": rejected_ts.isoformat(),
                             "da_settlement_equiv_replay_fallback_contaminated_anchor": 1.0,
-                            "da_settlement_equiv_replay_reason": "stale_prelock_anchor_not_reportable",
+                            "da_settlement_equiv_replay_warning": 1.0,
+                            "da_settlement_equiv_replay_warning_reason": (
+                                "accepted_path_fallback_present_but_settlement_replay_is_authority"
+                            ),
                         }
                     )
                 elif stale_anchor_requires_replay and missing_settlement_equiv_proof:
-                    rejected_ts = sorted(missing_settlement_equiv_proof)[0]
-                    accepted_da = {}
                     settlement_equiv_diag.update(
                         {
-                            "da_settlement_equiv_replay_pass": 0.0,
-                            "da_settlement_equiv_replay_rejected": 1.0,
-                            "da_settlement_equiv_replay_delivery_ts_utc": rejected_ts.isoformat(),
                             "da_settlement_equiv_replay_fallback_contaminated_anchor": 0.0,
-                            "da_settlement_equiv_replay_reason": "stale_prelock_anchor_not_reportable",
+                            "da_settlement_equiv_replay_warning": 1.0,
+                            "da_settlement_equiv_replay_warning_reason": (
+                                "stale_anchor_detected_but_schedule_kept_pending_canonical_prewrite"
+                            ),
                         }
                     )
                 patched_da_audit_rows = []
@@ -32354,6 +32754,7 @@ class BatteryBacktester:
         # both base prediction columns and existing quantile columns, otherwise
         # the naive optimizer can still read model quantile surfaces.
         naive_plan_history = pd.DataFrame()
+        naive_da_plan_diag = self._path_da_plan_history_diagnostics(naive_plan_history, prefix="naive")
         naive_forecast_mode = str(self.naive_forecast_mode)
         naive_forecast_causality_violations = 0.0
         naive_forecast_fallback_count = 0.0
@@ -32434,6 +32835,7 @@ class BatteryBacktester:
                 strategy_permissions=run_strategy_permissions,
             )
         if benchmark_paths["naive"]:
+            naive_da_plan_diag = self._path_da_plan_history_diagnostics(naive_plan_history, prefix="naive")
             with _phase_watchdog("settlement_naive_realized"):
                 naive_real = self.settle_dispatch(
                     df,
@@ -32475,6 +32877,9 @@ class BatteryBacktester:
                     on=colmap.timestamp,
                     how="left",
                 )
+            if not naive_real.empty:
+                for diag_key, diag_value in naive_da_plan_diag.items():
+                    naive_real[str(diag_key)] = diag_value
             _safe_write_checkpoint(
                 "stage_02_naive",
                 frame=naive_real,
@@ -32482,6 +32887,7 @@ class BatteryBacktester:
                     "naive_total_pnl_eur": float(pd.to_numeric(naive_real.get("naive_pnl_eur", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
                     if not naive_real.empty
                     else 0.0,
+                    **{str(k): v for k, v in naive_da_plan_diag.items()},
                 },
             )
 
@@ -32599,6 +33005,10 @@ class BatteryBacktester:
         rolling_pf_da_bid_sizer_status = "not_evaluated"
         rolling_pf_da_bid_sizer_error = ""
         rolling_pf_da_bid_sizer_method = ""
+        rolling_pf_da_candidate_support_sizer_used_as_authority = 0.0
+        rolling_pf_da_full_window_sizer_diagnostic_status = "not_run"
+        rolling_pf_da_full_window_sizer_diagnostic_reason = "not_run"
+        rolling_pf_da_path_price_semantics = ""
         rolling_pf_da_bid_sizer_objective_eur = float("nan")
         rolling_pf_da_bid_sizer_total_buy_mwh = 0.0
         rolling_pf_da_bid_sizer_total_sell_mwh = 0.0
@@ -33232,6 +33642,16 @@ class BatteryBacktester:
             rolling_pf_da_bid_sizer_status = str(pf_plan_diag["rolling_pf_da_bid_sizer_status"])
             rolling_pf_da_bid_sizer_error = str(pf_plan_diag["rolling_pf_da_bid_sizer_error"])
             rolling_pf_da_bid_sizer_method = str(pf_plan_diag["rolling_pf_da_bid_sizer_method"])
+            rolling_pf_da_candidate_support_sizer_used_as_authority = float(
+                pf_plan_diag["rolling_pf_da_candidate_support_sizer_used_as_authority"]
+            )
+            rolling_pf_da_full_window_sizer_diagnostic_status = str(
+                pf_plan_diag["rolling_pf_da_full_window_sizer_diagnostic_status"]
+            )
+            rolling_pf_da_full_window_sizer_diagnostic_reason = str(
+                pf_plan_diag["rolling_pf_da_full_window_sizer_diagnostic_reason"]
+            )
+            rolling_pf_da_path_price_semantics = str(pf_plan_diag["rolling_pf_da_path_price_semantics"])
             rolling_pf_da_bid_sizer_objective_eur = float(pf_plan_diag["rolling_pf_da_bid_sizer_objective_eur"])
             rolling_pf_da_bid_sizer_total_buy_mwh = float(pf_plan_diag["rolling_pf_da_bid_sizer_total_buy_mwh"])
             rolling_pf_da_bid_sizer_total_sell_mwh = float(pf_plan_diag["rolling_pf_da_bid_sizer_total_sell_mwh"])
@@ -34413,6 +34833,9 @@ class BatteryBacktester:
         # The merged hourly output is wide by this point; defragment once
         # before appending scalar benchmark diagnostics.
         hourly = hourly.copy()
+        for diag_key, diag_value in naive_da_plan_diag.items():
+            if str(diag_key) not in hourly.columns:
+                hourly[str(diag_key)] = diag_value
         hourly["rolling_pf_solver_pnl_eur"] = float(rolling_pf_solver_solution_eur)
         hourly["rolling_pf_solver_feasible"] = float(rolling_pf_solver_feasible)
         hourly["rolling_pf_selected_incumbent"] = str(rolling_pf_selected_incumbent)
@@ -34469,6 +34892,16 @@ class BatteryBacktester:
         hourly["rolling_pf_da_bid_sizer_status"] = str(rolling_pf_da_bid_sizer_status)
         hourly["rolling_pf_da_bid_sizer_error"] = str(rolling_pf_da_bid_sizer_error)
         hourly["rolling_pf_da_bid_sizer_method"] = str(rolling_pf_da_bid_sizer_method)
+        hourly["rolling_pf_da_candidate_support_sizer_used_as_authority"] = float(
+            rolling_pf_da_candidate_support_sizer_used_as_authority
+        )
+        hourly["rolling_pf_da_full_window_sizer_diagnostic_status"] = str(
+            rolling_pf_da_full_window_sizer_diagnostic_status
+        )
+        hourly["rolling_pf_da_full_window_sizer_diagnostic_reason"] = str(
+            rolling_pf_da_full_window_sizer_diagnostic_reason
+        )
+        hourly["rolling_pf_da_path_price_semantics"] = str(rolling_pf_da_path_price_semantics)
         hourly["rolling_pf_da_bid_sizer_objective_eur"] = float(rolling_pf_da_bid_sizer_objective_eur)
         hourly["rolling_pf_da_bid_sizer_total_buy_mwh"] = float(rolling_pf_da_bid_sizer_total_buy_mwh)
         hourly["rolling_pf_da_bid_sizer_total_sell_mwh"] = float(rolling_pf_da_bid_sizer_total_sell_mwh)
@@ -35842,6 +36275,16 @@ class BatteryBacktester:
             "rolling_pf_da_bid_sizer_status": str(rolling_pf_da_bid_sizer_status),
             "rolling_pf_da_bid_sizer_error": str(rolling_pf_da_bid_sizer_error),
             "rolling_pf_da_bid_sizer_method": str(rolling_pf_da_bid_sizer_method),
+            "rolling_pf_da_candidate_support_sizer_used_as_authority": float(
+                rolling_pf_da_candidate_support_sizer_used_as_authority
+            ),
+            "rolling_pf_da_full_window_sizer_diagnostic_status": str(
+                rolling_pf_da_full_window_sizer_diagnostic_status
+            ),
+            "rolling_pf_da_full_window_sizer_diagnostic_reason": str(
+                rolling_pf_da_full_window_sizer_diagnostic_reason
+            ),
+            "rolling_pf_da_path_price_semantics": str(rolling_pf_da_path_price_semantics),
             "rolling_pf_da_bid_sizer_objective_eur": float(rolling_pf_da_bid_sizer_objective_eur),
             "rolling_pf_da_bid_sizer_total_buy_mwh": float(rolling_pf_da_bid_sizer_total_buy_mwh),
             "rolling_pf_da_bid_sizer_total_sell_mwh": float(rolling_pf_da_bid_sizer_total_sell_mwh),
@@ -36701,6 +37144,7 @@ class BatteryBacktester:
         summary["total_slack_soc_max_mwh"] = float(hourly["slack_soc_max_mwh"].sum()) if "slack_soc_max_mwh" in hourly.columns else 0.0
 
         summary.update({str(k): v for k, v in rolling_pf_bcm_side_diag.items()})
+        summary.update({str(k): v for k, v in naive_da_plan_diag.items()})
 
         # Backward-compatible aliases used by older reports/scripts.
         summary["total_da_energy_revenue_eur"] = summary["total_da_revenue_eur"]
@@ -39334,6 +39778,10 @@ class BatteryBacktester:
             ("rolling_pf_da_bid_sizer_status", ""),
             ("rolling_pf_da_bid_sizer_error", ""),
             ("rolling_pf_da_bid_sizer_method", ""),
+            ("rolling_pf_da_candidate_support_sizer_used_as_authority", 0.0),
+            ("rolling_pf_da_full_window_sizer_diagnostic_status", ""),
+            ("rolling_pf_da_full_window_sizer_diagnostic_reason", ""),
+            ("rolling_pf_da_path_price_semantics", ""),
             ("rolling_pf_da_bid_sizer_objective_eur", float("nan")),
             ("rolling_pf_da_bid_sizer_total_buy_mwh", 0.0),
             ("rolling_pf_da_bid_sizer_total_sell_mwh", 0.0),
@@ -39352,6 +39800,30 @@ class BatteryBacktester:
             ("rolling_pf_da_first_rejection_candidate_buy_mw", 0.0),
             ("rolling_pf_da_first_rejection_candidate_sell_mw", 0.0),
             ("rolling_pf_da_first_rejection_existing_locked_buy_mw", 0.0),
+            ("naive_da_plan_history_rows", 0.0),
+            ("naive_da_plan_history_stage_used", ""),
+            ("naive_da_gate_allowed_rows", 0.0),
+            ("naive_da_gate_nonzero_candidate_rows", 0.0),
+            ("naive_da_raw_candidate_buy_mwh", 0.0),
+            ("naive_da_raw_candidate_sell_mwh", 0.0),
+            ("naive_da_sized_candidate_buy_mwh", 0.0),
+            ("naive_da_sized_candidate_sell_mwh", 0.0),
+            ("naive_da_postlock_candidate_buy_mwh", 0.0),
+            ("naive_da_postlock_candidate_sell_mwh", 0.0),
+            ("naive_da_selected_lockable_buy_mwh", 0.0),
+            ("naive_da_selected_lockable_sell_mwh", 0.0),
+            ("naive_da_zero_trade_reason", ""),
+            ("naive_da_zero_trade_stage", ""),
+            ("naive_da_plan_history_zero_reason", ""),
+            ("naive_da_bid_sizer_status", ""),
+            ("naive_da_bid_sizer_error", ""),
+            ("naive_da_bid_sizer_method", ""),
+            ("naive_da_candidate_support_sizer_used_as_authority", 0.0),
+            ("naive_da_full_window_sizer_diagnostic_status", ""),
+            ("naive_da_full_window_sizer_diagnostic_reason", ""),
+            ("naive_da_path_price_semantics", ""),
+            ("naive_da_replay_pass", 0.0),
+            ("naive_da_sizer_postlock_replay_mismatch", 0.0),
             ("rolling_pf_da_first_rejection_existing_locked_sell_mw", 0.0),
             ("rolling_pf_da_first_rejection_soc_before_mwh", float("nan")),
             ("rolling_pf_da_first_rejection_soc_after_mwh", float("nan")),

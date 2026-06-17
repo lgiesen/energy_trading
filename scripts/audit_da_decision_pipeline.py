@@ -120,6 +120,39 @@ def _path_da_totals(df: pd.DataFrame, prefix: str) -> dict[str, float]:
     return out
 
 
+def _path_da_trade_hours(df: pd.DataFrame, path: str) -> int:
+    """Count hours with nonzero path-specific DA volume."""
+    if df.empty:
+        return 0
+    if path == "model":
+        buy_cols = ["real_da_buy_mwh", "da_buy_mwh", "real_submitted_da_buy_mw", "submitted_da_buy_mw"]
+        sell_cols = ["real_da_sell_mwh", "da_sell_mwh", "real_submitted_da_sell_mw", "submitted_da_sell_mw"]
+    elif path == "naive":
+        buy_cols = ["naive_da_buy_mwh", "naive_submitted_da_buy_mw", "submitted_da_buy_mw"]
+        sell_cols = ["naive_da_sell_mwh", "naive_submitted_da_sell_mw", "submitted_da_sell_mw"]
+    else:
+        buy_cols = [
+            "perfect_foresight_da_buy_mwh",
+            "perfect_foresight_submitted_da_buy_mw",
+            "rolling_pf_da_buy_mwh",
+            "submitted_da_buy_mw",
+        ]
+        sell_cols = [
+            "perfect_foresight_da_sell_mwh",
+            "perfect_foresight_submitted_da_sell_mw",
+            "rolling_pf_da_sell_mwh",
+            "submitted_da_sell_mw",
+        ]
+
+    def _first_series(cols: list[str]) -> pd.Series:
+        for col in cols:
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
+        return pd.Series(0.0, index=df.index, dtype="float64")
+
+    return int((_first_series(buy_cols).abs() + _first_series(sell_cols).abs()).gt(TOL).sum())
+
+
 def _summary_float(summary: dict[str, object], names: Iterable[str], default: float) -> float:
     for name in names:
         try:
@@ -129,6 +162,107 @@ def _summary_float(summary: dict[str, object], names: Iterable[str], default: fl
         if np.isfinite(val):
             return float(val)
     return float(default)
+
+
+def _summary_text(summary: dict[str, object], names: Iterable[str], default: str = "") -> str:
+    for name in names:
+        val = summary.get(name, "")
+        text = str(val).strip()
+        if text and text.lower() not in {"nan", "none", "not_evaluated"}:
+            return text
+    return str(default)
+
+
+def _first_text_from_frame(df: pd.DataFrame, names: Iterable[str], default: str = "") -> str:
+    if df.empty:
+        return str(default)
+    for name in names:
+        if name not in df.columns:
+            continue
+        vals = df[name].dropna().astype(str).str.strip()
+        vals = vals[~vals.str.lower().isin({"", "nan", "none", "not_evaluated"})]
+        if not vals.empty:
+            return str(vals.iloc[0])
+    return str(default)
+
+
+def _first_num_from_frame(df: pd.DataFrame, names: Iterable[str], default: float = 0.0) -> float:
+    if df.empty:
+        return float(default)
+    for name in names:
+        if name not in df.columns:
+            continue
+        vals = pd.to_numeric(df[name], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if not vals.empty:
+            return float(vals.iloc[0])
+    return float(default)
+
+
+def _benchmark_da_zero_explanation(
+    summary: dict[str, object],
+    df: pd.DataFrame,
+    *,
+    path: str,
+) -> dict[str, object]:
+    if path == "naive":
+        prefix = "naive_da"
+    elif path == "rhpf":
+        prefix = "rolling_pf_da"
+    else:
+        return {"candidate_mwh": 0.0, "reason": "", "explained": True}
+    candidate_mwh = _summary_float(
+        summary,
+        [f"{prefix}_raw_candidate_buy_mwh"],
+        _first_num_from_frame(df, [f"{prefix}_raw_candidate_buy_mwh"], 0.0),
+    ) + _summary_float(
+        summary,
+        [f"{prefix}_raw_candidate_sell_mwh"],
+        _first_num_from_frame(df, [f"{prefix}_raw_candidate_sell_mwh"], 0.0),
+    )
+    if candidate_mwh <= TOL:
+        candidate_mwh = _summary_float(
+            summary,
+            [f"{prefix}_sized_candidate_buy_mwh"],
+            _first_num_from_frame(df, [f"{prefix}_sized_candidate_buy_mwh"], 0.0),
+        ) + _summary_float(
+            summary,
+            [f"{prefix}_sized_candidate_sell_mwh"],
+            _first_num_from_frame(df, [f"{prefix}_sized_candidate_sell_mwh"], 0.0),
+        )
+    reason = _summary_text(
+        summary,
+        [
+            f"{prefix}_zero_trade_reason",
+            f"{prefix}_plan_history_zero_reason",
+            f"{prefix}_sized_zero_reason",
+            f"{prefix}_first_rejection_reason",
+            f"{prefix}_bid_sizer_status",
+        ],
+        _first_text_from_frame(
+            df,
+            [
+                f"{prefix}_zero_trade_reason",
+                f"{prefix}_plan_history_zero_reason",
+                f"{prefix}_sized_zero_reason",
+                f"{prefix}_first_rejection_reason",
+                f"{prefix}_bid_sizer_status",
+            ],
+            "",
+        ),
+    )
+    generic_reasons = {
+        "",
+        "none",
+        "nan",
+        "not_evaluated",
+        "candidate_available",
+        "diagnostics_missing_post_precommit_stage",
+    }
+    return {
+        "candidate_mwh": float(candidate_mwh),
+        "reason": str(reason),
+        "explained": bool(candidate_mwh <= TOL or str(reason).strip().lower() not in generic_reasons),
+    }
 
 
 def _sum_first_existing(df: pd.DataFrame, cols: Iterable[str]) -> float:
@@ -305,8 +439,14 @@ def _diagnostic_global_da_oracle(hourly: pd.DataFrame, summary: dict[str, object
     }
 
 
-def _scenario_audit(scenario_dir: Path, max_gates: int) -> tuple[bool, list[str]]:
+def _scenario_audit(
+    scenario_dir: Path,
+    max_gates: int,
+    *,
+    min_da_trade_hours_per_path: int = 0,
+) -> tuple[bool, list[str]]:
     lines: list[str] = []
+    ok = True
     summary_path = scenario_dir / "backtest_summary.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     lines.append(f"\nScenario: {scenario_dir}")
@@ -333,6 +473,47 @@ def _scenario_audit(scenario_dir: Path, max_gates: int) -> tuple[bool, list[str]
             f"accepted={totals.get('accepted_buy', 0.0):.3f}/{totals.get('accepted_sell', 0.0):.3f} "
             f"realized={totals.get('realized_buy', 0.0):.3f}/{totals.get('realized_sell', 0.0):.3f}"
         )
+    trade_hours = {
+        "model": _path_da_trade_hours(hourly, "model"),
+        "naive": _path_da_trade_hours(naive, "naive"),
+        "rhpf": _path_da_trade_hours(rhpf, "rhpf"),
+    }
+    lines.append(
+        "DA trade-hour counts: "
+        f"model={trade_hours['model']} naive={trade_hours['naive']} rhpf={trade_hours['rhpf']}"
+    )
+    if int(min_da_trade_hours_per_path) > 0:
+        insufficient = {
+            path: count
+            for path, count in trade_hours.items()
+            if int(count) < int(min_da_trade_hours_per_path)
+        }
+        if insufficient:
+            lines.append(
+                "FAIL: DA trade-hour floor not met: "
+                + ", ".join(
+                    f"{path}={count}<{int(min_da_trade_hours_per_path)}"
+                    for path, count in insufficient.items()
+                )
+            )
+            ok = False
+    for path, df in (("naive", naive), ("rhpf", rhpf)):
+        if int(trade_hours.get(path, 0)) > 0:
+            continue
+        zero_diag = _benchmark_da_zero_explanation(summary, df, path=path)
+        if float(zero_diag["candidate_mwh"]) > TOL and not bool(zero_diag["explained"]):
+            lines.append(
+                "FAIL: benchmark zero DA without concrete reason: "
+                f"{path} candidate_mwh={float(zero_diag['candidate_mwh']):.3f} "
+                f"reason={zero_diag['reason'] or '-'}"
+            )
+            ok = False
+        elif float(zero_diag["candidate_mwh"]) > TOL:
+            lines.append(
+                "Benchmark zero DA explained: "
+                f"{path} candidate_mwh={float(zero_diag['candidate_mwh']):.3f} "
+                f"reason={zero_diag['reason']}"
+            )
     component_rows: list[dict[str, object]] = []
     for label, df, prefix in [
         ("model", hourly, "real"),
@@ -399,7 +580,7 @@ def _scenario_audit(scenario_dir: Path, max_gates: int) -> tuple[bool, list[str]
         source_name = "backtest_plan_history.parquet"
     if debug.empty:
         lines.append("DA gate audit: unavailable (no da_precommit_debug.csv or backtest_plan_history.parquet)")
-        return True, lines
+        return ok, lines
 
     if "source_snapshot_utc" not in debug.columns:
         for alt in ["snapshot_time_utc", "timestamp_utc"]:
@@ -499,13 +680,19 @@ def _scenario_audit(scenario_dir: Path, max_gates: int) -> tuple[bool, list[str]
             .head(max_gates)
             .to_string(index=False)
         )
-    return True, lines
+    return ok, lines
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path, help="Run root or scenario directory")
     parser.add_argument("--max-gates", type=int, default=20)
+    parser.add_argument(
+        "--min-da-trade-hours-per-path",
+        type=int,
+        default=0,
+        help="Fail if model, naive, or RHPF has fewer than this many DA trade hours.",
+    )
     args = parser.parse_args()
 
     scenarios = _discover_scenarios(args.run_dir)
@@ -515,7 +702,11 @@ def main() -> int:
     all_ok = True
     all_lines: list[str] = []
     for scenario in scenarios:
-        ok, lines = _scenario_audit(scenario, max(1, int(args.max_gates)))
+        ok, lines = _scenario_audit(
+            scenario,
+            max(1, int(args.max_gates)),
+            min_da_trade_hours_per_path=max(0, int(args.min_da_trade_hours_per_path)),
+        )
         all_ok = all_ok and ok
         all_lines.extend(lines)
     print(f"DA decision pipeline audit: {'PASS' if all_ok else 'FAIL'} scenarios_checked={len(scenarios)}")

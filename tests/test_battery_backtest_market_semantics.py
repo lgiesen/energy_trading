@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import energy_trading.simulation.battery_backtest as battery_backtest_module  # noqa: E402
 from energy_trading.simulation.battery_backtest import (  # noqa: E402
     BacktestColumnMap,
     BatteryBacktester,
@@ -68,6 +69,7 @@ from scripts.run_battery_backtest import (  # noqa: E402
 )
 from scripts import validate_simulation_outputs as validate_outputs  # noqa: E402
 from scripts import validate_rhpf_outputs  # noqa: E402
+from scripts import audit_da_decision_pipeline  # noqa: E402
 from scripts import audit_bcm_capacity_auction  # noqa: E402
 from scripts import audit_rhpf_market_price_lineage  # noqa: E402
 
@@ -5428,6 +5430,26 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(audit_rhpf[0]["da_canonical_sizer_rounded_replay_pass"]) == pytest.approx(1.0)
     assert str(audit_model[0]["selected_incumbent"]) == "no_trade"
 
+    selected_rhpf_same_semantics, audit_rhpf_same_semantics = bt._select_feasible_da_lock_schedule(
+        lock_rows=pf_rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+        allow_full_window_sizer=False,
+        is_perfect_foresight=True,
+        da_path_price_semantics="rhpf_true_price",
+    )
+
+    assert selected_rhpf_same_semantics[ts_buy][0] > 0.0
+    assert selected_rhpf_same_semantics[ts_sell][1] > 0.0
+    assert str(audit_rhpf_same_semantics[0]["da_bid_sizer_method"]) == "linprog_continuous_per_hour"
+    assert str(audit_rhpf_same_semantics[0]["da_canonical_sizer_price_source_column"]) == col.true_da_price
+    assert float(audit_rhpf_same_semantics[0]["da_candidate_support_sizer_used_as_authority"]) == pytest.approx(1.0)
+    assert str(audit_rhpf_same_semantics[0]["da_full_window_sizer_diagnostic_status"]) == "not_run"
+    assert str(audit_rhpf_same_semantics[0]["da_path_price_semantics"]) == "rhpf_true_price"
+
     ts0 = pd.Timestamp("2025-01-10T00:00:00Z")
     ts1 = pd.Timestamp("2025-01-10T01:00:00Z")
     ts2 = pd.Timestamp("2025-01-10T02:00:00Z")
@@ -6419,7 +6441,7 @@ def test_da_terminal_sensitive_window_classification_reaches_end_or_explicit_loo
         global_end_utc=global_end,
     )
     assert sensitive is True
-    assert reason == "window_end_reaches_global_end"
+    assert reason == "last_da_delivery_before_global_end"
 
     sensitive, reason = bt._is_da_terminal_sensitive_window(
         final_day_rows,
@@ -6443,6 +6465,7 @@ def test_da_terminal_sensitive_window_classification_reaches_end_or_explicit_loo
     assert reason == "not_terminal_window"
 
     bt.da_terminal_recovery_lookahead_h = 48.0
+    bt.da_terminal_lookahead_marks_sensitive = True
     sensitive, reason = bt._is_da_terminal_sensitive_window(
         lookahead_rows,
         global_end_utc=global_end,
@@ -6456,6 +6479,7 @@ def test_da_terminal_recovery_lookahead_prices_shortfall_before_final_day() -> N
     col = BacktestColumnMap()
     bt.terminal_value_mode = "terminal_recovery_aware"
     bt.da_terminal_recovery_lookahead_h = 72.0
+    bt.da_terminal_lookahead_marks_sensitive = True
     bt.eta_in = 1.0
     bt.eta_out = 1.0
     bt.deg_eur_mwh = 0.0
@@ -6493,6 +6517,7 @@ def test_da_sizer_terminal_sensitive_uses_explicit_recovery_cost_not_scalar_lamb
     col = BacktestColumnMap()
     bt.terminal_value_mode = "terminal_recovery_aware"
     bt.da_terminal_recovery_lookahead_h = 72.0
+    bt.da_terminal_lookahead_marks_sensitive = True
     bt.eta_in = 1.0
     bt.eta_out = 1.0
     bt.deg_eur_mwh = 0.0
@@ -6538,6 +6563,7 @@ def test_da_terminal_recovery_uses_causal_semantic_source_when_forecast_column_i
     col = BacktestColumnMap(pred_da_price="target_da_price")
     bt.terminal_value_mode = "terminal_recovery_aware"
     bt.da_terminal_recovery_lookahead_h = 72.0
+    bt.da_terminal_lookahead_marks_sensitive = True
     bt.eta_in = 1.0
     bt.eta_out = 1.0
     bt.deg_eur_mwh = 0.0
@@ -6584,6 +6610,7 @@ def test_da_sizer_rejects_local_profit_when_terminal_recovery_cost_makes_incumbe
     col = BacktestColumnMap()
     bt.terminal_value_mode = "terminal_recovery_aware"
     bt.da_terminal_recovery_lookahead_h = 48.0
+    bt.da_terminal_lookahead_marks_sensitive = True
     bt.terminal_recovery_lookahead_h = 48.0
     bt.eta_in = 1.0
     bt.eta_out = 1.0
@@ -6669,6 +6696,238 @@ def test_da_full_window_sizer_can_trade_future_rows_outside_candidate_support() 
     assert str(audit[0]["da_bid_sizer_method"]) == "linprog_full_window_continuous_per_hour"
     assert selected[pd.Timestamp(ts[1])][0] > 0.0
     assert selected[pd.Timestamp(ts[2])][1] > 0.0
+
+
+def test_da_zero_lp_sizer_does_not_remove_profitable_replay_feasible_raw_candidate(monkeypatch) -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.soc_min = 0.0
+    bt.soc_max = 10.0
+    bt.p_max_mw = 10.0
+    ts_buy = pd.Timestamp("2025-01-02T00:00:00Z")
+    ts_sell = pd.Timestamp("2025-01-02T01:00:00Z")
+    lock_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts_buy, ts_sell],
+            "target_time_utc": [ts_buy, ts_sell],
+            "charge_mw": [1.0, 0.0],
+            "discharge_mw": [0.0, 1.0],
+            col.pred_da_price: [0.0, 100.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+            "predicted_objective_eur": [100.0, 100.0],
+        }
+    )
+
+    class ZeroLinprogResult:
+        success = True
+        x = np.zeros(4, dtype=float)
+        fun = 0.0
+        message = "forced zero LP solution"
+
+    monkeypatch.setattr(
+        battery_backtest_module,
+        "linprog",
+        lambda *args, **kwargs: ZeroLinprogResult(),
+    )
+
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=lock_rows,
+        colmap=col,
+        current_soc_mwh=5.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert selected[ts_buy][0] == pytest.approx(1.0)
+    assert selected[ts_sell][1] == pytest.approx(1.0)
+    assert {str(row["selected_incumbent"]) for row in audit} == {"optimized"}
+    assert {str(row["da_zero_reason"]) for row in audit} == {"none"}
+    assert {str(row["da_bid_sizer_method"]) for row in audit} == {
+        "raw_candidate_recovered_after_zero_sizer"
+    }
+    assert {
+        float(row["da_recovered_profitable_feasible_raw_candidate_after_zero_sizer"])
+        for row in audit
+    } == {1.0}
+
+
+def test_da_trade_frequency_audit_counts_model_naive_and_rhpf_hours() -> None:
+    model = pd.DataFrame(
+        {
+            "real_da_buy_mwh": [1.0, 0.0, 0.0, 2.0, 0.0],
+            "real_da_sell_mwh": [0.0, 0.0, 3.0, 0.0, 4.0],
+        }
+    )
+    naive = pd.DataFrame(
+        {
+            "naive_da_buy_mwh": [0.0, 1.0, 0.0, 1.0, 0.0],
+            "naive_da_sell_mwh": [1.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    rhpf = pd.DataFrame(
+        {
+            "perfect_foresight_da_buy_mwh": [0.0, 0.0, 1.0, 0.0, 1.0],
+            "perfect_foresight_da_sell_mwh": [1.0, 0.0, 0.0, 1.0, 0.0],
+        }
+    )
+
+    assert audit_da_decision_pipeline._path_da_trade_hours(model, "model") == 4
+    assert audit_da_decision_pipeline._path_da_trade_hours(naive, "naive") == 4
+    assert audit_da_decision_pipeline._path_da_trade_hours(rhpf, "rhpf") == 4
+
+
+def test_da_plan_history_diagnostics_prefixes_naive_benchmark_fields() -> None:
+    bt = _mk_backtester()
+    ts = pd.date_range("2025-01-01T00:00:00Z", periods=2, freq="h")
+    plan_history = pd.DataFrame(
+        {
+            "plan_history_stage": ["post_precommit", "post_precommit"],
+            "timestamp_utc": ts,
+            "target_time_utc": ts,
+            "da_candidate_allowed_by_gate_window": [1.0, 1.0],
+            "raw_optimizer_charge_mw_before_da_gate_mask": [1.5, 0.0],
+            "raw_optimizer_discharge_mw_before_da_gate_mask": [0.0, 2.0],
+            "da_sized_candidate_buy_mw": [1.5, 0.0],
+            "da_sized_candidate_sell_mw": [0.0, 2.0],
+            "da_selected_lockable_buy_mw": [1.5, 0.0],
+            "da_selected_lockable_sell_mw": [0.0, 2.0],
+            "da_bid_sizer_method": ["candidate_support", "candidate_support"],
+            "da_path_price_semantics": ["naive", "naive"],
+            "da_candidate_support_sizer_used_as_authority": [1.0, 1.0],
+            "da_sizer_postlock_replay_mismatch": [0.0, 0.0],
+        }
+    )
+
+    diag = bt._path_da_plan_history_diagnostics(plan_history, prefix="naive")
+
+    assert diag["naive_da_plan_history_rows"] == 2.0
+    assert diag["naive_da_raw_candidate_buy_mwh"] == pytest.approx(1.5)
+    assert diag["naive_da_raw_candidate_sell_mwh"] == pytest.approx(2.0)
+    assert diag["naive_da_selected_lockable_buy_mwh"] == pytest.approx(1.5)
+    assert diag["naive_da_selected_lockable_sell_mwh"] == pytest.approx(2.0)
+    assert diag["naive_da_bid_sizer_method"] == "candidate_support"
+    assert diag["naive_da_path_price_semantics"] == "naive"
+    assert diag["naive_da_candidate_support_sizer_used_as_authority"] == 1.0
+    assert diag["naive_da_replay_pass"] == 1.0
+
+
+def test_da_audit_flags_benchmark_zero_trade_without_concrete_reason() -> None:
+    summary = {
+        "naive_da_raw_candidate_buy_mwh": 3.0,
+        "naive_da_raw_candidate_sell_mwh": 0.0,
+        "naive_da_zero_trade_reason": "not_evaluated",
+    }
+
+    diag = audit_da_decision_pipeline._benchmark_da_zero_explanation(
+        summary,
+        pd.DataFrame(),
+        path="naive",
+    )
+
+    assert diag["candidate_mwh"] == pytest.approx(3.0)
+    assert diag["explained"] is False
+
+
+def test_da_audit_accepts_benchmark_zero_trade_with_concrete_reason() -> None:
+    summary = {
+        "rolling_pf_da_raw_candidate_buy_mwh": 0.0,
+        "rolling_pf_da_raw_candidate_sell_mwh": 4.0,
+        "rolling_pf_da_zero_trade_reason": "da_sell_below_soc_min",
+    }
+
+    diag = audit_da_decision_pipeline._benchmark_da_zero_explanation(
+        summary,
+        pd.DataFrame(),
+        path="rhpf",
+    )
+
+    assert diag["candidate_mwh"] == pytest.approx(4.0)
+    assert diag["explained"] is True
+
+
+def test_da_terminal_sensitivity_uses_last_delivery_not_full_lookahead() -> None:
+    bt = _mk_backtester()
+    rows = pd.DataFrame(
+        {
+            "target_time_utc": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T01:00:00Z"],
+                utc=True,
+            )
+        }
+    )
+
+    sensitive, reason = bt._is_da_terminal_sensitive_window(
+        rows,
+        global_end_utc=pd.Timestamp("2025-01-03T00:00:00Z", tz="UTC"),
+    )
+
+    assert sensitive is False
+    assert reason == "not_terminal_window"
+
+
+def test_da_final_gate_hard_min_topup_adds_da_buy_before_postlock_zeroing() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.final_soc_mode = "hard_min"
+    bt.soc_target_end = 10.0
+    bt.soc_min = 2.0
+    bt.soc_max = 20.0
+    bt.soc_init = 8.0
+    bt.p_max_mw = 10.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.deg_eur_mwh = 0.0
+    ts = pd.date_range("2025-01-01T21:00:00Z", periods=3, freq="h")
+    lock_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            col.pred_da_price: [100.0, 20.0, 50.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0],
+        }
+    )
+    selected = {pd.Timestamp(t): (0.0, 0.0) for t in ts}
+    audit_rows = [
+        {
+            "timestamp_utc": str(t),
+            "da_candidate_buy_mw": 0.0,
+            "da_candidate_sell_mw": 0.0,
+            "da_sized_candidate_buy_mw": 0.0,
+            "da_sized_candidate_sell_mw": 0.0,
+            "selected_incumbent": "no_trade",
+        }
+        for t in ts
+    ]
+
+    repaired, repaired_audit = bt._apply_da_postlock_future_guard(
+        selected_da=selected,
+        da_audit_rows=audit_rows,
+        lock_rows=lock_rows,
+        future_rows=lock_rows,
+        colmap=col,
+        current_soc_mwh=8.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=pd.Timestamp("2025-01-02T00:00:00Z", tz="UTC"),
+    )
+
+    accepted_buy_mwh = sum(max(0.0, buy) for buy, _ in repaired.values()) * bt.dt_h
+    assert accepted_buy_mwh >= 2.0 - 1e-9
+    assert any(float(row.get("da_terminal_buy_scheduled_mwh", 0.0)) >= 2.0 for row in repaired_audit)
+    assert {str(row.get("da_terminal_recovery_source", "none")) for row in repaired_audit} == {"da"}
 
 
 def test_da_canonical_sizer_accepts_hard_min_surplus_terminal_replay_metadata(monkeypatch) -> None:
