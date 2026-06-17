@@ -19,8 +19,6 @@ from __future__ import annotations
 
 from typing import Dict
 
-import matplotlib.pyplot as plt
-
 # GeoDataViz multi-hue diverging palette.
 GEO_DIVERGING: Dict[str, str] = {
     "div_1": "#045275",
@@ -78,6 +76,13 @@ BACKTEST_LINE_STYLES: Dict[str, Dict[str, object]] = {
 }
 
 
+def _get_pyplot():
+    """Load matplotlib only when plotting style is applied."""
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
 def get_color(role: str, default: str = "#333333") -> str:
     """Return a semantic color for the given role, fallback to default."""
     return THESIS_PALETTE.get(role, default)
@@ -98,6 +103,8 @@ def get_backtest_line_style(series_name: str) -> Dict[str, object]:
 
 def apply_geo_style() -> None:
     """Apply global plotting style for scientific thesis plots."""
+    plt = _get_pyplot()
+
     # Keep seaborn optional to avoid hard dependency in scripts.
     try:
         import seaborn as sns  # type: ignore

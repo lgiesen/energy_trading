@@ -50,8 +50,6 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -74,6 +72,13 @@ INPUT_CACHE_SCHEMA_VERSION = "simulation_input_cache_v1"
 SIMULATION_EVAL_START_UTC = pd.Timestamp("2025-01-14T00:00:00Z")
 SIMULATION_EVAL_END_UTC = pd.Timestamp("2026-01-14T00:00:00Z")
 FORECAST_COVERAGE_SCHEMA_VERSION = "forecast_coverage_preflight_v1"
+
+
+def _get_pyplot():
+    """Load matplotlib only when a figure is actually rendered."""
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 def _to_utc_ts(value: object) -> pd.Timestamp | None:
@@ -753,6 +758,7 @@ def _plot_cumulative_pnl(
     d["naive_cum_pnl_eur"] = pd.to_numeric(d["naive_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
     d["perfect_foresight_cum_pnl_eur"] = pd.to_numeric(d["perfect_foresight_pnl_eur"], errors="coerce").fillna(0.0).cumsum()
 
+    plt = _get_pyplot()
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(d[ts_col], d["model_cum_pnl_eur"], label="Model", **get_backtest_line_style("model"))

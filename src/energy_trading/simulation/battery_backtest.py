@@ -3292,6 +3292,155 @@ class BatteryBacktester:
         )
 
     @staticmethod
+    def _copy_wide_prediction_by_timestamp(
+        window: pd.DataFrame,
+        source: pd.DataFrame,
+        *,
+        timestamp_col: str,
+        prediction_col: str,
+    ) -> pd.DataFrame:
+        """Transport an existing wide prediction column into a rolling window by timestamp.
+
+        Missing values stay missing; callers are responsible for fail-closed validation.
+        """
+        if prediction_col not in source.columns or timestamp_col not in window.columns:
+            return window
+        out = window.copy()
+        mapped = pd.to_numeric(out[timestamp_col].map(source[prediction_col]), errors="coerce")
+        out[prediction_col] = mapped.to_numpy()
+        return out
+
+    def _preserve_activation_rate_source_of_truth(
+        self,
+        merged: pd.DataFrame,
+        source_df: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        *,
+        context: str,
+        reserve_active: bool,
+    ) -> pd.DataFrame:
+        """Carry canonical activation-rate forecasts from source data into active outputs.
+
+        This is transport only: missing/non-finite source data remains missing and
+        is recorded as a source-of-truth failure for active reserve paths.
+        """
+        if merged.empty:
+            return merged
+        out = merged.copy()
+        timestamp_col = colmap.timestamp
+        if timestamp_col not in out.columns:
+            if bool(reserve_active):
+                self._record_missing_critical_source_field(
+                    f"{context}.timestamp",
+                    "activation_rate_source_of_truth_lost_during_model_output",
+                )
+            return out
+
+        reserve_cols = [
+            "plan_reserve_pos_mw",
+            "plan_reserve_neg_mw",
+            "reserve_pos_mw",
+            "reserve_neg_mw",
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "locked_bcm_capacity_pos_mw",
+            "locked_bcm_capacity_neg_mw",
+            "bem_only_pos_mw",
+            "bem_only_neg_mw",
+            "bem_only_submitted_pos_mw",
+            "bem_only_submitted_neg_mw",
+            "bem_only_executed_pos_mw",
+            "bem_only_executed_neg_mw",
+            "real_fixed_reserve_obligation_pos_mw",
+            "real_fixed_reserve_obligation_neg_mw",
+            "real_locked_bcm_capacity_pos_mw",
+            "real_locked_bcm_capacity_neg_mw",
+            "real_bem_only_submitted_pos_mw",
+            "real_bem_only_submitted_neg_mw",
+            "real_bem_only_executed_pos_mw",
+            "real_bem_only_executed_neg_mw",
+        ]
+        active_mask = pd.Series(bool(reserve_active), index=out.index, dtype=bool)
+        for col in reserve_cols:
+            if col in out.columns:
+                vals = pd.to_numeric(out[col], errors="coerce").fillna(0.0).abs() > 1e-12
+                active_mask = active_mask | vals
+        if not bool(active_mask.any()):
+            return out
+
+        source = source_df.copy()
+        if timestamp_col not in source.columns:
+            self._record_missing_critical_source_field(
+                f"{context}.timestamp_source",
+                "activation_rate_source_of_truth_lost_during_model_output",
+            )
+            return out
+        source_ts = pd.to_datetime(source[timestamp_col], utc=True, errors="coerce")
+        source = source.assign(_source_ts_utc=source_ts).dropna(subset=["_source_ts_utc"])
+        source = source.drop_duplicates(subset=["_source_ts_utc"], keep="last").set_index("_source_ts_utc")
+        out_ts = pd.to_datetime(out[timestamp_col], utc=True, errors="coerce")
+
+        canonical_cols = [
+            colmap.pred_afrr_activation_rate_pos,
+            colmap.pred_afrr_activation_rate_neg,
+        ]
+        for col in canonical_cols:
+            if col in out.columns:
+                existing = pd.to_numeric(out[col], errors="coerce")
+            else:
+                existing = pd.Series(np.nan, index=out.index, dtype=float)
+            needs_source = active_mask & (
+                existing.isna() | ~np.isfinite(existing.to_numpy(dtype=float, na_value=np.nan))
+            )
+            if bool(needs_source.any()) and col in source.columns:
+                mapped = pd.to_numeric(out_ts.map(source[col]), errors="coerce")
+                out[col] = existing.where(~needs_source, mapped)
+            elif col not in out.columns:
+                out[col] = existing
+
+            final_values = pd.to_numeric(out[col], errors="coerce")
+            bad_active = active_mask & (
+                final_values.isna() | ~np.isfinite(final_values.to_numpy(dtype=float, na_value=np.nan))
+            )
+            if bool(bad_active.any()):
+                label = (
+                    f"{context}.activation_rate_pos"
+                    if col == colmap.pred_afrr_activation_rate_pos
+                    else f"{context}.activation_rate_neg"
+                )
+                self._record_missing_critical_source_field(
+                    label,
+                    "missing_source_of_truth_activation_rate",
+                )
+
+            if col in source.columns:
+                source_mapped = pd.to_numeric(out_ts.map(source[col]), errors="coerce")
+                source_finite = active_mask & source_mapped.notna() & np.isfinite(
+                    source_mapped.to_numpy(dtype=float, na_value=np.nan)
+                )
+                output_finite = final_values.notna() & np.isfinite(
+                    final_values.to_numpy(dtype=float, na_value=np.nan)
+                )
+                if bool(source_finite.any()) and bool((source_finite & ~output_finite).any()):
+                    raise ValueError(
+                        "activation_rate_source_of_truth_lost_during_model_output: "
+                        f"context={context}; column={col}"
+                    )
+
+        provenance_cols = [
+            "afrr_activation_rate_guard_source_column_pos",
+            "afrr_activation_rate_guard_source_column_neg",
+            "afrr_activation_rate_guard_quantile",
+            "afrr_activation_rate_guard_policy",
+            "afrr_activation_rate_guard_mode",
+        ]
+        for col in provenance_cols:
+            if col in out.columns or col not in source.columns:
+                continue
+            out[col] = out_ts.map(source[col])
+        return out
+
+    @staticmethod
     def _parse_reserve_retry_ladder(raw: object) -> list[float]:
         if isinstance(raw, (list, tuple)):
             vals = [float(x) for x in raw]
@@ -7019,45 +7168,37 @@ class BatteryBacktester:
         if not candidates:
             return {}, []
 
-        deferred_terminal_shortfall_reason = "terminal_shortfall_deferred_to_final_da_gate"
-
         def _infeasibility_reason(stats: Mapping[str, object]) -> str:
+            generic_replay_reason = "none"
             for key in (
                 "da_bid_sizer_first_infeasible_reason",
                 "da_canonical_sizer_failure_reason",
+                "final_soc_feasibility_reason",
+                "da_terminal_replay_failure_reason",
+                "da_postlock_infeasibility_driver_detail",
+                "da_postlock_infeasibility_driver",
                 "infeasibility_driver_detail",
                 "infeasibility_driver",
                 "da_bid_sizer_zero_reason",
             ):
                 reason = str(stats.get(key, "none")).strip()
-                if reason.lower() not in {"", "none", "nan"}:
-                    return reason
-            return "none"
-
-        def _is_nonfinal_deferred_terminal_shortfall_only(stats: Mapping[str, object]) -> bool:
-            if _infeasibility_reason(stats) != deferred_terminal_shortfall_reason:
-                return False
-            if float(stats.get("da_terminal_sensitive_window", 0.0) or 0.0) >= 0.5:
-                return False
-            projected_min = pd.to_numeric(
-                pd.Series([stats.get("projected_soc_min_mwh", np.nan)]),
-                errors="coerce",
-            ).iloc[0]
-            projected_max = pd.to_numeric(
-                pd.Series([stats.get("projected_soc_max_mwh", np.nan)]),
-                errors="coerce",
-            ).iloc[0]
-            if pd.notna(projected_min) and float(projected_min) < float(self.soc_min) - 1e-9:
-                return False
-            if pd.notna(projected_max) and float(projected_max) > float(self.soc_max) + 1e-9:
-                return False
-            if float(stats.get("projected_power_violation_pos_mw", 0.0) or 0.0) > 1e-9:
-                return False
-            if float(stats.get("projected_power_violation_neg_mw", 0.0) or 0.0) > 1e-9:
-                return False
-            if float(stats.get("protected_soc_projection_violation_mwh", 0.0) or 0.0) > 1e-9:
-                return False
-            return True
+                reason_l = reason.lower()
+                if reason_l in {"", "none", "nan"}:
+                    continue
+                if reason_l in {
+                    "da_sizer_replay_failed",
+                    "canonical_da_sizer_infeasible",
+                    "canonical_da_sizer_no_positive_feasible_schedule",
+                }:
+                    if generic_replay_reason == "none":
+                        generic_replay_reason = reason
+                    continue
+                if reason_l == "passed":
+                    continue
+                if reason_l == "projection_not_completed":
+                    continue
+                return reason
+            return generic_replay_reason
 
         def _scaled_schedule(factor: float) -> dict[pd.Timestamp, tuple[float, float]]:
             out: dict[pd.Timestamp, tuple[float, float]] = {}
@@ -7155,7 +7296,6 @@ class BatteryBacktester:
                     )
                 ).strip()
                 if reason in {
-                    "terminal_shortfall_deferred_to_final_da_gate",
                     "terminal_shortfall_recoverable_with_id",
                     "terminal_repair_missing",
                     "locked_da_terminal_shortfall_unrecoverable",
@@ -7398,16 +7538,6 @@ class BatteryBacktester:
                 dis = 0.0 if abs(float(x[2 * i + 1])) <= 1e-8 else float(x[2 * i + 1])
                 schedule[ts] = self._normalize_da_bid(ch, dis)
             feasible, stats = _evaluate(schedule)
-            if _is_nonfinal_deferred_terminal_shortfall_only(stats):
-                feasible = True
-                stats = dict(stats)
-                stats["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
-                stats["da_bid_sizer_replay_override_reason"] = deferred_terminal_shortfall_reason
-                stats["da_bid_sizer_first_infeasible_reason"] = "none"
-                stats["infeasibility_driver"] = "none"
-                stats["infeasibility_driver_detail"] = "none"
-                stats["da_deferred_terminal_shortfall_nonfinal_nonfatal"] = 1.0
-                stats["da_candidate_support_sizer_used_as_authority"] = 0.0
             if _hard_min_surplus_replay_override(bool(feasible), stats):
                 feasible = True
                 stats = dict(stats)
@@ -7481,16 +7611,6 @@ class BatteryBacktester:
                         soc_after = _next_soc(ch_mw, dis_mw)
                     soc_clip = float(soc_after)
                 clipped_feasible, clipped_stats = _evaluate(clipped)
-                if _is_nonfinal_deferred_terminal_shortfall_only(clipped_stats):
-                    clipped_feasible = True
-                    clipped_stats = dict(clipped_stats)
-                    clipped_stats["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
-                    clipped_stats["da_bid_sizer_replay_override_reason"] = deferred_terminal_shortfall_reason
-                    clipped_stats["da_bid_sizer_first_infeasible_reason"] = "none"
-                    clipped_stats["infeasibility_driver"] = "none"
-                    clipped_stats["infeasibility_driver_detail"] = "none"
-                    clipped_stats["da_deferred_terminal_shortfall_nonfinal_nonfatal"] = 1.0
-                    clipped_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
                 if _hard_min_surplus_replay_override(bool(clipped_feasible), clipped_stats):
                     clipped_feasible = True
                     clipped_stats = dict(clipped_stats)
@@ -7703,21 +7823,23 @@ class BatteryBacktester:
                     "infeasibility_driver_detail": str(
                         diag.get("infeasibility_driver_detail", diag.get("infeasibility_driver", "none"))
                     ),
+                    "final_soc_feasibility_reason": str(
+                        diag.get("final_soc_feasibility_reason", "")
+                    ),
+                    "da_terminal_replay_failure_reason": str(
+                        diag.get("da_terminal_replay_failure_reason", "")
+                    ),
+                    "da_postlock_infeasibility_driver": str(
+                        diag.get("da_postlock_infeasibility_driver", "")
+                    ),
+                    "da_postlock_infeasibility_driver_detail": str(
+                        diag.get("da_postlock_infeasibility_driver_detail", "")
+                    ),
                     "da_terminal_sensitive_window": float(
                         diag.get("da_terminal_sensitive_window", 0.0) or 0.0
                     ),
                     "da_terminal_sensitive_reason": str(
                         diag.get("da_terminal_sensitive_reason", "")
-                    ),
-                    "da_deferred_terminal_shortfall_nonfinal_nonfatal": float(
-                        str(
-                            diag.get(
-                                "infeasibility_driver_detail",
-                                diag.get("infeasibility_driver", "none"),
-                            )
-                        )
-                        == deferred_terminal_shortfall_reason
-                        and float(diag.get("da_terminal_sensitive_window", 0.0) or 0.0) < 0.5
                     ),
                 }
             soc = float(current_soc_mwh)
@@ -7834,6 +7956,79 @@ class BatteryBacktester:
                 global_end_utc=global_end_utc,
             )
 
+        terminal_shortfall_reasons = {
+            "locked_da_terminal_shortfall_candidate_infeasible",
+            "terminal_shortfall_under_hard_min",
+            "terminal_repair_missing",
+            "terminal_repair_unreachable",
+        }
+
+        def _stats_float(stats: Mapping[str, object], *keys: str, default: float = 0.0) -> float:
+            for key in keys:
+                if key not in stats:
+                    continue
+                val = pd.to_numeric(pd.Series([stats.get(key)]), errors="coerce").iloc[0]
+                if pd.notna(val) and np.isfinite(float(val)):
+                    return float(val)
+            return float(default)
+
+        def _stats_reason(stats: Mapping[str, object]) -> str:
+            return str(_infeasibility_reason(stats)).strip()
+
+        def _is_nonfinal_terminal_shortfall_only(stats: Mapping[str, object]) -> bool:
+            reason = _stats_reason(stats).strip().lower()
+            if reason not in terminal_shortfall_reasons:
+                return False
+            terminal_sensitive_flag = max(
+                _stats_float(stats, "da_terminal_sensitive_window", default=0.0),
+                _stats_float(stats, "da_bid_sizer_terminal_sensitive_window", default=0.0),
+            )
+            if terminal_sensitive_flag >= 0.5:
+                return False
+            projected_min = _stats_float(
+                stats,
+                "projected_soc_min_mwh",
+                "da_canonical_sizer_projected_min_soc_mwh",
+                "da_bid_sizer_lp_projected_soc_min_mwh",
+                default=float(current_soc_mwh),
+            )
+            projected_max = _stats_float(
+                stats,
+                "projected_soc_max_mwh",
+                "da_canonical_sizer_projected_max_soc_mwh",
+                "da_bid_sizer_lp_projected_soc_max_mwh",
+                default=float(current_soc_mwh),
+            )
+            power_pos = _stats_float(stats, "projected_power_violation_pos_mw", default=0.0)
+            power_neg = _stats_float(stats, "projected_power_violation_neg_mw", default=0.0)
+            protected = _stats_float(stats, "protected_soc_projection_violation_mwh", default=0.0)
+            return bool(
+                projected_min >= float(self.soc_min) - 1e-9
+                and projected_max <= float(self.soc_max) + 1e-9
+                and power_pos <= 1e-9
+                and power_neg <= 1e-9
+                and protected <= 1e-9
+            )
+
+        def _mark_deferred_terminal_nonfatal(
+            stats: Mapping[str, object],
+            *,
+            source: str,
+        ) -> dict[str, float | str]:
+            out = dict(stats)
+            out["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
+            out["da_canonical_sizer_status"] = "ok_deferred_terminal_nonfatal"
+            out["da_canonical_sizer_failure_reason"] = "none"
+            out["da_canonical_sizer_rounded_replay_pass"] = 1.0
+            out["da_bid_sizer_zero_reason"] = "none"
+            out["da_bid_sizer_replay_override_reason"] = "nonfinal_terminal_shortfall_diagnostic_only"
+            out["da_nonfinal_terminal_shortfall_nonfatal"] = 1.0
+            out["da_candidate_support_sizer_used_as_authority"] = 0.0
+            out["da_deferred_terminal_nonfatal_source"] = str(source)
+            out.setdefault("da_terminal_sensitive_window", 0.0)
+            out.setdefault("da_terminal_sensitive_reason", "not_terminal_window")
+            return out
+
         selected_factor = 0.0
         selected = _scaled_schedule(0.0)
         selected_stats: dict[str, float | str] = {}
@@ -7897,12 +8092,9 @@ class BatteryBacktester:
         lp_stats["da_full_window_sizer_diagnostic_status"] = str(full_window_diag_status)
         lp_stats["da_full_window_sizer_diagnostic_reason"] = str(full_window_diag_reason)
         lp_stats["da_full_window_sizer_diagnostic_feasible"] = float(full_window_diag_feasible)
-        if float(lp_stats.get("da_deferred_terminal_shortfall_nonfinal_nonfatal", 0.0) or 0.0) > 0.5:
-            lp_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
-        else:
-            lp_stats["da_candidate_support_sizer_used_as_authority"] = float(
-                not bool(allow_full_window_sizer)
-            )
+        lp_stats["da_candidate_support_sizer_used_as_authority"] = float(
+            not bool(allow_full_window_sizer)
+        )
         lp_stats["da_path_price_semantics"] = str(path_price_semantics)
         if lp_schedule is None:
             lp_stats.setdefault("da_canonical_sizer_status", "canonical_da_sizer_infeasible")
@@ -7920,30 +8112,6 @@ class BatteryBacktester:
             )
             lp_stats.setdefault("da_canonical_sizer_rounded_replay_pass", 0.0)
         raw_total = float(sum(ch + dis for ch, dis in candidates.values()))
-        if (
-            lp_schedule is not None
-            and not bool(lp_feasible)
-            and raw_total > 1e-9
-            and _is_nonfinal_deferred_terminal_shortfall_only(lp_stats)
-        ):
-            # Non-final terminal shortfall is not a physical blocker for the
-            # current DA gate. Keep the raw rounded candidate eligible and let
-            # the final replay/selection path decide instead of zeroing here.
-            lp_schedule = dict(candidates)
-            lp_feasible = True
-            lp_stats = dict(lp_stats)
-            lp_stats["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
-            lp_stats["da_canonical_sizer_status"] = "ok_deferred_terminal_nonfatal"
-            lp_stats["da_canonical_sizer_failure_reason"] = "none"
-            lp_stats["da_canonical_sizer_rounded_replay_pass"] = 1.0
-            lp_stats["da_bid_sizer_first_infeasible_reason"] = "none"
-            lp_stats["infeasibility_driver"] = "none"
-            lp_stats["infeasibility_driver_detail"] = "none"
-            lp_stats["da_bid_sizer_zero_reason"] = "none"
-            lp_stats["da_bid_sizer_replay_override_reason"] = deferred_terminal_shortfall_reason
-            lp_stats["da_deferred_terminal_shortfall_nonfinal_nonfatal"] = 1.0
-            lp_stats["da_bid_sizer_candidate_support_deferred_terminal_nonfatal"] = 1.0
-            lp_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
         if lp_schedule is not None and bool(lp_feasible):
             lp_total = float(sum(ch + dis for ch, dis in lp_schedule.values()))
             selected = dict(lp_schedule)
@@ -7960,33 +8128,61 @@ class BatteryBacktester:
             sized_total = float(sum(ch + dis for ch, dis in selected.values()))
             selected_factor = float(sized_total / raw_total) if raw_total > 1e-12 else 0.0
         else:
-            selected_sizing_method = "linprog_full_window_continuous_per_hour"
-            selected_factor = 0.0
-            selected = _scaled_schedule(0.0)
-            selected_feasible, selected_stats = _evaluate(selected)
-            selected_stats = dict(selected_stats)
-            selected_stats["da_bid_sizer_status"] = str(
-                lp_stats.get("da_bid_sizer_status", "canonical_da_sizer_infeasible")
-            )
-            selected_stats["da_bid_sizer_method"] = "linprog_full_window_continuous_per_hour"
-            selected_stats["da_bid_sizer_zero_reason"] = "canonical_da_sizer_no_positive_feasible_schedule"
-            selected_stats["da_canonical_sizer_status"] = str(
-                lp_stats.get("da_canonical_sizer_status", "canonical_da_sizer_infeasible")
-            )
-            selected_stats["da_canonical_sizer_failure_reason"] = str(
-                lp_stats.get(
-                    "da_canonical_sizer_failure_reason",
-                    lp_stats.get(
-                        "da_bid_sizer_first_infeasible_reason",
-                        lp_stats.get("da_bid_sizer_error", "canonical_da_sizer_infeasible"),
-                    ),
+            raw_candidate_feasible_for_terminal, raw_candidate_terminal_stats = _evaluate(candidates)
+            raw_candidate_terminal_stats = dict(raw_candidate_terminal_stats)
+            if raw_total > 1e-9 and _is_nonfinal_terminal_shortfall_only(raw_candidate_terminal_stats):
+                selected_sizing_method = "raw_candidate_deferred_terminal_nonfatal"
+                selected = dict(candidates)
+                selected_feasible = True
+                selected_stats = _mark_deferred_terminal_nonfatal(
+                    raw_candidate_terminal_stats,
+                    source="candidate_support_sizer",
                 )
-            )
-            selected_stats["da_canonical_sizer_rounded_replay_pass"] = 0.0
-            for key, value in lp_stats.items():
-                selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
-            if "da_bid_sizer_error" in lp_stats:
-                selected_stats.setdefault("da_bid_sizer_error", str(lp_stats.get("da_bid_sizer_error")))
+                selected_stats["da_bid_sizer_method"] = selected_sizing_method
+                selected_stats["da_bid_sizer_candidate_support_status"] = str(
+                    candidate_support_stats.get("da_bid_sizer_status", "unknown")
+                )
+                selected_stats["da_bid_sizer_candidate_support_error"] = str(
+                    candidate_support_stats.get("da_bid_sizer_error", "")
+                )
+                selected_stats["da_bid_sizer_candidate_support_feasible"] = float(
+                    bool(candidate_support_feasible)
+                )
+                selected_stats["da_full_window_sizer_diagnostic_status"] = str(full_window_diag_status)
+                selected_stats["da_full_window_sizer_diagnostic_reason"] = str(full_window_diag_reason)
+                selected_stats["da_full_window_sizer_diagnostic_feasible"] = float(full_window_diag_feasible)
+                selected_stats["da_path_price_semantics"] = str(path_price_semantics)
+                for key, value in lp_stats.items():
+                    selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
+                selected_factor = 1.0
+            else:
+                selected_sizing_method = "linprog_full_window_continuous_per_hour"
+                selected_factor = 0.0
+                selected = _scaled_schedule(0.0)
+                selected_feasible, selected_stats = _evaluate(selected)
+                selected_stats = dict(selected_stats)
+                selected_stats["da_bid_sizer_status"] = str(
+                    lp_stats.get("da_bid_sizer_status", "canonical_da_sizer_infeasible")
+                )
+                selected_stats["da_bid_sizer_method"] = "linprog_full_window_continuous_per_hour"
+                selected_stats["da_bid_sizer_zero_reason"] = "canonical_da_sizer_no_positive_feasible_schedule"
+                selected_stats["da_canonical_sizer_status"] = str(
+                    lp_stats.get("da_canonical_sizer_status", "canonical_da_sizer_infeasible")
+                )
+                selected_stats["da_canonical_sizer_failure_reason"] = str(
+                    lp_stats.get(
+                        "da_canonical_sizer_failure_reason",
+                        lp_stats.get(
+                            "da_bid_sizer_first_infeasible_reason",
+                            lp_stats.get("da_bid_sizer_error", "canonical_da_sizer_infeasible"),
+                        ),
+                    )
+                )
+                selected_stats["da_canonical_sizer_rounded_replay_pass"] = 0.0
+                for key, value in lp_stats.items():
+                    selected_stats.setdefault(f"da_bid_sizer_lp_{key}", value)
+                if "da_bid_sizer_error" in lp_stats:
+                    selected_stats.setdefault("da_bid_sizer_error", str(lp_stats.get("da_bid_sizer_error")))
 
         optimized_schedule = dict(selected)
         optimized_factor = float(selected_factor)
@@ -8053,13 +8249,10 @@ class BatteryBacktester:
             raw_candidate_replay.get("da_cashflow_replay_error_reason", "unknown")
         )
         raw_candidate_missing_recovery_cost = _missing_terminal_recovery_estimate(raw_candidate_replay)
-        raw_candidate_deferred_terminal_only = _is_nonfinal_deferred_terminal_shortfall_only(
-            raw_candidate_physical_stats
-        )
         raw_candidate_replay_valid = bool(
             raw_candidate_replay_error <= 0.5
             and np.isfinite(raw_candidate_pnl)
-            and (bool(raw_candidate_physical_feasible) or bool(raw_candidate_deferred_terminal_only))
+            and bool(raw_candidate_physical_feasible)
             and not bool(raw_candidate_missing_recovery_cost)
         )
         raw_candidate_minus_incumbent = (
@@ -8104,9 +8297,6 @@ class BatteryBacktester:
                     "da_canonical_sizer_failure_reason": "none",
                     "da_canonical_sizer_rounded_replay_pass": 1.0,
                     "da_recovered_profitable_feasible_raw_candidate_after_zero_sizer": 1.0,
-                    "da_deferred_terminal_shortfall_nonfinal_nonfatal": float(
-                        bool(raw_candidate_deferred_terminal_only)
-                    ),
                 }
             )
             optimized_schedule = dict(selected)
@@ -8611,9 +8801,6 @@ class BatteryBacktester:
                         "profitable_replay_eligible_candidate_zeroed_without_concrete_blocker"
                         if bool(no_silent_zero_violation)
                         else "none"
-                    ),
-                    "da_raw_candidate_deferred_terminal_shortfall_nonfinal_nonfatal": float(
-                        bool(raw_candidate_deferred_terminal_only)
                     ),
                     "projected_soc_min_mwh": float(selected_stats.get("projected_soc_min_mwh", np.nan)),
                     "projected_soc_max_mwh": float(selected_stats.get("projected_soc_max_mwh", np.nan)),
@@ -12395,11 +12582,10 @@ class BatteryBacktester:
                 and shortfall > 1e-9
                 and not bool(terminal_sensitive_window)
             ):
-                # Non-final DA gates must not be zeroed just because the full
-                # replay horizon reaches the terminal target. The final DA gate
-                # or an explicit binding repair must handle the shortfall.
+                # Non-final DA gates do not own terminal hard-min enforcement.
+                # The final DA gate or explicit binding repair path handles it.
                 recoverable = True
-                detail = "terminal_shortfall_deferred_to_final_da_gate"
+                detail = "none"
             if str(self.final_soc_mode) in {"hard", "hard_min"} and shortfall > 1e-9 and bool(terminal_sensitive_window):
                 # Hard-final DA lockbooks may only pass with terminal recovery that is
                 # explicitly scheduled in the same physical replay. A generic "ID can
@@ -12928,7 +13114,22 @@ class BatteryBacktester:
                 and candidate_pnl_with_terminal_recovery
                 > zero_pnl_with_terminal_recovery + float(DA_PRECOMMIT_REPLAY_TOL_EUR)
             )
-            if bool(terminal_recovery_symmetric_candidate_kept):
+            if _is_nonfinal_terminal_shortfall_only(candidate_failure_diag):
+                feasible = True
+                final_schedule = dict(selected_da)
+                final_diag = _mark_deferred_terminal_nonfatal(
+                    candidate_failure_diag,
+                    source="postlock_future_guard",
+                )
+                final_diag["da_terminal_replay_pass"] = 1.0
+                final_diag["da_terminal_replay_failure_reason"] = "nonfinal_terminal_shortfall_diagnostic_only"
+                final_diag["infeasibility_driver"] = "none"
+                final_diag["infeasibility_driver_detail"] = "nonfinal_terminal_shortfall_diagnostic_only"
+                final_diag["final_soc_feasibility_reason"] = "nonfinal_terminal_shortfall_diagnostic_only"
+                final_selected_future_feasible = True
+                selected_after_check = "candidate_deferred_terminal_nonfatal"
+                rejected_due_to_future = 0.0
+            elif bool(terminal_recovery_symmetric_candidate_kept):
                 # Both paths are valued with the same explicit final terminal
                 # recovery cost. Do not zero a profitable candidate solely
                 # because the repair is deferred to the same final repair layer
@@ -26385,6 +26586,17 @@ class BatteryBacktester:
                     if pred_col not in window.columns:
                         window[pred_col] = np.nan
                     if pred_col not in forecast_warehouse:
+                        # Some active source-of-truth columns, notably aFRR
+                        # activation-rate forecasts, can be provided only on
+                        # the wide scenario frame. Preserve them before the
+                        # strict coverage check rather than leaving synthetic
+                        # NaNs that later look like missing source data.
+                        window = self._copy_wide_prediction_by_timestamp(
+                            window,
+                            source,
+                            timestamp_col=colmap.timestamp,
+                            prediction_col=pred_col,
+                        )
                         continue
                     src_df = forecast_warehouse[pred_col]
                     filled = _asof_fill_from_long(src_df, "predicted_value")
@@ -32118,6 +32330,17 @@ class BatteryBacktester:
                         "Data loss! Canonical prices were overwritten or lost "
                         f"(pred_da_price bad before={before_bad}, after={after_bad})."
                     )
+        merged = self._preserve_activation_rate_source_of_truth(
+            merged,
+            df,
+            colmap,
+            context=f"{kind}_settlement_merge",
+            reserve_active=bool(
+                getattr(self._strategy_permissions, "allow_bcm", False)
+                or getattr(self._strategy_permissions, "allow_bem_only", False)
+                or getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False)
+            ),
+        )
         required_merged_dispatch_cols = [c for c in required_dispatch_defaults if c != colmap.timestamp]
         missing_merged_dispatch_cols = [c for c in required_merged_dispatch_cols if c not in merged.columns]
         if missing_merged_dispatch_cols:
@@ -33801,10 +34024,19 @@ class BatteryBacktester:
         if not perms.allow_bcm:
             bcm_cols = [
                 "real_revenue_capacity_eur",
-                "real_afrr_cap_pos_awarded",
-                "real_afrr_cap_neg_awarded",
-                "real_locked_reserve_pos_mw",
-                "real_locked_reserve_neg_mw",
+                "real_bcm_capacity_revenue_eur",
+                "real_bcm_capacity_revenue_pos_eur",
+                "real_bcm_capacity_revenue_neg_eur",
+                "real_submitted_bcm_capacity_pos_mw",
+                "real_submitted_bcm_capacity_neg_mw",
+                "real_locked_bcm_capacity_pos_mw",
+                "real_locked_bcm_capacity_neg_mw",
+                "real_executed_bcm_capacity_pos_mw",
+                "real_executed_bcm_capacity_neg_mw",
+                "real_awarded_capacity_pos_mw",
+                "real_awarded_capacity_neg_mw",
+                "real_fixed_reserve_obligation_pos_mw",
+                "real_fixed_reserve_obligation_neg_mw",
             ]
             bcm_mag = self._sum_abs_present(hourly, bcm_cols)
             if bcm_mag > tol:

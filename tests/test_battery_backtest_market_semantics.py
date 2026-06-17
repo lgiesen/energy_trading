@@ -6879,193 +6879,6 @@ def test_da_zero_lp_sizer_does_not_remove_profitable_replay_feasible_raw_candida
     } == {1.0}
 
 
-def test_da_nonfinal_terminal_deferral_does_not_zero_profitable_raw_candidate(monkeypatch) -> None:
-    bt = _mk_backtester()
-    col = BacktestColumnMap()
-    bt.eta_in = 1.0
-    bt.eta_out = 1.0
-    bt.deg_eur_mwh = 0.0
-    bt.trans_eur_mwh = 0.0
-    bt.aux_off_mw = 0.0
-    bt.aux_trading_mw = 0.0
-    bt.soc_min = 0.0
-    bt.soc_max = 20.0
-    bt.p_max_mw = 10.0
-    bt.final_soc_mode = "hard_min"
-
-    ts_buy = pd.Timestamp("2025-01-02T00:00:00Z")
-    ts_sell = pd.Timestamp("2025-01-02T01:00:00Z")
-    lock_rows = pd.DataFrame(
-        {
-            col.timestamp: [ts_buy, ts_sell],
-            "target_time_utc": [ts_buy, ts_sell],
-            "charge_mw": [1.0, 0.0],
-            "discharge_mw": [0.0, 1.0],
-            col.pred_da_price: [0.0, 100.0],
-            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
-            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
-            "predicted_objective_eur": [100.0, 100.0],
-        }
-    )
-
-    class ZeroLinprogResult:
-        success = True
-        x = np.zeros(4, dtype=float)
-        fun = 0.0
-        message = "forced zero LP solution"
-
-    monkeypatch.setattr(
-        battery_backtest_module,
-        "linprog",
-        lambda *args, **kwargs: ZeroLinprogResult(),
-    )
-
-    def fake_postlock_replay(**kwargs):
-        da_lockbook = kwargs.get("da_lockbook", {}) or {}
-        has_candidate = any(
-            max(0.0, float(ch)) + max(0.0, float(dis)) > 1e-9
-            for ch, dis in da_lockbook.values()
-        )
-        diag = {
-            "projected_soc_min_mwh": 5.0,
-            "projected_soc_max_mwh": 6.0,
-            "projected_final_soc_mwh": 5.0,
-            "projected_power_violation_pos_mw": 0.0,
-            "projected_power_violation_neg_mw": 0.0,
-            "protected_soc_projection_violation_mwh": 0.0,
-            "expected_auxiliary_losses_mwh": 0.0,
-            "first_infeasible_timestamp_utc": "",
-            "da_terminal_sensitive_window": 0.0,
-            "da_terminal_sensitive_reason": "not_terminal_window",
-        }
-        if has_candidate:
-            diag.update(
-                {
-                    "infeasibility_driver": "none",
-                    "infeasibility_driver_detail": "terminal_shortfall_deferred_to_final_da_gate",
-                }
-            )
-            return False, diag
-        diag.update({"infeasibility_driver": "none", "infeasibility_driver_detail": "none"})
-        return True, diag
-
-    monkeypatch.setattr(bt, "_project_da_postlock_future_feasibility", fake_postlock_replay)
-
-    selected, audit = bt._select_feasible_da_lock_schedule(
-        lock_rows=lock_rows,
-        colmap=col,
-        current_soc_mwh=5.0,
-        fixed_reserve_pos={},
-        fixed_reserve_neg={},
-        future_rows=lock_rows,
-        existing_da_lockbook={},
-        global_end_utc=pd.Timestamp("2025-01-03T00:00:00Z"),
-    )
-
-    assert selected[ts_buy][0] == pytest.approx(1.0)
-    assert selected[ts_sell][1] == pytest.approx(1.0)
-    assert {str(row["selected_incumbent"]) for row in audit} == {"optimized"}
-    assert {str(row["da_zero_reason"]) for row in audit} == {"none"}
-    assert {float(row["da_raw_candidate_deferred_terminal_shortfall_nonfinal_nonfatal"]) for row in audit} == {1.0}
-    assert {float(row["da_no_silent_zero_violation"]) for row in audit} == {0.0}
-
-
-def test_da_support_sizer_nonfinal_terminal_deferral_keeps_sized_candidate(monkeypatch) -> None:
-    bt = _mk_backtester()
-    col = BacktestColumnMap()
-    bt.eta_in = 1.0
-    bt.eta_out = 1.0
-    bt.deg_eur_mwh = 0.0
-    bt.trans_eur_mwh = 0.0
-    bt.aux_off_mw = 0.0
-    bt.aux_trading_mw = 0.0
-    bt.soc_min = 0.0
-    bt.soc_max = 20.0
-    bt.p_max_mw = 10.0
-    bt.final_soc_mode = "hard_min"
-
-    ts_buy = pd.Timestamp("2025-01-02T00:00:00Z")
-    ts_sell = pd.Timestamp("2025-01-02T01:00:00Z")
-    lock_rows = pd.DataFrame(
-        {
-            col.timestamp: [ts_buy, ts_sell],
-            "target_time_utc": [ts_buy, ts_sell],
-            "charge_mw": [1.0, 0.0],
-            "discharge_mw": [0.0, 1.0],
-            col.pred_da_price: [0.0, 100.0],
-            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
-            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
-            "predicted_objective_eur": [100.0, 100.0],
-        }
-    )
-
-    class NonzeroLinprogResult:
-        success = True
-        x = np.asarray([1.0, 0.0, 0.0, 1.0], dtype=float)
-        fun = -100.0
-        message = "forced nonzero LP solution"
-
-    monkeypatch.setattr(
-        battery_backtest_module,
-        "linprog",
-        lambda *args, **kwargs: NonzeroLinprogResult(),
-    )
-
-    def fake_postlock_replay(**kwargs):
-        da_lockbook = kwargs.get("da_lockbook", {}) or {}
-        has_candidate = any(
-            max(0.0, float(ch)) + max(0.0, float(dis)) > 1e-9
-            for ch, dis in da_lockbook.values()
-        )
-        diag = {
-            "projected_soc_min_mwh": 5.0,
-            "projected_soc_max_mwh": 6.0,
-            "projected_final_soc_mwh": 5.0,
-            "projected_power_violation_pos_mw": 0.0,
-            "projected_power_violation_neg_mw": 0.0,
-            "protected_soc_projection_violation_mwh": 0.0,
-            "expected_auxiliary_losses_mwh": 0.0,
-            "first_infeasible_timestamp_utc": "",
-            "da_terminal_sensitive_window": 0.0,
-            "da_terminal_sensitive_reason": "not_terminal_window",
-        }
-        if has_candidate:
-            diag.update(
-                {
-                    "infeasibility_driver": "none",
-                    "infeasibility_driver_detail": "terminal_shortfall_deferred_to_final_da_gate",
-                }
-            )
-            return False, diag
-        diag.update({"infeasibility_driver": "none", "infeasibility_driver_detail": "none"})
-        return True, diag
-
-    monkeypatch.setattr(bt, "_project_da_postlock_future_feasibility", fake_postlock_replay)
-
-    selected, audit = bt._select_feasible_da_lock_schedule(
-        lock_rows=lock_rows,
-        colmap=col,
-        current_soc_mwh=5.0,
-        fixed_reserve_pos={},
-        fixed_reserve_neg={},
-        future_rows=lock_rows,
-        existing_da_lockbook={},
-        global_end_utc=pd.Timestamp("2025-01-03T00:00:00Z"),
-    )
-
-    assert selected[ts_buy][0] == pytest.approx(1.0)
-    assert selected[ts_sell][1] == pytest.approx(1.0)
-    assert {str(row["da_bid_sizer_status"]) for row in audit} == {
-        "ok_deferred_terminal_nonfatal"
-    }
-    assert {
-        float(row["da_sized_candidate_buy_mw"]) + float(row["da_sized_candidate_sell_mw"])
-        for row in audit
-    } == {1.0}
-    assert {float(row["da_candidate_support_sizer_used_as_authority"]) for row in audit} == {0.0}
-    assert {str(row["da_zero_reason"]) for row in audit} == {"none"}
-
-
 def test_source_truth_alias_group_present_fails_missing_active_fields() -> None:
     hourly = pd.DataFrame({"real_da_buy_mwh": [0.0, 1.0]})
     summary = {"terminal_soc_repair_cost_eur": 12.0}
@@ -8037,6 +7850,92 @@ def test_da_sizer_future_replay_keeps_soc_min_feasible_candidate() -> None:
     assert audit_rows
     assert max(float(row["da_selected_lockable_sell_mw"]) for row in audit_rows) > 0.0
     assert min(float(row["da_bid_sizer_lp_projected_soc_min_mwh"]) for row in audit_rows) >= bt.soc_min - 1e-6
+
+
+def test_da_sizer_terminal_shortfall_nonfinal_not_zeroed(monkeypatch) -> None:
+    bt = _mk_backtester()
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 10.0
+    bt.final_soc_mode = "hard_min"
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.p_max_mw = 10.0
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-01-02T00:00:00Z", periods=3, freq="h")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            col.pred_da_price: [-50.0, 10.0, 100.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0],
+        }
+    )
+
+    def terminal_shortfall_replay(**kwargs):
+        candidate_timestamps = set(kwargs.get("candidate_timestamps") or set())
+        terminal_sensitive = bool(candidate_timestamps and max(candidate_timestamps) >= ts[-1])
+        return False, {
+            "first_infeasible_timestamp_utc": str(ts[-1]),
+            "infeasibility_driver": "locked_da_terminal_shortfall_candidate_infeasible",
+            "infeasibility_driver_detail": "locked_da_terminal_shortfall_candidate_infeasible",
+            "final_soc_feasibility_reason": "locked_da_terminal_shortfall_candidate_infeasible",
+            "da_terminal_replay_failure_reason": "locked_da_terminal_shortfall_candidate_infeasible",
+            "projected_soc_min_mwh": 5.0,
+            "projected_soc_max_mwh": 6.0,
+            "projected_final_soc_mwh": 1.858,
+            "projected_power_violation_pos_mw": 0.0,
+            "projected_power_violation_neg_mw": 0.0,
+            "protected_soc_projection_violation_mwh": 0.0,
+            "da_terminal_sensitive_window": float(terminal_sensitive),
+            "da_terminal_sensitive_reason": (
+                "last_da_delivery_before_global_end" if terminal_sensitive else "not_terminal_window"
+            ),
+        }
+
+    monkeypatch.setattr(bt, "_project_da_postlock_future_feasibility", terminal_shortfall_replay)
+
+    nonfinal_rows = future_rows.iloc[[0]].copy()
+    nonfinal_rows["charge_mw"] = [1.0]
+    nonfinal_rows["discharge_mw"] = [0.0]
+    selected, audit_rows = bt._select_feasible_da_lock_schedule(
+        lock_rows=nonfinal_rows,
+        colmap=col,
+        current_soc_mwh=5.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=future_rows,
+        existing_da_lockbook={},
+        global_end_utc=pd.Timestamp(ts[-1]),
+    )
+    assert sum(ch + dis for ch, dis in selected.values()) > 0.0
+    assert {str(row["da_bid_sizer_status"]) for row in audit_rows} == {
+        "ok_deferred_terminal_nonfatal"
+    }
+    assert {str(row["da_canonical_sizer_failure_reason"]) for row in audit_rows} == {"none"}
+
+    final_rows = future_rows.iloc[[-1]].copy()
+    final_rows["charge_mw"] = [1.0]
+    final_rows["discharge_mw"] = [0.0]
+    selected_final, audit_final = bt._select_feasible_da_lock_schedule(
+        lock_rows=final_rows,
+        colmap=col,
+        current_soc_mwh=5.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=future_rows,
+        existing_da_lockbook={},
+        global_end_utc=pd.Timestamp(ts[-1]),
+    )
+    assert sum(ch + dis for ch, dis in selected_final.values()) == pytest.approx(0.0)
+    assert {
+        str(row["da_canonical_sizer_failure_reason"]) for row in audit_final
+    } != {"none"}
 
 
 def test_da_rhpf_plan_history_diagnostics_export_postlock_replay_mismatch() -> None:
@@ -13890,7 +13789,7 @@ def test_da_postlock_nonfinal_terminal_shortfall_is_not_labeled_recoverable() ->
     assert float(audit[0]["da_postlock_candidate_future_feasible"]) == pytest.approx(1.0)
     assert float(audit[0]["da_postlock_terminal_shortfall_recoverable"]) == pytest.approx(0.0)
     assert float(audit[0]["da_postlock_terminal_shortfall_unrecoverable"]) == pytest.approx(0.0)
-    assert str(audit[0]["da_postlock_infeasibility_driver_detail"]) == "terminal_shortfall_deferred_to_final_da_gate"
+    assert str(audit[0]["da_postlock_infeasibility_driver_detail"]) == "none"
     assert str(audit[0]["da_postlock_next_recovery_opportunity_type"]) == "technical_id_recourse"
     assert str(audit[0]["da_postlock_hard_projection_end_utc"]) == str(pd.Timestamp(ts[0]))
     assert float(audit[0]["da_postlock_hard_projection_reached_next_recovery"]) == pytest.approx(1.0)
@@ -17625,6 +17524,50 @@ def test_technical_repair_mode_rejects_economic_id_trade_type() -> None:
             allowed_markets=("aFRR", "BCM"),
             strategy_permissions=perms,
             strategy_name="bcm",
+            id_recourse_mode="common",
+        )
+
+
+def test_bem_only_generic_reserve_aliases_do_not_count_as_bcm_activity() -> None:
+    bt = _mk_backtester()
+    perms = bt.resolve_strategy_permissions(
+        strategy_name="bem",
+        allowed_markets=("aFRR", "BEM"),
+        id_recourse_mode="common",
+    )
+    assert not perms.allow_bcm
+    assert perms.allow_bem_only
+
+    hourly = pd.DataFrame(
+        {
+            # Generic reserve-envelope aliases may be nonzero for BEM-only
+            # commitments. They are not BCM lockbook source-of-truth fields.
+            "real_locked_reserve_pos_mw": [10.0],
+            "real_locked_reserve_neg_mw": [5.0],
+            "real_bem_only_submitted_pos_mw": [10.0],
+            "real_bem_only_submitted_neg_mw": [5.0],
+            "real_id_charge_mw": [0.0],
+            "real_id_discharge_mw": [0.0],
+            "real_pending_id_charge_mw": [0.0],
+            "real_pending_id_discharge_mw": [0.0],
+            "real_id_trade_type": ["none"],
+        }
+    )
+    bt._validate_strategy_isolation_outputs(
+        hourly=hourly,
+        allowed_markets=("aFRR", "BEM"),
+        strategy_permissions=perms,
+        strategy_name="bem",
+        id_recourse_mode="common",
+    )
+
+    contaminated = hourly.assign(real_locked_bcm_capacity_pos_mw=[1.0])
+    with pytest.raises(RuntimeError, match="non-zero BCM activity while BCM is disabled"):
+        bt._validate_strategy_isolation_outputs(
+            hourly=contaminated,
+            allowed_markets=("aFRR", "BEM"),
+            strategy_permissions=perms,
+            strategy_name="bem",
             id_recourse_mode="common",
         )
 
@@ -23197,6 +23140,122 @@ def test_activation_rate_source_of_truth_only_required_for_active_reserve() -> N
     bt._missing_critical_source_fields = []
     bt._missing_critical_source_reasons = set()
     assert bt._required_activation_rates_from_row(resolved, col, reserve_neg_mw=1.0) == (0.25, 0.5)
+    assert bt._missing_critical_source_fields == []
+
+
+def test_activation_rate_source_of_truth_wide_prediction_transport() -> None:
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-01T00:00:00Z")
+    ts1 = pd.Timestamp("2026-01-01T01:00:00Z")
+    window = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            col.pred_afrr_activation_rate_pos: [np.nan, np.nan],
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            col.pred_afrr_activation_rate_pos: [0.12, 0.34],
+        }
+    ).set_index(col.timestamp)
+
+    transported = BatteryBacktester._copy_wide_prediction_by_timestamp(
+        window,
+        source,
+        timestamp_col=col.timestamp,
+        prediction_col=col.pred_afrr_activation_rate_pos,
+    )
+
+    assert transported[col.pred_afrr_activation_rate_pos].tolist() == pytest.approx([0.12, 0.34])
+
+    missing_source = source.drop(columns=[col.pred_afrr_activation_rate_pos])
+    unchanged = BatteryBacktester._copy_wide_prediction_by_timestamp(
+        window,
+        missing_source,
+        timestamp_col=col.timestamp,
+        prediction_col=col.pred_afrr_activation_rate_pos,
+    )
+    assert unchanged[col.pred_afrr_activation_rate_pos].isna().all()
+
+
+def test_bcm_model_hourly_preserves_activation_rate_source_of_truth() -> None:
+    bt = _mk_backtester()
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    col = BacktestColumnMap()
+    ts0 = pd.Timestamp("2026-01-01T00:00:00Z")
+    ts1 = pd.Timestamp("2026-01-01T01:00:00Z")
+    source = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            col.pred_afrr_activation_rate_pos: [0.12, 0.34],
+            col.pred_afrr_activation_rate_neg: [0.21, 0.43],
+            "afrr_activation_rate_guard_source_column_pos": [
+                col.pred_afrr_activation_rate_pos,
+                col.pred_afrr_activation_rate_pos,
+            ],
+            "afrr_activation_rate_guard_source_column_neg": [
+                col.pred_afrr_activation_rate_neg,
+                col.pred_afrr_activation_rate_neg,
+            ],
+            "afrr_activation_rate_guard_policy": ["median", "median"],
+        }
+    )
+    model_hourly = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            "target_afrr_activation_rate_pos": [0.9, 0.9],
+            "target_afrr_activation_rate_neg": [0.8, 0.8],
+            "real_fixed_reserve_obligation_pos_mw": [1.0, 0.0],
+            "real_fixed_reserve_obligation_neg_mw": [0.0, 1.0],
+        }
+    )
+
+    preserved = bt._preserve_activation_rate_source_of_truth(
+        model_hourly,
+        source,
+        col,
+        context="model_hourly",
+        reserve_active=True,
+    )
+
+    assert preserved[col.pred_afrr_activation_rate_pos].tolist() == pytest.approx([0.12, 0.34])
+    assert preserved[col.pred_afrr_activation_rate_neg].tolist() == pytest.approx([0.21, 0.43])
+    assert preserved["afrr_activation_rate_guard_source_column_pos"].tolist() == [
+        col.pred_afrr_activation_rate_pos,
+        col.pred_afrr_activation_rate_pos,
+    ]
+    assert bt._missing_critical_source_fields == []
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    missing_canonical = bt._preserve_activation_rate_source_of_truth(
+        model_hourly,
+        source.drop(columns=[col.pred_afrr_activation_rate_pos, col.pred_afrr_activation_rate_neg]),
+        col,
+        context="model_hourly",
+        reserve_active=True,
+    )
+    assert missing_canonical[col.pred_afrr_activation_rate_pos].isna().all()
+    assert missing_canonical[col.pred_afrr_activation_rate_neg].isna().all()
+    assert set(bt._missing_critical_source_reasons) == {"missing_source_of_truth_activation_rate"}
+    assert "model_hourly.activation_rate_pos" in bt._missing_critical_source_fields
+    assert "model_hourly.activation_rate_neg" in bt._missing_critical_source_fields
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    da_only = pd.DataFrame({col.timestamp: [ts0], "real_fixed_reserve_obligation_pos_mw": [0.0]})
+    da_only_source = pd.DataFrame({col.timestamp: [ts0]})
+    inactive = bt._preserve_activation_rate_source_of_truth(
+        da_only,
+        da_only_source,
+        col,
+        context="model_hourly",
+        reserve_active=False,
+    )
+    assert col.pred_afrr_activation_rate_pos not in inactive.columns
+    assert col.pred_afrr_activation_rate_neg not in inactive.columns
     assert bt._missing_critical_source_fields == []
 
 
