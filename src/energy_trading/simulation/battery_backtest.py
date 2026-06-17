@@ -3075,6 +3075,20 @@ class BatteryBacktester:
         )
 
     @staticmethod
+    def _source_truth_alias_group_present(
+        hourly: pd.DataFrame,
+        summary: Mapping[str, object],
+        aliases: tuple[str, ...],
+    ) -> bool:
+        """Return True only when an active source-of-truth alias is populated."""
+        for name in aliases:
+            if name in hourly.columns and hourly[name].notna().any():
+                return True
+            if name in summary and pd.notna(summary.get(name)):
+                return True
+        return False
+
+    @staticmethod
     def _parse_reserve_retry_ladder(raw: object) -> list[float]:
         if isinstance(raw, (list, tuple)):
             vals = [float(x) for x in raw]
@@ -6218,6 +6232,51 @@ class BatteryBacktester:
         def _norm_reason(value: object) -> str:
             return str(value or "").strip().lower()
 
+        def _concrete_postlock_reason(reason: str) -> str:
+            reason = _norm_reason(reason)
+            if reason in {
+                "locked_da_hourly_soc_min_infeasible",
+                "locked_da_projected_soc_below_min",
+                "locked_da_sell_exceeds_available_energy",
+                "locked_da_sell_below_soc_min_before_future_buy",
+            }:
+                return "postlock_soc_min_violation"
+            if reason in {
+                "locked_da_hourly_soc_max_infeasible",
+                "locked_da_projected_soc_above_max",
+                "locked_da_buy_exceeds_soc_headroom",
+                "da_buy_exceeds_soc_max",
+            }:
+                return "postlock_soc_max_violation"
+            if reason in {
+                "locked_da_terminal_shortfall_candidate_infeasible",
+                "locked_da_terminal_shortfall_unrecoverable",
+                "locked_da_final_soc_below_target",
+                "terminal_shortfall_under_hard_min",
+                "terminal_repair_missing",
+                "terminal_repair_unreachable",
+            }:
+                return "postlock_terminal_hard_min_violation"
+            if reason in {
+                "blocked_by_locked_obligation",
+                "candidate_overlaps_existing_da_lockbook",
+                "candidate_overlaps_existing_lockbook",
+                "existing_lockbook_already_infeasible",
+                "locked_da_hourly_power_infeasible",
+                "settlement_equiv_replay_rejected",
+            }:
+                return "postlock_future_locked_obligation_conflict"
+            if reason in {"market_bid_below_min", "min_lot_rounding"}:
+                return "candidate_below_min_lot_after_rounding"
+            if reason in {
+                "accepted_lockbook_zeroed_after_postlock",
+                "accepted_lockbook_row_zeroed_after_postlock",
+                "final_lockbook_consistency_infeasible_no_trade_selected",
+                "postlock_future_infeasible_no_trade_selected",
+            }:
+                return "handoff_bug_candidate_nonzero_but_accepted_zero"
+            return reason
+
         def _candidate_zero_reason(row: dict[str, float | str]) -> str:
             for reason_key in (
                 "da_handoff_lost_postlock_candidate_reason",
@@ -6369,25 +6428,34 @@ class BatteryBacktester:
             existing_reason = _candidate_zero_reason(row)
             explicit_blocker = _explicit_blocker_reason(row, existing_reason)
             if row_lost_after_postlock and explicit_blocker:
-                return explicit_blocker
+                return _concrete_postlock_reason(explicit_blocker)
             if existing_reason in economic_rejection_reasons or existing_reason in concrete_blocker_reasons:
-                return existing_reason
+                if existing_reason in economic_rejection_reasons:
+                    return "no_trade_economically_better"
+                return _concrete_postlock_reason(existing_reason)
             prelock_reason = str(row.get("da_prelock_repair_reason", "") or "")
             if _row_float(row, "da_prelock_rejected_no_feasible_schedule") > 0.5:
                 if prelock_reason and prelock_reason != "none":
-                    return prelock_reason
+                    return _concrete_postlock_reason(prelock_reason)
                 return "prelock_repair_no_feasible_subset"
             if _row_float(row, "da_prelock_unaccepted_buy_mwh") + _row_float(row, "da_prelock_unaccepted_sell_mwh") > 1e-9:
                 if prelock_reason and prelock_reason != "none":
-                    return prelock_reason
-                return "prelock_repair_derated_to_feasible"
+                    return _concrete_postlock_reason(prelock_reason)
+                return "candidate_derated_to_zero"
             if str(zero_reason) == "accepted_lockbook_pnl_below_no_trade":
-                return "accepted_lockbook_pnl_below_no_trade"
+                return "no_trade_economically_better"
             if _prior_candidate_mwh(row) > 1e-9 and str(zero_reason) == "no_trade_or_market_rounding_zeroed":
-                return "accepted_lockbook_zeroed_after_postlock"
+                candidate_minus_incumbent = _row_float(row, "candidate_minus_incumbent_eur")
+                if _row_float(row, "bid_market_rounding_zeroed_below_min") > 0.5:
+                    return "candidate_below_min_lot_after_rounding"
+                if np.isfinite(candidate_minus_incumbent) and candidate_minus_incumbent <= float(selection_tolerance_eur):
+                    return "no_trade_economically_better"
+                if row_lost_after_postlock:
+                    return "handoff_bug_candidate_nonzero_but_accepted_zero"
+                return "handoff_bug_candidate_nonzero_but_accepted_zero"
             if row_lost_after_postlock:
                 if _row_float(row, "da_final_lockbook_consistency_rejected") > 0.5:
-                    return str(
+                    return _concrete_postlock_reason(
                         row.get(
                             "da_hourly_lock_infeasible_reason",
                             row.get(
@@ -6398,14 +6466,16 @@ class BatteryBacktester:
                         or "final_lockbook_consistency_zeroed_row"
                     )
                 if _row_float(row, "da_settlement_equiv_replay_rejected") > 0.5:
-                    return str(
+                    return _concrete_postlock_reason(
                         row.get("da_settlement_equiv_replay_reason", "settlement_equiv_replay_zeroed_row")
                         or "settlement_equiv_replay_zeroed_row"
                     )
                 if _row_float(row, "bid_market_rounding_zeroed_below_min") > 0.5:
-                    return "market_bid_below_min"
-                return "accepted_lockbook_row_zeroed_after_postlock"
-            return str(zero_reason)
+                    return "candidate_below_min_lot_after_rounding"
+                return "handoff_bug_candidate_nonzero_but_accepted_zero"
+            if str(zero_reason) == "no_trade_or_market_rounding_zeroed":
+                return "no_trade_economically_better"
+            return _concrete_postlock_reason(str(zero_reason))
 
         def _specific_loss_stage(reason: str) -> str:
             if reason.startswith("prelock_") or reason.startswith("derated_") or reason in {
@@ -6416,8 +6486,19 @@ class BatteryBacktester:
                 "locked_da_final_soc_below_target",
             }:
                 return "prelock_guard_zeroed"
-            if reason == "accepted_lockbook_pnl_below_no_trade":
+            if reason == "no_trade_economically_better":
                 return "accepted_lockbook_economic_zeroed"
+            if reason in {
+                "postlock_soc_min_violation",
+                "postlock_soc_max_violation",
+                "postlock_terminal_hard_min_violation",
+                "postlock_future_locked_obligation_conflict",
+            }:
+                return "postlock_replay_zeroed"
+            if reason == "handoff_bug_candidate_nonzero_but_accepted_zero":
+                return "handoff_mismatch"
+            if reason in {"candidate_below_min_lot_after_rounding", "candidate_rounding_to_zero"}:
+                return "market_rounding_zeroed"
             return "accepted_lockbook_zeroed"
 
         for audit_row in da_audit_rows:
@@ -6635,12 +6716,28 @@ class BatteryBacktester:
             )
             if accepted_energy_mwh <= 1e-12 or row_lost_after_postlock:
                 existing_da_zero = str(out_row.get("da_zero_reason", "") or "")
-                if existing_da_zero in {"", "none", "no_trade_or_market_rounding_zeroed"}:
+                if existing_da_zero in {
+                    "",
+                    "none",
+                    "no_trade_or_market_rounding_zeroed",
+                    "accepted_lockbook_zeroed_after_postlock",
+                    "accepted_lockbook_row_zeroed_after_postlock",
+                    "no_nonzero_feasible_da_schedule",
+                    "reduced_to_feasible_da_schedule",
+                }:
                     out_row["da_zero_reason"] = str(row_zero_reason)
                 else:
                     out_row["da_zero_reason"] = existing_da_zero
                 existing_zero = str(out_row.get("zero_reason", "") or "")
-                if existing_zero in {"", "none", "no_trade_or_market_rounding_zeroed"}:
+                if existing_zero in {
+                    "",
+                    "none",
+                    "no_trade_or_market_rounding_zeroed",
+                    "accepted_lockbook_zeroed_after_postlock",
+                    "accepted_lockbook_row_zeroed_after_postlock",
+                    "no_nonzero_feasible_da_schedule",
+                    "reduced_to_feasible_da_schedule",
+                }:
                     out_row["zero_reason"] = str(row_zero_reason)
                 else:
                     out_row["zero_reason"] = existing_zero
@@ -6726,15 +6823,17 @@ class BatteryBacktester:
         deferred_terminal_shortfall_reason = "terminal_shortfall_deferred_to_final_da_gate"
 
         def _infeasibility_reason(stats: Mapping[str, object]) -> str:
-            return str(
-                stats.get(
-                    "da_bid_sizer_first_infeasible_reason",
-                    stats.get(
-                        "infeasibility_driver_detail",
-                        stats.get("infeasibility_driver", "none"),
-                    ),
-                )
-            ).strip()
+            for key in (
+                "da_bid_sizer_first_infeasible_reason",
+                "da_canonical_sizer_failure_reason",
+                "infeasibility_driver_detail",
+                "infeasibility_driver",
+                "da_bid_sizer_zero_reason",
+            ):
+                reason = str(stats.get(key, "none")).strip()
+                if reason.lower() not in {"", "none", "nan"}:
+                    return reason
+            return "none"
 
         def _is_nonfinal_deferred_terminal_shortfall_only(stats: Mapping[str, object]) -> bool:
             if _infeasibility_reason(stats) != deferred_terminal_shortfall_reason:
@@ -6831,7 +6930,7 @@ class BatteryBacktester:
             ) -> bool:
                 """Accept replay when only stale terminal-shortfall metadata contradicts hard_min surplus."""
                 if bool(feasible_flag) or str(self.final_soc_mode) != "hard_min":
-                    return bool(feasible_flag)
+                    return False
                 projected_final = pd.to_numeric(
                     pd.Series([replay_stats.get("projected_final_soc_mwh", np.nan)]),
                     errors="coerce",
@@ -7107,12 +7206,13 @@ class BatteryBacktester:
             if _is_nonfinal_deferred_terminal_shortfall_only(stats):
                 feasible = True
                 stats = dict(stats)
-                stats["da_bid_sizer_status"] = "ok_deferred_terminal_shortfall_nonfinal"
+                stats["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
                 stats["da_bid_sizer_replay_override_reason"] = deferred_terminal_shortfall_reason
                 stats["da_bid_sizer_first_infeasible_reason"] = "none"
                 stats["infeasibility_driver"] = "none"
                 stats["infeasibility_driver_detail"] = "none"
                 stats["da_deferred_terminal_shortfall_nonfinal_nonfatal"] = 1.0
+                stats["da_candidate_support_sizer_used_as_authority"] = 0.0
             if _hard_min_surplus_replay_override(bool(feasible), stats):
                 feasible = True
                 stats = dict(stats)
@@ -7199,12 +7299,13 @@ class BatteryBacktester:
                 if _is_nonfinal_deferred_terminal_shortfall_only(clipped_stats):
                     clipped_feasible = True
                     clipped_stats = dict(clipped_stats)
-                    clipped_stats["da_bid_sizer_status"] = "ok_deferred_terminal_shortfall_nonfinal"
+                    clipped_stats["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
                     clipped_stats["da_bid_sizer_replay_override_reason"] = deferred_terminal_shortfall_reason
                     clipped_stats["da_bid_sizer_first_infeasible_reason"] = "none"
                     clipped_stats["infeasibility_driver"] = "none"
                     clipped_stats["infeasibility_driver_detail"] = "none"
                     clipped_stats["da_deferred_terminal_shortfall_nonfinal_nonfatal"] = 1.0
+                    clipped_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
                 if _hard_min_surplus_replay_override(bool(clipped_feasible), clipped_stats):
                     clipped_feasible = True
                     clipped_stats = dict(clipped_stats)
@@ -7607,9 +7708,12 @@ class BatteryBacktester:
         lp_stats["da_full_window_sizer_diagnostic_status"] = str(full_window_diag_status)
         lp_stats["da_full_window_sizer_diagnostic_reason"] = str(full_window_diag_reason)
         lp_stats["da_full_window_sizer_diagnostic_feasible"] = float(full_window_diag_feasible)
-        lp_stats["da_candidate_support_sizer_used_as_authority"] = float(
-            not bool(allow_full_window_sizer)
-        )
+        if float(lp_stats.get("da_deferred_terminal_shortfall_nonfinal_nonfatal", 0.0) or 0.0) > 0.5:
+            lp_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
+        else:
+            lp_stats["da_candidate_support_sizer_used_as_authority"] = float(
+                not bool(allow_full_window_sizer)
+            )
         lp_stats["da_path_price_semantics"] = str(path_price_semantics)
         if lp_schedule is None:
             lp_stats.setdefault("da_canonical_sizer_status", "canonical_da_sizer_infeasible")
@@ -7627,6 +7731,30 @@ class BatteryBacktester:
             )
             lp_stats.setdefault("da_canonical_sizer_rounded_replay_pass", 0.0)
         raw_total = float(sum(ch + dis for ch, dis in candidates.values()))
+        if (
+            lp_schedule is not None
+            and not bool(lp_feasible)
+            and raw_total > 1e-9
+            and _is_nonfinal_deferred_terminal_shortfall_only(lp_stats)
+        ):
+            # Non-final terminal shortfall is not a physical blocker for the
+            # current DA gate. Keep the raw rounded candidate eligible and let
+            # the final replay/selection path decide instead of zeroing here.
+            lp_schedule = dict(candidates)
+            lp_feasible = True
+            lp_stats = dict(lp_stats)
+            lp_stats["da_bid_sizer_status"] = "ok_deferred_terminal_nonfatal"
+            lp_stats["da_canonical_sizer_status"] = "ok_deferred_terminal_nonfatal"
+            lp_stats["da_canonical_sizer_failure_reason"] = "none"
+            lp_stats["da_canonical_sizer_rounded_replay_pass"] = 1.0
+            lp_stats["da_bid_sizer_first_infeasible_reason"] = "none"
+            lp_stats["infeasibility_driver"] = "none"
+            lp_stats["infeasibility_driver_detail"] = "none"
+            lp_stats["da_bid_sizer_zero_reason"] = "none"
+            lp_stats["da_bid_sizer_replay_override_reason"] = deferred_terminal_shortfall_reason
+            lp_stats["da_deferred_terminal_shortfall_nonfinal_nonfatal"] = 1.0
+            lp_stats["da_bid_sizer_candidate_support_deferred_terminal_nonfatal"] = 1.0
+            lp_stats["da_candidate_support_sizer_used_as_authority"] = 0.0
         if lp_schedule is not None and bool(lp_feasible):
             lp_total = float(sum(ch + dis for ch, dis in lp_schedule.values()))
             selected = dict(lp_schedule)
@@ -7952,29 +8080,60 @@ class BatteryBacktester:
 
         zeroed = float(all((ch <= 1e-9 and dis <= 1e-9) for ch, dis in selected.values()))
         zero_reason = "none"
+
+        def _selector_concrete_zero_reason() -> str:
+            if raw_total <= 1e-9:
+                return "candidate_rounding_to_zero"
+            if bool(candidate_zeroed_due_to_negative_valid_replay) or str(candidate_rejection_reason) == "candidate_pnl_below_no_trade":
+                return "no_trade_economically_better"
+            if bool(candidate_zeroed_due_to_invalid_replay) or not bool(candidate_replay_valid):
+                reason = str(candidate_replay_error_reason)
+                if reason in {"", "none", "nan", "unknown"}:
+                    return "candidate_infeasible_after_replay"
+                if reason in {"terminal_shortfall_missing_recovery_cost_estimate", "invalid_replay"}:
+                    return reason
+                return "candidate_infeasible_after_replay"
+            if bool(sized_schedule_zero) and raw_total > 1e-9:
+                if float(raw_total) * float(self.dt_h) < max(float(self.da_min_bid_size_mw), 0.0) * float(self.dt_h) + 1e-9:
+                    return "candidate_below_min_lot_after_rounding"
+                return "candidate_rounding_to_zero"
+            if selected_factor < 1.0:
+                return "candidate_derated_to_zero"
+            return "handoff_bug_candidate_nonzero_but_accepted_zero"
+
         if da_precommit_selection_valid < 0.5:
             zero_reason = "invalid_replay"
         elif da_selected_incumbent == "no_trade":
-            zero_reason = "no_trade_incumbent_selected"
+            zero_reason = "no_trade_economically_better"
         elif zeroed > 0.5 and any((ch > 1e-9 or dis > 1e-9) for ch, dis in candidates.values()):
             da_selected_incumbent = "zeroed_candidate"
             da_selection_reason = "optimized_candidate_zeroed_before_locking"
-            zero_reason = "no_nonzero_feasible_da_schedule"
+            zero_reason = _selector_concrete_zero_reason()
         elif selected_factor < 1.0:
-            zero_reason = "reduced_to_feasible_da_schedule"
+            zero_reason = "candidate_derated_to_zero"
 
         total_ch = float(sum(ch for ch, _ in selected.values()) * float(self.dt_h))
         total_dis = float(sum(dis for _, dis in selected.values()) * float(self.dt_h))
         concrete_zero_reasons = {
             "candidate_pnl_below_no_trade",
+            "candidate_below_min_lot_after_rounding",
+            "candidate_derated_to_zero",
+            "candidate_infeasible_after_replay",
+            "candidate_rounding_to_zero",
             "da_buy_exceeds_soc_max",
             "da_power_stack_violation",
             "da_sell_below_soc_min",
+            "handoff_bug_candidate_nonzero_but_accepted_zero",
             "invalid_replay",
             "locked_da_hourly_power_infeasible",
             "locked_da_hourly_soc_max_infeasible",
             "locked_da_hourly_soc_min_infeasible",
             "market_rounding_zeroed",
+            "no_trade_economically_better",
+            "postlock_future_locked_obligation_conflict",
+            "postlock_soc_max_violation",
+            "postlock_soc_min_violation",
+            "postlock_terminal_hard_min_violation",
             "terminal_shortfall_under_hard_min",
             "terminal_shortfall_missing_recovery_cost_estimate",
         }
@@ -22035,6 +22194,8 @@ class BatteryBacktester:
             bcm_reserve_buffer_repair_scheduled_mwh = 0.0
             bcm_reserve_buffer_repair_cost_eur = 0.0
             bcm_reserve_buffer_repair_reason = "none"
+            bcm_reserve_buffer_repair_binding_pass = 1.0
+            bcm_reserve_buffer_repair_binding_reason = "none"
             bcm_reserve_buffer_replay_pass = 1.0
             bcm_reserve_buffer_first_violation_ts_utc = ""
             bcm_reserve_buffer_required_soc_min_mwh = float(self.soc_min)
@@ -22736,7 +22897,43 @@ class BatteryBacktester:
                         "cost_eur": float(cost_eur),
                         "reason": "reserve_buffer_repair_scheduled",
                         "repair_ts": repair_ts.isoformat(),
+                        "repair_charge_mw": float(buy_mw),
+                        "repair_discharge_mw": float(sell_mw),
                     }
+
+                def _discard_nonbinding_reserve_buffer_repair(diag: dict[str, float | str]) -> None:
+                    if reserve_buffer_repair_by_ts is None:
+                        return
+                    repair_ts = pd.to_datetime(diag.get("repair_ts", ""), utc=True, errors="coerce")
+                    if pd.isna(repair_ts):
+                        return
+                    key = pd.Timestamp(repair_ts)
+                    entry = reserve_buffer_repair_by_ts.get(key)
+                    if not entry:
+                        return
+                    charge_mw = max(0.0, float(diag.get("repair_charge_mw", 0.0) or 0.0))
+                    discharge_mw = max(0.0, float(diag.get("repair_discharge_mw", 0.0) or 0.0))
+                    entry["charge_mw"] = max(0.0, float(entry.get("charge_mw", 0.0) or 0.0) - charge_mw)
+                    entry["discharge_mw"] = max(
+                        0.0,
+                        float(entry.get("discharge_mw", 0.0) or 0.0) - discharge_mw,
+                    )
+                    if (
+                        float(entry.get("charge_mw", 0.0) or 0.0) <= 1e-12
+                        and float(entry.get("discharge_mw", 0.0) or 0.0) <= 1e-12
+                    ):
+                        entry["status"] = "discarded_not_binding"
+                        entry["reason"] = "reserve_repair_not_binding_derated"
+
+                def _reserve_buffer_repair_is_binding(diag: dict[str, float | str]) -> tuple[bool, str]:
+                    """Precommit can only preserve MW when repair is already a fixed action."""
+                    repair_ts = pd.to_datetime(diag.get("repair_ts", ""), utc=True, errors="coerce")
+                    if pd.isna(repair_ts) or reserve_buffer_repair_by_ts is None:
+                        return False, "reserve_repair_not_binding_missing_fixed_id_action"
+                    entry = reserve_buffer_repair_by_ts.get(pd.Timestamp(repair_ts), {})
+                    if float(entry.get("binding_fixed_id_action", 0.0) or 0.0) >= 0.5:
+                        return True, "binding_fixed_id_action_present"
+                    return False, "reserve_repair_not_binding_derated"
 
                 def _largest_forward_feasible(
                     original_pos_mw: float,
@@ -22789,6 +22986,25 @@ class BatteryBacktester:
                 bcm_reserve_buffer_repair_reason = str(
                     reserve_buffer_repair_diag.get("reason", "none") or "none"
                 )
+                if bool(reserve_buffer_repair_applied):
+                    (
+                        reserve_buffer_repair_binding_ok,
+                        reserve_buffer_repair_binding_reason,
+                    ) = _reserve_buffer_repair_is_binding(reserve_buffer_repair_diag)
+                    bcm_reserve_buffer_repair_binding_pass = float(reserve_buffer_repair_binding_ok)
+                    bcm_reserve_buffer_repair_binding_reason = str(reserve_buffer_repair_binding_reason)
+                    if not reserve_buffer_repair_binding_ok:
+                        _discard_nonbinding_reserve_buffer_repair(reserve_buffer_repair_diag)
+                        bcm_reserve_buffer_repair_reason = str(reserve_buffer_repair_binding_reason)
+                        reserve_buffer_repair_diag["pass"] = 0.0
+                        reserve_buffer_repair_diag["scheduled_mwh"] = 0.0
+                        reserve_buffer_repair_diag["cost_eur"] = 0.0
+                        bcm_reserve_buffer_repair_scheduled_mwh = 0.0
+                        bcm_reserve_buffer_repair_cost_eur = 0.0
+                        reserve_buffer_repair_applied = False
+                else:
+                    bcm_reserve_buffer_repair_binding_pass = 1.0
+                    bcm_reserve_buffer_repair_binding_reason = "none"
                 bcm_reserve_buffer_replay_pass = float(
                     1.0 if bool(reserve_buffer_repair_applied) else reserve_buffer_repair_diag.get("pass", 0.0)
                 )
@@ -22985,6 +23201,15 @@ class BatteryBacktester:
                     bcm_reserve_buffer_derated_pos_mw = 0.0
                     bcm_reserve_buffer_derated_neg_mw = 0.0
                     bcm_reserve_buffer_rejected_reason = "none"
+                elif (
+                    str(bcm_reserve_buffer_repair_binding_reason).startswith("reserve_repair_not_binding")
+                    and (
+                        bcm_reserve_buffer_derated_pos_mw > 1e-9
+                        or bcm_reserve_buffer_derated_neg_mw > 1e-9
+                    )
+                ):
+                    bcm_protected_soc_rejection_reason = str(bcm_reserve_buffer_repair_binding_reason)
+                    bcm_reserve_buffer_rejected_reason = str(bcm_reserve_buffer_repair_binding_reason)
                 if protected_min_values:
                     bcm_required_protected_soc_min_mwh = float(
                         max(
@@ -23144,6 +23369,12 @@ class BatteryBacktester:
                 )
                 bcm_precommit_stats["reserve_buffer_repair_reason"] = str(
                     bcm_reserve_buffer_repair_reason
+                )
+                bcm_precommit_stats["reserve_buffer_repair_binding_pass"] = float(
+                    bcm_reserve_buffer_repair_binding_pass
+                )
+                bcm_precommit_stats["reserve_buffer_repair_binding_reason"] = str(
+                    bcm_reserve_buffer_repair_binding_reason
                 )
                 bcm_precommit_stats["reserve_buffer_replay_pass"] = float(
                     bcm_reserve_buffer_replay_pass
@@ -23742,6 +23973,14 @@ class BatteryBacktester:
                     str(bcm_reserve_buffer_repair_reason),
                 )
                 bcm_precommit_stats.setdefault(
+                    "reserve_buffer_repair_binding_pass",
+                    float(bcm_reserve_buffer_repair_binding_pass),
+                )
+                bcm_precommit_stats.setdefault(
+                    "reserve_buffer_repair_binding_reason",
+                    str(bcm_reserve_buffer_repair_binding_reason),
+                )
+                bcm_precommit_stats.setdefault(
                     "reserve_buffer_replay_pass",
                     float(bcm_reserve_buffer_replay_pass),
                 )
@@ -24273,6 +24512,12 @@ class BatteryBacktester:
                             )
                         precommit_audit_by_ts.setdefault("bcm_reserve_buffer_repair_reason", {})[tsu] = str(
                             bcm_precommit_stats.get("reserve_buffer_repair_reason", "none")
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_reserve_buffer_repair_binding_pass", {})[tsu] = float(
+                            bcm_precommit_stats.get("reserve_buffer_repair_binding_pass", 1.0)
+                        )
+                        precommit_audit_by_ts.setdefault("bcm_reserve_buffer_repair_binding_reason", {})[tsu] = str(
+                            bcm_precommit_stats.get("reserve_buffer_repair_binding_reason", "none")
                         )
                         precommit_audit_by_ts.setdefault("bcm_reserve_buffer_first_violation_ts_utc", {})[tsu] = str(
                             bcm_precommit_stats.get("reserve_buffer_first_violation_ts_utc", "")
@@ -25009,6 +25254,12 @@ class BatteryBacktester:
                         )
                     precommit_audit_by_ts.setdefault("bcm_reserve_buffer_repair_reason", {})[tsu] = str(
                         bcm_precommit_stats.get("reserve_buffer_repair_reason", "none")
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_reserve_buffer_repair_binding_pass", {})[tsu] = float(
+                        bcm_precommit_stats.get("reserve_buffer_repair_binding_pass", 1.0)
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_reserve_buffer_repair_binding_reason", {})[tsu] = str(
+                        bcm_precommit_stats.get("reserve_buffer_repair_binding_reason", "none")
                     )
                     precommit_audit_by_ts.setdefault("bcm_reserve_buffer_first_violation_ts_utc", {})[tsu] = str(
                         bcm_precommit_stats.get("reserve_buffer_first_violation_ts_utc", "")
@@ -34427,6 +34678,8 @@ class BatteryBacktester:
                     "bcm_reserve_buffer_repair_scheduled_mwh",
                     "bcm_reserve_buffer_repair_cost_eur",
                     "bcm_reserve_buffer_repair_reason",
+                    "bcm_reserve_buffer_repair_binding_pass",
+                    "bcm_reserve_buffer_repair_binding_reason",
                     "bcm_reserve_buffer_replay_pass",
                     "bcm_reserve_buffer_first_violation_ts_utc",
                     "bcm_reserve_buffer_required_soc_min_mwh",
@@ -34453,6 +34706,8 @@ class BatteryBacktester:
                     "repair_attempted",
                     "repair_scheduled_mwh",
                     "repair_cost_eur",
+                    "repair_binding_pass",
+                    "repair_binding_reason",
                     "replay_pass",
                     "first_violation_ts_utc",
                     "required_soc_min_mwh",
@@ -34487,6 +34742,7 @@ class BatteryBacktester:
                         "repair_attempted",
                         "repair_scheduled_mwh",
                         "repair_cost_eur",
+                        "repair_binding_pass",
                         "required_soc_min_mwh",
                         "derated_pos_mw",
                         "derated_neg_mw",
@@ -39513,7 +39769,142 @@ class BatteryBacktester:
         else:
             summary["first_da_realized_without_precommit_origin_timestamp_utc"] = ""
             summary["da_realized_without_precommit_origin_missing_columns"] = "[]"
+        source_truth_missing: list[str] = []
+        source_truth_reason_flags: set[str] = set()
+        path_source_truth_missing: dict[str, list[str]] = {"naive": [], "rhpf": []}
+
+        def _has_source_truth_field(
+            label: str,
+            aliases: tuple[str, ...],
+            *,
+            reason: str,
+            path: str | None = None,
+        ) -> bool:
+            """Validate active source-of-truth fields without changing optional diagnostic defaults."""
+            if self._source_truth_alias_group_present(hourly, summary, aliases):
+                return True
+            source_truth_missing.append(str(label))
+            source_truth_reason_flags.add(str(reason))
+            if path in path_source_truth_missing:
+                path_source_truth_missing[str(path)].append(str(label))
+            return False
+
+        def _require_groups(
+            groups: list[tuple[str, tuple[str, ...], str]],
+            *,
+            active: bool,
+            path: str | None = None,
+        ) -> None:
+            if not bool(active):
+                return
+            for label, aliases, reason in groups:
+                _has_source_truth_field(label, aliases, reason=reason, path=path)
+
+        active_da_market = bool(getattr(run_strategy_permissions, "allow_da", False))
+        active_bcm_market = bool(getattr(run_strategy_permissions, "allow_bcm", False))
+        active_bem_market = bool(getattr(run_strategy_permissions, "allow_bem_only", False))
+        rhpf_enabled = bool(benchmark_paths.get("rhpf", False))
+        naive_enabled = bool(benchmark_paths.get("naive", False))
+
+        da_source_groups = [
+            ("da.submitted_buy", ("real_submitted_da_buy_mw", "submitted_da_buy_mw"), "missing_source_of_truth_da"),
+            ("da.submitted_sell", ("real_submitted_da_sell_mw", "submitted_da_sell_mw"), "missing_source_of_truth_da"),
+            ("da.accepted_buy", ("real_da_buy_accepted", "da_buy_accepted"), "missing_source_of_truth_da"),
+            ("da.accepted_sell", ("real_da_sell_accepted", "da_sell_accepted"), "missing_source_of_truth_da"),
+            ("da.executed_buy", ("real_da_buy_mwh", "da_buy_mwh"), "missing_source_of_truth_da"),
+            ("da.executed_sell", ("real_da_sell_mwh", "da_sell_mwh"), "missing_source_of_truth_da"),
+            (
+                "da.lockbook_proof",
+                ("da_lockbook_row_present", "real_da_lockbook_row_present", "da_is_locked_delivery_hour"),
+                "missing_source_of_truth_da_lockbook",
+            ),
+        ]
+        naive_da_source_groups = [
+            ("naive.da.submitted_buy", ("naive_submitted_da_buy_mw",), "missing_source_of_truth_da"),
+            ("naive.da.submitted_sell", ("naive_submitted_da_sell_mw",), "missing_source_of_truth_da"),
+            ("naive.da.executed_buy", ("naive_da_buy_mwh",), "missing_source_of_truth_da"),
+            ("naive.da.executed_sell", ("naive_da_sell_mwh",), "missing_source_of_truth_da"),
+            (
+                "naive.da.lockbook_proof",
+                ("naive_da_selected_lockable_buy_mwh", "naive_da_selected_lockable_sell_mwh", "naive_da_replay_pass"),
+                "missing_source_of_truth_da_lockbook",
+            ),
+        ]
+        rhpf_da_source_groups = [
+            ("rhpf.da.submitted_buy", ("perfect_foresight_submitted_da_buy_mw", "rolling_pf_da_submitted_buy_mwh"), "missing_source_of_truth_da"),
+            ("rhpf.da.submitted_sell", ("perfect_foresight_submitted_da_sell_mw", "rolling_pf_da_submitted_sell_mwh"), "missing_source_of_truth_da"),
+            ("rhpf.da.executed_buy", ("perfect_foresight_da_buy_mwh", "rolling_pf_da_realized_buy_mwh"), "missing_source_of_truth_da"),
+            ("rhpf.da.executed_sell", ("perfect_foresight_da_sell_mwh", "rolling_pf_da_realized_sell_mwh"), "missing_source_of_truth_da"),
+            (
+                "rhpf.da.lockbook_proof",
+                ("rolling_pf_da_selected_lockable_buy_mwh", "rolling_pf_da_selected_lockable_sell_mwh", "rolling_pf_da_replay_pass"),
+                "missing_source_of_truth_da_lockbook",
+            ),
+        ]
+        bcm_source_groups = [
+            ("bcm.locked_pos", ("real_locked_bcm_capacity_pos_mw", "locked_bcm_capacity_pos_mw"), "missing_source_of_truth_bcm"),
+            ("bcm.locked_neg", ("real_locked_bcm_capacity_neg_mw", "locked_bcm_capacity_neg_mw"), "missing_source_of_truth_bcm"),
+            ("bcm.awarded_pos", ("real_awarded_capacity_pos_mw", "real_executed_bcm_capacity_pos_mw", "bcm_awarded_capacity_pos_mw"), "missing_source_of_truth_bcm"),
+            ("bcm.awarded_neg", ("real_awarded_capacity_neg_mw", "real_executed_bcm_capacity_neg_mw", "bcm_awarded_capacity_neg_mw"), "missing_source_of_truth_bcm"),
+            ("bcm.capacity_price_pos", ("real_bcm_capacity_bid_price_pos_eur_per_mw_h", "real_settlement_cap_bid_price_pos_eur_mw"), "missing_source_of_truth_bcm"),
+            ("bcm.capacity_price_neg", ("real_bcm_capacity_bid_price_neg_eur_per_mw_h", "real_settlement_cap_bid_price_neg_eur_mw"), "missing_source_of_truth_bcm"),
+        ]
+        rhpf_bcm_source_groups = [
+            ("rhpf.bcm.locked_pos", ("perfect_foresight_locked_bcm_capacity_pos_mw",), "missing_source_of_truth_rhpf_reserve"),
+            ("rhpf.bcm.locked_neg", ("perfect_foresight_locked_bcm_capacity_neg_mw",), "missing_source_of_truth_rhpf_reserve"),
+            ("rhpf.bcm.awarded_pos", ("perfect_foresight_awarded_capacity_pos_mw", "perfect_foresight_executed_bcm_capacity_pos_mw"), "missing_source_of_truth_rhpf_reserve"),
+            ("rhpf.bcm.awarded_neg", ("perfect_foresight_awarded_capacity_neg_mw", "perfect_foresight_executed_bcm_capacity_neg_mw"), "missing_source_of_truth_rhpf_reserve"),
+        ]
+        bem_source_groups = [
+            ("bem.submitted_pos", ("real_bem_only_submitted_pos_mw", "bem_only_submitted_pos_mw"), "missing_source_of_truth_bem"),
+            ("bem.submitted_neg", ("real_bem_only_submitted_neg_mw", "bem_only_submitted_neg_mw"), "missing_source_of_truth_bem"),
+            ("bem.executed_pos", ("real_bem_only_executed_pos_mw", "bem_only_executed_pos_mw"), "missing_source_of_truth_bem"),
+            ("bem.executed_neg", ("real_bem_only_executed_neg_mw", "bem_only_executed_neg_mw"), "missing_source_of_truth_bem"),
+        ]
+        rhpf_bem_source_groups = [
+            ("rhpf.bem.submitted_pos", ("perfect_foresight_bem_only_submitted_pos_mw",), "missing_source_of_truth_rhpf_reserve"),
+            ("rhpf.bem.submitted_neg", ("perfect_foresight_bem_only_submitted_neg_mw",), "missing_source_of_truth_rhpf_reserve"),
+            ("rhpf.bem.executed_pos", ("perfect_foresight_bem_only_executed_pos_mw",), "missing_source_of_truth_rhpf_reserve"),
+            ("rhpf.bem.executed_neg", ("perfect_foresight_bem_only_executed_neg_mw",), "missing_source_of_truth_rhpf_reserve"),
+        ]
+        terminal_repair_claimed = bool(
+            float(summary.get("terminal_soc_repair_cost_eur", 0.0) or 0.0) > 1e-9
+            or float(summary.get("terminal_soc_recovery_id_mwh", 0.0) or 0.0) > 1e-9
+            or float(summary.get("terminal_soc_net_adjustment_eur", 0.0) or 0.0) != 0.0
+            or float(summary.get("final_soc_shortfall_mwh", 0.0) or 0.0) > 1e-9
+        )
+        terminal_source_groups = [
+            ("terminal.closure_applied", ("terminal_closure_applied", "real_terminal_closure_applied"), "missing_source_of_truth_terminal_repair"),
+            ("terminal.closure_reason", ("terminal_closure_reason", "real_terminal_closure_reason"), "missing_source_of_truth_terminal_repair"),
+            ("terminal.closure_id_buy", ("terminal_closure_id_buy_mwh", "real_terminal_closure_id_buy_mwh", "terminal_soc_recovery_id_mwh"), "missing_source_of_truth_terminal_repair"),
+            ("terminal.closure_id_sell", ("terminal_closure_id_sell_mwh", "real_terminal_closure_id_sell_mwh", "terminal_soc_liquidation_mwh"), "missing_source_of_truth_terminal_repair"),
+            ("terminal.closure_cost", ("terminal_closure_cost_eur", "terminal_soc_repair_cost_eur"), "missing_source_of_truth_terminal_repair"),
+            ("terminal.final_soc_after_closure", ("final_soc_after_terminal_closure_mwh", "terminal_closure_soc_after_mwh", "final_soc_actual_mwh"), "missing_source_of_truth_terminal_repair"),
+        ]
+
+        _require_groups(da_source_groups, active=active_da_market)
+        _require_groups(naive_da_source_groups, active=active_da_market and naive_enabled, path="naive")
+        _require_groups(rhpf_da_source_groups, active=active_da_market and rhpf_enabled, path="rhpf")
+        _require_groups(bcm_source_groups, active=active_bcm_market)
+        _require_groups(rhpf_bcm_source_groups, active=active_bcm_market and rhpf_enabled, path="rhpf")
+        _require_groups(bem_source_groups, active=active_bem_market)
+        _require_groups(rhpf_bem_source_groups, active=active_bem_market and rhpf_enabled, path="rhpf")
+        _require_groups(terminal_source_groups, active=terminal_repair_claimed)
+        source_truth_missing = list(dict.fromkeys(source_truth_missing))
+        summary["missing_source_of_truth_fields"] = json.dumps(source_truth_missing, sort_keys=True)
+        summary["missing_source_of_truth_field_count"] = float(len(source_truth_missing))
+        summary["critical_required_fields_defaulted"] = float(len(source_truth_missing))
+        summary["missing_source_of_truth_invalid_reasons"] = ",".join(sorted(source_truth_reason_flags))
+        summary["naive_missing_source_of_truth_fields"] = json.dumps(
+            list(dict.fromkeys(path_source_truth_missing["naive"])),
+            sort_keys=True,
+        )
+        summary["rhpf_missing_source_of_truth_fields"] = json.dumps(
+            list(dict.fromkeys(path_source_truth_missing["rhpf"])),
+            sort_keys=True,
+        )
         invalid_reasons: list[str] = []
+        invalid_reasons.extend(sorted(source_truth_reason_flags))
         if reserve_infeasible_hours > 0:
             invalid_reasons.append("reserve_infeasible")
         if bool(strict_simulation_validity):
@@ -39907,6 +40298,16 @@ class BatteryBacktester:
                 reasons.append("path_unavailable")
             if not np.isfinite(pnl):
                 reasons.append("nonfinite_path_pnl")
+            missing_source_fields_raw = str(
+                summary.get(f"{path}_missing_source_of_truth_fields", "[]") or "[]"
+            )
+            if missing_source_fields_raw.strip() not in {"", "[]"}:
+                if path == "rhpf" and any(token in missing_source_fields_raw for token in ("rhpf.bcm.", "rhpf.bem.")):
+                    reasons.append("missing_source_of_truth_rhpf_reserve")
+                if "da.lockbook_proof" in missing_source_fields_raw:
+                    reasons.append("missing_source_of_truth_da_lockbook")
+                elif path != "rhpf" or "rhpf.da." in missing_source_fields_raw:
+                    reasons.append("missing_source_of_truth_da")
 
             soc = _path_num_series(soc_col).dropna()
             if soc.empty:
@@ -40018,6 +40419,8 @@ class BatteryBacktester:
             "bcm_reserve_buffer_repair_scheduled_mwh",
             "bcm_reserve_buffer_repair_cost_eur",
             "bcm_reserve_buffer_repair_reason",
+            "bcm_reserve_buffer_repair_binding_pass",
+            "bcm_reserve_buffer_repair_binding_reason",
             "bcm_reserve_buffer_replay_pass",
             "bcm_reserve_buffer_first_violation_ts_utc",
             "bcm_reserve_buffer_required_soc_min_mwh",
@@ -40031,6 +40434,8 @@ class BatteryBacktester:
             "reserve_buffer_repair_scheduled_mwh",
             "reserve_buffer_repair_cost_eur",
             "reserve_buffer_repair_reason",
+            "reserve_buffer_repair_binding_pass",
+            "reserve_buffer_repair_binding_reason",
             "reserve_buffer_replay_pass",
             "reserve_buffer_first_violation_ts_utc",
             "reserve_buffer_required_soc_min_mwh",
@@ -40303,6 +40708,12 @@ class BatteryBacktester:
             ("partial_bcm_block_at_start", 0.0),
             ("partial_bcm_block_at_end", 0.0),
             ("benchmark_same_rules_gate_consistent", 1.0),
+            ("missing_source_of_truth_fields", "[]"),
+            ("missing_source_of_truth_field_count", 0.0),
+            ("missing_source_of_truth_invalid_reasons", ""),
+            ("critical_required_fields_defaulted", 0.0),
+            ("naive_missing_source_of_truth_fields", "[]"),
+            ("rhpf_missing_source_of_truth_fields", "[]"),
             ("final_soc_mode", "hard_min"),
             ("benchmark_is_global_upper_bound", 0.0),
             ("rolling_perfect_foresight_same_rules_is_global_upper_bound", 0.0),

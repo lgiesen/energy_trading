@@ -6970,6 +6970,181 @@ def test_da_nonfinal_terminal_deferral_does_not_zero_profitable_raw_candidate(mo
     assert {float(row["da_no_silent_zero_violation"]) for row in audit} == {0.0}
 
 
+def test_da_support_sizer_nonfinal_terminal_deferral_keeps_sized_candidate(monkeypatch) -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.soc_min = 0.0
+    bt.soc_max = 20.0
+    bt.p_max_mw = 10.0
+    bt.final_soc_mode = "hard_min"
+
+    ts_buy = pd.Timestamp("2025-01-02T00:00:00Z")
+    ts_sell = pd.Timestamp("2025-01-02T01:00:00Z")
+    lock_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts_buy, ts_sell],
+            "target_time_utc": [ts_buy, ts_sell],
+            "charge_mw": [1.0, 0.0],
+            "discharge_mw": [0.0, 1.0],
+            col.pred_da_price: [0.0, 100.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+            "predicted_objective_eur": [100.0, 100.0],
+        }
+    )
+
+    class NonzeroLinprogResult:
+        success = True
+        x = np.asarray([1.0, 0.0, 0.0, 1.0], dtype=float)
+        fun = -100.0
+        message = "forced nonzero LP solution"
+
+    monkeypatch.setattr(
+        battery_backtest_module,
+        "linprog",
+        lambda *args, **kwargs: NonzeroLinprogResult(),
+    )
+
+    def fake_postlock_replay(**kwargs):
+        da_lockbook = kwargs.get("da_lockbook", {}) or {}
+        has_candidate = any(
+            max(0.0, float(ch)) + max(0.0, float(dis)) > 1e-9
+            for ch, dis in da_lockbook.values()
+        )
+        diag = {
+            "projected_soc_min_mwh": 5.0,
+            "projected_soc_max_mwh": 6.0,
+            "projected_final_soc_mwh": 5.0,
+            "projected_power_violation_pos_mw": 0.0,
+            "projected_power_violation_neg_mw": 0.0,
+            "protected_soc_projection_violation_mwh": 0.0,
+            "expected_auxiliary_losses_mwh": 0.0,
+            "first_infeasible_timestamp_utc": "",
+            "da_terminal_sensitive_window": 0.0,
+            "da_terminal_sensitive_reason": "not_terminal_window",
+        }
+        if has_candidate:
+            diag.update(
+                {
+                    "infeasibility_driver": "none",
+                    "infeasibility_driver_detail": "terminal_shortfall_deferred_to_final_da_gate",
+                }
+            )
+            return False, diag
+        diag.update({"infeasibility_driver": "none", "infeasibility_driver_detail": "none"})
+        return True, diag
+
+    monkeypatch.setattr(bt, "_project_da_postlock_future_feasibility", fake_postlock_replay)
+
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=lock_rows,
+        colmap=col,
+        current_soc_mwh=5.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        future_rows=lock_rows,
+        existing_da_lockbook={},
+        global_end_utc=pd.Timestamp("2025-01-03T00:00:00Z"),
+    )
+
+    assert selected[ts_buy][0] == pytest.approx(1.0)
+    assert selected[ts_sell][1] == pytest.approx(1.0)
+    assert {str(row["da_bid_sizer_status"]) for row in audit} == {
+        "ok_deferred_terminal_nonfatal"
+    }
+    assert {
+        float(row["da_sized_candidate_buy_mw"]) + float(row["da_sized_candidate_sell_mw"])
+        for row in audit
+    } == {1.0}
+    assert {float(row["da_candidate_support_sizer_used_as_authority"]) for row in audit} == {0.0}
+    assert {str(row["da_zero_reason"]) for row in audit} == {"none"}
+
+
+def test_source_truth_alias_group_present_fails_missing_active_fields() -> None:
+    hourly = pd.DataFrame({"real_da_buy_mwh": [0.0, 1.0]})
+    summary = {"terminal_soc_repair_cost_eur": 12.0}
+
+    assert BatteryBacktester._source_truth_alias_group_present(
+        hourly,
+        summary,
+        ("real_da_buy_mwh", "da_buy_mwh"),
+    )
+    assert BatteryBacktester._source_truth_alias_group_present(
+        hourly,
+        summary,
+        ("terminal_closure_cost_eur", "terminal_soc_repair_cost_eur"),
+    )
+    assert not BatteryBacktester._source_truth_alias_group_present(
+        hourly,
+        summary,
+        ("perfect_foresight_locked_bcm_capacity_pos_mw",),
+    )
+
+
+def test_da_zero_selection_exports_concrete_zero_reason(monkeypatch) -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_off_mw = 0.0
+    bt.aux_trading_mw = 0.0
+    bt.soc_min = 0.0
+    bt.soc_max = 10.0
+    bt.p_max_mw = 10.0
+    ts_buy = pd.Timestamp("2025-01-02T00:00:00Z")
+    ts_sell = pd.Timestamp("2025-01-02T01:00:00Z")
+    lock_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts_buy, ts_sell],
+            "target_time_utc": [ts_buy, ts_sell],
+            "charge_mw": [1.0, 0.0],
+            "discharge_mw": [0.0, 1.0],
+            col.pred_da_price: [100.0, 0.0],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+            "predicted_objective_eur": [-100.0, -100.0],
+        }
+    )
+
+    class ZeroLinprogResult:
+        success = True
+        x = np.zeros(4, dtype=float)
+        fun = 0.0
+        message = "forced zero LP solution"
+
+    monkeypatch.setattr(
+        battery_backtest_module,
+        "linprog",
+        lambda *args, **kwargs: ZeroLinprogResult(),
+    )
+
+    selected, audit = bt._select_feasible_da_lock_schedule(
+        lock_rows=lock_rows,
+        colmap=col,
+        current_soc_mwh=5.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert sum(ch + dis for ch, dis in selected.values()) == pytest.approx(0.0)
+    reasons = {str(row["da_zero_reason"]) for row in audit}
+    assert reasons == {"no_trade_economically_better"}
+    assert not reasons & {
+        "no_trade_or_market_rounding_zeroed",
+        "accepted_lockbook_zeroed_after_postlock",
+        "no_nonzero_feasible_da_schedule",
+    }
+
+
 def test_da_trade_frequency_audit_counts_model_naive_and_rhpf_hours() -> None:
     model = pd.DataFrame(
         {
@@ -18965,7 +19140,7 @@ def test_bcm_naive_rejects_pos_capacity_when_soc_at_min_and_activation_requested
     )
 
 
-def test_bcm_reserve_buffer_id_repair_keeps_pos_capacity_when_prior_repair_feasible() -> None:
+def test_bcm_reserve_buffer_metadata_repair_does_not_preserve_pos_capacity_without_binding_id() -> None:
     bt = _configure_bcm_naive_guard_test_backtester()
     bt.reserve_activation_headroom_h = 0.5
     bt.aux_off_mw = 0.0
@@ -19003,15 +19178,20 @@ def test_bcm_reserve_buffer_id_repair_keeps_pos_capacity_when_prior_repair_feasi
         reserve_buffer_repair_by_ts=repairs,
     )
 
-    assert all(float(v) == pytest.approx(4.0) for v in lock_pos.values())
+    assert all(float(v) == pytest.approx(0.0) for v in lock_pos.values())
     assert repair_ts in repairs
-    assert float(repairs[repair_ts]["charge_mw"]) >= 4.0
-    assert float(repairs[repair_ts]["charge_mw"]) <= bt.p_max_mw
-    assert str(repairs[repair_ts]["reason"]) == "reserve_buffer_recovery"
+    assert float(repairs[repair_ts]["charge_mw"]) == pytest.approx(0.0)
+    assert str(repairs[repair_ts]["status"]) == "discarded_not_binding"
+    assert str(repairs[repair_ts]["reason"]) == "reserve_repair_not_binding_derated"
     assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_reserve_buffer_repair_attempted"].values())
-    assert all(float(v) >= 4.0 for v in pre["bcm_reserve_buffer_repair_scheduled_mwh"].values())
-    assert all(str(v) == "reserve_buffer_repair_scheduled" for v in pre["bcm_reserve_buffer_repair_reason"].values())
-    assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_reserve_buffer_replay_pass"].values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_reserve_buffer_repair_scheduled_mwh"].values())
+    assert all(str(v) == "reserve_repair_not_binding_derated" for v in pre["bcm_reserve_buffer_repair_reason"].values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_reserve_buffer_repair_binding_pass"].values())
+    assert all(
+        str(v) == "reserve_repair_not_binding_derated"
+        for v in pre["bcm_reserve_buffer_repair_binding_reason"].values()
+    )
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_reserve_buffer_replay_pass"].values())
 
 
 def test_bcm_naive_uses_executed_soc_and_activation_headroom_floor() -> None:
