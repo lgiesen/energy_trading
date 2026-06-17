@@ -32213,6 +32213,335 @@ class BatteryBacktester:
                     ),
                 }
             )
+
+            # End-to-end DA handoff audit only: optimizer/sizer/lockbook/clearing/settlement.
+            # This deliberately does not participate in DA selection or settlement decisions.
+            dt_h = float(self.dt_h)
+
+            def _finite_float(value: object) -> float:
+                try:
+                    out_val = float(value)
+                except Exception:
+                    return float("nan")
+                return out_val if np.isfinite(out_val) else float("nan")
+
+            def _row_mwh(*names: str) -> float:
+                for name in names:
+                    val = _finite_float(_g(name, np.nan))
+                    if np.isfinite(val):
+                        return val
+                return float("nan")
+
+            def _row_mw_as_mwh(*names: str) -> float:
+                for name in names:
+                    val = _finite_float(_g(name, np.nan))
+                    if np.isfinite(val):
+                        return val * dt_h
+                return float("nan")
+
+            def _map_number(mapping: Mapping[str, object], *names: str) -> float:
+                for name in names:
+                    if name in mapping:
+                        val = _finite_float(mapping.get(name))
+                        if np.isfinite(val):
+                            return val
+                return float("nan")
+
+            def _row_reason(*names: str) -> str:
+                ignored = {"", "none", "nan", "nat", "not_evaluated"}
+                for name in names:
+                    try:
+                        val = getattr(r, name)
+                    except Exception:
+                        continue
+                    sval = str(val or "").strip()
+                    if sval.lower() not in ignored:
+                        return sval
+                return "none"
+
+            def _map_reason(mapping: Mapping[str, object], *names: str) -> str:
+                ignored = {"", "none", "nan", "nat", "not_evaluated"}
+                for name in names:
+                    if name not in mapping:
+                        continue
+                    sval = str(mapping.get(name) or "").strip()
+                    if sval.lower() not in ignored:
+                        return sval
+                return "none"
+
+            def _first_reason(*reasons: str) -> str:
+                ignored = {"", "none", "nan", "nat", "not_evaluated"}
+                for reason in reasons:
+                    sval = str(reason or "").strip()
+                    if sval.lower() not in ignored:
+                        return sval
+                return "none"
+
+            raw_optimizer_buy_mwh = _row_mw_as_mwh(
+                "raw_optimizer_charge_mw_before_da_gate_mask",
+                "da_precommit_da_raw_candidate_buy_mw",
+                "da_raw_candidate_buy_mw",
+            )
+            raw_optimizer_sell_mwh = _row_mw_as_mwh(
+                "raw_optimizer_discharge_mw_before_da_gate_mask",
+                "da_precommit_da_raw_candidate_sell_mw",
+                "da_raw_candidate_sell_mw",
+            )
+            sized_buy_mwh = _row_mw_as_mwh(
+                "da_sized_candidate_buy_mw",
+                "da_precommit_da_sized_candidate_buy_mw",
+                "da_candidate_buy_mw",
+                "da_precommit_da_candidate_buy_mw",
+            )
+            sized_sell_mwh = _row_mw_as_mwh(
+                "da_sized_candidate_sell_mw",
+                "da_precommit_da_sized_candidate_sell_mw",
+                "da_candidate_sell_mw",
+                "da_precommit_da_candidate_sell_mw",
+            )
+            selected_lockable_buy_mwh = _row_mw_as_mwh(
+                "da_selected_lockable_buy_mw",
+                "da_precommit_da_selected_lockable_buy_mw",
+                "da_accepted_buy_mw",
+                "da_precommit_da_accepted_buy_mw",
+            )
+            selected_lockable_sell_mwh = _row_mw_as_mwh(
+                "da_selected_lockable_sell_mw",
+                "da_precommit_da_selected_lockable_sell_mw",
+                "da_accepted_sell_mw",
+                "da_precommit_da_accepted_sell_mw",
+            )
+            lockbook_buy_mwh = _row_mwh(
+                "da_physical_lockbook_buy_mwh",
+                "da_precommit_da_physical_lockbook_buy_mwh",
+                "locked_buy_mwh_by_hour",
+                "da_precommit_locked_buy_mwh_by_hour",
+                "accepted_lockbook_row_buy_mwh",
+                "da_precommit_accepted_lockbook_row_buy_mwh",
+            )
+            lockbook_sell_mwh = _row_mwh(
+                "da_physical_lockbook_sell_mwh",
+                "da_precommit_da_physical_lockbook_sell_mwh",
+                "locked_sell_mwh_by_hour",
+                "da_precommit_locked_sell_mwh_by_hour",
+                "accepted_lockbook_row_sell_mwh",
+                "da_precommit_accepted_lockbook_row_sell_mwh",
+            )
+            if not np.isfinite(lockbook_buy_mwh):
+                lockbook_buy_mwh = trace_written_buy
+            if not np.isfinite(lockbook_sell_mwh):
+                lockbook_sell_mwh = max(0.0, float(discharge)) * dt_h
+
+            cleared_buy_mwh = _map_number(clearing_rec, "da_auction_accepted_buy_mwh")
+            cleared_sell_mwh = _map_number(clearing_rec, "da_auction_accepted_sell_mwh")
+            if not np.isfinite(cleared_buy_mwh):
+                submitted_buy_mw = _map_number(clearing_rec, "submitted_da_buy_mw")
+                buy_accepted = _map_number(clearing_rec, "da_buy_accepted")
+                cleared_buy_mwh = (
+                    max(0.0, submitted_buy_mw) * dt_h
+                    if np.isfinite(submitted_buy_mw) and (not np.isfinite(buy_accepted) or buy_accepted > 0.5)
+                    else 0.0
+                )
+            if not np.isfinite(cleared_sell_mwh):
+                submitted_sell_mw = _map_number(clearing_rec, "submitted_da_sell_mw")
+                sell_accepted = _map_number(clearing_rec, "da_sell_accepted")
+                cleared_sell_mwh = (
+                    max(0.0, submitted_sell_mw) * dt_h
+                    if np.isfinite(submitted_sell_mw) and (not np.isfinite(sell_accepted) or sell_accepted > 0.5)
+                    else 0.0
+                )
+            settled_buy_mwh = float(charge) * dt_h
+            settled_sell_mwh = float(discharge) * dt_h
+
+            sizer_reason = _first_reason(
+                _row_reason(
+                    "da_bid_sizer_status",
+                    "da_precommit_da_bid_sizer_status",
+                    "da_canonical_sizer_failure_reason",
+                    "da_precommit_da_canonical_sizer_failure_reason",
+                    "da_bid_sizer_zero_reason",
+                    "da_precommit_da_bid_sizer_zero_reason",
+                ),
+                _row_reason("da_zero_reason", "da_precommit_da_zero_reason"),
+            )
+            selection_reason = _first_reason(
+                _row_reason(
+                    "selection_reason",
+                    "da_precommit_selection_reason",
+                    "da_final_selection_reason",
+                    "da_precommit_da_final_selection_reason",
+                    "da_volume_loss_reason",
+                    "da_precommit_da_volume_loss_reason",
+                ),
+                _row_reason("da_zero_reason", "da_precommit_da_zero_reason"),
+            )
+            postlock_reason = _first_reason(
+                _row_reason(
+                    "da_handoff_lost_postlock_candidate_reason",
+                    "da_precommit_da_handoff_lost_postlock_candidate_reason",
+                    "da_settlement_equiv_replay_reason",
+                    "da_precommit_da_settlement_equiv_replay_reason",
+                    "da_final_lockbook_consistency_reason",
+                    "da_precommit_da_final_lockbook_consistency_reason",
+                    "da_hourly_lock_infeasible_reason",
+                    "da_precommit_da_hourly_lock_infeasible_reason",
+                ),
+                _row_reason("da_volume_loss_reason", "da_precommit_da_volume_loss_reason"),
+            )
+            clearing_reason = _first_reason(
+                _map_reason(clearing_rec, "da_buy_reason", "da_sell_reason", "da_clearing_reason"),
+                "market_clearing_rejected"
+                if (
+                    max(0.0, _map_number(clearing_rec, "da_price_rejected_buy_mwh"))
+                    + max(0.0, _map_number(clearing_rec, "da_price_rejected_sell_mwh"))
+                    > 1e-9
+                )
+                else "none",
+            )
+            settlement_reason = _first_reason(
+                "locked_da_buy_exceeds_soc_headroom" if float(m.get("da_unexecuted_buy_mwh", 0.0) or 0.0) > 1e-9 else "none",
+                "locked_da_sell_exceeds_soc_footroom" if float(m.get("da_unexecuted_sell_mwh", 0.0) or 0.0) > 1e-9 else "none",
+                str(m.get("da_execution_failure_reason", "none") or "none"),
+            )
+
+            def _stage_diff(prev_buy: float, prev_sell: float, next_buy: float, next_sell: float) -> bool:
+                vals = (prev_buy, prev_sell, next_buy, next_sell)
+                return all(np.isfinite(v) for v in vals) and (
+                    abs(float(prev_buy) - float(next_buy)) > 1e-9
+                    or abs(float(prev_sell) - float(next_sell)) > 1e-9
+                )
+
+            mismatch_reasons: list[str] = []
+            if _stage_diff(raw_optimizer_buy_mwh, raw_optimizer_sell_mwh, sized_buy_mwh, sized_sell_mwh):
+                mismatch_reasons.append(
+                    "raw_to_sized:"
+                    + (
+                        sizer_reason
+                        if sizer_reason != "none"
+                        else "raw_to_sized_changed_without_explicit_reason"
+                    )
+                )
+            if _stage_diff(sized_buy_mwh, sized_sell_mwh, selected_lockable_buy_mwh, selected_lockable_sell_mwh):
+                mismatch_reasons.append(
+                    "sized_to_selected:"
+                    + (
+                        selection_reason
+                        if selection_reason != "none"
+                        else "sized_to_selected_changed_without_explicit_reason"
+                    )
+                )
+            if _stage_diff(
+                selected_lockable_buy_mwh,
+                selected_lockable_sell_mwh,
+                lockbook_buy_mwh,
+                lockbook_sell_mwh,
+            ):
+                mismatch_reasons.append(
+                    "selected_to_lockbook:"
+                    + (
+                        postlock_reason
+                        if postlock_reason != "none"
+                        else "selected_to_lockbook_changed_without_explicit_reason"
+                    )
+                )
+            if _stage_diff(lockbook_buy_mwh, lockbook_sell_mwh, cleared_buy_mwh, cleared_sell_mwh):
+                mismatch_reasons.append(
+                    "lockbook_to_cleared:"
+                    + (
+                        clearing_reason
+                        if clearing_reason != "none"
+                        else "lockbook_to_cleared_changed_without_explicit_reason"
+                    )
+                )
+            if _stage_diff(cleared_buy_mwh, cleared_sell_mwh, settled_buy_mwh, settled_sell_mwh):
+                mismatch_reasons.append(
+                    "cleared_to_settled:"
+                    + (
+                        settlement_reason
+                        if settlement_reason != "none"
+                        else "cleared_to_settled_changed_without_explicit_reason"
+                    )
+                )
+
+            audit_prefix = f"{kind}_da_handoff_audit"
+            m.update(
+                {
+                    f"{audit_prefix}_raw_optimizer_buy_mwh": float(raw_optimizer_buy_mwh),
+                    f"{audit_prefix}_raw_optimizer_sell_mwh": float(raw_optimizer_sell_mwh),
+                    f"{audit_prefix}_sized_buy_mwh": float(sized_buy_mwh),
+                    f"{audit_prefix}_sized_sell_mwh": float(sized_sell_mwh),
+                    f"{audit_prefix}_selected_lockable_buy_mwh": float(selected_lockable_buy_mwh),
+                    f"{audit_prefix}_selected_lockable_sell_mwh": float(selected_lockable_sell_mwh),
+                    f"{audit_prefix}_lockbook_buy_mwh": float(lockbook_buy_mwh),
+                    f"{audit_prefix}_lockbook_sell_mwh": float(lockbook_sell_mwh),
+                    f"{audit_prefix}_cleared_buy_mwh": float(cleared_buy_mwh),
+                    f"{audit_prefix}_cleared_sell_mwh": float(cleared_sell_mwh),
+                    f"{audit_prefix}_settled_buy_mwh": float(settled_buy_mwh),
+                    f"{audit_prefix}_settled_sell_mwh": float(settled_sell_mwh),
+                    f"{audit_prefix}_raw_to_sized_delta_buy_mwh": float(
+                        sized_buy_mwh - raw_optimizer_buy_mwh
+                        if np.isfinite(sized_buy_mwh) and np.isfinite(raw_optimizer_buy_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_raw_to_sized_delta_sell_mwh": float(
+                        sized_sell_mwh - raw_optimizer_sell_mwh
+                        if np.isfinite(sized_sell_mwh) and np.isfinite(raw_optimizer_sell_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_sized_to_selected_delta_buy_mwh": float(
+                        selected_lockable_buy_mwh - sized_buy_mwh
+                        if np.isfinite(selected_lockable_buy_mwh) and np.isfinite(sized_buy_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_sized_to_selected_delta_sell_mwh": float(
+                        selected_lockable_sell_mwh - sized_sell_mwh
+                        if np.isfinite(selected_lockable_sell_mwh) and np.isfinite(sized_sell_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_selected_to_lockbook_delta_buy_mwh": float(
+                        lockbook_buy_mwh - selected_lockable_buy_mwh
+                        if np.isfinite(lockbook_buy_mwh) and np.isfinite(selected_lockable_buy_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_selected_to_lockbook_delta_sell_mwh": float(
+                        lockbook_sell_mwh - selected_lockable_sell_mwh
+                        if np.isfinite(lockbook_sell_mwh) and np.isfinite(selected_lockable_sell_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_lockbook_to_cleared_delta_buy_mwh": float(
+                        cleared_buy_mwh - lockbook_buy_mwh
+                        if np.isfinite(cleared_buy_mwh) and np.isfinite(lockbook_buy_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_lockbook_to_cleared_delta_sell_mwh": float(
+                        cleared_sell_mwh - lockbook_sell_mwh
+                        if np.isfinite(cleared_sell_mwh) and np.isfinite(lockbook_sell_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_cleared_to_settled_delta_buy_mwh": float(
+                        settled_buy_mwh - cleared_buy_mwh
+                        if np.isfinite(settled_buy_mwh) and np.isfinite(cleared_buy_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_cleared_to_settled_delta_sell_mwh": float(
+                        settled_sell_mwh - cleared_sell_mwh
+                        if np.isfinite(settled_sell_mwh) and np.isfinite(cleared_sell_mwh)
+                        else float("nan")
+                    ),
+                    f"{audit_prefix}_stage_mismatch": float(bool(mismatch_reasons)),
+                    f"{audit_prefix}_mismatch_reason": ";".join(mismatch_reasons) if mismatch_reasons else "none",
+                    f"{audit_prefix}_postlock_zeroed": float(
+                        _g(
+                            "da_handoff_lost_postlock_candidate",
+                            _g("da_precommit_da_handoff_lost_postlock_candidate", 0.0),
+                        )
+                        > 0.5
+                    ),
+                    f"{audit_prefix}_postlock_zero_reason": (
+                        postlock_reason if postlock_reason != "none" else "none"
+                    ),
+                }
+            )
             # Realized headroom audit (aligned to settlement-time commitments).
             committed_bem_pos_mw = float(clearing_rec.get("bem_only_submitted_pos_mw", 0.0))
             committed_bem_neg_mw = float(clearing_rec.get("bem_only_submitted_neg_mw", 0.0))
@@ -39110,6 +39439,45 @@ class BatteryBacktester:
         summary["da_quantile_fallback_count"] = float(
             _summary_num_series("real_da_price_fallback_used", "da_price_fallback_used").gt(0.5).sum()
         )
+        for audit_kind in ("real", "naive", "perfect_foresight"):
+            mismatch_col = f"{audit_kind}_da_handoff_audit_stage_mismatch"
+            reason_col = f"{audit_kind}_da_handoff_audit_mismatch_reason"
+            summary_prefix = f"{audit_kind}_da_handoff_audit"
+            if mismatch_col in hourly.columns:
+                mismatch_mask = pd.to_numeric(hourly[mismatch_col], errors="coerce").fillna(0.0).gt(0.5)
+                summary[f"{summary_prefix}_stage_mismatch_count"] = float(mismatch_mask.sum())
+                if bool(mismatch_mask.any()) and colmap.timestamp in hourly.columns:
+                    mismatch_ts = pd.to_datetime(
+                        hourly.loc[mismatch_mask, colmap.timestamp],
+                        utc=True,
+                        errors="coerce",
+                    ).dropna()
+                    summary[f"{summary_prefix}_first_mismatch_ts_utc"] = (
+                        "" if mismatch_ts.empty else mismatch_ts.min().isoformat()
+                    )
+                else:
+                    summary[f"{summary_prefix}_first_mismatch_ts_utc"] = ""
+                if reason_col in hourly.columns:
+                    reasons = (
+                        hourly.loc[mismatch_mask, reason_col]
+                        .fillna("")
+                        .astype(str)
+                        .str.strip()
+                    )
+                    unique_reasons = sorted(
+                        {
+                            reason
+                            for reason in reasons
+                            if reason and reason.lower() not in {"none", "nan", "nat"}
+                        }
+                    )
+                    summary[f"{summary_prefix}_mismatch_reasons"] = json.dumps(unique_reasons[:25])
+                else:
+                    summary[f"{summary_prefix}_mismatch_reasons"] = "[]"
+            else:
+                summary[f"{summary_prefix}_stage_mismatch_count"] = 0.0
+                summary[f"{summary_prefix}_first_mismatch_ts_utc"] = ""
+                summary[f"{summary_prefix}_mismatch_reasons"] = "[]"
         da_cashflow_replay_error = _summary_num_series("da_precommit_cashflow_replay_error")
         da_pnl_replay_error_abs = _summary_num_series(
             "da_precommit_candidate_pnl_reconciliation_error_eur",
