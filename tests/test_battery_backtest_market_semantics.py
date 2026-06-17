@@ -136,6 +136,30 @@ def test_predicted_settlement_uses_df_activation_rate_when_dispatch_placeholder_
         col.pred_afrr_activation_rate_pos,
     ]
 
+    df_without_predicted_market_cols = df[[col.timestamp]].copy()
+    dispatch_with_finite_market_cols = dispatch.copy()
+    dispatch_with_finite_market_cols[col.pred_da_price] = [80.0, 81.0]
+    dispatch_with_finite_market_cols[col.pred_afrr_capacity_price_pos] = [10.0, 11.0]
+    dispatch_with_finite_market_cols[col.pred_afrr_capacity_price_neg] = [9.0, 9.5]
+    dispatch_with_finite_market_cols[col.pred_afrr_activation_price_pos] = [120.0, 121.0]
+    dispatch_with_finite_market_cols[col.pred_afrr_activation_price_neg] = [-20.0, -21.0]
+    dispatch_with_finite_market_cols[col.pred_afrr_activation_rate_pos] = [0.45, 0.55]
+    dispatch_with_finite_market_cols[col.pred_afrr_activation_rate_neg] = [0.30, 0.40]
+
+    settled_from_dispatch_source = bt.settle_dispatch(
+        df_without_predicted_market_cols,
+        dispatch_with_finite_market_cols,
+        col,
+        predicted_settlement=True,
+    )
+
+    assert settled_from_dispatch_source[col.pred_da_price].tolist() == pytest.approx([80.0, 81.0])
+    assert settled_from_dispatch_source[col.pred_afrr_capacity_price_pos].tolist() == pytest.approx([10.0, 11.0])
+    assert settled_from_dispatch_source[col.pred_afrr_activation_price_pos].tolist() == pytest.approx([120.0, 121.0])
+    assert settled_from_dispatch_source[col.pred_afrr_activation_rate_pos].tolist() == pytest.approx([0.45, 0.55])
+    assert not (settled_from_dispatch_source[col.pred_afrr_activation_rate_pos] == 0.0).any()
+    assert settled_from_dispatch_source["pred_plan_reserve_pos_mw"].tolist() == pytest.approx([1.0, 2.0])
+
 
 def test_checkpoint_atomic_json_write(tmp_path: Path) -> None:
     path = tmp_path / "checkpoints" / "stage_summary.json"

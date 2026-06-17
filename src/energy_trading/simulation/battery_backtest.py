@@ -32350,6 +32350,35 @@ class BatteryBacktester:
             )
         base_cols = [c for c in dict.fromkeys(base_cols) if c in df.columns]
         market_side = df[base_cols].copy()
+        if predicted_settlement:
+            # Forecast-warehouse rolling runs can materialize authoritative
+            # predicted market columns on dispatch/window rather than the base
+            # df. Use dispatch only as a finite per-column fallback; never let
+            # NaN pred_/true_ placeholders override df-side market data.
+            dispatch_by_ts = dispatch.set_index(colmap.timestamp)
+            for market_col in [
+                da_col,
+                cap_pos_col,
+                cap_neg_col,
+                act_pos_col,
+                act_neg_col,
+                rate_pos_col,
+                rate_neg_col,
+            ]:
+                if market_col in market_side.columns:
+                    current = pd.to_numeric(market_side[market_col], errors="coerce")
+                else:
+                    current = pd.Series(np.nan, index=market_side.index, dtype=float)
+                if market_col not in dispatch_by_ts.columns:
+                    market_side[market_col] = current.to_numpy(dtype=float)
+                    continue
+                fallback = pd.to_numeric(
+                    market_side[colmap.timestamp].map(dispatch_by_ts[market_col]),
+                    errors="coerce",
+                )
+                current_bad = current.isna() | ~np.isfinite(current.to_numpy(dtype=float, na_value=np.nan))
+                fallback_ok = fallback.notna() & np.isfinite(fallback.to_numpy(dtype=float, na_value=np.nan))
+                market_side[market_col] = current.where(~(current_bad & fallback_ok), fallback)
         # Decision-driven, strict boundary: settlement intent comes from
         # dispatch; market prices come from canonical market_side only.
         dispatch_clean = dispatch[[c for c in dispatch_cols if c in dispatch.columns]].copy()
@@ -32388,7 +32417,7 @@ class BatteryBacktester:
         # Data-loss check: only meaningful when canonical pred price already
         # existed on df side before merge. If it did, left-merge must not
         # increase missingness.
-        if colmap.pred_da_price in market_side.columns:
+        if colmap.pred_da_price in df.columns:
             before = pd.to_numeric(df[colmap.pred_da_price], errors="coerce")
             before_bad = int((before.isna() | ~np.isfinite(before.to_numpy(dtype=float))).sum())
             after = pd.to_numeric(merged[colmap.pred_da_price], errors="coerce")
