@@ -3772,11 +3772,25 @@ class BatteryBacktester:
         source = source.drop_duplicates(subset=["_source_ts_utc"], keep="last").set_index("_source_ts_utc")
         out_ts = pd.to_datetime(out[timestamp_col], utc=True, errors="coerce")
 
-        resolved_pos_col, resolved_neg_col = self._resolved_activation_rate_columns(source, colmap)
-        source_truth_cols = [
-            (resolved_pos_col, colmap.pred_afrr_activation_rate_pos, f"{context}.activation_rate_pos"),
-            (resolved_neg_col, colmap.pred_afrr_activation_rate_neg, f"{context}.activation_rate_neg"),
-        ]
+        if str(context).startswith("real_"):
+            source_truth_cols = [
+                (
+                    colmap.true_afrr_activation_rate_pos,
+                    colmap.true_afrr_activation_rate_pos,
+                    f"{context}.activation_rate_pos",
+                ),
+                (
+                    colmap.true_afrr_activation_rate_neg,
+                    colmap.true_afrr_activation_rate_neg,
+                    f"{context}.activation_rate_neg",
+                ),
+            ]
+        else:
+            resolved_pos_col, resolved_neg_col = self._resolved_activation_rate_columns(source, colmap)
+            source_truth_cols = [
+                (resolved_pos_col, colmap.pred_afrr_activation_rate_pos, f"{context}.activation_rate_pos"),
+                (resolved_neg_col, colmap.pred_afrr_activation_rate_neg, f"{context}.activation_rate_neg"),
+            ]
         for source_col, canonical_col, label in source_truth_cols:
             if canonical_col in out.columns:
                 existing = pd.to_numeric(out[canonical_col], errors="coerce")
@@ -10310,6 +10324,7 @@ class BatteryBacktester:
         fixed_reserve_pos: dict[pd.Timestamp, float] | None = None,
         fixed_reserve_neg: dict[pd.Timestamp, float] | None = None,
         scheduled_id_by_ts: dict[pd.Timestamp, tuple[float, float]] | None = None,
+        activation_rate_source_rows: pd.DataFrame | None = None,
     ) -> tuple[float, dict[str, float | str]]:
         """Prefer settlement-equivalent fixed-obligation replay over stale planned SoC."""
         has_settlement_anchor_obligations = bool(
@@ -10330,6 +10345,7 @@ class BatteryBacktester:
                 fixed_reserve_pos=fixed_reserve_pos,
                 fixed_reserve_neg=fixed_reserve_neg,
                 scheduled_id_by_ts=scheduled_id_by_ts,
+                activation_rate_source_rows=activation_rate_source_rows,
             )
         )
         replay_rows_used = float(
@@ -10373,6 +10389,7 @@ class BatteryBacktester:
         fixed_reserve_pos: dict[pd.Timestamp, float] | None = None,
         fixed_reserve_neg: dict[pd.Timestamp, float] | None = None,
         scheduled_id_by_ts: dict[pd.Timestamp, tuple[float, float]] | None = None,
+        activation_rate_source_rows: pd.DataFrame | None = None,
     ) -> tuple[float, dict[str, float | str]]:
         """Replay fixed settlement obligations up to a DA gate for the SoC anchor."""
         ts_gate = pd.to_datetime(snapshot_ts, utc=True, errors="coerce")
@@ -10386,6 +10403,12 @@ class BatteryBacktester:
         if pd.isna(ts_gate) or rows is None or rows.empty or colmap.timestamp not in rows.columns:
             return float(soc), diag
         work = rows.copy()
+        if activation_rate_source_rows is not None and not activation_rate_source_rows.empty:
+            work = self._preserve_activation_rate_replay_source_columns(
+                work,
+                activation_rate_source_rows,
+                colmap,
+            )
         work[colmap.timestamp] = pd.to_datetime(work[colmap.timestamp], utc=True, errors="coerce")
         work = work.loc[work[colmap.timestamp].notna() & (work[colmap.timestamp] < pd.Timestamp(ts_gate))]
         work = work.sort_values(colmap.timestamp)
@@ -27394,6 +27417,7 @@ class BatteryBacktester:
         terminal_recovery_ledger: list[dict[str, object]] = []
         reopt_restart_done: set[pd.Timestamp] = set()
         asof_right_cache: dict[tuple[int, str], dict[int, pd.DataFrame]] = {}
+        activation_rate_replay_source_history = pd.DataFrame()
         accepted_path_fallback_contaminated = False
         i = 0
         progress_start = time.monotonic()
@@ -27424,6 +27448,38 @@ class BatteryBacktester:
             )
             progress_last_log = now
             progress_last_i = done
+
+        def _update_activation_rate_replay_source_history(
+            source_history: pd.DataFrame,
+            source_rows: pd.DataFrame,
+        ) -> pd.DataFrame:
+            if source_rows is None or source_rows.empty or colmap.timestamp not in source_rows.columns:
+                return source_history
+            activation_cols = [
+                c
+                for c in source_rows.columns
+                if "activation_rate" in str(c).lower() or "act_rate" in str(c).lower()
+            ]
+            if not activation_cols:
+                return source_history
+            keep_cols = [colmap.timestamp] + activation_cols
+            update = source_rows.loc[:, keep_cols].copy()
+            update[colmap.timestamp] = pd.to_datetime(update[colmap.timestamp], utc=True, errors="coerce")
+            update = update.dropna(subset=[colmap.timestamp])
+            if update.empty:
+                return source_history
+            combined = (
+                update
+                if source_history is None or source_history.empty
+                else pd.concat([source_history, update], ignore_index=True, sort=False)
+            )
+            combined[colmap.timestamp] = pd.to_datetime(
+                combined[colmap.timestamp],
+                utc=True,
+                errors="coerce",
+            )
+            combined = combined.dropna(subset=[colmap.timestamp])
+            return combined.drop_duplicates(subset=[colmap.timestamp], keep="last").copy()
 
         def _snapshot_plan_history_frame(
             snapshot_plan_in: pd.DataFrame,
@@ -28256,6 +28312,10 @@ class BatteryBacktester:
                     scheduled_grid_mwh / max(float(self.dt_h), 1e-12),
                     0.0,
                 )
+            activation_rate_replay_source_history = _update_activation_rate_replay_source_history(
+                activation_rate_replay_source_history,
+                window,
+            )
             optimizer_soc_feedback_mwh, optimizer_soc_feedback_diag = (
                 self._optimizer_soc_feedback_with_settlement_anchor(
                     rows=df,
@@ -28267,6 +28327,7 @@ class BatteryBacktester:
                     fixed_reserve_pos=afrr_cap_pos_lockbook,
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     scheduled_id_by_ts=optimizer_anchor_scheduled_id_by_ts,
+                    activation_rate_source_rows=activation_rate_replay_source_history,
                 )
             )
             if np.isfinite(float(optimizer_soc_feedback_mwh)):
@@ -30117,6 +30178,7 @@ class BatteryBacktester:
                     fixed_reserve_pos=afrr_cap_pos_lockbook,
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     scheduled_id_by_ts=scheduled_id_for_da_replay,
+                    activation_rate_source_rows=activation_rate_replay_source_history,
                 )
             )
             da_prelock_realized_soc_anchor_mwh, da_prelock_soc_anchor_diag = (

@@ -14870,6 +14870,62 @@ def test_da_realized_anchor_caps_lockbook_candidate_before_write() -> None:
     assert float(prior_diag["da_prelock_anchor_stale_state_detected"]) == pytest.approx(1.0)
 
 
+def test_activation_rate_source_of_truth_replay_anchor_uses_source_rows_for_stripped_rows() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-01T00:00:00Z")
+    snapshot_ts = ts + pd.Timedelta(hours=1)
+    stripped_rows = pd.DataFrame({col.timestamp: [ts]})
+    source_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            col.pred_afrr_activation_rate_pos: [0.12],
+            col.pred_afrr_activation_rate_neg: [0.34],
+        }
+    )
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    anchor, diag = bt._replay_da_prelock_settlement_equivalent_soc_anchor(
+        rows=stripped_rows,
+        snapshot_ts=snapshot_ts,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={ts: 4.0},
+        scheduled_id_by_ts={},
+        activation_rate_source_rows=source_rows,
+    )
+
+    assert np.isfinite(anchor)
+    assert float(diag["da_prelock_anchor_settlement_replay_rows"]) == pytest.approx(1.0)
+    assert bt._missing_critical_source_fields == []
+    assert bt._missing_critical_source_reasons == set()
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    bt._missing_critical_source_debug_records = []
+    bt._replay_da_prelock_settlement_equivalent_soc_anchor(
+        rows=stripped_rows,
+        snapshot_ts=snapshot_ts,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={ts: 4.0},
+        scheduled_id_by_ts={},
+        activation_rate_source_rows=pd.DataFrame({col.timestamp: [ts]}),
+    )
+
+    assert set(bt._missing_critical_source_reasons) == {"missing_source_of_truth_activation_rate"}
+    assert "afrr.activation_rate_pos" in bt._missing_critical_source_fields
+    assert "afrr.activation_rate_neg" in bt._missing_critical_source_fields
+    debug = bt._runtime_missing_source_truth_debug_records()
+    assert {record["caller_function_name"] for record in debug} == {
+        "_replay_da_prelock_settlement_equivalent_soc_anchor"
+    }
+
+
 def test_da_soc_feedback_uses_latest_settled_real_soc_before_gate() -> None:
     bt = _mk_backtester()
     col = BacktestColumnMap()
@@ -23984,6 +24040,47 @@ def test_bcm_model_hourly_preserves_activation_rate_source_of_truth() -> None:
     assert set(bt._missing_critical_source_reasons) == {"missing_source_of_truth_activation_rate"}
     assert "model_hourly.activation_rate_pos" in bt._missing_critical_source_fields
     assert "model_hourly.activation_rate_neg" in bt._missing_critical_source_fields
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    real_settlement_rows = pd.DataFrame(
+        {
+            col.timestamp: [ts0],
+            "real_fixed_reserve_obligation_neg_mw": [4.0],
+        }
+    )
+    real_source_with_true_rates = pd.DataFrame(
+        {
+            col.timestamp: [ts0],
+            col.true_afrr_activation_rate_pos: [0.11],
+            col.true_afrr_activation_rate_neg: [0.22],
+        }
+    )
+    real_preserved = bt._preserve_activation_rate_source_of_truth(
+        real_settlement_rows,
+        real_source_with_true_rates,
+        col,
+        context="real_settlement_merge",
+        reserve_active=True,
+    )
+    assert real_preserved[col.true_afrr_activation_rate_pos].tolist() == pytest.approx([0.11])
+    assert real_preserved[col.true_afrr_activation_rate_neg].tolist() == pytest.approx([0.22])
+    assert bt._missing_critical_source_fields == []
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    real_missing = bt._preserve_activation_rate_source_of_truth(
+        real_settlement_rows,
+        pd.DataFrame({col.timestamp: [ts0]}),
+        col,
+        context="real_settlement_merge",
+        reserve_active=True,
+    )
+    assert real_missing[col.true_afrr_activation_rate_pos].isna().all()
+    assert real_missing[col.true_afrr_activation_rate_neg].isna().all()
+    assert set(bt._missing_critical_source_reasons) == {"missing_source_of_truth_activation_rate"}
+    assert "real_settlement_merge.activation_rate_pos" in bt._missing_critical_source_fields
+    assert "real_settlement_merge.activation_rate_neg" in bt._missing_critical_source_fields
 
     bt._missing_critical_source_fields = []
     bt._missing_critical_source_reasons = set()
