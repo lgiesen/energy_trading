@@ -3430,6 +3430,15 @@ class BatteryBacktester:
         """Return the active forecast activation-rate source columns without defaulting values."""
         columns = set(source.columns if isinstance(source, pd.DataFrame) else source.index)
 
+        def _has_finite_value(column: str) -> bool:
+            if column not in columns:
+                return False
+            if isinstance(source, pd.DataFrame):
+                values = pd.to_numeric(source[column], errors="coerce")
+                return bool(values.notna().any() and np.isfinite(values.to_numpy(dtype=float, na_value=np.nan)).any())
+            value = pd.to_numeric(pd.Series([source.get(column)]), errors="coerce").iloc[0]
+            return bool(pd.notna(value) and np.isfinite(float(value)))
+
         def _source_meta_value(meta_col: str) -> str:
             candidate = ""
             if meta_col in columns:
@@ -3480,7 +3489,7 @@ class BatteryBacktester:
         def _from_meta(meta_col: str, canonical_col: str, side: str) -> str:
             candidate = _source_meta_value(meta_col)
             for alias in _activation_rate_source_aliases(candidate, canonical_col, side):
-                if alias in columns:
+                if _has_finite_value(alias):
                     return alias
             return canonical_col
 
@@ -10338,6 +10347,30 @@ class BatteryBacktester:
         activation_rate_source_rows: pd.DataFrame | None = None,
     ) -> tuple[float, dict[str, float | str]]:
         """Prefer settlement-equivalent fixed-obligation replay over stale planned SoC."""
+        authoritative_realized_sources = {
+            "realized_settlement_exact_start_soc",
+            "realized_settlement_latest_prior_end_soc",
+        }
+        current_source = str(
+            optimizer_soc_feedback_diag.get("optimizer_current_soc_source", "")
+        ).strip()
+        try:
+            realized_anchor_mwh = float(optimizer_soc_feedback_mwh)
+        except (TypeError, ValueError):
+            realized_anchor_mwh = float("nan")
+        if current_source in authoritative_realized_sources and np.isfinite(realized_anchor_mwh):
+            out_diag = dict(optimizer_soc_feedback_diag)
+            out_diag.update(
+                {
+                    "optimizer_settlement_anchor_replay_skipped": 1.0,
+                    "optimizer_settlement_anchor_replay_skip_reason": (
+                        "realized_settlement_anchor_already_authoritative"
+                    ),
+                    "optimizer_settlement_anchor_overrode_planned_soc": 0.0,
+                }
+            )
+            return float(realized_anchor_mwh), out_diag
+
         has_settlement_anchor_obligations = bool(
             da_lockbook
             or fixed_reserve_pos
@@ -10435,25 +10468,77 @@ class BatteryBacktester:
             for ts, qty in dict(da_lockbook or {}).items()
             if pd.notna(pd.to_datetime(ts, utc=True, errors="coerce"))
         }
+        def _row_optional_mw(row: pd.Series, *names: str) -> float:
+            best = 0.0
+            for name in names:
+                if name not in row.index:
+                    continue
+                val = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").iloc[0]
+                if pd.notna(val) and np.isfinite(float(val)):
+                    best = max(best, max(0.0, float(val)))
+            return float(best)
+
         rows_used = 0
         last_ts = pd.NaT
         for _, row in work.iterrows():
             ts = pd.Timestamp(row[colmap.timestamp])
             ch_mw, dis_mw = self._normalize_da_bid(*lockbook.get(ts, (0.0, 0.0)))
             id_ch_mw, id_dis_mw = scheduled_id_by_ts.get(ts, (0.0, 0.0))
-            ob_pos = max(0.0, float(fixed_reserve_pos.get(ts, 0.0)))
-            ob_neg = max(0.0, float(fixed_reserve_neg.get(ts, 0.0)))
+            ob_pos = max(
+                0.0,
+                float(fixed_reserve_pos.get(ts, 0.0)),
+                _row_optional_mw(
+                    row,
+                    "fixed_reserve_obligation_pos_mw",
+                    "real_fixed_reserve_obligation_pos_mw",
+                    "locked_bcm_capacity_pos_mw",
+                    "real_locked_bcm_capacity_pos_mw",
+                    "reserve_lockbook_pos_mw",
+                    "real_locked_reserve_pos_mw",
+                ),
+            )
+            ob_neg = max(
+                0.0,
+                float(fixed_reserve_neg.get(ts, 0.0)),
+                _row_optional_mw(
+                    row,
+                    "fixed_reserve_obligation_neg_mw",
+                    "real_fixed_reserve_obligation_neg_mw",
+                    "locked_bcm_capacity_neg_mw",
+                    "real_locked_bcm_capacity_neg_mw",
+                    "reserve_lockbook_neg_mw",
+                    "real_locked_reserve_neg_mw",
+                ),
+            )
+            bem_pos = _row_optional_mw(
+                row,
+                "bem_only_pos_mw",
+                "plan_bem_only_pos_mw",
+                "submitted_bem_only_pos_mw",
+                "real_bem_only_submitted_pos_mw",
+                "real_bem_only_executed_pos_mw",
+            )
+            bem_neg = _row_optional_mw(
+                row,
+                "bem_only_neg_mw",
+                "plan_bem_only_neg_mw",
+                "submitted_bem_only_neg_mw",
+                "real_bem_only_submitted_neg_mw",
+                "real_bem_only_executed_neg_mw",
+            )
+            total_pos = float(ob_pos) + float(bem_pos)
+            total_neg = float(ob_neg) + float(bem_neg)
             rate_pos, rate_neg = self._required_activation_rates_from_row(
                 row,
                 colmap,
-                reserve_pos_mw=float(ob_pos),
-                reserve_neg_mw=float(ob_neg),
+                reserve_pos_mw=float(total_pos),
+                reserve_neg_mw=float(total_neg),
             )
             aux_power_mw, _ = self._state_aux_power_mw(
                 charge_mw=float(ch_mw),
                 discharge_mw=float(dis_mw),
-                reserve_pos_mw=float(ob_pos),
-                reserve_neg_mw=float(ob_neg),
+                reserve_pos_mw=float(total_pos),
+                reserve_neg_mw=float(total_neg),
                 act_pos_rate=float(rate_pos),
                 act_neg_rate=float(rate_neg),
                 id_charge_mw=float(id_ch_mw),
@@ -10464,8 +10549,8 @@ class BatteryBacktester:
                 discharge_mw=float(dis_mw),
                 id_charge_mw=float(id_ch_mw),
                 id_discharge_mw=float(id_dis_mw),
-                act_pos_mwh=max(0.0, ob_pos * max(0.0, min(1.0, rate_pos)) * float(self.dt_h)),
-                act_neg_mwh=max(0.0, ob_neg * max(0.0, min(1.0, rate_neg)) * float(self.dt_h)),
+                act_pos_mwh=max(0.0, total_pos * max(0.0, min(1.0, rate_pos)) * float(self.dt_h)),
+                act_neg_mwh=max(0.0, total_neg * max(0.0, min(1.0, rate_neg)) * float(self.dt_h)),
                 aux_mwh=max(0.0, float(aux_power_mw) * float(self.dt_h)),
                 battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
                 dt_h=float(self.dt_h),
@@ -11451,6 +11536,33 @@ class BatteryBacktester:
                         row_val = max(row_val, float(val))
             return max(0.0, float(mapped), float(row_val))
 
+        def _row_bem(row: pd.Series, *, side: str) -> float:
+            aliases = (
+                (
+                    "bem_only_pos_mw",
+                    "plan_bem_only_pos_mw",
+                    "submitted_bem_only_pos_mw",
+                    "real_bem_only_submitted_pos_mw",
+                    "real_bem_only_executed_pos_mw",
+                )
+                if side == "pos"
+                else (
+                    "bem_only_neg_mw",
+                    "plan_bem_only_neg_mw",
+                    "submitted_bem_only_neg_mw",
+                    "real_bem_only_submitted_neg_mw",
+                    "real_bem_only_executed_neg_mw",
+                )
+            )
+            row_val = 0.0
+            for name in aliases:
+                if name not in row.index:
+                    continue
+                val = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").iloc[0]
+                if pd.notna(val) and np.isfinite(float(val)):
+                    row_val = max(row_val, max(0.0, float(val)))
+            return float(row_val)
+
         def _combined_da(
             base: tuple[float, float],
             extra: tuple[float, float],
@@ -11479,15 +11591,19 @@ class BatteryBacktester:
                 ts_key = pd.Timestamp(ts)
                 ob_pos = _row_reserve(row, ts_key, side="pos")
                 ob_neg = _row_reserve(row, ts_key, side="neg")
+                bem_pos = _row_bem(row, side="pos")
+                bem_neg = _row_bem(row, side="neg")
+                protected_pos = float(ob_pos) + float(bem_pos)
+                protected_neg = float(ob_neg) + float(bem_neg)
                 rate_pos, rate_neg = self._required_activation_rates_from_row(
                     row,
                     colmap,
-                    reserve_pos_mw=float(ob_pos),
-                    reserve_neg_mw=float(ob_neg),
+                    reserve_pos_mw=float(protected_pos),
+                    reserve_neg_mw=float(protected_neg),
                 )
-                if ob_pos > 1e-9 or ob_neg > 1e-9:
+                if protected_pos > 1e-9 or protected_neg > 1e-9:
                     req_pos = (
-                        ob_pos
+                        protected_pos
                         * max(
                             float(self.reserve_activation_headroom_h),
                             max(0.0, min(1.0, float(rate_pos))) * float(self.dt_h),
@@ -11495,7 +11611,7 @@ class BatteryBacktester:
                         / max(float(self.eta_out), 1e-12)
                     )
                     req_neg = (
-                        ob_neg
+                        protected_neg
                         * max(
                             float(self.reserve_activation_headroom_h),
                             max(0.0, min(1.0, float(rate_neg))) * float(self.dt_h),
@@ -11506,15 +11622,15 @@ class BatteryBacktester:
                         soc_start_mwh=float(baseline_soc),
                         required_headroom_pos_mwh=float(req_pos),
                         required_headroom_neg_mwh=float(req_neg),
-                        locked_reserve_pos_mw=float(ob_pos),
-                        locked_reserve_neg_mw=float(ob_neg),
+                        locked_reserve_pos_mw=float(protected_pos),
+                        locked_reserve_neg_mw=float(protected_neg),
                     )
                     candidate_bounds = self._compute_obligation_driven_protected_soc_bounds(
                         soc_start_mwh=float(candidate_soc),
                         required_headroom_pos_mwh=float(req_pos),
                         required_headroom_neg_mwh=float(req_neg),
-                        locked_reserve_pos_mw=float(ob_pos),
-                        locked_reserve_neg_mw=float(ob_neg),
+                        locked_reserve_pos_mw=float(protected_pos),
+                        locked_reserve_neg_mw=float(protected_neg),
                     )
                     max_protected_min = max(max_protected_min, float(candidate_bounds["protected_soc_min_mwh"]))
                     min_protected_max = min(min_protected_max, float(candidate_bounds["protected_soc_max_mwh"]))
@@ -11523,6 +11639,14 @@ class BatteryBacktester:
                     candidate_pos_v = float(candidate_bounds["protected_soc_violation_pos_mwh"])
                     candidate_neg_v = float(candidate_bounds["protected_soc_violation_neg_mwh"])
                     candidate_can_affect = any(key <= ts_key for key in candidate_keys)
+                    if candidate_can_affect and candidate_pos_v > 1e-9:
+                        first_ts = ts_key.isoformat()
+                        reason = "da_after_bcm_future_pos_protected_soc_violation"
+                        break
+                    if candidate_can_affect and candidate_neg_v > 1e-9:
+                        first_ts = ts_key.isoformat()
+                        reason = "da_after_bcm_future_neg_protected_soc_violation"
+                        break
                     if candidate_can_affect and candidate_pos_v > baseline_pos_v + 1e-9:
                         first_ts = ts_key.isoformat()
                         reason = "da_after_bcm_future_pos_protected_soc_violation"
@@ -11538,8 +11662,8 @@ class BatteryBacktester:
                 aux_base, _ = self._state_aux_power_mw(
                     charge_mw=float(base_buy),
                     discharge_mw=float(base_sell),
-                    reserve_pos_mw=float(ob_pos),
-                    reserve_neg_mw=float(ob_neg),
+                    reserve_pos_mw=float(protected_pos),
+                    reserve_neg_mw=float(protected_neg),
                     act_pos_rate=float(rate_pos),
                     act_neg_rate=float(rate_neg),
                     id_charge_mw=float(id_buy),
@@ -11548,8 +11672,8 @@ class BatteryBacktester:
                 aux_cand, _ = self._state_aux_power_mw(
                     charge_mw=float(cand_buy),
                     discharge_mw=float(cand_sell),
-                    reserve_pos_mw=float(ob_pos),
-                    reserve_neg_mw=float(ob_neg),
+                    reserve_pos_mw=float(protected_pos),
+                    reserve_neg_mw=float(protected_neg),
                     act_pos_rate=float(rate_pos),
                     act_neg_rate=float(rate_neg),
                     id_charge_mw=float(id_buy),
@@ -11560,8 +11684,8 @@ class BatteryBacktester:
                     discharge_mw=float(base_sell),
                     id_charge_mw=float(id_buy),
                     id_discharge_mw=float(id_sell),
-                    act_pos_mwh=max(0.0, ob_pos * max(0.0, float(rate_pos)) * float(self.dt_h)),
-                    act_neg_mwh=max(0.0, ob_neg * max(0.0, float(rate_neg)) * float(self.dt_h)),
+                    act_pos_mwh=max(0.0, protected_pos * max(0.0, float(rate_pos)) * float(self.dt_h)),
+                    act_neg_mwh=max(0.0, protected_neg * max(0.0, float(rate_neg)) * float(self.dt_h)),
                     aux_mwh=max(0.0, float(aux_base) * float(self.dt_h)),
                     battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
                     dt_h=float(self.dt_h),
@@ -11571,8 +11695,8 @@ class BatteryBacktester:
                     discharge_mw=float(cand_sell),
                     id_charge_mw=float(id_buy),
                     id_discharge_mw=float(id_sell),
-                    act_pos_mwh=max(0.0, ob_pos * max(0.0, float(rate_pos)) * float(self.dt_h)),
-                    act_neg_mwh=max(0.0, ob_neg * max(0.0, float(rate_neg)) * float(self.dt_h)),
+                    act_pos_mwh=max(0.0, protected_pos * max(0.0, float(rate_pos)) * float(self.dt_h)),
+                    act_neg_mwh=max(0.0, protected_neg * max(0.0, float(rate_neg)) * float(self.dt_h)),
                     aux_mwh=max(0.0, float(aux_cand) * float(self.dt_h)),
                     battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
                     dt_h=float(self.dt_h),
@@ -11581,6 +11705,50 @@ class BatteryBacktester:
                 candidate_soc = float(candidate_soc) + float(cand_delta)
                 min_soc = min(min_soc, float(candidate_soc))
                 max_soc = max(max_soc, float(candidate_soc))
+                if protected_pos > 1e-9 or protected_neg > 1e-9:
+                    baseline_post_bounds = self._compute_obligation_driven_protected_soc_bounds(
+                        soc_start_mwh=float(baseline_soc),
+                        required_headroom_pos_mwh=float(req_pos),
+                        required_headroom_neg_mwh=float(req_neg),
+                        locked_reserve_pos_mw=float(protected_pos),
+                        locked_reserve_neg_mw=float(protected_neg),
+                    )
+                    candidate_post_bounds = self._compute_obligation_driven_protected_soc_bounds(
+                        soc_start_mwh=float(candidate_soc),
+                        required_headroom_pos_mwh=float(req_pos),
+                        required_headroom_neg_mwh=float(req_neg),
+                        locked_reserve_pos_mw=float(protected_pos),
+                        locked_reserve_neg_mw=float(protected_neg),
+                    )
+                    max_protected_min = max(
+                        max_protected_min,
+                        float(candidate_post_bounds["protected_soc_min_mwh"]),
+                    )
+                    min_protected_max = min(
+                        min_protected_max,
+                        float(candidate_post_bounds["protected_soc_max_mwh"]),
+                    )
+                    baseline_pos_v = float(baseline_post_bounds["protected_soc_violation_pos_mwh"])
+                    baseline_neg_v = float(baseline_post_bounds["protected_soc_violation_neg_mwh"])
+                    candidate_pos_v = float(candidate_post_bounds["protected_soc_violation_pos_mwh"])
+                    candidate_neg_v = float(candidate_post_bounds["protected_soc_violation_neg_mwh"])
+                    candidate_can_affect = any(key <= ts_key for key in candidate_keys)
+                    if candidate_can_affect and candidate_pos_v > 1e-9:
+                        first_ts = ts_key.isoformat()
+                        reason = "da_after_bcm_future_pos_protected_soc_violation"
+                        break
+                    if candidate_can_affect and candidate_neg_v > 1e-9:
+                        first_ts = ts_key.isoformat()
+                        reason = "da_after_bcm_future_neg_protected_soc_violation"
+                        break
+                    if candidate_can_affect and candidate_pos_v > baseline_pos_v + 1e-9:
+                        first_ts = ts_key.isoformat()
+                        reason = "da_after_bcm_future_pos_protected_soc_violation"
+                        break
+                    if candidate_can_affect and candidate_neg_v > baseline_neg_v + 1e-9:
+                        first_ts = ts_key.isoformat()
+                        reason = "da_after_bcm_future_neg_protected_soc_violation"
+                        break
             return {
                 "pass": float(reason == "none"),
                 "first_ts": first_ts,
@@ -30966,9 +31134,20 @@ class BatteryBacktester:
                     scheduled_grid_mwh / max(float(self.dt_h), 1e-12),
                     0.0,
                 )
+            da_prelock_replay_rows = df
+            if decisions:
+                try:
+                    decision_replay_rows = pd.concat(
+                        [frame for frame in decisions if frame is not None and not frame.empty],
+                        ignore_index=True,
+                    )
+                except ValueError:
+                    decision_replay_rows = pd.DataFrame()
+                if not decision_replay_rows.empty and colmap.timestamp in decision_replay_rows.columns:
+                    da_prelock_replay_rows = decision_replay_rows
             da_prelock_settlement_soc_anchor_mwh, da_prelock_settlement_soc_anchor_diag = (
                 self._replay_da_prelock_settlement_equivalent_soc_anchor(
-                    rows=df,
+                    rows=da_prelock_replay_rows,
                     snapshot_ts=snapshot_ts_current,
                     colmap=colmap,
                     da_lockbook=da_lockbook,
@@ -33102,6 +33281,18 @@ class BatteryBacktester:
                 "da_precommit_da_postlock_failed_power_stack_mw",
                 "da_precommit_da_postlock_failed_power_limit_mw",
                 "da_precommit_da_postlock_failed_reason_detail",
+                "da_precommit_da_after_bcm_forward_replay_checked",
+                "da_precommit_da_after_bcm_forward_replay_pass",
+                "da_precommit_da_after_bcm_forward_replay_first_blocking_ts_utc",
+                "da_precommit_da_after_bcm_forward_replay_candidate_buy_mwh",
+                "da_precommit_da_after_bcm_forward_replay_candidate_sell_mwh",
+                "da_precommit_da_after_bcm_forward_replay_final_buy_mwh",
+                "da_precommit_da_after_bcm_forward_replay_final_sell_mwh",
+                "da_precommit_da_after_bcm_forward_replay_projected_soc_min_mwh",
+                "da_precommit_da_after_bcm_forward_replay_projected_soc_max_mwh",
+                "da_precommit_da_after_bcm_forward_replay_protected_min_mwh",
+                "da_precommit_da_after_bcm_forward_replay_protected_max_mwh",
+                "da_precommit_da_after_bcm_forward_replay_reason",
                 "da_precommit_candidate_predicted_pnl_excl_terminal_eur",
                 "da_precommit_incumbent_predicted_pnl_excl_terminal_eur",
                 "da_precommit_gross_spread_eur",

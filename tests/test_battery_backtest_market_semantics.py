@@ -13671,6 +13671,139 @@ def test_da_precommit_preserves_already_locked_bcm_reserve_envelope_after_bcm_ga
     assert float(by_ts[da_ts]["da_after_bcm_forward_replay_final_sell_mwh"]) == pytest.approx(repaired_sell)
 
 
+def test_da_after_bcm_guard_derates_buy_that_violates_future_neg_reserve_envelope() -> None:
+    bt = _mk_backtester("canonical_economic")
+    col = BacktestColumnMap()
+    bt.dt_h = 1.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.da_bid_granularity_mw = 0.1
+    bt.da_min_bid_size_mw = 0.1
+    bt.aux_standby_mw = 0.0
+    bt.aux_charge_mw = 0.0
+    bt.aux_discharge_mw = 0.0
+    bt.aux_afrr_active_mw = 0.0
+
+    da_ts = pd.Timestamp("2025-04-05T11:00:00Z")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: [da_ts],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "fixed_reserve_obligation_pos_mw": [0.0],
+            "fixed_reserve_obligation_neg_mw": [4.0],
+        }
+    )
+
+    repaired, diag, by_ts = bt._apply_da_after_bcm_forward_replay_guard(
+        accepted_da={da_ts: (3.0, 0.0)},
+        current_soc_mwh=14.0,
+        future_rows=future_rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={da_ts: 4.0},
+        scheduled_id_by_ts={},
+    )
+
+    repaired_buy, repaired_sell = bt._normalize_da_bid(*repaired[da_ts])
+    assert repaired_sell == pytest.approx(0.0)
+    assert 0.0 < repaired_buy <= 2.0
+    assert float(diag["da_after_bcm_forward_replay_checked"]) == pytest.approx(1.0)
+    assert float(diag["da_after_bcm_forward_replay_pass"]) == pytest.approx(1.0)
+    assert str(diag["da_after_bcm_forward_replay_reason"]) == "da_after_bcm_future_neg_protected_soc_violation"
+    assert str(diag["da_after_bcm_forward_replay_first_blocking_ts_utc"]) == da_ts.isoformat()
+    assert float(diag["da_after_bcm_forward_replay_final_buy_mwh"]) < 3.0
+    assert da_ts in by_ts
+    assert float(by_ts[da_ts]["da_after_bcm_forward_replay_final_buy_mwh"]) == pytest.approx(repaired_buy)
+    assert float(diag["da_after_bcm_forward_replay_protected_max_mwh"]) == pytest.approx(16.0)
+
+
+def test_da_prelock_anchor_replay_includes_prior_bem_only_activation() -> None:
+    bt = _mk_backtester("canonical_economic")
+    col = BacktestColumnMap()
+    bt.dt_h = 1.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_init = 10.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_charge_mw = 0.0
+    bt.aux_discharge_mw = 0.0
+    bt.aux_afrr_active_mw = 0.0
+
+    ts0 = pd.Timestamp("2025-04-01T08:00:00Z")
+    gate = pd.Timestamp("2025-04-01T09:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts0],
+            col.pred_afrr_activation_rate_pos: [1.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "plan_bem_only_pos_mw": [2.0],
+            "plan_bem_only_neg_mw": [0.0],
+        }
+    )
+
+    anchor, diag = bt._replay_da_prelock_settlement_equivalent_soc_anchor(
+        rows=rows,
+        snapshot_ts=gate,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        scheduled_id_by_ts={},
+    )
+
+    assert float(diag["da_prelock_anchor_settlement_replay_rows"]) == pytest.approx(1.0)
+    assert anchor == pytest.approx(8.0)
+
+
+def test_da_prelock_anchor_replay_includes_row_level_fixed_reserve_obligations() -> None:
+    bt = _mk_backtester("canonical_economic")
+    col = BacktestColumnMap()
+    bt.dt_h = 1.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_init = 10.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.aux_standby_mw = 0.0
+    bt.aux_charge_mw = 0.0
+    bt.aux_discharge_mw = 0.0
+    bt.aux_afrr_active_mw = 0.0
+
+    ts0 = pd.Timestamp("2025-04-01T08:00:00Z")
+    gate = pd.Timestamp("2025-04-01T09:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts0],
+            col.pred_afrr_activation_rate_pos: [1.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "real_fixed_reserve_obligation_pos_mw": [3.0],
+            "real_fixed_reserve_obligation_neg_mw": [0.0],
+        }
+    )
+
+    anchor, diag = bt._replay_da_prelock_settlement_equivalent_soc_anchor(
+        rows=rows,
+        snapshot_ts=gate,
+        colmap=col,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        scheduled_id_by_ts={},
+    )
+
+    assert float(diag["da_prelock_anchor_settlement_replay_rows"]) == pytest.approx(1.0)
+    assert anchor == pytest.approx(7.0)
+
+
 def test_da_postlock_diagnostics_survive_thesis_hourly_output_filter() -> None:
     required = {
         "da_postlock_candidate_future_feasible": [0.0],
@@ -24439,6 +24572,85 @@ def test_activation_rate_source_of_truth_only_required_for_active_reserve() -> N
     bt._missing_critical_source_reasons = set()
     assert bt._required_activation_rates_from_row(resolved, col, reserve_neg_mw=1.0) == (0.25, 0.5)
     assert bt._missing_critical_source_fields == []
+
+    stale_guard_with_canonical = pd.Series(
+        {
+            "afrr_activation_rate_guard_source_column_pos": "ev_pred_act_rate_pos_guard",
+            "afrr_activation_rate_guard_source_column_neg": "ev_pred_act_rate_neg_guard",
+            "ev_pred_act_rate_pos_guard": np.nan,
+            "ev_pred_act_rate_neg_guard": np.nan,
+            col.pred_afrr_activation_rate_pos: 0.12,
+            col.pred_afrr_activation_rate_neg: 0.34,
+        }
+    )
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    bt._missing_critical_source_debug_records = []
+    assert bt._required_activation_rates_from_row(
+        stale_guard_with_canonical,
+        col,
+        reserve_pos_mw=1.0,
+        reserve_neg_mw=1.0,
+    ) == pytest.approx((0.12, 0.34))
+    assert bt._missing_critical_source_fields == []
+    assert bt._missing_critical_source_reasons == set()
+
+    stale_guard_without_canonical = stale_guard_with_canonical.copy()
+    stale_guard_without_canonical[col.pred_afrr_activation_rate_pos] = np.nan
+    stale_guard_without_canonical[col.pred_afrr_activation_rate_neg] = np.nan
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    bt._missing_critical_source_debug_records = []
+    assert bt._required_activation_rates_from_row(
+        stale_guard_without_canonical,
+        col,
+        reserve_pos_mw=1.0,
+        reserve_neg_mw=1.0,
+    ) == (0.0, 0.0)
+    assert bt._missing_critical_source_reasons == {"missing_source_of_truth_activation_rate"}
+    assert bt._missing_critical_source_fields == [
+        "afrr.activation_rate_pos",
+        "afrr.activation_rate_neg",
+    ]
+
+
+def test_optimizer_soc_feedback_keeps_realized_settlement_anchor_over_lockbook_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    snapshot_ts = pd.Timestamp("2025-05-06T18:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: pd.date_range("2025-05-06T16:00:00Z", periods=3, freq="h"),
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0, 0.0],
+        }
+    )
+
+    def _fail_if_replayed(**_: object) -> tuple[float, dict[str, float | str]]:
+        raise AssertionError("settlement replay must not override realized settlement anchor")
+
+    monkeypatch.setattr(bt, "_replay_da_prelock_settlement_equivalent_soc_anchor", _fail_if_replayed)
+
+    anchor, diag = bt._optimizer_soc_feedback_with_settlement_anchor(
+        rows=rows,
+        snapshot_ts=snapshot_ts,
+        colmap=col,
+        optimizer_soc_feedback_mwh=4.542209,
+        optimizer_soc_feedback_diag={
+            "optimizer_current_soc_mwh": 4.542209,
+            "optimizer_current_soc_source": "realized_settlement_latest_prior_end_soc",
+            "optimizer_current_soc_source_timestamp_utc": "2025-05-06T17:00:00+00:00",
+        },
+        da_lockbook={pd.Timestamp("2025-05-07T11:00:00Z"): (6.0, 0.0)},
+    )
+
+    assert anchor == pytest.approx(4.542209)
+    assert diag["optimizer_current_soc_source"] == "realized_settlement_latest_prior_end_soc"
+    assert diag["optimizer_settlement_anchor_replay_skipped"] == pytest.approx(1.0)
+    assert diag["optimizer_settlement_anchor_replay_skip_reason"] == (
+        "realized_settlement_anchor_already_authoritative"
+    )
+    assert diag["optimizer_settlement_anchor_overrode_planned_soc"] == pytest.approx(0.0)
 
 
 def test_activation_rate_source_of_truth_wide_prediction_transport() -> None:
