@@ -6137,7 +6137,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     hard_selected, hard_audit = bt._apply_da_postlock_future_guard(
         selected_da={ts2: (0.0, 9.5)},
         da_audit_rows=hard_audit_rows,
-        lock_rows=hard_rows.iloc[[0]].copy(),
+        lock_rows=hard_rows.copy(),
         future_rows=hard_rows,
         colmap=col,
         current_soc_mwh=11.5,
@@ -6152,7 +6152,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(hard_audit[0]["da_candidate_rejected_hard_final_soc_infeasible"]) == pytest.approx(0.0)
     assert float(hard_audit[0]["da_postlock_rejected_due_to_future_infeasibility"]) == pytest.approx(1.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_checked_before_lock"]) == pytest.approx(1.0)
-    assert float(hard_audit[0]["da_final_soc_feasibility_passed_before_lock"]) == pytest.approx(1.0)
+    assert float(hard_audit[0]["da_final_soc_feasibility_passed_before_lock"]) == pytest.approx(0.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_required_mwh"]) == pytest.approx(10.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_projected_final_soc_mwh"]) == pytest.approx(2.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_margin_mwh"]) == pytest.approx(-8.0)
@@ -6161,7 +6161,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(hard_audit[0]["da_final_soc_feasibility_candidate_buy_mwh"]) == pytest.approx(0.0)
     assert float(hard_audit[0]["da_final_soc_feasibility_candidate_sell_mwh"]) == pytest.approx(9.5)
     assert float(hard_audit[0]["da_final_soc_feasibility_id_recourse_assumed"]) == pytest.approx(0.0)
-    assert str(hard_audit[0]["da_final_soc_feasibility_reason"]) == "terminal_repair_missing"
+    assert str(hard_audit[0]["da_final_soc_feasibility_reason"]) == "terminal_shortfall_under_hard_min"
     assert float(hard_audit[0]["da_postlock_terminal_shortfall_unrecoverable"]) == pytest.approx(1.0)
     assert float(hard_audit[0]["da_postlock_terminal_shortfall_mwh"]) == pytest.approx(8.0)
 

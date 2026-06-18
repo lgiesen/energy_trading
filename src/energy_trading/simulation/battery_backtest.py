@@ -14630,11 +14630,13 @@ class BatteryBacktester:
             )
             replay_rows = replay_rows.dropna(subset=["target_time_utc"]).sort_values("target_time_utc")
         source_snapshot_by_ts: dict[pd.Timestamp, str] = {}
+        delivery_window_timestamps: set[pd.Timestamp] = set()
         if not replay_rows.empty:
             for _, replay_row in replay_rows.iterrows():
                 ts = pd.to_datetime(replay_row.get("target_time_utc"), utc=True, errors="coerce")
                 if pd.isna(ts):
                     continue
+                delivery_window_timestamps.add(pd.Timestamp(ts))
                 source_val = replay_row.get("snapshot_time_utc", replay_row.get("source_snapshot_utc", ""))
                 source_ts = pd.to_datetime(source_val, utc=True, errors="coerce")
                 source_snapshot_by_ts[ts] = "" if pd.isna(source_ts) else str(source_ts)
@@ -14750,6 +14752,7 @@ class BatteryBacktester:
         candidate_sell_mwh = float(sum(max(0.0, dis) for _, dis in selected_da.values()) * float(self.dt_h))
         candidate_timestamps = {pd.to_datetime(ts, utc=True, errors="coerce") for ts in selected_da.keys()}
         candidate_timestamps = {ts for ts in candidate_timestamps if pd.notna(ts)}
+        terminal_window_timestamps = set(candidate_timestamps) | set(delivery_window_timestamps)
 
         def _terminal_topup_schedule(
             schedule: dict[pd.Timestamp, tuple[float, float]],
@@ -14768,6 +14771,7 @@ class BatteryBacktester:
                 for ts in schedule.keys()
             }
             schedule_ts = {ts for ts in schedule_ts if pd.notna(ts)}
+            schedule_ts = set(schedule_ts) | set(delivery_window_timestamps)
             terminal_sensitive, _ = self._is_da_terminal_sensitive_window(
                 pd.DataFrame({"target_time_utc": sorted(schedule_ts)}),
                 global_end_utc=global_end_utc,
@@ -14786,7 +14790,7 @@ class BatteryBacktester:
                     fixed_reserve_pos=fixed_reserve_pos,
                     fixed_reserve_neg=fixed_reserve_neg,
                     global_end_utc=global_end_utc,
-                    candidate_timestamps=set(trial_schedule.keys()),
+                    candidate_timestamps=set(trial_schedule.keys()) | set(delivery_window_timestamps),
                 )
 
             feasible_before, diag_before = _check(schedule)
@@ -14906,6 +14910,7 @@ class BatteryBacktester:
         selected_da, terminal_topup_diag = _terminal_topup_schedule(dict(selected_da))
         candidate_timestamps = {pd.to_datetime(ts, utc=True, errors="coerce") for ts in selected_da.keys()}
         candidate_timestamps = {ts for ts in candidate_timestamps if pd.notna(ts)}
+        candidate_timestamps = set(candidate_timestamps) | set(delivery_window_timestamps)
         candidate_buy_mwh = float(sum(max(0.0, ch) for ch, _ in selected_da.values()) * float(self.dt_h))
         candidate_sell_mwh = float(sum(max(0.0, dis) for _, dis in selected_da.values()) * float(self.dt_h))
         zero_schedule = {ts: (0.0, 0.0) for ts in selected_da.keys()}
@@ -14980,6 +14985,7 @@ class BatteryBacktester:
             )
             terminal_recovery_symmetric_candidate_kept = bool(
                 terminal_only_failure
+                and _stats_float(candidate_failure_diag, "da_terminal_sensitive_window", default=0.0) < 0.5
                 and candidate_terminal_cost_available >= 0.5
                 and zero_terminal_cost_available >= 0.5
                 and np.isfinite(candidate_pnl_with_terminal_recovery)
@@ -15531,7 +15537,7 @@ class BatteryBacktester:
                         in {"", "unknown", "none"}
                     ),
                     "da_final_soc_feasibility_checked_before_lock": 1.0,
-                    "da_final_soc_feasibility_passed_before_lock": float(bool(final_selected_future_feasible)),
+                    "da_final_soc_feasibility_passed_before_lock": float(bool(candidate_future_feasible)),
                     "da_final_soc_feasibility_required_mwh": float(
                         candidate_failure_diag.get("final_soc_feasibility_required_mwh", np.nan)
                     ),
