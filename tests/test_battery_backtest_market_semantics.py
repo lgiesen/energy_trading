@@ -18198,6 +18198,54 @@ def test_bem_only_generic_reserve_aliases_do_not_count_as_bcm_activity() -> None
         )
 
 
+def test_disabled_bcm_sanitizer_removes_inactive_transport_aliases_before_isolation() -> None:
+    bt = _mk_backtester()
+    bt._strategy_permissions = bt.resolve_strategy_permissions(
+        strategy_name="da",
+        allowed_markets=("DA",),
+        id_recourse_mode="disabled",
+    )
+    hourly = pd.DataFrame(
+        {
+            "real_revenue_capacity_eur": [10.0],
+            "real_bcm_capacity_revenue_eur": [10.0],
+            "real_submitted_bcm_capacity_pos_mw": [4.0],
+            "real_locked_bcm_capacity_neg_mw": [3.0],
+            "real_awarded_capacity_pos_mw": [2.0],
+            "real_fixed_reserve_obligation_neg_mw": [1.0],
+            "real_da_buy_mwh": [1.0],
+        }
+    )
+
+    sanitized = bt._zero_disabled_bcm_hourly(hourly)
+
+    assert sanitized["real_da_buy_mwh"].tolist() == [1.0]
+    for col in (
+        "real_revenue_capacity_eur",
+        "real_bcm_capacity_revenue_eur",
+        "real_submitted_bcm_capacity_pos_mw",
+        "real_locked_bcm_capacity_neg_mw",
+        "real_awarded_capacity_pos_mw",
+        "real_fixed_reserve_obligation_neg_mw",
+    ):
+        assert sanitized[col].tolist() == [0.0]
+    with pytest.raises(RuntimeError, match="non-zero aFRR activity detected"):
+        bt._validate_strategy_isolation_outputs(
+            hourly=hourly,
+            allowed_markets=("DA",),
+            strategy_permissions=bt._strategy_permissions,
+            strategy_name="da",
+            id_recourse_mode="disabled",
+        )
+    bt._validate_strategy_isolation_outputs(
+        hourly=sanitized,
+        allowed_markets=("DA",),
+        strategy_permissions=bt._strategy_permissions,
+        strategy_name="da",
+        id_recourse_mode="disabled",
+    )
+
+
 def test_multi_common_recourse_resolves_technical_id_consistently() -> None:
     bt = _mk_backtester()
     hourly = pd.DataFrame(
@@ -23754,6 +23802,33 @@ def test_activation_rate_source_of_truth_only_required_for_active_reserve() -> N
         "afrr.activation_rate_neg",
     ]
     assert bt._missing_critical_source_reasons == {"missing_source_of_truth_activation_rate"}
+    active_debug = bt._runtime_missing_source_truth_debug_records()
+    assert [r["label"] for r in active_debug] == [
+        "afrr.activation_rate_pos",
+        "afrr.activation_rate_neg",
+    ]
+    assert {r["reason"] for r in active_debug} == {"missing_source_of_truth_activation_rate"}
+    assert {r["context"] for r in active_debug} == {"afrr"}
+    assert {r["timestamp_utc"] for r in active_debug} == {"2026-01-01T00:00:00+00:00"}
+    for record in active_debug:
+        assert record["caller_function_name"] == "test_activation_rate_source_of_truth_only_required_for_active_reserve"
+        assert int(record["caller_line_number"]) > 0
+        assert record["label_prefix"] == "afrr"
+        assert record["reserve_pos_mw"] == 1.0
+        assert record["reserve_neg_mw"] == 0.0
+        assert record["bem_pos_mw"] == 0.0
+        assert record["bem_neg_mw"] == 0.0
+        assert record["resolved_pos_col"] == col.pred_afrr_activation_rate_pos
+        assert record["resolved_neg_col"] == col.pred_afrr_activation_rate_neg
+        assert record["resolved_pos_col_exists"] is False
+        assert record["resolved_neg_col_exists"] is False
+        assert record["resolved_pos_col_finite"] is False
+        assert record["resolved_neg_col_finite"] is False
+        assert record["activation_rate_like_columns"] == []
+    debug_summary = bt._missing_source_truth_debug_summary_fields()
+    assert debug_summary["missing_source_of_truth_runtime_debug_count"] == 2.0
+    assert debug_summary["missing_source_of_truth_activation_rate_runtime_debug_count"] == 2.0
+    assert json.loads(debug_summary["missing_source_of_truth_activation_rate_runtime_debug"]) == active_debug
 
     resolved = pd.Series(
         {
@@ -23871,6 +23946,47 @@ def test_bcm_model_hourly_preserves_activation_rate_source_of_truth() -> None:
 
     bt._missing_critical_source_fields = []
     bt._missing_critical_source_reasons = set()
+    zero_obligation_hourly = pd.DataFrame(
+        {
+            col.timestamp: [ts0, ts1],
+            "real_fixed_reserve_obligation_pos_mw": [0.0, 0.0],
+            "real_fixed_reserve_obligation_neg_mw": [0.0, 0.0],
+            "real_bem_only_submitted_pos_mw": [0.0, 0.0],
+            "real_bem_only_submitted_neg_mw": [0.0, 0.0],
+        }
+    )
+    zero_obligation_source = pd.DataFrame({col.timestamp: [ts0, ts1]})
+    zero_obligation_preserved = bt._preserve_activation_rate_source_of_truth(
+        zero_obligation_hourly,
+        zero_obligation_source,
+        col,
+        context="model_hourly",
+        reserve_active=True,
+    )
+    assert col.pred_afrr_activation_rate_pos not in zero_obligation_preserved.columns
+    assert col.pred_afrr_activation_rate_neg not in zero_obligation_preserved.columns
+    assert bt._missing_critical_source_fields == []
+    assert bt._missing_critical_source_reasons == set()
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    nonzero_obligation_hourly = zero_obligation_hourly.copy()
+    nonzero_obligation_hourly.loc[0, "real_fixed_reserve_obligation_pos_mw"] = 1.0
+    missing_rate_preserved = bt._preserve_activation_rate_source_of_truth(
+        nonzero_obligation_hourly,
+        zero_obligation_source,
+        col,
+        context="model_hourly",
+        reserve_active=True,
+    )
+    assert missing_rate_preserved[col.pred_afrr_activation_rate_pos].isna().all()
+    assert missing_rate_preserved[col.pred_afrr_activation_rate_neg].isna().all()
+    assert set(bt._missing_critical_source_reasons) == {"missing_source_of_truth_activation_rate"}
+    assert "model_hourly.activation_rate_pos" in bt._missing_critical_source_fields
+    assert "model_hourly.activation_rate_neg" in bt._missing_critical_source_fields
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
     ev_alias_source = pd.DataFrame(
         {
             col.timestamp: [ts0, ts1],
@@ -23913,6 +24029,57 @@ def test_bcm_model_hourly_preserves_activation_rate_source_of_truth() -> None:
         (0.91, 0.92)
     )
     assert bt._missing_critical_source_fields == []
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    stripped_plan = pd.DataFrame(
+        {
+            col.timestamp: [ts0],
+            "target_time_utc": [ts0],
+            "reserve_pos_mw": [1.0],
+        }
+    )
+    source_with_rates = pd.DataFrame(
+        {
+            col.timestamp: [ts0],
+            "ev_pred_act_rate_pos_guard": [0.42],
+            "ev_pred_act_rate_neg_guard": [0.24],
+            "afrr_activation_rate_guard_source_column_pos": [
+                f"{col.pred_afrr_activation_rate_pos}_p90"
+            ],
+            "afrr_activation_rate_guard_source_column_neg": [
+                f"{col.pred_afrr_activation_rate_neg}_p90"
+            ],
+            "afrr_activation_rate_guard_quantile_resolved": ["p90"],
+        }
+    )
+    enriched_plan = bt._preserve_activation_rate_replay_source_columns(
+        stripped_plan,
+        source_with_rates,
+        col,
+    )
+    assert bt._required_activation_rates_from_row(
+        enriched_plan.iloc[0],
+        col,
+        reserve_pos_mw=1.0,
+    ) == pytest.approx((0.42, 0.24))
+    assert bt._missing_critical_source_fields == []
+
+    bt._missing_critical_source_fields = []
+    bt._missing_critical_source_reasons = set()
+    still_stripped = bt._preserve_activation_rate_replay_source_columns(
+        stripped_plan,
+        pd.DataFrame({col.timestamp: [ts0]}),
+        col,
+    )
+    assert bt._required_activation_rates_from_row(
+        still_stripped.iloc[0],
+        col,
+        reserve_pos_mw=1.0,
+    ) == (0.0, 0.0)
+    assert set(bt._missing_critical_source_reasons) == {"missing_source_of_truth_activation_rate"}
+    assert "afrr.activation_rate_pos" in bt._missing_critical_source_fields
+    assert "afrr.activation_rate_neg" in bt._missing_critical_source_fields
 
     bt._missing_critical_source_fields = []
     bt._missing_critical_source_reasons = set()

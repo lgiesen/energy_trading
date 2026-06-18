@@ -30,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
+import inspect
 import json
 import os
 import signal
@@ -3193,7 +3194,38 @@ class BatteryBacktester:
                 return True
         return False
 
-    def _record_missing_critical_source_field(self, label: str, reason: str) -> None:
+    @staticmethod
+    def _source_truth_timestamp_from_row(row: pd.Series | Mapping[str, object]) -> str:
+        for key in ("timestamp_utc", "target_time_utc", "time", "datetime"):
+            if key not in row:
+                continue
+            ts = pd.to_datetime(row.get(key), utc=True, errors="coerce")
+            if pd.notna(ts):
+                return ts.isoformat()
+        return ""
+
+    @staticmethod
+    def _source_truth_first_timestamp_from_frame(frame: pd.DataFrame, mask: pd.Series | None = None) -> str:
+        for key in ("timestamp_utc", "target_time_utc", "time", "datetime"):
+            if key not in frame.columns:
+                continue
+            values = frame[key]
+            if mask is not None and len(mask) == len(frame):
+                values = values.loc[mask]
+            ts = pd.to_datetime(values, utc=True, errors="coerce").dropna()
+            if not ts.empty:
+                return ts.min().isoformat()
+        return ""
+
+    def _record_missing_critical_source_field(
+        self,
+        label: str,
+        reason: str,
+        *,
+        timestamp: object = "",
+        context: str | None = None,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
         """Record a missing active source-of-truth field without silently legitimizing zero."""
         fields = getattr(self, "_missing_critical_source_fields", None)
         if fields is None:
@@ -3208,6 +3240,38 @@ class BatteryBacktester:
             fields.append(label_s)
         if str(reason):
             reasons.add(str(reason))
+        debug_records = getattr(self, "_missing_critical_source_debug_records", None)
+        if debug_records is None:
+            debug_records = []
+            self._missing_critical_source_debug_records = debug_records
+        ts_text = ""
+        if timestamp not in ("", None):
+            ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
+            ts_text = "" if pd.isna(ts) else ts.isoformat()
+        context_s = str(context or "").strip()
+        if not context_s:
+            context_s = label_s.rsplit(".", 1)[0] if "." in label_s else label_s
+        record = {
+            "label": label_s,
+            "reason": str(reason),
+            "context": context_s,
+            "timestamp_utc": ts_text,
+        }
+        if details:
+            for key, value in details.items():
+                key_s = str(key)
+                if not key_s:
+                    continue
+                if isinstance(value, np.generic):
+                    record[key_s] = value.item()
+                elif isinstance(value, (str, int, float, bool)) or value is None:
+                    record[key_s] = value
+                elif isinstance(value, (list, tuple, set)):
+                    record[key_s] = [str(v) for v in value]
+                else:
+                    record[key_s] = str(value)
+        if record not in debug_records:
+            debug_records.append(record)
 
     def _append_runtime_missing_source_truth(
         self,
@@ -3227,6 +3291,43 @@ class BatteryBacktester:
         for reason in getattr(self, "_missing_critical_source_reasons", set()) or set():
             source_truth_reason_flags.add(str(reason))
 
+    def _runtime_missing_source_truth_debug_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for record in getattr(self, "_missing_critical_source_debug_records", []) or []:
+            if not isinstance(record, Mapping):
+                continue
+            out_record: dict[str, object] = {}
+            for key, value in record.items():
+                key_s = str(key)
+                if key_s in {"label", "reason", "context", "timestamp_utc"}:
+                    out_record[key_s] = str(value)
+                else:
+                    out_record[key_s] = value
+            records.append(out_record)
+        return records
+
+    def _missing_source_truth_debug_summary_fields(self) -> dict[str, object]:
+        runtime_missing_source_debug = self._runtime_missing_source_truth_debug_records()
+        activation_rate_missing_source_debug = [
+            record
+            for record in runtime_missing_source_debug
+            if record.get("reason") == "missing_source_of_truth_activation_rate"
+        ]
+        return {
+            "missing_source_of_truth_runtime_debug": json.dumps(
+                runtime_missing_source_debug,
+                sort_keys=True,
+            ),
+            "missing_source_of_truth_runtime_debug_count": float(len(runtime_missing_source_debug)),
+            "missing_source_of_truth_activation_rate_runtime_debug": json.dumps(
+                activation_rate_missing_source_debug,
+                sort_keys=True,
+            ),
+            "missing_source_of_truth_activation_rate_runtime_debug_count": float(
+                len(activation_rate_missing_source_debug)
+            ),
+        }
+
     def _required_number_from_row(
         self,
         row: pd.Series,
@@ -3235,14 +3336,25 @@ class BatteryBacktester:
         label: str,
         reason: str,
         fallback: float = 0.0,
+        debug_details: Mapping[str, object] | None = None,
     ) -> float:
         """Read an active row field; missing/NaN is invalid, not a real zero."""
         if column not in row.index:
-            self._record_missing_critical_source_field(label, reason)
+            self._record_missing_critical_source_field(
+                label,
+                reason,
+                timestamp=self._source_truth_timestamp_from_row(row),
+                details=debug_details,
+            )
             return float(fallback)
         value = pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
         if pd.isna(value) or not np.isfinite(float(value)):
-            self._record_missing_critical_source_field(label, reason)
+            self._record_missing_critical_source_field(
+                label,
+                reason,
+                timestamp=self._source_truth_timestamp_from_row(row),
+                details=debug_details,
+            )
             return float(fallback)
         return float(value)
 
@@ -3273,14 +3385,25 @@ class BatteryBacktester:
         label: str,
         reason: str,
         fallback: float = 0.0,
+        debug_details: Mapping[str, object] | None = None,
     ) -> pd.Series:
         """Read an active frame field; missing/all-NaN is invalid, not a real zero series."""
         if column not in frame.columns:
-            self._record_missing_critical_source_field(label, reason)
+            self._record_missing_critical_source_field(
+                label,
+                reason,
+                timestamp=self._source_truth_first_timestamp_from_frame(frame),
+                details=debug_details,
+            )
             return pd.Series(float(fallback), index=frame.index, dtype=float)
         values = pd.to_numeric(frame[column], errors="coerce")
         if values.isna().all():
-            self._record_missing_critical_source_field(label, reason)
+            self._record_missing_critical_source_field(
+                label,
+                reason,
+                timestamp=self._source_truth_first_timestamp_from_frame(frame),
+                details=debug_details,
+            )
         return values.fillna(float(fallback)).astype(float)
 
     @staticmethod
@@ -3376,6 +3499,35 @@ class BatteryBacktester:
         if not active:
             return 0.0, 0.0
         pos_col, neg_col = self._resolved_activation_rate_columns(row, colmap)
+        caller = inspect.currentframe().f_back
+        act_rate_cols = [
+            str(c)
+            for c in row.index
+            if "activation_rate" in str(c).lower() or "act_rate" in str(c).lower()
+        ]
+
+        def _row_col_finite(col: str) -> bool:
+            if col not in row.index:
+                return False
+            val = pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0]
+            return bool(pd.notna(val) and np.isfinite(float(val)))
+
+        debug_details = {
+            "caller_function_name": "" if caller is None else str(caller.f_code.co_name),
+            "caller_line_number": 0 if caller is None else int(caller.f_lineno),
+            "label_prefix": str(label_prefix),
+            "reserve_pos_mw": float(reserve_pos_mw),
+            "reserve_neg_mw": float(reserve_neg_mw),
+            "bem_pos_mw": float(bem_pos_mw),
+            "bem_neg_mw": float(bem_neg_mw),
+            "resolved_pos_col": str(pos_col),
+            "resolved_neg_col": str(neg_col),
+            "resolved_pos_col_exists": bool(pos_col in row.index),
+            "resolved_neg_col_exists": bool(neg_col in row.index),
+            "resolved_pos_col_finite": _row_col_finite(pos_col),
+            "resolved_neg_col_finite": _row_col_finite(neg_col),
+            "activation_rate_like_columns": act_rate_cols,
+        }
         return (
             self._required_number_from_row(
                 row,
@@ -3383,6 +3535,7 @@ class BatteryBacktester:
                 label=f"{label_prefix}.activation_rate_pos",
                 reason="missing_source_of_truth_activation_rate",
                 fallback=0.0,
+                debug_details=debug_details,
             ),
             self._required_number_from_row(
                 row,
@@ -3390,6 +3543,7 @@ class BatteryBacktester:
                 label=f"{label_prefix}.activation_rate_neg",
                 reason="missing_source_of_truth_activation_rate",
                 fallback=0.0,
+                debug_details=debug_details,
             ),
         )
 
@@ -3406,6 +3560,32 @@ class BatteryBacktester:
             zeros = pd.Series(0.0, index=frame.index, dtype=float)
             return zeros, zeros.copy()
         pos_col, neg_col = self._resolved_activation_rate_columns(frame, colmap)
+        caller = inspect.currentframe().f_back
+        act_rate_cols = [
+            str(c)
+            for c in frame.columns
+            if "activation_rate" in str(c).lower() or "act_rate" in str(c).lower()
+        ]
+
+        def _finite_count(col: str) -> int:
+            if col not in frame.columns:
+                return 0
+            vals = pd.to_numeric(frame[col], errors="coerce")
+            return int((vals.notna() & np.isfinite(vals.to_numpy(dtype=float, na_value=np.nan))).sum())
+
+        debug_details = {
+            "caller_function_name": "" if caller is None else str(caller.f_code.co_name),
+            "caller_line_number": 0 if caller is None else int(caller.f_lineno),
+            "label_prefix": str(label_prefix),
+            "active": bool(active),
+            "resolved_pos_col": str(pos_col),
+            "resolved_neg_col": str(neg_col),
+            "resolved_pos_col_exists": bool(pos_col in frame.columns),
+            "resolved_neg_col_exists": bool(neg_col in frame.columns),
+            "resolved_pos_col_finite_count": _finite_count(pos_col),
+            "resolved_neg_col_finite_count": _finite_count(neg_col),
+            "activation_rate_like_columns": act_rate_cols,
+        }
         return (
             self._required_numeric_series_from_frame(
                 frame,
@@ -3413,6 +3593,7 @@ class BatteryBacktester:
                 label=f"{label_prefix}.activation_rate_pos",
                 reason="missing_source_of_truth_activation_rate",
                 fallback=0.0,
+                debug_details=debug_details,
             ),
             self._required_numeric_series_from_frame(
                 frame,
@@ -3420,6 +3601,7 @@ class BatteryBacktester:
                 label=f"{label_prefix}.activation_rate_neg",
                 reason="missing_source_of_truth_activation_rate",
                 fallback=0.0,
+                debug_details=debug_details,
             ),
         )
 
@@ -3442,6 +3624,83 @@ class BatteryBacktester:
         out[prediction_col] = mapped.to_numpy()
         return out
 
+    def _preserve_activation_rate_replay_source_columns(
+        self,
+        rows: pd.DataFrame,
+        source_rows: pd.DataFrame,
+        colmap: BacktestColumnMap,
+    ) -> pd.DataFrame:
+        """Carry activation-rate source columns into replay/plan rows by delivery timestamp.
+
+        This is source transport only. It never fabricates zero activation rates:
+        missing source columns remain missing so active reserve/BEM reads fail closed.
+        """
+        if rows is None or rows.empty or source_rows is None or source_rows.empty:
+            return rows
+        out = rows.copy()
+        row_ts_col = colmap.timestamp if colmap.timestamp in out.columns else (
+            "target_time_utc" if "target_time_utc" in out.columns else None
+        )
+        if row_ts_col is None or colmap.timestamp not in source_rows.columns:
+            return out
+
+        source = source_rows.copy()
+        source_ts = pd.to_datetime(source[colmap.timestamp], utc=True, errors="coerce")
+        source = source.assign(_source_ts_utc=source_ts).dropna(subset=["_source_ts_utc"])
+        if source.empty:
+            return out
+        source = source.drop_duplicates(subset=["_source_ts_utc"], keep="last").set_index("_source_ts_utc")
+        out_ts = pd.to_datetime(out[row_ts_col], utc=True, errors="coerce")
+
+        copy_cols: list[str] = [
+            colmap.pred_afrr_activation_rate_pos,
+            colmap.pred_afrr_activation_rate_neg,
+            colmap.true_afrr_activation_rate_pos,
+            colmap.true_afrr_activation_rate_neg,
+            "ev_pred_act_rate_pos",
+            "ev_pred_act_rate_neg",
+            "ev_pred_act_rate_pos_guard",
+            "ev_pred_act_rate_neg_guard",
+            "afrr_activation_rate_guard_source_column_pos",
+            "afrr_activation_rate_guard_source_column_neg",
+            "afrr_activation_rate_guard_quantile",
+            "afrr_activation_rate_guard_quantile_resolved",
+            "afrr_activation_rate_guard_policy",
+            "afrr_activation_rate_guard_mode",
+        ]
+        for q in tuple(getattr(self, "afrr_quantile_bins", ()) or ()):
+            q_s = str(q)
+            copy_cols.extend(
+                [
+                    f"{colmap.pred_afrr_activation_rate_pos}_{q_s}",
+                    f"{colmap.pred_afrr_activation_rate_neg}_{q_s}",
+                    f"ev_pred_act_rate_pos_{q_s}",
+                    f"ev_pred_act_rate_neg_{q_s}",
+                    f"afrr_{q_s}_act_rate_pos",
+                    f"afrr_{q_s}_act_rate_neg",
+                ]
+            )
+
+        for col in dict.fromkeys(copy_cols):
+            if col not in source.columns:
+                continue
+            mapped = out_ts.map(source[col])
+            if col in out.columns:
+                existing = out[col]
+                if pd.api.types.is_numeric_dtype(source[col]):
+                    mapped_num = pd.to_numeric(mapped, errors="coerce")
+                    existing_num = pd.to_numeric(existing, errors="coerce")
+                    use_source = mapped_num.notna() & np.isfinite(
+                        mapped_num.to_numpy(dtype=float, na_value=np.nan)
+                    )
+                    out[col] = existing_num.where(~use_source, mapped_num)
+                else:
+                    use_source = mapped.notna()
+                    out[col] = existing.where(~use_source, mapped)
+            else:
+                out[col] = mapped
+        return out
+
     def _preserve_activation_rate_source_of_truth(
         self,
         merged: pd.DataFrame,
@@ -3459,13 +3718,14 @@ class BatteryBacktester:
         if merged.empty:
             return merged
         out = merged.copy()
+        if not bool(reserve_active):
+            return out
         timestamp_col = colmap.timestamp
         if timestamp_col not in out.columns:
-            if bool(reserve_active):
-                self._record_missing_critical_source_field(
-                    f"{context}.timestamp",
-                    "activation_rate_source_of_truth_lost_during_model_output",
-                )
+            self._record_missing_critical_source_field(
+                f"{context}.timestamp",
+                "activation_rate_source_of_truth_lost_during_model_output",
+            )
             return out
 
         reserve_cols = [
@@ -3492,7 +3752,7 @@ class BatteryBacktester:
             "real_bem_only_executed_pos_mw",
             "real_bem_only_executed_neg_mw",
         ]
-        active_mask = pd.Series(bool(reserve_active), index=out.index, dtype=bool)
+        active_mask = pd.Series(False, index=out.index, dtype=bool)
         for col in reserve_cols:
             if col in out.columns:
                 vals = pd.to_numeric(out[col], errors="coerce").fillna(0.0).abs() > 1e-12
@@ -3539,6 +3799,8 @@ class BatteryBacktester:
                 self._record_missing_critical_source_field(
                     label,
                     "missing_source_of_truth_activation_rate",
+                    timestamp=self._source_truth_first_timestamp_from_frame(out, bad_active),
+                    context=context,
                 )
 
             if source_col in source.columns:
@@ -29406,6 +29668,11 @@ class BatteryBacktester:
             snapshot_plan["target_time_utc"] = pd.to_datetime(snapshot_plan[colmap.timestamp], utc=True, errors="coerce")
             if snapshot_plan["target_time_utc"].isna().any():
                 raise ValueError("Rolling plan contains invalid target timestamps.")
+            snapshot_plan = self._preserve_activation_rate_replay_source_columns(
+                snapshot_plan,
+                window,
+                colmap,
+            )
             snapshot_plan["lead_time_h"] = (
                 (snapshot_plan["target_time_utc"] - snapshot_plan["snapshot_time_utc"]).dt.total_seconds() // 3600
             ).astype("Int64")
@@ -33466,6 +33733,10 @@ class BatteryBacktester:
                     act_rate_pos=float(rate_pos),
                     act_rate_neg=float(rate_neg),
                 )
+            if not bool(getattr(self._strategy_permissions, "allow_bcm", False)):
+                reserve_pos = 0.0
+                reserve_neg = 0.0
+                clearing_rec = self._zero_disabled_bcm_mapping(clearing_rec)
             soc, m = self._settle_one_hour(
                 soc=soc,
                 charge=charge,
@@ -34337,32 +34608,7 @@ class BatteryBacktester:
         if not bool(getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False)):
             reserve_pos = 0.0
             reserve_neg = 0.0
-            for c in (
-                "fixed_reserve_obligation_pos_mw",
-                "fixed_reserve_obligation_neg_mw",
-                "real_fixed_reserve_obligation_pos_mw",
-                "real_fixed_reserve_obligation_neg_mw",
-                "submitted_bcm_capacity_pos_mw",
-                "submitted_bcm_capacity_neg_mw",
-                "real_submitted_bcm_capacity_pos_mw",
-                "real_submitted_bcm_capacity_neg_mw",
-                "locked_bcm_capacity_pos_mw",
-                "locked_bcm_capacity_neg_mw",
-                "real_locked_bcm_capacity_pos_mw",
-                "real_locked_bcm_capacity_neg_mw",
-                "executed_bcm_capacity_pos_mw",
-                "executed_bcm_capacity_neg_mw",
-                "real_executed_bcm_capacity_pos_mw",
-                "real_executed_bcm_capacity_neg_mw",
-                "awarded_capacity_pos_mw",
-                "awarded_capacity_neg_mw",
-                "real_awarded_capacity_pos_mw",
-                "real_awarded_capacity_neg_mw",
-                "bcm_awarded_capacity_pos_mw",
-                "bcm_awarded_capacity_neg_mw",
-            ):
-                if c in clearing_rec:
-                    clearing_rec[c] = 0.0
+            clearing_rec = self._zero_disabled_bcm_mapping(clearing_rec)
         return {
             "charge": charge,
             "discharge": discharge,
@@ -34374,6 +34620,75 @@ class BatteryBacktester:
             "id_discharge": id_discharge,
             "clearing_rec": clearing_rec,
         }
+
+    @staticmethod
+    def _disabled_bcm_numeric_fields() -> tuple[str, ...]:
+        return (
+            "revenue_capacity_eur",
+            "real_revenue_capacity_eur",
+            "bcm_capacity_revenue_eur",
+            "real_bcm_capacity_revenue_eur",
+            "bcm_capacity_revenue_pos_eur",
+            "real_bcm_capacity_revenue_pos_eur",
+            "bcm_capacity_revenue_neg_eur",
+            "real_bcm_capacity_revenue_neg_eur",
+            "bcm_total_revenue_eur",
+            "real_bcm_total_revenue_eur",
+            "submitted_bcm_capacity_pos_mw",
+            "submitted_bcm_capacity_neg_mw",
+            "real_submitted_bcm_capacity_pos_mw",
+            "real_submitted_bcm_capacity_neg_mw",
+            "locked_bcm_capacity_pos_mw",
+            "locked_bcm_capacity_neg_mw",
+            "real_locked_bcm_capacity_pos_mw",
+            "real_locked_bcm_capacity_neg_mw",
+            "executed_bcm_capacity_pos_mw",
+            "executed_bcm_capacity_neg_mw",
+            "real_executed_bcm_capacity_pos_mw",
+            "real_executed_bcm_capacity_neg_mw",
+            "awarded_capacity_pos_mw",
+            "awarded_capacity_neg_mw",
+            "real_awarded_capacity_pos_mw",
+            "real_awarded_capacity_neg_mw",
+            "bcm_awarded_capacity_pos_mw",
+            "bcm_awarded_capacity_neg_mw",
+            "afrr_cap_pos_awarded",
+            "afrr_cap_neg_awarded",
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "real_fixed_reserve_obligation_pos_mw",
+            "real_fixed_reserve_obligation_neg_mw",
+            "locked_reserve_pos_mw",
+            "locked_reserve_neg_mw",
+            "real_locked_reserve_pos_mw",
+            "real_locked_reserve_neg_mw",
+            "bcm_pos_obligation_mw",
+            "bcm_neg_obligation_mw",
+            "power_stack_bcm_pos_mw",
+            "power_stack_bcm_neg_mw",
+            "real_power_stack_bcm_pos_mw",
+            "real_power_stack_bcm_neg_mw",
+        )
+
+    def _zero_disabled_bcm_mapping(self, mapping: Mapping[str, object]) -> dict[str, object]:
+        """Remove inactive BCM source-data aliases from a settlement row."""
+        out = dict(mapping)
+        if bool(getattr(self._strategy_permissions, "allow_bcm", False)):
+            return out
+        for col in self._disabled_bcm_numeric_fields():
+            if col in out:
+                out[col] = 0.0
+        return out
+
+    def _zero_disabled_bcm_hourly(self, hourly: pd.DataFrame) -> pd.DataFrame:
+        """Clear inactive BCM compatibility aliases before strategy isolation validation."""
+        if bool(getattr(self._strategy_permissions, "allow_bcm", False)) or hourly.empty:
+            return hourly
+        out = hourly.copy()
+        for col in self._disabled_bcm_numeric_fields():
+            if col in out.columns:
+                out[col] = 0.0
+        return out
 
     def _settle_realized_reclearing_row(
         self,
@@ -35098,6 +35413,7 @@ class BatteryBacktester:
         checkpoint_dir = None
         self._missing_critical_source_fields = []
         self._missing_critical_source_reasons = set()
+        self._missing_critical_source_debug_records = []
         self._infeasible_debug_dumps = []
         self._hard_final_soc_debug_rows = []
         self._solver_failure_diagnostics = []
@@ -37543,6 +37859,7 @@ class BatteryBacktester:
             ],
             axis=1,
         ).copy()
+        hourly = self._zero_disabled_bcm_hourly(hourly)
         self._validate_strategy_isolation_outputs(
             hourly=hourly,
             allowed_markets=allowed_markets,
@@ -41593,6 +41910,7 @@ class BatteryBacktester:
         summary["missing_source_of_truth_field_count"] = float(len(source_truth_missing))
         summary["critical_required_fields_defaulted"] = float(len(source_truth_missing))
         summary["missing_source_of_truth_invalid_reasons"] = ",".join(sorted(source_truth_reason_flags))
+        summary.update(self._missing_source_truth_debug_summary_fields())
         summary["naive_missing_source_of_truth_fields"] = json.dumps(
             list(dict.fromkeys(path_source_truth_missing["naive"])),
             sort_keys=True,
