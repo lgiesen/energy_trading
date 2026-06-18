@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 from pathlib import Path
 import os
@@ -159,6 +160,80 @@ def test_predicted_settlement_uses_df_activation_rate_when_dispatch_placeholder_
     assert settled_from_dispatch_source[col.pred_afrr_activation_rate_pos].tolist() == pytest.approx([0.45, 0.55])
     assert not (settled_from_dispatch_source[col.pred_afrr_activation_rate_pos] == 0.0).any()
     assert settled_from_dispatch_source["pred_plan_reserve_pos_mw"].tolist() == pytest.approx([1.0, 2.0])
+
+
+def test_predicted_settlement_uses_prefixed_bcm_capacity_bid_price() -> None:
+    col = BacktestColumnMap()
+    bt = _mk_backtester()
+    ts = pd.date_range("2025-04-01T00:00:00Z", periods=1, freq="h")
+    df = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [80.0],
+            col.pred_afrr_capacity_price_pos: [100.0],
+            col.pred_afrr_capacity_price_neg: [90.0],
+            col.pred_afrr_activation_price_pos: [120.0],
+            col.pred_afrr_activation_price_neg: [-20.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            col.true_da_price: [80.0],
+            col.true_afrr_capacity_price_pos: [100.0],
+            col.true_afrr_capacity_price_neg: [90.0],
+            col.true_afrr_activation_price_pos: [120.0],
+            col.true_afrr_activation_price_neg: [-20.0],
+            col.true_afrr_activation_rate_pos: [0.0],
+            col.true_afrr_activation_rate_neg: [0.0],
+            "pred_settlement_cap_bid_price_pos_eur_mw": [11.0],
+            "pred_settlement_cap_bid_price_neg_eur_mw": [13.0],
+        }
+    )
+    dispatch = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "plan_charge_mw": [0.0],
+            "plan_discharge_mw": [0.0],
+            "plan_reserve_pos_mw": [2.0],
+            "plan_reserve_neg_mw": [3.0],
+            "id_charge_mw": [0.0],
+            "id_discharge_mw": [0.0],
+            "is_precleared": [True],
+        }
+    )
+
+    predicted = bt.settle_dispatch(df, dispatch, col, predicted_settlement=True)
+
+    expected_pred_pos = 2.0 * 11.0 * bt.dt_h
+    expected_pred_neg = 3.0 * 13.0 * bt.dt_h
+    assert float(predicted["pred_bcm_capacity_revenue_pos_eur"].iloc[0]) == pytest.approx(expected_pred_pos)
+    assert float(predicted["pred_bcm_capacity_revenue_neg_eur"].iloc[0]) == pytest.approx(expected_pred_neg)
+    assert float(predicted["pred_bcm_capacity_revenue_eur"].iloc[0]) == pytest.approx(
+        expected_pred_pos + expected_pred_neg
+    )
+    assert float(predicted["pred_bcm_capacity_bid_price_pos_eur_per_mw_h"].iloc[0]) == pytest.approx(11.0)
+    assert float(predicted["pred_bcm_capacity_bid_price_neg_eur_per_mw_h"].iloc[0]) == pytest.approx(13.0)
+    assert float(predicted["pred_bcm_capacity_price_missing_with_awarded_mw"].iloc[0]) == pytest.approx(0.0)
+
+    realized_dispatch = dispatch.assign(
+        settlement_cap_bid_price_pos_eur_mw=[7.0],
+        settlement_cap_bid_price_neg_eur_mw=[17.0],
+        aFRR_Capacity_Won_Pos_MW=[2.0],
+        aFRR_Capacity_Won_Neg_MW=[3.0],
+    )
+    realized = bt.settle_dispatch(
+        df,
+        realized_dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+    )
+
+    expected_real_pos = 2.0 * 7.0 * bt.dt_h
+    expected_real_neg = 3.0 * 17.0 * bt.dt_h
+    assert float(realized["real_bcm_capacity_revenue_pos_eur"].iloc[0]) == pytest.approx(expected_real_pos)
+    assert float(realized["real_bcm_capacity_revenue_neg_eur"].iloc[0]) == pytest.approx(expected_real_neg)
+    assert float(realized["real_bcm_capacity_revenue_eur"].iloc[0]) == pytest.approx(
+        expected_real_pos + expected_real_neg
+    )
 
 
 def test_checkpoint_atomic_json_write(tmp_path: Path) -> None:
@@ -716,6 +791,116 @@ def test_market_clearing_bem_guard_uses_settlement_soc_not_planned_soc() -> None
     assert float(cleared["bem_only_submitted_pos_mw"]) == pytest.approx(0.0)
     assert float(cleared["executed_reserve_pos_mw"]) == pytest.approx(0.0)
     assert str(cleared["bem_guard_zero_reason_pos"]) == "bem_guard_stale_soc_anchor"
+
+
+def test_bem_rhpf_consistency_diagnostics_match_generic_afrr_and_bem_only_sources() -> None:
+    bt = _mk_backtester()
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=False,
+        allow_bcm=False,
+        allow_bcm_activation_obligations=False,
+        allow_bem_only=True,
+        id_mode="technical_repair",
+    )
+    bt.afrr_bid_granularity_mw = 0.1
+    bt.afrr_step_mw = 0.1
+    bt.afrr_min_bid_size_mw = 0.1
+    bt.eta_out = 1.0
+    bt.bem_only_headroom_safety_mwh = 0.0
+
+    cleared = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2025-06-12T17:00:00Z"),
+        is_perfect_foresight=True,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=1.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=0.2,
+        true_rate_neg=0.0,
+        pred_rate_pos=0.2,
+        pred_rate_neg=0.0,
+        soc_now=10.0,
+        settlement_soc_now=10.0,
+    )
+
+    assert float(cleared["bem_generic_afrr_submission_mismatch"]) == pytest.approx(0.0)
+    assert float(cleared["bem_generic_afrr_pos_mw"]) == pytest.approx(
+        float(cleared["submitted_afrr_pos_mw"])
+    )
+    assert float(cleared["bem_generic_afrr_pos_mw"]) == pytest.approx(
+        float(cleared["bem_only_submitted_pos_mw"])
+    )
+    assert float(cleared["bem_generic_vs_bem_only_pos_delta_mw"]) == pytest.approx(0.0)
+    assert float(cleared["bem_generic_vs_bem_only_pos_activation_delta_mwh"]) == pytest.approx(0.0)
+    assert float(cleared["bem_generic_vs_bem_only_activation_revenue_delta_eur"]) == pytest.approx(0.0)
+    assert float(cleared["bem_only_bcm_contamination_detected"]) == pytest.approx(0.0)
+    assert float(cleared["bem_only_bcm_contamination_raw_fixed_reserve_pos_mw"]) == pytest.approx(0.0)
+    assert float(cleared["bem_only_bcm_contamination_locked_bcm_capacity_pos_mw"]) == pytest.approx(0.0)
+
+    re_guarded, reserve_pos, reserve_neg = bt._apply_bem_settlement_anchor_guard_to_clearing_record(
+        clearing_rec=dict(cleared),
+        settlement_soc_start_mwh=bt.soc_min,
+        charge_mw=0.0,
+        discharge_mw=0.0,
+        id_charge_mw=0.0,
+        id_discharge_mw=0.0,
+        reserve_pos_mw=float(cleared["executed_reserve_pos_mw"]),
+        reserve_neg_mw=float(cleared["executed_reserve_neg_mw"]),
+        act_rate_pos=0.2,
+        act_rate_neg=0.0,
+    )
+    assert float(re_guarded["bem_only_submitted_pos_mw"]) == pytest.approx(0.0)
+    assert float(re_guarded["submitted_afrr_pos_mw"]) == pytest.approx(0.0)
+    assert float(re_guarded["bem_generic_afrr_pos_mw"]) == pytest.approx(0.0)
+    assert float(re_guarded["bem_generic_afrr_submission_mismatch"]) == pytest.approx(0.0)
+    assert reserve_pos == pytest.approx(0.0)
+    assert reserve_neg == pytest.approx(0.0)
+
+    zeroed = bt._apply_market_clearing(
+        target_time_utc=pd.Timestamp("2025-06-12T18:00:00Z"),
+        is_perfect_foresight=True,
+        planned_charge_mw=0.0,
+        planned_discharge_mw=0.0,
+        planned_reserve_pos_mw=0.0,
+        planned_reserve_neg_mw=0.0,
+        planned_bem_only_pos_mw=10.0,
+        planned_bem_only_neg_mw=0.0,
+        pred_da_price=0.0,
+        true_da_price=0.0,
+        pred_cap_pos=0.0,
+        true_cap_pos=0.0,
+        pred_cap_neg=0.0,
+        true_cap_neg=0.0,
+        pred_act_pos=100.0,
+        true_act_pos=100.0,
+        pred_act_neg=0.0,
+        true_act_neg=0.0,
+        true_rate_pos=0.2,
+        true_rate_neg=0.0,
+        pred_rate_pos=0.2,
+        pred_rate_neg=0.0,
+        soc_now=10.0,
+        settlement_soc_now=bt.soc_min,
+    )
+
+    assert float(zeroed["bem_only_submitted_pos_mw_before_guard"]) > 0.0
+    assert float(zeroed["bem_only_submitted_pos_mw"]) == pytest.approx(0.0)
+    assert float(zeroed["submitted_afrr_pos_mw"]) == pytest.approx(0.0)
+    assert float(zeroed["bem_generic_afrr_submission_mismatch"]) == pytest.approx(0.0)
+    assert str(zeroed["bem_guard_zero_reason_pos"]) not in {"", "none"}
+    assert float(zeroed["bem_only_bcm_contamination_detected"]) == pytest.approx(0.0)
 
 
 def test_market_clearing_unawarded_reserve_to_bem_uses_guarded_quantity() -> None:
@@ -3212,6 +3397,85 @@ def test_bcm_capacity_lockbook_stores_accepted_pay_as_bid_price_for_pos_and_neg(
     )
     expected = (2.0 * 20.0 + 3.0 * 15.0) * bt.dt_h
     assert float(metrics["bcm_capacity_revenue_eur"]) == pytest.approx(expected)
+
+
+def test_bcm_precommit_uses_settlement_equivalent_soc_after_locked_da_before_locking_pos_reserve() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.reserve_bid_derate = 1.0
+    bt.max_reserve_bid_mw = None
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.reserve_min_margin_after_bid_mwh = 0.0
+    col = BacktestColumnMap()
+    snapshot_ts = pd.Timestamp("2025-05-01T06:00:00Z")  # 08:00 Europe/Berlin BCM gate.
+    delivery_hours = pd.date_range("2025-05-01T22:00:00Z", periods=4, freq="h")
+    locked_da_sell_ts = pd.Timestamp("2025-05-01T10:00:00Z")
+    source_hours = pd.date_range(snapshot_ts, delivery_hours[-1], freq="h")
+    snap = pd.DataFrame(
+        {
+            "target_time_utc": delivery_hours,
+            col.timestamp: delivery_hours,
+            "reserve_pos_mw": [4.0] * 4,
+            "reserve_neg_mw": [0.0] * 4,
+            # Stale/planned delivery SoC would make the 4 MW POS bid look feasible.
+            "soc_start_lp_mwh": [8.9] * 4,
+            "charge_mw": [0.0] * 4,
+            "discharge_mw": [0.0] * 4,
+            "bem_only_pos_mw": [0.0] * 4,
+            "bem_only_neg_mw": [0.0] * 4,
+            col.pred_afrr_activation_rate_pos: [0.0] * 4,
+            col.pred_afrr_activation_rate_neg: [0.0] * 4,
+            col.pred_afrr_capacity_price_pos: [10.0] * 4,
+            col.pred_afrr_capacity_price_neg: [0.0] * 4,
+            col.true_afrr_capacity_price_pos: [100.0] * 4,
+            col.true_afrr_capacity_price_neg: [100.0] * 4,
+        }
+    )
+    source = pd.DataFrame(
+        {
+            col.timestamp: source_hours,
+            col.pred_afrr_activation_rate_pos: [0.0] * len(source_hours),
+            col.pred_afrr_activation_rate_neg: [0.0] * len(source_hours),
+            col.pred_afrr_capacity_price_pos: [10.0] * len(source_hours),
+            col.pred_afrr_capacity_price_neg: [0.0] * len(source_hours),
+            col.true_afrr_capacity_price_pos: [100.0] * len(source_hours),
+            col.true_afrr_capacity_price_neg: [100.0] * len(source_hours),
+        }
+    ).set_index(col.timestamp, drop=False)
+    da_lockbook = {locked_da_sell_ts: (0.0, 6.5)}
+    lock_pos: dict[pd.Timestamp, float] = {}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    audit: dict[str, dict[pd.Timestamp, float | str]] = {}
+
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=snap,
+        source=source,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=audit,
+        da_lockbook=da_lockbook,
+        is_perfect_foresight=False,
+        global_end_utc=delivery_hours[-1],
+        current_soc_mwh=8.9,
+    )
+
+    assert lock_pos
+    assert max(float(v) for v in lock_pos.values()) < 4.0
+    first_delivery = delivery_hours[0]
+    assert float(audit["bcm_precommit_settlement_equivalent_replay_used"][first_delivery]) == pytest.approx(1.0)
+    assert float(audit["bcm_precommit_original_candidate_pos_mw"][first_delivery]) == pytest.approx(4.0)
+    assert float(audit["bcm_precommit_written_pos_mw"][first_delivery]) == pytest.approx(
+        float(lock_pos[first_delivery])
+    )
+    assert str(audit["bcm_precommit_settlement_equiv_derate_reason"][first_delivery]) in {
+        "protected_soc_prevented_pos",
+        "physical_soc_min_after_obligation",
+    }
 
 
 def test_bcm_capacity_lockbook_restores_forecast_price_when_builder_zeroes() -> None:
@@ -10366,6 +10630,85 @@ def test_bem_only_negative_is_not_counted_as_bcm_in_canonical_stack() -> None:
     assert float(stack["charge_stack_violation_mw"]) == pytest.approx(0.0)
 
 
+def test_fixed_reserve_bem_settlement_does_not_promote_raw_bem_plan_to_bcm_obligation() -> None:
+    bt = _mk_backtester("canonical_economic")
+    bt.soc_init = bt.soc_min
+    bt._strategy_permissions = StrategyPermissions(
+        allow_da=True,
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=True,
+        id_mode="technical_repair",
+    )
+    df, col = _one_hour_pred_df(
+        da=0.0,
+        cap_pos=100.0,
+        cap_neg=100.0,
+        act_pos=100.0,
+        act_neg=100.0,
+        rate_pos=1.0,
+        rate_neg=0.0,
+    )
+    df[col.true_da_price] = df[col.pred_da_price]
+    df[col.true_afrr_capacity_price_pos] = df[col.pred_afrr_capacity_price_pos]
+    df[col.true_afrr_capacity_price_neg] = df[col.pred_afrr_capacity_price_neg]
+    df[col.true_afrr_activation_price_pos] = df[col.pred_afrr_activation_price_pos]
+    df[col.true_afrr_activation_price_neg] = df[col.pred_afrr_activation_price_neg]
+    df[col.true_afrr_activation_rate_pos] = df[col.pred_afrr_activation_rate_pos]
+    df[col.true_afrr_activation_rate_neg] = df[col.pred_afrr_activation_rate_neg]
+    dispatch = pd.DataFrame(
+        {
+            col.timestamp: df[col.timestamp],
+            "plan_charge_mw": [0.0],
+            "plan_discharge_mw": [0.0],
+            # In multi/BEM mode, this generic reserve plan is free BEM intent
+            # when there is no BCM lockbook obligation.
+            "plan_reserve_pos_mw": [10.0],
+            "plan_reserve_neg_mw": [0.0],
+            "plan_bem_only_pos_mw": [10.0],
+            "plan_bem_only_neg_mw": [0.0],
+            "id_charge_mw": [0.0],
+            "id_discharge_mw": [0.0],
+            "is_precleared": [True],
+            "executed_charge_mw": [0.0],
+            "executed_discharge_mw": [0.0],
+            "executed_reserve_pos_mw": [10.0],
+            "executed_reserve_neg_mw": [0.0],
+            "executed_rate_pos": [1.0],
+            "executed_rate_neg": [0.0],
+            "aFRR_Capacity_Won_Pos_MW": [0.0],
+            "aFRR_Capacity_Won_Neg_MW": [0.0],
+            "fixed_reserve_obligation_pos_mw": [0.0],
+            "fixed_reserve_obligation_neg_mw": [0.0],
+            "bem_only_submitted_pos_mw": [10.0],
+            "bem_only_submitted_neg_mw": [0.0],
+            "bem_only_executed_pos_mw": [10.0],
+            "bem_only_executed_neg_mw": [0.0],
+            "bem_guard_soc_anchor_mwh": [10.0],
+            "settlement_cap_bid_price_pos_eur_mw": [0.0],
+            "settlement_cap_bid_price_neg_eur_mw": [0.0],
+        }
+    )
+
+    settled = bt.settle_dispatch(
+        df,
+        dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+    )
+
+    assert float(settled["real_settlement_raw_plan_reserve_pos_mw"].iloc[0]) == pytest.approx(10.0)
+    assert float(settled["real_fixed_reserve_obligation_from_raw_plan_blocked"].iloc[0]) == pytest.approx(1.0)
+    assert float(settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(0.0)
+    assert settled["fixed_reserve_obligation_source_pos"].iloc[0] == "clearing_record_fixed_reserve_obligation"
+    assert settled["real_fixed_reserve_obligation_source_pos"].iloc[0] == "clearing_record_fixed_reserve_obligation"
+    assert float(settled["real_bem_request_pos_mw_before_guard"].iloc[0]) == pytest.approx(10.0)
+    assert float(settled["real_bem_submitted_pos_mw_after_guard"].iloc[0]) == pytest.approx(10.0)
+    assert float(settled["real_generic_afrr_to_fixed_reserve_mapping_used"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_fixed_reserve_obligation_from_bem_detected"].iloc[0]) == pytest.approx(1.0)
+
+
 def test_bcm_positive_headroom_30min() -> None:
     bt = _mk_backtester()
     # Need >= reserve*0.5/eta_out above soc_min for 10 MW reserve.
@@ -13275,6 +13618,59 @@ def test_da_postlock_uses_hourly_commitments_not_schedule_totals_for_feasibility
     assert all(float(r["da_postlock_candidate_total_locked_sell_mwh"]) > bt.p_max_mw for r in audit)
 
 
+def test_da_precommit_preserves_already_locked_bcm_reserve_envelope_after_bcm_gate() -> None:
+    bt = _mk_backtester("canonical_economic")
+    col = BacktestColumnMap()
+    bt.dt_h = 1.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.da_bid_granularity_mw = 0.1
+    bt.da_min_bid_size_mw = 0.1
+    bt.aux_standby_mw = 0.0
+    bt.aux_charge_mw = 0.0
+    bt.aux_discharge_mw = 0.0
+    bt.aux_afrr_active_mw = 0.0
+
+    da_ts = pd.Timestamp("2025-04-02T17:00:00Z")
+    reserve_ts = pd.Timestamp("2025-04-03T06:00:00Z")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: [da_ts, reserve_ts],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+            "fixed_reserve_obligation_pos_mw": [0.0, 4.0],
+            "fixed_reserve_obligation_neg_mw": [0.0, 0.0],
+        }
+    )
+
+    repaired, diag, by_ts = bt._apply_da_after_bcm_forward_replay_guard(
+        accepted_da={da_ts: (0.0, 3.0)},
+        current_soc_mwh=6.0,
+        future_rows=future_rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={reserve_ts: 4.0},
+        fixed_reserve_neg={},
+        scheduled_id_by_ts={},
+    )
+
+    repaired_buy, repaired_sell = bt._normalize_da_bid(*repaired[da_ts])
+    assert repaired_buy == pytest.approx(0.0)
+    assert 0.0 < repaired_sell <= 2.0
+    assert float(diag["da_after_bcm_forward_replay_checked"]) == pytest.approx(1.0)
+    assert float(diag["da_after_bcm_forward_replay_pass"]) == pytest.approx(1.0)
+    assert str(diag["da_after_bcm_forward_replay_reason"]) == "da_after_bcm_future_pos_protected_soc_violation"
+    assert str(diag["da_after_bcm_forward_replay_first_blocking_ts_utc"]) == reserve_ts.isoformat()
+    assert float(diag["da_after_bcm_forward_replay_final_sell_mwh"]) < 3.0
+    assert da_ts in by_ts
+    assert float(by_ts[da_ts]["da_after_bcm_forward_replay_final_sell_mwh"]) == pytest.approx(repaired_sell)
+
+
 def test_da_postlock_diagnostics_survive_thesis_hourly_output_filter() -> None:
     required = {
         "da_postlock_candidate_future_feasible": [0.0],
@@ -13564,6 +13960,151 @@ def test_da_hourly_lock_rejects_sell_exceeding_available_energy() -> None:
     assert float(diag["da_candidate_rejected_hourly_lock_infeasible"]) == pytest.approx(1.0)
     assert float(by_ts[ts]["da_hourly_lock_max_feasible_sell_mwh"]) == pytest.approx(9.5)
     assert float(by_ts[ts]["da_hourly_lock_infeasible_sell_mwh"]) == pytest.approx(0.5)
+
+
+def test_da_prelock_rejects_candidate_that_violates_locked_reserve_protected_soc() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    col = BacktestColumnMap()
+    da_ts = pd.Timestamp("2026-01-22T06:00:00Z")
+    reserve_ts = pd.Timestamp("2026-01-22T07:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [da_ts, reserve_ts])
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=7.91,
+        existing_da_lockbook={},
+        candidate_da={da_ts: (0.0, 5.2)},
+        fixed_reserve_pos={reserve_ts: 4.0},
+        fixed_reserve_neg={reserve_ts: 4.0},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasible_reason"]) == "locked_reserve_protected_soc_min_violation_after_da"
+    assert float(by_ts[reserve_ts]["da_locked_reserve_protected_soc_guard_checked"]) == pytest.approx(1.0)
+    assert float(by_ts[reserve_ts]["da_locked_reserve_protected_soc_min_mwh"]) == pytest.approx(4.0)
+    assert float(by_ts[reserve_ts]["da_locked_reserve_protected_soc_violation_pos_mwh"]) == pytest.approx(1.29)
+
+    repaired, repair_diag, _ = bt._repair_or_reject_da_before_lock(
+        accepted_da={da_ts: (0.0, 5.2)},
+        current_soc_mwh=7.91,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={reserve_ts: 4.0},
+        fixed_reserve_neg={reserve_ts: 4.0},
+        global_end_utc=None,
+    )
+
+    assert repaired == {}
+    assert float(repair_diag["da_prelock_derated_to_preserve_headroom"]) == pytest.approx(1.0)
+    assert float(repair_diag["da_prelock_locked_reserve_protected_soc_derate_or_reject"]) == pytest.approx(1.0)
+    assert (
+        str(repair_diag["da_prelock_locked_reserve_protected_soc_reason"])
+        == "locked_reserve_protected_soc_min_violation_after_da"
+    )
+    assert str(repair_diag["da_prelock_repair_reason"]) == "prelock_repair_no_feasible_subset"
+
+    ok_after_reject, _, by_ts_after_reject = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=7.91,
+        existing_da_lockbook={},
+        candidate_da=repaired,
+        fixed_reserve_pos={reserve_ts: 4.0},
+        fixed_reserve_neg={reserve_ts: 4.0},
+    )
+    assert ok_after_reject is True
+    assert float(by_ts_after_reject[reserve_ts]["da_locked_reserve_protected_soc_margin_pos_mwh"]) == pytest.approx(3.91)
+
+    ok_buy, diag_buy, by_ts_buy = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=12.0,
+        existing_da_lockbook={},
+        candidate_da={da_ts: (5.0, 0.0)},
+        fixed_reserve_pos={reserve_ts: 4.0},
+        fixed_reserve_neg={reserve_ts: 4.0},
+    )
+
+    assert ok_buy is False
+    assert str(diag_buy["da_hourly_lock_infeasible_reason"]) == "locked_reserve_protected_soc_max_violation_after_da"
+    assert float(by_ts_buy[reserve_ts]["da_locked_reserve_protected_soc_max_mwh"]) == pytest.approx(16.0)
+    assert float(by_ts_buy[reserve_ts]["da_locked_reserve_protected_soc_violation_neg_mwh"]) == pytest.approx(1.0)
+
+
+def test_da_prelock_uses_row_level_locked_reserve_for_future_protected_soc() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    col = BacktestColumnMap()
+    da_ts = pd.Timestamp("2026-01-22T06:00:00Z")
+    reserve_ts = pd.Timestamp("2026-01-22T07:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [da_ts, reserve_ts])
+    rows.loc[rows[col.timestamp] == reserve_ts, "real_fixed_reserve_obligation_pos_mw"] = 4.0
+    rows.loc[rows[col.timestamp] == reserve_ts, "real_fixed_reserve_obligation_neg_mw"] = 4.0
+
+    ok, diag, by_ts = bt._check_da_hourly_lock_physical_feasibility(
+        future_rows=rows,
+        colmap=col,
+        current_soc_mwh=7.91,
+        existing_da_lockbook={},
+        candidate_da={da_ts: (0.0, 5.2)},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+    )
+
+    assert ok is False
+    assert str(diag["da_hourly_lock_infeasible_reason"]) == "locked_reserve_protected_soc_min_violation_after_da"
+    assert str(diag["da_locked_reserve_protected_soc_violation_ts_utc"]) == str(reserve_ts)
+    assert float(by_ts[reserve_ts]["da_locked_reserve_protected_soc_guard_checked"]) == pytest.approx(1.0)
+    assert float(by_ts[reserve_ts]["da_locked_reserve_protected_soc_min_mwh"]) == pytest.approx(4.0)
+
+    repaired, repair_diag, by_ts_after = bt._repair_or_reject_da_before_lock(
+        accepted_da={da_ts: (0.0, 5.2)},
+        current_soc_mwh=7.91,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert repaired == {}
+    assert float(repair_diag["da_prelock_locked_reserve_protected_soc_derate_or_reject"]) == pytest.approx(1.0)
+    assert (
+        str(repair_diag["da_prelock_locked_reserve_protected_soc_reason"])
+        == "locked_reserve_protected_soc_min_violation_after_da"
+    )
+    assert float(by_ts_after[reserve_ts]["da_locked_reserve_protected_soc_guard_checked"]) == pytest.approx(1.0)
+
+
+def test_da_prelock_locked_reserve_protected_soc_diagnostics_are_hourly_whitelisted() -> None:
+    source = inspect.getsource(BatteryBacktester.optimize_dispatch_rolling)
+    required_fields = {
+        "da_precommit_da_prelock_locked_reserve_protected_soc_derate_or_reject",
+        "da_precommit_da_prelock_locked_reserve_protected_soc_reason",
+        "da_precommit_da_locked_reserve_protected_soc_guard_checked",
+        "da_precommit_da_locked_reserve_protected_soc_guard_pass",
+        "da_precommit_da_locked_reserve_protected_soc_min_mwh",
+        "da_precommit_da_locked_reserve_protected_soc_max_mwh",
+        "da_precommit_da_locked_reserve_protected_soc_violation_pos_mwh",
+        "da_precommit_da_locked_reserve_protected_soc_violation_neg_mwh",
+        "da_precommit_da_locked_reserve_protected_soc_violation_ts_utc",
+        "da_precommit_da_locked_reserve_protected_soc_derate_or_reject",
+        "da_precommit_da_locked_reserve_protected_soc_margin_pos_mwh",
+        "da_precommit_da_locked_reserve_protected_soc_margin_neg_mwh",
+    }
+
+    missing = [field for field in sorted(required_fields) if field not in source]
+    assert missing == []
 
 
 def test_da_hourly_lock_replay_uses_sequential_soc_not_independent_hourly_capacity() -> None:
