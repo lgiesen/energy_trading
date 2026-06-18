@@ -14053,6 +14053,503 @@ def _configure_zero_aux_unit_efficiency(bt: BatteryBacktester) -> None:
     bt.aux_afrr_active_mw = 0.0
 
 
+def test_universal_projection_detects_da_buy_violating_future_neg_reserve_envelope() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T06:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "real_locked_bcm_capacity_neg_mw": [4.0],
+        }
+    )
+
+    result = bt.project_settlement_equivalent_soc_for_lockbook_guard(
+        start_soc_mwh=15.0,
+        current_timestamp_utc=ts,
+        future_rows=rows,
+        colmap=col,
+        allow_da=True,
+        allow_bcm=True,
+        allow_bem_only=False,
+        allow_id=False,
+        candidate_da={ts: (2.0, 0.0)},
+    )
+
+    assert result.feasible is False
+    assert result.first_violation_reason == "protected_soc_max_violation"
+    assert result.first_violation_ts_utc == ts.isoformat()
+    assert result.protected_soc_violation_neg_max_mwh == pytest.approx(1.0)
+    assert result.steps[0].soc_end_mwh == pytest.approx(17.0)
+    assert result.steps[0].protected_soc_max_mwh == pytest.approx(16.0)
+    assert result.steps[0].bcm_neg_mw == pytest.approx(4.0)
+
+
+def test_universal_projection_detects_da_sell_violating_future_pos_reserve_envelope() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T06:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "real_locked_bcm_capacity_pos_mw": [4.0],
+        }
+    )
+
+    result = bt.project_settlement_equivalent_soc_for_lockbook_guard(
+        start_soc_mwh=5.0,
+        current_timestamp_utc=ts,
+        future_rows=rows,
+        colmap=col,
+        allow_da=True,
+        allow_bcm=True,
+        allow_bem_only=False,
+        allow_id=False,
+        candidate_da={ts: (0.0, 2.0)},
+    )
+
+    assert result.feasible is False
+    assert result.first_violation_reason == "protected_soc_min_violation"
+    assert result.first_violation_ts_utc == ts.isoformat()
+    assert result.protected_soc_violation_pos_max_mwh == pytest.approx(1.0)
+    assert result.steps[0].soc_end_mwh == pytest.approx(3.0)
+    assert result.steps[0].protected_soc_min_mwh == pytest.approx(4.0)
+    assert result.steps[0].bcm_pos_mw == pytest.approx(4.0)
+
+
+def test_universal_projection_ignores_inactive_market_aliases() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T06:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "real_locked_bcm_capacity_pos_mw": [12.0],
+            "real_locked_bcm_capacity_neg_mw": [12.0],
+            "real_bem_only_submitted_pos_mw": [12.0],
+            "real_bem_only_submitted_neg_mw": [12.0],
+        }
+    )
+
+    result = bt.project_settlement_equivalent_soc_for_lockbook_guard(
+        start_soc_mwh=10.0,
+        current_timestamp_utc=ts,
+        future_rows=rows,
+        colmap=col,
+        allow_da=True,
+        allow_bcm=False,
+        allow_bem_only=False,
+        allow_id=False,
+        candidate_da={},
+    )
+
+    assert result.feasible is True
+    assert result.first_violation_reason == "none"
+    assert result.steps[0].bcm_pos_mw == pytest.approx(0.0)
+    assert result.steps[0].bcm_neg_mw == pytest.approx(0.0)
+    assert result.steps[0].bem_pos_mw == pytest.approx(0.0)
+    assert result.steps[0].bem_neg_mw == pytest.approx(0.0)
+    assert result.steps[0].protected_soc_min_mwh == pytest.approx(bt.soc_min)
+    assert result.steps[0].protected_soc_max_mwh == pytest.approx(bt.soc_max)
+
+
+def test_universal_projection_uses_path_specific_activation_rate_sources() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.0
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T06:00:00Z")
+
+    def _project(row_data: dict[str, object], path: str):
+        rows = pd.DataFrame({col.timestamp: [ts], **{k: [v] for k, v in row_data.items()}})
+        return bt.project_settlement_equivalent_soc_for_lockbook_guard(
+            start_soc_mwh=10.0,
+            current_timestamp_utc=ts,
+            future_rows=rows,
+            colmap=col,
+            allow_da=False,
+            allow_bcm=True,
+            allow_bem_only=False,
+            allow_id=False,
+            activation_rate_path=path,
+        )
+
+    model = _project(
+        {
+            "real_locked_bcm_capacity_pos_mw": 1.0,
+            "real_locked_bcm_capacity_neg_mw": 1.0,
+            "ev_pred_act_rate_pos_guard": np.nan,
+            "ev_pred_act_rate_neg_guard": np.nan,
+            col.pred_afrr_activation_rate_pos: 0.11,
+            col.pred_afrr_activation_rate_neg: 0.12,
+            col.true_afrr_activation_rate_pos: 0.91,
+            col.true_afrr_activation_rate_neg: 0.92,
+        },
+        "model",
+    )
+    assert model.feasible is True
+    assert model.missing_source_fields == ()
+    assert model.steps[0].act_pos_rate == pytest.approx(0.11)
+    assert model.steps[0].act_neg_rate == pytest.approx(0.12)
+    assert model.steps[0].act_pos_source_col == col.pred_afrr_activation_rate_pos
+    assert model.steps[0].act_neg_source_col == col.pred_afrr_activation_rate_neg
+
+    naive = _project(
+        {
+            "real_locked_bcm_capacity_pos_mw": 1.0,
+            "real_locked_bcm_capacity_neg_mw": 1.0,
+            "naive_pred_afrr_activation_rate_pos": 0.21,
+            "naive_pred_afrr_activation_rate_neg": 0.22,
+            col.pred_afrr_activation_rate_pos: 0.31,
+            col.pred_afrr_activation_rate_neg: 0.32,
+            f"{col.pred_afrr_activation_rate_pos}_naive_source_mode": "same_weekday_last_week",
+            f"{col.pred_afrr_activation_rate_neg}_naive_source_mode": "same_weekday_last_week",
+            col.true_afrr_activation_rate_pos: 0.91,
+            col.true_afrr_activation_rate_neg: 0.92,
+        },
+        "naive",
+    )
+    assert naive.feasible is True
+    assert naive.missing_source_fields == ()
+    assert naive.steps[0].act_pos_rate == pytest.approx(0.21)
+    assert naive.steps[0].act_neg_rate == pytest.approx(0.22)
+    assert naive.steps[0].act_pos_source_col == "naive_pred_afrr_activation_rate_pos"
+    assert naive.steps[0].act_neg_source_col == "naive_pred_afrr_activation_rate_neg"
+
+    rhpf = _project(
+        {
+            "real_locked_bcm_capacity_pos_mw": 1.0,
+            "real_locked_bcm_capacity_neg_mw": 1.0,
+            "perfect_foresight_activation_rate_phys_pos": 0.41,
+            "perfect_foresight_activation_rate_phys_neg": 0.42,
+            col.pred_afrr_activation_rate_pos: 0.11,
+            col.pred_afrr_activation_rate_neg: 0.12,
+            col.true_afrr_activation_rate_pos: 0.51,
+            col.true_afrr_activation_rate_neg: 0.52,
+        },
+        "rhpf",
+    )
+    assert rhpf.feasible is True
+    assert rhpf.missing_source_fields == ()
+    assert rhpf.steps[0].act_pos_rate == pytest.approx(0.41)
+    assert rhpf.steps[0].act_neg_rate == pytest.approx(0.42)
+    assert rhpf.steps[0].act_pos_source_col == "perfect_foresight_activation_rate_phys_pos"
+    assert rhpf.steps[0].act_neg_source_col == "perfect_foresight_activation_rate_phys_neg"
+
+    missing_model = _project(
+        {
+            "real_locked_bcm_capacity_pos_mw": 1.0,
+            "real_locked_bcm_capacity_neg_mw": 1.0,
+            "ev_pred_act_rate_pos_guard": np.nan,
+            "ev_pred_act_rate_neg_guard": np.nan,
+            col.true_afrr_activation_rate_pos: 0.91,
+            col.true_afrr_activation_rate_neg: 0.92,
+        },
+        "model",
+    )
+    assert missing_model.feasible is False
+    assert missing_model.first_violation_reason == "missing_source_of_truth_activation_rate"
+    assert missing_model.missing_source_fields == (
+        "model.activation_rate_pos",
+        "model.activation_rate_neg",
+    )
+    assert np.isnan(missing_model.steps[0].act_pos_rate)
+    assert np.isnan(missing_model.steps[0].act_neg_rate)
+    assert missing_model.steps[0].act_pos_source_col == "missing_source_of_truth_activation_rate"
+    assert missing_model.steps[0].act_neg_source_col == "missing_source_of_truth_activation_rate"
+
+
+def test_da_prewrite_universal_projection_shadow_records_would_fail_without_changing_lockbook() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T06:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [ts],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            "real_locked_bcm_capacity_neg_mw": [4.0],
+        }
+    )
+    accepted_da = {ts: (2.0, 0.0)}
+    da_lockbook: dict[pd.Timestamp, tuple[float, float]] = {}
+    accepted_before = dict(accepted_da)
+    lockbook_before = dict(da_lockbook)
+
+    diag, by_ts = bt._da_prewrite_universal_projection_shadow_diagnostics(
+        accepted_da=accepted_da,
+        current_soc_mwh=15.0,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook=da_lockbook,
+        fixed_reserve_neg={ts: 4.0},
+        activation_rate_path="model",
+    )
+
+    assert accepted_da == accepted_before
+    assert da_lockbook == lockbook_before
+    assert diag["universal_projection_shadow_pass"] == pytest.approx(0.0)
+    assert diag["universal_projection_shadow_first_blocking_ts_utc"] == ts.isoformat()
+    assert diag["universal_projection_shadow_first_blocking_reason"] == "protected_soc_max_violation"
+    assert diag["universal_projection_shadow_max_protected_soc_violation_neg_mwh"] == pytest.approx(1.0)
+    assert diag["universal_projection_shadow_activation_rate_path"] == "model"
+    assert by_ts[ts]["universal_projection_shadow_pass"] == pytest.approx(0.0)
+
+
+def test_da_prewrite_universal_projection_guard_derates_rejects_and_preserves_safe_da() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.da_bid_granularity_mw = 0.1
+    bt.da_min_bid_size_mw = 0.1
+    col = BacktestColumnMap()
+    ts = pd.Timestamp("2026-01-22T06:00:00Z")
+
+    def _rows(extra: dict[str, object]) -> pd.DataFrame:
+        return pd.DataFrame({col.timestamp: [ts], **{k: [v] for k, v in extra.items()}})
+
+    buy_da = {ts: (2.0, 0.0)}
+    buy_lockbook: dict[pd.Timestamp, tuple[float, float]] = {}
+    guarded_buy, buy_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da=buy_da,
+        current_soc_mwh=15.0,
+        future_rows=_rows(
+            {
+                col.pred_afrr_activation_rate_pos: 0.0,
+                col.pred_afrr_activation_rate_neg: 0.0,
+                "real_locked_bcm_capacity_neg_mw": 4.0,
+            }
+        ),
+        colmap=col,
+        existing_da_lockbook=buy_lockbook,
+        fixed_reserve_neg={ts: 4.0},
+        activation_rate_path="model",
+    )
+    assert buy_da == {ts: (2.0, 0.0)}
+    assert buy_lockbook == {}
+    assert buy_diag["universal_projection_guard_applied"] == pytest.approx(1.0)
+    assert buy_diag["universal_projection_guard_first_blocking_reason"] == "protected_soc_max_violation"
+    assert guarded_buy[ts][0] == pytest.approx(1.0)
+    assert guarded_buy[ts][1] == pytest.approx(0.0)
+
+    sell_da = {ts: (0.0, 2.0)}
+    guarded_sell, sell_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da=sell_da,
+        current_soc_mwh=5.0,
+        future_rows=_rows(
+            {
+                col.pred_afrr_activation_rate_pos: 0.0,
+                col.pred_afrr_activation_rate_neg: 0.0,
+                "real_locked_bcm_capacity_pos_mw": 4.0,
+            }
+        ),
+        colmap=col,
+        fixed_reserve_pos={ts: 4.0},
+        activation_rate_path="model",
+    )
+    assert sell_da == {ts: (0.0, 2.0)}
+    assert sell_diag["universal_projection_guard_applied"] == pytest.approx(1.0)
+    assert sell_diag["universal_projection_guard_first_blocking_reason"] == "protected_soc_min_violation"
+    assert guarded_sell[ts][0] == pytest.approx(0.0)
+    assert guarded_sell[ts][1] == pytest.approx(1.0)
+
+    safe_da = {ts: (1.0, 0.0)}
+    guarded_safe, safe_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da=safe_da,
+        current_soc_mwh=10.0,
+        future_rows=_rows(
+            {
+                col.pred_afrr_activation_rate_pos: 0.0,
+                col.pred_afrr_activation_rate_neg: 0.0,
+            }
+        ),
+        colmap=col,
+        activation_rate_path="model",
+    )
+    assert guarded_safe == safe_da
+    assert safe_diag["universal_projection_guard_applied"] == pytest.approx(0.0)
+    assert safe_diag["universal_projection_guard_derated_mwh"] == pytest.approx(0.0)
+
+    da_only_permissions = StrategyPermissions(
+        allow_da=True,
+        id_mode="disabled",
+        allow_bcm=False,
+        allow_bcm_activation_obligations=False,
+        allow_bem_only=False,
+    )
+    stale_alias_da = {ts: (1.0, 0.0)}
+    guarded_inactive, inactive_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da=stale_alias_da,
+        current_soc_mwh=10.0,
+        future_rows=_rows(
+            {
+                col.pred_afrr_activation_rate_pos: 0.0,
+                col.pred_afrr_activation_rate_neg: 0.0,
+                "real_locked_bcm_capacity_pos_mw": 12.0,
+                "real_locked_bcm_capacity_neg_mw": 12.0,
+                "real_bem_only_submitted_pos_mw": 12.0,
+                "real_bem_only_submitted_neg_mw": 12.0,
+            }
+        ),
+        colmap=col,
+        strategy_permissions=da_only_permissions,
+        activation_rate_path="model",
+    )
+    assert guarded_inactive == stale_alias_da
+    assert inactive_diag["universal_projection_guard_applied"] == pytest.approx(0.0)
+
+    missing_source_da = {ts: (1.0, 0.0)}
+    guarded_missing, missing_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da=missing_source_da,
+        current_soc_mwh=10.0,
+        future_rows=_rows({"real_locked_bcm_capacity_neg_mw": 1.0}),
+        colmap=col,
+        fixed_reserve_neg={ts: 1.0},
+        activation_rate_path="model",
+    )
+    assert guarded_missing == {}
+    assert missing_diag["universal_projection_guard_applied"] == pytest.approx(1.0)
+    assert missing_diag["universal_projection_guard_first_blocking_reason"] == (
+        "missing_source_of_truth_activation_rate"
+    )
+    assert missing_diag["universal_projection_guard_missing_source_fields"] == "model.activation_rate_neg"
+
+
+def test_da_prewrite_guard_derates_buy_before_future_planned_neg_reserve_envelope() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.reserve_activation_headroom_h = 0.5
+    bt.reserve_headroom_safety_mwh = 0.0
+    bt.reserve_soc_projection_safety_mwh = 0.0
+    bt.da_bid_granularity_mw = 0.1
+    bt.da_min_bid_size_mw = 0.1
+    col = BacktestColumnMap()
+    prior_ts = pd.Timestamp("2026-01-22T09:00:00Z")
+    da_ts = pd.Timestamp("2026-01-22T10:00:00Z")
+    reserve_ts = pd.Timestamp("2026-01-22T11:00:00Z")
+    multi_permissions = StrategyPermissions(
+        allow_da=True,
+        id_mode="disabled",
+        allow_bcm=True,
+        allow_bcm_activation_obligations=True,
+        allow_bem_only=True,
+    )
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [prior_ts, da_ts, reserve_ts],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [1.0, 0.0, 0.0],
+            "plan_bem_only_neg_mw": [2.0, 0.0, 0.0],
+            "plan_reserve_neg_mw": [0.0, 0.0, 4.0],
+        }
+    )
+    accepted_da = {da_ts: (2.0, 0.0)}
+
+    stale_result = bt.project_settlement_equivalent_soc_for_lockbook_guard(
+        start_soc_mwh=13.0,
+        current_timestamp_utc=da_ts,
+        future_rows=rows.loc[rows[col.timestamp] >= da_ts],
+        colmap=col,
+        strategy_permissions=multi_permissions,
+        candidate_da=accepted_da,
+        activation_rate_path="model",
+    )
+    assert stale_result.feasible is True
+
+    shadow_diag, shadow_by_ts = bt._da_prewrite_universal_projection_shadow_diagnostics(
+        accepted_da=accepted_da,
+        current_soc_mwh=13.0,
+        future_rows=rows,
+        colmap=col,
+        strategy_permissions=multi_permissions,
+        activation_rate_path="model",
+    )
+    assert shadow_diag["universal_projection_shadow_pass"] == pytest.approx(0.0)
+    assert shadow_diag["universal_projection_shadow_first_blocking_ts_utc"] == reserve_ts.isoformat()
+    assert shadow_diag["universal_projection_shadow_first_blocking_reason"] == "protected_soc_max_violation"
+    assert shadow_diag["universal_projection_anchor_start_soc_mwh"] == pytest.approx(15.0)
+    assert shadow_diag["universal_projection_shadow_missing_source_fields"] == ""
+    assert shadow_by_ts[da_ts]["universal_projection_shadow_pass"] == pytest.approx(0.0)
+
+    guarded, diag, by_ts = bt._da_prewrite_universal_projection_guard(
+        accepted_da=accepted_da,
+        current_soc_mwh=13.0,
+        future_rows=rows,
+        colmap=col,
+        strategy_permissions=multi_permissions,
+        activation_rate_path="model",
+    )
+
+    assert accepted_da == {da_ts: (2.0, 0.0)}
+    assert diag["universal_projection_guard_applied"] == pytest.approx(1.0)
+    assert diag["universal_projection_guard_first_blocking_ts_utc"] == reserve_ts.isoformat()
+    assert diag["universal_projection_guard_first_blocking_reason"] == "protected_soc_max_violation"
+    assert diag["universal_projection_anchor_reference_soc_mwh"] == pytest.approx(13.0)
+    assert diag["universal_projection_anchor_start_soc_mwh"] == pytest.approx(15.0)
+    assert diag["universal_projection_anchor_delta_mwh"] == pytest.approx(2.0)
+    assert diag["universal_projection_first_da_delivery_ts_utc"] == da_ts.isoformat()
+    assert diag["universal_projection_guard_missing_source_fields"] == ""
+    assert guarded[da_ts][0] == pytest.approx(1.0)
+    assert guarded[da_ts][1] == pytest.approx(0.0)
+    assert by_ts[da_ts]["universal_projection_guard_row_original_da_mwh"] == pytest.approx(2.0)
+    assert by_ts[da_ts]["universal_projection_guard_row_final_da_mwh"] == pytest.approx(1.0)
+
+    safe_guarded, safe_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da={da_ts: (1.0, 0.0)},
+        current_soc_mwh=13.0,
+        future_rows=rows,
+        colmap=col,
+        strategy_permissions=multi_permissions,
+        activation_rate_path="model",
+    )
+    assert safe_guarded == {da_ts: (1.0, 0.0)}
+    assert safe_diag["universal_projection_guard_applied"] == pytest.approx(0.0)
+
+    da_only_permissions = StrategyPermissions(
+        allow_da=True,
+        id_mode="disabled",
+        allow_bcm=False,
+        allow_bcm_activation_obligations=False,
+        allow_bem_only=False,
+    )
+    inactive_guarded, inactive_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da={da_ts: (2.0, 0.0)},
+        current_soc_mwh=13.0,
+        future_rows=rows,
+        colmap=col,
+        strategy_permissions=da_only_permissions,
+        activation_rate_path="model",
+    )
+    assert inactive_guarded == {da_ts: (2.0, 0.0)}
+    assert inactive_diag["universal_projection_guard_applied"] == pytest.approx(0.0)
+
+
 def test_da_hourly_lock_rejects_buy_exceeding_soc_headroom() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)

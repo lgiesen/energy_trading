@@ -553,6 +553,55 @@ class StrategyPermissions:
         return self.id_mode == "economic"
 
 
+@dataclass(frozen=True)
+class PhysicalProjectionStep:
+    timestamp_utc: str
+    soc_start_mwh: float
+    soc_end_mwh: float
+    da_buy_mw: float
+    da_sell_mw: float
+    bcm_pos_mw: float
+    bcm_neg_mw: float
+    bem_pos_mw: float
+    bem_neg_mw: float
+    id_buy_mw: float
+    id_sell_mw: float
+    aux_mwh: float
+    act_pos_rate: float
+    act_neg_rate: float
+    act_pos_source_col: str
+    act_neg_source_col: str
+    protected_soc_min_mwh: float
+    protected_soc_max_mwh: float
+    physical_soc_violation_pos_mwh: float
+    physical_soc_violation_neg_mwh: float
+    protected_soc_violation_pos_mwh: float
+    protected_soc_violation_neg_mwh: float
+    headroom_violation_pos_mwh: float
+    headroom_violation_neg_mwh: float
+    violation_reason: str
+
+
+@dataclass(frozen=True)
+class PhysicalProjectionResult:
+    feasible: bool
+    first_violation_ts_utc: str
+    first_violation_reason: str
+    initial_soc_mwh: float
+    final_soc_mwh: float
+    projected_soc_min_mwh: float
+    projected_soc_max_mwh: float
+    protected_soc_violation_pos_max_mwh: float
+    protected_soc_violation_neg_max_mwh: float
+    headroom_violation_pos_max_mwh: float
+    headroom_violation_neg_max_mwh: float
+    physical_soc_violation_pos_max_mwh: float
+    physical_soc_violation_neg_max_mwh: float
+    missing_source_fields: tuple[str, ...]
+    steps: tuple[PhysicalProjectionStep, ...]
+    diagnostics: dict[str, float | str]
+
+
 ID_RECOURSE_MODES = {"common", "disabled", "afrr_obligation_only"}
 
 
@@ -22890,6 +22939,883 @@ class BatteryBacktester:
             "physical_soc_violation_neg_mwh": float(physical_violation_neg),
         }
 
+    def project_settlement_equivalent_soc_for_lockbook_guard(
+        self,
+        *,
+        start_soc_mwh: float,
+        current_timestamp_utc: pd.Timestamp,
+        future_rows: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        strategy_permissions: StrategyPermissions | None = None,
+        allow_da: bool | None = None,
+        allow_bcm: bool | None = None,
+        allow_bem_only: bool | None = None,
+        allow_id: bool | None = None,
+        da_lockbook: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        bcm_pos_lockbook: Mapping[pd.Timestamp, float] | None = None,
+        bcm_neg_lockbook: Mapping[pd.Timestamp, float] | None = None,
+        bem_schedule: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        id_repairs: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        candidate_da: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        candidate_bcm_pos: Mapping[pd.Timestamp, float] | None = None,
+        candidate_bcm_neg: Mapping[pd.Timestamp, float] | None = None,
+        candidate_bem: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        candidate_id: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        activation_rate_path: str = "model",
+        tol_mwh: float = 1e-9,
+    ) -> PhysicalProjectionResult:
+        """Read-only settlement-style physical projection for future lockbook guards.
+
+        This oracle intentionally does not write lockbooks, diagnostics, invalid
+        reasons, or fallback state. It is not wired into production decisions yet.
+        """
+        perms = strategy_permissions or self._strategy_permissions
+        active_da = bool(perms.allow_da if allow_da is None else allow_da)
+        active_bcm = bool(perms.allow_bcm if allow_bcm is None else allow_bcm)
+        active_bem = bool(perms.allow_bem_only if allow_bem_only is None else allow_bem_only)
+        active_id = bool(perms.allow_id if allow_id is None else allow_id)
+
+        def _ts(raw: object) -> pd.Timestamp | None:
+            parsed = pd.to_datetime(raw, utc=True, errors="coerce")
+            if pd.isna(parsed):
+                return None
+            return pd.Timestamp(parsed)
+
+        def _book_pair(
+            mapping: Mapping[pd.Timestamp, tuple[float, float]] | None,
+            *,
+            normalize_exclusive: bool = True,
+        ) -> dict[pd.Timestamp, tuple[float, float]]:
+            out: dict[pd.Timestamp, tuple[float, float]] = {}
+            for raw_ts, pair in dict(mapping or {}).items():
+                ts = _ts(raw_ts)
+                if ts is None:
+                    continue
+                if normalize_exclusive:
+                    out[ts] = self._normalize_da_bid(*pair)
+                else:
+                    try:
+                        a, b = pair
+                        out[ts] = (max(0.0, float(a)), max(0.0, float(b)))
+                    except (TypeError, ValueError):
+                        out[ts] = (0.0, 0.0)
+            return out
+
+        def _book_scalar(mapping: Mapping[pd.Timestamp, float] | None) -> dict[pd.Timestamp, float]:
+            out: dict[pd.Timestamp, float] = {}
+            for raw_ts, value in dict(mapping or {}).items():
+                ts = _ts(raw_ts)
+                if ts is None:
+                    continue
+                try:
+                    out[ts] = max(0.0, float(value))
+                except (TypeError, ValueError):
+                    out[ts] = 0.0
+            return out
+
+        def _add_pair(
+            base: tuple[float, float],
+            extra: tuple[float, float],
+            *,
+            normalize_exclusive: bool = True,
+        ) -> tuple[float, float]:
+            if normalize_exclusive:
+                base_a, base_b = self._normalize_da_bid(*base)
+                extra_a, extra_b = self._normalize_da_bid(*extra)
+                return self._normalize_da_bid(
+                    max(0.0, base_a) + max(0.0, extra_a),
+                    max(0.0, base_b) + max(0.0, extra_b),
+                )
+            base_a, base_b = base
+            extra_a, extra_b = extra
+            return (
+                max(0.0, float(base_a)) + max(0.0, float(extra_a)),
+                max(0.0, float(base_b)) + max(0.0, float(extra_b)),
+            )
+
+        def _row_max_float(row: pd.Series, names: tuple[str, ...]) -> float:
+            best = 0.0
+            for name in names:
+                if not name or name not in row.index:
+                    continue
+                val = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").iloc[0]
+                if pd.notna(val) and np.isfinite(float(val)):
+                    best = max(best, max(0.0, float(val)))
+            return float(best)
+
+        def _activation_source_candidates(side: str, row: pd.Series) -> tuple[str, ...]:
+            suffix = "pos" if side == "pos" else "neg"
+            canonical = colmap.pred_afrr_activation_rate_pos if side == "pos" else colmap.pred_afrr_activation_rate_neg
+            truth = colmap.true_afrr_activation_rate_pos if side == "pos" else colmap.true_afrr_activation_rate_neg
+            path = str(activation_rate_path or "model").strip().lower().replace("-", "_")
+            if path in {"rhpf", "rolling_pf", "perfect_foresight", "pf", "truth", "true", "realized"}:
+                return (
+                    f"perfect_foresight_activation_rate_phys_{suffix}",
+                    f"perfect_foresight_afrr_activation_rate_{suffix}",
+                    f"real_activation_rate_phys_{suffix}",
+                    truth,
+                    f"target_afrr_activation_rate_{suffix}",
+                )
+            if path in {"naive", "last_week", "same_weekday_last_week"}:
+                provenance_cols = (
+                    f"{canonical}_naive_source_mode",
+                    f"{canonical}_naive_source_timestamp_utc",
+                    f"{canonical}_naive_source_lag_hours",
+                )
+                canonical_is_naive = any(name in row.index for name in provenance_cols)
+                naive_candidates = (
+                    f"naive_{canonical}",
+                    f"naive_afrr_activation_rate_{suffix}",
+                    f"naive_ev_pred_act_rate_{suffix}",
+                    f"{canonical}_naive",
+                    f"ev_pred_act_rate_{suffix}_naive",
+                )
+                return naive_candidates + ((canonical,) if canonical_is_naive else ())
+            return (
+                f"ev_pred_act_rate_{suffix}_guard",
+                f"{canonical}_guard",
+                f"ev_pred_act_rate_{suffix}",
+                canonical,
+            )
+
+        def _activation_rate(row: pd.Series, side: str, active_mw: float) -> tuple[float, str, str]:
+            if active_mw <= 1e-12:
+                return 0.0, "none", ""
+            candidates = _activation_source_candidates(side, row)
+            for name in candidates:
+                if name not in row.index:
+                    continue
+                val = pd.to_numeric(pd.Series([row[name]]), errors="coerce").iloc[0]
+                if pd.notna(val) and np.isfinite(float(val)):
+                    return float(np.clip(float(val), 0.0, 1.0)), str(name), ""
+            required_label = f"{str(activation_rate_path or 'model').strip().lower()}.activation_rate_{side}"
+            return float("nan"), "missing_source_of_truth_activation_rate", required_label
+
+        current_ts = _ts(current_timestamp_utc)
+        soc = float(start_soc_mwh)
+        if current_ts is None or future_rows is None or future_rows.empty or colmap.timestamp not in future_rows.columns:
+            return PhysicalProjectionResult(
+                feasible=True,
+                first_violation_ts_utc="",
+                first_violation_reason="none",
+                initial_soc_mwh=float(soc),
+                final_soc_mwh=float(soc),
+                projected_soc_min_mwh=float(soc),
+                projected_soc_max_mwh=float(soc),
+                protected_soc_violation_pos_max_mwh=0.0,
+                protected_soc_violation_neg_max_mwh=0.0,
+                headroom_violation_pos_max_mwh=0.0,
+                headroom_violation_neg_max_mwh=0.0,
+                physical_soc_violation_pos_max_mwh=0.0,
+                physical_soc_violation_neg_max_mwh=0.0,
+                missing_source_fields=(),
+                steps=(),
+                diagnostics={"projection_checked": 0.0, "projection_reason": "empty_future_rows"},
+            )
+
+        rows = future_rows.copy()
+        rows[colmap.timestamp] = pd.to_datetime(rows[colmap.timestamp], utc=True, errors="coerce")
+        rows = rows.loc[rows[colmap.timestamp].notna() & (rows[colmap.timestamp] >= current_ts)]
+        rows = rows.sort_values(colmap.timestamp)
+
+        da_book = _book_pair(da_lockbook if active_da else None)
+        da_candidate = _book_pair(candidate_da if active_da else None)
+        bcm_pos = _book_scalar(bcm_pos_lockbook if active_bcm else None)
+        bcm_neg = _book_scalar(bcm_neg_lockbook if active_bcm else None)
+        cand_bcm_pos = _book_scalar(candidate_bcm_pos if active_bcm else None)
+        cand_bcm_neg = _book_scalar(candidate_bcm_neg if active_bcm else None)
+        bem_book = _book_pair(bem_schedule if active_bem else None, normalize_exclusive=False)
+        cand_bem_book = _book_pair(candidate_bem if active_bem else None, normalize_exclusive=False)
+        id_book = _book_pair(id_repairs if active_id else None)
+        cand_id_book = _book_pair(candidate_id if active_id else None)
+
+        steps: list[PhysicalProjectionStep] = []
+        first_violation_ts = ""
+        first_violation_reason = "none"
+        soc_min_seen = float(soc)
+        soc_max_seen = float(soc)
+        protected_pos_max = 0.0
+        protected_neg_max = 0.0
+        headroom_pos_max = 0.0
+        headroom_neg_max = 0.0
+        physical_pos_max = 0.0
+        physical_neg_max = 0.0
+        missing_source_fields: list[str] = []
+
+        for _, row in rows.iterrows():
+            ts = pd.Timestamp(row[colmap.timestamp])
+            da_buy, da_sell = (0.0, 0.0)
+            if active_da:
+                da_buy, da_sell = _add_pair(da_book.get(ts, (0.0, 0.0)), da_candidate.get(ts, (0.0, 0.0)))
+
+            bcm_pos_mw = 0.0
+            bcm_neg_mw = 0.0
+            if active_bcm:
+                bcm_pos_mw = max(
+                    bcm_pos.get(ts, 0.0) + cand_bcm_pos.get(ts, 0.0),
+                    _row_max_float(
+                        row,
+                        (
+                            "fixed_reserve_obligation_pos_mw",
+                            "real_fixed_reserve_obligation_pos_mw",
+                            "locked_bcm_capacity_pos_mw",
+                            "real_locked_bcm_capacity_pos_mw",
+                            "reserve_lockbook_pos_mw",
+                            "fixed_obligation_reserve_pos_mw",
+                            "fixed_obligation_reserve_pos_mw_max",
+                            "plan_reserve_pos_mw",
+                            "reserve_pos_mw",
+                            "reserve_pos_bin_0_mw",
+                            "submitted_reserve_pos_mw",
+                            "submitted_bcm_capacity_pos_mw",
+                        ),
+                    ),
+                )
+                bcm_neg_mw = max(
+                    bcm_neg.get(ts, 0.0) + cand_bcm_neg.get(ts, 0.0),
+                    _row_max_float(
+                        row,
+                        (
+                            "fixed_reserve_obligation_neg_mw",
+                            "real_fixed_reserve_obligation_neg_mw",
+                            "locked_bcm_capacity_neg_mw",
+                            "real_locked_bcm_capacity_neg_mw",
+                            "reserve_lockbook_neg_mw",
+                            "fixed_obligation_reserve_neg_mw",
+                            "fixed_obligation_reserve_neg_mw_max",
+                            "plan_reserve_neg_mw",
+                            "reserve_neg_mw",
+                            "reserve_neg_bin_0_mw",
+                            "submitted_reserve_neg_mw",
+                            "submitted_bcm_capacity_neg_mw",
+                        ),
+                    ),
+                )
+
+            bem_pos_mw = 0.0
+            bem_neg_mw = 0.0
+            if active_bem:
+                bem_pos_mw, bem_neg_mw = _add_pair(
+                    bem_book.get(ts, (0.0, 0.0)),
+                    cand_bem_book.get(ts, (0.0, 0.0)),
+                    normalize_exclusive=False,
+                )
+                bem_pos_mw = max(
+                    bem_pos_mw,
+                    _row_max_float(
+                        row,
+                        (
+                            "bem_only_pos_mw",
+                            "plan_bem_only_pos_mw",
+                            "submitted_bem_only_pos_mw",
+                            "real_bem_only_submitted_pos_mw",
+                            "real_bem_only_executed_pos_mw",
+                        ),
+                    ),
+                )
+                bem_neg_mw = max(
+                    bem_neg_mw,
+                    _row_max_float(
+                        row,
+                        (
+                            "bem_only_neg_mw",
+                            "plan_bem_only_neg_mw",
+                            "submitted_bem_only_neg_mw",
+                            "real_bem_only_submitted_neg_mw",
+                            "real_bem_only_executed_neg_mw",
+                        ),
+                    ),
+                )
+
+            id_buy, id_sell = (0.0, 0.0)
+            if active_id:
+                id_buy, id_sell = _add_pair(id_book.get(ts, (0.0, 0.0)), cand_id_book.get(ts, (0.0, 0.0)))
+
+            protected_pos_mw = float(bcm_pos_mw) + float(bem_pos_mw)
+            protected_neg_mw = float(bcm_neg_mw) + float(bem_neg_mw)
+            act_pos_rate, pos_rate_source, pos_missing_field = _activation_rate(row, "pos", protected_pos_mw)
+            act_neg_rate, neg_rate_source, neg_missing_field = _activation_rate(row, "neg", protected_neg_mw)
+
+            missing_rate = (
+                pos_rate_source == "missing_source_of_truth_activation_rate"
+                or neg_rate_source == "missing_source_of_truth_activation_rate"
+            )
+            if pos_missing_field:
+                missing_source_fields.append(pos_missing_field)
+            if neg_missing_field:
+                missing_source_fields.append(neg_missing_field)
+            act_pos_rate_for_calc = float(act_pos_rate) if np.isfinite(float(act_pos_rate)) else 0.0
+            act_neg_rate_for_calc = float(act_neg_rate) if np.isfinite(float(act_neg_rate)) else 0.0
+            req_pos_mwh = (
+                protected_pos_mw
+                * max(float(self.reserve_activation_headroom_h), float(act_pos_rate_for_calc) * float(self.dt_h))
+                / max(float(self.eta_out), 1e-12)
+            )
+            req_neg_mwh = (
+                protected_neg_mw
+                * max(float(self.reserve_activation_headroom_h), float(act_neg_rate_for_calc) * float(self.dt_h))
+                * max(float(self.eta_in), 1e-12)
+            )
+            aux_power_mw, _ = self._state_aux_power_mw(
+                charge_mw=float(da_buy),
+                discharge_mw=float(da_sell),
+                reserve_pos_mw=float(protected_pos_mw),
+                reserve_neg_mw=float(protected_neg_mw),
+                act_pos_rate=float(act_pos_rate_for_calc),
+                act_neg_rate=float(act_neg_rate_for_calc),
+                id_charge_mw=float(id_buy),
+                id_discharge_mw=float(id_sell),
+            )
+            aux_mwh = max(0.0, float(aux_power_mw) * float(self.dt_h))
+            delta, _ = self._calculate_soc_delta(
+                charge_mw=float(da_buy),
+                discharge_mw=float(da_sell),
+                id_charge_mw=float(id_buy),
+                id_discharge_mw=float(id_sell),
+                act_pos_mwh=max(0.0, protected_pos_mw * float(act_pos_rate_for_calc) * float(self.dt_h)),
+                act_neg_mwh=max(0.0, protected_neg_mw * float(act_neg_rate_for_calc) * float(self.dt_h)),
+                aux_mwh=float(aux_mwh),
+                battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                dt_h=float(self.dt_h),
+            )
+            soc_end = float(soc) + float(delta)
+            physical_pos = max(0.0, float(self.soc_min) - soc_end)
+            physical_neg = max(0.0, soc_end - float(self.soc_max))
+            headroom_pos = max(0.0, req_pos_mwh - max(0.0, soc_end - float(self.soc_min)))
+            headroom_neg = max(0.0, req_neg_mwh - max(0.0, float(self.soc_max) - soc_end))
+            post_psv = self._compute_obligation_driven_protected_soc_bounds(
+                soc_start_mwh=float(soc_end),
+                required_headroom_pos_mwh=float(req_pos_mwh),
+                required_headroom_neg_mwh=float(req_neg_mwh),
+                locked_reserve_pos_mw=float(protected_pos_mw),
+                locked_reserve_neg_mw=float(protected_neg_mw),
+                committed_bem_pos_mw=float(bem_pos_mw),
+                committed_bem_neg_mw=float(bem_neg_mw),
+                reserve_pos_mw=0.0,
+                reserve_neg_mw=0.0,
+            )
+            protected_pos_v = float(post_psv["protected_soc_violation_pos_mwh"])
+            protected_neg_v = float(post_psv["protected_soc_violation_neg_mwh"])
+            reason = "none"
+            if missing_rate:
+                reason = "missing_source_of_truth_activation_rate"
+            elif physical_pos > tol_mwh:
+                reason = "physical_soc_below_min"
+            elif physical_neg > tol_mwh:
+                reason = "physical_soc_above_max"
+            elif protected_pos_v > tol_mwh:
+                reason = "protected_soc_min_violation"
+            elif protected_neg_v > tol_mwh:
+                reason = "protected_soc_max_violation"
+            elif headroom_pos > tol_mwh:
+                reason = "reserve_headroom_shortfall_pos"
+            elif headroom_neg > tol_mwh:
+                reason = "reserve_headroom_shortfall_neg"
+
+            if first_violation_reason == "none" and reason != "none":
+                first_violation_ts = ts.isoformat()
+                first_violation_reason = reason
+
+            steps.append(
+                PhysicalProjectionStep(
+                    timestamp_utc=ts.isoformat(),
+                    soc_start_mwh=float(soc),
+                    soc_end_mwh=float(soc_end),
+                    da_buy_mw=float(da_buy),
+                    da_sell_mw=float(da_sell),
+                    bcm_pos_mw=float(bcm_pos_mw),
+                    bcm_neg_mw=float(bcm_neg_mw),
+                    bem_pos_mw=float(bem_pos_mw),
+                    bem_neg_mw=float(bem_neg_mw),
+                    id_buy_mw=float(id_buy),
+                    id_sell_mw=float(id_sell),
+                    aux_mwh=float(aux_mwh),
+                    act_pos_rate=float(act_pos_rate),
+                    act_neg_rate=float(act_neg_rate),
+                    act_pos_source_col=str(pos_rate_source),
+                    act_neg_source_col=str(neg_rate_source),
+                    protected_soc_min_mwh=float(post_psv["protected_soc_min_mwh"]),
+                    protected_soc_max_mwh=float(post_psv["protected_soc_max_mwh"]),
+                    physical_soc_violation_pos_mwh=float(physical_pos),
+                    physical_soc_violation_neg_mwh=float(physical_neg),
+                    protected_soc_violation_pos_mwh=float(protected_pos_v),
+                    protected_soc_violation_neg_mwh=float(protected_neg_v),
+                    headroom_violation_pos_mwh=float(headroom_pos),
+                    headroom_violation_neg_mwh=float(headroom_neg),
+                    violation_reason=reason,
+                )
+            )
+            soc = float(soc_end)
+            soc_min_seen = min(soc_min_seen, float(soc_end))
+            soc_max_seen = max(soc_max_seen, float(soc_end))
+            protected_pos_max = max(protected_pos_max, protected_pos_v)
+            protected_neg_max = max(protected_neg_max, protected_neg_v)
+            headroom_pos_max = max(headroom_pos_max, headroom_pos)
+            headroom_neg_max = max(headroom_neg_max, headroom_neg)
+            physical_pos_max = max(physical_pos_max, physical_pos)
+            physical_neg_max = max(physical_neg_max, physical_neg)
+
+        return PhysicalProjectionResult(
+            feasible=(first_violation_reason == "none"),
+            first_violation_ts_utc=first_violation_ts,
+            first_violation_reason=first_violation_reason,
+            initial_soc_mwh=float(start_soc_mwh),
+            final_soc_mwh=float(soc),
+            projected_soc_min_mwh=float(soc_min_seen),
+            projected_soc_max_mwh=float(soc_max_seen),
+            protected_soc_violation_pos_max_mwh=float(protected_pos_max),
+            protected_soc_violation_neg_max_mwh=float(protected_neg_max),
+            headroom_violation_pos_max_mwh=float(headroom_pos_max),
+            headroom_violation_neg_max_mwh=float(headroom_neg_max),
+            physical_soc_violation_pos_max_mwh=float(physical_pos_max),
+            physical_soc_violation_neg_max_mwh=float(physical_neg_max),
+            missing_source_fields=tuple(dict.fromkeys(missing_source_fields)),
+            steps=tuple(steps),
+            diagnostics={
+                "projection_checked": 1.0,
+                "projection_rows": float(len(steps)),
+                "active_da": float(active_da),
+                "active_bcm": float(active_bcm),
+                "active_bem_only": float(active_bem),
+                "active_id": float(active_id),
+                "activation_rate_path": str(activation_rate_path or "model"),
+                "first_violation_reason": first_violation_reason,
+                "missing_source_fields": ",".join(dict.fromkeys(missing_source_fields)),
+            },
+        )
+
+    def _da_prewrite_universal_projection_shadow_diagnostics(
+        self,
+        *,
+        accepted_da: Mapping[pd.Timestamp, tuple[float, float]],
+        current_soc_mwh: float,
+        future_rows: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        existing_da_lockbook: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        fixed_reserve_pos: Mapping[pd.Timestamp, float] | None = None,
+        fixed_reserve_neg: Mapping[pd.Timestamp, float] | None = None,
+        scheduled_id_by_ts: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        strategy_permissions: StrategyPermissions | None = None,
+        activation_rate_path: str = "model",
+    ) -> tuple[dict[str, float | str], dict[pd.Timestamp, dict[str, float | str]]]:
+        """Diagnostic-only universal projection before DA lockbook write.
+
+        The result is intentionally advisory: callers must not use it to alter DA
+        quantities, lockbooks, settlement, validity, fallback, or reportability.
+        """
+        try:
+            anchor_soc_mwh, projection_rows, anchor_diag, anchor_missing_fields = (
+                self._da_prewrite_universal_projection_anchor(
+                    accepted_da=accepted_da,
+                    current_soc_mwh=float(current_soc_mwh),
+                    future_rows=future_rows,
+                    colmap=colmap,
+                    existing_da_lockbook=existing_da_lockbook,
+                    fixed_reserve_pos=fixed_reserve_pos,
+                    fixed_reserve_neg=fixed_reserve_neg,
+                    scheduled_id_by_ts=scheduled_id_by_ts,
+                    strategy_permissions=strategy_permissions,
+                    activation_rate_path=str(activation_rate_path),
+                )
+            )
+            result = self.project_settlement_equivalent_soc_for_lockbook_guard(
+                start_soc_mwh=float(anchor_soc_mwh),
+                current_timestamp_utc=pd.to_datetime(
+                    projection_rows[colmap.timestamp].min(), utc=True, errors="coerce"
+                ),
+                future_rows=projection_rows,
+                colmap=colmap,
+                strategy_permissions=strategy_permissions,
+                da_lockbook=existing_da_lockbook,
+                bcm_pos_lockbook=fixed_reserve_pos,
+                bcm_neg_lockbook=fixed_reserve_neg,
+                id_repairs=scheduled_id_by_ts,
+                candidate_da=accepted_da,
+                activation_rate_path=str(activation_rate_path),
+            )
+            diag: dict[str, float | str] = {
+                "universal_projection_shadow_pass": float(bool(result.feasible)),
+                "universal_projection_shadow_first_blocking_ts_utc": str(result.first_violation_ts_utc),
+                "universal_projection_shadow_first_blocking_reason": str(result.first_violation_reason),
+                "universal_projection_shadow_max_physical_soc_min_violation_mwh": float(
+                    result.physical_soc_violation_pos_max_mwh
+                ),
+                "universal_projection_shadow_max_physical_soc_max_violation_mwh": float(
+                    result.physical_soc_violation_neg_max_mwh
+                ),
+                "universal_projection_shadow_max_protected_soc_violation_pos_mwh": float(
+                    result.protected_soc_violation_pos_max_mwh
+                ),
+                "universal_projection_shadow_max_protected_soc_violation_neg_mwh": float(
+                    result.protected_soc_violation_neg_max_mwh
+                ),
+                "universal_projection_shadow_max_headroom_violation_pos_mwh": float(
+                    result.headroom_violation_pos_max_mwh
+                ),
+                "universal_projection_shadow_max_headroom_violation_neg_mwh": float(
+                    result.headroom_violation_neg_max_mwh
+                ),
+                "universal_projection_shadow_missing_source_fields": ",".join(result.missing_source_fields),
+                "universal_projection_shadow_activation_rate_path": str(activation_rate_path),
+            }
+            if anchor_missing_fields:
+                diag["universal_projection_shadow_pass"] = 0.0
+                diag["universal_projection_shadow_first_blocking_reason"] = (
+                    "missing_source_of_truth_activation_rate"
+                )
+                diag["universal_projection_shadow_missing_source_fields"] = ",".join(
+                    dict.fromkeys(tuple(anchor_missing_fields) + tuple(result.missing_source_fields))
+                )
+            diag.update(anchor_diag)
+            by_ts: dict[pd.Timestamp, dict[str, float | str]] = {}
+            for step in result.steps:
+                ts = pd.to_datetime(step.timestamp_utc, utc=True, errors="coerce")
+                if pd.isna(ts):
+                    continue
+                by_ts[pd.Timestamp(ts)] = dict(diag)
+            return diag, by_ts
+        except Exception as exc:
+            diag = {
+                "universal_projection_shadow_pass": 0.0,
+                "universal_projection_shadow_first_blocking_ts_utc": "",
+                "universal_projection_shadow_first_blocking_reason": (
+                    f"universal_projection_shadow_exception:{type(exc).__name__}"
+                ),
+                "universal_projection_shadow_max_physical_soc_min_violation_mwh": 0.0,
+                "universal_projection_shadow_max_physical_soc_max_violation_mwh": 0.0,
+                "universal_projection_shadow_max_protected_soc_violation_pos_mwh": 0.0,
+                "universal_projection_shadow_max_protected_soc_violation_neg_mwh": 0.0,
+                "universal_projection_shadow_max_headroom_violation_pos_mwh": 0.0,
+                "universal_projection_shadow_max_headroom_violation_neg_mwh": 0.0,
+                "universal_projection_shadow_missing_source_fields": "",
+                "universal_projection_shadow_activation_rate_path": str(activation_rate_path),
+                "universal_projection_anchor_start_soc_mwh": float(current_soc_mwh),
+                "universal_projection_anchor_reference_soc_mwh": float(current_soc_mwh),
+                "universal_projection_anchor_delta_mwh": 0.0,
+                "universal_projection_anchor_start_ts_utc": "",
+                "universal_projection_first_da_delivery_ts_utc": "",
+            }
+            return diag, {}
+
+    def _da_prewrite_universal_projection_anchor(
+        self,
+        *,
+        accepted_da: Mapping[pd.Timestamp, tuple[float, float]],
+        current_soc_mwh: float,
+        future_rows: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        existing_da_lockbook: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        fixed_reserve_pos: Mapping[pd.Timestamp, float] | None = None,
+        fixed_reserve_neg: Mapping[pd.Timestamp, float] | None = None,
+        scheduled_id_by_ts: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        strategy_permissions: StrategyPermissions | None = None,
+        activation_rate_path: str = "model",
+    ) -> tuple[float, pd.DataFrame, dict[str, float | str], tuple[str, ...]]:
+        """Advance the DA guard anchor to the first DA delivery without the new DA candidate."""
+        def _accepted_ts() -> list[pd.Timestamp]:
+            out: list[pd.Timestamp] = []
+            for raw_ts, pair in dict(accepted_da or {}).items():
+                ts = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+                if pd.isna(ts):
+                    continue
+                buy_mw, sell_mw = self._normalize_da_bid(*pair)
+                if buy_mw > 1e-12 or sell_mw > 1e-12:
+                    out.append(pd.Timestamp(ts))
+            return sorted(out)
+
+        original_anchor = float(current_soc_mwh)
+        delivery_ts = _accepted_ts()
+        first_da_ts = delivery_ts[0] if delivery_ts else pd.NaT
+        diag: dict[str, float | str] = {
+            "universal_projection_anchor_start_soc_mwh": float(original_anchor),
+            "universal_projection_anchor_reference_soc_mwh": float(original_anchor),
+            "universal_projection_anchor_delta_mwh": 0.0,
+            "universal_projection_anchor_start_ts_utc": "" if pd.isna(first_da_ts) else first_da_ts.isoformat(),
+            "universal_projection_first_da_delivery_ts_utc": "" if pd.isna(first_da_ts) else first_da_ts.isoformat(),
+        }
+        if (
+            pd.isna(first_da_ts)
+            or future_rows is None
+            or future_rows.empty
+            or colmap.timestamp not in future_rows.columns
+        ):
+            return float(original_anchor), future_rows, diag, ()
+
+        rows = future_rows.copy()
+        rows[colmap.timestamp] = pd.to_datetime(rows[colmap.timestamp], utc=True, errors="coerce")
+        rows = rows.loc[rows[colmap.timestamp].notna()].sort_values(colmap.timestamp)
+        if rows.empty:
+            return float(original_anchor), rows, diag, ()
+        first_future_ts = pd.to_datetime(rows[colmap.timestamp].min(), utc=True, errors="coerce")
+        guard_rows = rows.loc[rows[colmap.timestamp] >= first_da_ts].copy()
+        anchor_rows = rows.loc[
+            (rows[colmap.timestamp] >= pd.Timestamp(first_future_ts))
+            & (rows[colmap.timestamp] < first_da_ts)
+        ].copy()
+        if anchor_rows.empty:
+            return float(original_anchor), guard_rows, diag, ()
+
+        anchor_result = self.project_settlement_equivalent_soc_for_lockbook_guard(
+            start_soc_mwh=float(original_anchor),
+            current_timestamp_utc=pd.Timestamp(first_future_ts),
+            future_rows=anchor_rows,
+            colmap=colmap,
+            strategy_permissions=strategy_permissions,
+            da_lockbook=existing_da_lockbook,
+            bcm_pos_lockbook=fixed_reserve_pos,
+            bcm_neg_lockbook=fixed_reserve_neg,
+            id_repairs=scheduled_id_by_ts,
+            candidate_da={},
+            activation_rate_path=str(activation_rate_path),
+        )
+        anchor_soc = float(anchor_result.final_soc_mwh)
+        if not np.isfinite(anchor_soc):
+            anchor_soc = float(original_anchor)
+        diag.update(
+            {
+                "universal_projection_anchor_start_soc_mwh": float(anchor_soc),
+                "universal_projection_anchor_reference_soc_mwh": float(original_anchor),
+                "universal_projection_anchor_delta_mwh": float(anchor_soc - original_anchor),
+                "universal_projection_anchor_start_ts_utc": first_da_ts.isoformat(),
+                "universal_projection_first_da_delivery_ts_utc": first_da_ts.isoformat(),
+            }
+        )
+        return float(anchor_soc), guard_rows, diag, tuple(anchor_result.missing_source_fields)
+
+    def _da_prewrite_universal_projection_guard(
+        self,
+        *,
+        accepted_da: Mapping[pd.Timestamp, tuple[float, float]],
+        current_soc_mwh: float,
+        future_rows: pd.DataFrame,
+        colmap: BacktestColumnMap,
+        existing_da_lockbook: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        fixed_reserve_pos: Mapping[pd.Timestamp, float] | None = None,
+        fixed_reserve_neg: Mapping[pd.Timestamp, float] | None = None,
+        scheduled_id_by_ts: Mapping[pd.Timestamp, tuple[float, float]] | None = None,
+        strategy_permissions: StrategyPermissions | None = None,
+        activation_rate_path: str = "model",
+    ) -> tuple[
+        dict[pd.Timestamp, tuple[float, float]],
+        dict[str, float | str],
+        dict[pd.Timestamp, dict[str, float | str]],
+    ]:
+        """Apply the universal projection as a local DA prewrite guard."""
+
+        def _normalize_schedule(
+            schedule: Mapping[pd.Timestamp, tuple[float, float]],
+        ) -> dict[pd.Timestamp, tuple[float, float]]:
+            out: dict[pd.Timestamp, tuple[float, float]] = {}
+            for raw_ts, pair in dict(schedule).items():
+                ts = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+                if pd.isna(ts):
+                    continue
+                buy_mw, sell_mw = self._normalize_da_bid(*pair)
+                if buy_mw > 1e-12 or sell_mw > 1e-12:
+                    out[pd.Timestamp(ts)] = (float(buy_mw), float(sell_mw))
+            return out
+
+        def _project(schedule: Mapping[pd.Timestamp, tuple[float, float]]) -> PhysicalProjectionResult:
+            return self.project_settlement_equivalent_soc_for_lockbook_guard(
+                start_soc_mwh=float(projection_anchor_soc_mwh),
+                current_timestamp_utc=pd.to_datetime(
+                    projection_rows[colmap.timestamp].min(), utc=True, errors="coerce"
+                ),
+                future_rows=projection_rows,
+                colmap=colmap,
+                strategy_permissions=strategy_permissions,
+                da_lockbook=existing_da_lockbook,
+                bcm_pos_lockbook=fixed_reserve_pos,
+                bcm_neg_lockbook=fixed_reserve_neg,
+                id_repairs=scheduled_id_by_ts,
+                candidate_da=schedule,
+                activation_rate_path=str(activation_rate_path),
+            )
+
+        def _mwh(schedule: Mapping[pd.Timestamp, tuple[float, float]]) -> float:
+            return float(sum((float(buy) + float(sell)) * float(self.dt_h) for buy, sell in schedule.values()))
+
+        def _round_pair_down(pair: tuple[float, float]) -> tuple[float, float]:
+            buy_mw, sell_mw = self._normalize_da_bid(*pair)
+            buy_mw = self._round_market_bid_down_mw(
+                buy_mw,
+                step_mw=float(self.da_bid_granularity_mw),
+                min_mw=float(self.da_min_bid_size_mw),
+            )
+            sell_mw = self._round_market_bid_down_mw(
+                sell_mw,
+                step_mw=float(self.da_bid_granularity_mw),
+                min_mw=float(self.da_min_bid_size_mw),
+            )
+            return self._normalize_da_bid(buy_mw, sell_mw)
+
+        blocking_reasons = {
+            "physical_soc_below_min",
+            "physical_soc_above_max",
+            "protected_soc_min_violation",
+            "protected_soc_max_violation",
+            "reserve_headroom_shortfall_pos",
+            "reserve_headroom_shortfall_neg",
+        }
+        guarded_da = _normalize_schedule(accepted_da)
+        original_da = dict(guarded_da)
+        original_mwh = _mwh(original_da)
+        row_diag: dict[pd.Timestamp, dict[str, float | str]] = {}
+        missing_fields: list[str] = []
+        projection_anchor_soc_mwh, projection_rows, anchor_diag, anchor_missing_fields = (
+            self._da_prewrite_universal_projection_anchor(
+                accepted_da=guarded_da,
+                current_soc_mwh=float(current_soc_mwh),
+                future_rows=future_rows,
+                colmap=colmap,
+                existing_da_lockbook=existing_da_lockbook,
+                fixed_reserve_pos=fixed_reserve_pos,
+                fixed_reserve_neg=fixed_reserve_neg,
+                scheduled_id_by_ts=scheduled_id_by_ts,
+                strategy_permissions=strategy_permissions,
+                activation_rate_path=str(activation_rate_path),
+            )
+        )
+        missing_fields.extend(anchor_missing_fields)
+
+        if not guarded_da:
+            diag = {
+                "universal_projection_guard_applied": 0.0,
+                "universal_projection_guard_original_da_mwh": 0.0,
+                "universal_projection_guard_final_da_mwh": 0.0,
+                "universal_projection_guard_derated_mwh": 0.0,
+                "universal_projection_guard_first_blocking_ts_utc": "",
+                "universal_projection_guard_first_blocking_reason": "none",
+                "universal_projection_guard_missing_source_fields": "",
+                "universal_projection_guard_activation_rate_path": str(activation_rate_path),
+            }
+            diag.update(anchor_diag)
+            return {}, diag, {}
+
+        if anchor_missing_fields:
+            diag = {
+                "universal_projection_guard_applied": 1.0,
+                "universal_projection_guard_original_da_mwh": float(original_mwh),
+                "universal_projection_guard_final_da_mwh": 0.0,
+                "universal_projection_guard_derated_mwh": float(original_mwh),
+                "universal_projection_guard_first_blocking_ts_utc": "",
+                "universal_projection_guard_first_blocking_reason": (
+                    "missing_source_of_truth_activation_rate"
+                ),
+                "universal_projection_guard_missing_source_fields": ",".join(
+                    dict.fromkeys(anchor_missing_fields)
+                ),
+                "universal_projection_guard_activation_rate_path": str(activation_rate_path),
+            }
+            diag.update(anchor_diag)
+            for ts, original_pair in original_da.items():
+                ts_diag = dict(diag)
+                ts_diag.update(
+                    {
+                        "universal_projection_guard_row_original_da_mwh": float(
+                            (float(original_pair[0]) + float(original_pair[1])) * float(self.dt_h)
+                        ),
+                        "universal_projection_guard_row_final_da_mwh": 0.0,
+                    }
+                )
+                row_diag[ts] = ts_diag
+            return {}, diag, row_diag
+
+        initial_result = _project(guarded_da)
+        first_blocking_ts = str(initial_result.first_violation_ts_utc)
+        first_blocking_reason = str(initial_result.first_violation_reason)
+        missing_fields.extend(initial_result.missing_source_fields)
+        if initial_result.feasible:
+            diag = {
+                "universal_projection_guard_applied": 0.0,
+                "universal_projection_guard_original_da_mwh": float(original_mwh),
+                "universal_projection_guard_final_da_mwh": float(original_mwh),
+                "universal_projection_guard_derated_mwh": 0.0,
+                "universal_projection_guard_first_blocking_ts_utc": "",
+                "universal_projection_guard_first_blocking_reason": "none",
+                "universal_projection_guard_missing_source_fields": "",
+                "universal_projection_guard_activation_rate_path": str(activation_rate_path),
+            }
+            diag.update(anchor_diag)
+            for ts in original_da:
+                row_diag[ts] = dict(diag)
+            return guarded_da, diag, row_diag
+
+        changed = False
+        for ts in sorted(original_da):
+            current_result = _project(guarded_da)
+            missing_fields.extend(current_result.missing_source_fields)
+            if current_result.feasible:
+                break
+            reason = str(current_result.first_violation_reason)
+            if reason == "missing_source_of_truth_activation_rate" or current_result.missing_source_fields:
+                guarded_da.pop(ts, None)
+                changed = True
+                continue
+            if reason not in blocking_reasons:
+                continue
+            original_pair = guarded_da[ts] if ts in guarded_da else original_da[ts]
+            zero_schedule = dict(guarded_da)
+            zero_schedule.pop(ts, None)
+            zero_result = _project(zero_schedule)
+            missing_fields.extend(zero_result.missing_source_fields)
+            if not zero_result.feasible:
+                guarded_da.pop(ts, None)
+                changed = True
+                continue
+            lo = 0.0
+            hi = 1.0
+            for _ in range(32):
+                mid = (lo + hi) / 2.0
+                trial_pair = _round_pair_down((float(original_pair[0]) * mid, float(original_pair[1]) * mid))
+                trial_schedule = dict(guarded_da)
+                if trial_pair[0] > 1e-12 or trial_pair[1] > 1e-12:
+                    trial_schedule[ts] = trial_pair
+                else:
+                    trial_schedule.pop(ts, None)
+                trial_result = _project(trial_schedule)
+                missing_fields.extend(trial_result.missing_source_fields)
+                if trial_result.feasible:
+                    lo = mid
+                else:
+                    hi = mid
+            final_pair = _round_pair_down((float(original_pair[0]) * lo, float(original_pair[1]) * lo))
+            if final_pair[0] > 1e-12 or final_pair[1] > 1e-12:
+                guarded_da[ts] = final_pair
+            else:
+                guarded_da.pop(ts, None)
+            changed = True
+
+        final_result = _project(guarded_da)
+        missing_fields.extend(final_result.missing_source_fields)
+        final_mwh = _mwh(guarded_da)
+        diag = {
+            "universal_projection_guard_applied": float(bool(changed)),
+            "universal_projection_guard_original_da_mwh": float(original_mwh),
+            "universal_projection_guard_final_da_mwh": float(final_mwh),
+            "universal_projection_guard_derated_mwh": float(max(0.0, original_mwh - final_mwh)),
+            "universal_projection_guard_first_blocking_ts_utc": first_blocking_ts,
+            "universal_projection_guard_first_blocking_reason": first_blocking_reason,
+            "universal_projection_guard_missing_source_fields": ",".join(dict.fromkeys(missing_fields)),
+            "universal_projection_guard_activation_rate_path": str(activation_rate_path),
+        }
+        diag.update(anchor_diag)
+        for ts, original_pair in original_da.items():
+            final_pair = guarded_da[ts] if ts in guarded_da else (0.0, 0.0)
+            ts_diag = dict(diag)
+            ts_diag.update(
+                {
+                    "universal_projection_guard_row_original_da_mwh": float(
+                        (float(original_pair[0]) + float(original_pair[1])) * float(self.dt_h)
+                    ),
+                    "universal_projection_guard_row_final_da_mwh": float(
+                        (float(final_pair[0]) + float(final_pair[1])) * float(self.dt_h)
+                    ),
+                }
+            )
+            row_diag[ts] = ts_diag
+        return guarded_da, diag, row_diag
+
     def _apply_market_clearing(
         self,
         *,
@@ -32215,6 +33141,57 @@ class BatteryBacktester:
                 da_audit_rows = patched_da_audit_rows
                 if da_execution_policy == "price_taker":
                     submitted_da_schedule_for_policy = dict(accepted_da)
+                universal_projection_shadow_path = (
+                    "rhpf"
+                    if bool(is_perfect_foresight)
+                    else ("naive" if str(run_mode).strip().lower() == "naive" else "model")
+                )
+                universal_projection_shadow_diag, universal_projection_shadow_by_ts = (
+                    self._da_prewrite_universal_projection_shadow_diagnostics(
+                        accepted_da=accepted_da,
+                        current_soc_mwh=float(soc),
+                        future_rows=future_rows_for_da_guard,
+                        colmap=colmap,
+                        existing_da_lockbook=da_lockbook,
+                        fixed_reserve_pos=afrr_cap_pos_lockbook,
+                        fixed_reserve_neg=afrr_cap_neg_lockbook,
+                        scheduled_id_by_ts=scheduled_id_for_da_replay,
+                        strategy_permissions=perms,
+                        activation_rate_path=universal_projection_shadow_path,
+                    )
+                )
+                patched_da_audit_rows = []
+                for audit_row in da_audit_rows:
+                    out_row = {**universal_projection_shadow_diag, **dict(audit_row)}
+                    tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
+                    if pd.notna(tsu):
+                        out_row.update(universal_projection_shadow_by_ts.get(pd.Timestamp(tsu), {}))
+                    patched_da_audit_rows.append(out_row)
+                da_audit_rows = patched_da_audit_rows
+                accepted_da, universal_projection_guard_diag, universal_projection_guard_by_ts = (
+                    self._da_prewrite_universal_projection_guard(
+                        accepted_da=accepted_da,
+                        current_soc_mwh=float(soc),
+                        future_rows=future_rows_for_da_guard,
+                        colmap=colmap,
+                        existing_da_lockbook=da_lockbook,
+                        fixed_reserve_pos=afrr_cap_pos_lockbook,
+                        fixed_reserve_neg=afrr_cap_neg_lockbook,
+                        scheduled_id_by_ts=scheduled_id_for_da_replay,
+                        strategy_permissions=perms,
+                        activation_rate_path=universal_projection_shadow_path,
+                    )
+                )
+                if da_execution_policy == "price_taker":
+                    submitted_da_schedule_for_policy = dict(accepted_da)
+                patched_da_audit_rows = []
+                for audit_row in da_audit_rows:
+                    out_row = {**universal_projection_guard_diag, **dict(audit_row)}
+                    tsu = pd.to_datetime(out_row.get("timestamp_utc", ""), utc=True, errors="coerce")
+                    if pd.notna(tsu):
+                        out_row.update(universal_projection_guard_by_ts.get(pd.Timestamp(tsu), {}))
+                    patched_da_audit_rows.append(out_row)
+                da_audit_rows = patched_da_audit_rows
                 for row in da_audit_rows:
                     tsu = pd.to_datetime(row.get("timestamp_utc", ""), utc=True, errors="coerce")
                     if pd.isna(tsu):
@@ -33293,6 +34270,32 @@ class BatteryBacktester:
                 "da_precommit_da_after_bcm_forward_replay_protected_min_mwh",
                 "da_precommit_da_after_bcm_forward_replay_protected_max_mwh",
                 "da_precommit_da_after_bcm_forward_replay_reason",
+                "da_precommit_universal_projection_shadow_pass",
+                "da_precommit_universal_projection_shadow_first_blocking_ts_utc",
+                "da_precommit_universal_projection_shadow_first_blocking_reason",
+                "da_precommit_universal_projection_shadow_max_physical_soc_min_violation_mwh",
+                "da_precommit_universal_projection_shadow_max_physical_soc_max_violation_mwh",
+                "da_precommit_universal_projection_shadow_max_protected_soc_violation_pos_mwh",
+                "da_precommit_universal_projection_shadow_max_protected_soc_violation_neg_mwh",
+                "da_precommit_universal_projection_shadow_max_headroom_violation_pos_mwh",
+                "da_precommit_universal_projection_shadow_max_headroom_violation_neg_mwh",
+                "da_precommit_universal_projection_shadow_missing_source_fields",
+                "da_precommit_universal_projection_shadow_activation_rate_path",
+                "da_precommit_universal_projection_guard_applied",
+                "da_precommit_universal_projection_guard_original_da_mwh",
+                "da_precommit_universal_projection_guard_final_da_mwh",
+                "da_precommit_universal_projection_guard_derated_mwh",
+                "da_precommit_universal_projection_guard_first_blocking_ts_utc",
+                "da_precommit_universal_projection_guard_first_blocking_reason",
+                "da_precommit_universal_projection_guard_missing_source_fields",
+                "da_precommit_universal_projection_guard_activation_rate_path",
+                "da_precommit_universal_projection_anchor_start_soc_mwh",
+                "da_precommit_universal_projection_anchor_reference_soc_mwh",
+                "da_precommit_universal_projection_anchor_delta_mwh",
+                "da_precommit_universal_projection_anchor_start_ts_utc",
+                "da_precommit_universal_projection_first_da_delivery_ts_utc",
+                "da_precommit_universal_projection_guard_row_original_da_mwh",
+                "da_precommit_universal_projection_guard_row_final_da_mwh",
                 "da_precommit_candidate_predicted_pnl_excl_terminal_eur",
                 "da_precommit_incumbent_predicted_pnl_excl_terminal_eur",
                 "da_precommit_gross_spread_eur",
