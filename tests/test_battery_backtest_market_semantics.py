@@ -1313,90 +1313,7 @@ def test_terminal_id_recovery_sizes_final_hour_id_for_post_aux_soc() -> None:
     assert float(diag["terminal_soc_recovery_post_aux_shortfall_mwh"]) == pytest.approx(0.0)
 
 
-def test_global_pf_timestamp_coverage_normalizes_equivalent_utc_timestamps() -> None:
-    expected = pd.date_range("2025-01-08T01:00:00Z", periods=47, freq="h")
-    candidate = expected.tz_convert("Europe/Berlin").to_series(index=None).sample(frac=1.0, random_state=7).tolist()
 
-    diag = BatteryBacktester._timestamp_coverage_diagnostics(expected, candidate)
-
-    assert float(diag["aligned"]) == pytest.approx(1.0)
-    assert float(diag["missing_timestamp_count"]) == pytest.approx(0.0)
-    assert str(diag["first_missing_timestamp_utc"]) == ""
-    assert float(diag["extra_timestamp_count"]) == pytest.approx(0.0)
-    assert str(diag["first_extra_timestamp_utc"]) == ""
-    assert float(diag["expected_rows"]) == pytest.approx(47.0)
-    assert float(diag["actual_rows"]) == pytest.approx(47.0)
-    assert float(diag["expected_row_count"]) == pytest.approx(47.0)
-    assert float(diag["actual_row_count"]) == pytest.approx(47.0)
-
-
-def test_global_pf_timestamp_coverage_uses_evaluated_window_not_raw_input_window() -> None:
-    raw_effective_window = pd.date_range("2025-01-08T00:00:00Z", periods=48, freq="h")
-    evaluated_settlement_window = pd.date_range("2025-01-08T01:00:00Z", periods=47, freq="h")
-    candidate = evaluated_settlement_window.tz_convert("Europe/Berlin").to_list()
-
-    raw_diag = BatteryBacktester._timestamp_coverage_diagnostics(raw_effective_window, candidate)
-    evaluated_diag = BatteryBacktester._timestamp_coverage_diagnostics(evaluated_settlement_window, candidate)
-
-    assert float(raw_diag["aligned"]) == pytest.approx(0.0)
-    assert float(raw_diag["missing_timestamp_count"]) == pytest.approx(1.0)
-    assert str(raw_diag["first_missing_timestamp_utc"]) == "2025-01-08T00:00:00+00:00"
-    assert float(raw_diag["expected_rows"]) == pytest.approx(48.0)
-    assert float(raw_diag["actual_rows"]) == pytest.approx(47.0)
-
-    assert float(evaluated_diag["aligned"]) == pytest.approx(1.0)
-    assert float(evaluated_diag["missing_timestamp_count"]) == pytest.approx(0.0)
-    assert float(evaluated_diag["extra_timestamp_count"]) == pytest.approx(0.0)
-    assert float(evaluated_diag["expected_rows"]) == pytest.approx(47.0)
-    assert float(evaluated_diag["actual_rows"]) == pytest.approx(47.0)
-
-
-def test_global_pf_timestamp_coverage_reports_true_missing_timestamp() -> None:
-    expected = pd.date_range("2025-01-08T00:00:00Z", periods=3, freq="h")
-    candidate = expected[:2]
-
-    diag = BatteryBacktester._timestamp_coverage_diagnostics(expected, candidate)
-
-    assert float(diag["aligned"]) == pytest.approx(0.0)
-    assert float(diag["missing_timestamp_count"]) == pytest.approx(1.0)
-    assert str(diag["first_missing_timestamp_utc"]) == "2025-01-08T02:00:00+00:00"
-    assert float(diag["extra_timestamp_count"]) == pytest.approx(0.0)
-    assert float(diag["expected_row_count"]) == pytest.approx(3.0)
-    assert float(diag["actual_row_count"]) == pytest.approx(2.0)
-
-
-def _one_hour_pred_df(
-    *,
-    da: float,
-    cap_pos: float,
-    cap_neg: float,
-    act_pos: float,
-    act_neg: float,
-    rate_pos: float,
-    rate_neg: float,
-) -> tuple[pd.DataFrame, BacktestColumnMap]:
-    col = BacktestColumnMap()
-    row = {
-        col.timestamp: [pd.Timestamp("2026-01-01T00:00:00Z")],
-        col.pred_da_price: [da],
-        col.pred_afrr_capacity_price_pos: [cap_pos],
-        col.pred_afrr_capacity_price_neg: [cap_neg],
-        col.pred_afrr_activation_price_pos: [act_pos],
-        col.pred_afrr_activation_price_neg: [act_neg],
-        col.pred_afrr_activation_rate_pos: [rate_pos],
-        col.pred_afrr_activation_rate_neg: [rate_neg],
-    }
-    for pref, val in [
-        (col.pred_afrr_capacity_price_pos, cap_pos),
-        (col.pred_afrr_capacity_price_neg, cap_neg),
-        (col.pred_afrr_activation_price_pos, act_pos),
-        (col.pred_afrr_activation_price_neg, act_neg),
-        (col.pred_afrr_activation_rate_pos, rate_pos),
-        (col.pred_afrr_activation_rate_neg, rate_neg),
-    ]:
-        for q in ["p01", "p05", "p10", "p30", "p50", "p70", "p90", "p95", "p99"]:
-            row[f"{pref}_{q}"] = [val]
-    return pd.DataFrame(row), col
 
 
 def test_da_execution_probability_buy_quantiles() -> None:
@@ -2687,7 +2604,6 @@ def test_strict_preparation_materializes_activation_price_p50_into_optimize_fram
         reopt_step_hours=1,
         forecast_warehouse=warehouse,
         strict_simulation_validity=True,
-        enable_global_perfect_foresight=False,
     )
     assert seen_cols, "optimize_dispatch should be called at least once"
     assert f"{col.pred_afrr_activation_price_pos}_p50" in seen_cols[0]
@@ -2741,7 +2657,6 @@ def test_strict_preparation_fails_for_missing_non_p50_active_bin(tmp_path: Path)
             reopt_step_hours=1,
             forecast_warehouse=warehouse,
             strict_simulation_validity=True,
-            enable_global_perfect_foresight=False,
         )
 
 
@@ -5848,7 +5763,7 @@ def test_da_precommit_selects_no_trade_when_predicted_replay_loses_money() -> No
     assert float(audit[0]["sell_candidate_mwh"]) == pytest.approx(0.0)
     assert float(audit[0]["sell_locked_mwh"]) == pytest.approx(0.0)
     assert audit[0]["sell_disabled_reason"] == "none"
-    assert audit[0]["da_zero_reason"] == "no_trade_incumbent_selected"
+    assert audit[0]["da_zero_reason"] == "no_trade_economically_better"
     assert float(audit[0]["raw_candidate_revenue_eur"]) == pytest.approx(0.0)
     assert float(audit[0]["raw_candidate_cost_eur"]) == pytest.approx(100.0)
     assert float(audit[0]["raw_candidate_gross_spread_eur"]) == pytest.approx(-100.0)
@@ -8785,6 +8700,97 @@ def test_bcm_rhpf_headroom_guard_diagnostics_export_first_rejected_block() -> No
     assert str(diag["rolling_pf_bcm_raw_solver_underperformance_classification"]) == (
         "raw_solver_headroom_guard_limits_bcm"
     )
+
+
+def test_rhpf_bcm_settlement_authority_uses_guarded_lockbook_not_raw_plan_reserve() -> None:
+    col = BacktestColumnMap()
+    ts = pd.date_range("2025-04-06T22:00:00Z", periods=1, freq="h")
+    df = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            col.pred_da_price: [80.0],
+            col.pred_afrr_capacity_price_pos: [8.0],
+            col.pred_afrr_capacity_price_neg: [4.0],
+            col.pred_afrr_activation_price_pos: [1000.0],
+            col.pred_afrr_activation_price_neg: [1000.0],
+            col.pred_afrr_activation_rate_pos: [0.0],
+            col.pred_afrr_activation_rate_neg: [0.0],
+            col.true_da_price: [80.0],
+            col.true_afrr_capacity_price_pos: [8.0],
+            col.true_afrr_capacity_price_neg: [4.0],
+            col.true_afrr_activation_price_pos: [1000.0],
+            col.true_afrr_activation_price_neg: [1000.0],
+            col.true_afrr_activation_rate_pos: [0.0],
+            col.true_afrr_activation_rate_neg: [0.0],
+        }
+    )
+    raw_rejected_dispatch = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "plan_charge_mw": [0.0],
+            "plan_discharge_mw": [0.0],
+            "plan_reserve_pos_mw": [7.0],
+            "plan_reserve_neg_mw": [4.0],
+            "plan_bem_only_pos_mw": [0.0],
+            "plan_bem_only_neg_mw": [0.0],
+            "id_charge_mw": [0.0],
+            "id_discharge_mw": [0.0],
+            "is_precleared": [False],
+            "fixed_reserve_obligation_pos_mw": [0.0],
+            "fixed_reserve_obligation_neg_mw": [0.0],
+            "aFRR_Capacity_Won_Pos_MW": [0.0],
+            "aFRR_Capacity_Won_Neg_MW": [0.0],
+            "settlement_cap_bid_price_pos_eur_mw": [0.0],
+            "settlement_cap_bid_price_neg_eur_mw": [0.0],
+        }
+    )
+
+    bt = _mk_backtester()
+    settled = bt.settle_dispatch(
+        df,
+        raw_rejected_dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+        perfect_foresight_mode=True,
+    )
+
+    assert float(raw_rejected_dispatch["plan_reserve_pos_mw"].iloc[0]) == pytest.approx(7.0)
+    assert float(raw_rejected_dispatch["plan_reserve_neg_mw"].iloc[0]) == pytest.approx(4.0)
+    assert float(settled["real_plan_reserve_pos_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_plan_reserve_neg_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_locked_bcm_capacity_pos_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_locked_bcm_capacity_neg_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_executed_bcm_capacity_pos_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_executed_bcm_capacity_neg_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_protected_soc_violation_pos_mwh"].iloc[0]) == pytest.approx(0.0)
+    assert float(settled["real_protected_soc_violation_neg_mwh"].iloc[0]) == pytest.approx(0.0)
+
+    missing_authority_dispatch = raw_rejected_dispatch.drop(
+        columns=[
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "aFRR_Capacity_Won_Pos_MW",
+            "aFRR_Capacity_Won_Neg_MW",
+        ]
+    )
+    bt_missing = _mk_backtester()
+    missing_settled = bt_missing.settle_dispatch(
+        df,
+        missing_authority_dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+        perfect_foresight_mode=True,
+    )
+
+    assert float(missing_settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(missing_settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(0.0)
+    assert "rhpf.bcm.lockbook_pos" in bt_missing._missing_critical_source_fields
+    assert "rhpf.bcm.lockbook_neg" in bt_missing._missing_critical_source_fields
+    assert "missing_source_of_truth_rhpf_reserve" in bt_missing._missing_critical_source_reasons
 
 
 def test_bcm_capacity_auction_audit_classifies_bid_above_cutoff_as_auction_bug() -> None:
@@ -15119,12 +15125,11 @@ def test_da_postlock_final_terminal_shortfall_without_repair_is_explicit_infeasi
     assert selected[ts] == pytest.approx((0.0, 0.0))
     assert float(audit[0]["da_postlock_terminal_shortfall_recoverable"]) == pytest.approx(0.0)
     assert str(audit[0]["da_postlock_infeasibility_driver_detail"]) == (
-        "locked_da_terminal_shortfall_candidate_infeasible"
+        "terminal_shortfall_under_hard_min"
     )
-    assert str(audit[0]["da_postlock_selected_after_future_check"]) == (
-        "locked_da_terminal_shortfall_candidate_infeasible"
-    )
-    assert str(audit[0]["da_volume_loss_reason"]) == "locked_da_terminal_shortfall_candidate_infeasible"
+    assert str(audit[0]["da_postlock_selected_after_future_check"]) == "rejected"
+    assert str(audit[0]["da_volume_loss_reason"]) == "postlock_future_infeasible_rejected"
+    assert str(audit[0]["da_zero_reason"]) == "terminal_shortfall_under_hard_min"
 
 
 def test_da_postlock_ordinary_window_does_not_apply_extra_terminal_recovery_cost() -> None:
@@ -19643,8 +19648,6 @@ def test_strategy_overview_ratio_fields_semantics() -> None:
     assert "realized_vs_perfect_foresight_comparable_market_ratio" not in out.summary
     assert "rolling_perfect_foresight_same_rules_total_pnl_eur" in out.summary
     assert "realized_vs_perfect_foresight_pct" in out.summary
-    assert "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur" in out.summary
-    assert "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct" in out.summary
     assert float(out.summary.get("benchmark_is_global_upper_bound", 1.0)) == 0.0
     assert float(out.summary.get("rolling_perfect_foresight_same_rules_is_global_upper_bound", 1.0)) == 0.0
 
@@ -19657,32 +19660,7 @@ def test_rolling_pf_not_global_upper_bound() -> None:
     assert float(out.summary.get("rolling_perfect_foresight_same_rules_can_be_beaten", 0.0)) == 1.0
 
 
-def test_global_perfect_foresight_is_full_horizon_not_rolling() -> None:
-    bt = _mk_backtester()
-    df, col = _tiny_backtest_df(hours=8)
-    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1)
-    assert float(out.summary.get("global_perfect_foresight_available", 1.0)) == 0.0
-    assert float(out.summary.get("global_hindsight_perfect_foresight_is_global_upper_bound", 1.0)) == 0.0
-    assert str(out.summary.get("global_perfect_foresight_validation_status", "")).startswith("disabled")
 
-
-def test_global_perfect_foresight_dominance_flag_present() -> None:
-    bt = _mk_backtester()
-    df, col = _tiny_backtest_df(hours=8)
-    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
-    assert "global_perfect_foresight_dominance_check_pass" in out.summary
-    assert "realized_exceeds_global_perfect_foresight" in out.summary
-
-
-def test_global_perfect_foresight_does_not_invalidate_when_disabled() -> None:
-    bt = _mk_backtester()
-    df, col = _tiny_backtest_df(hours=8)
-    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1, strict_simulation_validity=True)
-    s = out.summary
-    assert float(s.get("global_perfect_foresight_available", 1.0)) == 0.0
-    assert float(s.get("global_perfect_foresight_dominance_check_pass", 0.0)) >= 0.5
-    assert float(s.get("realized_exceeds_global_perfect_foresight", 1.0)) == 0.0
-    assert "realized_exceeds_global_perfect_foresight" not in str(s.get("invalid_reason", ""))
 
 
 def test_deprecated_perfect_foresight_aliases_are_labelled() -> None:
@@ -19694,14 +19672,6 @@ def test_deprecated_perfect_foresight_aliases_are_labelled() -> None:
     assert float(s.get("perfect_foresight_total_pnl_eur_is_deprecated", 0.0)) == 1.0
     assert str(s.get("perfect_foresight_total_pnl_eur_semantics", "")) == "rolling_perfect_foresight_same_rules"
 
-
-def test_global_perfect_foresight_disabled_by_default() -> None:
-    bt = _mk_backtester()
-    df, col = _tiny_backtest_df(hours=8)
-    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
-    s = out.summary
-    assert float(s.get("global_perfect_foresight_available", 1.0)) == 0.0
-    assert str(s.get("global_perfect_foresight_validation_status", "")).startswith("disabled")
 
 
 def test_realized_beating_rolling_pf_does_not_invalidate() -> None:
@@ -19715,8 +19685,6 @@ def test_strategy_overview_labels_diagnostic_vs_upper_bound_ratios() -> None:
     out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=6, reopt_step_hours=1)
     s = out.summary
     assert "realized_vs_perfect_foresight_pct" in s
-    if float(s.get("global_perfect_foresight_available", 0.0)) < 0.5:
-        assert np.isnan(float(s.get("realized_vs_global_hindsight_perfect_foresight_upper_bound_pct", float("nan"))))
 
 
 def test_rolling_pf_quantile_surface_mode_present() -> None:
@@ -19730,55 +19698,6 @@ def test_rolling_pf_quantile_surface_mode_present() -> None:
     }
 
 
-def test_global_perfect_foresight_bem_only_plan_mapping() -> None:
-    bt = _mk_backtester()
-    df, col = _tiny_backtest_df(hours=8)
-    out = bt.run(
-        df,
-        col,
-        use_rolling_horizon=True,
-        horizon_hours=4,
-        reopt_step_hours=1,
-        enable_global_perfect_foresight=True,
-    )
-    s = out.summary
-    # Scope-mismatch can still disable availability, but summary fields must exist.
-    assert "global_perfect_foresight_bem_only_included" in s
-    assert "global_perfect_foresight_dispatch_rows" in s
-    assert "global_perfect_foresight_settlement_rows" in s
-
-
-def test_global_perfect_foresight_same_rules_candidate_fields() -> None:
-    bt = _mk_backtester()
-    df, col = _tiny_backtest_df(hours=8)
-    out = bt.run(
-        df,
-        col,
-        use_rolling_horizon=True,
-        horizon_hours=4,
-        reopt_step_hours=1,
-        enable_global_perfect_foresight=True,
-    )
-    s = out.summary
-    assert "global_hindsight_same_rules_upper_bound_total_pnl_eur" in s
-    assert "realized_path_pnl_under_global_upper_bound_rules_eur" in s
-    assert "global_pf_verified_upper_bound" in s
-    assert "global_pf_upper_bound_gap_eur" in s
-    assert "global_pf_below_realized_incumbent" in s
-    assert str(s.get("global_perfect_foresight_capacity_bid_semantics")) in {
-        "global_solver_missing_bcm_lockbook_semantics",
-        "full_horizon_solver_with_lower_bound_guards",
-    }
-    if float(s.get("global_perfect_foresight_available", 0.0)) >= 0.5:
-        assert np.isclose(
-            float(s["global_hindsight_same_rules_upper_bound_total_pnl_eur"]),
-            float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]),
-            atol=1e-6,
-        )
-        assert float(s["global_pf_verified_upper_bound"]) in {0.0, 1.0}
-        assert float(s["global_perfect_foresight_dominance_check_pass"]) == float(
-            s["global_pf_verified_upper_bound"]
-        )
 
 
 def test_perfect_foresight_bcm_participates_and_exports_same_rules_columns() -> None:
@@ -19831,11 +19750,10 @@ def test_perfect_foresight_bcm_participates_and_exports_same_rules_columns() -> 
         allowed_markets=("aFRR", "BCM"),
         strategy_name="bcm",
         id_recourse_mode="common",
-        enable_global_perfect_foresight=True,
         bcm_bid_hour_local=8,
     )
     h = out.hourly
-    for prefix in ["real", "perfect_foresight", "global_perfect_foresight"]:
+    for prefix in ["real", "perfect_foresight"]:
         assert f"{prefix}_submitted_bcm_capacity_pos_mw" in h.columns
         assert f"{prefix}_submitted_bcm_capacity_neg_mw" in h.columns
         assert f"{prefix}_bcm_activation_bid_price_pos" in h.columns
@@ -19847,11 +19765,6 @@ def test_perfect_foresight_bcm_participates_and_exports_same_rules_columns() -> 
         pd.to_numeric(h["perfect_foresight_submitted_bcm_capacity_pos_mw"], errors="coerce").fillna(0.0).sum()
         + pd.to_numeric(h["perfect_foresight_submitted_bcm_capacity_neg_mw"], errors="coerce").fillna(0.0).sum()
     ) > 0.0
-    if float(out.summary.get("global_perfect_foresight_available", 0.0)) >= 0.5:
-        assert (
-            pd.to_numeric(h["global_perfect_foresight_submitted_bcm_capacity_pos_mw"], errors="coerce").fillna(0.0).sum()
-            + pd.to_numeric(h["global_perfect_foresight_submitted_bcm_capacity_neg_mw"], errors="coerce").fillna(0.0).sum()
-        ) > 0.0
     pf_zero = (
         pd.to_numeric(h["pf_submitted_bcm_capacity_pos_mw"], errors="coerce").fillna(0.0)
         + pd.to_numeric(h["pf_submitted_bcm_capacity_neg_mw"], errors="coerce").fillna(0.0)
@@ -19861,108 +19774,9 @@ def test_perfect_foresight_bcm_participates_and_exports_same_rules_columns() -> 
         assert bool((reasons != "").all())
 
 
-def test_global_pf_benchmark_mode_is_removed() -> None:
-    for mode in ("ghpf_only", "global_pf_only", "global_pf", "global_perfect_foresight"):
-        with pytest.raises(ValueError, match="global perfect-foresight benchmark has been removed"):
-            resolve_benchmark_paths(mode, enable_global_perfect_foresight=True)
 
 
-def test_global_pf_bcm_partial_product_disable_mask_uses_evaluated_window() -> None:
-    bt = _mk_backtester("canonical_economic")
-    # January is CET: 01:00-02:00 UTC are the tail of local 00:00-04:00,
-    # 03:00-06:00 UTC are the complete local 04:00-08:00 product, and
-    # 07:00 UTC starts the next partial product.
-    ts = pd.date_range("2025-01-08T01:00:00Z", periods=7, freq="h")
 
-    mask = bt._bcm_partial_product_disable_mask(pd.Series(ts))
-
-    assert mask.tolist() == [True, True, False, False, False, False, True]
-
-
-def test_global_pf_bcm_product_mapping_preserves_pay_as_bid_capacity_revenue_and_excludes_partials() -> None:
-    bt = _mk_backtester("canonical_economic")
-    col = BacktestColumnMap()
-    # January is CET: 03:00-06:00 UTC is a complete local 04:00-08:00 BCM product.
-    ts = pd.date_range("2025-01-08T03:00:00Z", periods=5, freq="h")
-    dispatch = pd.DataFrame(
-        {
-            col.timestamp: ts,
-            "reserve_pos_mw": [2.0, 2.0, 2.0, 2.0, 2.0],
-            "reserve_neg_mw": [0.0, 0.0, 0.0, 0.0, 0.0],
-        }
-    )
-    market_input = pd.DataFrame(
-        {
-            col.timestamp: ts,
-            col.pred_afrr_capacity_price_pos: [20.0] * len(ts),
-            col.pred_afrr_capacity_price_neg: [0.0] * len(ts),
-            col.true_afrr_capacity_price_pos: [25.0] * len(ts),
-            col.true_afrr_capacity_price_neg: [0.0] * len(ts),
-            col.pred_afrr_activation_price_pos: [100.0] * len(ts),
-            col.pred_afrr_activation_price_neg: [100.0] * len(ts),
-            col.true_afrr_activation_price_pos: [100.0] * len(ts),
-            col.true_afrr_activation_price_neg: [100.0] * len(ts),
-        }
-    )
-
-    mapped = bt._map_global_bcm_reserves_to_product_obligations(
-        dispatch=dispatch,
-        market_input=market_input,
-        colmap=col,
-    )
-
-    complete = mapped.iloc[:4]
-    partial = mapped.iloc[4:]
-    assert pd.to_numeric(complete["aFRR_Capacity_Won_Pos_MW"], errors="coerce").tolist() == [2.0] * 4
-    assert pd.to_numeric(complete["settlement_cap_bid_price_pos_eur_mw"], errors="coerce").tolist() == [20.0] * 4
-    assert float(
-        (
-            pd.to_numeric(complete["aFRR_Capacity_Won_Pos_MW"], errors="coerce")
-            * pd.to_numeric(complete["settlement_cap_bid_price_pos_eur_mw"], errors="coerce")
-            * bt.dt_h
-        ).sum()
-    ) == pytest.approx(160.0)
-    assert float(pd.to_numeric(partial["aFRR_Capacity_Won_Pos_MW"], errors="coerce").sum()) == pytest.approx(0.0)
-    assert float(pd.to_numeric(partial["global_pf_bcm_product_partial_excluded"], errors="coerce").iloc[0]) == pytest.approx(1.0)
-
-
-def test_global_pf_benchmark_timestamp_validation_uses_evaluated_window() -> None:
-    raw_effective_window = pd.date_range("2025-01-08T00:00:00Z", periods=48, freq="h")
-    evaluated_settlement_window = pd.date_range("2025-01-08T01:00:00Z", periods=47, freq="h")
-
-    raw_diag = BatteryBacktester._timestamp_coverage_diagnostics(raw_effective_window, evaluated_settlement_window)
-    evaluated_diag = BatteryBacktester._timestamp_coverage_diagnostics(
-        evaluated_settlement_window,
-        evaluated_settlement_window,
-    )
-
-    assert float(raw_diag["aligned"]) == pytest.approx(0.0)
-    assert float(evaluated_diag["aligned"]) == pytest.approx(1.0)
-    assert float(evaluated_diag["expected_rows"]) == pytest.approx(47.0)
-    assert float(evaluated_diag["actual_rows"]) == pytest.approx(47.0)
-
-
-def test_global_pf_no_market_candidate_uses_evaluated_timestamp_index() -> None:
-    raw_input = pd.DataFrame(
-        {
-            "timestamp_utc": pd.date_range("2025-01-08T00:00:00Z", periods=72, freq="h"),
-            "value": np.arange(72, dtype=float),
-        }
-    )
-    evaluated_index = pd.date_range("2025-01-08T01:00:00Z", periods=71, freq="h")
-
-    filtered = BatteryBacktester._filter_frame_to_expected_timestamps(
-        raw_input,
-        timestamp_col="timestamp_utc",
-        expected_timestamps=evaluated_index,
-    )
-
-    assert len(filtered) == 71
-    assert pd.Timestamp(filtered["timestamp_utc"].iloc[0]) == evaluated_index[0]
-    assert pd.Timestamp(filtered["timestamp_utc"].iloc[-1]) == evaluated_index[-1]
-    diag = BatteryBacktester._timestamp_coverage_diagnostics(evaluated_index, filtered["timestamp_utc"])
-    assert float(diag["aligned"]) == pytest.approx(1.0)
-    assert float(diag["extra_timestamp_count"]) == pytest.approx(0.0)
 
 
 def test_same_rules_rolling_pf_dominance_fields_present() -> None:
@@ -19976,51 +19790,6 @@ def test_same_rules_rolling_pf_dominance_fields_present() -> None:
     assert "same_rules_rolling_pf_verified_oracle" in s
 
 
-def test_global_perfect_foresight_available_only_after_scope_validation() -> None:
-    bt = _mk_backtester()
-    df, col = _tiny_backtest_df(hours=8)
-    out = bt.run(df, col, use_rolling_horizon=True, horizon_hours=4, reopt_step_hours=1, enable_global_perfect_foresight=True)
-    s = out.summary
-    if float(s.get("global_perfect_foresight_available", 0.0)) >= 0.5:
-        assert str(s.get("global_perfect_foresight_validation_status", "")) in {
-            "verified_same_rules_dominates_realized",
-            "verified_full_horizon_solver",
-            "verified_no_market",
-            "solver_below_realized_path_incumbent",
-            "global_pf_unverified",
-        }
-        if str(s.get("global_pf_selected_incumbent", "")) == "solver":
-            assert float(s.get("global_perfect_foresight_dispatch_rows", 0.0)) > 0.0
-            assert float(s.get("global_perfect_foresight_settlement_rows", 0.0)) > 0.0
-    else:
-        assert str(s.get("global_perfect_foresight_validation_status", "")).startswith("disabled") or str(s.get("global_perfect_foresight_validation_status", "")).startswith("computed")
-
-
-def test_global_pf_bcm_solver_unavailable_can_still_use_realized_path_fallback() -> None:
-    bt = _mk_backtester("canonical_economic")
-    df, col = _tiny_backtest_df(hours=8)
-
-    out = bt.run(
-        df,
-        col,
-        use_rolling_horizon=True,
-        horizon_hours=4,
-        reopt_step_hours=1,
-        enable_global_perfect_foresight=True,
-        allowed_markets=("aFRR", "BCM"),
-        strategy_name="bcm",
-    )
-    s = out.summary
-
-    assert float(s.get("global_pf_available", 0.0)) == pytest.approx(1.0)
-    assert float(s.get("global_pf_verified_upper_bound", 1.0)) == pytest.approx(0.0)
-    assert float(s.get("global_pf_solver_available", 1.0)) == pytest.approx(0.0)
-    assert float(s.get("global_pf_is_solver_upper_bound", 1.0)) == pytest.approx(0.0)
-    assert str(s.get("global_pf_selected_incumbent")) in {"no_market", "realized_path"}
-    assert str(s.get("global_pf_solver_status")) == "global_solver_missing_bcm_lockbook_semantics"
-    assert str(s.get("global_perfect_foresight_capacity_bid_semantics")) == (
-        "global_solver_missing_bcm_lockbook_semantics"
-    )
 
 
 def test_locked_reserve_obligation_preserves_future_soc_headroom() -> None:
@@ -21837,8 +21606,6 @@ def test_invalid_by_quantile_counts_only_invalid_scenarios(tmp_path: Path) -> No
         "activation_split_reconciliation_error_max": 0.0,
         "final_soc_check_pass": 1.0,
         "benchmark_same_rules_gate_consistent": 1.0,
-        "global_perfect_foresight_dominance_check_pass": 1.0,
-        "global_perfect_foresight_validation_status": "disabled_unverified",
     }
     payloads = {
         "p30_p30": dict(common, simulation_valid=0.0, thesis_reportable=0.0, invalid_reason="fallback_used"),
@@ -21889,8 +21656,6 @@ def test_validation_counts_are_consistent(tmp_path: Path) -> None:
         "activation_split_reconciliation_error_max": 0.0,
         "final_soc_check_pass": 1.0,
         "benchmark_same_rules_gate_consistent": 1.0,
-        "global_perfect_foresight_dominance_check_pass": 1.0,
-        "global_perfect_foresight_validation_status": "disabled_unverified",
     }
     for scen in ("p30_p30", "p50_p50", "p70_p90"):
         d = base / scen
@@ -22393,7 +22158,6 @@ def test_required_fields_not_runner_defaulted_silently() -> None:
         "activation_split_reconciliation_error_max": 0.0,
         "final_soc_check_pass": 1.0,
         "benchmark_same_rules_gate_consistent": 1.0,
-        "global_perfect_foresight_dominance_check_pass": 1.0,
         "required_fields_defaulted": '["simulation_valid"]',
         "required_fields_computed": "[]",
     }
@@ -22462,8 +22226,6 @@ def test_required_fields_ok_consistent_with_check_pass(tmp_path: Path) -> None:
         "activation_split_reconciliation_error_max": 0.0,
         "final_soc_check_pass": 1.0,
         "benchmark_same_rules_gate_consistent": 1.0,
-        "global_perfect_foresight_dominance_check_pass": 1.0,
-        "global_perfect_foresight_validation_status": "disabled_unverified",
     }
     (scen / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
     out_json = tmp_path / "stats.json"
@@ -22521,8 +22283,6 @@ def test_validator_fails_missing_debug_dump_fields(tmp_path: Path) -> None:
         "activation_split_reconciliation_error_max": 0.0,
         "final_soc_check_pass": 1.0,
         "benchmark_same_rules_gate_consistent": 1.0,
-        "global_perfect_foresight_dominance_check_pass": 1.0,
-        "global_perfect_foresight_validation_status": "disabled_unverified",
     }
     (scen / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SystemExit) as e:
@@ -22563,8 +22323,6 @@ def test_allow_stale_is_diagnostic_only(tmp_path: Path) -> None:
         "activation_split_reconciliation_error_max": 0.0,
         "final_soc_check_pass": 1.0,
         "benchmark_same_rules_gate_consistent": 1.0,
-        "global_perfect_foresight_dominance_check_pass": 1.0,
-        "global_perfect_foresight_validation_status": "disabled_unverified",
     }
     (scen / "backtest_summary.json").write_text(json.dumps(payload), encoding="utf-8")
     out_json = tmp_path / "stats.json"
@@ -23416,7 +23174,6 @@ def test_rolling_pf_solver_error_selects_feasible_no_market_incumbent() -> None:
         strategy_name="bcm",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
-        enable_global_perfect_foresight=True,
     )
     s = out.summary
     assert float(s["rolling_pf_available"]) == 1.0
@@ -23428,7 +23185,6 @@ def test_rolling_pf_solver_error_selects_feasible_no_market_incumbent() -> None:
     assert np.isfinite(float(s["rolling_pf_no_market_incumbent_eur"]))
     assert float(s["rolling_pf_no_market_incumbent_eur"]) <= 1e-9
     assert float(s["rolling_pf_no_market_terminal_shortfall_mwh"]) <= 1e-6
-    assert "global_pf_verified_upper_bound" in s
     assert "rolling_pf_solver_failed" in str(s["invalid_reason"])
     assert float(s["rolling_pf_reported_available"]) == pytest.approx(0.0)
     assert np.isnan(float(s["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
@@ -23463,7 +23219,6 @@ def test_rolling_pf_solver_error_selects_feasible_incumbent_without_invalidating
         strategy_name="da",
         strict_simulation_validity=True,
         enforce_final_soc_min=True,
-        enable_global_perfect_foresight=False,
     )
     s = out.summary
     assert str(s["rolling_pf_solver_status"]) == "solver_failed"
@@ -24067,28 +23822,25 @@ def test_raw_optimizer_objective_scope_separates_terminal_credit_from_row_ev() -
 
 
 def test_benchmark_mode_model_only_masks_disabled_benchmarks() -> None:
-    mode, paths = resolve_benchmark_paths("model_only", enable_global_perfect_foresight=True)
+    mode, paths = resolve_benchmark_paths("model_only")
 
     summary = apply_benchmark_availability_to_summary(
         {
             "realized_total_pnl_eur": 12.0,
             "naive_total_pnl_eur": 0.0,
             "rolling_perfect_foresight_same_rules_total_pnl_eur": 0.0,
-            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": 0.0,
         },
         benchmark_mode=mode,
         benchmark_paths=paths,
     )
 
-    assert paths == {"model": True, "naive": False, "rhpf": False, "ghpf": False}
+    assert paths == {"model": True, "naive": False, "rhpf": False}
     assert summary["model_available"] == 1.0
     assert summary["naive_available"] == 0.0
     assert summary["rolling_pf_available"] == 0.0
-    assert summary["global_pf_available"] == 0.0
     assert summary["model_total_pnl_eur"] == pytest.approx(12.0)
     assert np.isnan(float(summary["naive_total_pnl_eur"]))
     assert np.isnan(float(summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
-    assert np.isnan(float(summary["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]))
 
 
 def test_disabled_rolling_pf_does_not_report_solver_failed() -> None:
@@ -24107,53 +23859,10 @@ def test_enabled_rolling_pf_unavailable_reports_solver_failed() -> None:
     )
 
 
-def test_benchmark_mode_full_excludes_ghpf_by_default() -> None:
-    mode, paths = resolve_benchmark_paths("full", enable_global_perfect_foresight=True)
-    summary = apply_benchmark_availability_to_summary(
-        {
-            "realized_total_pnl_eur": 1.0,
-            "naive_total_pnl_eur": 2.0,
-            "rolling_perfect_foresight_same_rules_total_pnl_eur": 3.0,
-            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": 4.0,
-            "rolling_pf_available": 1.0,
-            "global_pf_available": 1.0,
-        },
-        benchmark_mode=mode,
-        benchmark_paths=paths,
-    )
-
-    assert paths == {"model": True, "naive": True, "rhpf": True, "ghpf": False}
-    assert summary["model_available"] == 1.0
-    assert summary["naive_available"] == 1.0
-    assert summary["rolling_pf_available"] == 1.0
-    assert summary["global_pf_available"] == 0.0
-    assert summary["model_total_pnl_eur"] == pytest.approx(1.0)
-    assert summary["rhpf_total_pnl_eur"] == pytest.approx(3.0)
-    assert np.isnan(float(summary["ghpf_total_pnl_eur"]))
-
-
-def test_benchmark_mode_full_can_enable_ghpf_explicitly() -> None:
-    mode, paths = resolve_benchmark_paths("full", enable_global_pf=True)
-    summary = apply_benchmark_availability_to_summary(
-        {
-            "realized_total_pnl_eur": 1.0,
-            "naive_total_pnl_eur": 2.0,
-            "rolling_perfect_foresight_same_rules_total_pnl_eur": 3.0,
-            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": 4.0,
-            "rolling_pf_available": 1.0,
-            "global_pf_available": 1.0,
-        },
-        benchmark_mode=mode,
-        benchmark_paths=paths,
-    )
-
-    assert paths == {"model": True, "naive": True, "rhpf": True, "ghpf": True}
-    assert summary["global_pf_available"] == 1.0
-    assert summary["ghpf_total_pnl_eur"] == pytest.approx(4.0)
 
 
 def test_rhpf_aliases_use_reported_raw_solver_not_selected_fallback() -> None:
-    mode, paths = resolve_benchmark_paths("full", enable_global_perfect_foresight=False)
+    mode, paths = resolve_benchmark_paths("full")
     summary = apply_benchmark_availability_to_summary(
         {
             "realized_total_pnl_eur": 1.0,
@@ -24313,13 +24022,6 @@ def test_validate_rhpf_outputs_passes_terminal_inclusive_solver_basis(tmp_path: 
 
     assert result.status == "PASS"
 
-
-def test_benchmark_mode_naive_rhpf_only_and_global_pf_removed() -> None:
-    assert resolve_benchmark_paths("naive_only")[1] == {"model": False, "naive": True, "rhpf": False, "ghpf": False}
-    assert resolve_benchmark_paths("rhpf_only")[1] == {"model": False, "naive": False, "rhpf": True, "ghpf": False}
-    assert resolve_benchmark_paths("rolling_pf_only")[0] == "rhpf_only"
-    with pytest.raises(ValueError, match="global perfect-foresight benchmark has been removed"):
-        resolve_benchmark_paths("global_pf_only")
 
 
 def test_naive_only_can_skip_model_manifest_even_with_model_selector() -> None:
@@ -24548,22 +24250,11 @@ def test_benchmark_mode_selected_respects_enable_disable_flags() -> None:
         "selected",
         enable_naive=False,
         enable_rolling_pf=True,
-        enable_global_pf=False,
-        enable_global_perfect_foresight=True,
     )
 
     assert mode == "selected"
-    assert paths == {"model": True, "naive": False, "rhpf": True, "ghpf": False}
+    assert paths == {"model": True, "naive": False, "rhpf": True}
 
-
-def test_benchmark_mode_selected_does_not_enable_ghpf_implicitly() -> None:
-    mode, paths = resolve_benchmark_paths(
-        "selected",
-        enable_global_perfect_foresight=True,
-    )
-
-    assert mode == "selected"
-    assert paths == {"model": True, "naive": True, "rhpf": True, "ghpf": False}
 
 
 def test_performance_paths_long_contains_only_enabled_paths_and_stable_schema() -> None:
@@ -24603,7 +24294,6 @@ def test_performance_paths_long_contains_only_enabled_paths_and_stable_schema() 
             "model_available": 1.0,
             "naive_available": 1.0,
             "rhpf_available": 1.0,
-            "ghpf_available": 0.0,
             "simulation_valid": 0.0,
             "invalid_reason": "fallback_used",
             "active_path_simulation_valid": 0.0,

@@ -365,7 +365,6 @@ def _select_hourly_output_columns(hourly: pd.DataFrame, *, output_detail: str, t
         "is_fallback_hour",
         "real_throughput_mwh",
         "perfect_foresight_pnl_eur",
-        "global_hindsight_perfect_foresight_pnl_eur",
         "afrr_activation_rate_guard_policy",
         "afrr_activation_rate_guard_quantile",
         "afrr_activation_rate_guard_quantile_resolved",
@@ -1867,13 +1866,11 @@ _PATH_PREFIX = {
     "model": "real",
     "naive": "naive",
     "rhpf": "perfect_foresight",
-    "ghpf": "global_perfect_foresight",
 }
 _PATH_FILE_STEM = {
     "model": "model",
     "naive": "naive",
     "rhpf": "rolling_pf",
-    "ghpf": "global_pf",
 }
 
 
@@ -1931,18 +1928,6 @@ def _build_performance_paths_long(
         elif path_type == "rhpf":
             valid = _summary_float("rhpf_simulation_valid")
             reason = _summary_reason("rhpf_invalid_reason", "rolling_pf_reported_invalid_reason")
-        elif path_type == "ghpf":
-            valid = _summary_float(
-                "global_pf_simulation_valid",
-                "global_perfect_foresight_simulation_valid",
-                "global_pf_available",
-                "global_perfect_foresight_available",
-            )
-            reason = _summary_reason(
-                "global_pf_invalid_reason",
-                "global_perfect_foresight_invalid_reason",
-                "global_pf_failure_reason",
-            )
         else:
             valid = _summary_float("simulation_valid")
             reason = _summary_reason("invalid_reason")
@@ -4052,22 +4037,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--enable-rhpf", "--enable-rolling-pf", dest="enable_rhpf", action="store_true", default=None, help="Enable rolling hindsight/perfect-foresight benchmark.")
     p.add_argument("--disable-rhpf", "--disable-rolling-pf", dest="enable_rhpf", action="store_false", help="Disable rolling hindsight/perfect-foresight benchmark.")
-    p.add_argument(
-        "--enable-ghpf",
-        "--enable-global-pf",
-        dest="enable_ghpf",
-        action="store_true",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument(
-        "--disable-ghpf",
-        "--disable-global-pf",
-        dest="enable_ghpf",
-        action="store_false",
-        help=argparse.SUPPRESS,
-    )
-
     p.add_argument("--timestamp-col", default="timestamp_utc")
     p.add_argument("--pred-da-col", default="pred_da_price")
     p.add_argument("--pred-cap-pos-col", default="pred_afrr_capacity_price_pos")
@@ -4473,8 +4442,6 @@ def main() -> None:
         str(args.benchmark_mode),
         enable_naive=args.enable_naive,
         enable_rolling_pf=args.enable_rhpf,
-        enable_global_pf=args.enable_ghpf,
-        enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
     )
     model_path_requested = bool(requested_benchmark_paths.get("model", False))
     model_manifest_loaded = False
@@ -4869,11 +4836,9 @@ def main() -> None:
                     id_mode=resolved_id_mode,
                     id_recourse_mode=resolved_id_recourse_mode,
                     strict_simulation_validity=bool(args.strict_simulation_validity),
-                    enable_global_perfect_foresight=bool(args.enable_global_perfect_foresight),
                     benchmark_mode=normalized_benchmark_mode,
                     enable_naive=args.enable_naive,
                     enable_rolling_pf=args.enable_rhpf,
-                    enable_global_pf=args.enable_ghpf,
                     bcm_bid_hour_local=int(args.bcm_bid_hour_local),
                     checkpoint_dir=checkpoint_dir,
                     write_checkpoints=checkpoints_enabled,
@@ -5580,12 +5545,9 @@ def main() -> None:
             "naive_available": float(requested_benchmark_paths.get("naive", False)),
             "rolling_pf_available": float(requested_benchmark_paths.get("rhpf", False)),
             "rhpf_available": float(requested_benchmark_paths.get("rhpf", False)),
-            "global_pf_available": float(requested_benchmark_paths.get("ghpf", False)),
-            "ghpf_available": float(requested_benchmark_paths.get("ghpf", False)),
             "model_path_executed": float(bool(requested_benchmark_paths.get("model", False))),
             "naive_path_executed": float(bool(requested_benchmark_paths.get("naive", False))),
             "rhpf_path_executed": float(bool(requested_benchmark_paths.get("rhpf", False))),
-            "ghpf_path_executed": float(bool(requested_benchmark_paths.get("ghpf", False))),
             "model_manifest_loaded": float(bool(model_manifest_loaded)),
             "model_predictions_loaded": float(bool(model_predictions_loaded)),
             "model_prediction_loading_skipped_reason": str(model_prediction_loading_skipped_reason),
@@ -6034,7 +5996,6 @@ def main() -> None:
             "model_available": outputs.summary.get("model_available"),
             "naive_available": outputs.summary.get("naive_available"),
             "rolling_pf_available": outputs.summary.get("rolling_pf_available"),
-            "global_pf_available": outputs.summary.get("global_pf_available"),
             "benchmark_mode": outputs.summary.get("benchmark_mode", normalized_benchmark_mode),
             "active_path": outputs.summary.get("active_path"),
             "active_path_simulation_valid": outputs.summary.get("active_path_simulation_valid"),
@@ -6061,15 +6022,8 @@ def main() -> None:
                 "rolling_perfect_foresight_same_rules_total_pnl_eur",
                 float("nan"),
             ),
-            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": outputs.summary.get(
-                "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"
-            ),
-            "global_perfect_foresight_available": outputs.summary.get("global_perfect_foresight_available"),
-            "global_perfect_foresight_dominance_check_pass": outputs.summary.get("global_perfect_foresight_dominance_check_pass"),
-            "global_perfect_foresight_validation_status": outputs.summary.get("global_perfect_foresight_validation_status"),
             "benchmark_is_global_upper_bound": outputs.summary.get("benchmark_is_global_upper_bound", 0.0),
             "rolling_pf_is_upper_bound": outputs.summary.get("rolling_pf_is_upper_bound", 0.0),
-            "global_perfect_foresight_is_upper_bound": outputs.summary.get("global_perfect_foresight_is_upper_bound", 0.0),
             "cost_of_forecast_error_total_eur": outputs.summary.get("cost_of_forecast_error_total_eur"),
             "pnl_gap_total_eur": outputs.summary.get("pnl_gap_total_eur"),
             "economic_opportunity_gap_ratio": outputs.summary.get("economic_opportunity_gap_ratio"),
@@ -6213,16 +6167,6 @@ def main() -> None:
             overview["realized_vs_perfect_foresight_pct"] = np.where(
                 o.abs() > 1e-12,
                 (r / o) * 100.0,
-                np.nan,
-            )
-        if {"realized_total_pnl_eur", "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"}.issubset(overview.columns):
-            r = pd.to_numeric(overview["realized_total_pnl_eur"], errors="coerce")
-            g = pd.to_numeric(overview["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"], errors="coerce")
-            avail = optional_numeric_series(overview, "global_perfect_foresight_available")
-            dom = optional_numeric_series(overview, "global_perfect_foresight_dominance_check_pass")
-            overview["realized_vs_global_hindsight_perfect_foresight_upper_bound_pct"] = np.where(
-                (avail >= 0.5) & (dom >= 0.5) & (g.abs() > 1e-12),
-                (r / g) * 100.0,
                 np.nan,
             )
         overview = _add_benchmark_comparison_columns(overview)

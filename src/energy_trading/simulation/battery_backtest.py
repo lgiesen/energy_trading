@@ -113,7 +113,7 @@ PREDICTED_PLANNED_PNL_ALIAS_TOL_EUR = 1e-6
 DA_PRECOMMIT_REPLAY_TOL_EUR = 1e-6
 
 
-BENCHMARK_PATH_TYPES = ("model", "naive", "rhpf", "ghpf")
+BENCHMARK_PATH_TYPES = ("model", "naive", "rhpf")
 
 
 def resolve_benchmark_paths(
@@ -121,8 +121,6 @@ def resolve_benchmark_paths(
     *,
     enable_naive: bool | None = None,
     enable_rolling_pf: bool | None = None,
-    enable_global_pf: bool | None = None,
-    enable_global_perfect_foresight: bool = False,
 ) -> tuple[str, dict[str, bool]]:
     """Resolve benchmark execution flags without running any benchmark branch."""
     raw_mode = str(benchmark_mode or "full").strip().lower()
@@ -133,8 +131,6 @@ def resolve_benchmark_paths(
         "perfect_foresight_only": "rhpf_only",
     }
     mode = mode_alias.get(raw_mode, raw_mode)
-    if mode in {"global_pf", "global_pf_only", "global_perfect_foresight", "global_perfect_foresight_only", "ghpf", "ghpf_only"}:
-        raise ValueError("global perfect-foresight benchmark has been removed; use rolling PF/RHPF instead")
     if mode not in {"full", "model_only", "naive_only", "rhpf_only", "selected"}:
         raise ValueError(
             "benchmark_mode must be one of: full, model_only, naive_only, rhpf_only, selected"
@@ -144,22 +140,17 @@ def resolve_benchmark_paths(
             "model": True,
             "naive": True if enable_naive is None else bool(enable_naive),
             "rhpf": True if enable_rolling_pf is None else bool(enable_rolling_pf),
-            "ghpf": False,
         }
     else:
         paths = {
             "model": mode in {"full", "model_only"},
             "naive": mode in {"full", "naive_only"},
             "rhpf": mode in {"full", "rhpf_only"},
-            "ghpf": False,
         }
         if enable_naive is not None:
             paths["naive"] = bool(enable_naive)
         if enable_rolling_pf is not None:
             paths["rhpf"] = bool(enable_rolling_pf)
-        # Global hindsight PF has been removed. Keep the key false for schema
-        # compatibility, but never execute or report a GHPF path.
-        paths["ghpf"] = False
     return mode, {k: bool(paths.get(k, False)) for k in BENCHMARK_PATH_TYPES}
 
 
@@ -184,14 +175,6 @@ def apply_benchmark_availability_to_summary(
         .iloc[0]
     )
     out["rhpf_available"] = out["rolling_pf_available"]
-    out["global_pf_available"] = float(1.0 if benchmark_paths.get("ghpf", False) else 0.0) * float(
-        pd.to_numeric(pd.Series([out.get("global_pf_available", out.get("global_perfect_foresight_available", 1.0))]), errors="coerce")
-        .fillna(0.0)
-        .iloc[0]
-    )
-    out["global_perfect_foresight_available"] = out["global_pf_available"]
-    out["ghpf_available"] = out["global_pf_available"]
-
     disabled_keys = {
         "model": [
             "realized_total_pnl_eur",
@@ -199,7 +182,6 @@ def apply_benchmark_availability_to_summary(
             "realized_market_pnl_eur",
             "realized_vs_perfect_foresight_ratio_multi_market",
             "realized_vs_perfect_foresight_pct",
-            "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
         ],
         "naive": [
             "naive_total_pnl_eur",
@@ -221,14 +203,6 @@ def apply_benchmark_availability_to_summary(
             "realized_vs_perfect_foresight_ratio_multi_market",
             "realized_vs_perfect_foresight_pct",
         ],
-        "ghpf": [
-            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
-            "global_hindsight_perfect_foresight_upper_bound_market_pnl_eur",
-            "global_pf_solver_solution_eur",
-            "global_pf_selected_incumbent_pnl_eur",
-            "ghpf_total_pnl_eur",
-            "realized_vs_global_hindsight_perfect_foresight_upper_bound_pct",
-        ],
     }
     for path, keys in disabled_keys.items():
         if not benchmark_paths.get(path, False):
@@ -239,8 +213,6 @@ def apply_benchmark_availability_to_summary(
         out["model_total_pnl_eur"] = out.get("realized_total_pnl_eur", float("nan"))
     if benchmark_paths.get("rhpf", False):
         out["rhpf_total_pnl_eur"] = out.get("rolling_perfect_foresight_same_rules_total_pnl_eur", float("nan"))
-    if benchmark_paths.get("ghpf", False):
-        out["ghpf_total_pnl_eur"] = out.get("global_hindsight_perfect_foresight_upper_bound_total_pnl_eur", float("nan"))
     return out
 
 
@@ -360,7 +332,6 @@ def _checkpoint_summary(
             "predicted_total_pnl_eur",
             "naive_total_pnl_eur",
             "rolling_perfect_foresight_same_rules_total_pnl_eur",
-            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur",
             "simulation_valid",
             "thesis_reportable",
             "invalid_reason",
@@ -374,7 +345,6 @@ def _checkpoint_summary(
             "predicted_total_pnl_eur": "pred_pnl_eur",
             "naive_total_pnl_eur": "naive_pnl_eur",
             "rolling_pf_total_pnl_eur": "perfect_foresight_pnl_eur",
-            "global_pf_total_pnl_eur": "global_perfect_foresight_pnl_eur",
         }
         for out_key, col in pnl_candidates.items():
             if out_key not in data and col in frame.columns:
@@ -1462,56 +1432,6 @@ class BatteryBacktester:
             "selected_is_no_market_fallback": float(str(selected) == "no_market"),
             "selection_reason": f"{selected}_has_highest_feasible_pnl",
         }
-
-    @staticmethod
-    def _global_pf_strict_invalid_reason(
-        *,
-        enable_global_perfect_foresight: bool,
-        global_pf_verified_upper_bound: float,
-        global_perfect_foresight_available: float,
-        global_perfect_foresight_validation_status: str,
-        global_pf_below_realized_incumbent: float,
-        global_pf_is_realized_path_fallback: float,
-    ) -> list[str]:
-        """Return strict invalid reasons caused by global-PF benchmark status only."""
-        if not bool(enable_global_perfect_foresight):
-            return []
-        if float(global_pf_verified_upper_bound) >= 0.5:
-            return []
-        if float(global_perfect_foresight_available) < 0.5:
-            return ["global_pf_unavailable"]
-        # A feasible realized-path incumbent is a benchmark fallback, not a
-        # model-path invalidity. It must not be classified as solver failure.
-        if float(global_pf_is_realized_path_fallback) >= 0.5:
-            return []
-        global_status = str(global_perfect_foresight_validation_status)
-        if "solver" in global_status:
-            return ["global_pf_solver_failed"]
-        if float(global_pf_below_realized_incumbent) >= 0.5:
-            return [
-                "global_pf_below_realized_incumbent",
-                "realized_exceeds_global_perfect_foresight",
-            ]
-        return ["global_pf_unverified"]
-
-    @staticmethod
-    def _global_pf_upper_bound_ratio_pct(
-        *,
-        realized_total_eur: float,
-        global_pf_total_eur: float,
-        global_perfect_foresight_available: float,
-        global_pf_verified_upper_bound: float,
-    ) -> float:
-        """Return realized/global-PF ratio only for an independent verified upper bound."""
-        if float(global_perfect_foresight_available) < 0.5:
-            return float("nan")
-        if float(global_pf_verified_upper_bound) < 0.5:
-            return float("nan")
-        if not (np.isfinite(float(realized_total_eur)) and np.isfinite(float(global_pf_total_eur))):
-            return float("nan")
-        if abs(float(global_pf_total_eur)) <= 1e-12:
-            return float("nan")
-        return float(100.0 * float(realized_total_eur) / float(global_pf_total_eur))
 
     def _rolling_pf_da_plan_history_diagnostics(
         self,
@@ -4378,160 +4298,6 @@ class BatteryBacktester:
             >= expected_block_hours
         )
         return pd.Series(~complete.to_numpy(dtype=bool), index=getattr(timestamp_utc, "index", None), dtype=bool)
-
-    def _map_global_bcm_reserves_to_product_obligations(
-        self,
-        *,
-        dispatch: pd.DataFrame,
-        market_input: pd.DataFrame,
-        colmap: BacktestColumnMap,
-    ) -> pd.DataFrame:
-        """Convert full-horizon GHPF raw reserve decisions into BCM product obligations.
-
-        The full-horizon optimizer emits hourly reserve decision columns. BCM
-        settlement, however, needs awarded 4h product capacity plus the submitted
-        pay-as-bid capacity price. This helper preserves the optimizer decision
-        only for complete products that clear against true capacity cutoffs, then
-        writes lockbook-style obligation columns consumed by settlement.
-        """
-        if dispatch is None or dispatch.empty or colmap.timestamp not in dispatch.columns:
-            return dispatch
-        out = dispatch.copy()
-        ts = pd.to_datetime(out[colmap.timestamp], utc=True, errors="coerce")
-        if ts.isna().any():
-            return out
-
-        market = market_input.copy() if market_input is not None else pd.DataFrame()
-        if colmap.timestamp in market.columns:
-            market_ts = pd.to_datetime(market[colmap.timestamp], utc=True, errors="coerce")
-            market = market.loc[market_ts.notna()].copy()
-            market["_ghpf_ts_key"] = pd.to_datetime(market[colmap.timestamp], utc=True, errors="coerce")
-        out["_ghpf_ts_key"] = ts
-        if not market.empty and "_ghpf_ts_key" in market.columns:
-            lookup_cols = [
-                c for c in [
-                    colmap.true_afrr_capacity_price_pos,
-                    colmap.true_afrr_capacity_price_neg,
-                    colmap.pred_afrr_capacity_price_pos,
-                    colmap.pred_afrr_capacity_price_neg,
-                    colmap.true_afrr_activation_price_pos,
-                    colmap.true_afrr_activation_price_neg,
-                    colmap.pred_afrr_activation_price_pos,
-                    colmap.pred_afrr_activation_price_neg,
-                ] if c in market.columns
-            ]
-            out = out.merge(
-                market[["_ghpf_ts_key", *lookup_cols]],
-                on="_ghpf_ts_key",
-                how="left",
-                suffixes=("", "_market"),
-            )
-
-        for c in (
-            "aFRR_Capacity_Won_Pos_MW",
-            "aFRR_Capacity_Won_Neg_MW",
-            "aFRR_Capacity_Won_MW",
-            "settlement_cap_bid_price_pos_eur_mw",
-            "settlement_cap_bid_price_neg_eur_mw",
-            "bcm_capacity_bid_price_pos_eur_per_mw_h",
-            "bcm_capacity_bid_price_neg_eur_per_mw_h",
-            "aFRR_Energy_Price_EUR_MWh_Pos",
-            "aFRR_Energy_Price_EUR_MWh_Neg",
-            "global_pf_bcm_product_partial_excluded",
-            "global_pf_bcm_product_capacity_mapped",
-        ):
-            if c not in out.columns:
-                out[c] = 0.0
-
-        reserve_pos_col = "reserve_pos_mw" if "reserve_pos_mw" in out.columns else "plan_reserve_pos_mw"
-        reserve_neg_col = "reserve_neg_mw" if "reserve_neg_mw" in out.columns else "plan_reserve_neg_mw"
-        if reserve_pos_col not in out.columns:
-            out[reserve_pos_col] = 0.0
-        if reserve_neg_col not in out.columns:
-            out[reserve_neg_col] = 0.0
-
-        block_info = assign_bcm_capacity_block(ts).reset_index(drop=True)
-        out["_ghpf_bcm_block_id"] = block_info["bcm_capacity_block_id"].astype(str).to_numpy()
-        expected_block_hours = int(round(float(self.reserve_product_duration_h) / max(float(self.dt_h), 1e-12)))
-
-        def _mean_col(frame: pd.DataFrame, cols: list[str], default: float = 0.0) -> float:
-            for col in cols:
-                if col in frame.columns:
-                    vals = pd.to_numeric(frame[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-                    if not vals.empty:
-                        return float(vals.mean())
-            return float(default)
-
-        for _block_id, idx in out.groupby("_ghpf_bcm_block_id", sort=False).groups.items():
-            idx_list = list(idx)
-            block = out.loc[idx_list]
-            complete = len(block) >= expected_block_hours
-            if not complete:
-                out.loc[idx_list, "global_pf_bcm_product_partial_excluded"] = 1.0
-                out.loc[idx_list, [reserve_pos_col, reserve_neg_col]] = 0.0
-                continue
-
-            raw_pos = max(0.0, _mean_col(block, [reserve_pos_col], 0.0))
-            raw_neg = max(0.0, _mean_col(block, [reserve_neg_col], 0.0))
-            bid_pos = _mean_col(
-                block,
-                [
-                    colmap.pred_afrr_capacity_price_pos,
-                    f"{colmap.pred_afrr_capacity_price_pos}_market",
-                    colmap.true_afrr_capacity_price_pos,
-                    f"{colmap.true_afrr_capacity_price_pos}_market",
-                ],
-                0.0,
-            )
-            bid_neg = _mean_col(
-                block,
-                [
-                    colmap.pred_afrr_capacity_price_neg,
-                    f"{colmap.pred_afrr_capacity_price_neg}_market",
-                    colmap.true_afrr_capacity_price_neg,
-                    f"{colmap.true_afrr_capacity_price_neg}_market",
-                ],
-                0.0,
-            )
-            cutoff_pos = _mean_col(
-                block,
-                [colmap.true_afrr_capacity_price_pos, f"{colmap.true_afrr_capacity_price_pos}_market"],
-                bid_pos,
-            )
-            cutoff_neg = _mean_col(
-                block,
-                [colmap.true_afrr_capacity_price_neg, f"{colmap.true_afrr_capacity_price_neg}_market"],
-                bid_neg,
-            )
-            accepted_pos = raw_pos if raw_pos > 1e-9 and bid_pos <= cutoff_pos + 1e-9 else 0.0
-            accepted_neg = raw_neg if raw_neg > 1e-9 and bid_neg <= cutoff_neg + 1e-9 else 0.0
-
-            out.loc[idx_list, reserve_pos_col] = accepted_pos
-            out.loc[idx_list, reserve_neg_col] = accepted_neg
-            out.loc[idx_list, "aFRR_Capacity_Won_Pos_MW"] = accepted_pos
-            out.loc[idx_list, "aFRR_Capacity_Won_Neg_MW"] = accepted_neg
-            out.loc[idx_list, "aFRR_Capacity_Won_MW"] = accepted_pos + accepted_neg
-            out.loc[idx_list, "settlement_cap_bid_price_pos_eur_mw"] = bid_pos if accepted_pos > 0 else 0.0
-            out.loc[idx_list, "settlement_cap_bid_price_neg_eur_mw"] = bid_neg if accepted_neg > 0 else 0.0
-            out.loc[idx_list, "bcm_capacity_bid_price_pos_eur_per_mw_h"] = bid_pos if accepted_pos > 0 else 0.0
-            out.loc[idx_list, "bcm_capacity_bid_price_neg_eur_per_mw_h"] = bid_neg if accepted_neg > 0 else 0.0
-            out.loc[idx_list, "global_pf_bcm_product_capacity_mapped"] = float(accepted_pos > 0 or accepted_neg > 0)
-
-        for side, cols in {
-            "Pos": [colmap.pred_afrr_activation_price_pos, f"{colmap.pred_afrr_activation_price_pos}_market", colmap.true_afrr_activation_price_pos],
-            "Neg": [colmap.pred_afrr_activation_price_neg, f"{colmap.pred_afrr_activation_price_neg}_market", colmap.true_afrr_activation_price_neg],
-        }.items():
-            target = f"aFRR_Energy_Price_EUR_MWh_{side}"
-            if target in out.columns:
-                vals = None
-                for c in cols:
-                    if c in out.columns:
-                        vals = pd.to_numeric(out[c], errors="coerce")
-                        break
-                if vals is not None:
-                    out[target] = vals.fillna(0.0)
-
-        return out.drop(columns=[c for c in ("_ghpf_ts_key", "_ghpf_bcm_block_id") if c in out.columns])
 
     @staticmethod
     def _assert_valid_time_index(df: pd.DataFrame, timestamp_col: str) -> pd.Series:
@@ -14381,7 +14147,7 @@ class BatteryBacktester:
                 # fix it later" assumption caused accepted DA schedules to enter the
                 # rolling MILP without the repair action and then fail terminal SoC.
                 recoverable = False
-                detail = "locked_da_terminal_shortfall_candidate_infeasible"
+                detail = "terminal_shortfall_under_hard_min"
             diag = _base_diag()
             diag.update(
                 {
@@ -20491,7 +20257,7 @@ class BatteryBacktester:
                 f"executed_afrr_act_pos_bin_{b}_price_eur_mwh": f"bcm_{q_label}_executed_act_pos_price_eur_mwh",
                 f"executed_afrr_act_neg_bin_{b}_price_eur_mwh": f"bcm_{q_label}_executed_act_neg_price_eur_mwh",
             }
-            for namespace in ("", "pred_", "real_", "naive_", "perfect_foresight_", "pf_", "global_perfect_foresight_"):
+            for namespace in ("", "pred_", "real_", "naive_", "perfect_foresight_", "pf_"):
                 for old_col, new_col in clearing_aliases.items():
                     old_name = f"{namespace}{old_col}"
                     new_name = f"{namespace}{new_col}"
@@ -37042,6 +36808,54 @@ class BatteryBacktester:
         pred_da_price_p90 = float(getattr(row, f"{colmap.pred_da_price}_p90")) if require_da_quantiles else np.nan
         pred_da_price_p95 = float(getattr(row, f"{colmap.pred_da_price}_p95")) if require_da_quantiles else np.nan
 
+        authoritative_reserve_pos = float(reserve_pos)
+        authoritative_reserve_neg = float(reserve_neg)
+        if (
+            bool(perfect_foresight_mode)
+            and bool(getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False))
+        ):
+            def _rhpf_lockbook_authority_value(side: str) -> float | None:
+                names = (
+                    f"fixed_reserve_obligation_{side}_mw",
+                    f"real_fixed_reserve_obligation_{side}_mw",
+                    f"locked_bcm_capacity_{side}_mw",
+                    f"real_locked_bcm_capacity_{side}_mw",
+                    f"aFRR_Capacity_Won_{'Pos' if side == 'pos' else 'Neg'}_MW",
+                )
+                for name in names:
+                    if not hasattr(row, name):
+                        continue
+                    val = pd.to_numeric(pd.Series([getattr(row, name)]), errors="coerce").iloc[0]
+                    try:
+                        val_f = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(val_f):
+                        return float(max(0.0, val_f))
+                self._record_missing_critical_source_field(
+                    f"rhpf.bcm.lockbook_{side}",
+                    "missing_source_of_truth_rhpf_reserve",
+                    timestamp=ts_utc,
+                    context="rhpf_bcm_settlement_authority",
+                    details={
+                        "available_columns": [
+                            name
+                            for name in names
+                            if hasattr(row, name)
+                        ],
+                    },
+                )
+                return None
+
+            # In RHPF settlement, raw solver reserve plans are candidates only.
+            # The guarded/capped BCM lockbook is the sole settlement authority.
+            lockbook_reserve_pos = _rhpf_lockbook_authority_value("pos")
+            lockbook_reserve_neg = _rhpf_lockbook_authority_value("neg")
+            authoritative_reserve_pos = 0.0 if lockbook_reserve_pos is None else float(lockbook_reserve_pos)
+            authoritative_reserve_neg = 0.0 if lockbook_reserve_neg is None else float(lockbook_reserve_neg)
+            reserve_pos = float(authoritative_reserve_pos)
+            reserve_neg = float(authoritative_reserve_neg)
+
         def _first_nonzero_capacity_price(names: list[str]) -> float | None:
             for name in names:
                 if not hasattr(row, name):
@@ -37079,8 +36893,8 @@ class BatteryBacktester:
             is_perfect_foresight=perfect_foresight_mode,
             planned_charge_mw=charge,
             planned_discharge_mw=discharge,
-            planned_reserve_pos_mw=reserve_pos,
-            planned_reserve_neg_mw=reserve_neg,
+            planned_reserve_pos_mw=authoritative_reserve_pos,
+            planned_reserve_neg_mw=authoritative_reserve_neg,
             planned_bem_only_pos_mw=bem_only_pos,
             planned_bem_only_neg_mw=bem_only_neg,
             pred_da_price=pred_da_price,
@@ -37111,12 +36925,12 @@ class BatteryBacktester:
             pred_act_neg_q50=float(getattr(row, "pred_afrr_activation_price_neg_p50")) if hasattr(row, "pred_afrr_activation_price_neg_p50") else np.nan,
             pred_act_neg_q90=float(getattr(row, "pred_afrr_activation_price_neg_p90")) if hasattr(row, "pred_afrr_activation_price_neg_p90") else np.nan,
             obligation_pos_mw=(
-                getf("aFRR_Capacity_Won_Pos_MW", 0.0)
+                authoritative_reserve_pos
                 if bool(getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False))
                 else 0.0
             ),
             obligation_neg_mw=(
-                getf("aFRR_Capacity_Won_Neg_MW", 0.0)
+                authoritative_reserve_neg
                 if bool(getattr(self._strategy_permissions, "allow_bcm_activation_obligations", False))
                 else 0.0
             ),
@@ -37677,11 +37491,9 @@ class BatteryBacktester:
         id_mode: str | None = None,
         id_recourse_mode: str = "common",
         strict_simulation_validity: bool = True,
-        enable_global_perfect_foresight: bool = False,
         benchmark_mode: str = "full",
         enable_naive: bool | None = None,
         enable_rolling_pf: bool | None = None,
-        enable_global_pf: bool | None = None,
         bcm_bid_hour_local: int | None = None,
         checkpoint_dir: str | Path | None = None,
         write_checkpoints: bool = False,
@@ -37741,14 +37553,7 @@ class BatteryBacktester:
             benchmark_mode,
             enable_naive=enable_naive,
             enable_rolling_pf=enable_rolling_pf,
-            enable_global_pf=enable_global_pf,
-            enable_global_perfect_foresight=bool(enable_global_perfect_foresight),
         )
-        # Global hindsight PF has been removed. Keep legacy summary defaults,
-        # but never build solver/no-market/realized-path GHPF candidates.
-        enable_global_perfect_foresight = False
-        enable_global_pf = False
-        benchmark_paths["ghpf"] = False
 
         def _empty_prefixed_frame(prefix: str) -> pd.DataFrame:
             ts = (
@@ -38401,7 +38206,6 @@ class BatteryBacktester:
         rolling_pf_solver_final_pnl_eur = float("nan")
         rolling_pf_realized_path_final_pnl_eur = float("nan")
         rolling_pf_solver_vs_realized_path_delta_eur = float("nan")
-        global_pf_solver_status = "disabled"
         pf_failure_reason = ""
 
         def _pf_failure_status(exc: BaseException) -> str:
@@ -39501,55 +39305,6 @@ class BatteryBacktester:
             rolling_pf_failure_reason = "benchmark_disabled"
 
 
-        global_perfect_foresight_real = pd.DataFrame()
-        global_perfect_foresight_validation_status = "disabled_unverified"
-        global_perfect_foresight_dispatch_rows = 0.0
-        global_perfect_foresight_settlement_rows = 0.0
-        global_perfect_foresight_bem_only_included = 0.0
-        global_perfect_foresight_pnl_reconciliation_error_eur = float("nan")
-        global_perfect_foresight_available_flag = 0.0
-        global_pf_solver_available = 0.0
-        global_pf_solver_benchmark_verified = 0.0
-        global_pf_is_solver_upper_bound = 0.0
-        global_pf_is_realized_path_fallback = 0.0
-        global_pf_solver_solution_eur = float("nan")
-        global_pf_best_feasible_lower_bound_name = "none"
-        global_pf_best_feasible_lower_bound_eur = float("nan")
-        global_pf_no_trade_incumbent_eur = float("nan")
-        global_pf_realized_path_incumbent_eur = float("nan")
-        global_pf_no_trade_final_soc_mwh = float("nan")
-        global_pf_no_trade_terminal_shortfall_mwh = float("nan")
-        global_pf_no_trade_id_buy_mwh = 0.0
-        global_pf_selected_incumbent = "none"
-        global_pf_incumbent_selection_reason = "disabled"
-        global_pf_selected_final_soc_mwh = float("nan")
-        global_pf_selected_terminal_shortfall_mwh = float("nan")
-        global_pf_candidate_terminal_shortfall_mwh = float("nan")
-        global_pf_solver_feasible = 0.0
-        global_pf_solver_rejection_reason = "disabled"
-        global_pf_solver_terminal_shortfall_mwh = float("nan")
-        global_pf_no_market_feasible = 0.0
-        global_pf_no_market_rejection_reason = "disabled"
-        global_pf_realized_path_feasible = 0.0
-        global_pf_realized_path_rejection_reason = "disabled"
-        global_pf_realized_path_missing_timestamp_count = 0.0
-        global_pf_realized_path_first_missing_timestamp_utc = ""
-        global_pf_realized_path_extra_timestamp_count = 0.0
-        global_pf_realized_path_first_extra_timestamp_utc = ""
-        global_pf_realized_path_expected_rows = 0.0
-        global_pf_realized_path_actual_rows = 0.0
-        global_pf_realized_path_expected_row_count = 0.0
-        global_pf_realized_path_actual_row_count = 0.0
-        da_true_for_global_pf = self._finite_numeric_series(
-            perfect_foresight_df,
-            colmap.true_da_price,
-            fallback_cols=[colmap.pred_da_price],
-            default=0.0,
-        )
-        terminal_price_for_global_pf = max(
-            0.0,
-            float(da_true_for_global_pf.iloc[-1]) if len(da_true_for_global_pf) else 0.0,
-        )
         # Global hindsight PF removed: do not build solver, no-market, or realized-path GHPF candidates.
         # Legacy isolated-market retrospective accounting removed.
         realized_da_only_feasible = True
@@ -39591,25 +39346,6 @@ class BatteryBacktester:
         hourly = _merge_unique(hourly, real)
         hourly = _merge_unique(hourly, naive_real)
         hourly = _merge_unique(hourly, perfect_foresight_real)
-        if not global_perfect_foresight_real.empty:
-            hourly = _merge_unique(hourly, global_perfect_foresight_real)
-        for missing_global_pf_col in (
-            "global_perfect_foresight_submitted_bcm_capacity_pos_mw",
-            "global_perfect_foresight_submitted_bcm_capacity_neg_mw",
-            "global_perfect_foresight_locked_bcm_capacity_pos_mw",
-            "global_perfect_foresight_locked_bcm_capacity_neg_mw",
-            "global_perfect_foresight_bcm_activation_bid_price_pos",
-            "global_perfect_foresight_bcm_true_activation_price_pos",
-            "global_perfect_foresight_bcm_precommit_feasibility_pass",
-            "global_perfect_foresight_bcm_precommit_zero_reason",
-            "global_perfect_foresight_bcm_zero_reason",
-        ):
-            if missing_global_pf_col not in hourly.columns:
-                hourly[missing_global_pf_col] = (
-                    "global_pf_unavailable"
-                    if missing_global_pf_col.endswith(("zero_reason",))
-                    else 0.0
-                )
         pf_alias_sources = {
             "pf_submitted_bcm_capacity_pos_mw": "perfect_foresight_submitted_bcm_capacity_pos_mw",
             "pf_submitted_bcm_capacity_neg_mw": "perfect_foresight_submitted_bcm_capacity_neg_mw",
@@ -39630,7 +39366,7 @@ class BatteryBacktester:
         if pf_alias_cols:
             hourly = pd.concat([hourly, pd.DataFrame(pf_alias_cols, index=hourly.index)], axis=1).copy()
         hourly = hourly.sort_values(colmap.timestamp).reset_index(drop=True)
-        for prefix in ("real", "pred", "naive", "perfect_foresight", "global_perfect_foresight"):
+        for prefix in ("real", "pred", "naive", "perfect_foresight"):
             buy_col = f"{prefix}_id_buy_mwh"
             sell_col = f"{prefix}_id_sell_mwh"
             reason_col = f"{prefix}_id_recourse_reason"
@@ -39803,7 +39539,7 @@ class BatteryBacktester:
             return comp
 
         terminal_closure_by_prefix: dict[str, dict[str, float | str]] = {}
-        for _prefix in ("pred", "real", "naive", "perfect_foresight", "global_perfect_foresight"):
+        for _prefix in ("pred", "real", "naive", "perfect_foresight"):
             terminal_closure_by_prefix[_prefix] = _apply_final_terminal_closure(_prefix)
         real_terminal_closure = terminal_closure_by_prefix.get("real", {})
         required_terminal_closure_fields = (
@@ -40106,43 +39842,6 @@ class BatteryBacktester:
             [
                 hourly.drop(columns=existing_rolling_pf_scalar_cols, errors="ignore"),
                 pd.DataFrame(rolling_pf_scalar_cols, index=hourly.index),
-            ],
-            axis=1,
-        ).copy()
-        global_pf_hourly_cols = {
-            "global_pf_selected_incumbent": str(global_pf_selected_incumbent),
-            "global_pf_is_solver_upper_bound": float(global_pf_is_solver_upper_bound),
-            "global_pf_is_realized_path_fallback": float(global_pf_is_realized_path_fallback),
-            "global_pf_solver_available": float(global_pf_solver_available),
-            "global_pf_solver_feasible": float(global_pf_solver_feasible),
-            "global_pf_best_feasible_lower_bound_name": str(global_pf_best_feasible_lower_bound_name),
-            "global_pf_best_feasible_lower_bound_eur": float(global_pf_best_feasible_lower_bound_eur),
-            "global_pf_no_market_feasible": float(global_pf_no_market_feasible),
-            "global_pf_realized_path_feasible": float(global_pf_realized_path_feasible),
-            "global_pf_solver_rejection_reason": str(global_pf_solver_rejection_reason),
-            "global_pf_no_market_rejection_reason": str(global_pf_no_market_rejection_reason),
-            "global_pf_realized_path_rejection_reason": str(global_pf_realized_path_rejection_reason),
-            "global_pf_realized_path_missing_timestamp_count": float(
-                global_pf_realized_path_missing_timestamp_count
-            ),
-            "global_pf_realized_path_first_missing_timestamp_utc": str(
-                global_pf_realized_path_first_missing_timestamp_utc
-            ),
-            "global_pf_realized_path_extra_timestamp_count": float(
-                global_pf_realized_path_extra_timestamp_count
-            ),
-            "global_pf_realized_path_first_extra_timestamp_utc": str(
-                global_pf_realized_path_first_extra_timestamp_utc
-            ),
-            "global_pf_realized_path_expected_rows": float(global_pf_realized_path_expected_rows),
-            "global_pf_realized_path_actual_rows": float(global_pf_realized_path_actual_rows),
-            "global_pf_realized_path_expected_row_count": float(global_pf_realized_path_expected_row_count),
-            "global_pf_realized_path_actual_row_count": float(global_pf_realized_path_actual_row_count),
-        }
-        hourly = pd.concat(
-            [
-                hourly.drop(columns=list(global_pf_hourly_cols), errors="ignore"),
-                pd.DataFrame(global_pf_hourly_cols, index=hourly.index),
             ],
             axis=1,
         ).copy()
@@ -40544,9 +40243,6 @@ class BatteryBacktester:
         terminal_closure_pf_pnl_eur = float(
             terminal_closure_by_prefix.get("perfect_foresight", {}).get("terminal_closure_net_pnl_eur", 0.0) or 0.0
         )
-        terminal_closure_global_pf_pnl_eur = float(
-            terminal_closure_by_prefix.get("global_perfect_foresight", {}).get("terminal_closure_net_pnl_eur", 0.0) or 0.0
-        )
         pred_pnl_raw = float(hourly["pred_pnl_eur"].sum()) - terminal_closure_pred_pnl_eur
         real_pnl_raw = float(hourly["real_pnl_eur"].sum()) - terminal_closure_real_pnl_eur
         naive_pnl_raw = float(hourly["naive_pnl_eur"].sum()) - terminal_closure_naive_pnl_eur
@@ -40581,13 +40277,11 @@ class BatteryBacktester:
             final_real_soc_mwh = float(hourly["real_soc_mwh"].iloc[-1]) if "real_soc_mwh" in hourly.columns else float(self.soc_init)
             final_naive_soc_mwh = float(hourly["naive_soc_mwh"].iloc[-1]) if "naive_soc_mwh" in hourly.columns else float(self.soc_init)
             final_perfect_foresight_soc_mwh = float(hourly["perfect_foresight_soc_mwh"].iloc[-1]) if "perfect_foresight_soc_mwh" in hourly.columns else float(self.soc_init)
-            final_global_perfect_foresight_soc_mwh = float(hourly["global_perfect_foresight_soc_mwh"].iloc[-1]) if "global_perfect_foresight_soc_mwh" in hourly.columns else float(self.soc_init)
         else:
             final_pred_soc_mwh = float(self.soc_init)
             final_real_soc_mwh = float(self.soc_init)
             final_naive_soc_mwh = float(self.soc_init)
             final_perfect_foresight_soc_mwh = float(self.soc_init)
-            final_global_perfect_foresight_soc_mwh = float(self.soc_init)
 
         da_pred_last = self._finite_numeric_series(
             df,
@@ -40626,27 +40320,17 @@ class BatteryBacktester:
             final_soc_mwh=final_perfect_foresight_soc_mwh,
             terminal_price_eur_mwh=terminal_price_true_eur_mwh,
         )
-        term_value_global_perfect_foresight = self._terminal_surplus_value_components(
-            final_soc_mwh=final_global_perfect_foresight_soc_mwh,
-            terminal_price_eur_mwh=terminal_price_true_eur_mwh,
-        )
 
         terminal_delta_pred_mwh = float(term_value_pred["terminal_surplus_grid_mwh"])
         terminal_delta_real_mwh = float(term_value_real["terminal_surplus_grid_mwh"])
         terminal_delta_naive_mwh = float(term_value_naive["terminal_surplus_grid_mwh"])
         terminal_delta_perfect_foresight_mwh = float(term_value_perfect_foresight["terminal_surplus_grid_mwh"])
-        terminal_delta_global_perfect_foresight_mwh = float(
-            term_value_global_perfect_foresight["terminal_surplus_grid_mwh"]
-        )
 
         terminal_value_pred_eur = float(term_value_pred["terminal_surplus_value_net_eur"])
         terminal_value_real_eur = float(term_value_real["terminal_surplus_value_net_eur"])
         terminal_value_naive_eur = float(term_value_naive["terminal_surplus_value_net_eur"])
         terminal_value_perfect_foresight_eur = float(
             term_value_perfect_foresight["terminal_surplus_value_net_eur"]
-        )
-        terminal_value_global_perfect_foresight_eur = float(
-            term_value_global_perfect_foresight["terminal_surplus_value_net_eur"]
         )
 
         def _terminal_target_adjustment(soc_final_mwh: float, term_price_eur_mwh: float) -> dict[str, float]:
@@ -40671,7 +40355,6 @@ class BatteryBacktester:
         term_adj_real = _terminal_target_adjustment(final_real_soc_mwh, terminal_price_true_eur_mwh)
         term_adj_naive = _terminal_target_adjustment(final_naive_soc_mwh, terminal_price_true_eur_mwh)
         term_adj_perfect_foresight = _terminal_target_adjustment(final_perfect_foresight_soc_mwh, terminal_price_true_eur_mwh)
-        term_adj_global_perfect_foresight = _terminal_target_adjustment(final_global_perfect_foresight_soc_mwh, terminal_price_true_eur_mwh)
 
         pred_pnl_total = pred_pnl_raw + terminal_closure_pred_pnl_eur + term_adj_pred["adjustment_eur"]
         real_pnl_total = real_pnl_raw + terminal_closure_real_pnl_eur + term_adj_real["adjustment_eur"]
@@ -40965,107 +40648,6 @@ class BatteryBacktester:
                 ],
                 axis=1,
             ).copy()
-        global_perfect_foresight_pnl_raw = (
-            _sum_col_zero("global_perfect_foresight_pnl_eur") - terminal_closure_global_pf_pnl_eur
-            if enable_global_perfect_foresight and global_perfect_foresight_available_flag >= 0.5
-            else float("nan")
-        )
-        global_perfect_foresight_pnl_total = (
-            global_perfect_foresight_pnl_raw
-            + terminal_closure_global_pf_pnl_eur
-            + term_adj_global_perfect_foresight["adjustment_eur"]
-            if enable_global_perfect_foresight and global_perfect_foresight_available_flag >= 0.5
-            else float("nan")
-        )
-        eps_global_perfect_foresight = 1e-2
-        same_rules_rolling_pf_gap_eur = (
-            float(rolling_pf_reported_total_pnl_eur - real_pnl_total)
-            if np.isfinite(rolling_pf_reported_total_pnl_eur) and np.isfinite(real_pnl_total)
-            else float("nan")
-        )
-        same_rules_rolling_pf_dominates_realized = float(
-            np.isfinite(same_rules_rolling_pf_gap_eur)
-            and same_rules_rolling_pf_gap_eur >= -eps_global_perfect_foresight
-        )
-        da_strategy_active_for_upper_bound = bool(run_strategy_permissions.allow_da)
-        rolling_pf_upper_bound_diag = self._rolling_pf_da_upper_bound_diagnostics(
-            rhpf_enabled=bool(benchmark_paths.get("rhpf", False)),
-            da_strategy_active=bool(da_strategy_active_for_upper_bound),
-            rolling_pf_verified=float(rolling_pf_verified),
-            rolling_pf_da_bid_sizer_method=str(rolling_pf_da_bid_sizer_method),
-            rolling_pf_da_bid_sizer_status=str(rolling_pf_da_bid_sizer_status),
-            da_sizer_postlock_replay_mismatch=float(da_sizer_postlock_replay_mismatch),
-            naive_total_pnl_eur=float(naive_pnl_total),
-            rolling_pf_total_pnl_eur=float(rolling_pf_reported_total_pnl_eur),
-        )
-        rolling_pf_da_exact_sizer_fallback_used = float(
-            rolling_pf_upper_bound_diag["rolling_pf_da_exact_sizer_fallback_used"]
-        )
-        rolling_pf_upper_bound_invalidated_by_da_sizer = float(
-            rolling_pf_upper_bound_diag["rolling_pf_upper_bound_invalidated_by_da_sizer"]
-        )
-        rolling_pf_verified_upper_bound_effective = float(
-            rolling_pf_upper_bound_diag["rolling_pf_verified_upper_bound_effective"]
-        )
-        naive_beats_rhpf = float(rolling_pf_upper_bound_diag["rolling_pf_naive_beats_rhpf"])
-        naive_beats_rhpf_reason = str(rolling_pf_upper_bound_diag["naive_beats_rhpf_reason"])
-        naive_minus_rhpf_eur = float(rolling_pf_upper_bound_diag["naive_minus_rhpf_eur"])
-        rhpf_benchmark_quality_pass = float(rolling_pf_upper_bound_diag["rhpf_benchmark_quality_pass"])
-        rhpf_benchmark_quality_reason = str(rolling_pf_upper_bound_diag["rhpf_benchmark_quality_reason"])
-        if not hourly.empty:
-            hourly["rolling_pf_da_exact_sizer_fallback_used"] = float(
-                rolling_pf_da_exact_sizer_fallback_used
-            )
-            hourly["rolling_pf_upper_bound_invalidated_by_da_sizer"] = float(
-                rolling_pf_upper_bound_invalidated_by_da_sizer
-            )
-            hourly["rolling_pf_verified_upper_bound_effective"] = float(
-                rolling_pf_verified_upper_bound_effective
-            )
-            hourly["rolling_pf_naive_beats_rhpf"] = float(naive_beats_rhpf)
-            hourly["naive_beats_rhpf_reason"] = str(naive_beats_rhpf_reason)
-            hourly["naive_minus_rhpf_eur"] = float(naive_minus_rhpf_eur)
-            hourly["rhpf_benchmark_quality_pass"] = float(rhpf_benchmark_quality_pass)
-            hourly["rhpf_benchmark_quality_reason"] = str(rhpf_benchmark_quality_reason)
-        realized_path_pnl_under_global_upper_bound_rules_eur = (
-            float(global_pf_realized_path_incumbent_eur)
-            if enable_global_perfect_foresight and np.isfinite(global_pf_realized_path_incumbent_eur)
-            else float(real_pnl_total)
-        )
-        global_pf_upper_bound_gap_eur = (
-            float(global_perfect_foresight_pnl_total - realized_path_pnl_under_global_upper_bound_rules_eur)
-            if np.isfinite(global_perfect_foresight_pnl_total)
-            and np.isfinite(realized_path_pnl_under_global_upper_bound_rules_eur)
-            else float("nan")
-        )
-        global_pf_below_realized_incumbent = float(
-            enable_global_perfect_foresight
-            and global_perfect_foresight_available_flag >= 0.5
-            and np.isfinite(global_pf_upper_bound_gap_eur)
-            and global_pf_upper_bound_gap_eur < -eps_global_perfect_foresight
-        )
-        global_pf_verified_upper_bound = float(
-            enable_global_perfect_foresight
-            and global_perfect_foresight_available_flag >= 0.5
-            and float(global_pf_is_solver_upper_bound) >= 0.5
-        )
-        if enable_global_perfect_foresight:
-            if str(global_perfect_foresight_validation_status) == "global_pf_solver_failed":
-                global_perfect_foresight_validation_status = "global_pf_solver_failed"
-            elif global_pf_verified_upper_bound >= 0.5:
-                if not str(global_perfect_foresight_validation_status).startswith("verified_"):
-                    global_perfect_foresight_validation_status = "verified_same_rules_dominates_realized"
-            elif global_pf_below_realized_incumbent >= 0.5:
-                global_perfect_foresight_validation_status = "solver_below_realized_path_incumbent"
-            elif global_perfect_foresight_available_flag < 0.5:
-                global_perfect_foresight_validation_status = "global_pf_unavailable"
-            elif float(global_pf_is_realized_path_fallback) >= 0.5:
-                global_perfect_foresight_validation_status = "verified_realized_path_fallback"
-            elif str(global_perfect_foresight_validation_status) not in {"", "disabled_unverified"}:
-                global_perfect_foresight_validation_status = str(global_perfect_foresight_validation_status)
-            else:
-                global_perfect_foresight_validation_status = "global_pf_unverified"
-
         # Rolling perfect-foresight is diagnostic only and can be beaten.
 
 
@@ -41075,6 +40657,43 @@ class BatteryBacktester:
             )
         else:
             opportunity_gap_ratio = float("nan")
+        same_rules_rolling_pf_gap_eur = (
+            float(rolling_pf_reported_total_pnl_eur - real_pnl_total)
+            if np.isfinite(float(rolling_pf_reported_total_pnl_eur)) and np.isfinite(float(real_pnl_total))
+            else float("nan")
+        )
+        same_rules_rolling_pf_dominates_realized = float(
+            np.isfinite(float(same_rules_rolling_pf_gap_eur))
+            and float(same_rules_rolling_pf_gap_eur) >= -1e-6
+        )
+        rolling_pf_upper_bound_diag = self._rolling_pf_da_upper_bound_diagnostics(
+            rhpf_enabled=bool(benchmark_paths.get("rhpf", False)),
+            da_strategy_active=bool(self._strategy_permissions.allow_da),
+            rolling_pf_verified=float(rolling_pf_verified),
+            rolling_pf_da_bid_sizer_method=str(rolling_pf_da_bid_sizer_method),
+            rolling_pf_da_bid_sizer_status=str(rolling_pf_da_bid_sizer_status),
+            da_sizer_postlock_replay_mismatch=float(da_sizer_postlock_replay_mismatch),
+            naive_total_pnl_eur=float(naive_pnl_total),
+            rolling_pf_total_pnl_eur=float(rolling_pf_reported_total_pnl_eur),
+        )
+        rolling_pf_da_exact_sizer_fallback_used = float(
+            rolling_pf_upper_bound_diag.get("rolling_pf_da_exact_sizer_fallback_used", 0.0)
+        )
+        rolling_pf_upper_bound_invalidated_by_da_sizer = float(
+            rolling_pf_upper_bound_diag.get("rolling_pf_upper_bound_invalidated_by_da_sizer", 0.0)
+        )
+        rolling_pf_verified_upper_bound_effective = float(
+            rolling_pf_upper_bound_diag.get("rolling_pf_verified_upper_bound_effective", 0.0)
+        )
+        naive_beats_rhpf = float(rolling_pf_upper_bound_diag.get("rolling_pf_naive_beats_rhpf", 0.0))
+        naive_beats_rhpf_reason = str(rolling_pf_upper_bound_diag.get("naive_beats_rhpf_reason", "none"))
+        naive_minus_rhpf_eur = float(rolling_pf_upper_bound_diag.get("naive_minus_rhpf_eur", float("nan")))
+        rhpf_benchmark_quality_pass = float(
+            rolling_pf_upper_bound_diag.get("rhpf_benchmark_quality_pass", 1.0)
+        )
+        rhpf_benchmark_quality_reason = str(
+            rolling_pf_upper_bound_diag.get("rhpf_benchmark_quality_reason", "none")
+        )
 
         if colmap.timestamp in hourly.columns:
             bcm_cols = [
@@ -41580,69 +41199,6 @@ class BatteryBacktester:
             "perfect_foresight_is_global_upper_bound": 0.0,
             "perfect_foresight_can_be_beaten": 1.0,
             "benchmark_is_global_upper_bound": 0.0,
-            "global_hindsight_perfect_foresight_upper_bound_total_pnl_eur": float(global_perfect_foresight_pnl_total) if np.isfinite(global_perfect_foresight_pnl_total) else float("nan"),
-            "global_hindsight_perfect_foresight_upper_bound_market_pnl_eur": float(global_perfect_foresight_pnl_total) if np.isfinite(global_perfect_foresight_pnl_total) else float("nan"),
-            "global_hindsight_same_rules_upper_bound_total_pnl_eur": float(global_perfect_foresight_pnl_total) if np.isfinite(global_perfect_foresight_pnl_total) else float("nan"),
-            "realized_path_pnl_under_global_upper_bound_rules_eur": float(realized_path_pnl_under_global_upper_bound_rules_eur),
-            "global_pf_verified_upper_bound": float(global_pf_verified_upper_bound),
-            "global_pf_is_solver_upper_bound": float(global_pf_is_solver_upper_bound),
-            "global_pf_is_realized_path_fallback": float(global_pf_is_realized_path_fallback),
-            "global_pf_available": float(global_perfect_foresight_available_flag),
-            "global_pf_solver_status": str(global_pf_solver_status),
-            "global_pf_verified": float(global_pf_solver_benchmark_verified),
-            "global_pf_solver_available": float(global_pf_solver_available),
-            "global_pf_solver_feasible": float(global_pf_solver_feasible),
-            "global_pf_solver_rejection_reason": str(global_pf_solver_rejection_reason),
-            "global_pf_solver_terminal_shortfall_mwh": float(global_pf_solver_terminal_shortfall_mwh),
-            "global_pf_no_market_feasible": float(global_pf_no_market_feasible),
-            "global_pf_no_market_rejection_reason": str(global_pf_no_market_rejection_reason),
-            "global_pf_realized_path_feasible": float(global_pf_realized_path_feasible),
-            "global_pf_realized_path_rejection_reason": str(global_pf_realized_path_rejection_reason),
-            "global_pf_realized_path_missing_timestamp_count": float(
-                global_pf_realized_path_missing_timestamp_count
-            ),
-            "global_pf_realized_path_first_missing_timestamp_utc": str(
-                global_pf_realized_path_first_missing_timestamp_utc
-            ),
-            "global_pf_realized_path_extra_timestamp_count": float(
-                global_pf_realized_path_extra_timestamp_count
-            ),
-            "global_pf_realized_path_first_extra_timestamp_utc": str(
-                global_pf_realized_path_first_extra_timestamp_utc
-            ),
-            "global_pf_realized_path_expected_rows": float(global_pf_realized_path_expected_rows),
-            "global_pf_realized_path_actual_rows": float(global_pf_realized_path_actual_rows),
-            "global_pf_realized_path_expected_row_count": float(global_pf_realized_path_expected_row_count),
-            "global_pf_realized_path_actual_row_count": float(global_pf_realized_path_actual_row_count),
-            "global_pf_upper_bound_gap_eur": float(global_pf_upper_bound_gap_eur),
-            "global_pf_below_realized_incumbent": float(global_pf_below_realized_incumbent),
-            "global_pf_solver_solution_eur": float(global_pf_solver_solution_eur),
-            "global_pf_best_feasible_lower_bound_name": str(global_pf_best_feasible_lower_bound_name),
-            "global_pf_best_feasible_lower_bound_eur": float(global_pf_best_feasible_lower_bound_eur),
-            "global_pf_no_trade_incumbent_eur": float(global_pf_no_trade_incumbent_eur),
-            "global_pf_no_market_incumbent_eur": float(global_pf_no_trade_incumbent_eur),
-            "global_pf_realized_path_incumbent_eur": float(global_pf_realized_path_incumbent_eur),
-            "global_pf_minus_no_market_incumbent_eur": (
-                float(global_perfect_foresight_pnl_total - global_pf_no_trade_incumbent_eur)
-                if np.isfinite(global_perfect_foresight_pnl_total) and np.isfinite(global_pf_no_trade_incumbent_eur)
-                else float("nan")
-            ),
-            "global_pf_no_trade_final_soc_mwh": float(global_pf_no_trade_final_soc_mwh),
-            "global_pf_no_trade_terminal_shortfall_mwh": float(global_pf_no_trade_terminal_shortfall_mwh),
-            "global_pf_no_trade_id_buy_mwh": float(global_pf_no_trade_id_buy_mwh),
-            "global_pf_selected_incumbent": str(global_pf_selected_incumbent),
-            "global_pf_selected_final_soc_mwh": float(global_pf_selected_final_soc_mwh),
-            "global_pf_selected_terminal_shortfall_mwh": float(global_pf_selected_terminal_shortfall_mwh),
-            "global_pf_incumbent_selection_reason": str(global_pf_incumbent_selection_reason),
-            "global_pf_candidate_terminal_shortfall_mwh": float(global_pf_candidate_terminal_shortfall_mwh),
-            "global_hindsight_perfect_foresight_is_global_upper_bound": 0.0,
-            "global_perfect_foresight_available": float(global_perfect_foresight_available_flag),
-                "global_perfect_foresight_capacity_bid_semantics": (
-                    "global_solver_missing_bcm_lockbook_semantics"
-                    if bool(run_strategy_permissions.allow_bcm)
-                    else "full_horizon_solver_with_lower_bound_guards"
-                ),
-            "benchmark_is_global_upper_bound_global_perfect_foresight": 1.0,
             "pf_failure_reason": str(pf_failure_reason),
             "predicted_pnl_excl_terminal_eur": float(pred_pnl_raw),
             "realized_pnl_excl_terminal_eur": float(real_pnl_raw),
@@ -41659,7 +41215,6 @@ class BatteryBacktester:
             "terminal_value_realized_eur": float(terminal_value_real_eur),
             "terminal_value_naive_eur": float(terminal_value_naive_eur),
             "terminal_value_perfect_foresight_eur": float(terminal_value_perfect_foresight_eur),
-            "terminal_value_global_perfect_foresight_eur": float(terminal_value_global_perfect_foresight_eur) if enable_global_perfect_foresight else float("nan"),
             "terminal_soc_shortfall_mwh": float(term_adj_real["shortfall_mwh"]),
             "terminal_soc_surplus_mwh": float(term_adj_real["surplus_mwh"]),
             "terminal_soc_repair_cost_eur": float(real_terminal_closure.get("terminal_closure_cost_eur", 0.0)),
@@ -41833,7 +41388,6 @@ class BatteryBacktester:
             "model_path_executed": float(bool(benchmark_paths.get("model", False))),
             "naive_path_executed": float(bool(benchmark_paths.get("naive", False))),
             "rhpf_path_executed": float(bool(benchmark_paths.get("rhpf", False))),
-            "ghpf_path_executed": float(bool(benchmark_paths.get("ghpf", False))),
             "naive_forecast_mode": str(naive_forecast_mode),
             "naive_forecast_causality_violations": float(naive_forecast_causality_violations),
             "naive_forecast_fallback_count": float(naive_forecast_fallback_count),
@@ -42334,85 +41888,6 @@ class BatteryBacktester:
                 rolling_pf_selected_vs_component_pnl_delta_eur
             )
         summary["rolling_pf_is_upper_bound"] = float(rolling_pf_verified_upper_bound_effective)
-        summary["global_perfect_foresight_is_upper_bound"] = 0.0
-        summary["global_perfect_foresight_validation_status"] = str(global_perfect_foresight_validation_status)
-        summary["global_perfect_foresight_dispatch_rows"] = float(global_perfect_foresight_dispatch_rows)
-        summary["global_perfect_foresight_settlement_rows"] = float(global_perfect_foresight_settlement_rows)
-        summary["global_perfect_foresight_bem_only_included"] = float(global_perfect_foresight_bem_only_included)
-        summary["global_perfect_foresight_market_scope"] = json.dumps(sorted({str(m).strip().lower() for m in allowed_markets}))
-        summary["global_perfect_foresight_terminal_adjustment_eur"] = float(term_adj_global_perfect_foresight["adjustment_eur"]) if enable_global_perfect_foresight else float("nan")
-        summary["global_pf_same_market_rules"] = float(
-            enable_global_perfect_foresight
-            and global_perfect_foresight_available_flag >= 0.5
-            and str(global_perfect_foresight_validation_status) != "global_pf_solver_failed"
-        )
-        summary["global_pf_realized_path_incumbent_eur"] = float(realized_path_pnl_under_global_upper_bound_rules_eur)
-        summary["global_pf_solution_eur"] = float(global_perfect_foresight_pnl_total)
-        summary["global_pf_solver_solution_eur"] = float(global_pf_solver_solution_eur)
-        summary["global_pf_best_feasible_lower_bound_name"] = str(global_pf_best_feasible_lower_bound_name)
-        summary["global_pf_best_feasible_lower_bound_eur"] = float(global_pf_best_feasible_lower_bound_eur)
-        summary["global_pf_no_market_incumbent_eur"] = float(global_pf_no_trade_incumbent_eur)
-        summary["global_pf_minus_no_market_incumbent_eur"] = (
-            float(global_perfect_foresight_pnl_total - global_pf_no_trade_incumbent_eur)
-            if np.isfinite(global_perfect_foresight_pnl_total) and np.isfinite(global_pf_no_trade_incumbent_eur)
-            else float("nan")
-        )
-        summary["global_pf_minus_realized_incumbent_eur"] = float(global_pf_upper_bound_gap_eur)
-        global_pf_failure_reason = "none"
-        if enable_global_perfect_foresight:
-            status_reason = str(global_perfect_foresight_validation_status)
-            if status_reason in {"no_feasible_incumbent", "global_pf_unavailable"}:
-                global_pf_failure_reason = "unavailable"
-            elif status_reason == "global_pf_solver_failed":
-                global_pf_failure_reason = "solver_failed"
-            elif status_reason and status_reason not in {"verified_full_horizon_solver", "verified_same_rules_dominates_realized"}:
-                global_pf_failure_reason = status_reason
-            elif global_pf_below_realized_incumbent >= 0.5:
-                global_pf_failure_reason = "solver_below_realized_path_incumbent"
-            elif global_pf_verified_upper_bound < 0.5:
-                global_pf_failure_reason = "unverified"
-        else:
-            global_pf_failure_reason = "disabled"
-        summary["global_pf_failure_reason"] = global_pf_failure_reason
-
-        global_component_pairs = {
-            "da_revenue": ("real_revenue_da_eur", "global_perfect_foresight_revenue_da_eur"),
-            "da_cost": ("real_cost_da_eur", "global_perfect_foresight_cost_da_eur"),
-            "bcm_capacity_revenue": ("real_revenue_capacity_eur", "global_perfect_foresight_revenue_capacity_eur"),
-            "activation_revenue": ("real_revenue_activation_eur", "global_perfect_foresight_revenue_activation_eur"),
-            "bcm_linked_activation_revenue": (
-                "real_bcm_linked_activation_revenue_eur",
-                "global_perfect_foresight_bcm_linked_activation_revenue_eur",
-            ),
-            "bem_only_activation_revenue": (
-                "real_bem_only_activation_revenue_eur",
-                "global_perfect_foresight_bem_only_activation_revenue_eur",
-            ),
-            "id_revenue": ("real_revenue_id_eur", "global_perfect_foresight_revenue_id_eur"),
-            "id_cost": ("real_cost_id_eur", "global_perfect_foresight_cost_id_eur"),
-            "degradation": ("real_degradation_cost_eur", "global_perfect_foresight_degradation_cost_eur"),
-            "auxiliary": ("real_aux_cost_eur", "global_perfect_foresight_aux_cost_eur"),
-            "transaction": ("real_transaction_cost_eur", "global_perfect_foresight_transaction_cost_eur"),
-            "penalties": ("real_penalty_eur", "global_perfect_foresight_penalty_eur"),
-        }
-        global_component_gap: dict[str, dict[str, float]] = {}
-        for name, (real_col, pf_col) in global_component_pairs.items():
-            real_val = _sum_col_zero(real_col)
-            pf_val = _sum_col_zero(pf_col)
-            global_component_gap[name] = {
-                "realized_eur": float(real_val),
-                "global_pf_eur": float(pf_val),
-                "global_pf_minus_realized_eur": float(pf_val - real_val),
-            }
-        global_component_gap["terminal_soc_adjustment"] = {
-            "realized_eur": float(term_adj_real["adjustment_eur"]),
-            "global_pf_eur": float(term_adj_global_perfect_foresight["adjustment_eur"]),
-            "global_pf_minus_realized_eur": float(
-                term_adj_global_perfect_foresight["adjustment_eur"] - term_adj_real["adjustment_eur"]
-            ),
-        }
-        summary["global_pf_component_gap_json"] = json.dumps(global_component_gap, sort_keys=True)
-
         # Per-hour comparable path diagnostics (realized minus perfect-foresight benchmark).
         if "real_pnl_eur" in hourly.columns and "pf_pnl_eur" in hourly.columns:
             hourly["cmp_delta_pnl_eur"] = pd.to_numeric(hourly["real_pnl_eur"], errors="coerce").fillna(0.0) - pd.to_numeric(
@@ -42967,56 +42442,6 @@ class BatteryBacktester:
             summary["realized_vs_perfect_foresight_ratio_multi_market"] = float(
                 summary["realized_vs_perfect_foresight_ratio_multi_market"]
             )
-        global_perfect_foresight_total = float(summary.get("global_hindsight_perfect_foresight_upper_bound_total_pnl_eur", float("nan")))
-        realized_total = float(summary.get("realized_total_pnl_eur", float("nan")))
-        summary["realized_minus_global_perfect_foresight_eur"] = (
-            float(realized_total - global_perfect_foresight_total)
-            if np.isfinite(realized_total) and np.isfinite(global_perfect_foresight_total)
-            else float("nan")
-        )
-        summary["realized_vs_global_hindsight_perfect_foresight_upper_bound_pct"] = (
-            self._global_pf_upper_bound_ratio_pct(
-                realized_total_eur=realized_total,
-                global_pf_total_eur=global_perfect_foresight_total,
-                global_perfect_foresight_available=float(
-                    summary.get("global_perfect_foresight_available", 0.0)
-                ),
-                global_pf_verified_upper_bound=float(
-                    summary.get("global_pf_verified_upper_bound", 0.0)
-                ),
-            )
-        )
-        summary["realized_exceeds_global_perfect_foresight"] = float(
-            float(summary.get("global_pf_below_realized_incumbent", 0.0)) >= 0.5
-        )
-        summary["global_perfect_foresight_dominance_check_pass"] = float(
-            (not bool(enable_global_perfect_foresight))
-            or (float(summary.get("global_pf_verified_upper_bound", 0.0)) >= 0.5)
-        )
-        summary["global_perfect_foresight_is_upper_bound"] = float(
-            (summary.get("global_perfect_foresight_available", 0.0) >= 0.5)
-            and (summary.get("global_pf_verified_upper_bound", 0.0) >= 0.5)
-        )
-        summary["global_hindsight_perfect_foresight_is_global_upper_bound"] = float(summary["global_perfect_foresight_is_upper_bound"])
-        summary["global_perfect_foresight_pnl_reconciliation_error_eur"] = (
-            float(
-                summary["global_hindsight_perfect_foresight_upper_bound_total_pnl_eur"]
-                - (
-                    _sum_col_zero("global_perfect_foresight_revenue_da_eur")
-                    + _sum_col_zero("global_perfect_foresight_revenue_id_eur")
-                    + _sum_col_zero("global_perfect_foresight_revenue_capacity_eur")
-                    + _sum_col_zero("global_perfect_foresight_revenue_activation_eur")
-                    - _sum_col_zero("global_perfect_foresight_cost_da_eur")
-                    - _sum_col_zero("global_perfect_foresight_cost_id_eur")
-                    - _sum_col_zero("global_perfect_foresight_degradation_cost_eur")
-                    - _sum_col_zero("global_perfect_foresight_transaction_cost_eur")
-                    - _sum_col_zero("global_perfect_foresight_aux_cost_eur")
-                    - _sum_col_zero("global_perfect_foresight_penalty_eur")
-                    + term_adj_global_perfect_foresight["adjustment_eur"]
-                )
-            )
-            if summary.get("global_perfect_foresight_available", 0.0) >= 0.5 else float("nan")
-        )
         if "shock_source" in hourly.columns:
             ss = hourly["shock_source"].fillna("none").astype(str)
             summary["soc_shock_events_total"] = float((ss != "none").sum())
@@ -44314,29 +43739,6 @@ class BatteryBacktester:
                 or float(summary.get("da_only_reserve_invalidity_emitted", 0.0)) > 0.5
             ):
                 invalid_reasons.append("da_only_market_isolation_violation")
-            invalid_reasons.extend(
-                self._global_pf_strict_invalid_reason(
-                    enable_global_perfect_foresight=bool(enable_global_perfect_foresight),
-                    global_pf_verified_upper_bound=float(
-                        summary.get("global_pf_verified_upper_bound", 0.0)
-                    ),
-                    global_perfect_foresight_available=float(
-                        summary.get("global_perfect_foresight_available", 0.0)
-                    ),
-                    global_perfect_foresight_validation_status=str(
-                        summary.get(
-                            "global_perfect_foresight_validation_status",
-                            "disabled_unverified",
-                        )
-                    ),
-                    global_pf_below_realized_incumbent=float(
-                        summary.get("global_pf_below_realized_incumbent", 0.0)
-                    ),
-                    global_pf_is_realized_path_fallback=float(
-                        summary.get("global_pf_is_realized_path_fallback", 0.0)
-                    ),
-                )
-            )
             if should_report_rolling_pf_solver_failed(
                 strict_simulation_validity=bool(strict_simulation_validity),
                 rolling_pf_enabled=bool(benchmark_paths.get("rhpf", False)),
@@ -45332,68 +44734,6 @@ class BatteryBacktester:
             ("perfect_foresight_is_global_upper_bound", 0.0),
             ("perfect_foresight_can_be_beaten", 1.0),
             ("rolling_pf_is_upper_bound", 0.0),
-            ("global_perfect_foresight_is_upper_bound", 0.0),
-            ("global_perfect_foresight_available", 0.0),
-            ("global_perfect_foresight_validation_status", "disabled_unverified"),
-            ("global_perfect_foresight_market_scope", "[]"),
-            ("global_perfect_foresight_dispatch_rows", 0.0),
-            ("global_perfect_foresight_settlement_rows", 0.0),
-            ("global_perfect_foresight_bem_only_included", 0.0),
-            ("global_hindsight_perfect_foresight_upper_bound_total_pnl_eur", float("nan")),
-            ("global_hindsight_perfect_foresight_upper_bound_market_pnl_eur", float("nan")),
-            ("global_hindsight_same_rules_upper_bound_total_pnl_eur", float("nan")),
-            ("realized_path_pnl_under_global_upper_bound_rules_eur", float("nan")),
-            ("global_pf_verified_upper_bound", 0.0),
-            ("global_pf_is_solver_upper_bound", 0.0),
-            ("global_pf_is_realized_path_fallback", 0.0),
-            ("global_pf_same_market_rules", 0.0),
-            ("global_pf_realized_path_incumbent_eur", float("nan")),
-            ("global_pf_solution_eur", float("nan")),
-            ("global_pf_minus_realized_incumbent_eur", float("nan")),
-            ("global_pf_component_gap_json", "{}"),
-            ("global_pf_failure_reason", "disabled"),
-            ("global_pf_available", 0.0),
-            ("global_pf_solver_status", "disabled"),
-            ("global_pf_verified", 0.0),
-            ("global_pf_solver_available", 0.0),
-            ("global_pf_solver_feasible", 0.0),
-            ("global_pf_no_market_feasible", 0.0),
-            ("global_pf_realized_path_feasible", 0.0),
-            ("global_pf_solver_rejection_reason", "disabled"),
-            ("global_pf_no_market_rejection_reason", "disabled"),
-            ("global_pf_realized_path_rejection_reason", "disabled"),
-            ("global_pf_realized_path_missing_timestamp_count", 0.0),
-            ("global_pf_realized_path_first_missing_timestamp_utc", ""),
-            ("global_pf_realized_path_extra_timestamp_count", 0.0),
-            ("global_pf_realized_path_first_extra_timestamp_utc", ""),
-            ("global_pf_realized_path_expected_rows", 0.0),
-            ("global_pf_realized_path_actual_rows", 0.0),
-            ("global_pf_realized_path_expected_row_count", 0.0),
-            ("global_pf_realized_path_actual_row_count", 0.0),
-            ("global_pf_upper_bound_gap_eur", float("nan")),
-            ("global_pf_below_realized_incumbent", 0.0),
-            ("global_pf_solver_solution_eur", float("nan")),
-            ("global_pf_best_feasible_lower_bound_name", "none"),
-            ("global_pf_best_feasible_lower_bound_eur", float("nan")),
-            ("global_pf_no_trade_incumbent_eur", float("nan")),
-            ("global_pf_no_market_incumbent_eur", float("nan")),
-            ("global_pf_realized_path_incumbent_eur", float("nan")),
-            ("global_pf_minus_no_market_incumbent_eur", float("nan")),
-            ("global_pf_no_trade_final_soc_mwh", float("nan")),
-            ("global_pf_no_trade_terminal_shortfall_mwh", float("nan")),
-            ("global_pf_no_trade_id_buy_mwh", 0.0),
-            ("global_pf_selected_incumbent", "none"),
-            ("global_pf_selected_final_soc_mwh", float("nan")),
-            ("global_pf_selected_terminal_shortfall_mwh", float("nan")),
-            ("global_pf_incumbent_selection_reason", "disabled"),
-            ("global_pf_candidate_terminal_shortfall_mwh", float("nan")),
-            ("global_hindsight_perfect_foresight_is_global_upper_bound", 0.0),
-                ("global_perfect_foresight_capacity_bid_semantics", "global_solver_missing_bcm_lockbook_semantics"),
-            ("realized_minus_global_perfect_foresight_eur", float("nan")),
-            ("realized_vs_global_hindsight_perfect_foresight_upper_bound_pct", float("nan")),
-            ("realized_exceeds_global_perfect_foresight", 0.0),
-            ("global_perfect_foresight_dominance_check_pass", 1.0),
-            ("global_perfect_foresight_pnl_reconciliation_error_eur", float("nan")),
             ("pf_failure_reason", ""),
             ("perfect_foresight_total_pnl_eur", float("nan")),
             ("optimizer_id_buy_reason_classification_basis", ""),
@@ -45455,7 +44795,6 @@ class BatteryBacktester:
             ("model_path_executed", float(bool(benchmark_paths.get("model", False)))),
             ("naive_path_executed", float(bool(benchmark_paths.get("naive", False)))),
             ("rhpf_path_executed", float(bool(benchmark_paths.get("rhpf", False)))),
-            ("ghpf_path_executed", float(bool(benchmark_paths.get("ghpf", False)))),
             ("naive_forecast_mode", str(naive_forecast_mode)),
             ("naive_forecast_causality_violations", float(naive_forecast_causality_violations)),
             ("naive_forecast_fallback_count", float(naive_forecast_fallback_count)),
