@@ -39119,13 +39119,34 @@ class BatteryBacktester:
                     perfect_foresight_real,
                     [("real_da_sell_mwh", False)],
                 )
-                perfect_foresight_real = perfect_foresight_real.rename(
-                    columns={
-                        c: c.replace("real_", "perfect_foresight_", 1)
-                        for c in perfect_foresight_real.columns
-                        if c.startswith("real_")
-                    }
-                )
+                pf_rename_map: dict[str, str] = {}
+                pf_drop_after_merge: list[str] = []
+                for c in list(perfect_foresight_real.columns):
+                    if not c.startswith("real_"):
+                        continue
+                    pf_col = c.replace("real_", "perfect_foresight_", 1)
+                    if pf_col not in perfect_foresight_real.columns:
+                        pf_rename_map[c] = pf_col
+                        continue
+                    existing = perfect_foresight_real[pf_col]
+                    source = perfect_foresight_real[c]
+                    existing_num = pd.to_numeric(existing, errors="coerce")
+                    source_num = pd.to_numeric(source, errors="coerce")
+                    existing_bad = existing_num.isna() | ~np.isfinite(
+                        existing_num.to_numpy(dtype=float, na_value=np.nan)
+                    )
+                    source_good = source_num.notna() & np.isfinite(
+                        source_num.to_numpy(dtype=float, na_value=np.nan)
+                    )
+                    perfect_foresight_real[pf_col] = existing.where(
+                        ~(existing_bad & source_good),
+                        source,
+                    )
+                    pf_drop_after_merge.append(c)
+                if pf_rename_map:
+                    perfect_foresight_real = perfect_foresight_real.rename(columns=pf_rename_map)
+                if pf_drop_after_merge:
+                    perfect_foresight_real = perfect_foresight_real.drop(columns=pf_drop_after_merge)
                 rhpf_bcm_protected_diag_fields = [
                     "bcm_protected_soc_replay_pass",
                     "bcm_first_protected_soc_violation_ts_utc",
