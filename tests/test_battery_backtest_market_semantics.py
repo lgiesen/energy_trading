@@ -8768,6 +8768,137 @@ def test_rhpf_bcm_settlement_authority_uses_guarded_lockbook_not_raw_plan_reserv
     assert float(settled["real_protected_soc_violation_pos_mwh"].iloc[0]) == pytest.approx(0.0)
     assert float(settled["real_protected_soc_violation_neg_mwh"].iloc[0]) == pytest.approx(0.0)
 
+    pf_alias_dispatch = raw_rejected_dispatch.drop(
+        columns=[
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "aFRR_Capacity_Won_Pos_MW",
+            "aFRR_Capacity_Won_Neg_MW",
+        ]
+    ).assign(
+        perfect_foresight_locked_bcm_capacity_pos_mw=[3.0],
+        perfect_foresight_locked_bcm_capacity_neg_mw=[2.0],
+    )
+    bt_pf_alias = _mk_backtester()
+    pf_alias_settled = bt_pf_alias.settle_dispatch(
+        df,
+        pf_alias_dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+        perfect_foresight_mode=True,
+    )
+
+    assert float(pf_alias_settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(3.0)
+    assert float(pf_alias_settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(2.0)
+    assert "rhpf.bcm.lockbook_pos" not in getattr(bt_pf_alias, "_missing_critical_source_fields", [])
+    assert "rhpf.bcm.lockbook_neg" not in getattr(bt_pf_alias, "_missing_critical_source_fields", [])
+    assert "missing_source_of_truth_rhpf_reserve" not in getattr(
+        bt_pf_alias,
+        "_missing_critical_source_reasons",
+        set(),
+    )
+
+    runtime_authority_dispatch = raw_rejected_dispatch.drop(
+        columns=[
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "aFRR_Capacity_Won_Pos_MW",
+            "aFRR_Capacity_Won_Neg_MW",
+        ]
+    ).assign(
+        bcm_precommit_written_pos_mw=[5.0],
+        bcm_precommit_written_neg_mw=[4.0],
+    )
+    bt_runtime_authority = _mk_backtester()
+    runtime_authority_settled = bt_runtime_authority.settle_dispatch(
+        df,
+        runtime_authority_dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+        perfect_foresight_mode=True,
+    )
+
+    assert float(runtime_authority_settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(5.0)
+    assert float(runtime_authority_settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(4.0)
+    assert "rhpf.bcm.lockbook_pos" not in getattr(bt_runtime_authority, "_missing_critical_source_fields", [])
+    assert "rhpf.bcm.lockbook_neg" not in getattr(bt_runtime_authority, "_missing_critical_source_fields", [])
+    assert "missing_source_of_truth_rhpf_reserve" not in getattr(
+        bt_runtime_authority,
+        "_missing_critical_source_reasons",
+        set(),
+    )
+
+    transport_dispatch = raw_rejected_dispatch.drop(
+        columns=[
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "aFRR_Capacity_Won_Pos_MW",
+            "aFRR_Capacity_Won_Neg_MW",
+        ]
+    )
+    transport_plan_history = pd.DataFrame(
+        {
+            "timestamp_utc": [ts[0]],
+            "plan_history_stage": ["post_precommit"],
+            "bcm_candidate_pos_mw": [9.0],
+            "bcm_candidate_neg_mw": [8.0],
+            "plan_reserve_pos_mw": [9.0],
+            "plan_reserve_neg_mw": [8.0],
+            "bcm_precommit_written_pos_mw": [6.0],
+            "bcm_precommit_written_neg_mw": [1.0],
+        }
+    )
+    bt_transport = _mk_backtester()
+    transported_dispatch = bt_transport._transport_rhpf_bcm_lockbook_authority_to_dispatch(
+        transport_dispatch,
+        transport_plan_history,
+        timestamp_col=col.timestamp,
+    )
+    transport_settled = bt_transport.settle_dispatch(
+        df,
+        transported_dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+        perfect_foresight_mode=True,
+    )
+
+    assert float(transported_dispatch["bcm_precommit_written_pos_mw"].iloc[0]) == pytest.approx(6.0)
+    assert float(transported_dispatch["bcm_precommit_written_neg_mw"].iloc[0]) == pytest.approx(1.0)
+    assert float(transport_settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(6.0)
+    assert float(transport_settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(1.0)
+    assert "rhpf.bcm.lockbook_pos" not in getattr(bt_transport, "_missing_critical_source_fields", [])
+    assert "rhpf.bcm.lockbook_neg" not in getattr(bt_transport, "_missing_critical_source_fields", [])
+
+    nonfinite_authority_dispatch = raw_rejected_dispatch.drop(
+        columns=[
+            "fixed_reserve_obligation_pos_mw",
+            "fixed_reserve_obligation_neg_mw",
+            "aFRR_Capacity_Won_Pos_MW",
+            "aFRR_Capacity_Won_Neg_MW",
+        ]
+    ).assign(
+        bcm_precommit_written_pos_mw=[np.nan],
+        bcm_precommit_written_neg_mw=[np.nan],
+    )
+    bt_nonfinite = _mk_backtester()
+    nonfinite_settled = bt_nonfinite.settle_dispatch(
+        df,
+        nonfinite_authority_dispatch,
+        col,
+        predicted_settlement=False,
+        apply_market_clearing=True,
+        perfect_foresight_mode=True,
+    )
+
+    assert float(nonfinite_settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(0.0)
+    assert float(nonfinite_settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(0.0)
+    assert "rhpf.bcm.lockbook_pos" in bt_nonfinite._missing_critical_source_fields
+    assert "rhpf.bcm.lockbook_neg" in bt_nonfinite._missing_critical_source_fields
+    assert "missing_source_of_truth_rhpf_reserve" in bt_nonfinite._missing_critical_source_reasons
+
     missing_authority_dispatch = raw_rejected_dispatch.drop(
         columns=[
             "fixed_reserve_obligation_pos_mw",

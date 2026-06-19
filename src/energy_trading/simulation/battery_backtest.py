@@ -2267,6 +2267,97 @@ class BatteryBacktester:
         return defaults
 
     @staticmethod
+    def _transport_rhpf_bcm_lockbook_authority_to_dispatch(
+        dispatch: pd.DataFrame,
+        plan_history: pd.DataFrame,
+        *,
+        timestamp_col: str,
+    ) -> pd.DataFrame:
+        """Carry guarded RHPF BCM lockbook authority into settlement dispatch rows."""
+        if dispatch is None or dispatch.empty or plan_history is None or plan_history.empty:
+            return dispatch
+        if timestamp_col not in dispatch.columns:
+            return dispatch
+
+        delivery_col = next(
+            (
+                col
+                for col in (
+                    timestamp_col,
+                    "timestamp_utc",
+                    "delivery_ts_utc",
+                    "delivery_timestamp_utc",
+                    "target_time_utc",
+                    "timestamp",
+                )
+                if col in plan_history.columns
+            ),
+            None,
+        )
+        if delivery_col is None:
+            return dispatch
+
+        source_frame = plan_history.copy()
+        if "plan_history_stage" in source_frame.columns:
+            stage = source_frame["plan_history_stage"].fillna("").astype(str)
+            post_precommit = source_frame.loc[stage.eq("post_precommit")].copy()
+            if not post_precommit.empty:
+                source_frame = post_precommit
+
+        source_frame["_rhpf_bcm_delivery_ts"] = pd.to_datetime(
+            source_frame[delivery_col],
+            utc=True,
+            errors="coerce",
+        )
+        source_frame = source_frame.loc[source_frame["_rhpf_bcm_delivery_ts"].notna()].copy()
+        if source_frame.empty:
+            return dispatch
+
+        out = dispatch.copy()
+        dispatch_ts = pd.to_datetime(out[timestamp_col], utc=True, errors="coerce")
+        authority_cols = {
+            "pos": (
+                "bcm_precommit_written_pos_mw",
+                "bcm_precommit_locked_pos_mw",
+                "precommit_locked_pos_mw",
+                "precommit_lockbook_obligation_pos_mw",
+            ),
+            "neg": (
+                "bcm_precommit_written_neg_mw",
+                "bcm_precommit_locked_neg_mw",
+                "precommit_locked_neg_mw",
+                "precommit_lockbook_obligation_neg_mw",
+            ),
+        }
+
+        for candidates in authority_cols.values():
+            for col in candidates:
+                if col not in source_frame.columns:
+                    continue
+                values = pd.to_numeric(source_frame[col], errors="coerce")
+                finite_mask = values.notna() & np.isfinite(values.to_numpy(dtype=float, na_value=np.nan))
+                if not bool(finite_mask.any()):
+                    continue
+                work = source_frame.loc[finite_mask, ["_rhpf_bcm_delivery_ts"]].copy()
+                work["_rhpf_bcm_authority_value"] = values.loc[finite_mask].astype(float).to_numpy()
+                per_ts = (
+                    work.assign(_order=np.arange(len(work), dtype="int64"))
+                    .sort_values(["_rhpf_bcm_delivery_ts", "_order"])
+                    .groupby("_rhpf_bcm_delivery_ts")["_rhpf_bcm_authority_value"]
+                    .last()
+                )
+                mapped = dispatch_ts.map(per_ts)
+                if col in out.columns:
+                    current = pd.to_numeric(out[col], errors="coerce")
+                    current_bad = current.isna() | ~np.isfinite(current.to_numpy(dtype=float, na_value=np.nan))
+                    out[col] = current.where(~(current_bad & mapped.notna()), mapped)
+                else:
+                    out[col] = mapped
+                break
+
+        return out
+
+    @staticmethod
     def _rolling_pf_bcm_side_mismatch_diagnostics(hourly: pd.DataFrame) -> dict[str, float | str]:
         """Compare model vs raw RHPF BCM side choices without affecting settlement."""
 
@@ -32061,6 +32152,8 @@ class BatteryBacktester:
                     if after_buy > 1e-12 or after_sell > 1e-12:
                         rounded_accepted_da[pd.Timestamp(tsu)] = (float(after_buy), float(after_sell))
                 accepted_da = rounded_accepted_da
+                # Prewrite guards must use the current settlement-path SoC, not the older DA gate anchor.
+                da_prewrite_guard_soc_mwh = float(soc)
 
                 def _da_schedule_milp_equivalent(schedule: dict[pd.Timestamp, tuple[float, float]]) -> bool:
                     if not schedule:
@@ -32075,7 +32168,7 @@ class BatteryBacktester:
                         self.optimize_dispatch(
                             snapshot_plan,
                             colmap,
-                            soc_start=float(da_prelock_executed_soc_anchor_mwh),
+                            soc_start=float(da_prewrite_guard_soc_mwh),
                             soc_end_target=enforce_end,
                             soc_end_min_target=optimizer_enforce_end_min,
                             fixed_da_dispatch=fixed_da_dispatch,
@@ -32288,7 +32381,7 @@ class BatteryBacktester:
                     accepted_da, limit_guard_diag, limit_guard_by_ts = (
                         self._cap_da_limit_schedule_for_independent_clearing(
                             submitted_da=accepted_da,
-                            current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                            current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                             future_rows=future_rows_for_da_guard,
                             colmap=colmap,
                             existing_da_lockbook=da_lockbook,
@@ -32344,7 +32437,7 @@ class BatteryBacktester:
                     da_audit_rows = patched_da_audit_rows
                 accepted_da, prelock_guard_diag, prelock_guard_by_ts = self._repair_or_reject_da_before_lock(
                     accepted_da=accepted_da,
-                    current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                    current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                     future_rows=future_rows_for_da_guard,
                     colmap=colmap,
                     existing_da_lockbook=da_lockbook,
@@ -32398,7 +32491,7 @@ class BatteryBacktester:
                 lock_phys_ok, lock_phys_diag, lock_phys_by_ts = self._check_da_hourly_lock_physical_feasibility(
                     future_rows=future_rows_for_da_guard,
                     colmap=colmap,
-                    current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                    current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                     existing_da_lockbook=da_lockbook,
                     candidate_da=accepted_da,
                     fixed_reserve_pos=afrr_cap_pos_lockbook,
@@ -32443,7 +32536,7 @@ class BatteryBacktester:
                     accepted_da=accepted_da,
                     lock_rows=lock_rows,
                     colmap=colmap,
-                    current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                    current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                     fixed_reserve_pos=afrr_cap_pos_lockbook,
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
@@ -32452,7 +32545,7 @@ class BatteryBacktester:
                 accepted_da, final_lockbook_repair_diag, final_lockbook_repair_by_ts = (
                     self._repair_or_reject_da_before_lock(
                         accepted_da=accepted_da,
-                        current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                        current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                         future_rows=future_rows_for_da_guard,
                         colmap=colmap,
                         existing_da_lockbook=da_lockbook,
@@ -32470,7 +32563,7 @@ class BatteryBacktester:
                     self._check_da_hourly_lock_physical_feasibility(
                         future_rows=future_rows_for_da_guard,
                         colmap=colmap,
-                        current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                        current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                         existing_da_lockbook=da_lockbook,
                         candidate_da=accepted_da,
                         fixed_reserve_pos=afrr_cap_pos_lockbook,
@@ -32505,9 +32598,9 @@ class BatteryBacktester:
                     "da_final_lockbook_consistency_projected_soc_before_buy": float(
                         final_blocking_row.get(
                             "da_hourly_lock_projected_soc_start_mwh",
-                            da_prelock_executed_soc_anchor_mwh,
+                            da_prewrite_guard_soc_mwh,
                         )
-                        or da_prelock_executed_soc_anchor_mwh
+                        or da_prewrite_guard_soc_mwh
                     ),
                     "da_final_lockbook_consistency_max_buy_mwh": float(
                         final_blocking_row.get("da_hourly_lock_max_feasible_buy_mwh", 0.0) or 0.0
@@ -32564,7 +32657,7 @@ class BatteryBacktester:
                     accepted_da=accepted_da,
                     lock_rows=lock_rows,
                     colmap=colmap,
-                    current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                    current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                     fixed_reserve_pos=afrr_cap_pos_lockbook,
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
@@ -32578,7 +32671,7 @@ class BatteryBacktester:
                 accepted_da, settlement_equiv_diag, settlement_equiv_by_ts = (
                     self._cap_da_lockbook_to_settlement_equivalent_replay(
                         accepted_da=accepted_da,
-                        current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                        current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                         future_rows=future_rows_for_da_guard,
                         colmap=colmap,
                         existing_da_lockbook=da_lockbook,
@@ -32666,14 +32759,14 @@ class BatteryBacktester:
                     accepted_da=accepted_da,
                     lock_rows=lock_rows,
                     colmap=colmap,
-                    current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                    current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                     fixed_reserve_pos=afrr_cap_pos_lockbook,
                     fixed_reserve_neg=afrr_cap_neg_lockbook,
                     global_end_utc=pd.to_datetime(df.iloc[-1][colmap.timestamp], utc=True, errors="coerce"),
                 )
                 accepted_da, final_prelock_diag, final_prelock_by_ts = self._repair_or_reject_da_before_lock(
                     accepted_da=accepted_da,
-                    current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                    current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                     future_rows=future_rows_for_da_guard,
                     colmap=colmap,
                     existing_da_lockbook=da_lockbook,
@@ -32784,7 +32877,7 @@ class BatteryBacktester:
                 accepted_da, canonical_prewrite_diag, canonical_prewrite_by_ts = (
                     self._canonical_da_lockbook_prewrite_replay(
                         accepted_da=accepted_da,
-                        current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                        current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                         future_rows=future_rows_for_da_guard,
                         colmap=colmap,
                         existing_da_lockbook=da_lockbook,
@@ -32861,7 +32954,7 @@ class BatteryBacktester:
                 accepted_da, da_after_bcm_diag, da_after_bcm_by_ts = (
                     self._apply_da_after_bcm_forward_replay_guard(
                         accepted_da=accepted_da,
-                        current_soc_mwh=float(da_prelock_executed_soc_anchor_mwh),
+                        current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                         future_rows=future_rows_for_da_guard,
                         colmap=colmap,
                         existing_da_lockbook=da_lockbook,
@@ -35273,6 +35366,18 @@ class BatteryBacktester:
             "pending_id_discharge_mw",
             "fixed_reserve_obligation_pos_mw",
             "fixed_reserve_obligation_neg_mw",
+            "bcm_precommit_written_pos_mw",
+            "bcm_precommit_written_neg_mw",
+            "bcm_precommit_locked_pos_mw",
+            "bcm_precommit_locked_neg_mw",
+            "precommit_locked_pos_mw",
+            "precommit_locked_neg_mw",
+            "precommit_lockbook_obligation_pos_mw",
+            "precommit_lockbook_obligation_neg_mw",
+            "perfect_foresight_locked_bcm_capacity_pos_mw",
+            "perfect_foresight_locked_bcm_capacity_neg_mw",
+            "perfect_foresight_fixed_reserve_obligation_pos_mw",
+            "perfect_foresight_fixed_reserve_obligation_neg_mw",
         ]
         dispatch_clearing_cols.extend(
             [
@@ -36816,6 +36921,12 @@ class BatteryBacktester:
         ):
             def _rhpf_lockbook_authority_value(side: str) -> float | None:
                 names = (
+                    f"perfect_foresight_locked_bcm_capacity_{side}_mw",
+                    f"perfect_foresight_fixed_reserve_obligation_{side}_mw",
+                    f"bcm_precommit_written_{side}_mw",
+                    f"bcm_precommit_locked_{side}_mw",
+                    f"precommit_locked_{side}_mw",
+                    f"precommit_lockbook_obligation_{side}_mw",
                     f"fixed_reserve_obligation_{side}_mw",
                     f"real_fixed_reserve_obligation_{side}_mw",
                     f"locked_bcm_capacity_{side}_mw",
@@ -38672,6 +38783,12 @@ class BatteryBacktester:
         else:
             self.milp_time_limit_seconds = _orig_tl
             self.milp_rel_gap = _orig_gap
+        if benchmark_paths["rhpf"]:
+            perfect_foresight_dispatch = self._transport_rhpf_bcm_lockbook_authority_to_dispatch(
+                perfect_foresight_dispatch,
+                perfect_foresight_plan_history,
+                timestamp_col=colmap.timestamp,
+            )
         if benchmark_paths["rhpf"]:
             rolling_pf_solver_dispatch_da_buy_mwh = _sum_first_available_mwh(
                 perfect_foresight_dispatch,
@@ -43572,8 +43689,16 @@ class BatteryBacktester:
             ("bcm.capacity_price_neg", ("real_bcm_capacity_bid_price_neg_eur_per_mw_h", "real_settlement_cap_bid_price_neg_eur_mw"), "missing_source_of_truth_bcm"),
         ]
         rhpf_bcm_source_groups = [
-            ("rhpf.bcm.locked_pos", ("perfect_foresight_locked_bcm_capacity_pos_mw",), "missing_source_of_truth_rhpf_reserve"),
-            ("rhpf.bcm.locked_neg", ("perfect_foresight_locked_bcm_capacity_neg_mw",), "missing_source_of_truth_rhpf_reserve"),
+            (
+                "rhpf.bcm.locked_pos",
+                ("perfect_foresight_locked_bcm_capacity_pos_mw", "perfect_foresight_fixed_reserve_obligation_pos_mw"),
+                "missing_source_of_truth_rhpf_reserve",
+            ),
+            (
+                "rhpf.bcm.locked_neg",
+                ("perfect_foresight_locked_bcm_capacity_neg_mw", "perfect_foresight_fixed_reserve_obligation_neg_mw"),
+                "missing_source_of_truth_rhpf_reserve",
+            ),
             ("rhpf.bcm.awarded_pos", ("perfect_foresight_awarded_capacity_pos_mw", "perfect_foresight_executed_bcm_capacity_pos_mw"), "missing_source_of_truth_rhpf_reserve"),
             ("rhpf.bcm.awarded_neg", ("perfect_foresight_awarded_capacity_neg_mw", "perfect_foresight_executed_bcm_capacity_neg_mw"), "missing_source_of_truth_rhpf_reserve"),
         ]
