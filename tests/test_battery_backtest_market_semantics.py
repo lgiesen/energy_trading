@@ -15546,6 +15546,65 @@ def test_da_accepted_lockbook_reconstructs_generic_zeroed_postlock_candidate() -
     assert str(row["da_handoff_lost_postlock_candidate_reason"]) == "none"
 
 
+def test_da_accepted_lockbook_replay_does_not_rehydrate_postlock_zeroed_candidate() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    col = BacktestColumnMap()
+    buy_ts = pd.Timestamp("2026-01-22T11:00:00Z")
+    sell_ts = pd.Timestamp("2026-01-22T17:00:00Z")
+    rows = _da_hourly_lock_future_rows(col, [buy_ts, sell_ts])
+    rows[col.pred_da_price] = [10.0, 1_000.0]
+
+    accepted, audit = bt._apply_da_accepted_lockbook_replay_to_audit_rows(
+        da_audit_rows=[
+            {
+                "timestamp_utc": str(buy_ts),
+                "da_handoff_postlock_selected_candidate": 1.0,
+                "da_postlock_candidate_buy_mw": 6.9,
+                "da_postlock_candidate_sell_mw": 0.0,
+                "da_sized_candidate_buy_mw": 6.9,
+                "da_sized_candidate_sell_mw": 0.0,
+                "selected_incumbent": "optimized",
+                "final_selected_incumbent": "optimized",
+                "da_decision_trace_postlock_zeroed": 1.0,
+                "da_decision_trace_postlock_zero_reason": "candidate_derated_to_zero",
+                "da_zero_reason": "none",
+                "zero_reason": "none",
+                "candidate_rejection_reason": "none",
+                "candidate_minus_incumbent_eur": 100.0,
+            },
+            {
+                "timestamp_utc": str(sell_ts),
+                "da_handoff_postlock_selected_candidate": 1.0,
+                "da_postlock_candidate_buy_mw": 0.0,
+                "da_postlock_candidate_sell_mw": 1.0,
+                "da_sized_candidate_buy_mw": 0.0,
+                "da_sized_candidate_sell_mw": 1.0,
+                "selected_incumbent": "optimized",
+                "final_selected_incumbent": "optimized",
+                "da_zero_reason": "none",
+                "zero_reason": "none",
+                "candidate_rejection_reason": "none",
+            },
+        ],
+        accepted_da={sell_ts: (0.0, 1.0)},
+        lock_rows=rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=None,
+    )
+
+    assert accepted == {sell_ts: pytest.approx((0.0, 1.0))}
+    buy_row, sell_row = audit
+    assert float(buy_row["accepted_lockbook_row_buy_mwh"]) == pytest.approx(0.0)
+    assert float(buy_row["da_handoff_lost_postlock_candidate"]) == pytest.approx(1.0)
+    assert str(buy_row["da_handoff_lost_postlock_candidate_reason"]) == "candidate_derated_to_zero"
+    assert float(sell_row["accepted_lockbook_row_sell_mwh"]) == pytest.approx(1.0)
+    assert float(sell_row["da_handoff_lost_postlock_candidate"]) == pytest.approx(0.0)
+
+
 def test_da_handoff_selected_nonzero_reaches_lockbook() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -21312,6 +21371,97 @@ def test_bcm_rhpf_valid_capacity_survives_protected_soc_guard() -> None:
     assert all(float(v) == pytest.approx(2.0) for v in lock_neg.values())
     assert all(float(v) == pytest.approx(1.0) for v in pre["bcm_protected_soc_replay_pass"].values())
     assert all(str(v) == "none" for v in pre["bcm_protected_soc_rejection_reason"].values())
+
+
+def test_bcm_rhpf_reserve_buffer_protected_soc_failure_caps_lockbook_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _configure_bcm_rhpf_protected_soc_test_backtester()
+    col, snapshot_ts, target_hours, snap, src = _bcm_naive_guard_inputs(
+        bt,
+        reserve_pos_mw=7.0,
+        reserve_neg_mw=4.0,
+        rate_pos=0.0,
+        rate_neg=0.0,
+    )
+    lock_pos: dict[pd.Timestamp, float] = {}
+    lock_neg: dict[pd.Timestamp, float] = {}
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+
+    def _selector_reports_reserve_buffer_block(**kwargs):  # type: ignore[no-untyped-def]
+        offered_pos = float(kwargs["offered_pos_mw"])
+        offered_neg = float(kwargs["offered_neg_mw"])
+        return (
+            offered_pos,
+            offered_neg,
+            AFRRCapacityClearingResult(
+                submitted_pos_mw=offered_pos,
+                submitted_neg_mw=offered_neg,
+                awarded_pos_mw=7.0,
+                awarded_neg_mw=4.0,
+                pos_awarded=True,
+                neg_awarded=True,
+            ),
+            [],
+            {
+                "feasibility_pass": 1.0,
+                "retry_factor_selected": 1.0,
+                "zero_reason": "none",
+                "projected_soc_min_mwh": bt.soc_min + 8.0,
+                "projected_soc_max_mwh": bt.soc_min + 8.0,
+                "projected_terminal_soc_mwh": bt.soc_min + 8.0,
+                "terminal_soc_feasible": 1.0,
+                "terminal_soc_shortfall_mwh": 0.0,
+                "selection_is_causal": 1.0,
+                "full_award_feasibility_checked": 1.0,
+                "retry_factor_selected_before_clearing": 1.0,
+                "realized_clearing_used_for_selection": 0.0,
+                "original_candidate_pos_mw": 7.0,
+                "original_candidate_neg_mw": 4.0,
+                "protected_soc_replay_pass": 1.0,
+                "protected_soc_rejection_reason": "none",
+                "capacity_derated_protected_soc_pos_mw": 0.0,
+                "capacity_derated_protected_soc_neg_mw": 0.0,
+                "reserve_buffer_replay_pass": 0.0,
+                "reserve_buffer_rejected_reason": "protected_soc_prevented_pos",
+                "reserve_buffer_derated_pos_mw": 0.0,
+                "reserve_buffer_derated_neg_mw": 0.0,
+            },
+        )
+
+    monkeypatch.setattr(bt, "_select_feasible_bcm_lock_candidate", _selector_reports_reserve_buffer_block)
+
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg=lock_neg,
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=True,
+        global_end_utc=target_hours[-1],
+        current_soc_mwh=bt.soc_min + 8.0,
+    )
+
+    assert all(float(v) == pytest.approx(0.0) for v in lock_pos.values())
+    assert all(float(v) == pytest.approx(4.0) for v in lock_neg.values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_precommit_written_pos_mw"].values())
+    assert all(float(v) == pytest.approx(4.0) for v in pre["bcm_precommit_written_neg_mw"].values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_precommit_locked_pos_mw"].values())
+    assert all(float(v) == pytest.approx(4.0) for v in pre["bcm_precommit_locked_neg_mw"].values())
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_protected_soc_replay_pass"].values())
+    assert all(
+        str(v) == "protected_soc_prevented_pos"
+        for v in pre["bcm_protected_soc_rejection_reason"].values()
+    )
+    assert all(float(v) == pytest.approx(0.0) for v in pre["bcm_reserve_buffer_replay_pass"].values())
+    assert all(
+        str(v) == "protected_soc_prevented_pos"
+        for v in pre["bcm_reserve_buffer_rejected_reason"].values()
+    )
 
 
 def test_bcm_rhpf_protected_final_award_guard_caps_unsafe_clearing_award(

@@ -6924,6 +6924,7 @@ class BatteryBacktester:
             "auction_not_cleared",
             "market_bid_below_min",
             "min_lot_rounding",
+            "candidate_derated_to_zero",
             "duplicate_delivery_ts",
         }
 
@@ -6977,6 +6978,8 @@ class BatteryBacktester:
 
         def _candidate_zero_reason(row: dict[str, float | str]) -> str:
             for reason_key in (
+                "da_decision_trace_postlock_zero_reason",
+                "da_postlock_zero_reason",
                 "da_handoff_lost_postlock_candidate_reason",
                 "da_zero_reason",
                 "zero_reason",
@@ -7006,6 +7009,14 @@ class BatteryBacktester:
                 return consistency_reason if consistency_reason not in generic_zero_reasons else "physical_soc_infeasible"
             if _audit_row_float(row, "bid_market_rounding_zeroed_below_min") > 0.5:
                 return "min_lot_rounding"
+            postlock_zero_reason = _norm_reason(
+                row.get("da_decision_trace_postlock_zero_reason", row.get("da_postlock_zero_reason", ""))
+            )
+            if (
+                _audit_row_float(row, "da_decision_trace_postlock_zeroed") > 0.5
+                and postlock_zero_reason not in generic_zero_reasons
+            ):
+                return postlock_zero_reason
             return ""
 
         def _postlock_selected(row: dict[str, float | str]) -> bool:
@@ -28105,6 +28116,55 @@ class BatteryBacktester:
             e_neg = float("nan")
             bcm_precommit_written_pos_mw = float(cap_res.awarded_pos_mw)
             bcm_precommit_written_neg_mw = float(cap_res.awarded_neg_mw)
+
+            def _finite_bcm_stat(name: str) -> float:
+                if name not in bcm_precommit_stats:
+                    return float("nan")
+                try:
+                    value = float(bcm_precommit_stats[name])
+                except (TypeError, ValueError):
+                    return float("nan")
+                return value if np.isfinite(value) else float("nan")
+
+            def _enforce_protected_soc_write_limit(
+                *,
+                reason: str,
+                derate_pos_mw: float,
+                derate_neg_mw: float,
+            ) -> None:
+                nonlocal bcm_precommit_written_pos_mw, bcm_precommit_written_neg_mw
+                if not str(reason).startswith("protected_soc_prevented"):
+                    return
+                blocks_pos = "pos" in str(reason)
+                blocks_neg = "neg" in str(reason)
+                original_pos = _finite_bcm_stat("original_candidate_pos_mw")
+                original_neg = _finite_bcm_stat("original_candidate_neg_mw")
+                if not np.isfinite(original_pos):
+                    original_pos = float(precommit_orig_pos)
+                if not np.isfinite(original_neg):
+                    original_neg = float(precommit_orig_neg)
+
+                if blocks_pos:
+                    if np.isfinite(float(derate_pos_mw)) and float(derate_pos_mw) > 1e-12:
+                        safe_pos_mw = max(0.0, float(original_pos) - float(derate_pos_mw))
+                        bcm_precommit_written_pos_mw = min(
+                            float(bcm_precommit_written_pos_mw),
+                            float(safe_pos_mw),
+                        )
+                    else:
+                        # A side-specific protected-SoC failure without a finite
+                        # safe derate must fail closed before settlement authority.
+                        bcm_precommit_written_pos_mw = 0.0
+                if blocks_neg:
+                    if np.isfinite(float(derate_neg_mw)) and float(derate_neg_mw) > 1e-12:
+                        safe_neg_mw = max(0.0, float(original_neg) - float(derate_neg_mw))
+                        bcm_precommit_written_neg_mw = min(
+                            float(bcm_precommit_written_neg_mw),
+                            float(safe_neg_mw),
+                        )
+                    else:
+                        bcm_precommit_written_neg_mw = 0.0
+
             protected_replay_failed = (
                 float(bcm_precommit_stats.get("protected_soc_replay_pass", 1.0) or 0.0) < 0.5
             )
@@ -28138,6 +28198,43 @@ class BatteryBacktester:
                     float(bcm_precommit_written_neg_mw),
                     float(protected_safe_neg_mw),
                 )
+            reserve_buffer_replay_pass = _finite_bcm_stat("reserve_buffer_replay_pass")
+            reserve_buffer_reason = str(
+                bcm_precommit_stats["reserve_buffer_rejected_reason"]
+                if "reserve_buffer_rejected_reason" in bcm_precommit_stats
+                else "none"
+            )
+            if (
+                np.isfinite(reserve_buffer_replay_pass)
+                and reserve_buffer_replay_pass < 0.5
+                and reserve_buffer_reason.startswith("protected_soc_prevented")
+            ):
+                _enforce_protected_soc_write_limit(
+                    reason=reserve_buffer_reason,
+                    derate_pos_mw=_finite_bcm_stat("reserve_buffer_derated_pos_mw"),
+                    derate_neg_mw=_finite_bcm_stat("reserve_buffer_derated_neg_mw"),
+                )
+                if float(bcm_precommit_written_pos_mw) <= 1e-12 and "pos" in reserve_buffer_reason:
+                    bcm_precommit_stats["capacity_rejected_protected_soc_pos_mw"] = float(
+                        max(
+                            _finite_bcm_stat("capacity_rejected_protected_soc_pos_mw")
+                            if np.isfinite(_finite_bcm_stat("capacity_rejected_protected_soc_pos_mw"))
+                            else 0.0,
+                            float(cap_res.awarded_pos_mw),
+                        )
+                    )
+                if float(bcm_precommit_written_neg_mw) <= 1e-12 and "neg" in reserve_buffer_reason:
+                    bcm_precommit_stats["capacity_rejected_protected_soc_neg_mw"] = float(
+                        max(
+                            _finite_bcm_stat("capacity_rejected_protected_soc_neg_mw")
+                            if np.isfinite(_finite_bcm_stat("capacity_rejected_protected_soc_neg_mw"))
+                            else 0.0,
+                            float(cap_res.awarded_neg_mw),
+                        )
+                    )
+                bcm_precommit_stats["protected_soc_replay_pass"] = 0.0
+                bcm_precommit_stats["protected_soc_rejection_reason"] = reserve_buffer_reason
+                bcm_precommit_stats["final_decision_reason"] = reserve_buffer_reason
             bcm_precommit_stats["written_pos_mw"] = float(bcm_precommit_written_pos_mw)
             bcm_precommit_stats["written_neg_mw"] = float(bcm_precommit_written_neg_mw)
             block_start_utc = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce").min()
