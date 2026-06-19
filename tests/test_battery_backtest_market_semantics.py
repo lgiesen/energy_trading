@@ -8840,7 +8840,8 @@ def test_rhpf_bcm_settlement_authority_uses_guarded_lockbook_not_raw_plan_reserv
     )
     transport_plan_history = pd.DataFrame(
         {
-            "timestamp_utc": [ts[0]],
+            "timestamp_utc": [ts[0] - pd.Timedelta(hours=1)],
+            "target_time_utc": [ts[0]],
             "plan_history_stage": ["post_precommit"],
             "bcm_candidate_pos_mw": [9.0],
             "bcm_candidate_neg_mw": [8.0],
@@ -8867,6 +8868,10 @@ def test_rhpf_bcm_settlement_authority_uses_guarded_lockbook_not_raw_plan_reserv
 
     assert float(transported_dispatch["bcm_precommit_written_pos_mw"].iloc[0]) == pytest.approx(6.0)
     assert float(transported_dispatch["bcm_precommit_written_neg_mw"].iloc[0]) == pytest.approx(1.0)
+    assert float(transported_dispatch["perfect_foresight_locked_bcm_capacity_pos_mw"].iloc[0]) == pytest.approx(6.0)
+    assert float(transported_dispatch["perfect_foresight_locked_bcm_capacity_neg_mw"].iloc[0]) == pytest.approx(1.0)
+    assert float(transported_dispatch["perfect_foresight_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(6.0)
+    assert float(transported_dispatch["perfect_foresight_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(1.0)
     assert float(transport_settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(6.0)
     assert float(transport_settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(1.0)
     assert "rhpf.bcm.lockbook_pos" not in getattr(bt_transport, "_missing_critical_source_fields", [])

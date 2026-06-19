@@ -2283,11 +2283,11 @@ class BatteryBacktester:
             (
                 col
                 for col in (
+                    "target_time_utc",
+                    "delivery_timestamp_utc",
+                    "delivery_ts_utc",
                     timestamp_col,
                     "timestamp_utc",
-                    "delivery_ts_utc",
-                    "delivery_timestamp_utc",
-                    "target_time_utc",
                     "timestamp",
                 )
                 if col in plan_history.columns
@@ -2329,8 +2329,18 @@ class BatteryBacktester:
                 "precommit_lockbook_obligation_neg_mw",
             ),
         }
+        output_aliases = {
+            "pos": (
+                "perfect_foresight_locked_bcm_capacity_pos_mw",
+                "perfect_foresight_fixed_reserve_obligation_pos_mw",
+            ),
+            "neg": (
+                "perfect_foresight_locked_bcm_capacity_neg_mw",
+                "perfect_foresight_fixed_reserve_obligation_neg_mw",
+            ),
+        }
 
-        for candidates in authority_cols.values():
+        for side, candidates in authority_cols.items():
             for col in candidates:
                 if col not in source_frame.columns:
                     continue
@@ -2353,6 +2363,15 @@ class BatteryBacktester:
                     out[col] = current.where(~(current_bad & mapped.notna()), mapped)
                 else:
                     out[col] = mapped
+                for alias in output_aliases[side]:
+                    if alias in out.columns:
+                        current = pd.to_numeric(out[alias], errors="coerce")
+                        current_bad = current.isna() | ~np.isfinite(
+                            current.to_numpy(dtype=float, na_value=np.nan)
+                        )
+                        out[alias] = current.where(~(current_bad & mapped.notna()), mapped)
+                    else:
+                        out[alias] = mapped
                 break
 
         return out
