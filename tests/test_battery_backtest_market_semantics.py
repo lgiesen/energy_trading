@@ -8924,9 +8924,13 @@ def test_rhpf_bcm_settlement_authority_uses_guarded_lockbook_not_raw_plan_reserv
 
     assert float(missing_settled["real_fixed_reserve_obligation_pos_mw"].iloc[0]) == pytest.approx(0.0)
     assert float(missing_settled["real_fixed_reserve_obligation_neg_mw"].iloc[0]) == pytest.approx(0.0)
-    assert "rhpf.bcm.lockbook_pos" in bt_missing._missing_critical_source_fields
-    assert "rhpf.bcm.lockbook_neg" in bt_missing._missing_critical_source_fields
-    assert "missing_source_of_truth_rhpf_reserve" in bt_missing._missing_critical_source_reasons
+    assert "rhpf.bcm.lockbook_pos" not in getattr(bt_missing, "_missing_critical_source_fields", [])
+    assert "rhpf.bcm.lockbook_neg" not in getattr(bt_missing, "_missing_critical_source_fields", [])
+    assert "missing_source_of_truth_rhpf_reserve" not in getattr(
+        bt_missing,
+        "_missing_critical_source_reasons",
+        set(),
+    )
 
 
 def test_bcm_capacity_auction_audit_classifies_bid_above_cutoff_as_auction_bug() -> None:

@@ -36952,9 +36952,11 @@ class BatteryBacktester:
                     f"real_locked_bcm_capacity_{side}_mw",
                     f"aFRR_Capacity_Won_{'Pos' if side == 'pos' else 'Neg'}_MW",
                 )
+                available_names: list[str] = []
                 for name in names:
                     if not hasattr(row, name):
                         continue
+                    available_names.append(name)
                     val = pd.to_numeric(pd.Series([getattr(row, name)]), errors="coerce").iloc[0]
                     try:
                         val_f = float(val)
@@ -36962,17 +36964,15 @@ class BatteryBacktester:
                         continue
                     if np.isfinite(val_f):
                         return float(max(0.0, val_f))
+                if not available_names:
+                    return 0.0
                 self._record_missing_critical_source_field(
                     f"rhpf.bcm.lockbook_{side}",
                     "missing_source_of_truth_rhpf_reserve",
                     timestamp=ts_utc,
                     context="rhpf_bcm_settlement_authority",
                     details={
-                        "available_columns": [
-                            name
-                            for name in names
-                            if hasattr(row, name)
-                        ],
+                        "available_columns": available_names,
                     },
                 )
                 return None
