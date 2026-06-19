@@ -25698,6 +25698,16 @@ class BatteryBacktester:
                         str(entry.get("reason", "reserve_buffer_recovery") or "reserve_buffer_recovery"),
                     )
 
+                def _row_optional_mw(row: pd.Series, *names: str) -> float:
+                    best = 0.0
+                    for name in names:
+                        if name not in row.index:
+                            continue
+                        val = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").iloc[0]
+                        if pd.notna(val) and np.isfinite(float(val)):
+                            best = max(best, max(0.0, float(val)))
+                    return float(best)
+
                 def _forward_replay_protected_soc(
                     candidate_pos_mw: float,
                     candidate_neg_mw: float,
@@ -25759,6 +25769,35 @@ class BatteryBacktester:
                             replay_rows[colmap.timestamp], utc=True, errors="coerce"
                         )
                         replay_rows = replay_rows.dropna(subset=[colmap.timestamp]).sort_values(colmap.timestamp)
+                    commitment_cols = [
+                        "bem_only_pos_mw",
+                        "bem_only_neg_mw",
+                        "plan_bem_only_pos_mw",
+                        "plan_bem_only_neg_mw",
+                        "submitted_bem_only_pos_mw",
+                        "submitted_bem_only_neg_mw",
+                        "perfect_foresight_bem_only_submitted_pos_mw",
+                        "perfect_foresight_bem_only_submitted_neg_mw",
+                        "perfect_foresight_bem_only_submitted_pos_mw_after_guard",
+                        "perfect_foresight_bem_only_submitted_neg_mw_after_guard",
+                    ]
+                    merge_cols = [
+                        c
+                        for c in commitment_cols
+                        if c in tgt.columns and c not in replay_rows.columns
+                    ]
+                    if merge_cols:
+                        commitment_rows = tgt[["target_time_utc", *merge_cols]].copy()
+                        commitment_rows[colmap.timestamp] = pd.to_datetime(
+                            commitment_rows["target_time_utc"], utc=True, errors="coerce"
+                        )
+                        commitment_rows = commitment_rows.drop(columns=["target_time_utc"], errors="ignore")
+                        commitment_rows = commitment_rows.dropna(subset=[colmap.timestamp])
+                        replay_rows = replay_rows.merge(
+                            commitment_rows,
+                            on=colmap.timestamp,
+                            how="left",
+                        )
 
                     current_block_ts = {
                         pd.Timestamp(ts)
@@ -25799,11 +25838,39 @@ class BatteryBacktester:
                             # The candidate is the final block award for this
                             # product, not an additive duplicate of an already
                             # staged value for the same delivery timestamp.
-                            total_pos = max(existing_pos, cand_pos)
-                            total_neg = max(existing_neg, cand_neg)
+                            bcm_pos = max(existing_pos, cand_pos)
+                            bcm_neg = max(existing_neg, cand_neg)
                         else:
-                            total_pos = existing_pos
-                            total_neg = existing_neg
+                            bcm_pos = existing_pos
+                            bcm_neg = existing_neg
+                        allow_bem_replay = bool(
+                            getattr(
+                                strategy_permissions or self._strategy_permissions,
+                                "allow_bem_only",
+                                False,
+                            )
+                        )
+                        bem_pos = 0.0
+                        bem_neg = 0.0
+                        if allow_bem_replay:
+                            bem_pos = _row_optional_mw(
+                                replay_row,
+                                "bem_only_pos_mw",
+                                "plan_bem_only_pos_mw",
+                                "submitted_bem_only_pos_mw",
+                                "perfect_foresight_bem_only_submitted_pos_mw_after_guard",
+                                "perfect_foresight_bem_only_submitted_pos_mw",
+                            )
+                            bem_neg = _row_optional_mw(
+                                replay_row,
+                                "bem_only_neg_mw",
+                                "plan_bem_only_neg_mw",
+                                "submitted_bem_only_neg_mw",
+                                "perfect_foresight_bem_only_submitted_neg_mw_after_guard",
+                                "perfect_foresight_bem_only_submitted_neg_mw",
+                            )
+                        total_pos = float(bcm_pos) + float(bem_pos)
+                        total_neg = float(bcm_neg) + float(bem_neg)
                         da_ch_mw, da_dis_mw = self._normalize_da_bid(
                             *(dict(da_lockbook or {}).get(ts_key, (0.0, 0.0)))
                         )
@@ -32309,8 +32376,11 @@ class BatteryBacktester:
                     if after_buy > 1e-12 or after_sell > 1e-12:
                         rounded_accepted_da[pd.Timestamp(tsu)] = (float(after_buy), float(after_sell))
                 accepted_da = rounded_accepted_da
-                # Prewrite guards must use the current settlement-path SoC, not the older DA gate anchor.
-                da_prewrite_guard_soc_mwh = float(soc)
+                # Prewrite guards must use the settlement-equivalent DA gate anchor.
+                # The rolling carry-state `soc` can be stale versus the realized
+                # settlement path; the anchor helper advances this value through
+                # already committed rows before the first DA delivery.
+                da_prewrite_guard_soc_mwh = float(da_prelock_executed_soc_anchor_mwh)
 
                 def _da_schedule_milp_equivalent(schedule: dict[pd.Timestamp, tuple[float, float]]) -> bool:
                     if not schedule:
@@ -33171,7 +33241,7 @@ class BatteryBacktester:
                 universal_projection_shadow_diag, universal_projection_shadow_by_ts = (
                     self._da_prewrite_universal_projection_shadow_diagnostics(
                         accepted_da=accepted_da,
-                        current_soc_mwh=float(soc),
+                        current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                         future_rows=future_rows_for_da_guard,
                         colmap=colmap,
                         existing_da_lockbook=da_lockbook,
@@ -33193,7 +33263,7 @@ class BatteryBacktester:
                 accepted_da, universal_projection_guard_diag, universal_projection_guard_by_ts = (
                     self._da_prewrite_universal_projection_guard(
                         accepted_da=accepted_da,
-                        current_soc_mwh=float(soc),
+                        current_soc_mwh=float(da_prewrite_guard_soc_mwh),
                         future_rows=future_rows_for_da_guard,
                         colmap=colmap,
                         existing_da_lockbook=da_lockbook,

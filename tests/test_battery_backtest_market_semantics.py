@@ -14696,6 +14696,64 @@ def test_da_prewrite_guard_derates_buy_before_future_planned_neg_reserve_envelop
     assert inactive_diag["universal_projection_guard_applied"] == pytest.approx(0.0)
 
 
+def test_da_prewrite_guard_uses_settlement_anchor_for_sell_physical_feasibility() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt.da_bid_granularity_mw = 0.1
+    bt.da_min_bid_size_mw = 0.1
+    col = BacktestColumnMap()
+    prior_ts = pd.Timestamp("2026-01-23T04:00:00Z")
+    da_ts = pd.Timestamp("2026-01-23T17:00:00Z")
+    rows = pd.DataFrame(
+        {
+            col.timestamp: [prior_ts, da_ts],
+            col.pred_afrr_activation_rate_pos: [0.0, 0.0],
+            col.pred_afrr_activation_rate_neg: [0.0, 0.0],
+        }
+    )
+    existing_da_lockbook = {prior_ts: (0.0, 4.0)}
+    accepted_da = {da_ts: (0.0, 4.3)}
+    permissions = StrategyPermissions(
+        allow_da=True,
+        id_mode="disabled",
+        allow_bcm=False,
+        allow_bcm_activation_obligations=False,
+        allow_bem_only=False,
+    )
+
+    stale_guarded, stale_diag, _ = bt._da_prewrite_universal_projection_guard(
+        accepted_da=accepted_da,
+        current_soc_mwh=14.0,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook=existing_da_lockbook,
+        strategy_permissions=permissions,
+        activation_rate_path="model",
+    )
+    assert stale_diag["universal_projection_anchor_start_soc_mwh"] == pytest.approx(10.0)
+    assert stale_diag["universal_projection_guard_applied"] == pytest.approx(0.0)
+    assert stale_guarded == accepted_da
+
+    settlement_guarded, settlement_diag, settlement_by_ts = bt._da_prewrite_universal_projection_guard(
+        accepted_da=accepted_da,
+        current_soc_mwh=9.0,
+        future_rows=rows,
+        colmap=col,
+        existing_da_lockbook=existing_da_lockbook,
+        strategy_permissions=permissions,
+        activation_rate_path="model",
+    )
+
+    assert settlement_diag["universal_projection_anchor_reference_soc_mwh"] == pytest.approx(9.0)
+    assert settlement_diag["universal_projection_anchor_start_soc_mwh"] == pytest.approx(5.0)
+    assert settlement_diag["universal_projection_guard_applied"] == pytest.approx(1.0)
+    assert settlement_diag["universal_projection_guard_first_blocking_reason"] == "physical_soc_below_min"
+    assert settlement_guarded[da_ts][0] == pytest.approx(0.0)
+    assert settlement_guarded[da_ts][1] == pytest.approx(3.0)
+    assert settlement_by_ts[da_ts]["universal_projection_guard_row_original_da_mwh"] == pytest.approx(4.3)
+    assert settlement_by_ts[da_ts]["universal_projection_guard_row_final_da_mwh"] == pytest.approx(3.0)
+
+
 def test_da_hourly_lock_rejects_buy_exceeding_soc_headroom() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
@@ -21243,6 +21301,63 @@ def test_bcm_rhpf_protected_forward_replay_includes_da_lockbook_effects() -> Non
     assert any(
         str(v) == pd.Timestamp(target_hours[0]).isoformat()
         for v in pre["bcm_first_protected_soc_violation_ts_utc"].values()
+    )
+
+
+def test_bcm_rhpf_protected_forward_replay_includes_bem_only_effects() -> None:
+    bt = _configure_bcm_rhpf_protected_soc_test_backtester()
+    col, snapshot_ts, target_hours, snap, src = _bcm_naive_guard_inputs(
+        bt,
+        reserve_pos_mw=2.0,
+        reserve_neg_mw=0.0,
+        rate_pos=0.0,
+        rate_neg=0.0,
+    )
+    baseline_lock_pos: dict[pd.Timestamp, float] = {}
+    baseline_pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=snap,
+        source=src,
+        colmap=col,
+        lock_pos=baseline_lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=baseline_pre,
+        is_perfect_foresight=True,
+        global_end_utc=target_hours[-1],
+        current_soc_mwh=bt.soc_min + 5.0,
+    )
+    assert all(float(v) == pytest.approx(2.0) for v in baseline_lock_pos.values())
+
+    bem_snap = snap.copy()
+    bem_snap["bem_only_pos_mw"] = 6.0
+    lock_pos: dict[pd.Timestamp, float] = {}
+    pre: dict[str, dict[pd.Timestamp, float | str]] = {}
+
+    bt._update_afrr_capacity_lockbooks_from_snapshot(
+        snapshot_ts=snapshot_ts,
+        snapshot_plan=bem_snap,
+        source=src,
+        colmap=col,
+        lock_pos=lock_pos,
+        lock_neg={},
+        lock_energy_pos={},
+        lock_energy_neg={},
+        precommit_audit_by_ts=pre,
+        is_perfect_foresight=True,
+        global_end_utc=target_hours[-1],
+        current_soc_mwh=bt.soc_min + 5.0,
+    )
+
+    assert all(0.0 <= float(v) < 2.0 for v in lock_pos.values())
+    assert any(
+        float(v) > 0.0 for v in pre["bcm_capacity_derated_protected_soc_pos_mw"].values()
+    )
+    assert all(
+        str(v) == "protected_soc_prevented_pos"
+        for v in pre["bcm_protected_soc_rejection_reason"].values()
     )
 
 
