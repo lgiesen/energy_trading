@@ -14253,20 +14253,11 @@ class BatteryBacktester:
             cost, cost_available = _estimate_terminal_recovery_cost(required)
             recoverable = bool(required <= 1e-9)
             detail = "none" if recoverable else "locked_da_terminal_shortfall_candidate_infeasible"
-            if (
-                str(self.final_soc_mode) in {"hard", "hard_min"}
-                and shortfall > 1e-9
-                and not bool(terminal_sensitive_window)
-            ):
-                # Non-final DA gates do not own terminal hard-min enforcement.
-                # The final DA gate or explicit binding repair path handles it.
-                recoverable = True
-                detail = "none"
-            if str(self.final_soc_mode) in {"hard", "hard_min"} and shortfall > 1e-9 and bool(terminal_sensitive_window):
-                # Hard-final DA lockbooks may only pass with terminal recovery that is
-                # explicitly scheduled in the same physical replay. A generic "ID can
-                # fix it later" assumption caused accepted DA schedules to enter the
-                # rolling MILP without the repair action and then fail terminal SoC.
+            if str(self.final_soc_mode) in {"hard", "hard_min"} and shortfall > 1e-9:
+                # Hard-final DA lockbooks may only pass when recovery is explicitly
+                # scheduled in the same physical replay. Treating non-terminal
+                # shortfall as "someone later can fix it" lets locked DA schedules
+                # enter the rolling MILP and later fail with terminal_soc_conflict.
                 recoverable = False
                 detail = "terminal_shortfall_under_hard_min"
             diag = _base_diag()
@@ -14871,7 +14862,8 @@ class BatteryBacktester:
                 zero_replay.get("selection_pnl_eur", np.nan)
             )
             terminal_recovery_symmetric_candidate_kept = bool(
-                terminal_only_failure
+                str(self.final_soc_mode) not in {"hard", "hard_min"}
+                and terminal_only_failure
                 and _stats_float(candidate_failure_diag, "da_terminal_sensitive_window", default=0.0) < 0.5
                 and candidate_terminal_cost_available >= 0.5
                 and zero_terminal_cost_available >= 0.5
@@ -14880,7 +14872,10 @@ class BatteryBacktester:
                 and candidate_pnl_with_terminal_recovery
                 > zero_pnl_with_terminal_recovery + float(DA_PRECOMMIT_REPLAY_TOL_EUR)
             )
-            if _is_nonfinal_terminal_shortfall_only(candidate_failure_diag):
+            if (
+                str(self.final_soc_mode) not in {"hard", "hard_min"}
+                and _is_nonfinal_terminal_shortfall_only(candidate_failure_diag)
+            ):
                 feasible = True
                 final_schedule = dict(selected_da)
                 final_diag = _mark_deferred_terminal_nonfatal(

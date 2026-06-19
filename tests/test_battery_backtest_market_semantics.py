@@ -13721,6 +13721,68 @@ def test_da_postlock_future_guard_rejects_future_infeasible_candidate_and_accept
     assert float(audit_ok[0]["da_postlock_rejected_due_to_future_infeasibility"]) == pytest.approx(0.0)
 
 
+def test_da_postlock_hard_min_shortfall_fails_even_when_not_terminal_sensitive() -> None:
+    bt = _mk_backtester()
+    col = BacktestColumnMap()
+    bt.final_soc_mode = "hard_min"
+    bt.soc_min = 2.0
+    bt.soc_max = 18.0
+    bt.soc_target_end = 10.0
+    bt.eta_in = 1.0
+    bt.eta_out = 1.0
+    bt.deg_eur_mwh = 0.0
+    bt.trans_eur_mwh = 0.0
+    bt.aux_mode = "off"
+
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=6, freq="h")
+    future_rows = pd.DataFrame(
+        {
+            col.timestamp: ts,
+            "target_time_utc": ts,
+            col.pred_da_price: [100.0] * len(ts),
+            col.pred_afrr_activation_rate_pos: [0.0] * len(ts),
+            col.pred_afrr_activation_rate_neg: [0.0] * len(ts),
+        }
+    )
+    audit_rows = [
+        {
+            "timestamp_utc": str(ts[0]),
+            "da_candidate_buy_mw": 0.0,
+            "da_candidate_sell_mw": 3.0,
+            "candidate_selection_pnl_eur": 300.0,
+            "incumbent_selection_pnl_eur": 0.0,
+            "selected_incumbent": "optimized",
+        }
+    ]
+
+    selected, audit = bt._apply_da_postlock_future_guard(
+        selected_da={pd.Timestamp(ts[0]): (0.0, 3.0)},
+        da_audit_rows=audit_rows,
+        lock_rows=future_rows.iloc[[0]].copy(),
+        future_rows=future_rows,
+        colmap=col,
+        current_soc_mwh=10.0,
+        da_lockbook={},
+        fixed_reserve_pos={},
+        fixed_reserve_neg={},
+        global_end_utc=pd.Timestamp(ts[-1]),
+    )
+
+    row = audit[0]
+    assert selected[pd.Timestamp(ts[0])] == pytest.approx((0.0, 0.0))
+    assert float(row["da_postlock_rejected_due_to_future_infeasibility"]) == pytest.approx(1.0)
+    assert float(row["da_final_soc_feasibility_passed_before_lock"]) == pytest.approx(0.0)
+    assert float(row["da_final_soc_feasibility_required_mwh"]) == pytest.approx(10.0)
+    assert float(row["da_final_soc_feasibility_projected_final_soc_mwh"]) == pytest.approx(7.0)
+    assert float(row["da_final_soc_feasibility_margin_mwh"]) == pytest.approx(-3.0)
+    assert str(row["da_final_soc_feasibility_reason"]) == "terminal_shortfall_under_hard_min"
+    assert str(row["da_postlock_infeasibility_driver"]) == "terminal_shortfall_under_hard_min"
+    assert str(row["da_postlock_selected_after_future_check"]) in {
+        "no_trade",
+        "locked_da_terminal_shortfall_candidate_infeasible",
+    }
+
+
 def test_da_postlock_uses_hourly_commitments_not_schedule_totals_for_feasibility() -> None:
     bt = _mk_backtester()
     col = BacktestColumnMap()
