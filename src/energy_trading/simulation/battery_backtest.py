@@ -28105,6 +28105,39 @@ class BatteryBacktester:
             e_neg = float("nan")
             bcm_precommit_written_pos_mw = float(cap_res.awarded_pos_mw)
             bcm_precommit_written_neg_mw = float(cap_res.awarded_neg_mw)
+            protected_replay_failed = (
+                float(bcm_precommit_stats.get("protected_soc_replay_pass", 1.0) or 0.0) < 0.5
+            )
+            protected_reason = str(
+                bcm_precommit_stats.get("protected_soc_rejection_reason", "none") or "none"
+            )
+            if protected_replay_failed and protected_reason.startswith("protected_soc_prevented"):
+                protected_derate_pos = max(
+                    0.0,
+                    float(bcm_precommit_stats.get("capacity_derated_protected_soc_pos_mw", 0.0) or 0.0),
+                )
+                protected_derate_neg = max(
+                    0.0,
+                    float(bcm_precommit_stats.get("capacity_derated_protected_soc_neg_mw", 0.0) or 0.0),
+                )
+                protected_safe_pos_mw = max(
+                    0.0,
+                    float(bcm_precommit_stats.get("original_candidate_pos_mw", precommit_orig_pos) or 0.0)
+                    - float(protected_derate_pos),
+                )
+                protected_safe_neg_mw = max(
+                    0.0,
+                    float(bcm_precommit_stats.get("original_candidate_neg_mw", precommit_orig_neg) or 0.0)
+                    - float(protected_derate_neg),
+                )
+                bcm_precommit_written_pos_mw = min(
+                    float(bcm_precommit_written_pos_mw),
+                    float(protected_safe_pos_mw),
+                )
+                bcm_precommit_written_neg_mw = min(
+                    float(bcm_precommit_written_neg_mw),
+                    float(protected_safe_neg_mw),
+                )
             bcm_precommit_stats["written_pos_mw"] = float(bcm_precommit_written_pos_mw)
             bcm_precommit_stats["written_neg_mw"] = float(bcm_precommit_written_neg_mw)
             block_start_utc = pd.to_datetime(blk["target_time_utc"], utc=True, errors="coerce").min()
@@ -28148,16 +28181,16 @@ class BatteryBacktester:
                     return float(fallback_price)
                 return 0.0
 
-            cap_price_pos_awarded = _submitted_capacity_price_for_side("pos", float(cap_res.awarded_pos_mw))
-            cap_price_neg_awarded = _submitted_capacity_price_for_side("neg", float(cap_res.awarded_neg_mw))
+            cap_price_pos_awarded = _submitted_capacity_price_for_side("pos", float(bcm_precommit_written_pos_mw))
+            cap_price_neg_awarded = _submitted_capacity_price_for_side("neg", float(bcm_precommit_written_neg_mw))
             cap_price_missing_for_nonzero_lockbook = float(
-                (float(cap_res.awarded_pos_mw) > 1e-12 and abs(float(cap_price_pos_awarded)) <= 1e-12)
-                or (float(cap_res.awarded_neg_mw) > 1e-12 and abs(float(cap_price_neg_awarded)) <= 1e-12)
+                (float(bcm_precommit_written_pos_mw) > 1e-12 and abs(float(cap_price_pos_awarded)) <= 1e-12)
+                or (float(bcm_precommit_written_neg_mw) > 1e-12 and abs(float(cap_price_neg_awarded)) <= 1e-12)
             )
             for ts in blk["target_time_utc"]:
                 tsu = pd.to_datetime(ts, utc=True)
-                lock_pos[tsu] = float(cap_res.awarded_pos_mw)
-                lock_neg[tsu] = float(cap_res.awarded_neg_mw)
+                lock_pos[tsu] = float(bcm_precommit_written_pos_mw)
+                lock_neg[tsu] = float(bcm_precommit_written_neg_mw)
                 lock_energy_pos[tsu] = float(e_pos)
                 lock_energy_neg[tsu] = float(e_neg)
                 lock_capacity_price_pos[tsu] = float(cap_price_pos_awarded)
@@ -28265,8 +28298,12 @@ class BatteryBacktester:
                     precommit_audit_by_ts.setdefault("precommit_market", {})[tsu] = "BCM"
                     precommit_audit_by_ts.setdefault("precommit_candidate_pos_mw", {})[tsu] = float(precommit_orig_pos)
                     precommit_audit_by_ts.setdefault("precommit_candidate_neg_mw", {})[tsu] = float(precommit_orig_neg)
-                    precommit_audit_by_ts.setdefault("precommit_locked_pos_mw", {})[tsu] = float(cap_res.awarded_pos_mw)
-                    precommit_audit_by_ts.setdefault("precommit_locked_neg_mw", {})[tsu] = float(cap_res.awarded_neg_mw)
+                    precommit_audit_by_ts.setdefault("precommit_locked_pos_mw", {})[tsu] = float(
+                        bcm_precommit_written_pos_mw
+                    )
+                    precommit_audit_by_ts.setdefault("precommit_locked_neg_mw", {})[tsu] = float(
+                        bcm_precommit_written_neg_mw
+                    )
                     precommit_audit_by_ts.setdefault("bcm_precommit_settlement_equivalent_replay_used", {})[tsu] = float(
                         bcm_precommit_stats.get("settlement_equivalent_replay_used", 0.0)
                     )
@@ -28619,8 +28656,12 @@ class BatteryBacktester:
                     )
                     precommit_audit_by_ts.setdefault("bcm_precommit_candidate_pos_mw", {})[tsu] = float(precommit_orig_pos)
                     precommit_audit_by_ts.setdefault("bcm_precommit_candidate_neg_mw", {})[tsu] = float(precommit_orig_neg)
-                    precommit_audit_by_ts.setdefault("bcm_precommit_locked_pos_mw", {})[tsu] = float(cap_res.awarded_pos_mw)
-                    precommit_audit_by_ts.setdefault("bcm_precommit_locked_neg_mw", {})[tsu] = float(cap_res.awarded_neg_mw)
+                    precommit_audit_by_ts.setdefault("bcm_precommit_locked_pos_mw", {})[tsu] = float(
+                        bcm_precommit_written_pos_mw
+                    )
+                    precommit_audit_by_ts.setdefault("bcm_precommit_locked_neg_mw", {})[tsu] = float(
+                        bcm_precommit_written_neg_mw
+                    )
                     precommit_audit_by_ts.setdefault("bcm_precommit_retry_factor_selected", {})[tsu] = float(
                         bcm_precommit_stats.get("retry_factor_selected", reserve_retry_factor)
                     )

@@ -21064,6 +21064,14 @@ def test_bcm_rhpf_derates_pos_capacity_to_protected_soc_feasible_level() -> None
 
     assert all(float(v) == pytest.approx(2.0) for v in lock_pos.values())
     assert all(
+        float(v) == pytest.approx(2.0)
+        for v in pre["bcm_precommit_written_pos_mw"].values()
+    )
+    assert all(
+        float(v) == pytest.approx(2.0)
+        for v in pre["bcm_precommit_locked_pos_mw"].values()
+    )
+    assert all(
         float(v) == pytest.approx(4.0)
         for v in pre["bcm_capacity_derated_protected_soc_pos_mw"].values()
     )
@@ -21207,6 +21215,10 @@ def test_bcm_rhpf_existing_pos_obligations_consume_protected_soc_capacity() -> N
     )
 
     assert all(float(v) == pytest.approx(4.0) for v in existing_lock_pos.values())
+    assert all(
+        float(v) == pytest.approx(4.0)
+        for v in pre["bcm_precommit_written_pos_mw"].values()
+    )
     assert all(
         float(v) == pytest.approx(2.0)
         for v in pre["bcm_capacity_derated_protected_soc_pos_mw"].values()
