@@ -4,10 +4,11 @@ set -Eeuo pipefail
 # Final thesis multi-market simulation matrix for the server.
 #
 # Window:
-#   2025-03-01T00:00:00Z inclusive -> 2025-06-01T00:00:00Z exclusive
+#   Default: 2025-04-01T00:00:00Z inclusive -> 2025-07-01T00:00:00Z exclusive
+#   Override with START=... END=...
 #
 # Matrix:
-#   models:    xgb, tft, linear
+#   models:    xgb, tft, linear by default. Override with MODELS="xgb tft linear".
 #   quantiles: p30, p50, p70 first, then p90, p10
 #   strategy:  multi
 #
@@ -38,15 +39,25 @@ set -Eeuo pipefail
 
 MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
 
-START="2025-04-01T00:00:00Z"
-END="2025-07-01T00:00:00Z"
-SPLIT="test"
-STRATEGY="multi"
+START="${START:-2025-04-01T00:00:00Z}"
+END="${END:-2025-07-01T00:00:00Z}"
+SPLIT="${SPLIT:-test}"
+STRATEGY="${STRATEGY:-multi}"
+FINAL_SOC_MODE="${FINAL_SOC_MODE:-hard}"
+ID_RECOURSE_MODE="${ID_RECOURSE_MODE:-common}"
+OUTPUT_DETAIL="${OUTPUT_DETAIL:-thesis}"
+DEBUG_DUMPS="${DEBUG_DUMPS:-accepted_only}"
+ALLOW_INVALID_OUTPUT="${ALLOW_INVALID_OUTPUT:-0}"
 
-MODELS=("xgb" "tft" "linear")
-PRIMARY_QUANTILES=("p30-p30" "p50-p50" "p70-p70")
-SECONDARY_QUANTILES=("p90-p90" "p10-p10")
+read -r -a MODELS <<< "${MODELS:-xgb tft linear}"
+read -r -a PRIMARY_QUANTILES <<< "${PRIMARY_QUANTILES:-p30-p30 p50-p50 p70-p70}"
+read -r -a SECONDARY_QUANTILES <<< "${SECONDARY_QUANTILES:-p90-p90 p10-p10}"
 QUANTILES=("${PRIMARY_QUANTILES[@]}" "${SECONDARY_QUANTILES[@]}")
+
+EXTRA_COMMON_ARGS=()
+if [[ "$ALLOW_INVALID_OUTPUT" == "1" || "$ALLOW_INVALID_OUTPUT" == "true" || "$ALLOW_INVALID_OUTPUT" == "yes" ]]; then
+  EXTRA_COMMON_ARGS+=(--allow-invalid-output)
+fi
 
 RUN_TS="${RUN_TS:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_ROOT="${RUN_ROOT:-artifacts/simulation_runs/thesis_final_multi_3m_${RUN_TS}}"
@@ -77,6 +88,11 @@ HOST="$(hostname)"
   echo "END=$END"
   echo "SPLIT=$SPLIT"
   echo "STRATEGY=$STRATEGY"
+  echo "FINAL_SOC_MODE=$FINAL_SOC_MODE"
+  echo "ID_RECOURSE_MODE=$ID_RECOURSE_MODE"
+  echo "OUTPUT_DETAIL=$OUTPUT_DETAIL"
+  echo "DEBUG_DUMPS=$DEBUG_DUMPS"
+  echo "ALLOW_INVALID_OUTPUT=$ALLOW_INVALID_OUTPUT"
   echo "MAX_PARALLEL_JOBS=$MAX_PARALLEL_JOBS"
   echo "MODELS=${MODELS[*]}"
   echo "PRIMARY_QUANTILES=${PRIMARY_QUANTILES[*]}"
@@ -160,15 +176,15 @@ run_job() {
       --start "$START" \
       --end "$END" \
       --strict-simulation-validity \
-      --final-soc-mode hard \
-      --id-recourse-mode common \
+      --final-soc-mode "$FINAL_SOC_MODE" \
+      --id-recourse-mode "$ID_RECOURSE_MODE" \
       --benchmark-mode "$benchmark_mode" \
-      --disable-ghpf \
       --no-enable-global-perfect-foresight \
-      --output-detail thesis \
-      --debug-dumps accepted_only \
+      --output-detail "$OUTPUT_DETAIL" \
+      --debug-dumps "$DEBUG_DUMPS" \
       --clean-output \
       --out-dir "$out_dir" \
+      "${EXTRA_COMMON_ARGS[@]}" \
       "${extra_args[@]}"
     echo
   } > "$log_dir/run.info"
@@ -184,15 +200,15 @@ run_job() {
     --start "$START" \
     --end "$END" \
     --strict-simulation-validity \
-    --final-soc-mode hard \
-    --id-recourse-mode common \
+    --final-soc-mode "$FINAL_SOC_MODE" \
+    --id-recourse-mode "$ID_RECOURSE_MODE" \
     --benchmark-mode "$benchmark_mode" \
-    --disable-ghpf \
     --no-enable-global-perfect-foresight \
-    --output-detail thesis \
-    --debug-dumps accepted_only \
+    --output-detail "$OUTPUT_DETAIL" \
+    --debug-dumps "$DEBUG_DUMPS" \
     --clean-output \
     --out-dir "$out_dir" \
+    "${EXTRA_COMMON_ARGS[@]}" \
     "${extra_args[@]}" \
     > "$log_dir/stdout.log" \
     2> "$log_dir/stderr.log"
