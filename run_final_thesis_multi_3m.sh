@@ -4,7 +4,8 @@ set -Eeuo pipefail
 # Final thesis multi-market simulation matrix for the server.
 #
 # Window:
-#   Default: 2025-04-01T00:00:00Z inclusive -> 2025-07-01T00:00:00Z exclusive
+#   Default: 2025-06-01 00:00 Europe/Berlin inclusive -> 2025-08-01 00:00 Europe/Berlin exclusive
+#   UTC:     2025-05-31T22:00:00Z inclusive -> 2025-07-31T22:00:00Z exclusive
 #   Override with START=... END=...
 #
 # Matrix:
@@ -19,28 +20,35 @@ set -Eeuo pipefail
 # Output policy:
 #   Every run gets a dedicated folder. Do not point multiple runs at the same
 #   out-dir because aggregate files inside an out-dir are overwritten by design.
+#   Resume is launcher-level: completed jobs are skipped, interrupted jobs are
+#   rerun from scratch.
 #
 # Server usage:
 #   chmod +x run_final_thesis_multi_3m.sh
 #   nohup ./run_final_thesis_multi_3m.sh \
-#     > artifacts/simulation_runs/final_thesis_multi_3m_launcher.out 2>&1 &
-#   tail -f artifacts/simulation_runs/final_thesis_multi_3m_launcher.out
+#     > artifacts/simulation_runs/final_thesis_multi_2m_launcher.out 2>&1 &
+#   tail -f artifacts/simulation_runs/final_thesis_multi_2m_launcher.out
 #
 # Resume a specific existing launcher root:
-#   RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_3m_YYYYmmddTHHMMSSZ \
+#   RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_2m_YYYYmmddTHHMMSSZ \
 #   ./run_final_thesis_multi_3m.sh
+#
+# Resume controls:
+#   SKIP_COMPLETED=1 skips jobs with .done markers and complete aggregate files.
+#   FORCE_RERUN=1 ignores .done markers.
+#   CLEAN_OUTPUT=1 passes --clean-output to workers; keep it 0 for crash resume.
 #
 # Check simulation worker process
 # pgrep -af "run_battery_backtest.py"
 #
 # Current logs
-# RUN_ROOT="artifacts/simulation_runs/thesis_final_multi_3m_YYYYmmddTHHMMSSZ"
+# RUN_ROOT="artifacts/simulation_runs/thesis_final_multi_2m_YYYYmmddTHHMMSSZ"
 # tail -f "$RUN_ROOT/logs/MODEL_QUANTILE/stdout.log"
 
 MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
 
-START="${START:-2025-03-31T22:00:00Z}"
-END="${END:-2025-07-01T23:00:00Z}"
+START="${START:-2025-05-31T22:00:00Z}"
+END="${END:-2025-07-31T22:00:00Z}"
 SPLIT="${SPLIT:-test}"
 STRATEGY="${STRATEGY:-multi}"
 FINAL_SOC_MODE="${FINAL_SOC_MODE:-hard_min}"
@@ -48,6 +56,9 @@ ID_RECOURSE_MODE="${ID_RECOURSE_MODE:-common}"
 OUTPUT_DETAIL="${OUTPUT_DETAIL:-thesis}"
 DEBUG_DUMPS="${DEBUG_DUMPS:-accepted_only}"
 ALLOW_INVALID_OUTPUT="${ALLOW_INVALID_OUTPUT:-1}"
+SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+FORCE_RERUN="${FORCE_RERUN:-0}"
+CLEAN_OUTPUT="${CLEAN_OUTPUT:-0}"
 
 read -r -a MODELS <<< "${MODELS:-xgb tft linear}"
 read -r -a PRIMARY_QUANTILES <<< "${PRIMARY_QUANTILES:-p30-p30 p50-p50 p70-p70}"
@@ -60,7 +71,7 @@ if [[ "$ALLOW_INVALID_OUTPUT" == "1" || "$ALLOW_INVALID_OUTPUT" == "true" || "$A
 fi
 
 RUN_TS="${RUN_TS:-$(date -u +%Y%m%dT%H%M%SZ)}"
-RUN_ROOT="${RUN_ROOT:-artifacts/simulation_runs/thesis_final_multi_3m_${RUN_TS}}"
+RUN_ROOT="${RUN_ROOT:-artifacts/simulation_runs/thesis_final_multi_2m_${RUN_TS}}"
 LOG_ROOT="${LOG_ROOT:-${RUN_ROOT}/logs}"
 
 mkdir -p "$RUN_ROOT" "$LOG_ROOT"
@@ -93,6 +104,9 @@ HOST="$(hostname)"
   echo "OUTPUT_DETAIL=$OUTPUT_DETAIL"
   echo "DEBUG_DUMPS=$DEBUG_DUMPS"
   echo "ALLOW_INVALID_OUTPUT=$ALLOW_INVALID_OUTPUT"
+  echo "SKIP_COMPLETED=$SKIP_COMPLETED"
+  echo "FORCE_RERUN=$FORCE_RERUN"
+  echo "CLEAN_OUTPUT=$CLEAN_OUTPUT"
   echo "MAX_PARALLEL_JOBS=$MAX_PARALLEL_JOBS"
   echo "MODELS=${MODELS[*]}"
   echo "PRIMARY_QUANTILES=${PRIMARY_QUANTILES[*]}"
@@ -126,6 +140,24 @@ mark_status() {
   echo "${run_id},${chain},${model},${quantile},${benchmark_mode},${status},${start_utc},${end_utc},${exit_code},${out_dir},${log_dir}" >> "$STATUS_CSV"
 }
 
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|y|Y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+job_complete() {
+  local out_dir="$1"
+  local log_dir="$2"
+  local done_marker="$log_dir/.done"
+
+  [[ -f "$done_marker" ]] || return 1
+  [[ -s "$out_dir/strategy_overview.csv" ]] || return 1
+  [[ -s "$out_dir/quantile_sweep_summary.csv" ]] || return 1
+  return 0
+}
+
 run_job() {
   local run_id="$1"
   local chain="$2"
@@ -139,18 +171,28 @@ run_job() {
 
   mkdir -p "$out_dir" "$log_dir"
 
-  local done_marker="$out_dir/.done"
-  local failed_marker="$out_dir/.failed"
+  local running_marker="$log_dir/.running"
+  local done_marker="$log_dir/.done"
+  local failed_marker="$log_dir/.failed"
 
-  if [[ -f "$done_marker" ]]; then
+  if truthy "$SKIP_COMPLETED" && ! truthy "$FORCE_RERUN" && job_complete "$out_dir" "$log_dir"; then
+    local skip_utc
+    skip_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "[SKIP] $run_id already completed: $done_marker"
+    mark_status "$run_id" "$chain" "$model" "$quantile" "$benchmark_mode" "skipped_done" "$skip_utc" "$skip_utc" "0" "$out_dir" "$log_dir"
     return 0
   fi
 
-  rm -f "$failed_marker"
+  rm -f "$running_marker" "$done_marker" "$failed_marker"
 
   local start_utc
   start_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "$start_utc" > "$running_marker"
+
+  local clean_args=()
+  if truthy "$CLEAN_OUTPUT"; then
+    clean_args+=(--clean-output)
+  fi
 
   {
     echo "RUN_ID=$run_id"
@@ -182,8 +224,8 @@ run_job() {
       --no-enable-global-perfect-foresight \
       --output-detail "$OUTPUT_DETAIL" \
       --debug-dumps "$DEBUG_DUMPS" \
-      --clean-output \
       --out-dir "$out_dir" \
+      "${clean_args[@]}" \
       "${EXTRA_COMMON_ARGS[@]}" \
       "${extra_args[@]}"
     echo
@@ -206,8 +248,8 @@ run_job() {
     --no-enable-global-perfect-foresight \
     --output-detail "$OUTPUT_DETAIL" \
     --debug-dumps "$DEBUG_DUMPS" \
-    --clean-output \
     --out-dir "$out_dir" \
+    "${clean_args[@]}" \
     "${EXTRA_COMMON_ARGS[@]}" \
     "${extra_args[@]}" \
     > "$log_dir/stdout.log" \
@@ -219,10 +261,12 @@ run_job() {
   end_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$code" -eq 0 ]]; then
+    rm -f "$running_marker" "$failed_marker"
     echo "$end_utc" > "$done_marker"
     echo "[DONE] $run_id at $end_utc"
     mark_status "$run_id" "$chain" "$model" "$quantile" "$benchmark_mode" "done" "$start_utc" "$end_utc" "$code" "$out_dir" "$log_dir"
   else
+    rm -f "$running_marker" "$done_marker"
     echo "$end_utc" > "$failed_marker"
     echo "[FAILED] $run_id at $end_utc exit_code=$code"
     mark_status "$run_id" "$chain" "$model" "$quantile" "$benchmark_mode" "failed" "$start_utc" "$end_utc" "$code" "$out_dir" "$log_dir"
