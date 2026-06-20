@@ -140,6 +140,10 @@ mark_status() {
   echo "${run_id},${chain},${model},${quantile},${benchmark_mode},${status},${start_utc},${end_utc},${exit_code},${out_dir},${log_dir}" >> "$STATUS_CSV"
 }
 
+active_job_count() {
+  jobs -rp | wc -l | tr -d ' '
+}
+
 truthy() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|y|Y) return 0 ;;
@@ -189,9 +193,31 @@ run_job() {
   start_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "$start_utc" > "$running_marker"
 
-  local clean_args=()
+  local cmd=(
+    "$PYTHON_BIN" -u scripts/run_battery_backtest.py
+    --model "$model"
+    --split "$SPLIT"
+    --trading-strategy "$STRATEGY"
+    --quantile-pairs "$quantile"
+    --start "$START"
+    --end "$END"
+    --strict-simulation-validity
+    --final-soc-mode "$FINAL_SOC_MODE"
+    --id-recourse-mode "$ID_RECOURSE_MODE"
+    --benchmark-mode "$benchmark_mode"
+    --no-enable-global-perfect-foresight
+    --output-detail "$OUTPUT_DETAIL"
+    --debug-dumps "$DEBUG_DUMPS"
+    --out-dir "$out_dir"
+  )
   if truthy "$CLEAN_OUTPUT"; then
-    clean_args+=(--clean-output)
+    cmd+=(--clean-output)
+  fi
+  if (( ${#EXTRA_COMMON_ARGS[@]} > 0 )); then
+    cmd+=("${EXTRA_COMMON_ARGS[@]}")
+  fi
+  if (( ${#extra_args[@]} > 0 )); then
+    cmd+=("${extra_args[@]}")
   fi
 
   {
@@ -210,48 +236,14 @@ run_job() {
     echo "HOST=$HOST"
     echo "PWD=$(pwd)"
     echo "START_UTC=$start_utc"
-    printf 'COMMAND=%q ' "$PYTHON_BIN" -u scripts/run_battery_backtest.py \
-      --model "$model" \
-      --split "$SPLIT" \
-      --trading-strategy "$STRATEGY" \
-      --quantile-pairs "$quantile" \
-      --start "$START" \
-      --end "$END" \
-      --strict-simulation-validity \
-      --final-soc-mode "$FINAL_SOC_MODE" \
-      --id-recourse-mode "$ID_RECOURSE_MODE" \
-      --benchmark-mode "$benchmark_mode" \
-      --no-enable-global-perfect-foresight \
-      --output-detail "$OUTPUT_DETAIL" \
-      --debug-dumps "$DEBUG_DUMPS" \
-      --out-dir "$out_dir" \
-      "${clean_args[@]}" \
-      "${EXTRA_COMMON_ARGS[@]}" \
-      "${extra_args[@]}"
+    printf 'COMMAND=%q ' "${cmd[@]}"
     echo
   } > "$log_dir/run.info"
 
   echo "[START] $run_id at $start_utc"
 
   set +e
-  PYTHONPYCACHEPREFIX=/tmp/pycache "$PYTHON_BIN" -u scripts/run_battery_backtest.py \
-    --model "$model" \
-    --split "$SPLIT" \
-    --trading-strategy "$STRATEGY" \
-    --quantile-pairs "$quantile" \
-    --start "$START" \
-    --end "$END" \
-    --strict-simulation-validity \
-    --final-soc-mode "$FINAL_SOC_MODE" \
-    --id-recourse-mode "$ID_RECOURSE_MODE" \
-    --benchmark-mode "$benchmark_mode" \
-    --no-enable-global-perfect-foresight \
-    --output-detail "$OUTPUT_DETAIL" \
-    --debug-dumps "$DEBUG_DUMPS" \
-    --out-dir "$out_dir" \
-    "${clean_args[@]}" \
-    "${EXTRA_COMMON_ARGS[@]}" \
-    "${extra_args[@]}" \
+  PYTHONPYCACHEPREFIX=/tmp/pycache "${cmd[@]}" \
     > "$log_dir/stdout.log" \
     2> "$log_dir/stderr.log"
   local code=$?
@@ -324,10 +316,8 @@ run_model_job() {
 }
 
 wait_for_slot() {
-  while (( $(jobs -rp | wc -l | tr -d ' ') >= MAX_PARALLEL_JOBS )); do
-    if ! wait -n; then
-      failures=$((failures + 1))
-    fi
+  while (( $(active_job_count) >= MAX_PARALLEL_JOBS )); do
+    sleep 5
   done
 }
 
@@ -351,11 +341,13 @@ run_benchmark_chain &
 run_model_wave "${PRIMARY_QUANTILES[@]}"
 run_model_wave "${SECONDARY_QUANTILES[@]}"
 
-while (( $(jobs -rp | wc -l | tr -d ' ') > 0 )); do
-  if ! wait -n; then
-    failures=$((failures + 1))
-  fi
+while (( $(active_job_count) > 0 )); do
+  sleep 5
 done
+
+if [[ -f "$STATUS_CSV" ]]; then
+  failures="$(awk -F, 'NR > 1 && $6 == "failed" {n++} END {print n+0}' "$STATUS_CSV")"
+fi
 
 echo "[ALL_DONE] $(date -u +%Y-%m-%dT%H:%M:%SZ) failures=$failures"
 echo "RUN_ROOT=$RUN_ROOT"
