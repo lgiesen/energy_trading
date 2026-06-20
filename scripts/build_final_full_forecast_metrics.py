@@ -622,7 +622,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build final RQ1 4.1.1 full unweighted forecast metrics.")
     p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
     p.add_argument("--benchmark-dir", action="append", default=[])
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/rq1/4_1_1_full_unweighted_metrics")
+    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_1_full_unweighted")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",

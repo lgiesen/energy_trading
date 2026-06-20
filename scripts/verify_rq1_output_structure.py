@@ -14,12 +14,16 @@ SUBSECTION_DIRS = [
     "4_1_3_per_lead",
     "4_1_4_gate_specific",
     "4_1_5_tail_spike",
+    "4_1_6_interim_answer",
+    "4_1_7_example_weeks",
 ]
 
 TIERS = [
     "result_section/figures",
+    "result_section/latex_figures",
     "result_section/tables",
     "appendix/figures",
+    "appendix/latex_figures",
     "appendix/tables",
     "backup/csv",
     "backup/diagnostics",
@@ -37,6 +41,19 @@ def _check_latex_table(path: Path) -> list[str]:
     for token in [r"\toprule", r"\midrule", r"\bottomrule"]:
         if token not in text:
             errors.append(f"{path} is missing {token}.")
+    return errors
+
+
+def _check_latex_figure(path: Path) -> list[str]:
+    errors: list[str] = []
+    text = path.read_text(encoding="utf-8")
+    for token in [r"\begin{figure}", r"\includegraphics", r"\caption", r"\label", r"\end{figure}"]:
+        if token not in text:
+            errors.append(f"{path} is missing {token}.")
+    if r"width=\textwidth" not in text or r"keepaspectratio" not in text:
+        errors.append(f"{path} does not use A4-safe includegraphics sizing.")
+    if "2E7D32" not in text:
+        errors.append(f"{path} does not include the style.py perfect_foresight color.")
     return errors
 
 
@@ -73,6 +90,8 @@ def verify(rq1_root: Path) -> list[str]:
             errors.append(f"Manifest path does not exist: {path}")
         if entry.get("artifact_type") == "latex_table" and path.exists():
             errors.extend(_check_latex_table(path))
+        if entry.get("artifact_type") == "latex_figure" and path.exists():
+            errors.extend(_check_latex_figure(path))
 
         if str(entry.get("tier")) == "result_section" and entry.get("artifact_type") == "latex_table" and path.exists():
             text = path.read_text(encoding="utf-8")
@@ -88,7 +107,7 @@ def verify(rq1_root: Path) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Verify organized RQ1 output structure.")
-    p.add_argument("--rq1-root", default="artifacts/final_benchmark/rq1")
+    p.add_argument("--rq1-root", default="artifacts/final_benchmark")
     return p.parse_args()
 
 

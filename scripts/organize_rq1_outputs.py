@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from energy_trading.evaluation.style import THESIS_PALETTE
+
 
 SUBSECTIONS = {
     "4.1.1": "4_1_1_full_unweighted",
@@ -25,15 +28,20 @@ SUBSECTIONS = {
     "4.1.3": "4_1_3_per_lead",
     "4.1.4": "4_1_4_gate_specific",
     "4.1.5": "4_1_5_tail_spike",
+    "4.1.6": "4_1_6_interim_answer",
+    "4.1.7": "4_1_7_example_weeks",
 }
 
 LEGACY_SUBSECTIONS = {
-    "4.1.1": ["4_1_1_full_unweighted_metrics", "4_1_1_full_unweighted"],
-    "4.1.2": ["4_1_2_calibration_uncertainty"],
-    "4.1.3": ["4_1_3_per_lead_hour", "4_1_3_per_lead"],
-    "4.1.4": ["4_1_4_gate_actionable", "4_1_4_gate_specific"],
-    "4.1.5": ["4_1_5_tail_spike"],
+    "4.1.1": ["4_1_1_full_unweighted_metrics", "4_1_1_full_unweighted", "rq1/4_1_1_full_unweighted_metrics", "rq1/4_1_1_full_unweighted"],
+    "4.1.2": ["4_1_2_calibration_uncertainty", "rq1/4_1_2_calibration_uncertainty"],
+    "4.1.3": ["4_1_3_per_lead_hour", "4_1_3_per_lead", "rq1/4_1_3_per_lead_hour", "rq1/4_1_3_per_lead"],
+    "4.1.4": ["4_1_4_gate_actionable", "4_1_4_gate_specific", "rq1/4_1_4_gate_actionable", "rq1/4_1_4_gate_specific"],
+    "4.1.5": ["4_1_5_tail_spike", "rq1/4_1_5_tail_spike"],
+    "4.1.7": ["4_1_7_example_weeks", "rq1/4_1_7_example_weeks"],
 }
+
+CANONICAL_DIRS = set(SUBSECTIONS.values())
 
 
 @dataclass(frozen=True)
@@ -282,9 +290,11 @@ def _find_source(final_root: Path, rq1_root: Path, candidates: tuple[str, ...]) 
 
 
 def _copy_route(route: Route, *, final_root: Path, rq1_root: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    source = _find_source(final_root, rq1_root, route.sources)
     subsection_dir = rq1_root / SUBSECTIONS[route.subsection]
     dest = subsection_dir / route.tier / route.dest_rel
+    source = _find_source(final_root, rq1_root, route.sources)
+    if source is None and dest.exists():
+        source = dest
     if source is None:
         return None, {
             "subsection": route.subsection,
@@ -316,14 +326,78 @@ def _ensure_structure(rq1_root: Path) -> None:
     for name in SUBSECTIONS.values():
         for rel in [
             "result_section/figures",
+            "result_section/latex_figures",
             "result_section/tables",
             "appendix/figures",
+            "appendix/latex_figures",
             "appendix/tables",
             "backup/csv",
             "backup/diagnostics",
             "backup/warnings",
         ]:
             (rq1_root / name / rel).mkdir(parents=True, exist_ok=True)
+
+
+def _remove_path(path: Path, removed: list[str]) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    removed.append(str(path))
+
+
+def prune_legacy_outputs(*, rq1_root: Path, final_root: Path) -> list[str]:
+    """Remove known generated legacy/unstructured output locations."""
+    removed: list[str] = []
+    legacy_root_names = [
+        ".DS_Store",
+        "_raw_outputs",
+        "rq1",
+        "calibration",
+        "figures",
+        "latex",
+        "gate_bucket_definitions.csv",
+        "gate_bucket_manifest.json",
+        "gate_bucket_metrics.csv",
+        "gate_bucket_metrics_test.csv",
+        "gate_bucket_observed_leads.csv",
+        "gate_bucket_row_counts.csv",
+        "gate_bucket_warnings.csv",
+        "per_lead_manifest.json",
+        "per_lead_metrics.csv",
+        "per_lead_metrics_test.csv",
+        "per_lead_range_summary_detail_test.csv",
+        "per_lead_range_summary_test.csv",
+        "per_lead_row_counts_test.csv",
+        "per_lead_warnings.csv",
+        "tail_spike_manifest.json",
+        "tail_spike_metrics.csv",
+        "tail_spike_metrics_test.csv",
+        "tail_spike_regime_definitions.csv",
+        "tail_spike_row_counts.csv",
+        "tail_spike_selected_weeks.csv",
+        "tail_spike_thresholds.csv",
+        "tail_spike_warnings.csv",
+    ]
+    for name in legacy_root_names:
+        _remove_path(rq1_root / name, removed)
+    for path in rq1_root.rglob(".DS_Store"):
+        _remove_path(path, removed)
+
+    for subdir in SUBSECTIONS.values():
+        root = rq1_root / subdir
+        for name in ["csv", "figures", "latex"]:
+            _remove_path(root / name, removed)
+        for path in root.glob("*.csv"):
+            _remove_path(path, removed)
+        for path in root.glob("*.json"):
+            _remove_path(path, removed)
+
+    if final_root != rq1_root and final_root.exists():
+        _remove_path(final_root, removed)
+    return removed
 
 
 def _add_derived_tables(entries: list[dict[str, Any]], missing: list[dict[str, Any]], *, rq1_root: Path, split: str) -> None:
@@ -360,7 +434,166 @@ def _add_derived_tables(entries: list[dict[str, Any]], missing: list[dict[str, A
         })
 
 
-def organize(*, final_root: Path, rq1_root: Path, split: str) -> dict[str, Any]:
+def _find_example_source_dirs(final_root: Path, rq1_root: Path) -> list[Path]:
+    candidates = [
+        final_root / "4_1_7_example_weeks",
+        rq1_root / "4_1_7_example_weeks",
+        rq1_root / "rq1" / "4_1_7_example_weeks",
+    ]
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if path.exists() and resolved not in seen:
+            out.append(path)
+            seen.add(resolved)
+    return out
+
+
+def _copy_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+
+
+def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[str, Any]], *, final_root: Path, rq1_root: Path) -> None:
+    subsection = "4.1.7"
+    target_root = rq1_root / SUBSECTIONS[subsection]
+    source_dirs = _find_example_source_dirs(final_root, rq1_root)
+    if not source_dirs:
+        missing.append(
+            {
+                "subsection": subsection,
+                "tier": "backup",
+                "artifact_type": "diagnostics",
+                "path": str(target_root / "backup" / "diagnostics" / "example_week_manifest.json"),
+                "metric_family": "example_weeks",
+                "thesis_use": "diagnostics",
+                "brief_description": "Example-week manifest.",
+                "required": False,
+                "status": "missing_source_dir",
+                "searched": [str(p) for p in _find_example_source_dirs(final_root, rq1_root)],
+            }
+        )
+        return
+    source_dir = source_dirs[0]
+    metrics = source_dir / "example_week_metrics.csv"
+    if metrics.exists():
+        dst = target_root / "backup" / "csv" / "example_week_metrics.csv"
+        _copy_file(metrics, dst)
+        entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "csv", "path": str(dst), "metric_family": "example_weeks", "thesis_use": "backup data", "brief_description": "Example-week plot inventory and diagnostics."})
+    manifest = source_dir / "example_week_manifest.json"
+    if manifest.exists():
+        dst = target_root / "backup" / "diagnostics" / "example_week_manifest.json"
+        _copy_file(manifest, dst)
+        entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "diagnostics", "path": str(dst), "metric_family": "example_weeks", "thesis_use": "diagnostics", "brief_description": "Example-week generation manifest."})
+    figures_root = source_dir / "figures"
+    if figures_root.exists():
+        for src in sorted(figures_root.rglob("*.png")):
+            rel = src.relative_to(figures_root)
+            tier = "result_section" if rel.parts and rel.parts[0] == "typical" else "appendix"
+            dst = target_root / tier / "figures" / rel
+            _copy_file(src, dst)
+            entries.append(
+                {
+                    "subsection": subsection,
+                    "tier": tier,
+                    "artifact_type": "figure",
+                    "path": str(dst),
+                    "metric_family": "example_weeks",
+                    "thesis_use": "main thesis figure" if tier == "result_section" else "appendix figure",
+                    "brief_description": f"Example-week forecast plot: {rel}",
+                }
+            )
+
+
+def _latex_color_name(role: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", role).lower()
+
+
+def _latex_figure_label(subsection: str, figure_path: Path) -> str:
+    stem = re.sub(r"[^a-z0-9]+", "-", figure_path.stem.lower()).strip("-")
+    section = subsection.replace(".", "-")
+    return f"fig:rq1-{section}-{stem}"
+
+
+def _latex_figure_path(rq1_root: Path, figure_path: Path) -> str:
+    rel = figure_path.relative_to(rq1_root).as_posix()
+    return rf"\rqonefigroot/{rel}"
+
+
+def _write_latex_figure_snippet(
+    *,
+    path: Path,
+    figure_path: Path,
+    rq1_root: Path,
+    subsection: str,
+    caption: str,
+    placement: str,
+) -> None:
+    color_lines = [
+        f"\\providecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
+        for role, hex_color in THESIS_PALETTE.items()
+    ]
+    lines = [
+        r"% Requires: \usepackage{graphicx}",
+        r"% Requires: \usepackage{xcolor}",
+        r"% Palette mirrored from src/energy_trading/visualization/style.py:",
+        *color_lines,
+        r"% Override this once in the thesis preamble if the figures are copied elsewhere.",
+        r"\providecommand{\rqonefigroot}{artifacts/final_benchmark}",
+        rf"\begin{{figure}}[{placement}]",
+        r"    \centering",
+        rf"    \includegraphics[width=\textwidth,height=0.82\textheight,keepaspectratio]{{{_latex_figure_path(rq1_root, figure_path)}}}",
+        f"    \\caption{{{_latex_escape(caption)}}}",
+        f"    \\label{{{_latex_figure_label(subsection, figure_path)}}}",
+        r"\end{figure}",
+        "",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _add_latex_figure_snippets(entries: list[dict[str, Any]], *, rq1_root: Path) -> None:
+    figure_entries = [
+        entry
+        for entry in list(entries)
+        if entry.get("artifact_type") == "figure"
+        and entry.get("tier") in {"result_section", "appendix"}
+        and Path(str(entry.get("path", ""))).suffix.lower() in {".png", ".pdf"}
+    ]
+    for entry in figure_entries:
+        figure_path = Path(str(entry["path"]))
+        if not figure_path.exists():
+            continue
+        tier = str(entry["tier"])
+        subsection = str(entry["subsection"])
+        subsection_dir = rq1_root / SUBSECTIONS[subsection]
+        figure_rel = figure_path.relative_to(subsection_dir / tier / "figures")
+        snippet_rel = figure_rel.with_suffix(".tex")
+        snippet_path = subsection_dir / tier / "latex_figures" / snippet_rel
+        _write_latex_figure_snippet(
+            path=snippet_path,
+            figure_path=figure_path,
+            rq1_root=rq1_root,
+            subsection=subsection,
+            caption=str(entry.get("brief_description", figure_path.stem.replace("_", " "))),
+            placement="htbp" if tier == "result_section" else "p",
+        )
+        entries.append(
+            {
+                "subsection": subsection,
+                "tier": tier,
+                "artifact_type": "latex_figure",
+                "path": str(snippet_path),
+                "metric_family": entry.get("metric_family", "figure"),
+                "thesis_use": "copy-paste figure code",
+                "brief_description": f"LaTeX includegraphics snippet for {figure_path.name}.",
+            }
+        )
+
+
+def organize(*, final_root: Path, rq1_root: Path, split: str, prune_legacy: bool = False) -> dict[str, Any]:
     _ensure_structure(rq1_root)
     entries: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -371,31 +604,39 @@ def organize(*, final_root: Path, rq1_root: Path, split: str) -> dict[str, Any]:
         if miss is not None:
             missing.append(miss)
     _add_derived_tables(entries, missing, rq1_root=rq1_root, split=split)
+    _add_example_week_outputs(entries, missing, final_root=final_root, rq1_root=rq1_root)
+    _add_latex_figure_snippets(entries, rq1_root=rq1_root)
+    removed = prune_legacy_outputs(rq1_root=rq1_root, final_root=final_root) if prune_legacy else []
     manifest = {
         "description": "Organized RQ1 thesis benchmark output manifest.",
         "split": split,
         "root": str(rq1_root),
         "outputs": sorted(entries, key=lambda r: (r["subsection"], r["tier"], r["artifact_type"], r["path"])),
         "missing_outputs": sorted(missing, key=lambda r: (r["subsection"], r["tier"], r["artifact_type"], r["path"])),
+        "removed_legacy_outputs": removed,
     }
     manifest_path = rq1_root / "rq1_output_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     missing_path = rq1_root / "rq1_output_missing.csv"
-    pd.DataFrame(missing).to_csv(missing_path, index=False)
+    if missing:
+        pd.DataFrame(missing).to_csv(missing_path, index=False)
+    elif missing_path.exists():
+        missing_path.unlink()
     return manifest
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Organize final RQ1 outputs into thesis-facing tiers.")
     p.add_argument("--final-root", default="artifacts/final_benchmark")
-    p.add_argument("--rq1-root", default="artifacts/final_benchmark/rq1")
+    p.add_argument("--rq1-root", default="artifacts/final_benchmark")
     p.add_argument("--split", default="test")
+    p.add_argument("--prune-legacy", action="store_true", help="Remove known generated legacy/unstructured copies after organizing.")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    manifest = organize(final_root=Path(args.final_root), rq1_root=Path(args.rq1_root), split=str(args.split))
+    manifest = organize(final_root=Path(args.final_root), rq1_root=Path(args.rq1_root), split=str(args.split), prune_legacy=bool(args.prune_legacy))
     print(f"[OK] Organized RQ1 outputs: {Path(args.rq1_root) / 'rq1_output_manifest.json'}")
     print(f"[OK] outputs={len(manifest['outputs'])} missing={len(manifest['missing_outputs'])}")
     return 0

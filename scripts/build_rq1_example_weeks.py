@@ -387,7 +387,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build RQ1 example-week forecast figures.")
     p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/rq1/4_1_7_example_weeks")
+    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_7_example_weeks")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
     p.add_argument("--targets", default="", help="Optional comma-separated prediction targets. Default: all common targets.")

@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run implemented RQ1 thesis analyses.")
     p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/rq1")
+    p.add_argument("--out-dir", default="artifacts/final_benchmark")
     p.add_argument("--split", default=DEFAULT_SPLIT, help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -93,11 +93,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
+    work_dir = out_dir / "_raw_outputs"
     full_dir = out_dir / "4_1_1_full_unweighted"
     calibration_dir = out_dir / "4_1_2_calibration_uncertainty"
     per_lead_dir = out_dir / "4_1_3_per_lead"
     gate_dir = out_dir / "4_1_4_gate_specific"
     tail_dir = out_dir / "4_1_5_tail_spike"
+    interim_dir = out_dir / "4_1_6_interim_answer"
     example_dir = out_dir / "4_1_7_example_weeks"
     log_dir = out_dir / "logs" / "rq1_wrapper"
     steps: list[dict[str, Any]] = []
@@ -113,7 +115,7 @@ def main() -> int:
             "scripts/build_final_full_forecast_metrics.py",
             *benchmark_args,
             "--out-dir",
-            str(full_dir),
+            str(work_dir / "4_1_1_full_unweighted"),
             "--split",
             str(args.split),
             "--splits",
@@ -129,7 +131,9 @@ def main() -> int:
             "scripts/build_final_calibration_uncertainty.py",
             *benchmark_args,
             "--out-dir",
-            str(calibration_dir),
+            str(work_dir / "4_1_2_calibration_uncertainty"),
+            "--legacy-flat-out-dir",
+            str(work_dir / "calibration"),
             "--split",
             str(args.split),
             "--splits",
@@ -145,9 +149,9 @@ def main() -> int:
             "scripts/build_final_per_lead_benchmark.py",
             *benchmark_args,
             "--out-dir",
-            "artifacts/final_benchmark",
+            str(work_dir / "shared"),
             "--structured-out-dir",
-            str(per_lead_dir),
+            str(work_dir / "4_1_3_per_lead"),
             "--split",
             str(args.split),
             "--splits",
@@ -163,9 +167,9 @@ def main() -> int:
             "scripts/build_final_gate_bucket_benchmark.py",
             *benchmark_args,
             "--out-dir",
-            "artifacts/final_benchmark",
+            str(work_dir / "shared"),
             "--structured-out-dir",
-            str(gate_dir),
+            str(work_dir / "4_1_4_gate_specific"),
             "--split",
             str(args.split),
             "--splits",
@@ -181,9 +185,9 @@ def main() -> int:
             "scripts/build_final_tail_spike_benchmark.py",
             *benchmark_args,
             "--out-dir",
-            "artifacts/final_benchmark",
+            str(work_dir / "shared"),
             "--structured-out-dir",
-            str(tail_dir),
+            str(work_dir / "4_1_5_tail_spike"),
             "--split",
             str(args.split),
             "--splits",
@@ -199,7 +203,7 @@ def main() -> int:
             "scripts/build_rq1_example_weeks.py",
             *benchmark_args,
             "--out-dir",
-            str(example_dir),
+            str(work_dir / "4_1_7_example_weeks"),
             "--split",
             str(args.split),
             "--models",
@@ -227,11 +231,12 @@ def main() -> int:
             py,
             "scripts/organize_rq1_outputs.py",
             "--final-root",
-            "artifacts/final_benchmark",
+            str(work_dir),
             "--rq1-root",
             str(out_dir),
             "--split",
             str(args.split),
+            "--prune-legacy",
         ]
         steps.append(_run_step("rq1_output_organization", cmd, log_dir=log_dir))
 
@@ -275,7 +280,7 @@ def main() -> int:
                 "section": "4.1.6",
                 "name": "Interim answer to RQ1",
                 "status": "not_implemented",
-                "output_dir": str(out_dir / "4_1_6_interim_answer"),
+                "output_dir": str(interim_dir),
             },
             {
                 "section": "4.1.7",
@@ -285,79 +290,15 @@ def main() -> int:
             },
         ],
         "steps": steps,
-        "expected_gate_bucket_outputs": [
-            "artifacts/final_benchmark/gate_bucket_metrics.csv",
-            f"artifacts/final_benchmark/gate_bucket_metrics_{args.split}.csv",
-            "artifacts/final_benchmark/gate_bucket_row_counts.csv",
-            "artifacts/final_benchmark/gate_bucket_definitions.csv",
-            "artifacts/final_benchmark/gate_bucket_observed_leads.csv",
-            "artifacts/final_benchmark/gate_bucket_warnings.csv",
-            f"artifacts/final_benchmark/latex/gate_bucket_metrics_{args.split}.tex",
-            "artifacts/final_benchmark/figures/gate_bucket_pinball_by_target_group.png",
-            "artifacts/final_benchmark/figures/gate_bucket_mae_p50_by_target_group.png",
-            "artifacts/final_benchmark/figures/gate_bucket_coverage_p10_p90_by_target_group.png",
-            "artifacts/final_benchmark/figures/gate_bucket_observed_leads.png",
-        ],
-        "expected_tail_spike_outputs": [
-            "artifacts/final_benchmark/tail_spike_metrics.csv",
-            f"artifacts/final_benchmark/tail_spike_metrics_{args.split}.csv",
-            "artifacts/final_benchmark/tail_spike_regime_definitions.csv",
-            "artifacts/final_benchmark/tail_spike_thresholds.csv",
-            "artifacts/final_benchmark/tail_spike_row_counts.csv",
-            "artifacts/final_benchmark/tail_spike_selected_weeks.csv",
-            "artifacts/final_benchmark/tail_spike_warnings.csv",
-            f"artifacts/final_benchmark/latex/tail_spike_metrics_{args.split}.tex",
-            "artifacts/final_benchmark/figures/tail_spike_relative_pinball_by_regime.png",
-            "artifacts/final_benchmark/figures/tail_spike_pinball_by_regime.png",
-            "artifacts/final_benchmark/figures/tail_spike_mae_p50_by_regime.png",
-            "artifacts/final_benchmark/figures/tail_spike_coverage_by_regime.png",
-            "artifacts/final_benchmark/figures/tail_spike_true_vs_p50_hexbin.png",
-            "artifacts/final_benchmark/figures/tail_spike_residual_distribution_by_regime.png",
-        ],
-        "expected_per_lead_outputs": [
-            "artifacts/final_benchmark/per_lead_metrics.csv",
-            f"artifacts/final_benchmark/per_lead_metrics_{args.split}.csv",
-            f"artifacts/final_benchmark/per_lead_range_summary_{args.split}.csv",
-            f"artifacts/final_benchmark/per_lead_row_counts_{args.split}.csv",
-            f"artifacts/final_benchmark/latex/per_lead_range_summary_{args.split}.tex",
-            "artifacts/final_benchmark/figures/per_lead_pinball_da_price.png",
-            "artifacts/final_benchmark/figures/per_lead_pinball_afrr_capacity_price.png",
-            "artifacts/final_benchmark/figures/per_lead_pinball_afrr_activation_price.png",
-            "artifacts/final_benchmark/figures/per_lead_pinball_afrr_activation_rate.png",
-            "artifacts/final_benchmark/figures/per_lead_relative_pinball_da_price.png",
-            "artifacts/final_benchmark/figures/per_lead_relative_pinball_afrr_capacity_price.png",
-            "artifacts/final_benchmark/figures/per_lead_relative_pinball_afrr_activation_price.png",
-            "artifacts/final_benchmark/figures/per_lead_relative_pinball_afrr_activation_rate.png",
-        ],
-        "expected_full_metrics_outputs": [
-            str(full_dir / "csv" / "rq1_4_1_1_forecast_metrics_full_long.csv"),
-            str(full_dir / "csv" / f"rq1_4_1_1_forecast_metrics_full_primary_{args.split}.csv"),
-            str(full_dir / "csv" / f"rq1_4_1_1_forecast_metrics_full_detailed_{args.split}.csv"),
-            str(full_dir / "csv" / f"rq1_4_1_1_forecast_metrics_full_alignment_diagnostics_{args.split}.csv"),
-            str(full_dir / "latex" / f"rq1_4_1_1_forecast_metrics_full_primary_{args.split}.tex"),
-            str(full_dir / "latex" / f"rq1_4_1_1_forecast_metrics_full_detailed_{args.split}.tex"),
-            str(full_dir / "figures" / f"rq1_4_1_1_forecast_metrics_full_relative_pinball_{args.split}.png"),
-        ],
-        "expected_calibration_outputs": [
-            str(calibration_dir / "csv" / "rq1_4_1_2_calibration_quantile_coverage.csv"),
-            str(calibration_dir / "csv" / f"rq1_4_1_2_calibration_quantile_coverage_{args.split}.csv"),
-            str(calibration_dir / "csv" / "rq1_4_1_2_calibration_interval_coverage_width.csv"),
-            str(calibration_dir / "csv" / f"rq1_4_1_2_calibration_interval_coverage_width_{args.split}.csv"),
-            str(calibration_dir / "csv" / "rq1_4_1_2_calibration_quantile_crossing.csv"),
-            str(calibration_dir / "csv" / f"rq1_4_1_2_calibration_quantile_crossing_{args.split}.csv"),
-            str(calibration_dir / "csv" / "rq1_4_1_2_calibration_summary.csv"),
-            str(calibration_dir / "csv" / f"rq1_4_1_2_calibration_summary_{args.split}.csv"),
-            str(calibration_dir / "csv" / "rq1_4_1_2_calibration_row_counts.csv"),
-            str(calibration_dir / "csv" / "rq1_4_1_2_calibration_warnings.csv"),
-            str(calibration_dir / "latex" / f"rq1_4_1_2_calibration_summary_{args.split}.tex"),
-            str(calibration_dir / "latex" / f"rq1_4_1_2_calibration_quantile_coverage_{args.split}_appendix.tex"),
-            str(calibration_dir / "latex" / f"rq1_4_1_2_calibration_interval_quality_{args.split}_appendix.tex"),
-            str(calibration_dir / "latex" / f"rq1_4_1_2_calibration_quantile_crossing_{args.split}_appendix.tex"),
-            str(calibration_dir / "figures" / "rq1_4_1_2_calibration_reliability_by_target_group.png"),
-            str(calibration_dir / "figures" / "rq1_4_1_2_calibration_interval_coverage_by_target_group.png"),
-            str(calibration_dir / "figures" / "rq1_4_1_2_calibration_interval_width_by_target_group.png"),
-            str(calibration_dir / "figures" / "rq1_4_1_2_calibration_quantile_crossing_by_target_group.png"),
-        ],
+        "canonical_output_layout": {
+            "root": str(out_dir),
+            "subsection_tiers": ["result_section", "appendix", "backup"],
+            "artifact_subfolders": {
+                "result_section": ["figures", "tables"],
+                "appendix": ["figures", "tables"],
+                "backup": ["csv", "diagnostics", "warnings"],
+            },
+        },
         "expected_example_week_outputs_dir": str(example_dir),
         "organized_manifest": str(out_dir / "rq1_output_manifest.json"),
     }
@@ -365,7 +306,8 @@ def main() -> int:
     for subsection in manifest["subsections"]:
         Path(str(subsection["output_dir"])).mkdir(parents=True, exist_ok=True)
     example_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = out_dir / "rq1_manifest.json"
+    manifest_path = interim_dir / "backup" / "diagnostics" / "rq1_wrapper_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"[OK] RQ1 wrapper complete: {manifest_path}")
     return 0

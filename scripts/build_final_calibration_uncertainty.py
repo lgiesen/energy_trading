@@ -1070,7 +1070,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build final RQ1 calibration and uncertainty-quality outputs.")
     p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/rq1/4_1_2_calibration_uncertainty")
+    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_2_calibration_uncertainty")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -1078,7 +1078,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated splits to load/export. Defaults to test only; --split selects the main reported split.",
     )
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
-    p.add_argument("--legacy-flat-out-dir", default="artifacts/final_benchmark/calibration")
+    p.add_argument("--legacy-flat-out-dir", default="artifacts/final_benchmark/_raw_outputs/calibration")
     p.add_argument("--no-legacy-flat-aliases", action="store_true")
     return p.parse_args()
 
