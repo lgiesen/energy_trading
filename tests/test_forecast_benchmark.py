@@ -76,6 +76,13 @@ def test_approx_crps_monotonic_sanity() -> None:
     assert approx_crps(y, good) < approx_crps(y, bad)
 
 
+def test_approx_crps_falls_back_when_numpy_trapezoid_is_unavailable(monkeypatch) -> None:
+    y = np.array([1.0, 2.0, 3.0])
+    preds = {0.1: np.array([0.9, 1.9, 2.9]), 0.5: np.array([1.0, 2.0, 3.0]), 0.9: np.array([1.1, 2.1, 3.1])}
+    monkeypatch.delattr(np, "trapezoid", raising=False)
+    assert np.isfinite(approx_crps(y, preds))
+
+
 def test_quantile_coverage_known_values() -> None:
     y = np.array([1, 2, 3], dtype=float)
     yq = np.array([2, 2, 2], dtype=float)
@@ -370,7 +377,7 @@ def test_make_figures_creates_forecast_band_examples(tmp_path: Path) -> None:
 
 
 def test_thesis_palette_model_mapping_is_fixed() -> None:
-    assert get_model_color("truth") == THESIS_PALETTE["neutral_dark"]
+    assert get_model_color("truth") == THESIS_PALETTE["perfect_foresight"]
     assert get_model_color("linear") == THESIS_PALETTE["secondary"]
     assert get_model_color("xgb") == THESIS_PALETTE["primary"]
     assert get_model_color("tft") == THESIS_PALETTE["tertiary"]

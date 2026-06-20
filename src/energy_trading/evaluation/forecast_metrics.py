@@ -47,7 +47,12 @@ def approx_crps(y: np.ndarray, q_preds: dict[float, np.ndarray]) -> float:
         return float("nan")
     qs = np.asarray([p[0] for p in pairs], dtype=float)
     ls = np.asarray([p[1] for p in pairs], dtype=float)
-    return float(2.0 * np.trapezoid(ls, qs))
+    trapz_fn = getattr(np, "trapezoid", None)
+    if trapz_fn is None:
+        trapz_fn = getattr(np, "trapz", None)
+    if trapz_fn is None:
+        raise AttributeError("NumPy has neither trapezoid nor trapz; cannot compute CRPS approximation.")
+    return float(2.0 * trapz_fn(ls, qs))
 
 
 def empirical_coverage(y: np.ndarray, yq: np.ndarray) -> float:

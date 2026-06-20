@@ -526,7 +526,26 @@ def run_benchmark(
                     if q_col not in joined.columns:
                         joined[q_col] = np.nan
                 joined_min = joined[
-                    [c for c in ["model", "split", "target", "target_time_utc", "lead_time_h", "y_true", "p10", "p30", "p50", "p70", "p90", "predicted_value"] if c in joined.columns]
+                    [
+                        c
+                        for c in [
+                            "model",
+                            "split",
+                            "target",
+                            "forecast_time_utc",
+                            "snapshot_time_utc",
+                            "target_time_utc",
+                            "lead_time_h",
+                            "y_true",
+                            "p10",
+                            "p30",
+                            "p50",
+                            "p70",
+                            "p90",
+                            "predicted_value",
+                        ]
+                        if c in joined.columns
+                    ]
                 ].copy()
                 if save_joined_predictions:
                     joined_min.to_parquet(joined_diag_dir / f"{model}__{split}__{target}.parquet", index=False)

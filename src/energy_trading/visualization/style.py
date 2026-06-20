@@ -53,7 +53,7 @@ THESIS_PALETTE: Dict[str, str] = {
 
 # Fixed semantic mapping for thesis figures.
 MODEL_COLOR_MAP: Dict[str, str] = {
-    "truth": THESIS_PALETTE["neutral_dark"],
+    "truth": THESIS_PALETTE["perfect_foresight"],
     "linear": THESIS_PALETTE["secondary"],
     "xgb": THESIS_PALETTE["primary"],
     "tft": THESIS_PALETTE["tertiary"],
