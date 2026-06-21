@@ -1140,61 +1140,176 @@ def _write_tail_spike_relative_tex(
     label: str,
     placement: str = "htbp",
 ) -> Path | None:
-    root = path.parents[2]
-    figure_dir = root / "result_section" / "figures"
     latex_dir = path.parent
-    price_capacity_png = figure_dir / "tail_spike_relative_pinball_by_regime_price_capacity.png"
-    activation_png = figure_dir / "tail_spike_relative_pinball_by_regime_activation.png"
-    available = {
-        "price_capacity": price_capacity_png.exists(),
-        "activation": activation_png.exists(),
-    }
-    if not any(available.values()):
+    required = {"target_label", "regime", "model_label", "mean_pinball_loss"}
+    if data.empty or not required.issubset(data.columns):
         return None
 
     thesis_root = "figures/4-results/rq1_ml_model_benchmark/4_1_5_tail_spike/result_section"
 
-    def _include_file(
+    def _relative_frame(target_labels: list[str]) -> pd.DataFrame:
+        d = data.copy()
+        d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+        d = d.dropna(subset=["mean_pinball_loss"])
+        d = d[d["target_label"].astype(str).isin(target_labels)].copy()
+        if d.empty:
+            return pd.DataFrame()
+        rows: list[pd.DataFrame] = []
+        for target_label in target_labels:
+            regimes = TAIL_SPIKE_MAIN_REGIMES_BY_TARGET.get(target_label, [])
+            part = d[d["target_label"].astype(str).eq(target_label) & d["regime"].astype(str).isin(regimes)].copy()
+            if part.empty:
+                continue
+            part["_target_order"] = target_labels.index(target_label)
+            part["_regime_order"] = part["regime"].astype(str).map({regime: i for i, regime in enumerate(regimes)}).fillna(99)
+            rows.append(part)
+        if not rows:
+            return pd.DataFrame()
+        main = pd.concat(rows, ignore_index=True)
+        pivot = main.pivot_table(
+            index=["target_label", "regime", "_target_order", "_regime_order"],
+            columns="model_label",
+            values="mean_pinball_loss",
+            aggfunc="mean",
+        ).reset_index()
+        if "RLQR" not in pivot.columns:
+            return pd.DataFrame()
+        out_rows: list[dict[str, Any]] = []
+        for _, row in pivot.iterrows():
+            base = pd.to_numeric(pd.Series([row.get("RLQR")]), errors="coerce").iloc[0]
+            if not np.isfinite(base) or abs(base) <= 1e-12:
+                continue
+            for model in ["XGB", "TFT"]:
+                value = pd.to_numeric(pd.Series([row.get(model)]), errors="coerce").iloc[0]
+                if not np.isfinite(value):
+                    continue
+                out_rows.append(
+                    {
+                        "target_label": str(row["target_label"]),
+                        "regime": str(row["regime"]),
+                        "model_label": model,
+                        "relative_pinball": value / base,
+                        "_target_order": int(row["_target_order"]),
+                        "_regime_order": float(row["_regime_order"]),
+                    }
+                )
+        rel = pd.DataFrame(out_rows)
+        if rel.empty:
+            return rel
+        return rel.sort_values(["_target_order", "_regime_order", "model_label"]).reset_index(drop=True)
+
+    def _write_native_file(
         filename: str,
         *,
-        image_name: str,
+        target_labels: list[str],
         figure_caption: str,
         short_caption: str,
         figure_label: str,
-    ) -> Path:
+    ) -> Path | None:
         out = latex_dir / filename
+        rel = _relative_frame(target_labels)
+        if rel.empty:
+            return None
+        present_targets = [target for target in target_labels if target in set(rel["target_label"])]
+        group_cols = 1
+        group_rows = len(present_targets)
+        height = "4.0cm" if group_rows <= 3 else "3.45cm"
+        x_max_value = pd.to_numeric(rel["relative_pinball"], errors="coerce").max()
+        xmax = max(1.35, float(x_max_value) * 1.12) if np.isfinite(x_max_value) else 1.35
+        legend_entries = ["RLQR baseline", "XGB", "TFT"]
         lines = [
-            r"\begin{figure}[htbp]",
+            r"% Requires: \usepackage{pgfplots}",
+            r"% Requires: \usepackage{xcolor}",
+            r"% Requires: \usepgfplotslibrary{groupplots}",
+            r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+            *_latex_color_defs(),
+            rf"\begin{{figure}}[{placement}]",
             r"    \centering",
-            rf"    \includegraphics[width=\linewidth]{{{thesis_root}/figures/{image_name}}}",
-            f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
-            f"    \\label{{{figure_label}}}",
-            r"\end{figure}",
-            "",
+            r"    \resizebox{\linewidth}{!}{%",
+            r"        \begin{tikzpicture}",
+            r"            \begin{groupplot}[",
+            rf"                group style={{group size={group_cols} by {group_rows}, horizontal sep=1.10cm, vertical sep=1.20cm}},",
+            r"                width=0.96\textwidth,",
+            rf"                height={height},",
+            r"                xmin=0,",
+            rf"                xmax={_tex_num(xmax)},",
+            r"                xlabel={Mean pinball loss relative to RLQR},",
+            r"                axis lines*=left,",
+            r"                grid=major,",
+            r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+            r"                legend cell align={left},",
+            r"                area legend,",
+            r"            ]",
         ]
-        return _write_lines(out, lines)
+        for panel_i, target_label in enumerate(present_targets):
+            panel = rel[rel["target_label"].eq(target_label)].copy()
+            regimes = TAIL_SPIKE_MAIN_REGIMES_BY_TARGET.get(target_label, [])
+            regime_order = [regime for regime in regimes if regime in set(panel["regime"])]
+            y_labels = [_tail_spike_regime_label(regime) for regime in regime_order]
+            y_symbols = [_tex_symbol(label) for label in y_labels]
+            panel_title = _latex_escape(thesis_titlecase(_tail_spike_target_label(target_label))).replace(r"\$-\$", r"$-$")
+            panel_lines = [
+                rf"                \nextgroupplot[title={{{panel_title}}},",
+                r"                    xbar,",
+                r"                    bar width=8pt,",
+                "                    symbolic y coords={" + ",".join(y_symbols) + "},",
+                "                    ytick={" + ",".join(y_symbols) + "},",
+                "                    yticklabels={" + ",".join(_latex_escape(label) for label in y_labels) + "},",
+                r"                    y dir=reverse,",
+                r"                ]",
+            ]
+            if y_symbols:
+                panel_lines.append(rf"                    \draw[color=neutraldark, densely dotted, line width=1.2pt, shorten <=-6mm, shorten >=-6mm] (axis cs:1,{y_symbols[0]}) -- (axis cs:1,{y_symbols[-1]});")
+            if panel_i == 0:
+                panel_lines.append(r"                    \addlegendimage{color=neutraldark, densely dotted, line width=1.2pt}")
+            lines.extend(panel_lines)
+            for model, shift in [("XGB", "-4pt"), ("TFT", "4pt")]:
+                color = _model_color_role(model)
+                coords: list[str] = []
+                model_data = panel[panel["model_label"].eq(model)].copy()
+                for regime, y_symbol in zip(regime_order, y_symbols):
+                    match = model_data[model_data["regime"].eq(regime)]
+                    if match.empty:
+                        continue
+                    value = pd.to_numeric(pd.Series([match["relative_pinball"].iloc[0]]), errors="coerce").iloc[0]
+                    if np.isfinite(value):
+                        coords.append(f"({_tex_num(value)},{y_symbol})")
+                if coords:
+                    lines.append(rf"                    \addplot[xbar, bar shift={shift}, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+        lines.append("                \\legend{" + ",".join(_latex_escape(entry) for entry in legend_entries) + "}")
+        lines.extend(
+            [
+                r"            \end{groupplot}",
+                r"        \end{tikzpicture}}",
+                f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
+                f"    \\label{{{figure_label}}}",
+                r"\end{figure}",
+                "",
+            ]
+        )
+        return _write_lines(out, [line for line in lines if line != ""])
 
     written: list[Path] = []
-    if available["price_capacity"]:
-        written.append(
-            _include_file(
-                "tail_spike_relative_pinball_by_regime_price_capacity.tex",
-                image_name="tail_spike_relative_pinball_by_regime_price_capacity.png",
-                figure_caption="Tail and spike performance for DA and aFRR capacity price forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
-                short_caption="Tail and spike performance: DA and aFRR capacity price",
-                figure_label="fig:tail_spike_relative_pinball_price_capacity",
-            )
-        )
-    if available["activation"]:
-        written.append(
-            _include_file(
-                "tail_spike_relative_pinball_by_regime_activation.tex",
-                image_name="tail_spike_relative_pinball_by_regime_activation.png",
-                figure_caption="Tail and spike performance for aFRR activation forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
-                short_caption="Tail and spike performance: aFRR activation",
-                figure_label="fig:tail_spike_relative_pinball_activation",
-            )
-        )
+    price_capacity = _write_native_file(
+        "tail_spike_relative_pinball_by_regime_price_capacity.tex",
+        target_labels=TAIL_SPIKE_PRICE_CAPACITY_TARGETS,
+        figure_caption="Tail and spike performance for DA and aFRR capacity price forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+        short_caption="Tail and spike performance: DA and aFRR capacity price",
+        figure_label="fig:tail_spike_relative_pinball_price_capacity",
+    )
+    if price_capacity is not None and price_capacity.exists():
+        written.append(price_capacity)
+    activation = _write_native_file(
+        "tail_spike_relative_pinball_by_regime_activation.tex",
+        target_labels=TAIL_SPIKE_ACTIVATION_TARGETS,
+        figure_caption="Tail and spike performance for aFRR activation forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+        short_caption="Tail and spike performance: aFRR activation",
+        figure_label="fig:tail_spike_relative_pinball_activation",
+    )
+    if activation is not None and activation.exists():
+        written.append(activation)
+    if not written:
+        return None
 
     wrapper_lines = [
         rf"\input{{{thesis_root}/latex_figures/{p.name}}}"
@@ -1958,8 +2073,8 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 description="LaTeX wrapper for split tail/spike relative pinball figures.",
             )
             for split_name, description in [
-                ("tail_spike_relative_pinball_by_regime_price_capacity.tex", "LaTeX includegraphics snippet for DA and aFRR capacity tail/spike relative pinball figure."),
-                ("tail_spike_relative_pinball_by_regime_activation.tex", "LaTeX includegraphics snippet for aFRR activation tail/spike relative pinball figure."),
+                ("tail_spike_relative_pinball_by_regime_price_capacity.tex", "Native pgfplots DA and aFRR capacity tail/spike relative pinball figure."),
+                ("tail_spike_relative_pinball_by_regime_activation.tex", "Native pgfplots aFRR activation tail/spike relative pinball figure."),
             ]:
                 split_path = path.parent / split_name
                 if split_path.exists():
@@ -1984,17 +2099,12 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
 
 
 def _prune_latex_figure_imports(rq1_root: Path) -> None:
-    keep_includegraphics = {
-        "tail_spike_relative_pinball_by_regime.tex",
-        "tail_spike_relative_pinball_by_regime_price_capacity.tex",
-        "tail_spike_relative_pinball_by_regime_activation.tex",
-    }
     for tex in rq1_root.rglob("*.tex"):
         if "latex_figures" not in tex.parts:
             continue
         if "4_1_6_example_weeks" in tex.parts:
             continue
-        if tex.name.endswith("_p50_absolute_error_tolerance_curve.tex") or tex.name in keep_includegraphics:
+        if tex.name.endswith("_p50_absolute_error_tolerance_curve.tex"):
             continue
         if tex.read_text(encoding="utf-8", errors="ignore").find(r"\includegraphics") >= 0:
             tex.unlink()

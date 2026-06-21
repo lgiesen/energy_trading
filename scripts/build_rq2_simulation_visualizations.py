@@ -43,6 +43,20 @@ DEFAULT_FORECAST_BENCHMARK_DIR = Path("artifacts/benchmark/rq1_ml_model_benchmar
 DEFAULT_MODELS = ("linear", "xgb", "tft")
 DEFAULT_QUANTILES = ("p10", "p30", "p50", "p70", "p90")
 TRUTH_REFERENCE_COLOR = "#000000"
+MONTH_ABBR_FULL = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
+}
 MODEL_LABELS = {"linear": "RLQR", "xgb": "XGB", "tft": "TFT"}
 MODEL_ORDER = ["RLQR", "XGB", "TFT"]
 BENCHMARK_ORDER = ["Naive", "RHPF"]
@@ -1100,7 +1114,7 @@ def plot_profit_by_quantile(table: pd.DataFrame, bench: pd.DataFrame, out_base: 
         ax.axhline(value, color=color, linestyle="--", linewidth=1.8, label=f"{benchmark} benchmark")
     ax.set_xticks(x)
     ax.set_xticklabels(table["quantile"].astype(str).tolist())
-    ax.set_ylabel("Annualized Net Profit (EUR/year)")
+    ax.set_ylabel("Annualized Net Profit")
     ax.set_xlabel("Quantile policy")
     ax.set_title("Net Profit by Model and Quantile")
     ax.text(0.0, 1.02, f"Multi-market strategy, annualized from {run_name}. Higher is better.", transform=ax.transAxes, fontsize=9)
@@ -1114,20 +1128,24 @@ def plot_profit_by_quantile(table: pd.DataFrame, bench: pd.DataFrame, out_base: 
 def plot_heatmap(table: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.ticker import StrMethodFormatter
 
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(9.4, 4.9))
     rows = ["Naive", "RHPF", *MODEL_ORDER]
     quantiles = table["quantile"].astype(str).tolist()
     pivot = table.set_index("quantile").reindex(quantiles)[rows].T
-    arr = pivot.to_numpy(dtype=float)
-    masked = np.ma.masked_invalid(arr)
+    pivot_k = pivot / 1000.0
+    arr_k = pivot_k.to_numpy(dtype=float)
+    masked = np.ma.masked_invalid(arr_k)
     cmap = LinearSegmentedColormap.from_list(
         "geo_sequential_blue",
         [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)],
     )
     cmap.set_bad("#F2F2F2")
     im = ax.imshow(masked, aspect="auto", cmap=cmap)
+    ax.grid(False)
+    ax.tick_params(which="minor", bottom=False, left=False)
     ax.set_xticks(np.arange(len(quantiles)))
     ax.set_xticklabels(quantiles)
     ax.set_yticks(np.arange(len(rows)))
@@ -1142,7 +1160,9 @@ def plot_heatmap(table: pd.DataFrame, out_base: Path, formats: list[str]) -> lis
             text_color = "white" if model == "RHPF" else THESIS_PALETTE["neutral_dark"]
             ax.text(j, i, txt, ha="center", va="center", color=text_color, fontsize=9)
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Annualized Net Profit (EUR/year)")
+    cbar.ax.grid(False)
+    cbar.ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    cbar.set_label("Annualized Net Profit (kEUR/year)")
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
@@ -1155,42 +1175,75 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(11.0, 5.8))
     x = np.arange(len(quantiles))
+    x_by_quantile = {q: i for i, q in enumerate(quantiles)}
     marker_by_model = {"Naive": "D", "RHPF": "X", "RLQR": "o", "XGB": "s", "TFT": "^"}
     color_by_model = {
         "Naive": THESIS_PALETTE["naive"],
-        "RHPF": THESIS_PALETTE["perfect_foresight"],
+        "RHPF": TRUTH_REFERENCE_COLOR,
         "RLQR": get_model_color("linear"),
         "XGB": get_model_color("xgb"),
         "TFT": get_model_color("tft"),
     }
-    linestyle_by_model = {"Naive": "--", "RHPF": "--", "RLQR": "-", "XGB": "-", "TFT": "-"}
-    label_offsets = {"Naive": 6, "RHPF": -12, "RLQR": 6, "XGB": 6, "TFT": 6}
+    linestyle_by_model = {"RLQR": "-", "XGB": "-", "TFT": "-"}
+
+    def _label_offset(model: str, quantile: str) -> int:
+        if model == "RLQR" and quantile == "p50":
+            return -16
+        if model == "XGB" and quantile == "p90":
+            return -16
+        if model == "Naive":
+            return -14
+        if model == "RHPF":
+            return 8
+        return 8
+
     for model in ["Naive", "RHPF", *MODEL_ORDER]:
         g = sweep_data.loc[sweep_data["series"].astype(str).eq(model)].copy()
         if g.empty:
             continue
-        values = []
-        for q in quantiles:
+        if model in BENCHMARK_ORDER:
+            q = "p50" if "p50" in x_by_quantile else quantiles[len(quantiles) // 2]
             match = g.loc[g["quantile"].astype(str).eq(q)]
-            values.append(_safe_float(match["annualized_net_profit_eur_per_year"].iloc[0]) if not match.empty else np.nan)
-        values_arr = np.asarray(values, dtype=float)
-        ax.plot(
-            x,
-            values_arr,
-            marker=marker_by_model[model],
-            linewidth=2.0,
-            linestyle=linestyle_by_model[model],
-            label=model if model not in BENCHMARK_ORDER else f"{model} benchmark",
-            color=color_by_model[model],
-        )
-        for xi, yi in zip(x, values_arr):
+            if match.empty:
+                match = g.head(1)
+            plot_x = np.asarray([x_by_quantile.get(q, len(quantiles) // 2)], dtype=float)
+            values_arr = np.asarray([_safe_float(match["annualized_net_profit_eur_per_year"].iloc[0])], dtype=float)
+            ax.scatter(
+                plot_x,
+                values_arr,
+                marker=marker_by_model[model],
+                s=58,
+                label=f"{model} benchmark",
+                color=color_by_model[model],
+                zorder=4,
+            )
+            plot_quantiles = [q]
+        else:
+            values = []
+            for q in quantiles:
+                match = g.loc[g["quantile"].astype(str).eq(q)]
+                values.append(_safe_float(match["annualized_net_profit_eur_per_year"].iloc[0]) if not match.empty else np.nan)
+            values_arr = np.asarray(values, dtype=float)
+            plot_x = x
+            plot_quantiles = quantiles
+            ax.plot(
+                plot_x,
+                values_arr,
+                marker=marker_by_model[model],
+                linewidth=2.0,
+                linestyle=linestyle_by_model[model],
+                label=model,
+                color=color_by_model[model],
+                zorder=3,
+            )
+        for xi, yi, q in zip(plot_x, values_arr, plot_quantiles):
             if not math.isfinite(float(yi)):
                 continue
             ax.annotate(
                 f"€{yi/1000:,.0f}k",
                 (xi, yi),
                 textcoords="offset points",
-                xytext=(0, label_offsets[model]),
+                xytext=(0, _label_offset(model, q)),
                 ha="center",
                 fontsize=8,
                 color=THESIS_PALETTE["neutral_dark"],
@@ -1199,16 +1252,9 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
     ax.set_xticklabels(quantiles)
     ax.set_ylabel("Annualized Net Profit (EUR/year)")
     ax.set_xlabel("Quantile policy")
-    ax.set_title("Quantile Sweep: Net Profit by Model")
-    ax.text(
-        0.0,
-        1.02,
-        f"All numeric model/benchmark rows, annualized from {run_name}. Validity flags are reported in the source CSV.",
-        transform=ax.transAxes,
-        fontsize=9,
-    )
-    ax.legend(ncol=3, loc="best")
-    fig.tight_layout()
+    ax.set_title("Quantile Sweep: Net Profit by Model", pad=14)
+    ax.legend(ncol=5, loc="upper center", bbox_to_anchor=(0.5, -0.16), frameon=True)
+    fig.tight_layout(rect=(0, 0.12, 1, 1))
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
     return written
@@ -1278,15 +1324,17 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     ax.set_xticklabels([f"{m}\n{q}" if q else m for m, q in zip(models, best_quantiles)])
     ax.set_ylabel("Annualized component value (EUR/year)")
     ax.set_xlabel("Model and best quantile")
-    ax.set_title("RQ2 Revenue and Cost Components at Best Quantile")
-    ax.text(
-        0.0,
-        1.02,
-        f"Best numeric quantile per model, annualized from {run_name}. Costs are plotted below zero; validity flags are reported in the source CSV.",
-        transform=ax.transAxes,
-        fontsize=9,
-    )
-    ax.legend(ncol=2, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    ax.set_title("RQ2 Revenue and Cost Components at Best Quantile", pad=12)
+    handles, labels = ax.get_legend_handles_labels()
+    handle_by_label = dict(zip(labels, handles))
+    revenue_labels = [label for label in component_order if label not in {display for _col, display in COMPONENT_COLUMNS if _col in COMPONENT_COST_COLUMNS}]
+    cost_labels = [label for _col, label in COMPONENT_COLUMNS if _col in COMPONENT_COST_COLUMNS and label in handle_by_label]
+    from matplotlib.patches import Patch
+
+    spacer_count = max(0, len(cost_labels) - len(revenue_labels))
+    legend_labels = revenue_labels + [" "] * spacer_count + cost_labels
+    legend_handles = [handle_by_label[label] if label in handle_by_label else Patch(facecolor="none", edgecolor="none") for label in legend_labels]
+    ax.legend(legend_handles, legend_labels, ncol=2, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
@@ -1390,19 +1438,20 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     ax2.spines["right"].set_visible(True)
     ax2.spines["right"].set_color(THESIS_PALETTE["perfect_foresight"])
     ax2.spines["right"].set_linewidth(1.0)
-    pnl = (
+    pnl_keur = (
         data[["timestamp_utc", "cumulative_pnl_eur"]]
         .drop_duplicates("timestamp_utc")
         .sort_values("timestamp_utc")
         .set_index("timestamp_utc")
         .reindex(times)["cumulative_pnl_eur"]
         .to_numpy(dtype=float)
+        / 1000.0
     )
     pnl_color = GEO_SEQUENTIAL_BLUE["seq_7"]
     ax3 = ax.twinx()
     ax3.spines["right"].set_position(("axes", 1.08))
-    ax3.plot(x, pnl, color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit")
-    ax3.set_ylabel("Cumulative Net Profit (EUR)")
+    ax3.plot(x, pnl_keur, color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit")
+    ax3.set_ylabel("Cumulative Net Profit (k€)")
     ax3.tick_params(axis="y", colors=pnl_color)
     ax3.spines["right"].set_visible(True)
     ax3.spines["right"].set_color(pnl_color)
@@ -1414,30 +1463,31 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     ax3.grid(False)
     ax.set_axisbelow(True)
     ax.set_ylim(-10, 10)
+    if len(x) > 0:
+        ax.set_xlim(0, len(x) - 1)
     ax.set_ylabel("Power (MW): charge (+), discharge (-)")
-    ax.set_xlabel("Time")
+    selected_date = pd.Timestamp(times[0]).date() if times else None
+    selected_date_label = f"{selected_date.day} {MONTH_ABBR_FULL[selected_date.month]} {selected_date.year}" if selected_date is not None else ""
+    ax.set_xlabel(f"Time ({selected_date_label})" if selected_date_label else "Time")
     labels = [pd.Timestamp(ts).strftime("%H:%M") for ts in times]
     ax.set_xticks(x[:: max(1, len(x) // 8)])
     ax.set_xticklabels(labels[:: max(1, len(x) // 8)])
-    selected_day = str(pd.Timestamp(times[0]).date()) if times else ""
-    fig.suptitle("Market Dispatch and SoC on Selected Day", y=0.98)
-    ax.set_title(
-        f"TFT p90 multi-market dispatch on {selected_day}. Charging actions are above zero; discharging actions are below zero.",
-        fontsize=9,
-        loc="left",
-        pad=10,
-    )
+    fig.suptitle("Exemplary Trading Day with TFT p90 and a Multi-Market Strategy", y=0.98)
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
     legend_components = ["DA buy", "BEM negative activation", "BCM negative activation"]
-    handles = [Patch(facecolor=color_map[component], edgecolor="none", label=label_map[component]) for component in legend_components]
-    handles.extend(
-        [
-            Line2D([0], [0], color=THESIS_PALETTE["perfect_foresight"], linewidth=2.2, label="SoC"),
-            Line2D([0], [0], color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit"),
-        ]
-    )
+    blank = Patch(facecolor="none", edgecolor="none", label=" ")
+    handles = [
+        Patch(facecolor=color_map["DA buy"], edgecolor="none", label=label_map["DA buy"]),
+        blank,
+        Patch(facecolor=color_map["BEM negative activation"], edgecolor="none", label=label_map["BEM negative activation"]),
+        Patch(facecolor=color_map["BCM negative activation"], edgecolor="none", label=label_map["BCM negative activation"]),
+        blank,
+        blank,
+        Line2D([0], [0], color=THESIS_PALETTE["perfect_foresight"], linewidth=2.2, label="SoC"),
+        Line2D([0], [0], color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit"),
+    ]
     ax.legend(handles=handles, ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.15), frameon=True)
     fig.tight_layout(rect=(0, 0, 0.94, 0.94))
     written = _save_figure(fig, out_base, formats)
@@ -1447,6 +1497,7 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
 
 def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[str], run_name: str) -> list[Path]:
     import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
 
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(11.2, 5.8))
@@ -1486,24 +1537,19 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
         label = group["series"].iloc[0]
         ax.plot(
             group["timestamp_utc"],
-            group["cum_pnl_eur"],
+            pd.to_numeric(group["cum_pnl_eur"], errors="coerce") / 1000.0,
             label=label,
             color=color_map.get(model, THESIS_PALETTE["neutral_dark"]),
             linestyle=line_style.get(model, "-"),
             linewidth=2.2 if model not in BENCHMARK_ORDER else 1.9,
         )
-    ax.set_ylabel("Cumulative Net Profit (EUR)")
-    ax.set_xlabel("Time")
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.set_ylabel("Cumulative Net Profit (kEUR)")
+    ax.set_xlabel("Time (2025)")
     ax.set_title("Cumulative Net Profit: Model Comparison Over Test Period")
-    ax.text(
-        0.0,
-        1.02,
-        f"Best numeric quantile per model, from {run_name}. Validity flags are reported in the source CSV.",
-        transform=ax.transAxes,
-        fontsize=9,
-    )
     ax.legend(ncol=3, loc="best")
-    fig.autofmt_xdate(rotation=0)
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
@@ -1518,6 +1564,8 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
     color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
     marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
     for target, label in TARGET_LABELS.items():
+        if target == "pred_da_price":
+            continue
         slug = TARGET_SLUGS[target]
         df = scatter_data.loc[scatter_data.get("target", pd.Series(dtype=str)).astype(str).eq(target)].copy() if not scatter_data.empty else pd.DataFrame()
         fig, ax = plt.subplots(figsize=(8.2, 5.6))
@@ -1538,9 +1586,10 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
                 g = df.loc[df["model"].eq(model)].copy()
                 if g.empty:
                     continue
+                y_k = pd.to_numeric(g["annualized_profit_eur_per_year"], errors="coerce") / 1000.0
                 ax.scatter(
                     g["mean_pinball_loss"],
-                    g["annualized_profit_eur_per_year"],
+                    y_k,
                     label=model,
                     color=color_map[model],
                     marker=marker_map[model],
@@ -1552,19 +1601,114 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
                 for _, row in g.iterrows():
                     ax.annotate(
                         str(row["quantile"]),
-                        (row["mean_pinball_loss"], row["annualized_profit_eur_per_year"]),
+                        (row["mean_pinball_loss"], _safe_float(row["annualized_profit_eur_per_year"]) / 1000.0),
                         textcoords="offset points",
                         xytext=(4, 3),
                         fontsize=8,
                         color=THESIS_PALETTE["neutral_dark"],
                     )
             ax.set_xlabel("Mean pinball loss")
-            ax.set_ylabel("Annualized Net Profit (EUR/year)")
+            ax.set_ylabel("Annualized Net Profit (k€ / year)")
             ax.legend(title="Model", loc="best")
         ax.set_title(f"RQ2 Pinball Loss vs Net Profit: {label}")
         fig.tight_layout()
         written.extend(_save_figure(fig, figures_dir / f"5_pinball_loss_vs_net_profit_{slug}", formats))
         plt.close(fig)
+    return written
+
+
+def build_normalized_da_price_pinball_profit_data(scatter_data: pd.DataFrame) -> pd.DataFrame:
+    """Normalize DA-price forecast loss and profit to [0, 1] over observed model-quantile rows."""
+    if scatter_data.empty:
+        return pd.DataFrame()
+    df = scatter_data.loc[scatter_data["target"].astype(str).eq("pred_da_price")].copy()
+    if df.empty:
+        return pd.DataFrame()
+    df["mean_pinball_loss"] = pd.to_numeric(df["mean_pinball_loss"], errors="coerce")
+    df["annualized_profit_eur_per_year"] = pd.to_numeric(df["annualized_profit_eur_per_year"], errors="coerce")
+    df = df.dropna(subset=["mean_pinball_loss", "annualized_profit_eur_per_year"]).copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    loss_min = float(df["mean_pinball_loss"].min())
+    loss_max = float(df["mean_pinball_loss"].max())
+    profit_min = float(df["annualized_profit_eur_per_year"].min())
+    profit_max = float(df["annualized_profit_eur_per_year"].max())
+    loss_range = loss_max - loss_min
+    profit_range = profit_max - profit_min
+    df["normalized_forecast_loss"] = 0.0 if math.isclose(loss_range, 0.0) else (df["mean_pinball_loss"] - loss_min) / loss_range
+    df["normalized_annualized_net_profit"] = 0.0 if math.isclose(profit_range, 0.0) else (df["annualized_profit_eur_per_year"] - profit_min) / profit_range
+    df["loss_min_observed"] = loss_min
+    df["loss_max_observed"] = loss_max
+    df["profit_min_observed_eur_per_year"] = profit_min
+    df["profit_max_observed_eur_per_year"] = profit_max
+    return df
+
+
+def plot_normalized_da_price_pinball_profit_scatter(normalized_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(8.2, 5.6))
+    color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
+    marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
+    if normalized_data.empty:
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+            "No normalized DA-price pinball-loss / Net Profit data available.",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color=THESIS_PALETTE["neutral_dark"],
+            wrap=True,
+        )
+    else:
+        ax.plot(
+            [0.0, 1.0],
+            [1.0, 0.0],
+            color=THESIS_PALETTE["naive"],
+            linestyle="--",
+            linewidth=1.3,
+            alpha=0.8,
+            label="Idealized lower-loss / higher-profit relationship",
+            zorder=1,
+        )
+        for model in MODEL_ORDER:
+            g = normalized_data.loc[normalized_data["model"].eq(model)].copy()
+            if g.empty:
+                continue
+            ax.scatter(
+                g["normalized_forecast_loss"],
+                g["normalized_annualized_net_profit"],
+                label=model,
+                color=color_map[model],
+                marker=marker_map[model],
+                s=62,
+                edgecolor="black",
+                linewidth=0.45,
+                alpha=0.92,
+                zorder=3,
+            )
+            for _, row in g.iterrows():
+                ax.annotate(
+                    str(row["quantile"]),
+                    (row["normalized_forecast_loss"], row["normalized_annualized_net_profit"]),
+                    textcoords="offset points",
+                    xytext=(4, 3),
+                    fontsize=8,
+                    color=THESIS_PALETTE["neutral_dark"],
+                )
+        ax.set_xlim(-0.04, 1.04)
+        ax.set_ylim(-0.04, 1.04)
+        ax.set_xlabel("Normalized total mean pinball loss")
+        ax.set_ylabel("Normalized annualized net profit")
+        ax.legend(title="Series", loc="best", fontsize=8)
+    ax.set_title("DA Price: Normalized Forecast Loss vs Net Profit")
+    fig.tight_layout()
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
     return written
 
 
@@ -1592,9 +1736,10 @@ def plot_total_pinball_net_profit_scatter(scatter_data: pd.DataFrame, out_base: 
             g = scatter_data.loc[scatter_data["model"].eq(model)].copy()
             if g.empty:
                 continue
+            y_k = pd.to_numeric(g["annualized_profit_eur_per_year"], errors="coerce") / 1000.0
             ax.scatter(
                 g["mean_pinball_loss"],
-                g["annualized_profit_eur_per_year"],
+                y_k,
                 label=model,
                 color=color_map[model],
                 marker=marker_map[model],
@@ -1606,14 +1751,27 @@ def plot_total_pinball_net_profit_scatter(scatter_data: pd.DataFrame, out_base: 
             for _, row in g.iterrows():
                 ax.annotate(
                     str(row["quantile"]),
-                    (row["mean_pinball_loss"], row["annualized_profit_eur_per_year"]),
+                    (row["mean_pinball_loss"], _safe_float(row["annualized_profit_eur_per_year"]) / 1000.0),
                     textcoords="offset points",
                     xytext=(4, 3),
                     fontsize=8,
                     color=THESIS_PALETTE["neutral_dark"],
                 )
+        xmin, xmax = ax.get_xlim()
+        ymin, ymax = ax.get_ylim()
+        ax.plot(
+            [xmax, xmin],
+            [ymin, ymax],
+            color=THESIS_PALETTE["naive"],
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.75,
+            zorder=1,
+        )
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
         ax.set_xlabel("Total mean pinball loss")
-        ax.set_ylabel("Annualized Net Profit (EUR/year)")
+        ax.set_ylabel("Annualized Net Profit (k€ / year)")
         ax.legend(title="Model", loc="best")
     ax.set_title("Total Mean Pinball Loss vs Net Profit")
     ax.text(
@@ -1649,6 +1807,11 @@ def _write_latex_include(path: Path, figure_rel: str, caption: str, label: str) 
 def _thesis_figure_rel(out_root: Path, figure_name: str) -> str:
     """Return thesis-project include path for a generated result-section figure."""
     return f"figures/4-results/{out_root.name}/result_section/figures/{figure_name}"
+
+
+def _thesis_appendix_figure_rel(out_root: Path, figure_name: str) -> str:
+    """Return thesis-project include path for a generated appendix figure."""
+    return f"figures/4-results/{out_root.name}/appendix/figures/{figure_name}"
 
 
 def _manifest_entry(path: Path, root: Path, tier: str, artifact_type: str, metric_family: str, thesis_use: str, run_root: Path, created: str, days: float, factor: float) -> dict[str, Any]:
@@ -1701,6 +1864,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         split=str(args.split),
         quantiles=quantiles,
     )
+    normalized_da_price_scatter_data = build_normalized_da_price_pinball_profit_data(scatter_data)
     total_scatter_data = build_total_pinball_net_profit_scatter_data(scatter_data)
     dispatch_soc_data, dispatch_soc_warnings = build_market_dispatch_soc_day(summary, run_root=run_root)
 
@@ -1710,7 +1874,9 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     figures_dir = out_root / "result_section/figures"
     tables_dir = out_root / "result_section/tables"
     latex_figures_dir = out_root / "result_section/latex_figures"
+    appendix_figures_dir = out_root / "appendix/figures"
     appendix_tables_dir = out_root / "appendix/tables"
+    appendix_latex_figures_dir = out_root / "appendix/latex_figures"
 
     summary.to_csv(csv_dir / "rq2_scenario_summary_long.csv", index=False)
     table.to_csv(csv_dir / "1_net_profit_by_model_and_quantile.csv", index=False)
@@ -1719,6 +1885,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     component_data.to_csv(csv_dir / "3_revenue_cost_components_best_quantile.csv", index=False)
     cumulative_data.to_csv(csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", index=False)
     scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", index=False)
+    normalized_da_price_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_da_price_normalized.csv", index=False)
     total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", index=False)
     dispatch_soc_data.to_csv(csv_dir / "6_market_dispatch_soc_selected_day.csv", index=False)
     bench.to_csv(csv_dir / "rq2_benchmark_values.csv", index=False)
@@ -1731,15 +1898,17 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
     write_appendix_table(appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", summary)
 
-    figure_paths: list[Path] = []
+    result_figure_paths: list[Path] = []
+    appendix_figure_paths: list[Path] = []
     if formats:
-        figure_paths += plot_net_profit_lines(sweep_data, figures_dir / "2_quantile_sweep_net_profit_by_model", formats, run_root.name, quantiles)
-        figure_paths += plot_best_quantile_components(component_data, figures_dir / "3_revenue_cost_components_best_quantile", formats, run_root.name)
-        figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "4_cumulative_net_profit_model_comparison_test_period", formats, run_root.name)
-        figure_paths += plot_pinball_net_profit_scatter(scatter_data, figures_dir, formats)
-        figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
-        figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
-        figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
+        result_figure_paths += plot_net_profit_lines(sweep_data, figures_dir / "2_quantile_sweep_net_profit_by_model", formats, run_root.name, quantiles)
+        result_figure_paths += plot_best_quantile_components(component_data, figures_dir / "3_revenue_cost_components_best_quantile", formats, run_root.name)
+        result_figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "4_cumulative_net_profit_model_comparison_test_period", formats, run_root.name)
+        appendix_figure_paths += plot_pinball_net_profit_scatter(scatter_data, appendix_figures_dir, formats)
+        result_figure_paths += plot_normalized_da_price_pinball_profit_scatter(normalized_da_price_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_da_price", formats)
+        appendix_figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, appendix_figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
+        result_figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
+        result_figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
         _write_latex_include(
             latex_figures_dir / "2_quantile_sweep_net_profit_by_model.tex",
             _thesis_figure_rel(out_root, "2_quantile_sweep_net_profit_by_model.png"),
@@ -1760,22 +1929,33 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         )
         for target, label in TARGET_LABELS.items():
             slug = TARGET_SLUGS[target]
+            if target == "pred_da_price":
+                caption = (
+                    "Normalized DA-price forecast loss and annualized Net Profit by model and quantile policy. "
+                    "The grey dashed line shows the idealized negative association between lower forecast loss and higher profit."
+                )
+                tex_path = latex_figures_dir / f"5_pinball_loss_vs_net_profit_{slug}.tex"
+                figure_rel = _thesis_figure_rel(out_root, f"5_pinball_loss_vs_net_profit_{slug}.png")
+            else:
+                caption = f"Mean pinball loss and annualized Net Profit for {label.replace('$-$', '-')} by model and quantile policy."
+                tex_path = appendix_latex_figures_dir / f"5_pinball_loss_vs_net_profit_{slug}.tex"
+                figure_rel = _thesis_appendix_figure_rel(out_root, f"5_pinball_loss_vs_net_profit_{slug}.png")
             _write_latex_include(
-                latex_figures_dir / f"5_pinball_loss_vs_net_profit_{slug}.tex",
-                _thesis_figure_rel(out_root, f"5_pinball_loss_vs_net_profit_{slug}.png"),
-                f"Mean pinball loss and annualized Net Profit for {label.replace('$-$', '-')} by model and quantile policy.",
+                tex_path,
+                figure_rel,
+                caption,
                 f"fig:5_pinball_loss_vs_net_profit_{slug}",
             )
         _write_latex_include(
-            latex_figures_dir / "5_pinball_loss_vs_net_profit_total.tex",
-            _thesis_figure_rel(out_root, "5_pinball_loss_vs_net_profit_total.png"),
+            appendix_latex_figures_dir / "5_pinball_loss_vs_net_profit_total.tex",
+            _thesis_appendix_figure_rel(out_root, "5_pinball_loss_vs_net_profit_total.png"),
             "Total mean pinball loss and annualized Net Profit by model and quantile policy. The forecast metric is the observation-weighted raw mean pinball loss across all target variables.",
             "fig:5_pinball_loss_vs_net_profit_total",
         )
         _write_latex_include(
             latex_figures_dir / "6_market_dispatch_soc_selected_day.tex",
             _thesis_figure_rel(out_root, "6_market_dispatch_soc_selected_day.png"),
-            "Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero, discharging actions below zero, the green line shows SoC, and the blue dashed line shows cumulative realized Net Profit.",
+            "Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero, discharging actions below zero, the green line shows SoC, and the blue dashed line shows cumulative realized Net Profit in k€.",
             "fig:6_market_dispatch_soc_selected_day",
         )
         _write_latex_include(
@@ -1798,6 +1978,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (csv_dir / "3_revenue_cost_components_best_quantile.csv", "backup", "csv", "revenue and cost components", "source data for best-quantile stacked component figure"),
         (csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", "backup", "csv", "cumulative Net Profit", "source data for best-quantile cumulative Net Profit figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for target-specific pinball-loss scatter figures"),
+        (csv_dir / "5_pinball_loss_vs_net_profit_da_price_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized DA-price scatter figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for total pinball-loss scatter figure"),
         (csv_dir / "6_market_dispatch_soc_selected_day.csv", "backup", "csv", "market dispatch and SoC", "source data for selected-day stacked dispatch/SOC figure"),
         (csv_dir / "rq2_benchmark_values.csv", "backup", "csv", "benchmark values", "Naive/RHPF benchmark source"),
@@ -1807,10 +1988,14 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", "backup", "warnings", "market dispatch and SoC", "selected-day invalidity and direct violation checks"),
     ]:
         entries.append(_manifest_entry(path, out_root, tier, artifact_type, metric_family, thesis_use, run_root, created, days, factor))
-    for fig in figure_paths:
+    for fig in result_figure_paths:
         entries.append(_manifest_entry(fig, out_root, "result_section", "figure", "annualized realized net profit", "RQ2 result-section visualization", run_root, created, days, factor))
+    for fig in appendix_figure_paths:
+        entries.append(_manifest_entry(fig, out_root, "appendix", "figure", "forecast accuracy vs Net Profit", "appendix scatter visualization", run_root, created, days, factor))
     for tex in latex_figures_dir.glob("*.tex"):
         entries.append(_manifest_entry(tex, out_root, "result_section", "latex_figure", "annualized realized net profit", "LaTeX figure wrapper", run_root, created, days, factor))
+    for tex in appendix_latex_figures_dir.glob("*.tex"):
+        entries.append(_manifest_entry(tex, out_root, "appendix", "latex_figure", "forecast accuracy vs Net Profit", "appendix LaTeX figure wrapper", run_root, created, days, factor))
 
     manifest = {
         "schema_version": "rq2_output_manifest_v1",
