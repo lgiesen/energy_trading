@@ -75,12 +75,12 @@ TARGET_GROUPS = {
 
 REGIME_LABELS = {
     "normal": "Normal",
-    "da_abs_tail_top5": "DA absolute tail",
-    "da_positive_spike_top5": "DA positive spike",
-    "da_negative_spike_bottom5": "DA negative spike",
-    "afrr_activation_price_abs_tail_top5": "Activation price tail",
-    "activation_nonzero": "Activation non-zero",
-    "activation_zero_or_nearzero": "Activation zero/near-zero",
+    "da_abs_tail_top5": "Abs. tail top 5%",
+    "da_positive_spike_top5": "Positive spike top 5%",
+    "da_negative_spike_bottom5": "Negative spike bottom 5%",
+    "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
+    "activation_nonzero": "Activation nonzero",
+    "activation_zero_or_nearzero": "Activation zero / near-zero",
     "high_volatility_week": "High-volatility week",
     "spike_week": "Spike week",
 }
@@ -106,6 +106,39 @@ TARGET_GROUP_ORDER = [
 
 MODEL_ORDER = {"linear": 0, "xgb": 1, "tft": 2}
 REGIME_ORDER = {regime: i for i, regime in enumerate(REGIME_LABELS)}
+
+MAIN_REGIMES_BY_TARGET_GROUP = {
+    "DA price": [
+        "normal",
+        "da_abs_tail_top5",
+        "da_positive_spike_top5",
+        "da_negative_spike_bottom5",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR capacity price": [
+        "normal",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR activation price": [
+        "normal",
+        "afrr_activation_price_abs_tail_top5",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR activation rate": [
+        "activation_zero_or_nearzero",
+        "activation_nonzero",
+        "high_volatility_week",
+        "spike_week",
+    ],
+}
+
+MAIN_REGIME_ORDER = {
+    group: {regime: i for i, regime in enumerate(regimes)}
+    for group, regimes in MAIN_REGIMES_BY_TARGET_GROUP.items()
+}
 
 DA_TARGET = "target_da_price"
 ACTIVATION_PRICE_TARGETS = {"target_afrr_activation_price_vwap_pos", "target_afrr_activation_price_vwap_neg"}
@@ -147,6 +180,12 @@ def _target_info(target: str) -> tuple[str, str]:
 
 def _clean_regime_label(regime: Any) -> str:
     return REGIME_LABELS.get(str(regime), str(regime).replace("_", " ").title())
+
+
+def _main_regime_order_key(group: Any, regime: Any) -> tuple[int, str]:
+    group_s = str(group)
+    regime_s = str(regime)
+    return MAIN_REGIME_ORDER.get(group_s, {}).get(regime_s, 99), _clean_regime_label(regime_s)
 
 
 def _main_issue(regime: Any) -> str:
@@ -499,8 +538,8 @@ def build_tail_spike_outputs(
     main_split: str,
     epsilon: float,
     derive_forecast_time: bool,
-    eval_origin_start: pd.Timestamp | None,
-    eval_origin_end: pd.Timestamp | None,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> dict[str, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -661,8 +700,25 @@ def build_tail_spike_outputs(
                     points["regime"] = regime
                     point_rows.append(points)
 
+    metrics_df = sort_target_frame(pd.DataFrame(metric_rows), target_col="target", extra_cols=["split", "regime", "model_label"])
+    if not metrics_df.empty:
+        available = metrics_df.loc[metrics_df["split"].eq(main_split)].groupby("target_group")["regime"].apply(lambda s: set(map(str, s))).to_dict()
+        for group, regimes in MAIN_REGIMES_BY_TARGET_GROUP.items():
+            have = available.get(group, set())
+            for regime in regimes:
+                if regime not in have:
+                    warnings.append(
+                        {
+                            "split": main_split,
+                            "target": group,
+                            "regime": regime,
+                            "severity": "warning",
+                            "message": "Regime requested for thesis main tail/spike figure is unavailable for this target group; no placeholder bar is drawn.",
+                        }
+                    )
+
     return {
-        "metrics": sort_target_frame(pd.DataFrame(metric_rows), target_col="target", extra_cols=["split", "regime", "model_label"]),
+        "metrics": metrics_df,
         "row_counts": sort_target_frame(pd.DataFrame(row_rows), target_col="target", extra_cols=["split", "regime", "model_label"]),
         "definitions": _regime_definitions(),
         "thresholds": thresholds,
@@ -809,13 +865,11 @@ def _plot_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, metric: st
     return path
 
 
-def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
-    import matplotlib.pyplot as plt
-
+def _relative_pinball_frame(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     d = metrics.loc[metrics["split"].eq(split)].copy()
     required = {"target_group", "target", "regime", "model_label", "mean_pinball_loss", "n_obs"}
     if d.empty or not required <= set(d.columns):
-        return None
+        return pd.DataFrame()
     pivot = d.pivot_table(
         index=["target_group", "target", "regime"],
         columns="model_label",
@@ -823,7 +877,7 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) 
         aggfunc="mean",
     ).reset_index()
     if "RLQR" not in pivot.columns:
-        return None
+        return pd.DataFrame()
     rows: list[dict[str, Any]] = []
     counts = d.groupby(["target_group", "target", "regime", "model_label"], as_index=False)["n_obs"].min()
     n_by_key = counts.groupby(["target_group", "target", "regime"], as_index=False)["n_obs"].min()
@@ -836,7 +890,13 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) 
         part["model"] = "tft" if label == "TFT" else "xgb"
         part["relative_pinball"] = part[label] / part["RLQR"]
         rows.extend(part[["target_group", "target", "regime", "model", "model_label", "relative_pinball", "n_obs"]].to_dict("records"))
-    rel = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+def _plot_relative_pinball_all_in_one(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
+    import matplotlib.pyplot as plt
+
+    rel = _relative_pinball_frame(metrics, split=split)
     if rel.empty:
         return None
 
@@ -875,7 +935,68 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) 
     fig.tight_layout()
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    path = fig_dir / "tail_spike_relative_pinball_by_regime.png"
+    path = fig_dir / "tail_spike_relative_pinball_by_regime_all_in_one.png"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _plot_relative_pinball_main(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
+    import matplotlib.pyplot as plt
+
+    rel = _relative_pinball_frame(metrics, split=split)
+    if rel.empty:
+        return None
+    rows: list[pd.DataFrame] = []
+    for group, regimes in MAIN_REGIMES_BY_TARGET_GROUP.items():
+        part = rel[rel["target_group"].eq(group) & rel["regime"].isin(regimes)].copy()
+        if part.empty:
+            continue
+        part["_regime_order"] = part["regime"].map(MAIN_REGIME_ORDER[group]).fillna(99)
+        rows.append(part)
+    if not rows:
+        return None
+    main = pd.concat(rows, ignore_index=True)
+
+    apply_geo_style()
+    groups = [g for g in TARGET_GROUP_ORDER if g in set(main["target_group"])]
+    fig, axes = plt.subplots(2, 2, figsize=(12.2, 8.2), sharex=True)
+    axes_flat = list(axes.ravel())
+    for ax, group in zip(axes_flat, groups):
+        p = main[main["target_group"].eq(group)].copy()
+        agg = (
+            p.groupby(["regime", "model", "model_label"], as_index=False, sort=False)
+            .agg(value=("relative_pinball", "mean"), n_obs=("n_obs", "min"))
+        )
+        regimes = sorted(agg["regime"].dropna().unique(), key=lambda r: _main_regime_order_key(group, r))
+        y = np.arange(len(regimes), dtype=float)
+        height = 0.34
+        ax.axvline(1.0, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=1.3, label="RLQR baseline")
+        for i, label in enumerate(["XGB", "TFT"]):
+            mg = agg[agg["model_label"].eq(label)]
+            if mg.empty:
+                continue
+            vals = [float(mg.loc[mg["regime"].eq(r), "value"].mean()) if mg["regime"].eq(r).any() else np.nan for r in regimes]
+            model_key = "tft" if label == "TFT" else "xgb"
+            ax.barh(y + (i - 0.5) * height, vals, height=height, label=label, color=get_model_color(model_key))
+        ax.set_title(thesis_titlecase(group))
+        ax.set_yticks(y)
+        ax.set_yticklabels([_clean_regime_label(r) for r in regimes])
+        ax.invert_yaxis()
+        ax.grid(axis="x", alpha=0.25)
+    for ax in axes_flat[len(groups):]:
+        ax.axis("off")
+    handles, labels = axes_flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, ncol=3, loc="lower center", bbox_to_anchor=(0.5, 0.01))
+    for ax in axes_flat[-2:]:
+        if ax.has_data():
+            ax.set_xlabel("Mean pinball loss relative to RLQR")
+    fig.suptitle(thesis_titlecase("Tail and Spike Performance by Regime"), y=0.995)
+    fig.tight_layout(rect=(0, 0.045, 1, 0.97))
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    path = fig_dir / "tail_spike_relative_pinball_by_regime_main.png"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -1084,7 +1205,8 @@ def write_outputs(
     if tex is not None:
         paths.append(tex)
     plot_results = [
-        _plot_relative_pinball(outputs["metrics"], out_dir=out_dir, split=split),
+        _plot_relative_pinball_main(outputs["metrics"], out_dir=out_dir, split=split),
+        _plot_relative_pinball_all_in_one(outputs["metrics"], out_dir=out_dir, split=split),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mean_pinball_loss", filename="tail_spike_pinball_by_regime.png", ylabel="Mean pinball loss"),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mae_p50", filename="tail_spike_mae_p50_by_regime.png", ylabel="MAE p50"),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="coverage_p10_p90", filename="tail_spike_coverage_by_regime.png", ylabel="p10-p90 coverage"),

@@ -142,6 +142,20 @@ def _bucket_label(bucket: Any) -> str:
     return BUCKET_LABELS.get(str(bucket), str(bucket))
 
 
+def _actionable_label(bucket: Any, target_group: Any) -> str:
+    bucket_s = str(bucket)
+    group_s = str(target_group)
+    if bucket_s == "actionable_da_dplus1_11":
+        return "DA price D+1 at 11:00"
+    if bucket_s == "actionable_bcm_dplus1_08":
+        return "BCM capacity price D+1 at 08:00"
+    if bucket_s == "actionable_bem_short_h1_8" and "rate" in group_s.lower():
+        return "BEM activation rate h1-h8"
+    if bucket_s == "actionable_bem_short_h1_8":
+        return "BEM activation price h1-h8"
+    return _bucket_label(bucket)
+
+
 def _parse_models(raw: str) -> list[ModelSpec]:
     out: list[ModelSpec] = []
     seen: set[str] = set()
@@ -715,52 +729,48 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str, 
     required = {"target_group", "bucket", "model", "model_label", "mean_pinball_loss", "n_obs"}
     if d.empty or not required.issubset(d.columns):
         return None
+    d = d[d["bucket_family"].eq("actionable")].copy() if "bucket_family" in d.columns else d
+    if d.empty:
+        return None
     apply_geo_style()
-    groups = ordered_unique(d["target_group"].dropna().unique(), group=True)
-    fig, axes = plt.subplots(len(groups), 1, figsize=(12, max(3.2, 2.7 * len(groups))), sharex=False)
-    if len(groups) == 1:
-        axes = [axes]
-    bucket_order = {spec.bucket: i for i, spec in enumerate(BUCKETS)}
-    for ax, group in zip(axes, groups):
-        panel = d[d["target_group"].eq(group)].copy()
-        agg = panel.groupby(["bucket", "model_label"], as_index=False, sort=False).agg(
-            value=("mean_pinball_loss", "mean"),
-            n_obs=("n_obs", "sum"),
-        )
-        pivot = agg.pivot_table(index="bucket", columns="model_label", values="value", aggfunc="mean").reset_index()
-        counts = agg.groupby("bucket", as_index=False)["n_obs"].max()
-        pivot = pivot.merge(counts, on="bucket", how="left")
-        if "RLQR" not in pivot.columns:
+    d = sort_target_frame(d, target_col="target_group", extra_cols=["bucket", "model_label"])
+    agg = d.groupby(["target_group", "bucket", "model_label"], as_index=False, sort=False).agg(
+        value=("mean_pinball_loss", "mean"),
+    )
+    pivot = agg.pivot_table(index=["target_group", "bucket"], columns="model_label", values="value", aggfunc="mean").reset_index()
+    if "RLQR" not in pivot.columns:
+        return None
+    pivot = pivot[pd.to_numeric(pivot["RLQR"], errors="coerce").notna() & pd.to_numeric(pivot["RLQR"], errors="coerce").ne(0)].copy()
+    if pivot.empty:
+        return None
+    pivot["label"] = [_actionable_label(bucket, group) for group, bucket in zip(pivot["target_group"], pivot["bucket"])]
+    label_order = {
+        "DA price D+1 at 11:00": 0,
+        "BCM capacity price D+1 at 08:00": 1,
+        "BEM activation price h1-h8": 2,
+        "BEM activation rate h1-h8": 3,
+    }
+    pivot["_order"] = pivot["label"].map(label_order).fillna(99)
+    pivot = pivot.sort_values(["_order", "label"]).reset_index(drop=True)
+    y = np.arange(len(pivot), dtype=float)
+    height = 0.34
+    fig, ax = plt.subplots(figsize=(10.5, max(3.2, 0.72 * len(pivot) + 1.6)))
+    ax.axvline(1.0, color=get_model_color("linear"), linewidth=1.4, linestyle=":", label="RLQR")
+    for idx, (label, model_key) in enumerate([("XGB", "xgb"), ("TFT", "tft")]):
+        if label not in pivot.columns:
             continue
-        pivot = pivot[pd.to_numeric(pivot["RLQR"], errors="coerce").notna() & pd.to_numeric(pivot["RLQR"], errors="coerce").ne(0)].copy()
-        if pivot.empty:
-            continue
-        buckets = sorted(pivot["bucket"].dropna().unique(), key=lambda b: bucket_order.get(str(b), 99))
-        x = np.arange(len(buckets), dtype=float)
-        width = 0.32
-        ax.axhline(1.0, color=get_model_color("linear"), linewidth=1.4, linestyle=":", label="RLQR")
-        for idx, (label, model_key) in enumerate([("XGB", "xgb"), ("TFT", "tft")]):
-            if label not in pivot.columns:
-                continue
-            vals: list[float] = []
-            for bucket in buckets:
-                row = pivot[pivot["bucket"].eq(bucket)]
-                if row.empty:
-                    vals.append(float("nan"))
-                    continue
-                denom = float(row["RLQR"].iloc[0])
-                value = float(row[label].iloc[0]) if pd.notna(row[label].iloc[0]) else float("nan")
-                vals.append(value / denom if np.isfinite(denom) and abs(denom) > 1e-12 else float("nan"))
-            ax.bar(x + (idx - 0.5) * width, vals, width=width, label=label, color=get_model_color(model_key))
-        for i, bucket in enumerate(buckets):
-            n = int(pivot.loc[pivot["bucket"] == bucket, "n_obs"].max()) if not pivot.loc[pivot["bucket"] == bucket].empty else 0
-            ax.text(i, ax.get_ylim()[1] * 0.98, f"n={n}", ha="center", va="top", fontsize=7)
-        ax.set_title(thesis_titlecase(group))
-        ax.set_ylabel("Mean pinball loss relative to RLQR")
-        ax.set_xticks(x)
-        ax.set_xticklabels([_bucket_label(bucket) for bucket in buckets], rotation=25, ha="right")
-        ax.legend(ncol=3, loc="upper left")
-    fig.suptitle(thesis_titlecase("Gate-specific relative mean pinball loss (RLQR = 1)"), y=1.01)
+        vals = []
+        for _, row in pivot.iterrows():
+            denom = float(row["RLQR"])
+            value = float(row[label]) if pd.notna(row[label]) else float("nan")
+            vals.append(value / denom if np.isfinite(denom) and abs(denom) > 1e-12 else float("nan"))
+        ax.barh(y + (idx - 0.5) * height, vals, height=height, label=label, color=get_model_color(model_key))
+    ax.set_yticks(y)
+    ax.set_yticklabels(pivot["label"].astype(str).tolist())
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean pinball loss relative to RLQR")
+    ax.set_title(thesis_titlecase("Actionable Forecast Performance by Market Gate Relative to RLQR"))
+    ax.legend(ncol=3, loc="lower right")
     fig.tight_layout()
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)

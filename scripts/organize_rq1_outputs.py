@@ -89,14 +89,20 @@ def build_routes(split: str) -> list[Route]:
     routes = [
         _route("4.1.1", "result_section", "figure", f"figures/forecast_metrics_full_relative_pinball_{split}.png", _sub_sources("4.1.1", f"figures/rq1_4_1_1_forecast_metrics_full_relative_pinball_{split}.png"), "mean_pinball_loss", "main thesis figure", "Relative mean pinball loss against RLQR."),
         _route("4.1.1", "result_section", "figure", "figures/computational_cost_365d.png", _sub_sources("4.1.1", "figures/rq1_4_1_1_computational_cost_365d.png"), "computational_cost", "main thesis figure", "Computational Cost of Each Model Scaled for 365 Days of Training Data."),
+        _route("4.1.1", "result_section", "figure", "figures/da_price_p50_absolute_error_tolerance_curve.png", _sub_sources("4.1.1", "figures/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.png"), "p50 absolute error tolerance", "secondary interpretability figure", "DA price cumulative absolute p50 error tolerance curve."),
+        _route("4.1.1", "result_section", "figure", "figures/da_price_p50_absolute_error_tolerance_curve.pdf", _sub_sources("4.1.1", "figures/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.pdf"), "p50 absolute error tolerance", "secondary interpretability figure", "DA price cumulative absolute p50 error tolerance curve PDF.", required=False),
+        _route("4.1.1", "result_section", "latex_figure", "figures/da_price_p50_absolute_error_tolerance_curve.tex", _sub_sources("4.1.1", "figures/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex"), "p50 absolute error tolerance", "secondary interpretability figure", "LaTeX includegraphics snippet for DA price p50 error tolerance curve."),
         _route("4.1.1", "appendix", "figure", f"figures/forecast_metrics_full_relative_mae_p50_{split}.png", _sub_sources("4.1.1", f"figures/rq1_4_1_1_forecast_metrics_full_relative_mae_p50_{split}.png"), "mae_p50", "appendix figure", "Relative p50 MAE against RLQR by target."),
         _route("4.1.1", "result_section", "latex_table", f"tables/forecast_metrics_full_primary_{split}.tex", _sub_sources("4.1.1", f"latex/rq1_4_1_1_forecast_metrics_full_primary_{split}.tex"), "mean_pinball_loss", "main thesis table", "Primary full-sample mean pinball table."),
         _route("4.1.1", "result_section", "latex_table", "tables/computational_cost_365d.tex", _sub_sources("4.1.1", "latex/rq1_4_1_1_computational_cost_365d.tex"), "computational_cost", "main thesis table", "Observed and 365-day-scaled computational cost table."),
         _route("4.1.1", "appendix", "latex_table", f"tables/forecast_metrics_full_detailed_{split}.tex", _sub_sources("4.1.1", f"latex/rq1_4_1_1_forecast_metrics_full_detailed_{split}.tex"), "point_and_probabilistic_errors", "appendix table", "Detailed full-sample metrics."),
+        _route("4.1.1", "appendix", "latex_table", f"tables/da_price_p50_error_tolerance_summary_{split}.tex", _sub_sources("4.1.1", f"latex/rq1_4_1_1_da_price_p50_error_tolerance_summary_{split}.tex"), "p50 absolute error tolerance", "appendix table", "DA price p50 absolute error tolerance threshold summary."),
         _route("4.1.1", "backup", "csv", "csv/forecast_metrics_full_long.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_forecast_metrics_full_long.csv"), "all_full_metrics", "backup data", "Long-form full metrics CSV."),
         _route("4.1.1", "backup", "csv", f"csv/forecast_metrics_full_primary_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_primary_{split}.csv"), "mean_pinball_loss", "backup data", "Primary full metrics CSV."),
         _route("4.1.1", "backup", "csv", f"csv/forecast_metrics_full_detailed_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_detailed_{split}.csv"), "point_and_probabilistic_errors", "backup data", "Detailed full metrics CSV."),
         _route("4.1.1", "backup", "csv", "csv/computational_cost_365d.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_computational_cost_365d.csv"), "computational_cost", "backup data", "Observed and scaled computational cost source CSV."),
+        _route("4.1.1", "backup", "csv", "csv/da_price_p50_absolute_error_tolerance_curve.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.csv"), "p50 absolute error tolerance", "backup data", "DA price p50 absolute error tolerance curve source CSV."),
+        _route("4.1.1", "backup", "csv", f"csv/da_price_p50_error_tolerance_summary_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_da_price_p50_error_tolerance_summary_{split}.csv"), "p50 absolute error tolerance", "backup data", "DA price p50 absolute error tolerance summary CSV."),
         _route("4.1.1", "backup", "diagnostics", f"diagnostics/forecast_metrics_full_alignment_diagnostics_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_alignment_diagnostics_{split}.csv"), "alignment", "diagnostics", "Alignment diagnostics for full metrics."),
         _route("4.1.2", "result_section", "figure", "figures/calibration_reliability_by_target.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_reliability_by_target.png"), "calibration", "main thesis figure", "Quantile reliability by target."),
         _route("4.1.2", "result_section", "figure", "figures/calibration_interval_coverage_by_target_group.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_interval_coverage_by_target_group.png"), "interval_coverage", "main thesis figure", "Interval coverage reliability by target group.", required=False),
@@ -118,7 +124,7 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.3", "backup", "csv", f"csv/per_lead_range_summary_{split}.csv", _sub_sources("4.1.3", f"per_lead_range_summary_{split}.csv") + [f"per_lead_range_summary_{split}.csv"], "mean_pinball_loss", "backup data", "Per-lead range summary CSV."),
         _route("4.1.3", "backup", "diagnostics", f"diagnostics/per_lead_row_counts_{split}.csv", _sub_sources("4.1.3", f"per_lead_row_counts_{split}.csv") + [f"per_lead_row_counts_{split}.csv"], "row_counts", "diagnostics", "Per-lead row counts."),
         _route("4.1.3", "backup", "warnings", "warnings/per_lead_warnings.csv", _sub_sources("4.1.3", "per_lead_warnings.csv") + ["per_lead_warnings.csv"], "warnings", "warnings", "Per-lead warnings."),
-        _route("4.1.4", "result_section", "figure", "figures/gate_bucket_pinball_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_pinball_by_target_group.png") + ["figures/gate_bucket_pinball_by_target_group.png"], "relative_mean_pinball_loss", "main thesis figure", "Gate-specific relative mean pinball loss (RLQR = 1)."),
+        _route("4.1.4", "result_section", "figure", "figures/gate_bucket_pinball_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_pinball_by_target_group.png") + ["figures/gate_bucket_pinball_by_target_group.png"], "relative_mean_pinball_loss", "main thesis figure", "Actionable forecast performance by market gate relative to RLQR."),
         _route("4.1.4", "result_section", "latex_table", f"tables/gate_bucket_metrics_{split}.tex", _sub_sources("4.1.4", f"latex/gate_bucket_metrics_{split}.tex") + [f"latex/gate_bucket_metrics_{split}.tex"], "mean_pinball_loss", "main thesis table", "Gate bucket mean pinball table."),
         _route("4.1.4", "appendix", "figure", "figures/gate_bucket_coverage_p10_p90_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_coverage_p10_p90_by_target_group.png") + ["figures/gate_bucket_coverage_p10_p90_by_target_group.png"], "interval_coverage", "appendix figure", "Gate bucket p10-p90 coverage."),
         _route("4.1.4", "appendix", "figure", "figures/gate_bucket_observed_leads.png", _sub_sources("4.1.4", "figures/gate_bucket_observed_leads.png") + ["figures/gate_bucket_observed_leads.png"], "observed_leads", "appendix figure", "Observed leads by gate bucket."),
@@ -127,7 +133,7 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.4", "backup", "diagnostics", "diagnostics/gate_bucket_row_counts.csv", _sub_sources("4.1.4", "gate_bucket_row_counts.csv") + ["gate_bucket_row_counts.csv"], "row_counts", "diagnostics", "Gate bucket row counts."),
         _route("4.1.4", "backup", "diagnostics", "diagnostics/gate_bucket_observed_leads.csv", _sub_sources("4.1.4", "gate_bucket_observed_leads.csv") + ["gate_bucket_observed_leads.csv"], "observed_leads", "diagnostics", "Gate bucket observed leads."),
         _route("4.1.4", "backup", "warnings", "warnings/gate_bucket_warnings.csv", _sub_sources("4.1.4", "gate_bucket_warnings.csv") + ["gate_bucket_warnings.csv"], "warnings", "warnings", "Gate bucket warnings."),
-        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime.png") + ["figures/tail_spike_relative_pinball_by_regime.png"], "mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime."),
+        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_main.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_main.png") + ["figures/tail_spike_relative_pinball_by_regime_main.png"], "mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime."),
         _route("4.1.5", "result_section", "figure", "figures/tail_spike_residual_distribution_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_residual_distribution_by_regime.png") + ["figures/tail_spike_residual_distribution_by_regime.png"], "residuals", "main thesis figure", "Tail/spike residual distributions."),
         _route("4.1.5", "result_section", "latex_table", f"tables/tail_spike_metrics_{split}.tex", _sub_sources("4.1.5", f"latex/tail_spike_metrics_{split}.tex") + [f"latex/tail_spike_metrics_{split}.tex"], "mean_pinball_loss", "main thesis table", "Tail/spike mean pinball table."),
         _route("4.1.5", "appendix", "figure", "figures/tail_spike_coverage_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_coverage_by_regime.png") + ["figures/tail_spike_coverage_by_regime.png"], "interval_coverage", "appendix figure", "Tail/spike p10-p90 coverage."),
@@ -138,6 +144,7 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.5", "backup", "csv", "csv/tail_spike_thresholds.csv", _sub_sources("4.1.5", "tail_spike_thresholds.csv") + ["tail_spike_thresholds.csv"], "thresholds", "backup data", "Tail/spike thresholds."),
         _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_row_counts.csv", _sub_sources("4.1.5", "tail_spike_row_counts.csv") + ["tail_spike_row_counts.csv"], "row_counts", "diagnostics", "Tail/spike row counts."),
         _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_selected_weeks.csv", _sub_sources("4.1.5", "tail_spike_selected_weeks.csv") + ["tail_spike_selected_weeks.csv"], "selected_weeks", "diagnostics", "Tail/spike selected weeks."),
+        _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_relative_pinball_by_regime_all_in_one.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_all_in_one.png") + ["figures/tail_spike_relative_pinball_by_regime_all_in_one.png"], "relative_mean_pinball_loss", "diagnostic figure", "Dense all-in-one tail/spike relative mean pinball chart.", required=False),
         _route("4.1.5", "backup", "warnings", "warnings/tail_spike_warnings.csv", _sub_sources("4.1.5", "tail_spike_warnings.csv") + ["tail_spike_warnings.csv"], "warnings", "warnings", "Tail/spike warnings."),
     ]
     target_stems = [
@@ -442,6 +449,15 @@ def prune_legacy_outputs(*, rq1_root: Path, final_root: Path) -> list[str]:
         for path in root.glob("*.json"):
             _remove_path(path, removed)
 
+    _remove_path(
+        rq1_root
+        / SUBSECTIONS["4.1.5"]
+        / "result_section"
+        / "figures"
+        / "tail_spike_relative_pinball_by_regime.png",
+        removed,
+    )
+
     return removed
 
 
@@ -676,14 +692,70 @@ BUCKET_LABELS = {
     "short_h1_8": "Short horizon (h1--h8)",
     "medium_h9_16": "Medium horizon (h9--h16)",
     "long_h17_48": "Long horizon (h17--h48)",
-    "actionable_da_dplus1_11": "DA gate (D+1 11:00)",
-    "actionable_bcm_dplus1_08": "aFRR capacity gate (D+1 08:00)",
-    "actionable_bem_short_h1_8": "Activation gate (h1--h8)",
 }
 
 
 def _bucket_label(bucket: Any) -> str:
     return BUCKET_LABELS.get(str(bucket), _tex_label(bucket))
+
+
+def _actionable_label(bucket: Any, target_group: Any) -> str:
+    bucket_s = str(bucket)
+    group_s = str(target_group)
+    if bucket_s == "actionable_da_dplus1_11":
+        return "DA price D+1 at 11:00"
+    if bucket_s == "actionable_bcm_dplus1_08":
+        return "BCM capacity price D+1 at 08:00"
+    if bucket_s == "actionable_bem_short_h1_8" and "rate" in group_s.lower():
+        return "BEM activation rate h1-h8"
+    if bucket_s == "actionable_bem_short_h1_8":
+        return "BEM activation price h1-h8"
+    return _bucket_label(bucket)
+
+
+TAIL_SPIKE_REGIME_LABELS = {
+    "normal": "Normal",
+    "da_abs_tail_top5": "Abs. tail top 5%",
+    "da_positive_spike_top5": "Positive spike top 5%",
+    "da_negative_spike_bottom5": "Negative spike bottom 5%",
+    "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
+    "activation_nonzero": "Activation nonzero",
+    "activation_zero_or_nearzero": "Activation zero / near-zero",
+    "high_volatility_week": "High-volatility week",
+    "spike_week": "Spike week",
+}
+
+TAIL_SPIKE_MAIN_REGIMES = {
+    "DA price": [
+        "normal",
+        "da_abs_tail_top5",
+        "da_positive_spike_top5",
+        "da_negative_spike_bottom5",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR capacity price": [
+        "normal",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR activation price": [
+        "normal",
+        "afrr_activation_price_abs_tail_top5",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR activation rate": [
+        "activation_zero_or_nearzero",
+        "activation_nonzero",
+        "high_volatility_week",
+        "spike_week",
+    ],
+}
+
+
+def _tail_spike_regime_label(regime: Any) -> str:
+    return TAIL_SPIKE_REGIME_LABELS.get(str(regime), _tex_label(regime))
 
 
 def _caption_from_name(stem: str) -> str:
@@ -817,20 +889,134 @@ def _write_gate_bucket_relative_tex(
     if data.empty or not required.issubset(data.columns):
         return None
     d = data.copy()
+    d = d[d["bucket_family"].eq("actionable")].copy() if "bucket_family" in d.columns else d
     d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
     d = d.dropna(subset=["mean_pinball_loss"])
     if d.empty:
         return None
-    bucket_order = {
-        "full_h1_48": 0,
-        "short_h1_8": 1,
-        "medium_h9_16": 2,
-        "long_h17_48": 3,
-        "actionable_da_dplus1_11": 4,
-        "actionable_bcm_dplus1_08": 4,
-        "actionable_bem_short_h1_8": 4,
+    d = sort_target_frame(d, target_col="target_group", extra_cols=["bucket", "model_label"])
+    agg = (
+        d.groupby(["target_group", "bucket", "model_label"], as_index=False, sort=False)
+        .agg(mean_pinball_loss=("mean_pinball_loss", "mean"))
+    )
+    pivot = agg.pivot_table(index=["target_group", "bucket"], columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
+    if "RLQR" not in pivot.columns:
+        return None
+    denom = pd.to_numeric(pivot["RLQR"], errors="coerce")
+    pivot = pivot.loc[denom.notna() & denom.abs().gt(1e-12)].copy()
+    if pivot.empty:
+        return None
+    pivot["label"] = [_actionable_label(bucket, group) for group, bucket in zip(pivot["target_group"], pivot["bucket"])]
+    label_order = {
+        "DA price D+1 at 11:00": 0,
+        "BCM capacity price D+1 at 08:00": 1,
+        "BEM activation price h1-h8": 2,
+        "BEM activation rate h1-h8": 3,
     }
-    panels = ordered_unique(d["target_group"].dropna().unique(), group=True)
+    pivot["_order"] = pivot["label"].map(label_order).fillna(99)
+    pivot = pivot.sort_values(["_order", "label"]).reset_index(drop=True)
+    labels = pivot["label"].astype(str).tolist()
+    y_symbols = [_tex_symbol(label) for label in labels]
+    y_symbol_list = ",".join(y_symbols)
+    y_tick_labels = ",".join(_latex_escape(label) for label in labels)
+
+    lines = [
+        r"% Requires: \usepackage{pgfplots}",
+        r"% Requires: \usepackage{xcolor}",
+        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+        *_latex_color_defs(),
+        rf"\begin{{figure}}[{placement}]",
+        r"    \centering",
+        r"    \resizebox{\linewidth}{!}{%",
+        r"        \begin{tikzpicture}",
+        r"            \begin{axis}[",
+        r"                xbar,",
+        r"                bar width=8pt,",
+        r"                width=0.96\textwidth,",
+        r"                height=7.2cm,",
+        r"                xlabel={Mean pinball loss relative to RLQR},",
+        r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend cell align={left},",
+        r"                area legend,",
+        r"                axis lines*=left,",
+        r"                xmin=0,",
+        r"                grid=major,",
+        rf"                symbolic y coords={{{y_symbol_list}}},",
+        rf"                ytick={{{y_symbol_list}}},",
+        rf"                yticklabels={{{y_tick_labels}}},",
+        r"                y dir=reverse,",
+        r"            ]",
+    ]
+    lines.append(rf"                \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{(1,{y_symbols[0]}) (1,{y_symbols[-1]})}};")
+    lines.append(r"                \addlegendentry{RLQR}")
+    for model in ["XGB", "TFT"]:
+        if model not in pivot.columns:
+            continue
+        color = _model_color_role(model)
+        coords: list[str] = []
+        for _, row in pivot.iterrows():
+            base = float(pd.to_numeric(pd.Series([row["RLQR"]]), errors="coerce").iloc[0])
+            value = float(pd.to_numeric(pd.Series([row[model]]), errors="coerce").iloc[0])
+            if np.isfinite(base) and abs(base) > 1e-12 and np.isfinite(value):
+                coords.append(f"({_tex_num(value / base)},{_tex_symbol(row['label'])})")
+        if coords:
+            lines.append(rf"                \addplot[xbar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+            lines.append(rf"                \addlegendentry{{{model}}}")
+    lines.extend(
+        [
+            r"            \end{axis}",
+            r"        \end{tikzpicture}}",
+            f"    \\caption{{{_latex_escape(thesis_titlecase(caption))}}}",
+            f"    \\label{{{label}}}",
+            r"\end{figure}",
+            "",
+        ]
+    )
+    return _write_lines(path, lines)
+
+
+def _write_tail_spike_relative_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    caption: str,
+    label: str,
+    placement: str = "htbp",
+) -> Path | None:
+    required = {"target_group", "regime", "model_label", "mean_pinball_loss"}
+    if data.empty or not required.issubset(data.columns):
+        return None
+    d = data.copy()
+    d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+    d = d.dropna(subset=["mean_pinball_loss"])
+    if d.empty:
+        return None
+    agg = (
+        d.groupby(["target_group", "regime", "model_label"], as_index=False, sort=False)
+        .agg(mean_pinball_loss=("mean_pinball_loss", "mean"))
+    )
+    pivot = agg.pivot_table(index=["target_group", "regime"], columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
+    if "RLQR" not in pivot.columns:
+        return None
+    denom = pd.to_numeric(pivot["RLQR"], errors="coerce")
+    pivot = pivot.loc[denom.notna() & denom.abs().gt(1e-12)].copy()
+    if pivot.empty:
+        return None
+    for model in ["XGB", "TFT"]:
+        if model in pivot.columns:
+            pivot[model] = pd.to_numeric(pivot[model], errors="coerce") / pd.to_numeric(pivot["RLQR"], errors="coerce")
+
+    panels: list[tuple[str, pd.DataFrame, list[str], list[str]]] = []
+    for group, regimes in TAIL_SPIKE_MAIN_REGIMES.items():
+        part = pivot[pivot["target_group"].astype(str).eq(group) & pivot["regime"].astype(str).isin(regimes)].copy()
+        if part.empty:
+            continue
+        order = {regime: i for i, regime in enumerate(regimes)}
+        part["_order"] = part["regime"].astype(str).map(order).fillna(99)
+        part = part.sort_values(["_order", "regime"]).reset_index(drop=True)
+        labels = [_tail_spike_regime_label(regime) for regime in part["regime"]]
+        symbols = [_tex_symbol(f"{group}_{label}") for label in labels]
+        panels.append((group, part, labels, symbols))
     if not panels:
         return None
 
@@ -842,71 +1028,59 @@ def _write_gate_bucket_relative_tex(
         *_latex_color_defs(),
         rf"\begin{{figure}}[{placement}]",
         r"    \centering",
-        r"    \resizebox{\linewidth}{!}{%",
-        r"        \begin{tikzpicture}",
-        r"            \begin{groupplot}[",
-        rf"                group style={{group size=1 by {len(panels)}, vertical sep=1.0cm}},",
-        r"                ybar,",
-        r"                bar width=9pt,",
-        r"                width=0.96\textwidth,",
-        r"                height=4.3cm,",
-        r"                ylabel={Mean pinball loss relative to RLQR},",
-        r"                x tick label style={rotate=25, anchor=east},",
-        r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
-        r"                legend cell align={left},",
-        r"                area legend,",
-        r"                axis lines*=left,",
-        r"                ymin=0,",
-        r"                grid=major,",
-        r"            ]",
+        r"    \begin{tikzpicture}",
+        r"        \begin{groupplot}[",
+        rf"            group style={{group size=1 by {len(panels)}, vertical sep=1.05cm}},",
+        r"            width=0.92\linewidth,",
+        r"            height=3.15cm,",
+        r"            xlabel={Mean pinball loss relative to RLQR},",
+        r"            legend style={at={(0.5,1.22)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"            legend cell align={left},",
+        r"            area legend,",
+        r"            axis lines*=left,",
+        r"            xmin=0,",
+        r"            grid=major,",
+        r"        ]",
     ]
-    for panel_i, panel in enumerate(panels):
-        panel_df = d[d["target_group"].astype(str).eq(str(panel))].copy()
-        agg = (
-            panel_df.groupby(["bucket", "model_label"], as_index=False, sort=False)
-            .agg(mean_pinball_loss=("mean_pinball_loss", "mean"))
-        )
-        pivot = agg.pivot_table(index="bucket", columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
-        if "RLQR" not in pivot.columns:
-            continue
-        denom = pd.to_numeric(pivot["RLQR"], errors="coerce")
-        pivot = pivot.loc[denom.notna() & denom.abs().gt(1e-12)].copy()
-        if pivot.empty:
-            continue
-        buckets = sorted(pivot["bucket"].dropna().astype(str).unique(), key=lambda b: bucket_order.get(b, 99))
-        ticks = ",".join(str(i) for i in range(len(buckets)))
-        ticklabels = ",".join(_latex_escape(_bucket_label(bucket)) for bucket in buckets)
-        xmax = max(len(buckets) - 0.35, 0.5)
+    legend_written = False
+    for group, part, labels, symbols in panels:
+        symbol_list = ",".join(symbols)
+        label_list = ",".join(_latex_escape(label) for label in labels)
         lines.extend(
             [
-                rf"                \nextgroupplot[title={{{_latex_escape(thesis_titlecase(str(panel)))}}}, xmin=-0.65, xmax={_tex_num(xmax)}, xtick={{{ticks}}}, xticklabels={{{ticklabels}}}]",
-                rf"                    \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{(-0.65,1) ({_tex_num(xmax)},1)}};",
+                r"            \nextgroupplot[",
+                r"                xbar,",
+                r"                bar width=6pt,",
+                rf"                title={{{_latex_escape(thesis_titlecase(group))}}},",
+                rf"                symbolic y coords={{{symbol_list}}},",
+                rf"                ytick={{{symbol_list}}},",
+                rf"                yticklabels={{{label_list}}},",
+                r"                y dir=reverse,",
+                r"            ]",
+                rf"                \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{(1,{symbols[0]}) (1,{symbols[-1]})}};",
             ]
         )
-        if panel_i == 0:
-            lines.append(r"                    \addlegendentry{RLQR}")
-        for model, offset in [("XGB", -0.18), ("TFT", 0.18)]:
-            if model not in pivot.columns:
+        if not legend_written:
+            lines.append(r"                \addlegendentry{RLQR baseline}")
+        for model in ["XGB", "TFT"]:
+            if model not in part.columns:
                 continue
             color = _model_color_role(model)
             coords: list[str] = []
-            for i, bucket in enumerate(buckets):
-                row = pivot[pivot["bucket"].astype(str).eq(bucket)]
-                if row.empty:
-                    continue
-                base = float(pd.to_numeric(row["RLQR"], errors="coerce").iloc[0])
-                value = float(pd.to_numeric(row[model], errors="coerce").iloc[0])
-                if np.isfinite(base) and abs(base) > 1e-12 and np.isfinite(value):
-                    coords.append(f"({_tex_num(i + offset)},{_tex_num(value / base)})")
-            if coords:
-                lines.append(rf"                    \addplot[ybar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
-                if panel_i == 0:
-                    lines.append(rf"                    \addlegendentry{{{model}}}")
+            for symbol, value in zip(symbols, pd.to_numeric(part[model], errors="coerce")):
+                if pd.notna(value) and np.isfinite(float(value)):
+                    coords.append(f"({_tex_num(value)},{symbol})")
+            if not coords:
+                continue
+            lines.append(rf"                \addplot[xbar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+            if not legend_written:
+                lines.append(rf"                \addlegendentry{{{_latex_escape(model)}}}")
+        legend_written = True
     lines.extend(
         [
-            r"            \end{groupplot}",
-            r"        \end{tikzpicture}}",
-            f"    \\caption{{{_latex_escape(thesis_titlecase(caption))}}}",
+            r"        \end{groupplot}",
+            r"    \end{tikzpicture}",
+            f"    \\caption{{{_latex_escape(caption)}}}",
             f"    \\label{{{label}}}",
             r"\end{figure}",
             "",
@@ -1475,11 +1649,11 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             path = _write_gate_bucket_relative_tex(
                 out,
                 data=d,
-                caption="Gate-Specific Relative Mean Pinball Loss (RLQR = 1).",
+                caption="Actionable Forecast Performance by Market Gate Relative to RLQR.",
                 label="fig:rq1-4-1-4-gate-bucket-pinball",
             )
             if path:
-                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description="Native pgfplots gate-specific relative pinball bar chart.")
+                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description="Native pgfplots actionable market-gate relative pinball horizontal bar chart.")
             if "coverage_p10_p90" in d.columns:
                 d["x"] = d["bucket"].map(_bucket_label) + " / " + d["target_group"].astype(str)
                 x_order = d["x"].drop_duplicates().tolist()
@@ -1499,19 +1673,17 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
         df = pd.read_csv(tail)
         d = df.copy()
         d = sort_target_frame(d, target_col="target", extra_cols=["regime"])
+        out = root / "result_section" / "latex_figures" / "tail_spike_relative_pinball_by_regime.tex"
+        path = _write_tail_spike_relative_tex(
+            out,
+            data=d,
+            caption="Tail and spike performance by regime. Values below 1 indicate lower mean pinball loss than RLQR, while values above 1 indicate worse performance.",
+            label="fig:rq1-4-1-5-tail-spike-relative-pinball",
+        )
+        if path:
+            _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description="Native pgfplots tail/spike relative pinball horizontal bar chart.")
         d["x"] = d["regime"].astype(str) + " / " + d["target_group"].astype(str)
         x_order = d["x"].drop_duplicates().tolist()
-        pivot = d.pivot_table(index="x", columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
-        pivot["x"] = pd.Categorical(pivot["x"], categories=x_order, ordered=True)
-        pivot = pivot.sort_values("x")
-        if "RLQR" in pivot.columns:
-            for col in ["XGB", "TFT"]:
-                if col in pivot.columns:
-                    pivot[col] = pd.to_numeric(pivot[col], errors="coerce") / pd.to_numeric(pivot["RLQR"], errors="coerce")
-            out = root / "result_section" / "latex_figures" / "tail_spike_relative_pinball_by_regime.tex"
-            path = _write_grouped_bar_tex(out, data=pivot, x_col="x", series_cols=[c for c in ["XGB", "TFT"] if c in pivot.columns], caption="Tail/spike mean pinball loss relative to RLQR by regime.", label="fig:rq1-4-1-5-tail-spike-relative-pinball", ylabel="Mean pinball loss relative to RLQR", reference_y=1.0, reference_label="RLQR")
-            if path:
-                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description="Native pgfplots tail/spike relative pinball bar chart.")
         pivot = d.pivot_table(index="x", columns="model_label", values="coverage_p10_p90", aggfunc="mean").reset_index()
         pivot["x"] = pd.Categorical(pivot["x"], categories=x_order, ordered=True)
         pivot = pivot.sort_values("x")

@@ -7,6 +7,7 @@ import pandas as pd
 
 from scripts.build_final_full_forecast_metrics import (
     ModelSpec,
+    build_p50_error_tolerance_outputs,
     build_detailed_table,
     build_full_metrics,
     build_primary_table,
@@ -129,9 +130,9 @@ def test_primary_table_is_mean_pinball_only(tmp_path: Path) -> None:
     assert "target_group" not in primary.columns
     assert list(primary.columns) == [
         "target",
-        "TFT",
-        "XGB",
         "RLQR",
+        "XGB",
+        "TFT",
         "best_model",
         "relative_improvement_vs_RLQR_pct",
         "n_obs",
@@ -153,7 +154,7 @@ def test_detailed_table_contains_all_four_metrics(tmp_path: Path) -> None:
 
 def test_outputs_exclude_interval_metrics_from_4_1_1(tmp_path: Path) -> None:
     metrics, diagnostics = _build_small_metrics(tmp_path)
-    outputs = write_outputs(metrics, diagnostics, out_dir=tmp_path / "out", split="test")
+    outputs = write_outputs(metrics, diagnostics, benchmark_dir=tmp_path / "benchmark", out_dir=tmp_path / "out", split="test")
     names = {p.name for p in outputs}
     assert "rq1_4_1_1_forecast_metrics_full_long.csv" in names
     assert "rq1_4_1_1_forecast_metrics_full_primary_test.csv" in names
@@ -165,7 +166,8 @@ def test_outputs_exclude_interval_metrics_from_4_1_1(tmp_path: Path) -> None:
 
     primary_tex = (tmp_path / "out" / "latex" / "rq1_4_1_1_forecast_metrics_full_primary_test.tex").read_text(encoding="utf-8")
     detailed_tex = (tmp_path / "out" / "latex" / "rq1_4_1_1_forecast_metrics_full_detailed_test.tex").read_text(encoding="utf-8")
-    assert r"\textbf{Target} & \textbf{TFT} & \textbf{XGB} & \textbf{RLQR} & \textbf{Best model} & \textbf{Improvement vs RLQR (\%)} & \textbf{N}" in primary_tex
+    assert r"\textbf{Target} & \textbf{RLQR} & \textbf{XGB} & \textbf{TFT} & \textbf{Best model}" in primary_tex
+    assert r"\shortstack{Improvement\\vs RLQR (\%)}" in primary_tex
     assert r"\textbf{Target group}" not in primary_tex
     assert r"\textbf{Quantiles}" not in primary_tex
     assert r"\textbf{Metric}" not in primary_tex
@@ -189,9 +191,9 @@ def test_outputs_exclude_interval_metrics_from_4_1_1(tmp_path: Path) -> None:
     detailed_csv = pd.read_csv(tmp_path / "out" / "csv" / "rq1_4_1_1_forecast_metrics_full_detailed_test.csv")
     assert list(primary_csv.columns) == [
         "target",
-        "TFT",
-        "XGB",
         "RLQR",
+        "XGB",
+        "TFT",
         "best_model",
         "relative_improvement_vs_RLQR_pct",
         "n_obs",
@@ -202,9 +204,9 @@ def test_outputs_exclude_interval_metrics_from_4_1_1(tmp_path: Path) -> None:
     assert list(detailed_csv.columns) == [
         "target",
         "metric",
-        "TFT",
-        "XGB",
         "RLQR",
+        "XGB",
+        "TFT",
         "best_model",
         "relative_improvement_vs_RLQR_pct",
         "n_obs",
@@ -212,3 +214,60 @@ def test_outputs_exclude_interval_metrics_from_4_1_1(tmp_path: Path) -> None:
         "lead_min",
         "lead_max",
     ]
+
+
+def test_p50_absolute_error_tolerance_curve_uses_common_intersection(tmp_path: Path) -> None:
+    joined = tmp_path / "benchmark" / "diagnostics" / "joined_predictions"
+    _write_joined(joined / "linear__test__pred_da_price.parquet", _rows("linear", include_third=True))
+    _write_joined(joined / "xgb__test__pred_da_price.parquet", _rows("xgb", include_third=True))
+    _write_joined(joined / "tft__test__pred_da_price.parquet", _rows("tft", include_third=False))
+
+    curve, summary = build_p50_error_tolerance_outputs(
+        benchmark_dir=tmp_path / "benchmark",
+        models=[ModelSpec("tft", "TFT"), ModelSpec("xgb", "XGB"), ModelSpec("linear", "RLQR")],
+        splits=["test"],
+        grid_size=5,
+    )
+
+    assert set(curve["n_obs"]) == {2}
+    assert set(summary["n_obs"]) == {2}
+    for model, part in curve.groupby("model"):
+        ordered = part.sort_values("threshold")
+        assert ordered["share_within_threshold"].is_monotonic_increasing, model
+
+    tft_zero = curve[(curve["model"] == "TFT") & (curve["threshold"] == 0.0)].iloc[0]
+    assert math.isclose(float(tft_zero["share_within_threshold"]), 0.5)
+    xgb_one = summary[summary["model"] == "XGB"].iloc[0]
+    assert math.isclose(float(xgb_one["share_le_1"]), 1.0)
+    rlqr_one = summary[summary["model"] == "RLQR"].iloc[0]
+    assert math.isclose(float(rlqr_one["share_le_1"]), 0.5)
+
+
+def test_p50_absolute_error_tolerance_outputs_and_latex_snippet(tmp_path: Path) -> None:
+    metrics, diagnostics = _build_small_metrics(tmp_path)
+    curve, summary = build_p50_error_tolerance_outputs(
+        benchmark_dir=tmp_path / "benchmark",
+        models=[ModelSpec("tft", "TFT"), ModelSpec("xgb", "XGB"), ModelSpec("linear", "RLQR")],
+        splits=["test"],
+        grid_size=5,
+    )
+    outputs = write_outputs(
+        metrics,
+        diagnostics,
+        benchmark_dir=tmp_path / "benchmark",
+        out_dir=tmp_path / "out",
+        split="test",
+        p50_tolerance_curve=curve,
+        p50_tolerance_summary=summary,
+    )
+    names = {p.name for p in outputs}
+    assert "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.csv" in names
+    assert "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.png" in names
+    assert "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex" in names
+    assert "rq1_4_1_1_da_price_p50_error_tolerance_summary_test.csv" in names
+    assert "rq1_4_1_1_da_price_p50_error_tolerance_summary_test.tex" in names
+
+    tex = (tmp_path / "out" / "figures" / "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex").read_text(encoding="utf-8")
+    assert r"\includegraphics" in tex
+    assert r"\caption" in tex
+    assert r"\label{fig:da_price_p50_absolute_error_tolerance_curve}" in tex

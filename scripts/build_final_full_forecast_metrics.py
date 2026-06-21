@@ -82,6 +82,9 @@ ROW_INTERSECTION_KEY = "split,target,target_time_utc,lead_time_h"
 DEFAULT_TRAINING_DAYS = 365.0
 DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
 DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
+DA_PRICE_TARGETS = {"pred_da_price", "target_da_price"}
+P50_TOLERANCE_THRESHOLDS = (1.0, 5.0, 10.0)
+P50_TOLERANCE_UNIT_DA = "EUR/MWh"
 
 
 @dataclass(frozen=True)
@@ -268,8 +271,8 @@ def build_full_metrics(
     benchmark_dir: Path,
     models: list[ModelSpec],
     splits: list[str],
-    eval_origin_start: pd.Timestamp | None,
-    eval_origin_end: pd.Timestamp | None,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -377,6 +380,133 @@ def build_full_metrics(
     metrics = sort_target_frame(pd.DataFrame(rows), target_col="target", extra_cols=["split", "metric", "model_label"])
     diag = sort_target_frame(pd.DataFrame(diagnostics), target_col="target", extra_cols=["split", "model"])
     return metrics, diag
+
+
+def _threshold_slug(threshold: float) -> str:
+    x = float(threshold)
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return str(x).replace(".", "_")
+
+
+def _valid_p50_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df[[*KEY_COLS, "y_true", "p50"]].copy()
+    for col in ["y_true", "p50"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    mask = pd.notna(out["target_time_utc"]) & pd.notna(out["lead_time_h"])
+    mask &= np.isfinite(out["y_true"].to_numpy(dtype=float))
+    mask &= np.isfinite(out["p50"].to_numpy(dtype=float))
+    return out.loc[mask].copy()
+
+
+def build_p50_error_tolerance_outputs(
+    *,
+    benchmark_dir: Path,
+    models: list[ModelSpec],
+    splits: list[str],
+    target: str = "pred_da_price",
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
+    thresholds: tuple[float, ...] = P50_TOLERANCE_THRESHOLDS,
+    x_max: float | None = None,
+    grid_size: int = 201,
+    unit: str = P50_TOLERANCE_UNIT_DA,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
+    files: dict[tuple[str, str, str], Path] = {}
+    for path in sorted(joined_dir.glob("*.parquet")):
+        parsed = _parse_joined_name(path)
+        if parsed is not None:
+            files[parsed] = path
+
+    curve_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+    for split in splits:
+        loaded: dict[str, pd.DataFrame] = {}
+        for model in models:
+            path = files.get((model.key, split, target))
+            if path is None:
+                raise FileNotFoundError(
+                    f"Missing joined predictions for p50 tolerance curve: model={model.key}, split={split}, target={target}. "
+                    f"Expected {joined_dir / f'{model.key}__{split}__{target}.parquet'}."
+                )
+            df = _apply_forecast_origin_window(
+                _read_joined_prediction(path),
+                start=eval_origin_start,
+                end=eval_origin_end,
+            )
+            _assert_unique_keys(df, model=model.key, split=split, target=target)
+            loaded[model.key] = _valid_p50_frame(df)
+
+        common_keys = set.intersection(*(_key_tuples(loaded[m.key]) for m in models))
+        if not common_keys:
+            raise ValueError(f"Common p50 valid row intersection is empty for split={split}, target={target}.")
+        common_key_df = pd.DataFrame(list(common_keys), columns=KEY_COLS)
+        common_key_df["target_time_utc"] = pd.to_datetime(common_key_df["target_time_utc"], utc=True)
+        common_key_df["lead_time_h"] = pd.to_numeric(common_key_df["lead_time_h"], errors="coerce").astype(float)
+
+        abs_errors_by_model: dict[str, np.ndarray] = {}
+        pooled_abs_errors: list[np.ndarray] = []
+        for model in models:
+            eval_df = loaded[model.key].merge(common_key_df, on=KEY_COLS, how="inner").sort_values(KEY_COLS)
+            err = (
+                pd.to_numeric(eval_df["p50"], errors="coerce").to_numpy(dtype=float)
+                - pd.to_numeric(eval_df["y_true"], errors="coerce").to_numpy(dtype=float)
+            )
+            abs_err = np.abs(err)
+            abs_errors_by_model[model.label] = abs_err
+            pooled_abs_errors.append(abs_err)
+
+        pooled = np.concatenate(pooled_abs_errors) if pooled_abs_errors else np.array([], dtype=float)
+        finite_pooled = pooled[np.isfinite(pooled)]
+        if finite_pooled.size == 0:
+            raise ValueError(f"No finite absolute p50 errors for split={split}, target={target}.")
+        robust_max = float(np.nanpercentile(finite_pooled, 95.0)) if x_max is None else float(x_max)
+        robust_max = max(robust_max, max(thresholds), 1.0)
+        grid = np.linspace(0.0, robust_max, int(max(grid_size, 2)))
+        threshold_values = sorted(set(float(x) for x in [*grid.tolist(), *thresholds, 0.0] if 0.0 <= float(x) <= robust_max))
+
+        for model in models:
+            abs_err = abs_errors_by_model[model.label]
+            finite = abs_err[np.isfinite(abs_err)]
+            n_obs = int(finite.size)
+            if n_obs == 0:
+                continue
+            for threshold in threshold_values:
+                curve_rows.append(
+                    {
+                        "split": split,
+                        "target": target,
+                        "model": model.label,
+                        "threshold": float(threshold),
+                        "share_within_threshold": float(np.mean(finite <= threshold)),
+                        "n_obs": n_obs,
+                        "unit": unit,
+                    }
+                )
+            summary = {
+                "split": split,
+                "target": target,
+                "model": model.label,
+                "median_absolute_error": float(np.median(finite)),
+                "mae_p50": float(np.mean(finite)),
+                "n_obs": n_obs,
+                "unit": unit,
+            }
+            for threshold in thresholds:
+                summary[f"share_le_{_threshold_slug(threshold)}"] = float(np.mean(finite <= float(threshold)))
+            summary_rows.append(summary)
+
+    curve = pd.DataFrame(curve_rows)
+    summary = pd.DataFrame(summary_rows)
+    order = {label: i for i, label in enumerate(MODEL_LABELS)}
+    if not curve.empty:
+        curve["_model_order"] = curve["model"].map(order)
+        curve = curve.sort_values(["split", "target", "_model_order", "threshold"]).drop(columns=["_model_order"]).reset_index(drop=True)
+    if not summary.empty:
+        summary["_model_order"] = summary["model"].map(order)
+        summary = summary.sort_values(["split", "target", "_model_order"]).drop(columns=["_model_order"]).reset_index(drop=True)
+    return curve, summary
 
 
 def _latex_escape(value: Any) -> str:
@@ -941,7 +1071,137 @@ def write_relative_mae_figure(detailed: pd.DataFrame, *, out_dir: Path, split: s
     return paths
 
 
-def write_outputs(metrics: pd.DataFrame, diagnostics: pd.DataFrame, *, benchmark_dir: Path, out_dir: Path, split: str, skip_pdf: bool = False) -> list[Path]:
+def write_p50_error_tolerance_figure(curve: pd.DataFrame, *, out_dir: Path, split: str, skip_pdf: bool = False) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    d = curve.loc[(curve["split"].eq(split)) & (curve["target"].isin(DA_PRICE_TARGETS))].copy()
+    if d.empty:
+        return []
+    d["threshold"] = pd.to_numeric(d["threshold"], errors="coerce")
+    d["share_within_threshold"] = pd.to_numeric(d["share_within_threshold"], errors="coerce")
+    d = d.dropna(subset=["threshold", "share_within_threshold"])
+    if d.empty:
+        return []
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(8.8, 5.4))
+    for label in MODEL_LABELS:
+        part = d[d["model"].eq(label)].sort_values("threshold")
+        if part.empty:
+            continue
+        model_key = "linear" if label == "RLQR" else label.lower()
+        ax.plot(
+            part["threshold"].to_numpy(dtype=float),
+            part["share_within_threshold"].to_numpy(dtype=float),
+            label=label,
+            color=get_model_color(model_key),
+            linewidth=2.0,
+        )
+    x_max = float(d["threshold"].max())
+    for ref in P50_TOLERANCE_THRESHOLDS:
+        if 0.0 <= ref <= x_max:
+            ax.axvline(ref, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=0.9, alpha=0.65)
+            ax.text(ref, 0.03, f"{int(ref)} €/MWh", rotation=90, va="bottom", ha="right", fontsize=8)
+    ax.set_xlim(0.0, x_max)
+    ax.set_ylim(0.0, 1.0)
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+    ax.set_xlabel("Absolute p50 error threshold in €/MWh")
+    ax.set_ylabel("Share of observations within threshold")
+    ax.set_title("DA price: cumulative absolute p50 error tolerance", pad=18)
+    fig.text(
+        0.125,
+        0.91,
+        "Higher is better. The curve shows the share of p50 forecasts within each absolute error threshold.",
+        ha="left",
+        va="top",
+        fontsize=9,
+    )
+    ax.legend(ncol=3, loc="lower right")
+    ax.grid(alpha=0.25)
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    png = fig_dir / "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.png"
+    fig.savefig(png)
+    paths = [png]
+    if not skip_pdf:
+        pdf = fig_dir / "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.pdf"
+        fig.savefig(pdf)
+        paths.append(pdf)
+    plt.close(fig)
+    return paths
+
+
+def write_p50_error_tolerance_latex_figure(*, out_dir: Path) -> Path:
+    path = out_dir / "figures" / "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        r"\begin{figure}[htbp]",
+        r"    \centering",
+        r"    \includegraphics[width=\linewidth]{da_price_p50_absolute_error_tolerance_curve.png}",
+        r"    \caption{Cumulative absolute p50 error tolerance for DA price forecasts on the test split. The curves report the share of forecasts with absolute p50 error below a given threshold in €/MWh. Higher values indicate a larger share of forecasts within the tolerance threshold.}",
+        r"    \label{fig:da_price_p50_absolute_error_tolerance_curve}",
+        r"\end{figure}",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def write_p50_error_tolerance_summary_latex(summary: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
+    d = summary.loc[(summary["split"].eq(split)) & (summary["target"].isin(DA_PRICE_TARGETS))].copy()
+    if d.empty:
+        return None
+    order = {label: i for i, label in enumerate(MODEL_LABELS)}
+    d["_model_order"] = d["model"].map(order)
+    d = d.sort_values("_model_order")
+    path = out_dir / "latex" / f"rq1_4_1_1_da_price_p50_error_tolerance_summary_{split}.tex"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        r"\begin{table}[ht]",
+        r"    \centering",
+        r"    \begin{tabular}{@{}lrrrrrr@{}}",
+        r"        \toprule",
+        r"        \textbf{Model} & \textbf{$\leq$1 €/MWh} & \textbf{$\leq$5 €/MWh} & \textbf{$\leq$10 €/MWh} & \textbf{Median absolute error} & \textbf{MAE p50} & \textbf{N} \\",
+        r"        \midrule",
+    ]
+    for _, row in d.iterrows():
+        vals = [
+            _latex_escape(row["model"]),
+            f"{100.0 * float(row.get('share_le_1', np.nan)):.1f}\\%",
+            f"{100.0 * float(row.get('share_le_5', np.nan)):.1f}\\%",
+            f"{100.0 * float(row.get('share_le_10', np.nan)):.1f}\\%",
+            f"{float(row['median_absolute_error']):.2f}",
+            f"{float(row['mae_p50']):.2f}",
+            _fmt_int(row["n_obs"]),
+        ]
+        lines.append("        " + " & ".join(vals) + r" \\")
+    lines.extend(
+        [
+            r"        \bottomrule",
+            r"    \end{tabular}",
+            r"    \caption{DA price p50 absolute error tolerance summary on the test split. Threshold columns report the share of forecasts with absolute p50 error within the stated tolerance.}",
+            r"    \label{tab:da_price_p50_error_tolerance_summary_test}",
+            r"\end{table}",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def write_outputs(
+    metrics: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    *,
+    benchmark_dir: Path,
+    out_dir: Path,
+    split: str,
+    skip_pdf: bool = False,
+    p50_tolerance_curve: pd.DataFrame | None = None,
+    p50_tolerance_summary: pd.DataFrame | None = None,
+) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_dir = out_dir / "csv"
     csv_dir.mkdir(parents=True, exist_ok=True)
@@ -965,6 +1225,24 @@ def write_outputs(metrics: pd.DataFrame, diagnostics: pd.DataFrame, *, benchmark
     outputs.extend(write_latex_tables(primary, detailed, out_dir=out_dir, split=split))
     outputs.extend(write_relative_pinball_figure(primary, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
     outputs.extend(write_relative_mae_figure(detailed, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
+
+    if p50_tolerance_curve is not None and not p50_tolerance_curve.empty:
+        tolerance_curve_path = csv_dir / "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.csv"
+        p50_tolerance_curve.loc[
+            (p50_tolerance_curve["split"].eq(split)) & (p50_tolerance_curve["target"].isin(DA_PRICE_TARGETS))
+        ].to_csv(tolerance_curve_path, index=False)
+        outputs.append(tolerance_curve_path)
+        outputs.extend(write_p50_error_tolerance_figure(p50_tolerance_curve, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
+        outputs.append(write_p50_error_tolerance_latex_figure(out_dir=out_dir))
+    if p50_tolerance_summary is not None and not p50_tolerance_summary.empty:
+        tolerance_summary_path = csv_dir / f"rq1_4_1_1_da_price_p50_error_tolerance_summary_{split}.csv"
+        p50_tolerance_summary.loc[
+            (p50_tolerance_summary["split"].eq(split)) & (p50_tolerance_summary["target"].isin(DA_PRICE_TARGETS))
+        ].to_csv(tolerance_summary_path, index=False)
+        outputs.append(tolerance_summary_path)
+        tolerance_summary_tex = write_p50_error_tolerance_summary_latex(p50_tolerance_summary, out_dir=out_dir, split=split)
+        if tolerance_summary_tex is not None:
+            outputs.append(tolerance_summary_tex)
 
     costs = build_computational_cost_table(benchmark_dir)
     if not costs.empty:
@@ -1028,7 +1306,24 @@ def main() -> int:
         eval_origin_start=eval_origin_start,
         eval_origin_end=eval_origin_end,
     )
-    outputs = write_outputs(metrics, diagnostics, benchmark_dir=benchmark_dir, out_dir=Path(args.out_dir), split=args.split, skip_pdf=bool(args.skip_pdf))
+    tolerance_curve, tolerance_summary = build_p50_error_tolerance_outputs(
+        benchmark_dir=benchmark_dir,
+        models=models,
+        splits=splits,
+        target="pred_da_price",
+        eval_origin_start=eval_origin_start,
+        eval_origin_end=eval_origin_end,
+    )
+    outputs = write_outputs(
+        metrics,
+        diagnostics,
+        benchmark_dir=benchmark_dir,
+        out_dir=Path(args.out_dir),
+        split=args.split,
+        skip_pdf=bool(args.skip_pdf),
+        p50_tolerance_curve=tolerance_curve,
+        p50_tolerance_summary=tolerance_summary,
+    )
     print("[OK] Built RQ1 4.1.1 full unweighted forecast metrics.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     for path in outputs:
