@@ -598,6 +598,233 @@ def build_cumulative_pnl_paths(summary: pd.DataFrame, *, run_root: Path) -> pd.D
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
 
 
+def _num_col(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(0.0, index=df.index, dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+
+
+def _sum_matching_cols(df: pd.DataFrame, *, prefix: str, suffix: str) -> pd.Series:
+    cols = [c for c in df.columns if c.startswith(prefix) and c.endswith(suffix)]
+    if not cols:
+        return pd.Series(0.0, index=df.index, dtype=float)
+    return df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1)
+
+
+def _first_available_num_col(df: pd.DataFrame, candidates: list[str]) -> tuple[pd.Series, str]:
+    for column in candidates:
+        if column in df.columns:
+            return _num_col(df, column), column
+    return pd.Series(0.0, index=df.index, dtype=float), ""
+
+
+def _find_backtest_hourly_path(scenario_dir: Path) -> Path | None:
+    direct = scenario_dir / "multi" / "p90_p90" / "backtest_hourly.parquet"
+    if direct.exists():
+        return direct
+    candidates = sorted(scenario_dir.rglob("backtest_hourly.parquet"))
+    return candidates[0] if candidates else None
+
+
+def _first_full_week_dates(timestamps: pd.Series) -> set[Any]:
+    ts = pd.to_datetime(timestamps, errors="coerce", utc=True).dropna()
+    if ts.empty:
+        return set()
+    first_date = ts.min().normalize()
+    first_monday = first_date + pd.Timedelta(days=(7 - first_date.weekday()) % 7)
+    week = pd.date_range(first_monday, first_monday + pd.Timedelta(days=6), freq="1D", tz="UTC")
+    return {d.date() for d in week}
+
+
+def build_market_dispatch_soc_day(
+    summary: pd.DataFrame,
+    *,
+    run_root: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = [
+        "timestamp_utc",
+        "date",
+        "hour_utc",
+        "component",
+        "market",
+        "direction",
+        "mw_signed",
+        "mw_abs",
+        "soc_mwh",
+        "pnl_eur",
+        "cumulative_pnl_eur",
+        "source_column",
+        "pnl_source_column",
+        "model",
+        "quantile",
+        "scenario_folder",
+        "scenario_output_dir",
+    ]
+    warnings: list[dict[str, Any]] = []
+    model_rows = summary.loc[~summary["is_benchmark"].astype(bool)].copy()
+    model_rows["annualized_profit_eur_per_year"] = pd.to_numeric(model_rows["annualized_profit_eur_per_year"], errors="coerce")
+    model_rows = model_rows.dropna(subset=["annualized_profit_eur_per_year"]).copy()
+    if model_rows.empty:
+        warnings.append({"severity": "warning", "scenario": "", "message": "No numeric model scenarios available for dispatch/SOC example-day figure."})
+        return pd.DataFrame(columns=columns), pd.DataFrame(warnings)
+    best = model_rows.sort_values("annualized_profit_eur_per_year", ascending=False).iloc[0]
+    scenario_dir = run_root / str(best["folder"])
+    hourly_path = _find_backtest_hourly_path(scenario_dir)
+    if hourly_path is None:
+        warnings.append({"severity": "warning", "scenario": str(best["folder"]), "message": "Missing nested backtest_hourly.parquet for dispatch/SOC example-day figure."})
+        return pd.DataFrame(columns=columns), pd.DataFrame(warnings)
+
+    hourly = pd.read_parquet(hourly_path).copy()
+    if "timestamp_utc" not in hourly.columns:
+        warnings.append({"severity": "warning", "scenario": str(best["folder"]), "message": f"Missing timestamp_utc in {hourly_path}."})
+        return pd.DataFrame(columns=columns), pd.DataFrame(warnings)
+    hourly["timestamp_utc"] = pd.to_datetime(hourly["timestamp_utc"], errors="coerce", utc=True)
+    hourly = hourly.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc").copy()
+    if hourly.empty:
+        warnings.append({"severity": "warning", "scenario": str(best["folder"]), "message": f"No valid timestamps in {hourly_path}."})
+        return pd.DataFrame(columns=columns), pd.DataFrame(warnings)
+
+    d = hourly.copy()
+    d["date"] = d["timestamp_utc"].dt.date
+    d["da_charge_mw"] = _num_col(d, "real_da_buy_mwh")
+    d["da_discharge_mw"] = _num_col(d, "real_da_sell_mwh")
+    d["bem_charge_mw"] = _num_col(d, "real_bem_only_executed_neg_mwh")
+    d["bem_discharge_mw"] = _num_col(d, "real_bem_only_executed_pos_mwh")
+    d["bcm_charge_mw"], bcm_charge_source = _first_available_num_col(
+        d,
+        [
+            "real_bcm_linked_neg_activation_mwh",
+            "real_bcm_p90_executed_act_neg_mw",
+            "real_executed_afrr_act_neg_mw",
+        ],
+    )
+    d["bcm_discharge_mw"], bcm_discharge_source = _first_available_num_col(
+        d,
+        [
+            "real_bcm_linked_pos_activation_mwh",
+            "real_bcm_p90_executed_act_pos_mw",
+            "real_executed_afrr_act_pos_mw",
+        ],
+    )
+    if not bcm_charge_source:
+        d["bcm_charge_mw"] = _sum_matching_cols(d, prefix="real_executed_afrr_act_neg_bin_", suffix="_mw")
+        bcm_charge_source = "real_executed_afrr_act_neg_bin_*_mw"
+    if not bcm_discharge_source:
+        d["bcm_discharge_mw"] = _sum_matching_cols(d, prefix="real_executed_afrr_act_pos_bin_", suffix="_mw")
+        bcm_discharge_source = "real_executed_afrr_act_pos_bin_*_mw"
+    d["soc_mwh"] = pd.to_numeric(d.get("real_soc_mwh", d.get("soc_mwh", np.nan)), errors="coerce")
+    d["pnl_eur"], pnl_source = _first_available_num_col(
+        d,
+        [
+            "real_pnl_eur",
+            "real_da_pnl_eur",
+            "perfect_foresight_pnl_eur",
+            "pnl_eur",
+        ],
+    )
+    if not pnl_source:
+        pnl_parts = [
+            _num_col(d, "real_revenue_da_eur") - _num_col(d, "real_cost_da_eur"),
+            _num_col(d, "real_revenue_id_eur") - _num_col(d, "real_cost_id_eur"),
+            _num_col(d, "real_bcm_capacity_revenue_eur"),
+            _num_col(d, "real_bcm_linked_activation_revenue_eur"),
+            _num_col(d, "real_bem_only_activation_revenue_eur"),
+            -_num_col(d, "real_transaction_cost_eur"),
+            -_num_col(d, "real_degradation_cost_eur"),
+            -_num_col(d, "real_aux_cost_eur"),
+        ]
+        d["pnl_eur"] = sum(pnl_parts)
+        pnl_source = "reconstructed_real_market_revenue_cost_columns"
+    for col in ["real_power_violation_charge_mw", "real_power_violation_discharge_mw", "real_protected_soc_violation_pos_mwh", "real_protected_soc_violation_neg_mwh"]:
+        d[col] = _num_col(d, col)
+    d["activity_mw"] = d[["da_charge_mw", "da_discharge_mw", "bem_charge_mw", "bem_discharge_mw", "bcm_charge_mw", "bcm_discharge_mw"]].abs().sum(axis=1)
+    d["direct_violation"] = d[["real_power_violation_charge_mw", "real_power_violation_discharge_mw", "real_protected_soc_violation_pos_mwh", "real_protected_soc_violation_neg_mwh"]].abs().sum(axis=1)
+
+    first_week_dates = _first_full_week_dates(d["timestamp_utc"])
+    candidates = d.loc[d["date"].isin(first_week_dates)].copy()
+    if candidates.empty:
+        candidates = d.copy()
+        warnings.append({"severity": "warning", "scenario": str(best["folder"]), "message": "Could not isolate first full week; selected day from full available horizon."})
+    daily = candidates.groupby("date", as_index=False).agg(
+        n_rows=("timestamp_utc", "size"),
+        activity_mw=("activity_mw", "sum"),
+        direct_violation=("direct_violation", "sum"),
+    )
+    complete = daily.loc[daily["n_rows"] >= 24].copy()
+    if complete.empty:
+        complete = daily.copy()
+        warnings.append({"severity": "warning", "scenario": str(best["folder"]), "message": "No complete 24-row day available for dispatch/SOC example-day figure."})
+    no_direct_viol = complete.loc[complete["direct_violation"].abs() <= 1e-9].copy()
+    selector = no_direct_viol if not no_direct_viol.empty else complete
+    selected_day = selector.sort_values(["activity_mw", "date"], ascending=[False, True]).iloc[0]["date"]
+    day = d.loc[d["date"].eq(selected_day)].copy()
+    day["cumulative_pnl_eur"] = pd.to_numeric(day["pnl_eur"], errors="coerce").fillna(0.0).cumsum()
+
+    scenario_invalid = str(best.get("invalid_reason", "") or "")
+    sim_valid = _safe_float(best.get("simulation_valid", np.nan))
+    thesis_reportable = _safe_float(best.get("thesis_reportable", np.nan))
+    selected_violation = float(day["direct_violation"].sum()) if not day.empty else math.nan
+    if sim_valid < 0.5 or thesis_reportable < 0.5 or scenario_invalid:
+        warnings.append(
+            {
+                "severity": "warning",
+                "scenario": str(best["folder"]),
+                "message": "Selected scenario has global simulation invalidity flags.",
+                "simulation_valid": sim_valid,
+                "thesis_reportable": thesis_reportable,
+                "invalid_reason": scenario_invalid,
+                "selected_day": str(selected_day),
+            }
+        )
+    if math.isfinite(selected_violation) and selected_violation > 1e-9:
+        warnings.append(
+            {
+                "severity": "warning",
+                "scenario": str(best["folder"]),
+                "message": "Selected dispatch day has direct power/protected-SoC violation columns above zero.",
+                "selected_day": str(selected_day),
+                "direct_violation_sum": selected_violation,
+            }
+        )
+    else:
+        warnings.append(
+            {
+                "severity": "info",
+                "scenario": str(best["folder"]),
+                "message": "Selected dispatch day has no direct power/protected-SoC violations in the checked columns.",
+                "selected_day": str(selected_day),
+                "direct_violation_sum": selected_violation,
+            }
+        )
+
+    specs = [
+        ("DA buy", "DA", "charge", "da_charge_mw", "real_da_buy_mwh", 1.0),
+        ("BEM negative activation", "BEM", "charge", "bem_charge_mw", "real_bem_only_executed_neg_mwh", 1.0),
+        ("BCM negative activation", "BCM activation", "charge", "bcm_charge_mw", bcm_charge_source, 1.0),
+        ("DA sell", "DA", "discharge", "da_discharge_mw", "real_da_sell_mwh", -1.0),
+        ("BEM positive activation", "BEM", "discharge", "bem_discharge_mw", "real_bem_only_executed_pos_mwh", -1.0),
+        ("BCM positive activation", "BCM activation", "discharge", "bcm_discharge_mw", bcm_discharge_source, -1.0),
+    ]
+    rows: list[pd.DataFrame] = []
+    for component, market, direction, value_col, source_col, sign in specs:
+        part = day[["timestamp_utc", "date", "soc_mwh", "pnl_eur", "cumulative_pnl_eur", value_col]].copy()
+        part["hour_utc"] = part["timestamp_utc"].dt.strftime("%H:%M")
+        part["component"] = component
+        part["market"] = market
+        part["direction"] = direction
+        part["mw_abs"] = pd.to_numeric(part[value_col], errors="coerce").fillna(0.0).abs()
+        part["mw_signed"] = sign * part["mw_abs"]
+        part["source_column"] = source_col
+        part["pnl_source_column"] = pnl_source
+        part["model"] = str(best["model"])
+        part["quantile"] = str(best["quantile"])
+        part["scenario_folder"] = str(best["folder"])
+        part["scenario_output_dir"] = str(hourly_path.parent)
+        rows.append(part[columns])
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=columns)
+    return out.sort_values(["timestamp_utc", "direction", "component"]).reset_index(drop=True), pd.DataFrame(warnings)
+
+
 def _pinball_loss(y_true: pd.Series, y_pred: pd.Series, quantile: float) -> pd.Series:
     err = y_true - y_pred
     return np.maximum(quantile * err, (quantile - 1.0) * err)
@@ -1056,6 +1283,149 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     return written
 
 
+def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(12.0, 5.8))
+    if dispatch_data.empty:
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+            "No market dispatch/SOC example-day data available.",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color=THESIS_PALETTE["neutral_dark"],
+            wrap=True,
+        )
+        ax.set_title("Market Dispatch and SoC on Selected Day")
+        fig.tight_layout()
+        written = _save_figure(fig, out_base, formats)
+        plt.close(fig)
+        return written
+
+    data = dispatch_data.copy()
+    data["timestamp_utc"] = pd.to_datetime(data["timestamp_utc"], errors="coerce", utc=True)
+    times = sorted(data["timestamp_utc"].dropna().unique())
+    x = np.arange(len(times))
+    time_index = {ts: i for i, ts in enumerate(times)}
+    data["x"] = data["timestamp_utc"].map(time_index)
+
+    component_order = [
+        "DA buy",
+        "BEM negative activation",
+        "BCM negative activation",
+        "DA sell",
+        "BEM positive activation",
+        "BCM positive activation",
+    ]
+    label_map = {
+        "DA buy": "DA buy",
+        "DA sell": "DA sell",
+        "BEM negative activation": "BEM activation $-$",
+        "BEM positive activation": "BEM activation +",
+        "BCM negative activation": "BCM activation $-$",
+        "BCM positive activation": "BCM activation +",
+    }
+    color_map = {
+        "DA buy": MARKET_COLOR_MAP["DA"],
+        "DA sell": MARKET_COLOR_MAP["DA"],
+        "BEM negative activation": MARKET_COLOR_MAP["BEM"],
+        "BEM positive activation": MARKET_COLOR_MAP["BEM"],
+        "BCM negative activation": MARKET_COLOR_MAP["BCM activation"],
+        "BCM positive activation": MARKET_COLOR_MAP["BCM activation"],
+    }
+    pos_bottom = np.zeros(len(times))
+    neg_bottom = np.zeros(len(times))
+    width = 0.82
+    for component in component_order:
+        g = data.loc[data["component"].eq(component)].copy()
+        if g.empty:
+            continue
+        values = np.zeros(len(times))
+        for _, row in g.iterrows():
+            idx = int(row["x"])
+            values[idx] = float(row["mw_signed"])
+        bottom = pos_bottom if np.nanmean(values) >= 0 else neg_bottom
+        label = label_map[component]
+        ax.bar(
+            x,
+            values,
+            width=width,
+            bottom=bottom,
+            color=color_map[component],
+            edgecolor="white",
+            linewidth=0.5,
+            label=None,
+        )
+        if np.nanmean(values) >= 0:
+            pos_bottom = pos_bottom + values
+        else:
+            neg_bottom = neg_bottom + values
+
+    soc = (
+        data[["timestamp_utc", "soc_mwh"]]
+        .drop_duplicates("timestamp_utc")
+        .sort_values("timestamp_utc")
+        .set_index("timestamp_utc")
+        .reindex(times)["soc_mwh"]
+        .to_numpy(dtype=float)
+    )
+    ax2 = ax.twinx()
+    ax2.plot(x, soc, color=THESIS_PALETTE["perfect_foresight"], linewidth=2.2, label="SoC")
+    ax2.set_ylabel("SoC (MWh)")
+    ax2.tick_params(axis="y", colors=THESIS_PALETTE["perfect_foresight"])
+    ax2.spines["right"].set_color(THESIS_PALETTE["perfect_foresight"])
+    pnl = (
+        data[["timestamp_utc", "cumulative_pnl_eur"]]
+        .drop_duplicates("timestamp_utc")
+        .sort_values("timestamp_utc")
+        .set_index("timestamp_utc")
+        .reindex(times)["cumulative_pnl_eur"]
+        .to_numpy(dtype=float)
+    )
+    pnl_color = GEO_SEQUENTIAL_BLUE["seq_7"]
+    ax3 = ax.twinx()
+    ax3.spines["right"].set_position(("axes", 1.08))
+    ax3.plot(x, pnl, color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit")
+    ax3.set_ylabel("Cumulative Net Profit (EUR)")
+    ax3.tick_params(axis="y", colors=pnl_color)
+    ax3.spines["right"].set_color(pnl_color)
+
+    ax.axhline(0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.9)
+    ax.set_ylim(-10, 10)
+    ax.set_ylabel("Power (MW): charge (+), discharge (-)")
+    ax.set_xlabel("Time")
+    labels = [pd.Timestamp(ts).strftime("%H:%M") for ts in times]
+    ax.set_xticks(x[:: max(1, len(x) // 8)])
+    ax.set_xticklabels(labels[:: max(1, len(x) // 8)])
+    selected_day = str(pd.Timestamp(times[0]).date()) if times else ""
+    fig.suptitle("Market Dispatch and SoC on Selected Day", y=0.98)
+    ax.set_title(
+        f"TFT p90 multi-market dispatch on {selected_day}. Charging actions are above zero; discharging actions are below zero.",
+        fontsize=9,
+        loc="left",
+        pad=10,
+    )
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    handles = [Patch(facecolor=color_map[component], edgecolor="white", label=label_map[component]) for component in component_order]
+    handles.extend(
+        [
+            Line2D([0], [0], color=THESIS_PALETTE["perfect_foresight"], linewidth=2.2, label="SoC"),
+            Line2D([0], [0], color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit"),
+        ]
+    )
+    ax.legend(handles=handles, ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.15), frameon=True)
+    fig.tight_layout(rect=(0, 0, 0.94, 0.94))
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
+    return written
+
+
 def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[str], run_name: str) -> list[Path]:
     import matplotlib.pyplot as plt
 
@@ -1313,6 +1683,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         quantiles=quantiles,
     )
     total_scatter_data = build_total_pinball_net_profit_scatter_data(scatter_data)
+    dispatch_soc_data, dispatch_soc_warnings = build_market_dispatch_soc_day(summary, run_root=run_root)
 
     csv_dir = out_root / "backup/csv"
     diag_dir = out_root / "backup/diagnostics"
@@ -1330,10 +1701,13 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     cumulative_data.to_csv(csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", index=False)
     scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", index=False)
     total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", index=False)
+    dispatch_soc_data.to_csv(csv_dir / "6_market_dispatch_soc_selected_day.csv", index=False)
     bench.to_csv(csv_dir / "rq2_benchmark_values.csv", index=False)
     inventory.to_csv(diag_dir / "rq2_input_file_inventory.csv", index=False)
     validity.to_csv(diag_dir / "rq2_validity_diagnostics.csv", index=False)
+    warning_df = pd.concat([warning_df, dispatch_soc_warnings], ignore_index=True, sort=False)
     warning_df.to_csv(warn_dir / "rq2_warnings.csv", index=False)
+    dispatch_soc_warnings.to_csv(warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", index=False)
 
     write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
     write_appendix_table(appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", summary)
@@ -1345,6 +1719,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "4_cumulative_net_profit_model_comparison_test_period", formats, run_root.name)
         figure_paths += plot_pinball_net_profit_scatter(scatter_data, figures_dir, formats)
         figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
+        figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
         figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
         _write_latex_include(
             latex_figures_dir / "2_quantile_sweep_net_profit_by_model.tex",
@@ -1379,6 +1754,12 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
             "fig:5_pinball_loss_vs_net_profit_total",
         )
         _write_latex_include(
+            latex_figures_dir / "6_market_dispatch_soc_selected_day.tex",
+            _thesis_figure_rel(out_root, "6_market_dispatch_soc_selected_day.png"),
+            "Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero, discharging actions below zero, the green line shows SoC, and the blue dashed line shows cumulative realized Net Profit.",
+            "fig:6_market_dispatch_soc_selected_day",
+        )
+        _write_latex_include(
             latex_figures_dir / "1_profit_heatmap.tex",
             _thesis_figure_rel(out_root, "1_profit_heatmap.png"),
             "Net Profit heatmap by strategy and quantile policy. Values show all numeric simulation rows from the scenario folders; validity flags are reported in the source CSV.",
@@ -1399,10 +1780,12 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", "backup", "csv", "cumulative Net Profit", "source data for best-quantile cumulative Net Profit figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for target-specific pinball-loss scatter figures"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for total pinball-loss scatter figure"),
+        (csv_dir / "6_market_dispatch_soc_selected_day.csv", "backup", "csv", "market dispatch and SoC", "source data for selected-day stacked dispatch/SOC figure"),
         (csv_dir / "rq2_benchmark_values.csv", "backup", "csv", "benchmark values", "Naive/RHPF benchmark source"),
         (diag_dir / "rq2_input_file_inventory.csv", "backup", "diagnostics", "input inventory", "reproducibility audit"),
         (diag_dir / "rq2_validity_diagnostics.csv", "backup", "diagnostics", "validity diagnostics", "invalid-row audit"),
         (warn_dir / "rq2_warnings.csv", "backup", "warnings", "warnings", "generation warnings"),
+        (warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", "backup", "warnings", "market dispatch and SoC", "selected-day invalidity and direct violation checks"),
     ]:
         entries.append(_manifest_entry(path, out_root, tier, artifact_type, metric_family, thesis_use, run_root, created, days, factor))
     for fig in figure_paths:
