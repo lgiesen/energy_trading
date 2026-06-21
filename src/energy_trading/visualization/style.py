@@ -60,6 +60,16 @@ MODEL_COLOR_MAP: Dict[str, str] = {
     "tft": THESIS_PALETTE["tertiary"],
 }
 
+# Fixed semantic mapping for market components. Charge and discharge components
+# from the same market intentionally share one color.
+MARKET_COLOR_MAP: Dict[str, str] = {
+    "DA": THESIS_PALETTE["primary"],
+    "ID": GEO_SEQUENTIAL_BLUE["seq_4"],
+    "BEM": THESIS_PALETTE["tertiary"],
+    "BCM activation": GEO_DIVERGING["div_4"],
+    "BCM capacity": THESIS_PALETTE["secondary"],
+}
+
 _TITLECASE_KEEP_LOWER = {
     "a",
     "an",

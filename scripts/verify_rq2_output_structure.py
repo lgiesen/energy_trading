@@ -11,36 +11,37 @@ import pandas as pd
 
 
 REQUIRED_FILES = [
-    "result_section/tables/rq2_annualized_pnl_by_model_quantile.tex",
-    "result_section/figures/rq2_annualized_pnl_by_model_quantile.png",
-    "result_section/figures/rq2_net_profit_by_quantile_line.png",
-    "result_section/latex_figures/rq2_net_profit_by_quantile_line.tex",
-    "result_section/figures/rq2_best_quantile_revenue_cost_components.png",
-    "result_section/latex_figures/rq2_best_quantile_revenue_cost_components.tex",
-    "result_section/figures/rq2_cumulative_pnl_best_quantile_model_comparison.png",
-    "result_section/latex_figures/rq2_cumulative_pnl_best_quantile_model_comparison.tex",
-    "result_section/figures/rq2_pinball_loss_vs_net_profit_da_price.png",
-    "result_section/latex_figures/rq2_pinball_loss_vs_net_profit_da_price.tex",
-    "result_section/figures/rq2_pinball_loss_vs_net_profit_afrr_capacity_price_pos.png",
-    "result_section/latex_figures/rq2_pinball_loss_vs_net_profit_afrr_capacity_price_pos.tex",
-    "result_section/figures/rq2_pinball_loss_vs_net_profit_afrr_capacity_price_neg.png",
-    "result_section/latex_figures/rq2_pinball_loss_vs_net_profit_afrr_capacity_price_neg.tex",
-    "result_section/figures/rq2_pinball_loss_vs_net_profit_afrr_activation_price_pos.png",
-    "result_section/latex_figures/rq2_pinball_loss_vs_net_profit_afrr_activation_price_pos.tex",
-    "result_section/figures/rq2_pinball_loss_vs_net_profit_afrr_activation_price_neg.png",
-    "result_section/latex_figures/rq2_pinball_loss_vs_net_profit_afrr_activation_price_neg.tex",
-    "result_section/figures/rq2_pinball_loss_vs_net_profit_afrr_activation_rate_pos.png",
-    "result_section/latex_figures/rq2_pinball_loss_vs_net_profit_afrr_activation_rate_pos.tex",
-    "result_section/figures/rq2_pinball_loss_vs_net_profit_afrr_activation_rate_neg.png",
-    "result_section/latex_figures/rq2_pinball_loss_vs_net_profit_afrr_activation_rate_neg.tex",
-    "result_section/figures/rq2_model_profit_heatmap.png",
+    "result_section/tables/1_net_profit_by_model_and_quantile.tex",
+    "result_section/figures/2_quantile_sweep_net_profit_by_model.png",
+    "result_section/latex_figures/2_quantile_sweep_net_profit_by_model.tex",
+    "result_section/figures/3_revenue_cost_components_best_quantile.png",
+    "result_section/latex_figures/3_revenue_cost_components_best_quantile.tex",
+    "result_section/figures/4_cumulative_net_profit_model_comparison_test_period.png",
+    "result_section/latex_figures/4_cumulative_net_profit_model_comparison_test_period.tex",
+    "result_section/figures/5_pinball_loss_vs_net_profit_da_price.png",
+    "result_section/latex_figures/5_pinball_loss_vs_net_profit_da_price.tex",
+    "result_section/figures/5_pinball_loss_vs_net_profit_afrr_capacity_price_pos.png",
+    "result_section/latex_figures/5_pinball_loss_vs_net_profit_afrr_capacity_price_pos.tex",
+    "result_section/figures/5_pinball_loss_vs_net_profit_afrr_capacity_price_neg.png",
+    "result_section/latex_figures/5_pinball_loss_vs_net_profit_afrr_capacity_price_neg.tex",
+    "result_section/figures/5_pinball_loss_vs_net_profit_afrr_activation_price_pos.png",
+    "result_section/latex_figures/5_pinball_loss_vs_net_profit_afrr_activation_price_pos.tex",
+    "result_section/figures/5_pinball_loss_vs_net_profit_afrr_activation_price_neg.png",
+    "result_section/latex_figures/5_pinball_loss_vs_net_profit_afrr_activation_price_neg.tex",
+    "result_section/figures/5_pinball_loss_vs_net_profit_afrr_activation_rate_pos.png",
+    "result_section/latex_figures/5_pinball_loss_vs_net_profit_afrr_activation_rate_pos.tex",
+    "result_section/figures/5_pinball_loss_vs_net_profit_afrr_activation_rate_neg.png",
+    "result_section/latex_figures/5_pinball_loss_vs_net_profit_afrr_activation_rate_neg.tex",
+    "result_section/figures/1_profit_heatmap.png",
+    "result_section/latex_figures/1_profit_heatmap.tex",
     "appendix/tables/rq2_profit_and_validity_detailed.tex",
     "backup/csv/rq2_scenario_summary_long.csv",
-    "backup/csv/rq2_annualized_pnl_by_model_quantile.csv",
-    "backup/csv/rq2_profit_heatmap_data.csv",
-    "backup/csv/rq2_best_quantile_component_data.csv",
-    "backup/csv/rq2_cumulative_pnl_best_quantile_paths.csv",
-    "backup/csv/rq2_pinball_loss_vs_net_profit_scatter_data.csv",
+    "backup/csv/1_net_profit_by_model_and_quantile.csv",
+    "backup/csv/1_profit_heatmap.csv",
+    "backup/csv/2_quantile_sweep_net_profit_by_model.csv",
+    "backup/csv/3_revenue_cost_components_best_quantile.csv",
+    "backup/csv/4_cumulative_net_profit_model_comparison_test_period.csv",
+    "backup/csv/5_pinball_loss_vs_net_profit_scatter_data.csv",
     "backup/csv/rq2_benchmark_values.csv",
     "backup/diagnostics/rq2_input_file_inventory.csv",
     "backup/diagnostics/rq2_validity_diagnostics.csv",
@@ -69,15 +70,15 @@ def verify(out_root: Path) -> list[str]:
         if "simulation_days" not in manifest or "annualization_factor" not in manifest:
             errors.append("Manifest is missing simulation_days or annualization_factor.")
 
-    table_path = out_root / "result_section/tables/rq2_annualized_pnl_by_model_quantile.tex"
+    table_path = out_root / "result_section/tables/1_net_profit_by_model_and_quantile.tex"
     if table_path.exists():
         text = table_path.read_text(encoding="utf-8")
-        for token in [r"\toprule", r"\midrule", r"\bottomrule", r"\label{tab:rq2_annualized_pnl_by_model_quantile}"]:
+        for token in [r"\toprule", r"\midrule", r"\bottomrule", r"\label{tab:1_net_profit_by_model_and_quantile}"]:
             if token not in text:
                 errors.append(f"Primary table is missing {token}.")
 
     diagnostics_path = out_root / "backup/diagnostics/rq2_validity_diagnostics.csv"
-    result_csv_path = out_root / "backup/csv/rq2_annualized_pnl_by_model_quantile.csv"
+    result_csv_path = out_root / "backup/csv/1_net_profit_by_model_and_quantile.csv"
     warnings_path = out_root / "backup/warnings/rq2_warnings.csv"
     if diagnostics_path.exists() and result_csv_path.exists():
         diagnostics = pd.read_csv(diagnostics_path)

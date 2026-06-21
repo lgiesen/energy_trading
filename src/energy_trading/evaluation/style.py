@@ -9,6 +9,7 @@ from energy_trading.visualization.style import (  # noqa: F401
     BACKTEST_LINE_STYLES,
     GEO_DIVERGING,
     GEO_SEQUENTIAL_BLUE,
+    MARKET_COLOR_MAP,
     MODEL_COLOR_MAP,
     THESIS_PALETTE,
     apply_geo_style,

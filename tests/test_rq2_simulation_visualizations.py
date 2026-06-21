@@ -62,16 +62,56 @@ def test_primary_latex_table_uses_booktabs(tmp_path: Path) -> None:
     assert r"\toprule" in text
     assert r"\midrule" in text
     assert r"\bottomrule" in text
-    assert r"\label{tab:rq2_annualized_pnl_by_model_quantile}" in text
+    assert r"\label{tab:1_net_profit_by_model_and_quantile}" in text
+    assert "Annualized PnL table" in text
+    assert r"Best vs\\Naive (\%)" in text
+    assert r"Best vs\\RHPF (\%)" in text
 
 
 def test_default_output_root_and_latex_include_path_are_stable() -> None:
     assert rq2.DEFAULT_OUT_ROOT == Path("artifacts/benchmark/rq2_simulation_benchmark")
-    rel = rq2._thesis_figure_rel(rq2.DEFAULT_OUT_ROOT, "rq2_net_profit_by_quantile_line.png")
-    assert rel == "figures/4-results/rq2_simulation_benchmark/result_section/figures/rq2_net_profit_by_quantile_line.png"
+    rel = rq2._thesis_figure_rel(rq2.DEFAULT_OUT_ROOT, "2_quantile_sweep_net_profit_by_model.png")
+    assert rel == "figures/4-results/rq2_simulation_benchmark/result_section/figures/2_quantile_sweep_net_profit_by_model.png"
+    heatmap_rel = rq2._thesis_figure_rel(rq2.DEFAULT_OUT_ROOT, "1_profit_heatmap.png")
+    assert heatmap_rel == "figures/4-results/rq2_simulation_benchmark/result_section/figures/1_profit_heatmap.png"
 
 
-def test_best_quantile_component_data_uses_best_valid_model_rows() -> None:
+def test_quantile_sweep_data_uses_numeric_rows_and_keeps_missing_values_missing() -> None:
+    summary = pd.DataFrame(
+        [
+            {"model": "Naive", "quantile": "benchmark", "is_benchmark": True, "annualized_profit_eur_per_year": 10.0, "realized_profit_eur": 1.0, "included_in_result_section": True},
+            {"model": "RHPF", "quantile": "benchmark", "is_benchmark": True, "annualized_profit_eur_per_year": 20.0, "realized_profit_eur": 2.0, "included_in_result_section": False},
+            {"model": "RLQR", "quantile": "p30", "is_benchmark": False, "annualized_profit_eur_per_year": 30.0, "realized_profit_eur": 3.0, "included_in_result_section": False},
+            {"model": "XGB", "quantile": "p10", "is_benchmark": False, "annualized_profit_eur_per_year": 40.0, "realized_profit_eur": 4.0, "included_in_result_section": False},
+        ]
+    )
+    out = rq2.build_quantile_sweep_data(summary, ["p10", "p30"])
+    assert set(out["series"].astype(str)) == {"Naive", "RHPF", "RLQR", "XGB"}
+    assert len(out.loc[out["series"].astype(str).eq("Naive")]) == 2
+    assert len(out.loc[(out["series"].astype(str).eq("RLQR")) & (out["quantile"].astype(str).eq("p10"))]) == 0
+    assert out.loc[(out["series"].astype(str).eq("XGB")) & (out["quantile"].astype(str).eq("p10")), "annualized_net_profit_eur_per_year"].iloc[0] == 40.0
+
+
+def test_profit_heatmap_data_uses_all_numeric_rows_not_strict_result_filter() -> None:
+    summary = pd.DataFrame(
+        [
+            {"model": "Naive", "quantile": "benchmark", "is_benchmark": True, "annualized_profit_eur_per_year": 10.0, "included_in_result_section": True},
+            {"model": "RHPF", "quantile": "benchmark", "is_benchmark": True, "annualized_profit_eur_per_year": 20.0, "included_in_result_section": False},
+            {"model": "RLQR", "quantile": "p10", "is_benchmark": False, "annualized_profit_eur_per_year": 30.0, "included_in_result_section": False},
+            {"model": "XGB", "quantile": "p10", "is_benchmark": False, "annualized_profit_eur_per_year": 40.0, "included_in_result_section": False},
+            {"model": "TFT", "quantile": "p10", "is_benchmark": False, "annualized_profit_eur_per_year": 50.0, "included_in_result_section": False},
+        ]
+    )
+    out = rq2.build_profit_heatmap_data(summary, ["p10", "p30"])
+    assert out.loc[out["quantile"].eq("p10"), "Naive"].iloc[0] == 10.0
+    assert out.loc[out["quantile"].eq("p10"), "RHPF"].iloc[0] == 20.0
+    assert out.loc[out["quantile"].eq("p10"), "RLQR"].iloc[0] == 30.0
+    assert out.loc[out["quantile"].eq("p10"), "XGB"].iloc[0] == 40.0
+    assert out.loc[out["quantile"].eq("p10"), "TFT"].iloc[0] == 50.0
+    assert math.isnan(out.loc[out["quantile"].eq("p30"), "XGB"].iloc[0])
+
+
+def test_best_quantile_component_data_uses_best_numeric_model_rows_with_validity_flags() -> None:
     summary = pd.DataFrame(
         [
             {
@@ -110,25 +150,29 @@ def test_best_quantile_component_data_uses_best_valid_model_rows() -> None:
         ]
     )
     out = rq2.build_best_quantile_components(summary)
-    assert set(out["model"]) == {"XGB"}
-    assert set(out["quantile"]) == {"p90"}
-    da = out.loc[out["component"].eq("DA net")].iloc[0]
-    cost = out.loc[out["component"].eq("Degradation cost")].iloc[0]
+    assert set(out["model"]) == {"XGB", "TFT"}
+    assert set(out.loc[out["model"].eq("XGB"), "quantile"]) == {"p90"}
+    assert set(out.loc[out["model"].eq("TFT"), "quantile"]) == {"p90"}
+    da = out.loc[(out["model"].eq("XGB")) & (out["component"].eq("DA net"))].iloc[0]
+    cost = out.loc[(out["model"].eq("XGB")) & (out["component"].eq("Degradation cost"))].iloc[0]
     assert da["annualized_component_value_eur_per_year"] == 18.0
     assert cost["annualized_component_value_eur_per_year"] == -8.0
+    assert not bool(out.loc[out["model"].eq("TFT"), "included_in_result_section"].iloc[0])
 
 
 def test_cumulative_pnl_paths_use_best_valid_quantile(tmp_path: Path) -> None:
     summary = pd.DataFrame(
         [
             {"folder": "benchmarks_naive", "model": "Naive", "quantile": "benchmark", "is_benchmark": True, "included_in_result_section": True, "annualized_profit_eur_per_year": 10.0},
+            {"folder": "benchmarks_rhpf", "model": "RHPF", "quantile": "benchmark", "is_benchmark": True, "included_in_result_section": False, "annualized_profit_eur_per_year": 40.0, "simulation_valid": 0.0, "thesis_reportable": 0.0},
             {"folder": "xgb_p10", "model": "XGB", "quantile": "p10", "is_benchmark": False, "included_in_result_section": True, "annualized_profit_eur_per_year": 20.0},
-            {"folder": "xgb_p90", "model": "XGB", "quantile": "p90", "is_benchmark": False, "included_in_result_section": False, "annualized_profit_eur_per_year": 99.0},
+            {"folder": "xgb_p90", "model": "XGB", "quantile": "p90", "is_benchmark": False, "included_in_result_section": False, "annualized_profit_eur_per_year": 99.0, "simulation_valid": 0.0, "thesis_reportable": 0.0},
             {"folder": "tft_p50", "model": "TFT", "quantile": "p50", "is_benchmark": False, "included_in_result_section": True, "annualized_profit_eur_per_year": 30.0},
         ]
     )
     for folder, path_type, values in [
         ("benchmarks_naive", "naive", [1.0, 3.0]),
+        ("benchmarks_rhpf", "rhpf", [4.0, 7.0]),
         ("xgb_p10", "model", [2.0, 5.0]),
         ("xgb_p90", "model", [9.0, 99.0]),
         ("tft_p50", "model", [4.0, 8.0]),
@@ -146,9 +190,10 @@ def test_cumulative_pnl_paths_use_best_valid_quantile(tmp_path: Path) -> None:
         ).to_csv(d / "performance_paths_long.csv", index=False)
 
     out = rq2.build_cumulative_pnl_paths(summary, run_root=tmp_path)
-    assert set(out["series"]) == {"Naive", "XGB p10", "TFT p50"}
-    assert "XGB p90" not in set(out["series"])
-    assert out.loc[out["series"].eq("XGB p10"), "cum_pnl_eur"].tolist() == [2.0, 5.0]
+    assert set(out["series"]) == {"Naive", "RHPF", "XGB p90", "TFT p50"}
+    assert "XGB p10" not in set(out["series"])
+    assert out.loc[out["series"].eq("XGB p90"), "cum_pnl_eur"].tolist() == [9.0, 99.0]
+    assert not bool(out.loc[out["series"].eq("XGB p90"), "included_in_result_section"].iloc[0])
 
 
 def test_pinball_net_profit_scatter_data_merges_forecast_accuracy_and_profit(tmp_path: Path) -> None:
@@ -191,6 +236,52 @@ def test_pinball_net_profit_scatter_data_merges_forecast_accuracy_and_profit(tmp
     assert row["annualized_profit_eur_per_year"] == 365.0
     assert row["n_obs"] == 2
     assert row["mean_pinball_loss"] == 0.75
+
+
+def test_total_pinball_net_profit_scatter_data_uses_observation_weighting() -> None:
+    scatter = pd.DataFrame(
+        [
+            {
+                "split": "test",
+                "target": "pred_da_price",
+                "target_label": "DA Price",
+                "model_key": "xgb",
+                "model": "XGB",
+                "quantile": "p50",
+                "mean_pinball_loss": 2.0,
+                "n_obs": 10,
+                "realized_profit_eur": 100.0,
+                "annualized_profit_eur_per_year": 365.0,
+                "simulation_valid": 0.0,
+                "thesis_reportable": 0.0,
+                "included_in_result_section": False,
+                "invalid_reason": "diagnostic",
+            },
+            {
+                "split": "test",
+                "target": "pred_afrr_capacity_price_pos",
+                "target_label": "aFRR Capacity Price +",
+                "model_key": "xgb",
+                "model": "XGB",
+                "quantile": "p50",
+                "mean_pinball_loss": 8.0,
+                "n_obs": 30,
+                "realized_profit_eur": 100.0,
+                "annualized_profit_eur_per_year": 365.0,
+                "simulation_valid": 0.0,
+                "thesis_reportable": 0.0,
+                "included_in_result_section": False,
+                "invalid_reason": "diagnostic",
+            },
+        ]
+    )
+    out = rq2.build_total_pinball_net_profit_scatter_data(scatter)
+    row = out.iloc[0]
+    assert row["target"] == "all_targets"
+    assert row["n_obs"] == 40
+    assert row["n_targets"] == 2
+    assert row["annualized_profit_eur_per_year"] == 365.0
+    assert row["mean_pinball_loss"] == 6.5
 
 
 def test_expected_scenarios_warn_missing_without_zero_fill(tmp_path: Path) -> None:

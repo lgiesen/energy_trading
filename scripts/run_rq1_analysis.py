@@ -257,7 +257,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-tail-spike", action="store_true")
     p.add_argument("--skip-example-weeks", action="store_true")
     p.add_argument("--skip-organize", action="store_true")
-    p.add_argument("--skip-pdf", action="store_true", help="Do not keep PDF outputs. Where supported, PDF rendering is skipped; remaining PDFs are pruned from the final output tree.")
+    p.add_argument("--skip-pdf", action=argparse.BooleanOptionalAction, default=True, help="Do not keep PDF outputs. Defaults to true; use --no-skip-pdf or --include-pdf to keep PDF outputs.")
+    p.add_argument("--include-pdf", dest="skip_pdf", action="store_false", help="Keep PDF outputs.")
+    p.add_argument("--skip-svg", action=argparse.BooleanOptionalAction, default=True, help="Do not keep SVG outputs. Defaults to true; use --no-skip-svg or --include-svg to keep SVG outputs.")
+    p.add_argument("--include-svg", dest="skip_svg", action="store_false", help="Keep SVG outputs.")
     p.add_argument("--skip-csv", action="store_true", help="Prune CSV files from the final organized output tree after derived tables and LaTeX figures are generated.")
     p.add_argument("--skip-json", action="store_true", help="Prune JSON files from the final organized output tree after generation.")
     p.add_argument("--export-dir", default=DEFAULT_EXPORT_DIR, help="Destination thesis folder for the organized rq1_ml_model_benchmark output.")
@@ -515,6 +518,7 @@ def main() -> int:
         "export_skipped": bool(args.skip_export),
         "prune_requested": {
             "pdf": bool(args.skip_pdf),
+            "svg": bool(args.skip_svg),
             "csv": bool(args.skip_csv),
             "json": bool(args.skip_json),
         },
@@ -529,6 +533,8 @@ def main() -> int:
     prune_suffixes: set[str] = set()
     if args.skip_pdf:
         prune_suffixes.add(".pdf")
+    if args.skip_svg:
+        prune_suffixes.add(".svg")
     if args.skip_csv:
         prune_suffixes.add(".csv")
     if args.skip_json:

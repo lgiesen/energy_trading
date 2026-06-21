@@ -29,6 +29,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from energy_trading.evaluation.style import (  # noqa: E402
+    GEO_SEQUENTIAL_BLUE,
+    MARKET_COLOR_MAP,
     THESIS_PALETTE,
     apply_geo_style,
     get_model_color,
@@ -81,6 +83,19 @@ COMPONENT_COST_COLUMNS = {
     "offer_cost_eur",
     "penalty_cost_eur",
     "terminal_soc_repair_cost_eur",
+}
+MARKET_COMPONENT_COLORS = {
+    "DA net": MARKET_COLOR_MAP["DA"],
+    "ID net": MARKET_COLOR_MAP["ID"],
+    "BCM capacity": MARKET_COLOR_MAP["BCM capacity"],
+    "BCM activation": MARKET_COLOR_MAP["BCM activation"],
+    "BEM activation": MARKET_COLOR_MAP["BEM"],
+    "Degradation cost": "#F0746E",
+    "Auxiliary cost": "#DC3977",
+    "Transaction cost": "#7A7A7A",
+    "Offer cost": "#9EC9E2",
+    "Penalty cost": "#333333",
+    "Terminal SoC repair": "#045275",
 }
 ALL_OUTPUT_DIRS = [
     "result_section/figures",
@@ -378,10 +393,79 @@ def build_result_tables(summary: pd.DataFrame, quantiles: list[str]) -> tuple[pd
     return result, heatmap, bench_values
 
 
+def build_quantile_sweep_data(summary: pd.DataFrame, quantiles: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for benchmark in BENCHMARK_ORDER:
+        match = summary.loc[summary["model"].eq(benchmark)].copy()
+        if match.empty:
+            continue
+        row = match.iloc[0]
+        value = _safe_float(row.get("annualized_profit_eur_per_year", np.nan))
+        if not math.isfinite(value):
+            continue
+        for quantile in quantiles:
+            rows.append(
+                {
+                    "series": benchmark,
+                    "model": benchmark,
+                    "quantile": quantile,
+                    "annualized_net_profit_eur_per_year": value,
+                    "realized_profit_eur": row.get("realized_profit_eur", np.nan),
+                    "simulation_valid": row.get("simulation_valid", np.nan),
+                    "thesis_reportable": row.get("thesis_reportable", np.nan),
+                    "included_in_result_section": row.get("included_in_result_section", False),
+                    "invalid_reason": row.get("invalid_reason", ""),
+                }
+            )
+
+    model_rows = summary.loc[~summary["is_benchmark"].astype(bool)].copy()
+    for _, row in model_rows.iterrows():
+        value = _safe_float(row.get("annualized_profit_eur_per_year", np.nan))
+        if not math.isfinite(value):
+            continue
+        rows.append(
+            {
+                "series": str(row["model"]),
+                "model": str(row["model"]),
+                "quantile": str(row["quantile"]),
+                "annualized_net_profit_eur_per_year": value,
+                "realized_profit_eur": row.get("realized_profit_eur", np.nan),
+                "simulation_valid": row.get("simulation_valid", np.nan),
+                "thesis_reportable": row.get("thesis_reportable", np.nan),
+                "included_in_result_section": row.get("included_in_result_section", False),
+                "invalid_reason": row.get("invalid_reason", ""),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["quantile"] = pd.Categorical(out["quantile"], categories=quantiles, ordered=True)
+    out["series"] = pd.Categorical(out["series"], categories=["Naive", "RHPF", *MODEL_ORDER], ordered=True)
+    return out.sort_values(["series", "quantile"]).reset_index(drop=True)
+
+
+def build_profit_heatmap_data(summary: pd.DataFrame, quantiles: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for q in quantiles:
+        rec: dict[str, Any] = {"quantile": q}
+        for benchmark in BENCHMARK_ORDER:
+            match = summary.loc[summary["model"].eq(benchmark)].copy()
+            value = _safe_float(match["annualized_profit_eur_per_year"].iloc[0]) if not match.empty else math.nan
+            rec[benchmark] = value
+        for model in MODEL_ORDER:
+            match = summary.loc[(summary["model"].eq(model)) & (summary["quantile"].astype(str).eq(q))].copy()
+            value = _safe_float(match["annualized_profit_eur_per_year"].iloc[0]) if not match.empty else math.nan
+            rec[model] = value
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
 def build_best_quantile_components(summary: pd.DataFrame) -> pd.DataFrame:
-    valid = summary.loc[
-        (~summary["is_benchmark"].astype(bool)) & (summary["included_in_result_section"].astype(bool))
-    ].copy()
+    valid = summary.loc[~summary["is_benchmark"].astype(bool)].copy()
+    valid["annualized_profit_eur_per_year"] = pd.to_numeric(
+        valid["annualized_profit_eur_per_year"], errors="coerce"
+    )
+    valid = valid.dropna(subset=["annualized_profit_eur_per_year"]).copy()
     rows: list[dict[str, Any]] = []
     if valid.empty:
         return pd.DataFrame(
@@ -393,15 +477,16 @@ def build_best_quantile_components(summary: pd.DataFrame) -> pd.DataFrame:
                 "annualized_component_value_eur_per_year",
                 "realized_profit_eur",
                 "annualized_profit_eur_per_year",
+                "simulation_valid",
+                "thesis_reportable",
+                "included_in_result_section",
+                "invalid_reason",
             ]
         )
     for model in MODEL_ORDER:
         model_rows = valid.loc[valid["model"].eq(model)].copy()
         if model_rows.empty:
             continue
-        model_rows["annualized_profit_eur_per_year"] = pd.to_numeric(
-            model_rows["annualized_profit_eur_per_year"], errors="coerce"
-        )
         best = model_rows.sort_values("annualized_profit_eur_per_year", ascending=False).iloc[0]
         factor = _safe_float(best.get("annualization_factor", np.nan))
         for col, label in COMPONENT_COLUMNS:
@@ -419,13 +504,17 @@ def build_best_quantile_components(summary: pd.DataFrame) -> pd.DataFrame:
                     "annualized_component_value_eur_per_year": signed * factor if math.isfinite(factor) else math.nan,
                     "realized_profit_eur": best["realized_profit_eur"],
                     "annualized_profit_eur_per_year": best["annualized_profit_eur_per_year"],
+                    "simulation_valid": best.get("simulation_valid", np.nan),
+                    "thesis_reportable": best.get("thesis_reportable", np.nan),
+                    "included_in_result_section": best.get("included_in_result_section", False),
+                    "invalid_reason": best.get("invalid_reason", ""),
                 }
             )
     return pd.DataFrame(rows)
 
 
 def _best_rows_for_cumulative_paths(summary: pd.DataFrame) -> pd.DataFrame:
-    valid = summary.loc[summary["included_in_result_section"].astype(bool)].copy()
+    valid = summary.copy()
     selected: list[pd.Series] = []
     for benchmark in BENCHMARK_ORDER:
         rows = valid.loc[valid["model"].eq(benchmark)]
@@ -436,6 +525,7 @@ def _best_rows_for_cumulative_paths(summary: pd.DataFrame) -> pd.DataFrame:
     model_rows["annualized_profit_eur_per_year"] = pd.to_numeric(
         model_rows["annualized_profit_eur_per_year"], errors="coerce"
     )
+    model_rows = model_rows.dropna(subset=["annualized_profit_eur_per_year"])
     for model in MODEL_ORDER:
         rows = model_rows.loc[model_rows["model"].eq(model)].copy()
         if rows.empty:
@@ -446,7 +536,20 @@ def _best_rows_for_cumulative_paths(summary: pd.DataFrame) -> pd.DataFrame:
 
 def build_cumulative_pnl_paths(summary: pd.DataFrame, *, run_root: Path) -> pd.DataFrame:
     selected = _best_rows_for_cumulative_paths(summary)
-    columns = ["timestamp_utc", "series", "model", "quantile", "path_type", "cum_pnl_eur", "pnl_eur", "folder"]
+    columns = [
+        "timestamp_utc",
+        "series",
+        "model",
+        "quantile",
+        "path_type",
+        "cum_pnl_eur",
+        "pnl_eur",
+        "folder",
+        "simulation_valid",
+        "thesis_reportable",
+        "included_in_result_section",
+        "invalid_reason",
+    ]
     if selected.empty:
         return pd.DataFrame(columns=columns)
 
@@ -481,7 +584,16 @@ def build_cumulative_pnl_paths(summary: pd.DataFrame, *, run_root: Path) -> pd.D
         df["pnl_eur"] = pd.to_numeric(df.get("pnl_eur", np.nan), errors="coerce")
         series = model if model in BENCHMARK_ORDER else f"{model} {quantile}"
         frames.append(
-            df.assign(series=series, model=model, quantile=quantile, folder=folder)[columns]
+            df.assign(
+                series=series,
+                model=model,
+                quantile=quantile,
+                folder=folder,
+                simulation_valid=row.get("simulation_valid", np.nan),
+                thesis_reportable=row.get("thesis_reportable", np.nan),
+                included_in_result_section=row.get("included_in_result_section", False),
+                invalid_reason=row.get("invalid_reason", ""),
+            )[columns]
         )
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
 
@@ -577,6 +689,70 @@ def build_pinball_net_profit_scatter_data(
     return out.sort_values(["target", "model", "quantile"]).reset_index(drop=True)
 
 
+def build_total_pinball_net_profit_scatter_data(scatter_data: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate target-level mean pinball losses into one total diagnostic.
+
+    This is an observation-weighted raw mean across targets. It is useful as a
+    compact diagnostic but remains target-scale dependent.
+    """
+    columns = [
+        "split",
+        "target",
+        "target_label",
+        "model_key",
+        "model",
+        "quantile",
+        "mean_pinball_loss",
+        "n_obs",
+        "n_targets",
+        "realized_profit_eur",
+        "annualized_profit_eur_per_year",
+        "simulation_valid",
+        "thesis_reportable",
+        "included_in_result_section",
+        "invalid_reason",
+    ]
+    if scatter_data.empty:
+        return pd.DataFrame(columns=columns)
+
+    d = scatter_data.copy()
+    d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+    d["n_obs"] = pd.to_numeric(d["n_obs"], errors="coerce")
+    d = d.dropna(subset=["mean_pinball_loss", "n_obs"])
+    d = d.loc[d["n_obs"] > 0].copy()
+    if d.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    group_cols = ["split", "model_key", "model", "quantile"]
+    value_cols = [
+        "realized_profit_eur",
+        "annualized_profit_eur_per_year",
+        "simulation_valid",
+        "thesis_reportable",
+        "included_in_result_section",
+        "invalid_reason",
+    ]
+    for keys, group in d.groupby(group_cols, dropna=False, observed=True):
+        weights = group["n_obs"].to_numpy(dtype=float)
+        losses = group["mean_pinball_loss"].to_numpy(dtype=float)
+        base = dict(zip(group_cols, keys))
+        first = group.iloc[0]
+        rec: dict[str, Any] = {
+            **base,
+            "target": "all_targets",
+            "target_label": "All Target Variables",
+            "mean_pinball_loss": float(np.average(losses, weights=weights)),
+            "n_obs": int(np.sum(weights)),
+            "n_targets": int(group["target"].nunique()),
+        }
+        for col in value_cols:
+            rec[col] = first.get(col, np.nan)
+        rows.append(rec)
+    out = pd.DataFrame(rows)
+    return out[columns].sort_values(["model", "quantile"]).reset_index(drop=True)
+
+
 def _format_eur(value: Any) -> str:
     val = _safe_float(value)
     if not math.isfinite(val):
@@ -597,11 +773,11 @@ def write_primary_table(path: Path, table: pd.DataFrame, simulation_days: float)
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
-        rf"\caption{{RQ2 annualized realized net profit by model and quantile policy. Profit is annualized from the actual simulation duration of {simulation_days:.2f} days.}}",
-        r"\label{tab:rq2_annualized_pnl_by_model_quantile}",
+        rf"\caption{{Annualized PnL table. Profit is annualized from the actual simulation duration of {simulation_days:.2f} days.}}",
+        r"\label{tab:1_net_profit_by_model_and_quantile}",
         r"\begin{tabular}{@{}lrrrrrlll@{}}",
         r"\toprule",
-        r"\textbf{Quantile} & \textbf{Naive} & \textbf{RHPF} & \textbf{RLQR} & \textbf{XGB} & \textbf{TFT} & \textbf{Best model} & \textbf{Best vs Naive} & \textbf{Best vs RHPF} \\",
+        r"\textbf{Quantile} & \textbf{Naive} & \textbf{RHPF} & \textbf{RLQR} & \textbf{XGB} & \textbf{TFT} & \textbf{Best model} & \textbf{\begin{tabular}[c]{@{}l@{}}Best vs\\Naive (\%)\end{tabular}} & \textbf{\begin{tabular}[c]{@{}l@{}}Best vs\\RHPF (\%)\end{tabular}} \\",
         r"\midrule",
     ]
     for _, row in table.iterrows():
@@ -687,9 +863,9 @@ def plot_profit_by_quantile(table: pd.DataFrame, bench: pd.DataFrame, out_base: 
         ax.axhline(value, color=color, linestyle="--", linewidth=1.8, label=f"{benchmark} benchmark")
     ax.set_xticks(x)
     ax.set_xticklabels(table["quantile"].astype(str).tolist())
-    ax.set_ylabel("Annualized realized net profit (EUR/year)")
+    ax.set_ylabel("Annualized Net Profit (EUR/year)")
     ax.set_xlabel("Quantile policy")
-    ax.set_title("RQ2 Annualized Realized Net Profit by Model and Quantile Policy")
+    ax.set_title("Net Profit by Model and Quantile")
     ax.text(0.0, 1.02, f"Multi-market strategy, annualized from {run_name}. Higher is better.", transform=ax.transAxes, fontsize=9)
     ax.legend(ncol=3, loc="best")
     fig.tight_layout()
@@ -698,76 +874,102 @@ def plot_profit_by_quantile(table: pd.DataFrame, bench: pd.DataFrame, out_base: 
     return written
 
 
-def plot_heatmap(heatmap: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+def plot_heatmap(table: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
 
     apply_geo_style()
-    fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    models = MODEL_ORDER
-    quantiles = list(DEFAULT_QUANTILES)
-    pivot = heatmap.pivot_table(index="model", columns="quantile", values="annualized_profit_eur_per_year", aggfunc="first").reindex(index=models, columns=quantiles)
+    fig, ax = plt.subplots(figsize=(9.4, 4.9))
+    rows = ["Naive", "RHPF", *MODEL_ORDER]
+    quantiles = table["quantile"].astype(str).tolist()
+    pivot = table.set_index("quantile").reindex(quantiles)[rows].T
     arr = pivot.to_numpy(dtype=float)
     masked = np.ma.masked_invalid(arr)
-    cmap = plt.get_cmap("Blues").copy()
+    cmap = LinearSegmentedColormap.from_list(
+        "geo_sequential_blue",
+        [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)],
+    )
     cmap.set_bad("#F2F2F2")
     im = ax.imshow(masked, aspect="auto", cmap=cmap)
     ax.set_xticks(np.arange(len(quantiles)))
     ax.set_xticklabels(quantiles)
-    ax.set_yticks(np.arange(len(models)))
-    ax.set_yticklabels(models)
+    ax.set_yticks(np.arange(len(rows)))
+    ax.set_yticklabels(rows)
     ax.set_xlabel("Quantile policy")
-    ax.set_ylabel("Model")
-    ax.set_title("RQ2 Model Profit Heatmap")
-    for i, model in enumerate(models):
+    ax.set_ylabel("Strategy")
+    ax.set_title("Net Profit")
+    for i, model in enumerate(rows):
         for j, q in enumerate(quantiles):
             val = pivot.loc[model, q]
             txt = "n/a" if not math.isfinite(_safe_float(val)) else f"€{val/1000:,.0f}k"
-            ax.text(j, i, txt, ha="center", va="center", color=THESIS_PALETTE["neutral_dark"], fontsize=9)
+            text_color = "white" if model == "RHPF" else THESIS_PALETTE["neutral_dark"]
+            ax.text(j, i, txt, ha="center", va="center", color=text_color, fontsize=9)
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Annualized realized net profit (EUR/year)")
+    cbar.set_label("Annualized Net Profit (EUR/year)")
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
     return written
 
 
-def plot_net_profit_lines(table: pd.DataFrame, bench: pd.DataFrame, out_base: Path, formats: list[str], run_name: str) -> list[Path]:
+def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: list[str], run_name: str, quantiles: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
 
     apply_geo_style()
-    fig, ax = plt.subplots(figsize=(10.5, 5.6))
-    x = np.arange(len(table))
-    marker_by_model = {"RLQR": "o", "XGB": "s", "TFT": "^"}
-    for model in MODEL_ORDER:
-        values = pd.to_numeric(table[model], errors="coerce").to_numpy(dtype=float)
-        ax.plot(
-            x,
-            values,
-            marker=marker_by_model[model],
-            linewidth=2.2,
-            label=model,
-            color=get_model_color("linear" if model == "RLQR" else model.lower()),
-        )
-    for benchmark in BENCHMARK_ORDER:
-        match = bench.loc[bench["model"] == benchmark]
-        if match.empty:
+    fig, ax = plt.subplots(figsize=(11.0, 5.8))
+    x = np.arange(len(quantiles))
+    marker_by_model = {"Naive": "D", "RHPF": "X", "RLQR": "o", "XGB": "s", "TFT": "^"}
+    color_by_model = {
+        "Naive": THESIS_PALETTE["naive"],
+        "RHPF": THESIS_PALETTE["perfect_foresight"],
+        "RLQR": get_model_color("linear"),
+        "XGB": get_model_color("xgb"),
+        "TFT": get_model_color("tft"),
+    }
+    linestyle_by_model = {"Naive": "--", "RHPF": "--", "RLQR": "-", "XGB": "-", "TFT": "-"}
+    label_offsets = {"Naive": 6, "RHPF": -12, "RLQR": 6, "XGB": 6, "TFT": 6}
+    for model in ["Naive", "RHPF", *MODEL_ORDER]:
+        g = sweep_data.loc[sweep_data["series"].astype(str).eq(model)].copy()
+        if g.empty:
             continue
-        value = float(match["annualized_profit_eur_per_year"].iloc[0])
-        color = THESIS_PALETTE["naive"] if benchmark == "Naive" else THESIS_PALETTE["perfect_foresight"]
+        values = []
+        for q in quantiles:
+            match = g.loc[g["quantile"].astype(str).eq(q)]
+            values.append(_safe_float(match["annualized_net_profit_eur_per_year"].iloc[0]) if not match.empty else np.nan)
+        values_arr = np.asarray(values, dtype=float)
         ax.plot(
             x,
-            np.full(len(table), value),
-            linestyle="--",
+            values_arr,
+            marker=marker_by_model[model],
             linewidth=2.0,
-            label=f"{benchmark} benchmark",
-            color=color,
+            linestyle=linestyle_by_model[model],
+            label=model if model not in BENCHMARK_ORDER else f"{model} benchmark",
+            color=color_by_model[model],
         )
+        for xi, yi in zip(x, values_arr):
+            if not math.isfinite(float(yi)):
+                continue
+            ax.annotate(
+                f"€{yi/1000:,.0f}k",
+                (xi, yi),
+                textcoords="offset points",
+                xytext=(0, label_offsets[model]),
+                ha="center",
+                fontsize=8,
+                color=THESIS_PALETTE["neutral_dark"],
+            )
     ax.set_xticks(x)
-    ax.set_xticklabels(table["quantile"].astype(str).tolist())
-    ax.set_ylabel("Annualized realized net profit (EUR/year)")
+    ax.set_xticklabels(quantiles)
+    ax.set_ylabel("Annualized Net Profit (EUR/year)")
     ax.set_xlabel("Quantile policy")
-    ax.set_title("RQ2 Net Profit by Quantile Policy")
-    ax.text(0.0, 1.02, f"Multi-market strategy, annualized from {run_name}. Higher is better.", transform=ax.transAxes, fontsize=9)
+    ax.set_title("Quantile Sweep: Net Profit by Model")
+    ax.text(
+        0.0,
+        1.02,
+        f"All numeric model/benchmark rows, annualized from {run_name}. Validity flags are reported in the source CSV.",
+        transform=ax.transAxes,
+        fontsize=9,
+    )
     ax.legend(ncol=3, loc="best")
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
@@ -785,7 +987,7 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
         ax.text(
             0.5,
             0.5,
-            "No thesis-reportable model scenarios available for component decomposition.",
+            "No model scenarios available for component decomposition.",
             ha="center",
             va="center",
             fontsize=11,
@@ -802,19 +1004,6 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     x = np.arange(len(models))
     width = 0.62
     component_order = [label for _col, label in COMPONENT_COLUMNS if label in set(component_data["component"])]
-    palette = {
-        "DA net": THESIS_PALETTE["primary"],
-        "ID net": "#6CB0D6",
-        "BCM capacity": THESIS_PALETTE["secondary"],
-        "BCM activation": "#FCDE9C",
-        "BEM activation": THESIS_PALETTE["tertiary"],
-        "Degradation cost": "#F0746E",
-        "Auxiliary cost": "#DC3977",
-        "Transaction cost": "#7A7A7A",
-        "Offer cost": "#9EC9E2",
-        "Penalty cost": "#333333",
-        "Terminal SoC repair": "#045275",
-    }
     pivot = component_data.pivot_table(
         index="model",
         columns="component",
@@ -832,7 +1021,7 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
             width=width,
             bottom=bottoms,
             label=component,
-            color=palette.get(component, THESIS_PALETTE["neutral_dark"]),
+            color=MARKET_COMPONENT_COLORS.get(component, THESIS_PALETTE["neutral_dark"]),
             edgecolor="white",
             linewidth=0.6,
         )
@@ -853,7 +1042,13 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     ax.set_ylabel("Annualized component value (EUR/year)")
     ax.set_xlabel("Model and best quantile")
     ax.set_title("RQ2 Revenue and Cost Components at Best Quantile")
-    ax.text(0.0, 1.02, f"Multi-market strategy, annualized from {run_name}. Costs are plotted below zero.", transform=ax.transAxes, fontsize=9)
+    ax.text(
+        0.0,
+        1.02,
+        f"Best numeric quantile per model, annualized from {run_name}. Costs are plotted below zero; validity flags are reported in the source CSV.",
+        transform=ax.transAxes,
+        fontsize=9,
+    )
     ax.legend(ncol=2, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
@@ -871,14 +1066,14 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
         ax.text(
             0.5,
             0.5,
-            "No thesis-reportable cumulative P&L paths available.",
+            "No thesis-reportable cumulative Net Profit paths available.",
             ha="center",
             va="center",
             fontsize=11,
             color=THESIS_PALETTE["neutral_dark"],
             wrap=True,
         )
-        ax.set_title("RQ2 Cumulative P&L: Model Comparison Over Test Period")
+        ax.set_title("Cumulative Net Profit: Model Comparison Over Test Period")
         fig.tight_layout()
         written = _save_figure(fig, out_base, formats)
         plt.close(fig)
@@ -891,7 +1086,7 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
         "XGB": get_model_color("xgb"),
         "TFT": get_model_color("tft"),
     }
-    line_style = {"Naive": "--", "RHPF": "--", "RLQR": "-", "XGB": "-", "TFT": "-"}
+    line_style = {"Naive": "-", "RHPF": "-", "RLQR": "-", "XGB": "-", "TFT": "-"}
     order = ["Naive", "RHPF", "RLQR", "XGB", "TFT"]
     cumulative = cumulative.copy()
     cumulative["timestamp_utc"] = pd.to_datetime(cumulative["timestamp_utc"], errors="coerce", utc=True)
@@ -908,10 +1103,16 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
             linestyle=line_style.get(model, "-"),
             linewidth=2.2 if model not in BENCHMARK_ORDER else 1.9,
         )
-    ax.set_ylabel("Cumulative P&L (EUR)")
+    ax.set_ylabel("Cumulative Net Profit (EUR)")
     ax.set_xlabel("Time")
-    ax.set_title("RQ2 Cumulative P&L: Model Comparison Over Test Period")
-    ax.text(0.0, 1.02, f"Best valid quantile per model, from {run_name}.", transform=ax.transAxes, fontsize=9)
+    ax.set_title("Cumulative Net Profit: Model Comparison Over Test Period")
+    ax.text(
+        0.0,
+        1.02,
+        f"Best numeric quantile per model, from {run_name}. Validity flags are reported in the source CSV.",
+        transform=ax.transAxes,
+        fontsize=9,
+    )
     ax.legend(ncol=3, loc="best")
     fig.autofmt_xdate(rotation=0)
     fig.tight_layout()
@@ -973,8 +1174,69 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
             ax.legend(title="Model", loc="best")
         ax.set_title(f"RQ2 Pinball Loss vs Net Profit: {label}")
         fig.tight_layout()
-        written.extend(_save_figure(fig, figures_dir / f"rq2_pinball_loss_vs_net_profit_{slug}", formats))
+        written.extend(_save_figure(fig, figures_dir / f"5_pinball_loss_vs_net_profit_{slug}", formats))
         plt.close(fig)
+    return written
+
+
+def plot_total_pinball_net_profit_scatter(scatter_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(8.4, 5.6))
+    color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
+    marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
+    if scatter_data.empty:
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+            "No total pinball-loss / Net Profit data available.",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color=THESIS_PALETTE["neutral_dark"],
+            wrap=True,
+        )
+    else:
+        for model in MODEL_ORDER:
+            g = scatter_data.loc[scatter_data["model"].eq(model)].copy()
+            if g.empty:
+                continue
+            ax.scatter(
+                g["mean_pinball_loss"],
+                g["annualized_profit_eur_per_year"],
+                label=model,
+                color=color_map[model],
+                marker=marker_map[model],
+                s=62,
+                edgecolor="black",
+                linewidth=0.45,
+                alpha=0.9,
+            )
+            for _, row in g.iterrows():
+                ax.annotate(
+                    str(row["quantile"]),
+                    (row["mean_pinball_loss"], row["annualized_profit_eur_per_year"]),
+                    textcoords="offset points",
+                    xytext=(4, 3),
+                    fontsize=8,
+                    color=THESIS_PALETTE["neutral_dark"],
+                )
+        ax.set_xlabel("Total mean pinball loss")
+        ax.set_ylabel("Annualized Net Profit (EUR/year)")
+        ax.legend(title="Model", loc="best")
+    ax.set_title("Total Mean Pinball Loss vs Net Profit")
+    ax.text(
+        0.0,
+        1.02,
+        "Observation-weighted raw mean pinball loss across all target variables. Lower forecast loss and higher Net Profit are preferable.",
+        transform=ax.transAxes,
+        fontsize=9,
+    )
+    fig.tight_layout()
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
     return written
 
 
@@ -1040,6 +1302,8 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         summary["annualized_profit_eur_per_year"] = summary["realized_profit_eur"]
         summary["annualization_factor"] = 1.0
     table, heatmap, bench = build_result_tables(summary, quantiles)
+    heatmap_table = build_profit_heatmap_data(summary, quantiles)
+    sweep_data = build_quantile_sweep_data(summary, quantiles)
     component_data = build_best_quantile_components(summary)
     cumulative_data = build_cumulative_pnl_paths(summary, run_root=run_root)
     scatter_data = build_pinball_net_profit_scatter_data(
@@ -1048,6 +1312,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         split=str(args.split),
         quantiles=quantiles,
     )
+    total_scatter_data = build_total_pinball_net_profit_scatter_data(scatter_data)
 
     csv_dir = out_root / "backup/csv"
     diag_dir = out_root / "backup/diagnostics"
@@ -1058,78 +1323,82 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     appendix_tables_dir = out_root / "appendix/tables"
 
     summary.to_csv(csv_dir / "rq2_scenario_summary_long.csv", index=False)
-    table.to_csv(csv_dir / "rq2_annualized_pnl_by_model_quantile.csv", index=False)
-    heatmap.to_csv(csv_dir / "rq2_profit_heatmap_data.csv", index=False)
-    component_data.to_csv(csv_dir / "rq2_best_quantile_component_data.csv", index=False)
-    cumulative_data.to_csv(csv_dir / "rq2_cumulative_pnl_best_quantile_paths.csv", index=False)
-    scatter_data.to_csv(csv_dir / "rq2_pinball_loss_vs_net_profit_scatter_data.csv", index=False)
+    table.to_csv(csv_dir / "1_net_profit_by_model_and_quantile.csv", index=False)
+    heatmap_table.to_csv(csv_dir / "1_profit_heatmap.csv", index=False)
+    sweep_data.to_csv(csv_dir / "2_quantile_sweep_net_profit_by_model.csv", index=False)
+    component_data.to_csv(csv_dir / "3_revenue_cost_components_best_quantile.csv", index=False)
+    cumulative_data.to_csv(csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", index=False)
+    scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", index=False)
+    total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", index=False)
     bench.to_csv(csv_dir / "rq2_benchmark_values.csv", index=False)
     inventory.to_csv(diag_dir / "rq2_input_file_inventory.csv", index=False)
     validity.to_csv(diag_dir / "rq2_validity_diagnostics.csv", index=False)
     warning_df.to_csv(warn_dir / "rq2_warnings.csv", index=False)
 
-    write_primary_table(tables_dir / "rq2_annualized_pnl_by_model_quantile.tex", table, days)
+    write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
     write_appendix_table(appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", summary)
 
     figure_paths: list[Path] = []
     if formats:
-        figure_paths += plot_profit_by_quantile(table, bench, figures_dir / "rq2_annualized_pnl_by_model_quantile", formats, run_root.name)
-        figure_paths += plot_net_profit_lines(table, bench, figures_dir / "rq2_net_profit_by_quantile_line", formats, run_root.name)
-        figure_paths += plot_best_quantile_components(component_data, figures_dir / "rq2_best_quantile_revenue_cost_components", formats, run_root.name)
-        figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "rq2_cumulative_pnl_best_quantile_model_comparison", formats, run_root.name)
+        figure_paths += plot_net_profit_lines(sweep_data, figures_dir / "2_quantile_sweep_net_profit_by_model", formats, run_root.name, quantiles)
+        figure_paths += plot_best_quantile_components(component_data, figures_dir / "3_revenue_cost_components_best_quantile", formats, run_root.name)
+        figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "4_cumulative_net_profit_model_comparison_test_period", formats, run_root.name)
         figure_paths += plot_pinball_net_profit_scatter(scatter_data, figures_dir, formats)
-        figure_paths += plot_heatmap(heatmap, figures_dir / "rq2_model_profit_heatmap", formats)
+        figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
+        figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
         _write_latex_include(
-            latex_figures_dir / "rq2_annualized_pnl_by_model_quantile.tex",
-            _thesis_figure_rel(out_root, "rq2_annualized_pnl_by_model_quantile.png"),
-            "RQ2 annualized realized net profit by model and quantile policy. Benchmarks are shown as reference lines; invalid or non-reportable scenarios are not plotted.",
-            "fig:rq2_annualized_pnl_by_model_quantile",
+            latex_figures_dir / "2_quantile_sweep_net_profit_by_model.tex",
+            _thesis_figure_rel(out_root, "2_quantile_sweep_net_profit_by_model.png"),
+            "Quantile sweep of annualized Net Profit by model and benchmark. The plot shows all numeric simulation rows; validity flags are reported in the source CSV.",
+            "fig:2_quantile_sweep_net_profit_by_model",
         )
         _write_latex_include(
-            latex_figures_dir / "rq2_net_profit_by_quantile_line.tex",
-            _thesis_figure_rel(out_root, "rq2_net_profit_by_quantile_line.png"),
-            "RQ2 annualized realized net profit by quantile policy. Lines show valid thesis-reportable model and benchmark scenarios only.",
-            "fig:rq2_net_profit_by_quantile_line",
+            latex_figures_dir / "3_revenue_cost_components_best_quantile.tex",
+            _thesis_figure_rel(out_root, "3_revenue_cost_components_best_quantile.png"),
+            "Revenue and cost components for each model at its best numeric quantile policy. Values are annualized from the simulation duration; costs are plotted below zero. Validity flags are reported in the source CSV.",
+            "fig:3_revenue_cost_components_best_quantile",
         )
         _write_latex_include(
-            latex_figures_dir / "rq2_best_quantile_revenue_cost_components.tex",
-            _thesis_figure_rel(out_root, "rq2_best_quantile_revenue_cost_components.png"),
-            "Revenue and cost components for each model at its best valid quantile policy. Values are annualized from the simulation duration; costs are plotted below zero.",
-            "fig:rq2_best_quantile_revenue_cost_components",
-        )
-        _write_latex_include(
-            latex_figures_dir / "rq2_cumulative_pnl_best_quantile_model_comparison.tex",
-            _thesis_figure_rel(out_root, "rq2_cumulative_pnl_best_quantile_model_comparison.png"),
-            "Cumulative P&L over the test period for Naive, RHPF and each model at its best valid quantile policy.",
-            "fig:rq2_cumulative_pnl_best_quantile_model_comparison",
+            latex_figures_dir / "4_cumulative_net_profit_model_comparison_test_period.tex",
+            _thesis_figure_rel(out_root, "4_cumulative_net_profit_model_comparison_test_period.png"),
+            "Cumulative Net Profit over the test period for Naive, RHPF and each model at its best numeric quantile policy. If a model path exceeds RHPF, interpret this as an accounting and timing diagnostic: rising energy prices may create value that was not fully valued at the decision time, and RHPF is a same-rules diagnostic rather than a global oracle. Validity flags are reported in the source CSV.",
+            "fig:4_cumulative_net_profit_model_comparison_test_period",
         )
         for target, label in TARGET_LABELS.items():
             slug = TARGET_SLUGS[target]
             _write_latex_include(
-                latex_figures_dir / f"rq2_pinball_loss_vs_net_profit_{slug}.tex",
-                _thesis_figure_rel(out_root, f"rq2_pinball_loss_vs_net_profit_{slug}.png"),
+                latex_figures_dir / f"5_pinball_loss_vs_net_profit_{slug}.tex",
+                _thesis_figure_rel(out_root, f"5_pinball_loss_vs_net_profit_{slug}.png"),
                 f"Mean pinball loss and annualized Net Profit for {label.replace('$-$', '-')} by model and quantile policy.",
-                f"fig:rq2_pinball_loss_vs_net_profit_{slug}",
+                f"fig:5_pinball_loss_vs_net_profit_{slug}",
             )
         _write_latex_include(
-            latex_figures_dir / "rq2_model_profit_heatmap.tex",
-            _thesis_figure_rel(out_root, "rq2_model_profit_heatmap.png"),
-            "RQ2 model profit heatmap. Missing cells indicate scenarios excluded from result-section claims by validity filtering.",
-            "fig:rq2_model_profit_heatmap",
+            latex_figures_dir / "5_pinball_loss_vs_net_profit_total.tex",
+            _thesis_figure_rel(out_root, "5_pinball_loss_vs_net_profit_total.png"),
+            "Total mean pinball loss and annualized Net Profit by model and quantile policy. The forecast metric is the observation-weighted raw mean pinball loss across all target variables.",
+            "fig:5_pinball_loss_vs_net_profit_total",
+        )
+        _write_latex_include(
+            latex_figures_dir / "1_profit_heatmap.tex",
+            _thesis_figure_rel(out_root, "1_profit_heatmap.png"),
+            "Net Profit heatmap by strategy and quantile policy. Values show all numeric simulation rows from the scenario folders; validity flags are reported in the source CSV.",
+            "fig:1_profit_heatmap",
         )
 
     created = datetime.now(timezone.utc).isoformat()
     factor = 1.0 if not args.annualize else 365.0 / days
     entries: list[dict[str, Any]] = []
     for path, tier, artifact_type, metric_family, thesis_use in [
-        (tables_dir / "rq2_annualized_pnl_by_model_quantile.tex", "result_section", "latex_table", "annualized realized net profit", "primary RQ2 result table"),
+        (tables_dir / "1_net_profit_by_model_and_quantile.tex", "result_section", "latex_table", "annualized realized net profit", "primary RQ2 result table"),
         (appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", "appendix", "latex_table", "profit and validity", "validity audit table"),
         (csv_dir / "rq2_scenario_summary_long.csv", "backup", "csv", "scenario summary", "reproducibility backup"),
-        (csv_dir / "rq2_annualized_pnl_by_model_quantile.csv", "backup", "csv", "annualized realized net profit", "source data for primary table"),
-        (csv_dir / "rq2_profit_heatmap_data.csv", "backup", "csv", "annualized realized net profit", "source data for heatmap"),
-        (csv_dir / "rq2_best_quantile_component_data.csv", "backup", "csv", "revenue and cost components", "source data for best-quantile stacked component figure"),
-        (csv_dir / "rq2_cumulative_pnl_best_quantile_paths.csv", "backup", "csv", "cumulative P&L", "source data for best-quantile cumulative P&L figure"),
-        (csv_dir / "rq2_pinball_loss_vs_net_profit_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for target-specific pinball-loss scatter figures"),
+        (csv_dir / "1_net_profit_by_model_and_quantile.csv", "backup", "csv", "annualized realized net profit", "source data for primary table"),
+        (csv_dir / "1_profit_heatmap.csv", "backup", "csv", "annualized realized net profit", "source data for diagnostic heatmap with all numeric rows"),
+        (csv_dir / "2_quantile_sweep_net_profit_by_model.csv", "backup", "csv", "annualized Net Profit", "source data for quantile sweep line figure"),
+        (csv_dir / "3_revenue_cost_components_best_quantile.csv", "backup", "csv", "revenue and cost components", "source data for best-quantile stacked component figure"),
+        (csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", "backup", "csv", "cumulative Net Profit", "source data for best-quantile cumulative Net Profit figure"),
+        (csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for target-specific pinball-loss scatter figures"),
+        (csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for total pinball-loss scatter figure"),
         (csv_dir / "rq2_benchmark_values.csv", "backup", "csv", "benchmark values", "Naive/RHPF benchmark source"),
         (diag_dir / "rq2_input_file_inventory.csv", "backup", "diagnostics", "input inventory", "reproducibility audit"),
         (diag_dir / "rq2_validity_diagnostics.csv", "backup", "diagnostics", "validity diagnostics", "invalid-row audit"),
@@ -1173,7 +1442,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--quantiles", default=",".join(DEFAULT_QUANTILES))
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--no-figures", action="store_true")
-    ap.add_argument("--formats", default="png,pdf,svg")
+    ap.add_argument("--formats", default="png", help="Comma-separated figure formats. Defaults to png only; pass png,pdf,svg to also write PDF/SVG.")
     return ap.parse_args(argv)
 
 
