@@ -1,0 +1,7 @@
+likely_driver,rule
+tail_price_event,absolute realized price is in a tail column and event regret is positive
+activation_volume_surprise,activation volume forecast/realization error columns are present and large
+activation_price_surprise,activation price forecast/realization error columns are present and large
+non_executed_bid,non-executed or rejected bid columns are nonzero
+penalty_or_infeasibility,"fallback, infeasible, shortfall, missed, penalty or violation flags are present"
+residual_unknown,no transparent rule matched

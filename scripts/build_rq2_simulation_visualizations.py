@@ -1206,17 +1206,20 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
             match = g.loc[g["quantile"].astype(str).eq(q)]
             if match.empty:
                 match = g.head(1)
-            plot_x = np.asarray([x_by_quantile.get(q, len(quantiles) // 2)], dtype=float)
-            values_arr = np.asarray([_safe_float(match["annualized_net_profit_eur_per_year"].iloc[0])], dtype=float)
-            ax.scatter(
-                plot_x,
-                values_arr,
-                marker=marker_by_model[model],
-                s=58,
+            value = _safe_float(match["annualized_net_profit_eur_per_year"].iloc[0])
+            if not math.isfinite(value):
+                continue
+            ax.plot(
+                x,
+                np.full(len(x), value, dtype=float),
+                linewidth=2.0,
+                linestyle="-",
                 label=f"{model} benchmark",
                 color=color_by_model[model],
-                zorder=4,
+                zorder=2,
             )
+            plot_x = np.asarray([x_by_quantile.get(q, len(quantiles) // 2)], dtype=float)
+            values_arr = np.asarray([value], dtype=float)
             plot_quantiles = [q]
         else:
             values = []
@@ -1564,8 +1567,6 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
     color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
     marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
     for target, label in TARGET_LABELS.items():
-        if target == "pred_da_price":
-            continue
         slug = TARGET_SLUGS[target]
         df = scatter_data.loc[scatter_data.get("target", pd.Series(dtype=str)).astype(str).eq(target)].copy() if not scatter_data.empty else pd.DataFrame()
         fig, ax = plt.subplots(figsize=(8.2, 5.6))
@@ -1617,13 +1618,11 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
     return written
 
 
-def build_normalized_da_price_pinball_profit_data(scatter_data: pd.DataFrame) -> pd.DataFrame:
-    """Normalize DA-price forecast loss and profit to [0, 1] over observed model-quantile rows."""
-    if scatter_data.empty:
+def build_normalized_total_pinball_profit_data(total_scatter_data: pd.DataFrame) -> pd.DataFrame:
+    """Normalize total mean pinball loss and profit to [0, 1] over observed model-quantile rows."""
+    if total_scatter_data.empty:
         return pd.DataFrame()
-    df = scatter_data.loc[scatter_data["target"].astype(str).eq("pred_da_price")].copy()
-    if df.empty:
-        return pd.DataFrame()
+    df = total_scatter_data.copy()
     df["mean_pinball_loss"] = pd.to_numeric(df["mean_pinball_loss"], errors="coerce")
     df["annualized_profit_eur_per_year"] = pd.to_numeric(df["annualized_profit_eur_per_year"], errors="coerce")
     df = df.dropna(subset=["mean_pinball_loss", "annualized_profit_eur_per_year"]).copy()
@@ -1645,7 +1644,7 @@ def build_normalized_da_price_pinball_profit_data(scatter_data: pd.DataFrame) ->
     return df
 
 
-def plot_normalized_da_price_pinball_profit_scatter(normalized_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
 
     apply_geo_style()
@@ -1653,14 +1652,14 @@ def plot_normalized_da_price_pinball_profit_scatter(normalized_data: pd.DataFram
     color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
     marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
     if normalized_data.empty:
-        ax.axis("off")
-        ax.text(
-            0.5,
-            0.5,
-            "No normalized DA-price pinball-loss / Net Profit data available.",
-            ha="center",
-            va="center",
-            fontsize=11,
+            ax.axis("off")
+            ax.text(
+                0.5,
+                0.5,
+                "No normalized total pinball-loss / Net Profit data available.",
+                ha="center",
+                va="center",
+                fontsize=11,
             color=THESIS_PALETTE["neutral_dark"],
             wrap=True,
         )
@@ -1704,9 +1703,9 @@ def plot_normalized_da_price_pinball_profit_scatter(normalized_data: pd.DataFram
         ax.set_ylim(-0.04, 1.04)
         ax.set_xlabel("Normalized total mean pinball loss")
         ax.set_ylabel("Normalized annualized net profit")
-        ax.legend(title="Series", loc="best", fontsize=8)
-    ax.set_title("DA Price: Normalized Forecast Loss vs Net Profit")
-    fig.tight_layout()
+        ax.legend(title="Series", loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=4, fontsize=8, frameon=True)
+    ax.set_title("Normalized Total Forecast Loss vs Net Profit")
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
     return written
@@ -1864,8 +1863,8 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         split=str(args.split),
         quantiles=quantiles,
     )
-    normalized_da_price_scatter_data = build_normalized_da_price_pinball_profit_data(scatter_data)
     total_scatter_data = build_total_pinball_net_profit_scatter_data(scatter_data)
+    normalized_total_scatter_data = build_normalized_total_pinball_profit_data(total_scatter_data)
     dispatch_soc_data, dispatch_soc_warnings = build_market_dispatch_soc_day(summary, run_root=run_root)
 
     csv_dir = out_root / "backup/csv"
@@ -1885,8 +1884,8 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     component_data.to_csv(csv_dir / "3_revenue_cost_components_best_quantile.csv", index=False)
     cumulative_data.to_csv(csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", index=False)
     scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", index=False)
-    normalized_da_price_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_da_price_normalized.csv", index=False)
     total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", index=False)
+    normalized_total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", index=False)
     dispatch_soc_data.to_csv(csv_dir / "6_market_dispatch_soc_selected_day.csv", index=False)
     bench.to_csv(csv_dir / "rq2_benchmark_values.csv", index=False)
     inventory.to_csv(diag_dir / "rq2_input_file_inventory.csv", index=False)
@@ -1905,7 +1904,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         result_figure_paths += plot_best_quantile_components(component_data, figures_dir / "3_revenue_cost_components_best_quantile", formats, run_root.name)
         result_figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "4_cumulative_net_profit_model_comparison_test_period", formats, run_root.name)
         appendix_figure_paths += plot_pinball_net_profit_scatter(scatter_data, appendix_figures_dir, formats)
-        result_figure_paths += plot_normalized_da_price_pinball_profit_scatter(normalized_da_price_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_da_price", formats)
+        result_figure_paths += plot_normalized_total_pinball_profit_scatter(normalized_total_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_total_normalized", formats)
         appendix_figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, appendix_figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
         result_figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
         result_figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
@@ -1927,19 +1926,17 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
             "Cumulative Net Profit over the test period for Naive, RHPF and each model at its best numeric quantile policy. If a model path exceeds RHPF, interpret this as an accounting and timing diagnostic: rising energy prices may create value that was not fully valued at the decision time, and RHPF is a same-rules diagnostic rather than a global oracle. Validity flags are reported in the source CSV.",
             "fig:4_cumulative_net_profit_model_comparison_test_period",
         )
+        _write_latex_include(
+            latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex",
+            _thesis_figure_rel(out_root, "5_pinball_loss_vs_net_profit_total_normalized.png"),
+            "Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line shows the idealized negative association between lower forecast loss and higher profit.",
+            "fig:5_pinball_loss_vs_net_profit_total_normalized",
+        )
         for target, label in TARGET_LABELS.items():
             slug = TARGET_SLUGS[target]
-            if target == "pred_da_price":
-                caption = (
-                    "Normalized DA-price forecast loss and annualized Net Profit by model and quantile policy. "
-                    "The grey dashed line shows the idealized negative association between lower forecast loss and higher profit."
-                )
-                tex_path = latex_figures_dir / f"5_pinball_loss_vs_net_profit_{slug}.tex"
-                figure_rel = _thesis_figure_rel(out_root, f"5_pinball_loss_vs_net_profit_{slug}.png")
-            else:
-                caption = f"Mean pinball loss and annualized Net Profit for {label.replace('$-$', '-')} by model and quantile policy."
-                tex_path = appendix_latex_figures_dir / f"5_pinball_loss_vs_net_profit_{slug}.tex"
-                figure_rel = _thesis_appendix_figure_rel(out_root, f"5_pinball_loss_vs_net_profit_{slug}.png")
+            caption = f"Mean pinball loss and annualized Net Profit for {label.replace('$-$', '-')} by model and quantile policy."
+            tex_path = appendix_latex_figures_dir / f"5_pinball_loss_vs_net_profit_{slug}.tex"
+            figure_rel = _thesis_appendix_figure_rel(out_root, f"5_pinball_loss_vs_net_profit_{slug}.png")
             _write_latex_include(
                 tex_path,
                 figure_rel,
@@ -1978,8 +1975,8 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (csv_dir / "3_revenue_cost_components_best_quantile.csv", "backup", "csv", "revenue and cost components", "source data for best-quantile stacked component figure"),
         (csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", "backup", "csv", "cumulative Net Profit", "source data for best-quantile cumulative Net Profit figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for target-specific pinball-loss scatter figures"),
-        (csv_dir / "5_pinball_loss_vs_net_profit_da_price_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized DA-price scatter figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for total pinball-loss scatter figure"),
+        (csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total pinball-loss scatter figure"),
         (csv_dir / "6_market_dispatch_soc_selected_day.csv", "backup", "csv", "market dispatch and SoC", "source data for selected-day stacked dispatch/SOC figure"),
         (csv_dir / "rq2_benchmark_values.csv", "backup", "csv", "benchmark values", "Naive/RHPF benchmark source"),
         (diag_dir / "rq2_input_file_inventory.csv", "backup", "diagnostics", "input inventory", "reproducibility audit"),

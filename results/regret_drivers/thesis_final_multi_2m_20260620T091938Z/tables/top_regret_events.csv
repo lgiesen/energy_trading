@@ -1,0 +1,16 @@
+model,quantile,likely_driver,data_status
+RLQR,p10,unavailable,missing_event_level_profit_columns
+RLQR,p30,unavailable,missing_event_level_profit_columns
+RLQR,p50,unavailable,missing_event_level_profit_columns
+RLQR,p70,unavailable,missing_event_level_profit_columns
+RLQR,p90,unavailable,missing_event_level_profit_columns
+TFT,p10,unavailable,missing_event_level_profit_columns
+TFT,p30,unavailable,missing_event_level_profit_columns
+TFT,p50,unavailable,missing_event_level_profit_columns
+TFT,p70,unavailable,missing_event_level_profit_columns
+TFT,p90,unavailable,missing_event_level_profit_columns
+XGB,p10,unavailable,missing_event_level_profit_columns
+XGB,p30,unavailable,missing_event_level_profit_columns
+XGB,p50,unavailable,missing_event_level_profit_columns
+XGB,p70,unavailable,missing_event_level_profit_columns
+XGB,p90,unavailable,missing_event_level_profit_columns
