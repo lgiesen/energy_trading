@@ -609,26 +609,68 @@ def _fmt(value: Any) -> str:
     return f"{x:.4f}" if np.isfinite(x) else "-"
 
 
+def _fmt_best(value: Any, *, model: str, best_model: Any) -> str:
+    formatted = _fmt(value)
+    if formatted != "-" and str(model) == str(best_model):
+        return rf"\textbf{{{formatted}}}"
+    return formatted
+
+
+def _table_target_label(value: Any) -> str:
+    text = str(value)
+    if text.startswith("aFRR "):
+        rest = text[len("aFRR "):]
+        if rest.endswith(" -"):
+            rest = rest[:-2] + " $-$"
+        return rf"\shortstack{{aFRR\\{rest}}}"
+    return _latex_escape(text)
+
+
+def _table_bucket_label(bucket: Any, target_label: Any = "") -> str:
+    bucket_s = str(bucket)
+    target_s = str(target_label).lower()
+    labels = {
+        "full_h1_48": "Full horizon (h01--h48)",
+        "short_h1_8": "Short horizon (h01--h08)",
+        "medium_h9_16": "Medium horizon (h09--h16)",
+        "long_h17_48": "Long horizon (h17--h48)",
+        "actionable_da_dplus1_11": "DA price D+1 at 11:00",
+        "actionable_bcm_dplus1_08": "BCM capacity price D+1 at 08:00",
+        "actionable_bem_short_h1_8": "BEM activation rate h01--h08" if "rate" in target_s else "BEM activation price h01--h08",
+    }
+    return _latex_escape(labels.get(bucket_s, _bucket_label(bucket_s)))
+
+
 def _main_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     d = metrics.loc[metrics["split"] == split].copy()
     if d.empty:
         return pd.DataFrame()
     d = sort_target_frame(d, target_col="target", extra_cols=["bucket", "model_label"])
     rows: list[dict[str, Any]] = []
-    for (bucket, target_group), part in d.groupby(["bucket", "target_group"], sort=False):
+    for (bucket, target_label), part in d.groupby(["bucket", "target_label"], sort=False):
         vals = {
             str(label): float(group["mean_pinball_loss"].mean())
             for label, group in part.groupby("model_label")
             if pd.to_numeric(group["mean_pinball_loss"], errors="coerce").notna().any()
         }
-        best = min(vals, key=vals.get) if vals else ""
+        rlqr = vals.get("RLQR", np.nan)
+        if np.isfinite(float(rlqr)) and abs(float(rlqr)) > 1e-12:
+            rel_vals = {
+                label: value / float(rlqr)
+                for label, value in vals.items()
+                if np.isfinite(float(value))
+            }
+        else:
+            rel_vals = {}
+        best = min(rel_vals, key=rel_vals.get) if rel_vals else ""
         rows.append(
             {
                 "bucket": bucket,
-                "target_group": target_group,
-                "RLQR": vals.get("RLQR", np.nan),
-                "XGB": vals.get("XGB", np.nan),
-                "TFT": vals.get("TFT", np.nan),
+                "target": part["target"].iloc[0],
+                "target_label": target_label,
+                "RLQR": rel_vals.get("RLQR", np.nan),
+                "XGB": rel_vals.get("XGB", np.nan),
+                "TFT": rel_vals.get("TFT", np.nan),
                 "best_model": best,
                 "n_obs": int(part.groupby("model_label")["n_obs"].sum().min()) if not part.empty else 0,
             }
@@ -636,7 +678,7 @@ def _main_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    out["_target_order"] = out["target_group"].map(lambda x: target_sort_key(str(x))[0])
+    out["_target_order"] = out["target"].map(lambda x: target_sort_key(str(x))[0])
     out["_bucket_order"] = out["bucket"].map({spec.bucket: i for i, spec in enumerate(BUCKETS)}).fillna(99)
     return out.sort_values(["_target_order", "_bucket_order"]).drop(columns=["_target_order", "_bucket_order"]).reset_index(drop=True)
 
@@ -645,7 +687,7 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     table = _main_table(metrics, split=split)
     if table.empty:
         return None
-    headers = ["Bucket", "Target group", "RLQR", "XGB", "TFT", "Best model", "N"]
+    headers = ["Bucket", "Target", "RLQR (= 1)", "XGB / RLQR", "TFT / RLQR", "Best model", "N"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
@@ -656,11 +698,11 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     ]
     for _, row in table.iterrows():
         vals = [
-            r"\textbf{" + _latex_escape(_bucket_label(row["bucket"])) + "}",
-            _latex_escape(row["target_group"]),
-            _fmt(row["RLQR"]),
-            _fmt(row["XGB"]),
-            _fmt(row["TFT"]),
+            r"\textbf{" + _table_bucket_label(row["bucket"], row["target_label"]) + "}",
+            _table_target_label(row["target_label"]),
+            _fmt_best(row["RLQR"], model="RLQR", best_model=row["best_model"]),
+            _fmt_best(row["XGB"], model="XGB", best_model=row["best_model"]),
+            _fmt_best(row["TFT"], model="TFT", best_model=row["best_model"]),
             _latex_escape(row["best_model"]),
             str(int(row["n_obs"])),
         ]
@@ -669,7 +711,7 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{Gate-specific and horizon-bucket mean pinball loss on the test split. Values are unweighted and computed on common valid forecast rows across models.}",
+            r"    \caption{Gate-specific and horizon-bucket mean pinball loss relative to RLQR on the test split. RLQR is fixed at 1. Values below 1 indicate lower mean pinball loss than RLQR.}",
             r"    \label{tab:gate_bucket_metrics_test}",
             r"\end{table}",
             "",

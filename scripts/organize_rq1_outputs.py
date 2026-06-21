@@ -168,7 +168,15 @@ def build_routes(split: str) -> list[Route]:
 def _latex_escape(value: Any) -> str:
     s = str(value)
     minus_token = "@@RQ1MINUS@@"
-    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+    minus_labels = [
+        "aFRR capacity price",
+        "aFRR Capacity Price",
+        "aFRR activation price",
+        "aFRR Activation Price",
+        "aFRR activation rate",
+        "aFRR Activation Rate",
+    ]
+    for label in minus_labels:
         s = s.replace(f"{label} -", f"{label} {minus_token}")
         s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
@@ -185,6 +193,13 @@ def _latex_escape(value: Any) -> str:
     }.items():
         s = s.replace(old, new)
     return s.replace(minus_token, "$-$")
+
+
+def _axis_label(value: Any) -> str:
+    s = str(value)
+    if s == "mean pinball loss":
+        return "Mean pinball loss"
+    return s
 
 
 def _fmt(value: Any) -> str:
@@ -848,7 +863,7 @@ def _write_grouped_bar_tex(
             r"                bar width=13pt,",
             r"                width=0.96\textwidth,",
             r"                height=8cm,",
-            rf"                ylabel={{{_latex_escape(ylabel)}}},",
+            rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
             r"                x tick label style={rotate=35, anchor=east},",
             r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
             r"                legend cell align={left},",
@@ -947,7 +962,8 @@ def _write_gate_bucket_relative_tex(
         r"                y dir=reverse,",
         r"            ]",
     ]
-    lines.append(rf"                \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{(1,{y_symbols[0]}) (1,{y_symbols[-1]})}};")
+    lines.append(rf"                \draw[color=secondary, densely dotted, line width=1.2pt] (axis cs:1,{y_symbols[0]}) -- (axis cs:1,{y_symbols[-1]});")
+    lines.append(r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}")
     lines.append(r"                \addlegendentry{RLQR}")
     for model in ["XGB", "TFT"]:
         if model not in pivot.columns:
@@ -1128,7 +1144,7 @@ def _write_model_bar_tex(
             r"                bar width=22pt,",
             r"                width=0.78\textwidth,",
             r"                height=7cm,",
-            rf"                ylabel={{{_latex_escape(ylabel)}}},",
+            rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
             r"                nodes near coords,",
             r"                every node near coord/.append style={font=\scriptsize, text=black, /pgf/number format/fixed, /pgf/number format/precision=2},",
             r"                axis lines*=left,",
@@ -1232,7 +1248,7 @@ def _write_line_tex(
             r"                width=0.96\textwidth,",
             r"                height=7cm,",
             rf"                xlabel={{{_latex_escape(xlabel)}}},",
-            rf"                ylabel={{{_latex_escape(ylabel)}}},",
+            rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
             r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
             r"                legend cell align={left},",
             r"                axis lines*=left,",
@@ -1310,7 +1326,19 @@ def _write_line_panel_tex(
     panels = ordered_unique(data[panel_col].dropna().astype(str).drop_duplicates().tolist())
     if not panels:
         return None
+    group_cols = min(len(panels), 2)
+    group_rows = int(np.ceil(len(panels) / group_cols))
+    axis_width = "0.47\\textwidth" if group_cols > 1 else "0.86\\textwidth"
+    axis_height = "6.2cm" if y_col == "mean_pinball_loss" else "5.8cm"
     colors = {"TFT": "tertiary", "XGB": "primary", "RLQR": "secondary", "linear": "secondary", "tft": "tertiary", "xgb": "primary"}
+    all_series = {str(series) for series in data[series_col].dropna().unique()}
+    ordered_all_series = [s for s in ordered_model_labels(all_series) if s in all_series]
+    ordered_all_series.extend([s for s in sorted(all_series) if s not in ordered_all_series])
+    legend_entries: list[str] = []
+    if reference_y is not None:
+        legend_entries.append(_latex_escape(_tex_label(reference_label or f"{reference_y:g}")))
+    for series in ordered_all_series:
+        legend_entries.append(_latex_escape(_tex_label(series)))
     lines = [
         r"% Requires: \usepackage{pgfplots}",
         r"% Requires: \usepackage{xcolor}",
@@ -1321,13 +1349,17 @@ def _write_line_panel_tex(
         r"    \centering",
         r"    \resizebox{\linewidth}{!}{%",
         r"        \begin{tikzpicture}",
+    ]
+    lines.extend(
+        [
         r"            \begin{groupplot}[",
-        rf"                group style={{group size=1 by {len(panels)}, vertical sep=1.0cm}},",
-        r"                width=0.96\textwidth,",
-        r"                height=4.2cm,",
+        rf"                group style={{group size={group_cols} by {group_rows}, horizontal sep=1.25cm, vertical sep=1.15cm}},",
+        rf"                width={axis_width},",
+        rf"                height={axis_height},",
         rf"                xlabel={{{_latex_escape(xlabel)}}},",
-        rf"                ylabel={{{_latex_escape(ylabel)}}},",
-        r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
+        r"                y label style={at={(-0.11,0.5)}},",
+        r"                legend style={at={(0.5,1.22)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
         r"                axis lines*=left,",
         r"                grid=major,",
@@ -1335,8 +1367,8 @@ def _write_line_panel_tex(
         *([rf"                ymin={_tex_num(ylim[0])},", rf"                ymax={_tex_num(ylim[1])},"] if ylim is not None else []),
         *(_percent_tick_options(percent_ticks) if percent_ticks is not None else []),
         r"            ]",
-    ]
-    legend_entries: list[str] = []
+        ]
+    )
     for panel_i, panel in enumerate(panels):
         panel_df = data[data[panel_col].astype(str).eq(panel)].copy()
         lines.append(rf"                \nextgroupplot[title={{{_latex_escape(thesis_titlecase(_tex_label(panel)))}}}]")
@@ -1349,8 +1381,6 @@ def _write_line_panel_tex(
                 xmin = float(x_values.min())
                 xmax = float(x_values.max())
                 lines.append(rf"                    \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{({_tex_num(xmin)},{_tex_num(reference_y)}) ({_tex_num(xmax)},{_tex_num(reference_y)})}};")
-                if panel_i == 0:
-                    legend_entries.append(_latex_escape(_tex_label(reference_label or f"{reference_y:g}")))
         for series in ordered_series:
             group = (
                 grouped[series]
@@ -1366,16 +1396,12 @@ def _write_line_panel_tex(
             color = colors.get(series, "neutraldark")
             marker_style = rf"mark=*, mark options={{fill={color}, draw={color}}}" if show_markers else "mark=none"
             lines.append(rf"                    \addplot[color={color}, {marker_style}, line width=1pt] coordinates {{{coords}}};")
-            if panel_i == 0:
-                legend_entries.append(_latex_escape(_tex_label(series)))
         if ideal_diagonal:
             xmin, xmax = xlim if xlim is not None else (0.0, 1.0)
             ymin, ymax = ylim if ylim is not None else (0.0, 1.0)
             lo = max(float(xmin), float(ymin))
             hi = min(float(xmax), float(ymax))
             lines.append(rf"                    \addplot[color=neutraldark, dashed, mark=none, line width=1pt] coordinates {{({_tex_num(lo)},{_tex_num(lo)}) ({_tex_num(hi)},{_tex_num(hi)})}};")
-            if panel_i == 0:
-                legend_entries.append("Ideal")
     if legend_entries:
         lines.append("                \\legend{" + ",".join(legend_entries) + "}")
     lines.extend(
