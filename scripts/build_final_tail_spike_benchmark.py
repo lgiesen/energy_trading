@@ -782,16 +782,15 @@ def _fmt(value: Any) -> str:
     return f"{x:.4f}" if np.isfinite(x) else "-"
 
 
+def _fmt_best(value: Any, *, model: str, best_model: Any) -> str:
+    formatted = _fmt(value)
+    if formatted != "-" and str(model) == str(best_model):
+        return rf"\textbf{{{formatted}}}"
+    return formatted
+
+
 def _latex_header(label: str) -> str:
-    stacks = {
-        "Target": r"Target",
-        "Best model": r"Best\\model",
-        "Main issue": r"Main\\issue",
-    }
-    body = stacks.get(str(label))
-    if body is None:
-        body = _latex_escape(label)
-    return r"\textbf{\shortstack{" + body + r"}}"
+    return r"\textbf{" + _latex_escape(label) + r"}"
 
 
 def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
@@ -821,11 +820,11 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     table["_target_order"] = table["target"].map(lambda x: target_sort_key(x)[0])
     table["_regime_order"] = table["regime"].map(lambda x: REGIME_ORDER.get(str(x), 99))
     table = table.sort_values(["_target_order", "_regime_order"]).drop(columns=["_target_order", "_regime_order"])
-    headers = ["Regime", "Target", "RLQR", "XGB", "TFT", "Best model", "N", "Main issue"]
+    headers = ["Regime", "Target", "RLQR", "XGB", "TFT"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
-        r"    \begin{tabular}{@{}llrrrrll@{}}",
+        r"    \begin{tabular}{@{}llrrr@{}}",
         r"        \toprule",
         "        " + " & ".join(_latex_header(h) for h in headers) + r" \\",
         r"        \midrule",
@@ -836,13 +835,10 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
             + " & ".join(
                 [
                     _latex_escape(row["regime_label"]),
-                    r"\textbf{" + _latex_escape(row["target_label"]) + "}",
-                    _fmt(row["RLQR"]),
-                    _fmt(row["XGB"]),
-                    _fmt(row["TFT"]),
-                    _latex_escape(row["best_model"]),
-                    str(int(row["n_obs"])),
-                    _latex_escape(row["main_issue"]),
+                    _latex_escape(row["target_label"]),
+                    _fmt_best(row["RLQR"], model="RLQR", best_model=row["best_model"]),
+                    _fmt_best(row["XGB"], model="XGB", best_model=row["best_model"]),
+                    _fmt_best(row["TFT"], model="TFT", best_model=row["best_model"]),
                 ]
             )
             + r" \\"

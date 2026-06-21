@@ -154,6 +154,8 @@ def test_common_row_intersection_and_latex(tmp_path: Path) -> None:
     assert "\\textbf{\\shortstack{XGB\\\\RLQR}}" in content
     assert "\\textbf{\\shortstack{TFT\\\\RLQR}}" in content
     assert "\\textbf{\\shortstack{Best\\\\model}}" in content
+    assert r"\begin{tabular}[c]{@{}l@{}}\textbf{Full horizon}\\\textbf{(h01--h48)}\end{tabular}" in content
+    assert r"\textbf{Full horizon (h01--h48)}" not in content
     assert "RLQR (= 1)" not in content
 
 

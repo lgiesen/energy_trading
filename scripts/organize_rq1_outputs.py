@@ -562,10 +562,14 @@ def _copy_file(src: Path, dst: Path) -> None:
 def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[str, Any]], *, final_root: Path, rq1_root: Path) -> None:
     subsection = "4.1.6"
     target_root = rq1_root / SUBSECTIONS[subsection]
-    result_week_keys = {"typical", "high_volatility"}
+    result_week_keys: set[str] = set()
     for stale_dir in [
         target_root / "appendix" / "figures" / "high_volatility",
         target_root / "appendix" / "latex_figures" / "high_volatility",
+        target_root / "result_section" / "figures" / "typical",
+        target_root / "result_section" / "figures" / "high_volatility",
+        target_root / "result_section" / "latex_figures" / "typical",
+        target_root / "result_section" / "latex_figures" / "high_volatility",
     ]:
         if stale_dir.exists():
             shutil.rmtree(stale_dir)
@@ -594,6 +598,10 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
         dst = target_root / "backup" / "csv" / "example_week_metrics.csv"
         _copy_file(metrics, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "csv", "path": str(dst), "metric_family": "example_weeks", "thesis_use": "backup data", "brief_description": "Example-week plot inventory and diagnostics."})
+    for src in sorted((source_dir / "backup" / "csv").glob("example_week_market_actionable_*.csv")):
+        dst = target_root / "backup" / "csv" / src.name
+        _copy_file(src, dst)
+        entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "csv", "path": str(dst), "metric_family": "market_actionable_example_weeks", "thesis_use": "backup data", "brief_description": f"Market-actionable example-week data: {src.name}."})
     manifest = source_dir / "example_week_manifest.json"
     if not manifest.exists():
         manifest = source_dir / "backup" / "diagnostics" / "example_week_manifest.json"
@@ -601,6 +609,14 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
         dst = target_root / "backup" / "diagnostics" / "example_week_manifest.json"
         _copy_file(manifest, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "diagnostics", "path": str(dst), "metric_family": "example_weeks", "thesis_use": "diagnostics", "brief_description": "Example-week generation manifest."})
+    for src in sorted((source_dir / "backup" / "diagnostics").glob("example_week_market_actionable_*.csv")):
+        dst = target_root / "backup" / "diagnostics" / src.name
+        _copy_file(src, dst)
+        entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "diagnostics", "path": str(dst), "metric_family": "market_actionable_example_weeks", "thesis_use": "diagnostics", "brief_description": f"Market-actionable example-week diagnostics: {src.name}."})
+    for src in sorted((source_dir / "backup" / "warnings").glob("example_week_market_actionable_*.csv")):
+        dst = target_root / "backup" / "warnings" / src.name
+        _copy_file(src, dst)
+        entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "warnings", "path": str(dst), "metric_family": "market_actionable_example_weeks", "thesis_use": "warnings", "brief_description": f"Market-actionable example-week warnings: {src.name}."})
     figures_root = source_dir / "figures"
     if figures_root.exists():
         for src in sorted(figures_root.rglob("*.png")):
@@ -669,6 +685,42 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
                         "metric_family": "example_weeks",
                         "thesis_use": "native TikZ/pgfplots figure code",
                         "brief_description": f"Native example-week forecast plot code: {rel}",
+                    }
+                )
+
+    for tier in ["result_section", "appendix"]:
+        figures_dir = source_dir / tier / "figures"
+        if figures_dir.exists():
+            for src in sorted(figures_dir.rglob("*.png")):
+                rel = src.relative_to(figures_dir)
+                dst = target_root / tier / "figures" / rel
+                _copy_file(src, dst)
+                entries.append(
+                    {
+                        "subsection": subsection,
+                        "tier": tier,
+                        "artifact_type": "figure",
+                        "path": str(dst),
+                        "metric_family": "market_actionable_example_weeks",
+                        "thesis_use": "main thesis figure" if tier == "result_section" else "appendix figure",
+                        "brief_description": f"Market-actionable example-week forecast plot: {rel}",
+                    }
+                )
+        latex_dir = source_dir / tier / "latex_figures"
+        if latex_dir.exists():
+            for src in sorted(latex_dir.rglob("*.tex")):
+                rel = src.relative_to(latex_dir)
+                dst = target_root / tier / "latex_figures" / rel
+                _copy_file(src, dst)
+                entries.append(
+                    {
+                        "subsection": subsection,
+                        "tier": tier,
+                        "artifact_type": "latex_figure",
+                        "path": str(dst),
+                        "metric_family": "market_actionable_example_weeks",
+                        "thesis_use": "main thesis figure" if tier == "result_section" else "appendix figure",
+                        "brief_description": f"LaTeX includegraphics snippet for market-actionable example-week plot: {rel}",
                     }
                 )
 
@@ -1939,6 +1991,8 @@ def _prune_latex_figure_imports(rq1_root: Path) -> None:
     }
     for tex in rq1_root.rglob("*.tex"):
         if "latex_figures" not in tex.parts:
+            continue
+        if "4_1_6_example_weeks" in tex.parts:
             continue
         if tex.name.endswith("_p50_absolute_error_tolerance_curve.tex") or tex.name in keep_includegraphics:
             continue

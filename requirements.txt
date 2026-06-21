@@ -1,3 +1,4 @@
+absl-py==2.4.0
 aiohappyeyeballs==2.6.2
 aiohttp==3.14.1
 aiosignal==1.4.0
@@ -25,7 +26,7 @@ cycler==0.12.1
 debugpy==1.8.21
 decorator==5.3.1
 defusedxml==0.7.1
--e git+https://github.com/lgiesen/energy_trading.git@8e6661abfdd0f0b79f2ca65be2cde295baf97fc3#egg=energy_trading
+-e git+https://github.com/lgiesen/energy_trading.git@04de4513d8a92e412bd5b1146397657ce986e7c3#egg=energy_trading
 entsoe-py==0.7.8
 et_xmlfile==2.0.0
 exceptiongroup==1.3.1
@@ -37,6 +38,7 @@ fqdn==1.5.1
 frozendict==2.4.7
 frozenlist==1.8.0
 fsspec==2025.12.0
+grpcio==1.81.1
 h11==0.16.0
 holidays==0.57
 html5lib==1.1
@@ -70,6 +72,7 @@ lightning-utilities==0.15.3
 llvmlite==0.47.0
 lxml==6.1.1
 Mako==1.3.12
+Markdown==3.10.2
 MarkupSafe==3.0.3
 matplotlib==3.9.2
 matplotlib-inline==0.2.2
@@ -101,6 +104,7 @@ pluggy==1.6.0
 prometheus_client==0.25.0
 prompt_toolkit==3.0.52
 propcache==0.5.2
+protobuf==7.35.1
 psutil==7.2.2
 ptyprocess==0.7.0
 pure_eval==0.2.3
@@ -135,7 +139,8 @@ SQLAlchemy==2.0.50
 stack-data==0.6.3
 sympy==1.13.1
 tenacity==9.1.4
-tensorboard==2.18.0
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
 terminado==0.18.1
 threadpoolctl==3.6.0
 tinycss2==1.5.1
@@ -153,6 +158,7 @@ wcwidth==0.8.1
 webcolors==25.10.0
 webencodings==0.5.1
 websocket-client==1.9.0
+Werkzeug==3.1.8
 xgboost==2.1.1
 yarl==1.24.2
 yfinance==0.2.44

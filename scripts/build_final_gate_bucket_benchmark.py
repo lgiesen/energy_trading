@@ -637,19 +637,31 @@ def _table_target_label(value: Any) -> str:
     return _latex_escape(text)
 
 
+def _bold_multiline_cell(*lines: str) -> str:
+    escaped = [r"\textbf{" + _latex_escape(line) + "}" for line in lines if str(line).strip()]
+    if not escaped:
+        return ""
+    if len(escaped) == 1:
+        return escaped[0]
+    return r"\begin{tabular}[c]{@{}l@{}}" + r"\\".join(escaped) + r"\end{tabular}"
+
+
 def _table_bucket_label(bucket: Any, target_label: Any = "") -> str:
     bucket_s = str(bucket)
     target_s = str(target_label).lower()
     labels = {
-        "full_h1_48": "Full horizon (h01--h48)",
-        "short_h1_8": "Short horizon (h01--h08)",
-        "medium_h9_16": "Medium horizon (h09--h16)",
-        "long_h17_48": "Long horizon (h17--h48)",
-        "actionable_da_dplus1_11": "DA price D+1 at 11:00",
-        "actionable_bcm_dplus1_08": "BCM capacity price D+1 at 08:00",
-        "actionable_bem_short_h1_8": "BEM activation rate h01--h08" if "rate" in target_s else "BEM activation price h01--h08",
+        "full_h1_48": ("Full horizon", "(h01--h48)"),
+        "short_h1_8": ("Short horizon", "(h01--h08)"),
+        "medium_h9_16": ("Medium horizon", "(h09--h16)"),
+        "long_h17_48": ("Long horizon", "(h17--h48)"),
+        "actionable_da_dplus1_11": ("DA price D+1", "at 11:00"),
+        "actionable_bcm_dplus1_08": ("BCM capacity price", "D+1 at 08:00"),
+        "actionable_bem_short_h1_8": ("BEM activation rate", "h01--h08") if "rate" in target_s else ("BEM activation price", "h01--h08"),
     }
-    return _latex_escape(labels.get(bucket_s, _bucket_label(bucket_s)))
+    label = labels.get(bucket_s)
+    if label is not None:
+        return _bold_multiline_cell(*label)
+    return _bold_multiline_cell(_bucket_label(bucket_s))
 
 
 def _table_target_caption_label(value: Any) -> str:
@@ -729,7 +741,7 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
         )
         for _, row in part.iterrows():
             vals = [
-                r"\textbf{" + _table_bucket_label(row["bucket"], row["target_label"]) + "}",
+                _table_bucket_label(row["bucket"], row["target_label"]),
                 _fmt_best(row["RLQR"], model="RLQR", best_model=row["best_model"]),
                 _fmt_best(row["XGB"], model="XGB", best_model=row["best_model"]),
                 _fmt_best(row["TFT"], model="TFT", best_model=row["best_model"]),

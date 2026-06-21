@@ -66,6 +66,11 @@ def _check_latex_figure(path: Path) -> list[str]:
             if token in text:
                 errors.append(f"{path} should remain an image-backed thesis wrapper, but contains {token}.")
         return errors
+    if "4_1_6_example_weeks" in path.parts and r"\includegraphics" in text:
+        for token in [r"\begin{figure}", r"\includegraphics", r"\caption", r"\label", r"\end{figure}"]:
+            if token not in text:
+                errors.append(f"{path} is missing {token}.")
+        return errors
     if path.name.startswith("calibration_reliability_"):
         stripped = text.strip()
         if not stripped.startswith(r"\begin{tikzpicture}"):

@@ -10,6 +10,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,7 @@ DEFAULT_LEAD_H = 24
 DEFAULT_QUANTILE = "p50"
 DEFAULT_WINDOW_HOURS = 24 * 7
 LOCAL_TZ = "Europe/Berlin"
+LOCAL_ZONE = ZoneInfo(LOCAL_TZ)
 MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 MODEL_KEYS = {
@@ -47,6 +49,81 @@ TARGET_LABELS = {
     "pred_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price -"),
     "pred_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
     "pred_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
+}
+
+CANONICAL_TO_PRED_TARGET = {
+    "target_da_price": "pred_da_price",
+    "target_afrr_capacity_price_pos": "pred_afrr_capacity_price_pos",
+    "target_afrr_capacity_price_neg": "pred_afrr_capacity_price_neg",
+    "target_afrr_activation_price_vwap_pos": "pred_afrr_activation_price_pos",
+    "target_afrr_activation_price_vwap_neg": "pred_afrr_activation_price_neg",
+    "target_afrr_activation_rate_pos": "pred_afrr_activation_rate_pos",
+    "target_afrr_activation_rate_neg": "pred_afrr_activation_rate_neg",
+}
+
+PRED_TO_CANONICAL_TARGET = {v: k for k, v in CANONICAL_TO_PRED_TARGET.items()}
+
+MARKET_ACTIONABLE_TARGET_LABELS = {
+    "target_da_price": "DA price",
+    "target_afrr_capacity_price_pos": "aFRR capacity price +",
+    "target_afrr_capacity_price_neg": "aFRR capacity price -",
+    "target_afrr_activation_price_vwap_pos": "aFRR activation price +",
+    "target_afrr_activation_price_vwap_neg": "aFRR activation price -",
+    "target_afrr_activation_rate_pos": "aFRR activation rate +",
+    "target_afrr_activation_rate_neg": "aFRR activation rate -",
+}
+
+MARKET_ACTIONABLE_SPECS = [
+    {
+        "market_context": "da_dminus1_11",
+        "targets": ["target_da_price"],
+        "selection": "local_dminus1_snapshot",
+        "forecast_hour": 11,
+        "title_prefix": "DA price | D-1 11:00 forecast snapshot | p50",
+        "snapshot_description": "D-1 11:00 Europe/Berlin forecast snapshot for next-day DA delivery hours.",
+        "filename_prefix": "da_dminus1_11_da_price",
+    },
+    {
+        "market_context": "bcm_dplus1_08",
+        "targets": [
+            "target_afrr_capacity_price_pos",
+            "target_afrr_capacity_price_neg",
+            "target_afrr_activation_price_vwap_pos",
+            "target_afrr_activation_price_vwap_neg",
+            "target_afrr_activation_rate_pos",
+            "target_afrr_activation_rate_neg",
+        ],
+        "selection": "local_dminus1_snapshot",
+        "forecast_hour": 8,
+        "title_prefix": "BCM D-1 08:00 forecast snapshot",
+        "snapshot_description": "BCM D-1 08:00 Europe/Berlin forecast snapshot for next-day capacity bids and activation assumptions.",
+        "filename_prefix": "bcm_dplus1_08",
+    },
+    {
+        "market_context": "bem_h1",
+        "targets": [
+            "target_afrr_activation_price_vwap_pos",
+            "target_afrr_activation_price_vwap_neg",
+            "target_afrr_activation_rate_pos",
+            "target_afrr_activation_rate_neg",
+        ],
+        "selection": "lead_h1",
+        "lead_h": 1.0,
+        "title_prefix": "BEM h1",
+        "snapshot_description": "BEM h1 forecast for next-hour activation inputs.",
+        "filename_prefix": "bem_h1",
+    },
+]
+
+RESULT_MARKET_ACTIONABLE = {
+    ("typical", "da_dminus1_11", "target_da_price"),
+    ("typical", "bcm_dplus1_08", "target_afrr_capacity_price_neg"),
+    ("typical", "bem_h1", "target_afrr_activation_price_vwap_neg"),
+    ("typical", "bem_h1", "target_afrr_activation_rate_pos"),
+    ("high_volatility", "da_dminus1_11", "target_da_price"),
+    ("high_volatility", "bcm_dplus1_08", "target_afrr_capacity_price_neg"),
+    ("high_volatility", "bem_h1", "target_afrr_activation_price_vwap_neg"),
+    ("high_volatility", "bem_h1", "target_afrr_activation_rate_pos"),
 }
 
 QUANTILE_RE = re.compile(r"^p(\d{1,2})$")
@@ -240,14 +317,364 @@ def load_merged_target(
     return merged.sort_values("target_time_utc").reset_index(drop=True)
 
 
+def _canonical_target(target: str) -> str:
+    return PRED_TO_CANONICAL_TARGET.get(str(target), str(target))
+
+
+def _prediction_target(canonical_target: str) -> str:
+    return CANONICAL_TO_PRED_TARGET.get(str(canonical_target), str(canonical_target))
+
+
 def _target_info(target: str) -> tuple[str, str]:
     return TARGET_LABELS.get(target, ("Other", target.replace("_", " ")))
+
+
+def _market_target_label(canonical_target: str) -> str:
+    return MARKET_ACTIONABLE_TARGET_LABELS.get(str(canonical_target), str(canonical_target).replace("_", " "))
 
 
 def _window_slice(df: pd.DataFrame, start_utc: pd.Timestamp, window_hours: int) -> pd.DataFrame:
     end_utc = start_utc + pd.Timedelta(hours=int(window_hours))
     ts = pd.to_datetime(df["target_time_utc"], utc=True, errors="coerce")
     return df.loc[(ts >= start_utc) & (ts < end_utc)].copy()
+
+
+def _read_market_actionable_model_target(
+    *,
+    benchmark_dir: Path,
+    model: ModelSpec,
+    split: str,
+    canonical_target: str,
+) -> pd.DataFrame:
+    target = _prediction_target(canonical_target)
+    path = benchmark_dir / "diagnostics" / "joined_predictions" / f"{model.key}__{split}__{target}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing joined prediction file: {path}")
+    df = pd.read_parquet(path)
+    if "forecast_time_utc" not in df.columns and "snapshot_time_utc" in df.columns:
+        df = df.rename(columns={"snapshot_time_utc": "forecast_time_utc"})
+    required = {"forecast_time_utc", "target_time_utc", "lead_time_h", "y_true"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"{path} is missing required columns for market-actionable example weeks: {sorted(missing)}. "
+            "Cannot infer DA/BCM market snapshots without forecast_time_utc."
+        )
+    pred_col = "p50" if "p50" in df.columns else "predicted_value"
+    if pred_col not in df.columns:
+        raise ValueError(f"{path} does not contain p50 or predicted_value.")
+    out = df[["forecast_time_utc", "target_time_utc", "lead_time_h", "y_true", pred_col]].copy()
+    out["forecast_time_utc"] = pd.to_datetime(out["forecast_time_utc"], utc=True, errors="coerce")
+    out["target_time_utc"] = pd.to_datetime(out["target_time_utc"], utc=True, errors="coerce")
+    out["lead_time_h"] = pd.to_numeric(out["lead_time_h"], errors="coerce")
+    out["y_true"] = pd.to_numeric(out["y_true"], errors="coerce")
+    out["p50"] = pd.to_numeric(out[pred_col], errors="coerce")
+    out = out.dropna(subset=["forecast_time_utc", "target_time_utc", "lead_time_h", "y_true", "p50"]).copy()
+    out["model"] = model.key
+    out["model_label"] = model.label
+    out["target"] = canonical_target
+    out["target_display"] = _market_target_label(canonical_target)
+    return out[["model", "model_label", "target", "target_display", "forecast_time_utc", "target_time_utc", "lead_time_h", "y_true", "p50"]]
+
+
+def _select_market_actionable_rows(
+    df: pd.DataFrame,
+    *,
+    spec: dict[str, Any],
+    week: WeekSpec,
+    window_hours: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    d = _window_slice(df, week.start_utc, window_hours)
+    warning = ""
+    if d.empty:
+        warning = "No target timestamps in selected week."
+        selected = d
+    elif spec["selection"] == "lead_h1":
+        lead_h = float(spec["lead_h"])
+        selected = d.loc[np.isclose(pd.to_numeric(d["lead_time_h"], errors="coerce"), lead_h, atol=1e-9)].copy()
+        if selected.empty:
+            warning = "No h1 rows available for selected week."
+    elif spec["selection"] == "local_dminus1_snapshot":
+        forecast_local = pd.to_datetime(d["forecast_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE)
+        target_local = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE)
+        mask = (
+            forecast_local.dt.hour.eq(int(spec["forecast_hour"]))
+            & forecast_local.dt.minute.eq(0)
+            & target_local.dt.normalize().eq(forecast_local.dt.normalize() + pd.Timedelta(days=1))
+            & target_local.dt.hour.between(0, 23)
+        )
+        selected = d.loc[mask].copy()
+        if selected.empty:
+            warning = f"No D-1 {int(spec['forecast_hour']):02d}:00 Europe/Berlin snapshot rows available for selected week."
+    else:
+        raise ValueError(f"Unknown market-actionable selection: {spec['selection']}")
+
+    if not selected.empty:
+        selected = selected.sort_values(["target_time_utc", "model"]).drop_duplicates(["target_time_utc", "model"], keep="last")
+    observed_forecast_times = ""
+    observed_leads = ""
+    if not selected.empty:
+        observed_forecast_times = "; ".join(
+            sorted(
+                pd.to_datetime(selected["forecast_time_utc"], utc=True)
+                .dt.tz_convert(LOCAL_ZONE)
+                .dt.strftime("%Y-%m-%d %H:%M")
+                .unique()
+                .tolist()
+            )
+        )
+        observed_leads = ",".join(
+            str(int(x)) if float(x).is_integer() else f"{float(x):g}"
+            for x in sorted(pd.to_numeric(selected["lead_time_h"], errors="coerce").dropna().unique())
+        )
+    diagnostic = {
+        "selection_rule": str(spec["selection"]),
+        "expected_snapshot": str(spec["snapshot_description"]),
+        "observed_forecast_times_local": observed_forecast_times,
+        "observed_leads": observed_leads,
+        "n_rows": int(len(selected)),
+        "warning": warning,
+    }
+    return selected, diagnostic
+
+
+def _market_actionable_filename(spec: dict[str, Any], canonical_target: str, week: WeekSpec) -> str:
+    target_slug = {
+        "target_da_price": "da_price",
+        "target_afrr_capacity_price_pos": "capacity_price_pos",
+        "target_afrr_capacity_price_neg": "capacity_price_neg",
+        "target_afrr_activation_price_vwap_pos": "activation_price_pos",
+        "target_afrr_activation_price_vwap_neg": "activation_price_neg",
+        "target_afrr_activation_rate_pos": "activation_rate_pos",
+        "target_afrr_activation_rate_neg": "activation_rate_neg",
+    }.get(canonical_target, _safe_slug(canonical_target))
+    prefix = str(spec["filename_prefix"])
+    if prefix.endswith(target_slug):
+        return f"{prefix}_{week.key}.png"
+    return f"{prefix}_{target_slug}_{week.key}.png"
+
+
+def _market_actionable_title(spec: dict[str, Any], target_display: str) -> str:
+    if spec["market_context"] == "da_dminus1_11":
+        return "DA price | D-1 11:00 forecast snapshot | p50"
+    return f"{spec['title_prefix']} | {target_display} | p50"
+
+
+def _market_actionable_caption(week: WeekSpec, spec: dict[str, Any], target_display: str) -> str:
+    return (
+        f"Example-week {target_display} forecasts for the selected {week.label.lower()} week using the "
+        f"{spec['snapshot_description']} The figure compares realized values with p50 forecasts from RLQR, XGB and TFT and therefore shows information available at the market decision time."
+    )
+
+
+def _plot_market_actionable(
+    *,
+    selected: pd.DataFrame,
+    spec: dict[str, Any],
+    week: WeekSpec,
+    canonical_target: str,
+    models: list[ModelSpec],
+    out_path: Path,
+) -> dict[str, Any]:
+    import matplotlib.pyplot as plt
+
+    if selected.empty:
+        raise ValueError(f"Empty market-actionable selection for {week.key}/{spec['market_context']}/{canonical_target}.")
+    pivot = selected.pivot_table(
+        index="target_time_utc",
+        columns="model",
+        values="p50",
+        aggfunc="first",
+    ).sort_index()
+    truth = selected[["target_time_utc", "y_true"]].drop_duplicates("target_time_utc").set_index("target_time_utc").sort_index()
+    d = truth.join(pivot, how="inner").reset_index()
+    d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE)
+    target_display = _market_target_label(canonical_target)
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(13.5, 4.6))
+    ax.plot(d["local_time"], d["y_true"], label="Truth", color=get_model_color("truth"), linewidth=2.3)
+    row: dict[str, Any] = {
+        "week_type": week.key,
+        "market_context": spec["market_context"],
+        "target": canonical_target,
+        "target_display": target_display,
+        "figure_path": str(out_path),
+    }
+    for model in models:
+        if model.key not in d.columns:
+            continue
+        mae = float(np.mean(np.abs(pd.to_numeric(d[model.key], errors="coerce") - pd.to_numeric(d["y_true"], errors="coerce"))))
+        ax.plot(d["local_time"], d[model.key], label=f"{model.label} p50 (MAE={mae:.3f})", color=get_model_color(model.key), linewidth=1.8)
+        row[f"mae_{model.key}"] = mae
+    ax.set_title(thesis_titlecase(_market_actionable_title(spec, target_display)))
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Value")
+    tick_rows = d.index[d["local_time"].dt.hour.eq(0) & d["local_time"].dt.minute.eq(0)].tolist()
+    if not tick_rows:
+        tick_rows = list(range(0, len(d), max(1, len(d) // 7)))
+    tick_positions = [d.loc[i, "local_time"] for i in tick_rows if i in d.index]
+    tick_labels = ["\n".join(_format_week_tick(pd.Timestamp(t))) for t in tick_positions]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels)
+    ax.tick_params(axis="x", rotation=0)
+    ax.legend(ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.24))
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+    return row
+
+
+def _write_includegraphics_tex(*, image_path: Path, tex_path: Path, caption: str, label: str) -> Path:
+    rel = image_path.as_posix()
+    marker = "rq1_ml_model_benchmark/"
+    if marker in rel:
+        suffix = rel.split(marker, 1)[1]
+        raw_prefix = "_raw_outputs/4_1_6_example_weeks/"
+        if suffix.startswith(raw_prefix):
+            suffix = "4_1_6_example_weeks/" + suffix[len(raw_prefix):]
+        rel = "figures/4-results/rq1_ml_model_benchmark/" + suffix
+    lines = [
+        r"\begin{figure}[htbp]",
+        r"    \centering",
+        rf"    \includegraphics[width=\linewidth]{{{rel}}}",
+        f"    \\caption{{{_latex_escape(caption)}}}",
+        f"    \\label{{{label}}}",
+        r"\end{figure}",
+        "",
+    ]
+    tex_path.parent.mkdir(parents=True, exist_ok=True)
+    tex_path.write_text("\n".join(lines), encoding="utf-8")
+    return tex_path
+
+
+def build_market_actionable_examples(
+    *,
+    benchmark_dir: Path,
+    out_dir: Path,
+    models: list[ModelSpec],
+    split: str,
+    weeks: list[WeekSpec],
+    window_hours: int,
+) -> list[Path]:
+    outputs: list[Path] = []
+    prediction_rows: list[pd.DataFrame] = []
+    metric_rows: list[dict[str, Any]] = []
+    diagnostic_rows: list[dict[str, Any]] = []
+    warning_rows: list[dict[str, Any]] = []
+    cache: dict[tuple[str, str], pd.DataFrame] = {}
+
+    for spec in MARKET_ACTIONABLE_SPECS:
+        for canonical_target in spec["targets"]:
+            target_display = _market_target_label(canonical_target)
+            for model in models:
+                cache[(model.key, canonical_target)] = _read_market_actionable_model_target(
+                    benchmark_dir=benchmark_dir,
+                    model=model,
+                    split=split,
+                    canonical_target=canonical_target,
+                )
+            all_model_rows = pd.concat([cache[(model.key, canonical_target)] for model in models], ignore_index=True)
+            for week in weeks:
+                selected, diag = _select_market_actionable_rows(all_model_rows, spec=spec, week=week, window_hours=window_hours)
+                diag_row = {
+                    "week_type": week.key,
+                    "market_context": spec["market_context"],
+                    "target": canonical_target,
+                    "selection_rule": diag["selection_rule"],
+                    "expected_snapshot": diag["expected_snapshot"],
+                    "observed_forecast_times_local": diag["observed_forecast_times_local"],
+                    "observed_leads": diag["observed_leads"],
+                    "n_rows": diag["n_rows"],
+                    "warning": diag["warning"],
+                }
+                diagnostic_rows.append(diag_row)
+                if diag["warning"]:
+                    warning_rows.append(diag_row)
+                if selected.empty:
+                    continue
+                selected = selected.copy()
+                selected["week_type"] = week.key
+                selected["market_context"] = spec["market_context"]
+                selected["forecast_time_local"] = pd.to_datetime(selected["forecast_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE).astype(str)
+                selected["target_time_local"] = pd.to_datetime(selected["target_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE).astype(str)
+                selected["error_p50"] = selected["p50"] - selected["y_true"]
+                selected["abs_error_p50"] = selected["error_p50"].abs()
+                prediction_rows.append(
+                    selected[
+                        [
+                            "week_type",
+                            "market_context",
+                            "target",
+                            "target_display",
+                            "model_label",
+                            "forecast_time_utc",
+                            "forecast_time_local",
+                            "target_time_utc",
+                            "target_time_local",
+                            "lead_time_h",
+                            "y_true",
+                            "p50",
+                            "error_p50",
+                            "abs_error_p50",
+                        ]
+                    ].rename(columns={"model_label": "model"})
+                )
+                for model in models:
+                    part = selected[selected["model"].eq(model.key)].copy()
+                    if part.empty:
+                        continue
+                    metric_rows.append(
+                        {
+                            "week_type": week.key,
+                            "market_context": spec["market_context"],
+                            "target": canonical_target,
+                            "target_display": target_display,
+                            "model": model.label,
+                            "mae_p50": float(part["abs_error_p50"].mean()),
+                            "bias_p50": float(part["error_p50"].mean()),
+                            "median_abs_error_p50": float(part["abs_error_p50"].median()),
+                            "n_obs": int(len(part)),
+                            "observed_lead_min": float(part["lead_time_h"].min()),
+                            "observed_lead_max": float(part["lead_time_h"].max()),
+                            "forecast_snapshot_description": spec["snapshot_description"],
+                        }
+                    )
+
+                tier = "result_section" if (week.key, spec["market_context"], canonical_target) in RESULT_MARKET_ACTIONABLE else "appendix"
+                filename = _market_actionable_filename(spec, canonical_target, week)
+                fig_path = out_dir / tier / "figures" / filename
+                plot_row = _plot_market_actionable(selected=selected, spec=spec, week=week, canonical_target=canonical_target, models=models, out_path=fig_path)
+                outputs.append(fig_path)
+                tex_path = out_dir / tier / "latex_figures" / filename.replace(".png", ".tex")
+                _write_includegraphics_tex(
+                    image_path=fig_path,
+                    tex_path=tex_path,
+                    caption=_market_actionable_caption(week, spec, target_display),
+                    label=f"fig:rq1-market-actionable-{_safe_slug(week.key)}-{_safe_slug(spec['market_context'])}-{_safe_slug(target_display)}",
+                )
+                outputs.append(tex_path)
+                plot_row["latex_path"] = str(tex_path)
+
+    backup_csv = out_dir / "backup" / "csv"
+    backup_diag = out_dir / "backup" / "diagnostics"
+    backup_warn = out_dir / "backup" / "warnings"
+    backup_csv.mkdir(parents=True, exist_ok=True)
+    backup_diag.mkdir(parents=True, exist_ok=True)
+    backup_warn.mkdir(parents=True, exist_ok=True)
+    pred_path = backup_csv / "example_week_market_actionable_predictions.csv"
+    metrics_path = backup_csv / "example_week_market_actionable_metrics.csv"
+    diag_path = backup_diag / "example_week_market_actionable_selection.csv"
+    warn_path = backup_warn / "example_week_market_actionable_warnings.csv"
+    if prediction_rows:
+        pd.concat(prediction_rows, ignore_index=True).to_csv(pred_path, index=False)
+    else:
+        pd.DataFrame(columns=["week_type", "market_context", "target", "target_display", "model", "forecast_time_utc", "forecast_time_local", "target_time_utc", "target_time_local", "lead_time_h", "y_true", "p50", "error_p50", "abs_error_p50"]).to_csv(pred_path, index=False)
+    pd.DataFrame(metric_rows).to_csv(metrics_path, index=False)
+    pd.DataFrame(diagnostic_rows).to_csv(diag_path, index=False)
+    pd.DataFrame(warning_rows).to_csv(warn_path, index=False)
+    outputs.extend([pred_path, metrics_path, diag_path, warn_path])
+    return outputs
 
 
 def _target_scale_key(target: str) -> str:
@@ -672,6 +1099,15 @@ def main() -> int:
         quantile=quantile,
         window_hours=int(args.window_hours),
     )
+    market_outputs = build_market_actionable_examples(
+        benchmark_dir=benchmark_dir,
+        out_dir=Path(args.out_dir),
+        models=models,
+        split=args.split,
+        weeks=weeks,
+        window_hours=int(args.window_hours),
+    )
+    outputs.extend(market_outputs)
     print("[OK] Built RQ1 example-week figures.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     print(f"[OK] rows={len(summary)} targets={len(targets)} weeks={len(weeks)}")

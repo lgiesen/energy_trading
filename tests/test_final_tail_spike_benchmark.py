@@ -140,9 +140,10 @@ def test_latex_table_booktabs(tmp_path: Path) -> None:
     assert "\\toprule" in text
     assert "\\midrule" in text
     assert "\\bottomrule" in text
-    assert r"\textbf{\shortstack{Target}}" in text
-    assert r"\textbf{\shortstack{Best\\model}}" in text
-    assert r"\textbf{\shortstack{Main\\issue}}" in text
+    assert r"\textbf{Target}" in text
+    assert r"\textbf{Best" not in text
+    assert r"\textbf{N}" not in text
+    assert r"\textbf{Main" not in text
 
 
 def test_latex_table_keeps_positive_and_negative_targets_separate(tmp_path: Path) -> None:
@@ -167,5 +168,8 @@ def test_latex_table_keeps_positive_and_negative_targets_separate(tmp_path: Path
     path = write_latex_table(pd.DataFrame(rows), out_dir=tmp_path, split="test")
     assert path is not None
     text = path.read_text(encoding="utf-8")
-    assert r"\textbf{aFRR capacity price +}" in text
-    assert r"\textbf{aFRR capacity price $-$}" in text
+    assert "aFRR capacity price +" in text
+    assert "aFRR capacity price $-$" in text
+    assert r"\textbf{aFRR capacity price +}" not in text
+    assert r"\textbf{0.8000}" in text
+    assert r"\textbf{8.0000}" in text
