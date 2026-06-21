@@ -133,7 +133,8 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.4", "backup", "diagnostics", "diagnostics/gate_bucket_row_counts.csv", _sub_sources("4.1.4", "gate_bucket_row_counts.csv") + ["gate_bucket_row_counts.csv"], "row_counts", "diagnostics", "Gate bucket row counts."),
         _route("4.1.4", "backup", "diagnostics", "diagnostics/gate_bucket_observed_leads.csv", _sub_sources("4.1.4", "gate_bucket_observed_leads.csv") + ["gate_bucket_observed_leads.csv"], "observed_leads", "diagnostics", "Gate bucket observed leads."),
         _route("4.1.4", "backup", "warnings", "warnings/gate_bucket_warnings.csv", _sub_sources("4.1.4", "gate_bucket_warnings.csv") + ["gate_bucket_warnings.csv"], "warnings", "warnings", "Gate bucket warnings."),
-        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_main.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_main.png") + ["figures/tail_spike_relative_pinball_by_regime_main.png"], "mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime."),
+        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_price_capacity.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_price_capacity.png") + ["figures/tail_spike_relative_pinball_by_regime_price_capacity.png"], "relative_mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime for DA and capacity price targets."),
+        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_activation.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_activation.png") + ["figures/tail_spike_relative_pinball_by_regime_activation.png"], "relative_mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime for activation price and rate targets."),
         _route("4.1.5", "result_section", "figure", "figures/tail_spike_residual_distribution_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_residual_distribution_by_regime.png") + ["figures/tail_spike_residual_distribution_by_regime.png"], "residuals", "main thesis figure", "Tail/spike residual distributions."),
         _route("4.1.5", "result_section", "latex_table", f"tables/tail_spike_metrics_{split}.tex", _sub_sources("4.1.5", f"latex/tail_spike_metrics_{split}.tex") + [f"latex/tail_spike_metrics_{split}.tex"], "mean_pinball_loss", "main thesis table", "Tail/spike mean pinball table."),
         _route("4.1.5", "appendix", "figure", "figures/tail_spike_coverage_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_coverage_by_regime.png") + ["figures/tail_spike_coverage_by_regime.png"], "interval_coverage", "appendix figure", "Tail/spike p10-p90 coverage."),
@@ -740,7 +741,7 @@ TAIL_SPIKE_REGIME_LABELS = {
     "spike_week": "Spike week",
 }
 
-TAIL_SPIKE_MAIN_REGIMES = {
+TAIL_SPIKE_MAIN_REGIMES_BY_TARGET = {
     "DA price": [
         "normal",
         "da_abs_tail_top5",
@@ -749,18 +750,35 @@ TAIL_SPIKE_MAIN_REGIMES = {
         "high_volatility_week",
         "spike_week",
     ],
-    "aFRR capacity price": [
+    "aFRR capacity price +": [
         "normal",
         "high_volatility_week",
         "spike_week",
     ],
-    "aFRR activation price": [
+    "aFRR capacity price -": [
+        "normal",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR activation price +": [
         "normal",
         "afrr_activation_price_abs_tail_top5",
         "high_volatility_week",
         "spike_week",
     ],
-    "aFRR activation rate": [
+    "aFRR activation price -": [
+        "normal",
+        "afrr_activation_price_abs_tail_top5",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR activation rate +": [
+        "activation_zero_or_nearzero",
+        "activation_nonzero",
+        "high_volatility_week",
+        "spike_week",
+    ],
+    "aFRR activation rate -": [
         "activation_zero_or_nearzero",
         "activation_nonzero",
         "high_volatility_week",
@@ -768,9 +786,26 @@ TAIL_SPIKE_MAIN_REGIMES = {
     ],
 }
 
+TAIL_SPIKE_PRICE_CAPACITY_TARGETS = ["DA price", "aFRR capacity price +", "aFRR capacity price -"]
+TAIL_SPIKE_ACTIVATION_TARGETS = [
+    "aFRR activation price +",
+    "aFRR activation price -",
+    "aFRR activation rate +",
+    "aFRR activation rate -",
+]
+
 
 def _tail_spike_regime_label(regime: Any) -> str:
     return TAIL_SPIKE_REGIME_LABELS.get(str(regime), _tex_label(regime))
+
+
+def _tail_spike_target_label(target_label: Any) -> str:
+    text = str(target_label)
+    if text.endswith(" -"):
+        return text[:-2] + r" $-$"
+    if text.endswith(" +"):
+        return text
+    return text
 
 
 def _caption_from_name(stem: str) -> str:
@@ -999,7 +1034,7 @@ def _write_tail_spike_relative_tex(
     label: str,
     placement: str = "htbp",
 ) -> Path | None:
-    required = {"target_group", "regime", "model_label", "mean_pinball_loss"}
+    required = {"target_label", "regime", "model_label", "mean_pinball_loss"}
     if data.empty or not required.issubset(data.columns):
         return None
     d = data.copy()
@@ -1008,10 +1043,10 @@ def _write_tail_spike_relative_tex(
     if d.empty:
         return None
     agg = (
-        d.groupby(["target_group", "regime", "model_label"], as_index=False, sort=False)
+        d.groupby(["target_label", "regime", "model_label"], as_index=False, sort=False)
         .agg(mean_pinball_loss=("mean_pinball_loss", "mean"))
     )
-    pivot = agg.pivot_table(index=["target_group", "regime"], columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
+    pivot = agg.pivot_table(index=["target_label", "regime"], columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
     if "RLQR" not in pivot.columns:
         return None
     denom = pd.to_numeric(pivot["RLQR"], errors="coerce")
@@ -1022,18 +1057,98 @@ def _write_tail_spike_relative_tex(
         if model in pivot.columns:
             pivot[model] = pd.to_numeric(pivot[model], errors="coerce") / pd.to_numeric(pivot["RLQR"], errors="coerce")
 
-    panels: list[tuple[str, pd.DataFrame, list[str], list[str]]] = []
-    for group, regimes in TAIL_SPIKE_MAIN_REGIMES.items():
-        part = pivot[pivot["target_group"].astype(str).eq(group) & pivot["regime"].astype(str).isin(regimes)].copy()
-        if part.empty:
-            continue
-        order = {regime: i for i, regime in enumerate(regimes)}
-        part["_order"] = part["regime"].astype(str).map(order).fillna(99)
-        part = part.sort_values(["_order", "regime"]).reset_index(drop=True)
-        labels = [_tail_spike_regime_label(regime) for regime in part["regime"]]
-        symbols = [_tex_symbol(f"{group}_{label}") for label in labels]
-        panels.append((group, part, labels, symbols))
-    if not panels:
+    def _build_panels(targets: list[str]) -> list[tuple[str, pd.DataFrame, list[str], list[str]]]:
+        panels: list[tuple[str, pd.DataFrame, list[str], list[str]]] = []
+        for target_label in targets:
+            regimes = TAIL_SPIKE_MAIN_REGIMES_BY_TARGET[target_label]
+            part = pivot[pivot["target_label"].astype(str).eq(target_label) & pivot["regime"].astype(str).isin(regimes)].copy()
+            if part.empty:
+                continue
+            order = {regime: i for i, regime in enumerate(regimes)}
+            part["_order"] = part["regime"].astype(str).map(order).fillna(99)
+            part = part.sort_values(["_order", "regime"]).reset_index(drop=True)
+            labels = [_tail_spike_regime_label(regime) for regime in part["regime"]]
+            symbols = [_tex_symbol(f"{target_label}_{label}") for label in labels]
+            panels.append((target_label, part, labels, symbols))
+        return panels
+
+    def _figure_block(
+        *,
+        panels: list[tuple[str, pd.DataFrame, list[str], list[str]]],
+        figure_caption: str,
+        figure_label: str,
+        height_cm: float,
+    ) -> list[str]:
+        if not panels:
+            return []
+        lines = [
+            rf"\begin{{figure}}[{placement}]",
+            r"    \centering",
+            r"    \begin{tikzpicture}",
+            r"        \begin{groupplot}[",
+            rf"            group style={{group size=1 by {len(panels)}, vertical sep=1.00cm}},",
+            r"            width=0.86\linewidth,",
+            rf"            height={height_cm:.2f}cm,",
+            r"            xlabel={Mean pinball loss relative to RLQR},",
+            r"            legend style={at={(0.5,1.26)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+            r"            legend cell align={left},",
+            r"            area legend,",
+            r"            axis lines*=left,",
+            r"            xmin=0,",
+            r"            grid=major,",
+            r"        ]",
+        ]
+        legend_written = False
+        for target_label, part, labels, symbols in panels:
+            symbol_list = ",".join(symbols)
+            label_list = ",".join(_latex_escape(label) for label in labels)
+            lines.extend(
+                [
+                    r"            \nextgroupplot[",
+                    r"                xbar,",
+                    r"                bar width=5pt,",
+                    rf"                title={{{_latex_escape(thesis_titlecase(target_label))}}},",
+                    rf"                symbolic y coords={{{symbol_list}}},",
+                    rf"                ytick={{{symbol_list}}},",
+                    rf"                yticklabels={{{label_list}}},",
+                    r"                y dir=reverse,",
+                    r"                enlarge y limits=0.22,",
+                    r"            ]",
+                    rf"                \draw[color=secondary, densely dotted, line width=1.2pt] (axis cs:1,{symbols[0]}) -- (axis cs:1,{symbols[-1]});",
+                ]
+            )
+            if not legend_written:
+                lines.append(r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}")
+                lines.append(r"                \addlegendentry{RLQR baseline}")
+            for model in ["XGB", "TFT"]:
+                if model not in part.columns:
+                    continue
+                color = _model_color_role(model)
+                coords: list[str] = []
+                for symbol, value in zip(symbols, pd.to_numeric(part[model], errors="coerce")):
+                    if pd.notna(value) and np.isfinite(float(value)):
+                        coords.append(f"({_tex_num(value)},{symbol})")
+                if not coords:
+                    continue
+                lines.append(rf"                \addplot[xbar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+                if not legend_written:
+                    lines.append(rf"                \addlegendentry{{{_latex_escape(model)}}}")
+            legend_written = True
+        lines.extend(
+            [
+                r"        \end{groupplot}",
+                r"    \end{tikzpicture}",
+                f"    \\caption{{{_latex_escape(figure_caption)}}}",
+                f"    \\label{{{figure_label}}}",
+                r"\end{figure}",
+                "",
+            ]
+        )
+        return lines
+
+    price_capacity_panels = _build_panels(TAIL_SPIKE_PRICE_CAPACITY_TARGETS)
+    activation_panels = _build_panels(TAIL_SPIKE_ACTIVATION_TARGETS)
+    if not price_capacity_panels and not activation_panels:
         return None
 
     lines = [
@@ -1042,66 +1157,25 @@ def _write_tail_spike_relative_tex(
         r"% Requires: \usepgfplotslibrary{groupplots}",
         r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
         *_latex_color_defs(),
-        rf"\begin{{figure}}[{placement}]",
-        r"    \centering",
-        r"    \begin{tikzpicture}",
-        r"        \begin{groupplot}[",
-        rf"            group style={{group size=1 by {len(panels)}, vertical sep=1.05cm}},",
-        r"            width=0.92\linewidth,",
-        r"            height=3.15cm,",
-        r"            xlabel={Mean pinball loss relative to RLQR},",
-        r"            legend style={at={(0.5,1.22)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
-        r"            legend cell align={left},",
-        r"            area legend,",
-        r"            axis lines*=left,",
-        r"            xmin=0,",
-        r"            grid=major,",
-        r"        ]",
     ]
-    legend_written = False
-    for group, part, labels, symbols in panels:
-        symbol_list = ",".join(symbols)
-        label_list = ",".join(_latex_escape(label) for label in labels)
+    if price_capacity_panels:
         lines.extend(
-            [
-                r"            \nextgroupplot[",
-                r"                xbar,",
-                r"                bar width=6pt,",
-                rf"                title={{{_latex_escape(thesis_titlecase(group))}}},",
-                rf"                symbolic y coords={{{symbol_list}}},",
-                rf"                ytick={{{symbol_list}}},",
-                rf"                yticklabels={{{label_list}}},",
-                r"                y dir=reverse,",
-                r"            ]",
-                rf"                \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{(1,{symbols[0]}) (1,{symbols[-1]})}};",
-            ]
+            _figure_block(
+                panels=price_capacity_panels,
+                figure_caption="Tail and spike performance by regime for DA and aFRR capacity price forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+                figure_label="fig:tail_spike_relative_pinball_by_regime_price_capacity",
+                height_cm=3.05,
+            )
         )
-        if not legend_written:
-            lines.append(r"                \addlegendentry{RLQR baseline}")
-        for model in ["XGB", "TFT"]:
-            if model not in part.columns:
-                continue
-            color = _model_color_role(model)
-            coords: list[str] = []
-            for symbol, value in zip(symbols, pd.to_numeric(part[model], errors="coerce")):
-                if pd.notna(value) and np.isfinite(float(value)):
-                    coords.append(f"({_tex_num(value)},{symbol})")
-            if not coords:
-                continue
-            lines.append(rf"                \addplot[xbar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
-            if not legend_written:
-                lines.append(rf"                \addlegendentry{{{_latex_escape(model)}}}")
-        legend_written = True
-    lines.extend(
-        [
-            r"        \end{groupplot}",
-            r"    \end{tikzpicture}",
-            f"    \\caption{{{_latex_escape(caption)}}}",
-            f"    \\label{{{label}}}",
-            r"\end{figure}",
-            "",
-        ]
-    )
+    if activation_panels:
+        lines.extend(
+            _figure_block(
+                panels=activation_panels,
+                figure_caption="Tail and spike performance by regime for aFRR activation price and activation rate forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+                figure_label="fig:tail_spike_relative_pinball_by_regime_activation",
+                height_cm=2.85,
+            )
+        )
     return _write_lines(path, lines)
 
 
