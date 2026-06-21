@@ -18,6 +18,7 @@ Reuse this module across Python scripts and notebooks:
 from __future__ import annotations
 
 from typing import Dict
+import re
 
 # GeoDataViz multi-hue diverging palette.
 GEO_DIVERGING: Dict[str, str] = {
@@ -58,6 +59,82 @@ MODEL_COLOR_MAP: Dict[str, str] = {
     "xgb": THESIS_PALETTE["primary"],
     "tft": THESIS_PALETTE["tertiary"],
 }
+
+_TITLECASE_KEEP_LOWER = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "per",
+    "the",
+    "to",
+    "under",
+    "vs",
+    "with",
+}
+
+_TITLECASE_SPECIAL = {
+    "afrr": "aFRR",
+    "bess": "BESS",
+    "bem": "BEM",
+    "bcm": "BCM",
+    "crps": "CRPS",
+    "da": "DA",
+    "hpo": "HPO",
+    "id": "ID",
+    "mae": "MAE",
+    "pnl": "PnL",
+    "rlqr": "RLQR",
+    "rmse": "RMSE",
+    "tft": "TFT",
+    "xgb": "XGB",
+    "xgboost": "XGBoost",
+}
+
+
+def thesis_titlecase(text: str) -> str:
+    """Return thesis-style Title Case while preserving domain acronyms."""
+    raw = str(text)
+    word_re = re.compile(r"p\d+(?:-p\d+)?|[A-Za-z]+(?:-[A-Za-z]+)*", re.IGNORECASE)
+    matches = list(word_re.finditer(raw))
+    if not matches:
+        return raw
+    first_word_start = matches[0].start()
+    last_word_start = matches[-1].start()
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(0)
+        low = token.lower()
+        if low in _TITLECASE_SPECIAL:
+            return _TITLECASE_SPECIAL[low]
+        if re.fullmatch(r"p\d+(?:-p\d+)?", low):
+            return low
+        if "-" in token:
+            return "-".join(repl_part(part) for part in token.split("-"))
+        if match.start() not in {first_word_start, last_word_start} and low in _TITLECASE_KEEP_LOWER:
+            return low
+        return token[:1].upper() + token[1:].lower()
+
+    def repl_part(part: str) -> str:
+        low = part.lower()
+        if low in _TITLECASE_SPECIAL:
+            return _TITLECASE_SPECIAL[low]
+        if re.fullmatch(r"p\d+", low):
+            return low
+        if low in _TITLECASE_KEEP_LOWER:
+            return low
+        return part[:1].upper() + part[1:].lower()
+
+    return word_re.sub(repl, raw)
 
 # Fixed semantic styling for backtest benchmark paths.
 BACKTEST_LINE_STYLES: Dict[str, Dict[str, object]] = {

@@ -19,8 +19,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from energy_trading.evaluation.style import THESIS_PALETTE
-
+from energy_trading.evaluation.style import THESIS_PALETTE, thesis_titlecase
+from energy_trading.evaluation.rq1_target_order import MODEL_LABELS, model_sort_key, ordered_model_labels, ordered_unique, sort_model_frame, sort_target_frame, target_sort_key
 
 SUBSECTIONS = {
     "4.1.1": "4_1_1_full_unweighted",
@@ -28,8 +28,7 @@ SUBSECTIONS = {
     "4.1.3": "4_1_3_per_lead",
     "4.1.4": "4_1_4_gate_specific",
     "4.1.5": "4_1_5_tail_spike",
-    "4.1.6": "4_1_6_interim_answer",
-    "4.1.7": "4_1_7_example_weeks",
+    "4.1.6": "4_1_6_example_weeks",
 }
 
 LEGACY_SUBSECTIONS = {
@@ -38,7 +37,7 @@ LEGACY_SUBSECTIONS = {
     "4.1.3": ["4_1_3_per_lead_hour", "4_1_3_per_lead", "rq1/4_1_3_per_lead_hour", "rq1/4_1_3_per_lead"],
     "4.1.4": ["4_1_4_gate_actionable", "4_1_4_gate_specific", "rq1/4_1_4_gate_actionable", "rq1/4_1_4_gate_specific"],
     "4.1.5": ["4_1_5_tail_spike", "rq1/4_1_5_tail_spike"],
-    "4.1.7": ["4_1_7_example_weeks", "rq1/4_1_7_example_weeks"],
+    "4.1.6": ["4_1_6_example_weeks", "rq1/4_1_6_example_weeks"],
 }
 
 CANONICAL_DIRS = set(SUBSECTIONS.values())
@@ -89,14 +88,18 @@ def _sub_sources(subsection: str, rel: str) -> list[str]:
 def build_routes(split: str) -> list[Route]:
     routes = [
         _route("4.1.1", "result_section", "figure", f"figures/forecast_metrics_full_relative_pinball_{split}.png", _sub_sources("4.1.1", f"figures/rq1_4_1_1_forecast_metrics_full_relative_pinball_{split}.png"), "mean_pinball_loss", "main thesis figure", "Relative mean pinball loss against RLQR."),
+        _route("4.1.1", "result_section", "figure", "figures/computational_cost_365d.png", _sub_sources("4.1.1", "figures/rq1_4_1_1_computational_cost_365d.png"), "computational_cost", "main thesis figure", "Computational Cost of Each Model Scaled for 365 Days of Training Data."),
+        _route("4.1.1", "appendix", "figure", f"figures/forecast_metrics_full_relative_mae_p50_{split}.png", _sub_sources("4.1.1", f"figures/rq1_4_1_1_forecast_metrics_full_relative_mae_p50_{split}.png"), "mae_p50", "appendix figure", "Relative p50 MAE against RLQR by target."),
         _route("4.1.1", "result_section", "latex_table", f"tables/forecast_metrics_full_primary_{split}.tex", _sub_sources("4.1.1", f"latex/rq1_4_1_1_forecast_metrics_full_primary_{split}.tex"), "mean_pinball_loss", "main thesis table", "Primary full-sample mean pinball table."),
+        _route("4.1.1", "result_section", "latex_table", "tables/computational_cost_365d.tex", _sub_sources("4.1.1", "latex/rq1_4_1_1_computational_cost_365d.tex"), "computational_cost", "main thesis table", "Observed and 365-day-scaled computational cost table."),
         _route("4.1.1", "appendix", "latex_table", f"tables/forecast_metrics_full_detailed_{split}.tex", _sub_sources("4.1.1", f"latex/rq1_4_1_1_forecast_metrics_full_detailed_{split}.tex"), "point_and_probabilistic_errors", "appendix table", "Detailed full-sample metrics."),
         _route("4.1.1", "backup", "csv", "csv/forecast_metrics_full_long.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_forecast_metrics_full_long.csv"), "all_full_metrics", "backup data", "Long-form full metrics CSV."),
         _route("4.1.1", "backup", "csv", f"csv/forecast_metrics_full_primary_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_primary_{split}.csv"), "mean_pinball_loss", "backup data", "Primary full metrics CSV."),
         _route("4.1.1", "backup", "csv", f"csv/forecast_metrics_full_detailed_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_detailed_{split}.csv"), "point_and_probabilistic_errors", "backup data", "Detailed full metrics CSV."),
+        _route("4.1.1", "backup", "csv", "csv/computational_cost_365d.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_computational_cost_365d.csv"), "computational_cost", "backup data", "Observed and scaled computational cost source CSV."),
         _route("4.1.1", "backup", "diagnostics", f"diagnostics/forecast_metrics_full_alignment_diagnostics_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_alignment_diagnostics_{split}.csv"), "alignment", "diagnostics", "Alignment diagnostics for full metrics."),
-        _route("4.1.2", "result_section", "figure", "figures/calibration_reliability_by_target_group.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_reliability_by_target_group.png"), "calibration", "main thesis figure", "Quantile reliability by target group."),
-        _route("4.1.2", "result_section", "figure", "figures/calibration_interval_coverage_by_target_group.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_interval_coverage_by_target_group.png"), "interval_coverage", "main thesis figure", "Interval coverage by target group."),
+        _route("4.1.2", "result_section", "figure", "figures/calibration_reliability_by_target.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_reliability_by_target.png"), "calibration", "main thesis figure", "Quantile reliability by target."),
+        _route("4.1.2", "result_section", "figure", "figures/calibration_interval_coverage_by_target_group.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_interval_coverage_by_target_group.png"), "interval_coverage", "main thesis figure", "Interval coverage reliability by target group.", required=False),
         _route("4.1.2", "result_section", "latex_table", f"tables/calibration_summary_{split}.tex", _sub_sources("4.1.2", f"latex/rq1_4_1_2_calibration_summary_{split}.tex"), "calibration", "main thesis table", "Calibration summary table."),
         _route("4.1.2", "appendix", "latex_table", f"tables/calibration_quantile_coverage_{split}_appendix.tex", _sub_sources("4.1.2", f"latex/rq1_4_1_2_calibration_quantile_coverage_{split}_appendix.tex"), "calibration", "appendix table", "Quantile coverage appendix table."),
         _route("4.1.2", "appendix", "latex_table", f"tables/calibration_interval_quality_{split}_appendix.tex", _sub_sources("4.1.2", f"latex/rq1_4_1_2_calibration_interval_quality_{split}_appendix.tex"), "interval_coverage_width", "appendix table", "Interval quality appendix table."),
@@ -115,7 +118,7 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.3", "backup", "csv", f"csv/per_lead_range_summary_{split}.csv", _sub_sources("4.1.3", f"per_lead_range_summary_{split}.csv") + [f"per_lead_range_summary_{split}.csv"], "mean_pinball_loss", "backup data", "Per-lead range summary CSV."),
         _route("4.1.3", "backup", "diagnostics", f"diagnostics/per_lead_row_counts_{split}.csv", _sub_sources("4.1.3", f"per_lead_row_counts_{split}.csv") + [f"per_lead_row_counts_{split}.csv"], "row_counts", "diagnostics", "Per-lead row counts."),
         _route("4.1.3", "backup", "warnings", "warnings/per_lead_warnings.csv", _sub_sources("4.1.3", "per_lead_warnings.csv") + ["per_lead_warnings.csv"], "warnings", "warnings", "Per-lead warnings."),
-        _route("4.1.4", "result_section", "figure", "figures/gate_bucket_pinball_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_pinball_by_target_group.png") + ["figures/gate_bucket_pinball_by_target_group.png"], "mean_pinball_loss", "main thesis figure", "Gate bucket mean pinball by target group."),
+        _route("4.1.4", "result_section", "figure", "figures/gate_bucket_pinball_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_pinball_by_target_group.png") + ["figures/gate_bucket_pinball_by_target_group.png"], "relative_mean_pinball_loss", "main thesis figure", "Gate-specific relative mean pinball loss (RLQR = 1)."),
         _route("4.1.4", "result_section", "latex_table", f"tables/gate_bucket_metrics_{split}.tex", _sub_sources("4.1.4", f"latex/gate_bucket_metrics_{split}.tex") + [f"latex/gate_bucket_metrics_{split}.tex"], "mean_pinball_loss", "main thesis table", "Gate bucket mean pinball table."),
         _route("4.1.4", "appendix", "figure", "figures/gate_bucket_coverage_p10_p90_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_coverage_p10_p90_by_target_group.png") + ["figures/gate_bucket_coverage_p10_p90_by_target_group.png"], "interval_coverage", "appendix figure", "Gate bucket p10-p90 coverage."),
         _route("4.1.4", "appendix", "figure", "figures/gate_bucket_observed_leads.png", _sub_sources("4.1.4", "figures/gate_bucket_observed_leads.png") + ["figures/gate_bucket_observed_leads.png"], "observed_leads", "appendix figure", "Observed leads by gate bucket."),
@@ -157,6 +160,10 @@ def build_routes(split: str) -> list[Route]:
 
 def _latex_escape(value: Any) -> str:
     s = str(value)
+    minus_token = "@@RQ1MINUS@@"
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} -", f"{label} {minus_token}")
+        s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -170,7 +177,7 @@ def _latex_escape(value: Any) -> str:
         "^": r"\textasciicircum{}",
     }.items():
         s = s.replace(old, new)
-    return s
+    return s.replace(minus_token, "$-$")
 
 
 def _fmt(value: Any) -> str:
@@ -216,17 +223,36 @@ def _derive_per_lead_appendix(csv_path: Path, out_path: Path, split: str) -> Pat
     df = pd.read_csv(csv_path)
     if "split" in df.columns:
         df = df[df["split"].eq(split)]
-    rows: list[list[Any]] = []
+    rows: list[dict[str, Any]] = []
     metrics = [("mean_pinball_loss", "Mean pinball loss"), ("mae_p50", "MAE p50"), ("rmse_p50", "RMSE p50"), ("bias_p50", "Bias p50")]
+    metric_order = {label: idx for idx, (_, label) in enumerate(metrics)}
     for metric, label in metrics:
         if metric not in df.columns:
             continue
         pivot = _pivot_metric_rows(df, ["target_label", "lead_time_h"], metric)
+        pivot = sort_target_frame(pivot, target_col="target_label", extra_cols=["lead_time_h"])
         for _, row in pivot.iterrows():
-            vals = {m: float(row[m]) for m in ["TFT", "XGB", "RLQR"] if m in row and pd.notna(row[m])}
+            vals = {m: float(row[m]) for m in MODEL_LABELS if m in row and pd.notna(row[m])}
             n = int(df[(df["target_label"].eq(row["target_label"])) & (df["lead_time_h"].eq(row["lead_time_h"]))]["n_obs"].min())
-            rows.append([row["target_label"], int(row["lead_time_h"]), label, vals.get("TFT", np.nan), vals.get("XGB", np.nan), vals.get("RLQR", np.nan), _best(vals), n])
-    return _write_table(out_path, ["Target", "Lead hour", "Metric", "TFT", "XGB", "RLQR", "Best model", "N"], rows, "Per-lead detailed forecast metrics on the test split.", "tab:per_lead_detailed_metrics_test")
+            rows.append(
+                {
+                    "Target": row["target_label"],
+                    "Lead hour": int(row["lead_time_h"]),
+                    "Metric": label,
+                    "RLQR": vals.get("RLQR", np.nan),
+                    "XGB": vals.get("XGB", np.nan),
+                    "TFT": vals.get("TFT", np.nan),
+                    "Best model": _best(vals),
+                    "N": n,
+                }
+            )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return None
+    out["_metric_order"] = out["Metric"].map(metric_order).fillna(99)
+    out = sort_target_frame(out, target_col="Target", extra_cols=["_metric_order", "Lead hour"])
+    table_rows = out[["Target", "Lead hour", "Metric", "RLQR", "XGB", "TFT", "Best model", "N"]].values.tolist()
+    return _write_table(out_path, ["Target", "Lead hour", "Metric", "RLQR", "XGB", "TFT", "Best model", "N"], table_rows, "Per-lead detailed forecast metrics on the test split.", "tab:per_lead_detailed_metrics_test")
 
 
 def _derive_gate_interval_appendix(csv_path: Path, out_path: Path, split: str) -> Path | None:
@@ -235,6 +261,9 @@ def _derive_gate_interval_appendix(csv_path: Path, out_path: Path, split: str) -
     df = pd.read_csv(csv_path)
     if "split" in df.columns:
         df = df[df["split"].eq(split)]
+    target_col = "target" if "target" in df.columns else "target_group" if "target_group" in df.columns else None
+    if target_col is not None:
+        df = sort_target_frame(df, target_col=target_col, extra_cols=["bucket", "model_label"])
     rows: list[list[Any]] = []
     for _, row in df.iterrows():
         rows.append([
@@ -254,7 +283,7 @@ def _derive_tail_appendix(csv_path: Path, out_path: Path, split: str) -> Path | 
     df = pd.read_csv(csv_path)
     if "split" in df.columns:
         df = df[df["split"].eq(split)]
-    rows: list[list[Any]] = []
+    rows: list[dict[str, Any]] = []
     metrics = [
         ("mean_pinball_loss", "Mean pinball loss"),
         ("mae_p50", "MAE p50"),
@@ -263,16 +292,35 @@ def _derive_tail_appendix(csv_path: Path, out_path: Path, split: str) -> Path | 
         ("coverage_p10_p90", "p10-p90 coverage"),
         ("interval_width_p10_p90_mean", "p10-p90 width"),
     ]
+    metric_order = {label: idx for idx, (_, label) in enumerate(metrics)}
     for metric, label in metrics:
         if metric not in df.columns:
             continue
-        pivot = _pivot_metric_rows(df, ["regime", "target_label"], metric)
+        pivot = _pivot_metric_rows(df, ["target_label", "regime"], metric)
+        pivot = sort_target_frame(pivot, target_col="target_label", extra_cols=["regime"])
         for _, row in pivot.iterrows():
-            vals = {m: float(row[m]) for m in ["TFT", "XGB", "RLQR"] if m in row and pd.notna(row[m])}
+            vals = {m: float(row[m]) for m in MODEL_LABELS if m in row and pd.notna(row[m])}
             mask = df["regime"].eq(row["regime"]) & df["target_label"].eq(row["target_label"])
             n = int(df[mask]["n_obs"].min())
-            rows.append([row["regime"], row["target_label"], label, vals.get("TFT", np.nan), vals.get("XGB", np.nan), vals.get("RLQR", np.nan), _best(vals), n])
-    return _write_table(out_path, ["Regime", "Target", "Metric", "TFT", "XGB", "RLQR", "Best model", "N"], rows, "Tail/spike detailed metrics on the test split.", "tab:tail_spike_detailed_metrics_test")
+            rows.append(
+                {
+                    "Target": row["target_label"],
+                    "Regime": row["regime"],
+                    "Metric": label,
+                    "RLQR": vals.get("RLQR", np.nan),
+                    "XGB": vals.get("XGB", np.nan),
+                    "TFT": vals.get("TFT", np.nan),
+                    "Best model": _best(vals),
+                    "N": n,
+                }
+            )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return None
+    out["_metric_order"] = out["Metric"].map(metric_order).fillna(99)
+    out = sort_target_frame(out, target_col="Target", extra_cols=["_metric_order", "Regime"])
+    table_rows = out[["Target", "Regime", "Metric", "RLQR", "XGB", "TFT", "Best model", "N"]].values.tolist()
+    return _write_table(out_path, ["Target", "Regime", "Metric", "RLQR", "XGB", "TFT", "Best model", "N"], table_rows, "Tail/spike detailed metrics on the test split.", "tab:tail_spike_detailed_metrics_test")
 
 
 def _find_source(final_root: Path, rq1_root: Path, candidates: tuple[str, ...]) -> Path | None:
@@ -353,7 +401,6 @@ def prune_legacy_outputs(*, rq1_root: Path, final_root: Path) -> list[str]:
     removed: list[str] = []
     legacy_root_names = [
         ".DS_Store",
-        "_raw_outputs",
         "rq1",
         "calibration",
         "figures",
@@ -395,8 +442,6 @@ def prune_legacy_outputs(*, rq1_root: Path, final_root: Path) -> list[str]:
         for path in root.glob("*.json"):
             _remove_path(path, removed)
 
-    if final_root != rq1_root and final_root.exists():
-        _remove_path(final_root, removed)
     return removed
 
 
@@ -436,9 +481,11 @@ def _add_derived_tables(entries: list[dict[str, Any]], missing: list[dict[str, A
 
 def _find_example_source_dirs(final_root: Path, rq1_root: Path) -> list[Path]:
     candidates = [
-        final_root / "4_1_7_example_weeks",
-        rq1_root / "4_1_7_example_weeks",
-        rq1_root / "rq1" / "4_1_7_example_weeks",
+        final_root / "_raw_outputs" / "4_1_6_example_weeks",
+        rq1_root / "_raw_outputs" / "4_1_6_example_weeks",
+        final_root / "4_1_6_example_weeks",
+        rq1_root / "4_1_6_example_weeks",
+        rq1_root / "rq1" / "4_1_6_example_weeks",
     ]
     out: list[Path] = []
     seen: set[Path] = set()
@@ -457,7 +504,7 @@ def _copy_file(src: Path, dst: Path) -> None:
 
 
 def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[str, Any]], *, final_root: Path, rq1_root: Path) -> None:
-    subsection = "4.1.7"
+    subsection = "4.1.6"
     target_root = rq1_root / SUBSECTIONS[subsection]
     source_dirs = _find_example_source_dirs(final_root, rq1_root)
     if not source_dirs:
@@ -478,11 +525,15 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
         return
     source_dir = source_dirs[0]
     metrics = source_dir / "example_week_metrics.csv"
+    if not metrics.exists():
+        metrics = source_dir / "backup" / "csv" / "example_week_metrics.csv"
     if metrics.exists():
         dst = target_root / "backup" / "csv" / "example_week_metrics.csv"
         _copy_file(metrics, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "csv", "path": str(dst), "metric_family": "example_weeks", "thesis_use": "backup data", "brief_description": "Example-week plot inventory and diagnostics."})
     manifest = source_dir / "example_week_manifest.json"
+    if not manifest.exists():
+        manifest = source_dir / "backup" / "diagnostics" / "example_week_manifest.json"
     if manifest.exists():
         dst = target_root / "backup" / "diagnostics" / "example_week_manifest.json"
         _copy_file(manifest, dst)
@@ -505,95 +556,995 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
                     "brief_description": f"Example-week forecast plot: {rel}",
                 }
             )
+        for src in sorted(figures_root.rglob("*.tex")):
+            rel = src.relative_to(figures_root)
+            if r"\includegraphics" in src.read_text(encoding="utf-8", errors="ignore"):
+                continue
+            tier = "result_section" if rel.parts and rel.parts[0] == "typical" else "appendix"
+            dst = target_root / tier / "latex_figures" / rel
+            _copy_file(src, dst)
+            entries.append(
+                {
+                    "subsection": subsection,
+                    "tier": tier,
+                    "artifact_type": "latex_figure",
+                    "path": str(dst),
+                    "metric_family": "example_weeks",
+                    "thesis_use": "native TikZ/pgfplots figure code",
+                    "brief_description": f"Native example-week forecast plot code: {rel}",
+                }
+            )
+    else:
+        for tier in ["result_section", "appendix"]:
+            for src in sorted((source_dir / tier / "figures").rglob("*.png")):
+                rel = src.relative_to(source_dir / tier / "figures")
+                dst = target_root / tier / "figures" / rel
+                _copy_file(src, dst)
+                entries.append(
+                    {
+                        "subsection": subsection,
+                        "tier": tier,
+                        "artifact_type": "figure",
+                        "path": str(dst),
+                        "metric_family": "example_weeks",
+                        "thesis_use": "main thesis figure" if tier == "result_section" else "appendix figure",
+                        "brief_description": f"Example-week forecast plot: {rel}",
+                    }
+                )
+            for src in sorted((source_dir / tier / "latex_figures").rglob("*.tex")):
+                rel = src.relative_to(source_dir / tier / "latex_figures")
+                if r"\includegraphics" in src.read_text(encoding="utf-8", errors="ignore"):
+                    continue
+                dst = target_root / tier / "latex_figures" / rel
+                _copy_file(src, dst)
+                entries.append(
+                    {
+                        "subsection": subsection,
+                        "tier": tier,
+                        "artifact_type": "latex_figure",
+                        "path": str(dst),
+                        "metric_family": "example_weeks",
+                        "thesis_use": "native TikZ/pgfplots figure code",
+                        "brief_description": f"Native example-week forecast plot code: {rel}",
+                    }
+                )
 
 
 def _latex_color_name(role: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "", role).lower()
 
 
-def _latex_figure_label(subsection: str, figure_path: Path) -> str:
-    stem = re.sub(r"[^a-z0-9]+", "-", figure_path.stem.lower()).strip("-")
-    section = subsection.replace(".", "-")
-    return f"fig:rq1-{section}-{stem}"
-
-
-def _latex_figure_path(rq1_root: Path, figure_path: Path) -> str:
-    rel = figure_path.relative_to(rq1_root).as_posix()
-    return rf"\rqonefigroot/{rel}"
-
-
-def _write_latex_figure_snippet(
-    *,
-    path: Path,
-    figure_path: Path,
-    rq1_root: Path,
-    subsection: str,
-    caption: str,
-    placement: str,
-) -> None:
-    color_lines = [
-        f"\\providecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
+def _latex_color_defs() -> list[str]:
+    return [
+        f"\\definecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
         for role, hex_color in THESIS_PALETTE.items()
     ]
-    lines = [
-        r"% Requires: \usepackage{graphicx}",
+
+
+def _tex_num(value: Any) -> str:
+    try:
+        x = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(x):
+        return "nan"
+    return f"{x:.6g}"
+
+
+def _tex_hours(value: Any) -> str:
+    try:
+        x = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(x):
+        return "nan"
+    return f"{x:.2f}"
+
+
+def _tex_symbol(value: Any) -> str:
+    raw = str(value)
+    raw = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")
+    if not raw:
+        raw = "x"
+    if raw[0].isdigit():
+        raw = "x_" + raw
+    return raw
+
+
+def _tex_label(value: Any) -> str:
+    text = str(value).replace("\\", "/").replace("{", "(").replace("}", ")")
+    text = text.replace("_", " ")
+    replacements = {
+        "afrr": "aFRR",
+        "da": "DA",
+        "id": "ID",
+        "vwap": "VWAP",
+        "p10": "P10",
+        "p50": "P50",
+        "p90": "P90",
+        "rmse": "RMSE",
+        "mae": "MAE",
+        "rlqr": "RLQR",
+        "xgb": "XGB",
+        "tft": "TFT",
+    }
+    return " ".join(replacements.get(part.lower(), part) for part in text.split())
+
+
+BUCKET_LABELS = {
+    "full_h1_48": "Full horizon (h1--h48)",
+    "short_h1_8": "Short horizon (h1--h8)",
+    "medium_h9_16": "Medium horizon (h9--h16)",
+    "long_h17_48": "Long horizon (h17--h48)",
+    "actionable_da_dplus1_11": "DA gate (D+1 11:00)",
+    "actionable_bcm_dplus1_08": "aFRR capacity gate (D+1 08:00)",
+    "actionable_bem_short_h1_8": "Activation gate (h1--h8)",
+}
+
+
+def _bucket_label(bucket: Any) -> str:
+    return BUCKET_LABELS.get(str(bucket), _tex_label(bucket))
+
+
+def _caption_from_name(stem: str) -> str:
+    return stem.replace("_", " ").strip().capitalize() + "."
+
+
+def _figure_label(section: str, stem: str) -> str:
+    clean = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
+    return f"fig:rq1-{section.replace('.', '-')}-{clean}"
+
+
+def _tikz_header(caption: str, label: str, *, placement: str = "htbp") -> list[str]:
+    return [
+        r"% Requires: \usepackage{pgfplots}",
         r"% Requires: \usepackage{xcolor}",
-        r"% Palette mirrored from src/energy_trading/visualization/style.py:",
-        *color_lines,
-        r"% Override this once in the thesis preamble if the figures are copied elsewhere.",
-        r"\providecommand{\rqonefigroot}{artifacts/final_benchmark}",
+        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+        *_latex_color_defs(),
         rf"\begin{{figure}}[{placement}]",
         r"    \centering",
-        rf"    \includegraphics[width=\textwidth,height=0.82\textheight,keepaspectratio]{{{_latex_figure_path(rq1_root, figure_path)}}}",
-        f"    \\caption{{{_latex_escape(caption)}}}",
-        f"    \\label{{{_latex_figure_label(subsection, figure_path)}}}",
+        r"    \resizebox{\linewidth}{!}{%",
+        r"        \begin{tikzpicture}",
+    ]
+
+
+def _tikz_footer(caption: str, label: str) -> list[str]:
+    return [
+        r"        \end{tikzpicture}}",
+        f"    \\caption{{{_latex_escape(thesis_titlecase(caption))}}}",
+        f"    \\label{{{label}}}",
         r"\end{figure}",
         "",
     ]
+
+
+def _percent_tick_options(ticks: tuple[float, ...]) -> list[str]:
+    tick_values = ",".join(_tex_num(tick) for tick in ticks)
+    tick_labels = ",".join(rf"{tick * 100:.0f}\%" for tick in ticks)
+    return [
+        f"                xtick={{{tick_values}}},",
+        f"                xticklabels={{{tick_labels}}},",
+        f"                ytick={{{tick_values}}},",
+        f"                yticklabels={{{tick_labels}}},",
+    ]
+
+
+def _write_lines(path: Path, lines: list[str]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
-def _add_latex_figure_snippets(entries: list[dict[str, Any]], *, rq1_root: Path) -> None:
-    figure_entries = [
-        entry
-        for entry in list(entries)
-        if entry.get("artifact_type") == "figure"
-        and entry.get("tier") in {"result_section", "appendix"}
-        and Path(str(entry.get("path", ""))).suffix.lower() in {".png", ".pdf"}
+def _coordinates(rows: list[tuple[Any, Any]]) -> str:
+    return " ".join(f"({_tex_symbol(x)},{_tex_num(y)})" for x, y in rows)
+
+
+def _symbolic_axis_options(labels: list[Any]) -> list[str]:
+    symbols = [_tex_symbol(x) for x in labels]
+    tick_labels = [_latex_escape(_tex_label(x)) for x in labels]
+    return [
+        "                symbolic x coords={" + ",".join(symbols) + "},",
+        "                xtick={" + ",".join(symbols) + "},",
+        "                xticklabels={" + ",".join(tick_labels) + "},",
     ]
-    for entry in figure_entries:
-        figure_path = Path(str(entry["path"]))
-        if not figure_path.exists():
+
+
+def _write_grouped_bar_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    x_col: str,
+    series_cols: list[str],
+    caption: str,
+    label: str,
+    ylabel: str,
+    colors: list[str] | None = None,
+    placement: str = "htbp",
+    reference_y: float | None = None,
+    reference_label: str | None = None,
+) -> Path | None:
+    if data.empty or not series_cols:
+        return None
+    del colors
+    series_cols = [c for c in ordered_model_labels(series_cols) if c in series_cols]
+    labels = data[x_col].astype(str).tolist()
+    lines = _tikz_header(caption, label, placement=placement)
+    lines.extend(
+        [
+            r"            \begin{axis}[",
+            r"                ybar,",
+            r"                bar width=13pt,",
+            r"                width=0.96\textwidth,",
+            r"                height=8cm,",
+            rf"                ylabel={{{_latex_escape(ylabel)}}},",
+            r"                x tick label style={rotate=35, anchor=east},",
+            r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+            r"                legend cell align={left},",
+            r"                area legend,",
+            r"                axis lines*=left,",
+            r"                ymin=0,",
+            *_symbolic_axis_options(labels),
+            r"            ]",
+        ]
+    )
+    if reference_y is not None and labels:
+        first = _tex_symbol(labels[0])
+        last = _tex_symbol(labels[-1])
+        ref_label = reference_label or f"{reference_y:g}"
+        lines.append(rf"                \draw[color=secondary, densely dotted, line width=1.2pt, shorten <=-12mm, shorten >=-12mm] (axis cs:{first},{_tex_num(reference_y)}) -- (axis cs:{last},{_tex_num(reference_y)});")
+        lines.append(r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}")
+        lines.append(rf"                \addlegendentry{{{_latex_escape(_tex_label(ref_label))}}}")
+    for col in series_cols:
+        if col not in data.columns:
             continue
-        tier = str(entry["tier"])
-        subsection = str(entry["subsection"])
-        subsection_dir = rq1_root / SUBSECTIONS[subsection]
-        figure_rel = figure_path.relative_to(subsection_dir / tier / "figures")
-        snippet_rel = figure_rel.with_suffix(".tex")
-        snippet_path = subsection_dir / tier / "latex_figures" / snippet_rel
-        _write_latex_figure_snippet(
-            path=snippet_path,
-            figure_path=figure_path,
-            rq1_root=rq1_root,
-            subsection=subsection,
-            caption=str(entry.get("brief_description", figure_path.stem.replace("_", " "))),
-            placement="htbp" if tier == "result_section" else "p",
+        color = _model_color_role(col)
+        rows = [(x, y) for x, y in zip(data[x_col], pd.to_numeric(data[col], errors="coerce"))]
+        lines.append(rf"                \addplot[ybar, fill={color}, draw={color}, area legend] coordinates {{{_coordinates(rows)}}};")
+        lines.append(rf"                \addlegendentry{{{_latex_escape(_tex_label(col))}}}")
+    lines.extend([r"            \end{axis}", *_tikz_footer(caption, label)])
+    return _write_lines(path, lines)
+
+
+def _write_gate_bucket_relative_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    caption: str,
+    label: str,
+    placement: str = "htbp",
+) -> Path | None:
+    required = {"target_group", "bucket", "model_label", "mean_pinball_loss"}
+    if data.empty or not required.issubset(data.columns):
+        return None
+    d = data.copy()
+    d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+    d = d.dropna(subset=["mean_pinball_loss"])
+    if d.empty:
+        return None
+    bucket_order = {
+        "full_h1_48": 0,
+        "short_h1_8": 1,
+        "medium_h9_16": 2,
+        "long_h17_48": 3,
+        "actionable_da_dplus1_11": 4,
+        "actionable_bcm_dplus1_08": 4,
+        "actionable_bem_short_h1_8": 4,
+    }
+    panels = ordered_unique(d["target_group"].dropna().unique(), group=True)
+    if not panels:
+        return None
+
+    lines = [
+        r"% Requires: \usepackage{pgfplots}",
+        r"% Requires: \usepackage{xcolor}",
+        r"% Requires: \usepgfplotslibrary{groupplots}",
+        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+        *_latex_color_defs(),
+        rf"\begin{{figure}}[{placement}]",
+        r"    \centering",
+        r"    \resizebox{\linewidth}{!}{%",
+        r"        \begin{tikzpicture}",
+        r"            \begin{groupplot}[",
+        rf"                group style={{group size=1 by {len(panels)}, vertical sep=1.0cm}},",
+        r"                ybar,",
+        r"                bar width=9pt,",
+        r"                width=0.96\textwidth,",
+        r"                height=4.3cm,",
+        r"                ylabel={Mean pinball loss relative to RLQR},",
+        r"                x tick label style={rotate=25, anchor=east},",
+        r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend cell align={left},",
+        r"                area legend,",
+        r"                axis lines*=left,",
+        r"                ymin=0,",
+        r"                grid=major,",
+        r"            ]",
+    ]
+    for panel_i, panel in enumerate(panels):
+        panel_df = d[d["target_group"].astype(str).eq(str(panel))].copy()
+        agg = (
+            panel_df.groupby(["bucket", "model_label"], as_index=False, sort=False)
+            .agg(mean_pinball_loss=("mean_pinball_loss", "mean"))
         )
-        entries.append(
-            {
-                "subsection": subsection,
-                "tier": tier,
-                "artifact_type": "latex_figure",
-                "path": str(snippet_path),
-                "metric_family": entry.get("metric_family", "figure"),
-                "thesis_use": "copy-paste figure code",
-                "brief_description": f"LaTeX includegraphics snippet for {figure_path.name}.",
-            }
+        pivot = agg.pivot_table(index="bucket", columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
+        if "RLQR" not in pivot.columns:
+            continue
+        denom = pd.to_numeric(pivot["RLQR"], errors="coerce")
+        pivot = pivot.loc[denom.notna() & denom.abs().gt(1e-12)].copy()
+        if pivot.empty:
+            continue
+        buckets = sorted(pivot["bucket"].dropna().astype(str).unique(), key=lambda b: bucket_order.get(b, 99))
+        ticks = ",".join(str(i) for i in range(len(buckets)))
+        ticklabels = ",".join(_latex_escape(_bucket_label(bucket)) for bucket in buckets)
+        xmax = max(len(buckets) - 0.35, 0.5)
+        lines.extend(
+            [
+                rf"                \nextgroupplot[title={{{_latex_escape(thesis_titlecase(str(panel)))}}}, xmin=-0.65, xmax={_tex_num(xmax)}, xtick={{{ticks}}}, xticklabels={{{ticklabels}}}]",
+                rf"                    \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{(-0.65,1) ({_tex_num(xmax)},1)}};",
+            ]
         )
+        if panel_i == 0:
+            lines.append(r"                    \addlegendentry{RLQR}")
+        for model, offset in [("XGB", -0.18), ("TFT", 0.18)]:
+            if model not in pivot.columns:
+                continue
+            color = _model_color_role(model)
+            coords: list[str] = []
+            for i, bucket in enumerate(buckets):
+                row = pivot[pivot["bucket"].astype(str).eq(bucket)]
+                if row.empty:
+                    continue
+                base = float(pd.to_numeric(row["RLQR"], errors="coerce").iloc[0])
+                value = float(pd.to_numeric(row[model], errors="coerce").iloc[0])
+                if np.isfinite(base) and abs(base) > 1e-12 and np.isfinite(value):
+                    coords.append(f"({_tex_num(i + offset)},{_tex_num(value / base)})")
+            if coords:
+                lines.append(rf"                    \addplot[ybar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+                if panel_i == 0:
+                    lines.append(rf"                    \addlegendentry{{{model}}}")
+    lines.extend(
+        [
+            r"            \end{groupplot}",
+            r"        \end{tikzpicture}}",
+            f"    \\caption{{{_latex_escape(thesis_titlecase(caption))}}}",
+            f"    \\label{{{label}}}",
+            r"\end{figure}",
+            "",
+        ]
+    )
+    return _write_lines(path, lines)
+
+
+def _model_color_role(model: Any) -> str:
+    key = str(model).strip().lower()
+    if key in {"tft"}:
+        return "tertiary"
+    if key in {"xgb", "xgboost"}:
+        return "primary"
+    if key in {"linear", "rlqr"}:
+        return "secondary"
+    return "neutraldark"
+
+
+def _write_model_bar_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    model_col: str,
+    caption: str,
+    label: str,
+    ylabel: str,
+    placement: str = "htbp",
+) -> Path | None:
+    if data.empty or x_col not in data.columns or y_col not in data.columns:
+        return None
+    d = data.copy()
+    d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+    d = d.dropna(subset=[y_col])
+    if d.empty:
+        return None
+    labels = d[x_col].astype(str).tolist()
+    lines = _tikz_header(caption, label, placement=placement)
+    lines.extend(
+        [
+            r"            \begin{axis}[",
+            r"                ybar,",
+            r"                bar width=22pt,",
+            r"                width=0.78\textwidth,",
+            r"                height=7cm,",
+            rf"                ylabel={{{_latex_escape(ylabel)}}},",
+            r"                nodes near coords,",
+            r"                every node near coord/.append style={font=\scriptsize, text=black, /pgf/number format/fixed, /pgf/number format/precision=2},",
+            r"                axis lines*=left,",
+            r"                ymin=0,",
+            *_symbolic_axis_options(labels),
+            r"            ]",
+        ]
+    )
+    for _, row in d.iterrows():
+        x = row[x_col]
+        y = row[y_col]
+        role = _model_color_role(row.get(model_col, x))
+        lines.append(rf"                \addplot[ybar, bar shift=0pt, fill={role}, draw={role}] coordinates {{({_tex_symbol(x)},{_tex_num(y)})}};")
+    lines.extend([r"            \end{axis}", *_tikz_footer(caption, label)])
+    return _write_lines(path, lines)
+
+
+def _write_computational_cost_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    caption: str,
+    label: str,
+    placement: str = "htbp",
+) -> Path | None:
+    required = {"model_label", "model", "final_training_scaled_hours_365d"}
+    if data.empty or not required.issubset(data.columns):
+        return None
+    d = data.copy()
+    d["final_training_scaled_hours_365d"] = pd.to_numeric(d["final_training_scaled_hours_365d"], errors="coerce")
+    d = d.dropna(subset=["final_training_scaled_hours_365d"])
+    if d.empty:
+        return None
+    d = sort_model_frame(d, model_col="model_label")
+    labels = d["model_label"].astype(str).tolist()
+    x_positions = list(range(len(labels)))
+    ymax = max(0.1, float(d["final_training_scaled_hours_365d"].max()) * 1.18)
+
+    lines = _tikz_header(caption, label, placement=placement)
+    lines.extend(
+        [
+            r"            \begin{axis}[",
+            r"                width=0.78\textwidth,",
+            r"                height=7cm,",
+            r"                ylabel={Time (h)},",
+            r"                axis lines*=left,",
+            r"                ymin=0,",
+            rf"                ymax={_tex_num(ymax)},",
+            r"                xmin=-0.6,",
+            rf"                xmax={_tex_num(len(labels) - 0.4)},",
+            "                xtick={" + ",".join(str(x) for x in x_positions) + "},",
+            "                xticklabels={" + ",".join(_latex_escape(_tex_label(x)) for x in labels) + "},",
+            r"            ]",
+        ]
+    )
+    half_width = 0.28
+    for x_pos, (_, row) in zip(x_positions, d.iterrows()):
+        role = _model_color_role(row.get("model", row.get("model_label", "")))
+        training = float(row["final_training_scaled_hours_365d"])
+        x_left = x_pos - half_width
+        x_right = x_pos + half_width
+        lines.append(rf"                \draw[fill={role}, draw={role}] (axis cs:{_tex_num(x_left)},0) rectangle (axis cs:{_tex_num(x_right)},{_tex_num(training)});")
+        lines.append(rf"                \node[font=\scriptsize, text=black, anchor=south] at (axis cs:{_tex_num(x_pos)},{_tex_num(training)}) {{{_tex_hours(training)}}};")
+    lines.extend(
+        [
+            r"            \end{axis}",
+            *_tikz_footer(caption, label),
+        ]
+    )
+    return _write_lines(path, lines)
+
+
+def _write_line_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    series_col: str,
+    caption: str,
+    label: str,
+    ylabel: str,
+    xlabel: str = "Lead hour",
+    placement: str = "htbp",
+    reference_y: float | None = None,
+    reference_label: str | None = None,
+    ideal_diagonal: bool = False,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
+    percent_axes: bool = False,
+    show_markers: bool = True,
+    fragment_only: bool = False,
+) -> Path | None:
+    if data.empty:
+        return None
+    colors = {"TFT": "tertiary", "XGB": "primary", "RLQR": "secondary", "linear": "secondary", "tft": "tertiary", "xgb": "primary"}
+    lines = [r"\begin{tikzpicture}"] if fragment_only else _tikz_header(caption, label, placement=placement)
+    lines.extend(
+        [
+            r"            \begin{axis}[",
+            r"                width=0.96\textwidth,",
+            r"                height=7cm,",
+            rf"                xlabel={{{_latex_escape(xlabel)}}},",
+            rf"                ylabel={{{_latex_escape(ylabel)}}},",
+            r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+            r"                legend cell align={left},",
+            r"                axis lines*=left,",
+            r"                grid=major,",
+            *([rf"                xmin={_tex_num(xlim[0])},", rf"                xmax={_tex_num(xlim[1])},"] if xlim is not None else []),
+            *([rf"                ymin={_tex_num(ylim[0])},", rf"                ymax={_tex_num(ylim[1])},"] if ylim is not None else []),
+            *((
+                r"                xtick={0.1,0.3,0.5,0.7,0.9},",
+                r"                xticklabels={10\%,30\%,50\%,70\%,90\%},",
+                r"                ytick={0.1,0.3,0.5,0.7,0.9},",
+                r"                yticklabels={10\%,30\%,50\%,70\%,90\%},",
+            ) if percent_axes else ()),
+            r"            ]",
+        ]
+    )
+    legends: list[str] = []
+    grouped = {str(series): group for series, group in data.groupby(series_col, sort=False)}
+    ordered_series = [s for s in ordered_model_labels(grouped.keys()) if s in grouped]
+    ordered_series.extend([s for s in grouped if s not in ordered_series])
+    if reference_y is not None:
+        x_values = pd.to_numeric(data[x_col], errors="coerce").dropna()
+        if not x_values.empty:
+            xmin = float(x_values.min())
+            xmax = float(x_values.max())
+            ref_label = reference_label or f"{reference_y:g}"
+            lines.append(rf"                \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{({_tex_num(xmin)},{_tex_num(reference_y)}) ({_tex_num(xmax)},{_tex_num(reference_y)})}};")
+            legends.append(_latex_escape(_tex_label(ref_label)))
+    for series in ordered_series:
+        group = grouped[series]
+        group = group.sort_values(x_col)
+        coords = " ".join(f"({_tex_num(x)},{_tex_num(y)})" for x, y in zip(group[x_col], pd.to_numeric(group[y_col], errors="coerce")))
+        color = colors.get(str(series), "neutraldark")
+        marker_style = rf"mark=*, mark options={{fill={color}, draw={color}}}" if show_markers else "mark=none"
+        lines.append(rf"                \addplot[color={color}, {marker_style}, line width=1pt] coordinates {{{coords}}};")
+        legends.append(_latex_escape(_tex_label(series)))
+    if ideal_diagonal:
+        xmin, xmax = xlim if xlim is not None else (0.0, 1.0)
+        ymin, ymax = ylim if ylim is not None else (0.0, 1.0)
+        lo = max(float(xmin), float(ymin))
+        hi = min(float(xmax), float(ymax))
+        lines.append(rf"                \addplot[color=neutraldark, dashed, mark=none, line width=1pt] coordinates {{({_tex_num(lo)},{_tex_num(lo)}) ({_tex_num(hi)},{_tex_num(hi)})}};")
+        legends.append("Ideal")
+    if legends:
+        lines.append("                \\legend{" + ",".join(legends) + "}")
+    if fragment_only:
+        lines.extend([r"            \end{axis}", r"\end{tikzpicture}", ""])
+    else:
+        lines.extend([r"            \end{axis}", *_tikz_footer(caption, label)])
+    return _write_lines(path, lines)
+
+
+def _write_line_panel_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    panel_col: str,
+    x_col: str,
+    y_col: str,
+    series_col: str,
+    caption: str,
+    label: str,
+    ylabel: str,
+    xlabel: str = "Lead hour",
+    placement: str = "htbp",
+    reference_y: float | None = None,
+    reference_label: str | None = None,
+    ideal_diagonal: bool = False,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
+    percent_ticks: tuple[float, ...] | None = None,
+    show_markers: bool = True,
+) -> Path | None:
+    if data.empty:
+        return None
+    panels = ordered_unique(data[panel_col].dropna().astype(str).drop_duplicates().tolist())
+    if not panels:
+        return None
+    colors = {"TFT": "tertiary", "XGB": "primary", "RLQR": "secondary", "linear": "secondary", "tft": "tertiary", "xgb": "primary"}
+    lines = [
+        r"% Requires: \usepackage{pgfplots}",
+        r"% Requires: \usepackage{xcolor}",
+        r"% Requires: \usepgfplotslibrary{groupplots}",
+        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+        *_latex_color_defs(),
+        rf"\begin{{figure}}[{placement}]",
+        r"    \centering",
+        r"    \resizebox{\linewidth}{!}{%",
+        r"        \begin{tikzpicture}",
+        r"            \begin{groupplot}[",
+        rf"                group style={{group size=1 by {len(panels)}, vertical sep=1.0cm}},",
+        r"                width=0.96\textwidth,",
+        r"                height=4.2cm,",
+        rf"                xlabel={{{_latex_escape(xlabel)}}},",
+        rf"                ylabel={{{_latex_escape(ylabel)}}},",
+        r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend cell align={left},",
+        r"                axis lines*=left,",
+        r"                grid=major,",
+        *([rf"                xmin={_tex_num(xlim[0])},", rf"                xmax={_tex_num(xlim[1])},"] if xlim is not None else []),
+        *([rf"                ymin={_tex_num(ylim[0])},", rf"                ymax={_tex_num(ylim[1])},"] if ylim is not None else []),
+        *(_percent_tick_options(percent_ticks) if percent_ticks is not None else []),
+        r"            ]",
+    ]
+    legend_entries: list[str] = []
+    for panel_i, panel in enumerate(panels):
+        panel_df = data[data[panel_col].astype(str).eq(panel)].copy()
+        lines.append(rf"                \nextgroupplot[title={{{_latex_escape(thesis_titlecase(_tex_label(panel)))}}}]")
+        grouped = {str(series): group for series, group in panel_df.groupby(series_col, sort=False)}
+        ordered_series = [s for s in ordered_model_labels(grouped.keys()) if s in grouped]
+        ordered_series.extend([s for s in grouped if s not in ordered_series])
+        if reference_y is not None:
+            x_values = pd.to_numeric(panel_df[x_col], errors="coerce").dropna()
+            if not x_values.empty:
+                xmin = float(x_values.min())
+                xmax = float(x_values.max())
+                lines.append(rf"                    \addplot[color=secondary, densely dotted, mark=none, line width=1.2pt] coordinates {{({_tex_num(xmin)},{_tex_num(reference_y)}) ({_tex_num(xmax)},{_tex_num(reference_y)})}};")
+                if panel_i == 0:
+                    legend_entries.append(_latex_escape(_tex_label(reference_label or f"{reference_y:g}")))
+        for series in ordered_series:
+            group = (
+                grouped[series]
+                .assign(**{x_col: pd.to_numeric(grouped[series][x_col], errors="coerce"), y_col: pd.to_numeric(grouped[series][y_col], errors="coerce")})
+                .dropna(subset=[x_col, y_col])
+                .sort_values(x_col)
+            )
+            if group.empty:
+                continue
+            # Defensive aggregation: one plotted point per panel/model/lead.
+            group = group.groupby(x_col, as_index=False)[y_col].mean()
+            coords = " ".join(f"({_tex_num(x)},{_tex_num(y)})" for x, y in zip(group[x_col], group[y_col]))
+            color = colors.get(series, "neutraldark")
+            marker_style = rf"mark=*, mark options={{fill={color}, draw={color}}}" if show_markers else "mark=none"
+            lines.append(rf"                    \addplot[color={color}, {marker_style}, line width=1pt] coordinates {{{coords}}};")
+            if panel_i == 0:
+                legend_entries.append(_latex_escape(_tex_label(series)))
+        if ideal_diagonal:
+            xmin, xmax = xlim if xlim is not None else (0.0, 1.0)
+            ymin, ymax = ylim if ylim is not None else (0.0, 1.0)
+            lo = max(float(xmin), float(ymin))
+            hi = min(float(xmax), float(ymax))
+            lines.append(rf"                    \addplot[color=neutraldark, dashed, mark=none, line width=1pt] coordinates {{({_tex_num(lo)},{_tex_num(lo)}) ({_tex_num(hi)},{_tex_num(hi)})}};")
+            if panel_i == 0:
+                legend_entries.append("Ideal")
+    if legend_entries:
+        lines.append("                \\legend{" + ",".join(legend_entries) + "}")
+    lines.extend(
+        [
+            r"            \end{groupplot}",
+            r"        \end{tikzpicture}}",
+            f"    \\caption{{{_latex_escape(thesis_titlecase(caption))}}}",
+            f"    \\label{{{label}}}",
+            r"\end{figure}",
+            "",
+        ]
+    )
+    return _write_lines(path, lines)
+
+
+def _write_heatmap_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    value_col: str,
+    caption: str,
+    label: str,
+    placement: str = "htbp",
+) -> Path | None:
+    if data.empty:
+        return None
+    xs = data[x_col].astype(str).drop_duplicates().tolist()
+    ys = data[y_col].astype(str).drop_duplicates().tolist()
+    lines = _tikz_header(caption, label, placement=placement)
+    lines.extend(
+        [
+            r"            \begin{axis}[",
+            r"                width=0.98\textwidth,",
+            r"                height=8cm,",
+            r"                view={0}{90},",
+            r"                colorbar,",
+            r"                colormap/Blues,",
+            r"                x tick label style={rotate=35, anchor=east},",
+            *_symbolic_axis_options(xs),
+            "                symbolic y coords={" + ",".join(_tex_symbol(y) for y in ys) + "},",
+            "                ytick={" + ",".join(_tex_symbol(y) for y in ys) + "},",
+            "                yticklabels={" + ",".join(_latex_escape(y) for y in ys) + "},",
+            r"            ]",
+            r"                \addplot[matrix plot*, point meta=explicit] coordinates {",
+        ]
+    )
+    for _, row in data.iterrows():
+        lines.append(f"                    ({_tex_symbol(row[x_col])},{_tex_symbol(row[y_col])}) [{_tex_num(row[value_col])}]")
+    lines.extend([r"                };", r"            \end{axis}", *_tikz_footer(caption, label)])
+    return _write_lines(path, lines)
+
+
+def _add_tikz_entry(entries: list[dict[str, Any]], *, subsection: str, tier: str, path: Path, metric_family: str, description: str) -> None:
+    entries.append(
+        {
+            "subsection": subsection,
+            "tier": tier,
+            "artifact_type": "latex_figure",
+            "path": str(path),
+            "metric_family": metric_family,
+            "thesis_use": "native TikZ/pgfplots figure code",
+            "brief_description": description,
+        }
+    )
+
+
+def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, split: str) -> None:
+    # 4.1.1 relative full-sample pinball bar chart.
+    sec = "4.1.1"
+    root = rq1_root / SUBSECTIONS[sec]
+    primary = root / "backup" / "csv" / f"forecast_metrics_full_primary_{split}.csv"
+    if primary.exists():
+        df = pd.read_csv(primary)
+        df["target_label"] = df["target"].map(lambda x: _tex_label(str(x).replace("pred_", "")))
+        df = sort_target_frame(df, target_col="target")
+        for col in ["XGB", "TFT"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce") / pd.to_numeric(df["RLQR"], errors="coerce")
+        out = root / "result_section" / "latex_figures" / f"forecast_metrics_full_relative_pinball_{split}.tex"
+        path = _write_grouped_bar_tex(
+            out,
+            data=df,
+            x_col="target_label",
+            series_cols=["XGB", "TFT"],
+            caption="Relative mean pinball loss by target (RLQR = 1; lower is better).",
+            label="fig:rq1-4-1-1-forecast-metrics-full-relative-pinball",
+            ylabel="Mean pinball loss relative to RLQR",
+            reference_y=1.0,
+            reference_label="RLQR",
+        )
+        if path:
+            _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="mean_pinball_loss", description="Native pgfplots relative full-sample pinball bar chart.")
+    detailed = root / "backup" / "csv" / f"forecast_metrics_full_detailed_{split}.csv"
+    if detailed.exists():
+        df = pd.read_csv(detailed)
+        df = df.loc[df["metric"].eq("mae_p50")].copy()
+        df["target_label"] = df["target"].map(lambda x: _tex_label(str(x).replace("pred_", "")))
+        df = sort_target_frame(df, target_col="target")
+        denom = pd.to_numeric(df["RLQR"], errors="coerce")
+        df = df.loc[denom.notna() & denom.abs().gt(1e-12)].copy()
+        denom = pd.to_numeric(df["RLQR"], errors="coerce")
+        for col in ["XGB", "TFT"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce") / denom
+        out = root / "appendix" / "latex_figures" / f"forecast_metrics_full_relative_mae_p50_{split}.tex"
+        path = _write_grouped_bar_tex(
+            out,
+            data=df,
+            x_col="target_label",
+            series_cols=["XGB", "TFT"],
+            caption="Relative MAE p50 by target (RLQR = 1; lower is better).",
+            label="fig:rq1-4-1-1-forecast-metrics-full-relative-mae-p50",
+            ylabel="MAE p50 relative to RLQR",
+            placement="p",
+            reference_y=1.0,
+            reference_label="RLQR",
+        )
+        if path:
+            _add_tikz_entry(entries, subsection=sec, tier="appendix", path=path, metric_family="mae_p50", description="Native pgfplots relative full-sample p50 MAE bar chart.")
+    cost_csv = root / "backup" / "csv" / "computational_cost_365d.csv"
+    if cost_csv.exists():
+        cost = pd.read_csv(cost_csv)
+        out = root / "result_section" / "latex_figures" / "computational_cost_365d.tex"
+        path = _write_computational_cost_tex(
+            out,
+            data=cost,
+            caption="Computational Cost of Each Model Scaled for 365 Days of Training Data",
+            label="fig:rq1-4-1-1-computational-cost-365d",
+        )
+        if path:
+            _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="computational_cost", description="Native pgfplots computational-cost bar chart.")
+
+    # 4.1.2 calibration and uncertainty.
+    sec = "4.1.2"
+    root = rq1_root / SUBSECTIONS[sec]
+    cal = root / "backup" / "csv" / f"calibration_quantile_coverage_{split}.csv"
+    if cal.exists():
+        for stale in (root / "result_section" / "latex_figures").glob("calibration_reliability_*.tex"):
+            stale.unlink()
+        df = pd.read_csv(cal)
+        df = (
+            df.groupby(["target", "target_label", "target_group", "model", "model_label", "quantile"], as_index=False)
+            .agg(empirical_coverage=("empirical_coverage", "mean"), n_obs=("n_obs", "sum"))
+        )
+        df = sort_target_frame(df, target_col="target", extra_cols=["model_label", "quantile"])
+        for target_label in ordered_unique(df["target_label"].dropna().unique()):
+            group = df[df["target_label"].eq(target_label)].copy()
+            target_slug = _tex_symbol(str(group["target"].iloc[0]).replace("pred_", ""))
+            out = root / "result_section" / "latex_figures" / f"calibration_reliability_{target_slug}.tex"
+            path = _write_line_tex(
+                out,
+                data=group,
+                x_col="quantile",
+                y_col="empirical_coverage",
+                series_col="model_label",
+                caption=f"Quantile reliability for {target_label}.",
+                label=f"fig:rq1-4-1-2-calibration-reliability-{target_slug.lower()}",
+                ylabel="Empirical coverage",
+                xlabel="Nominal quantile",
+                ideal_diagonal=True,
+                xlim=(0.0, 1.0),
+                ylim=(0.0, 1.0),
+                percent_axes=True,
+                fragment_only=True,
+            )
+            if path:
+                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="calibration", description=f"Native pgfplots quantile reliability for {target_label}.")
+    interval = root / "backup" / "csv" / f"calibration_interval_coverage_width_{split}.csv"
+    if interval.exists():
+        df = pd.read_csv(interval)
+        required_cols = {"target_group", "model", "model_label", "nominal_interval_coverage", "interval_coverage", "n_obs"}
+        if required_cols.issubset(df.columns):
+            df = (
+                df.groupby(["target_group", "model", "model_label", "nominal_interval_coverage"], as_index=False)
+                .agg(interval_coverage=("interval_coverage", "mean"), n_obs=("n_obs", "sum"))
+            )
+            df["_target_group_order"] = df["target_group"].map(lambda x: target_sort_key(x)[0])
+            df = df.sort_values(["_target_group_order", "model_label", "nominal_interval_coverage"]).drop(columns="_target_group_order")
+            out = root / "result_section" / "latex_figures" / "calibration_interval_coverage_by_target_group.tex"
+            path = _write_line_panel_tex(
+                out,
+                data=df,
+                panel_col="target_group",
+                x_col="nominal_interval_coverage",
+                y_col="interval_coverage",
+                series_col="model_label",
+                caption="Interval coverage vs nominal interval coverage by target group.",
+                label="fig:rq1-4-1-2-calibration-interval-coverage",
+                ylabel="Empirical interval coverage",
+                xlabel="Nominal interval coverage",
+                ideal_diagonal=True,
+                xlim=(0.0, 1.0),
+                ylim=(0.0, 1.0),
+                percent_ticks=(0.40, 0.80, 0.90, 0.98),
+            )
+            if path:
+                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="interval_coverage", description="Native pgfplots interval coverage reliability by target group.")
+    # 4.1.3 per-lead line charts.
+    sec = "4.1.3"
+    root = rq1_root / SUBSECTIONS[sec]
+    per_lead = root / "backup" / "csv" / f"per_lead_metrics_{split}.csv"
+    if per_lead.exists():
+        df = pd.read_csv(per_lead)
+        for target_slug in sorted(df["target_slug"].dropna().unique(), key=target_sort_key):
+            group = sort_target_frame(df[df["target_slug"].eq(target_slug)].copy(), target_col="target_label")
+            for metric, stem, tier in [
+                ("mean_pinball_loss", "per_lead_pinball", "result_section"),
+                ("mae_p50", "per_lead_mae_p50", "appendix"),
+                ("rmse_p50", "per_lead_rmse_p50", "appendix"),
+            ]:
+                out = root / tier / "latex_figures" / f"{stem}_{target_slug}.tex"
+                target_label = _tex_label(group["target_label"].iloc[0])
+                if group["target_label"].nunique(dropna=True) > 1:
+                    path = _write_line_panel_tex(
+                        out,
+                        data=group,
+                        panel_col="target_label",
+                        x_col="lead_time_h",
+                        y_col=metric,
+                        series_col="model_label",
+                        caption=f"{_tex_label(metric)} by lead hour for {_tex_label(group['target_group'].iloc[0])}.",
+                        label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}",
+                        ylabel=_tex_label(metric),
+                        placement="htbp" if tier == "result_section" else "p",
+                        show_markers=metric != "mean_pinball_loss",
+                    )
+                else:
+                    path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss")
+                if path:
+                    _add_tikz_entry(entries, subsection=sec, tier=tier, path=path, metric_family=metric, description=f"Native pgfplots {metric} per-lead line chart for {target_slug}.")
+            pivot = group.pivot_table(index=["target_label", "lead_time_h"], columns="model_label", values="mean_pinball_loss", aggfunc="first").reset_index()
+            if "RLQR" in pivot.columns:
+                rel_rows = []
+                for _, row in pivot.iterrows():
+                    for model in ["XGB", "TFT"]:
+                        if model in pivot.columns and pd.notna(row.get(model)) and pd.notna(row.get("RLQR")) and abs(float(row["RLQR"])) > 1e-12:
+                            rel_rows.append({"target_label": row["target_label"], "lead_time_h": row["lead_time_h"], "model_label": model, "relative": float(row[model]) / float(row["RLQR"])})
+                rel = pd.DataFrame(rel_rows)
+                out = root / "result_section" / "latex_figures" / f"per_lead_relative_pinball_{target_slug}.tex"
+                target_label = _tex_label(group["target_label"].iloc[0])
+                if group["target_label"].nunique(dropna=True) > 1:
+                    path = _write_line_panel_tex(
+                        out,
+                        data=rel,
+                        panel_col="target_label",
+                        x_col="lead_time_h",
+                        y_col="relative",
+                        series_col="model_label",
+                        caption=f"Relative mean pinball loss by lead hour for {_tex_label(group['target_group'].iloc[0])} (RLQR = 1).",
+                        label=f"fig:rq1-4-1-3-per-lead-relative-pinball-{target_slug.replace('_','-')}",
+                        ylabel="Mean pinball loss relative to RLQR",
+                        reference_y=1.0,
+                        reference_label="RLQR",
+                    )
+                else:
+                    path = _write_line_tex(out, data=rel, x_col="lead_time_h", y_col="relative", series_col="model_label", caption=f"Relative mean pinball loss by lead hour for {target_label} (RLQR = 1).", label=f"fig:rq1-4-1-3-per-lead-relative-pinball-{target_slug.replace('_','-')}", ylabel="Mean pinball loss relative to RLQR", reference_y=1.0, reference_label="RLQR")
+                if path:
+                    _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description=f"Native pgfplots relative per-lead pinball line chart for {target_slug}.")
+
+    # 4.1.4 gate-specific bars.
+    sec = "4.1.4"
+    root = rq1_root / SUBSECTIONS[sec]
+    gate = root / "backup" / "csv" / f"gate_bucket_metrics_{split}.csv"
+    if gate.exists():
+        df = pd.read_csv(gate)
+        required_gate_cols = {"bucket", "bucket_family", "target", "target_group", "model_label", "mean_pinball_loss"}
+        if required_gate_cols.issubset(df.columns):
+            d = df.copy()
+            d = sort_target_frame(d, target_col="target", extra_cols=["bucket"])
+            out = root / "result_section" / "latex_figures" / "gate_bucket_pinball_by_target_group.tex"
+            path = _write_gate_bucket_relative_tex(
+                out,
+                data=d,
+                caption="Gate-Specific Relative Mean Pinball Loss (RLQR = 1).",
+                label="fig:rq1-4-1-4-gate-bucket-pinball",
+            )
+            if path:
+                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description="Native pgfplots gate-specific relative pinball bar chart.")
+            if "coverage_p10_p90" in d.columns:
+                d["x"] = d["bucket"].map(_bucket_label) + " / " + d["target_group"].astype(str)
+                x_order = d["x"].drop_duplicates().tolist()
+                pivot = d.pivot_table(index="x", columns="model_label", values="coverage_p10_p90", aggfunc="mean").reset_index()
+                pivot["x"] = pd.Categorical(pivot["x"], categories=x_order, ordered=True)
+                pivot = pivot.sort_values("x")
+                out = root / "appendix" / "latex_figures" / "gate_bucket_coverage_p10_p90_by_target_group.tex"
+                path = _write_grouped_bar_tex(out, data=pivot, x_col="x", series_cols=[c for c in MODEL_LABELS if c in pivot.columns], caption="Gate-specific p10-p90 interval coverage.", label="fig:rq1-4-1-4-gate-bucket-coverage", ylabel="Coverage", placement="p")
+                if path:
+                    _add_tikz_entry(entries, subsection=sec, tier="appendix", path=path, metric_family="interval_coverage", description="Native pgfplots gate-specific coverage bar chart.")
+
+    # 4.1.5 tail/spike bars from regime metrics.
+    sec = "4.1.5"
+    root = rq1_root / SUBSECTIONS[sec]
+    tail = root / "backup" / "csv" / f"tail_spike_metrics_{split}.csv"
+    if tail.exists():
+        df = pd.read_csv(tail)
+        d = df.copy()
+        d = sort_target_frame(d, target_col="target", extra_cols=["regime"])
+        d["x"] = d["regime"].astype(str) + " / " + d["target_group"].astype(str)
+        x_order = d["x"].drop_duplicates().tolist()
+        pivot = d.pivot_table(index="x", columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
+        pivot["x"] = pd.Categorical(pivot["x"], categories=x_order, ordered=True)
+        pivot = pivot.sort_values("x")
+        if "RLQR" in pivot.columns:
+            for col in ["XGB", "TFT"]:
+                if col in pivot.columns:
+                    pivot[col] = pd.to_numeric(pivot[col], errors="coerce") / pd.to_numeric(pivot["RLQR"], errors="coerce")
+            out = root / "result_section" / "latex_figures" / "tail_spike_relative_pinball_by_regime.tex"
+            path = _write_grouped_bar_tex(out, data=pivot, x_col="x", series_cols=[c for c in ["XGB", "TFT"] if c in pivot.columns], caption="Tail/spike mean pinball loss relative to RLQR by regime.", label="fig:rq1-4-1-5-tail-spike-relative-pinball", ylabel="Mean pinball loss relative to RLQR", reference_y=1.0, reference_label="RLQR")
+            if path:
+                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description="Native pgfplots tail/spike relative pinball bar chart.")
+        pivot = d.pivot_table(index="x", columns="model_label", values="coverage_p10_p90", aggfunc="mean").reset_index()
+        pivot["x"] = pd.Categorical(pivot["x"], categories=x_order, ordered=True)
+        pivot = pivot.sort_values("x")
+        out = root / "appendix" / "latex_figures" / "tail_spike_coverage_by_regime.tex"
+        path = _write_grouped_bar_tex(out, data=pivot, x_col="x", series_cols=[c for c in MODEL_LABELS if c in pivot.columns], caption="Tail/spike p10-p90 interval coverage by regime.", label="fig:rq1-4-1-5-tail-spike-coverage", ylabel="Coverage", placement="p")
+        if path:
+            _add_tikz_entry(entries, subsection=sec, tier="appendix", path=path, metric_family="interval_coverage", description="Native pgfplots tail/spike coverage bar chart.")
+
+
+def _prune_latex_figure_imports(rq1_root: Path) -> None:
+    for tex in rq1_root.rglob("*.tex"):
+        if "latex_figures" not in tex.parts:
+            continue
+        if tex.read_text(encoding="utf-8", errors="ignore").find(r"\includegraphics") >= 0:
+            tex.unlink()
+
+
+def _add_latex_figure_snippets(entries: list[dict[str, Any]], *, rq1_root: Path, split: str) -> None:
+    """Generate native LaTeX figures from CSV data.
+
+    Deliberately does not emit includegraphics wrappers. If the source figure is
+    image-only and the plotted data are not available, no LaTeX figure is
+    generated.
+    """
+    _prune_latex_figure_imports(rq1_root)
+    _generate_latex_figures(entries, rq1_root=rq1_root, split=split)
 
 
 def organize(*, final_root: Path, rq1_root: Path, split: str, prune_legacy: bool = False) -> dict[str, Any]:
+    if not final_root.exists():
+        raise FileNotFoundError(f"Missing RQ1 raw output source directory: {final_root}")
+    if not any(final_root.rglob("*")):
+        raise FileNotFoundError(f"RQ1 raw output source directory is empty: {final_root}")
     _ensure_structure(rq1_root)
     entries: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -605,7 +1556,7 @@ def organize(*, final_root: Path, rq1_root: Path, split: str, prune_legacy: bool
             missing.append(miss)
     _add_derived_tables(entries, missing, rq1_root=rq1_root, split=split)
     _add_example_week_outputs(entries, missing, final_root=final_root, rq1_root=rq1_root)
-    _add_latex_figure_snippets(entries, rq1_root=rq1_root)
+    _add_latex_figure_snippets(entries, rq1_root=rq1_root, split=split)
     removed = prune_legacy_outputs(rq1_root=rq1_root, final_root=final_root) if prune_legacy else []
     manifest = {
         "description": "Organized RQ1 thesis benchmark output manifest.",
@@ -627,8 +1578,8 @@ def organize(*, final_root: Path, rq1_root: Path, split: str, prune_legacy: bool
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Organize final RQ1 outputs into thesis-facing tiers.")
-    p.add_argument("--final-root", default="artifacts/final_benchmark")
-    p.add_argument("--rq1-root", default="artifacts/final_benchmark")
+    p.add_argument("--final-root", default="artifacts/rq1_ml_model_benchmark")
+    p.add_argument("--rq1-root", default="artifacts/rq1_ml_model_benchmark")
     p.add_argument("--split", default="test")
     p.add_argument("--prune-legacy", action="store_true", help="Remove known generated legacy/unstructured copies after organizing.")
     return p.parse_args()

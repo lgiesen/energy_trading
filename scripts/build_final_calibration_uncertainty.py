@@ -28,7 +28,8 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from energy_trading.visualization.style import THESIS_PALETTE, apply_geo_style, get_model_color
+from energy_trading.visualization.style import THESIS_PALETTE, apply_geo_style, get_model_color, thesis_titlecase
+from energy_trading.evaluation.rq1_target_order import MODEL_LABELS, model_sort_key, ordered_unique, sort_target_frame, target_sort_key
 
 
 MODEL_KEYS = {
@@ -42,26 +43,28 @@ MODEL_KEYS = {
 TARGET_GROUPS = {
     "pred_da_price": ("DA price", "DA price"),
     "target_da_price": ("DA price", "DA price"),
-    "pred_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price positive"),
-    "target_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price positive"),
-    "pred_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price negative"),
-    "target_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price negative"),
-    "pred_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "target_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "target_afrr_activation_price_vwap_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "pred_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "target_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "target_afrr_activation_price_vwap_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "pred_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate positive"),
-    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate positive"),
-    "pred_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate negative"),
-    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate negative"),
+    "pred_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price +"),
+    "target_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price +"),
+    "pred_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price -"),
+    "target_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price -"),
+    "pred_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price +"),
+    "target_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price +"),
+    "target_afrr_activation_price_vwap_pos": ("aFRR activation price", "aFRR activation price +"),
+    "pred_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price -"),
+    "target_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price -"),
+    "target_afrr_activation_price_vwap_neg": ("aFRR activation price", "aFRR activation price -"),
+    "pred_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
+    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
+    "pred_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
+    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
 }
 
 REQUIRED_INTERVAL = (0.10, 0.90)
 INTERVAL_PAIRS = [(0.30, 0.70), (0.10, 0.90), (0.05, 0.95), (0.01, 0.99)]
 OPTIONAL_PAIRS = [(0.05, 0.95), (0.01, 0.99)]
 QCOL_RE = re.compile(r"^p(\d{1,2})$", re.IGNORECASE)
+DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
+DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,10 @@ def _target_info(target: str) -> tuple[str, str]:
 
 def _latex_escape(value: Any) -> str:
     s = str(value)
+    minus_token = "@@RQ1MINUS@@"
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} -", f"{label} {minus_token}")
+        s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -157,7 +164,13 @@ def _latex_escape(value: Any) -> str:
         "^": r"\textasciicircum{}",
     }.items():
         s = s.replace(old, new)
-    return s
+    return s.replace(minus_token, "$-$")
+
+
+def _stacked_header(label: str) -> str:
+    words = [word for word in str(label).split() if word]
+    body = r"\\".join(_latex_escape(word) for word in words)
+    return r"\textbf{\shortstack{" + body + r"}}"
 
 
 def _read_joined(path: Path) -> pd.DataFrame:
@@ -174,12 +187,29 @@ def _read_joined(path: Path) -> pd.DataFrame:
     elif "forecast_time_utc" in df.columns:
         df["snapshot_time_utc"] = pd.to_datetime(df["forecast_time_utc"], utc=True, errors="coerce")
     else:
-        # Joined benchmark artifacts historically use target_time + lead as key.
-        df["snapshot_time_utc"] = pd.NaT
+        df["snapshot_time_utc"] = df["target_time_utc"] - pd.to_timedelta(df["lead_time_h"], unit="h")
     df["lead_time_h"] = pd.to_numeric(df["lead_time_h"], errors="coerce")
     df["y_true"] = pd.to_numeric(df["y_true"], errors="coerce")
     df["p50"] = pd.to_numeric(df["p50"], errors="coerce")
     return df
+
+
+def _parse_utc_bound(raw: str | None) -> pd.Timestamp | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    return pd.to_datetime(raw, utc=True)
+
+
+def _apply_forecast_origin_window(df: pd.DataFrame, *, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    if start is None and end is None:
+        return df
+    origin = pd.to_datetime(df["snapshot_time_utc"], utc=True, errors="coerce")
+    mask = origin.notna()
+    if start is not None:
+        mask &= origin.ge(start)
+    if end is not None:
+        mask &= origin.le(end)
+    return df.loc[mask].copy()
 
 
 def _key_cols(loaded: dict[str, pd.DataFrame]) -> list[str]:
@@ -339,6 +369,8 @@ def build_calibration_outputs(
     benchmark_dir: Path,
     models: list[ModelSpec],
     splits: list[str],
+    eval_origin_start: pd.Timestamp | None,
+    eval_origin_end: pd.Timestamp | None,
 ) -> dict[str, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -347,7 +379,7 @@ def build_calibration_outputs(
         if parsed is not None:
             files[parsed] = path
 
-    targets = sorted({target for _, split, target in files if split in set(splits)})
+    targets = sorted({target for _, split, target in files if split in set(splits)}, key=target_sort_key)
     if not targets:
         raise FileNotFoundError(f"No joined prediction parquet files for splits={splits} in {joined_dir}.")
 
@@ -365,7 +397,11 @@ def build_calibration_outputs(
                 path = files.get((model.key, split, target))
                 if path is None:
                     raise FileNotFoundError(f"Missing joined predictions for model={model.key}, split={split}, target={target}.")
-                df = _read_joined(path)
+                df = _apply_forecast_origin_window(
+                    _read_joined(path),
+                    start=eval_origin_start,
+                    end=eval_origin_end,
+                )
                 loaded[model.key] = df
                 qmaps[model.key] = _quantile_cols(df)
                 if 0.50 not in qmaps[model.key]:
@@ -411,6 +447,8 @@ def build_calibration_outputs(
                         "quantiles_available": ",".join(_qcol(q) for q in sorted(qmaps[model.key])),
                         "quantiles_used": ",".join(_qcol(q) for q in sorted(common_qs)),
                         "row_intersection_key": ",".join(["split", "target", *key_cols]),
+                        "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
+                        "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
                     }
                 )
                 eval_df = _filter_common(valid[model.key], common_keys, key_cols)
@@ -503,7 +541,7 @@ def build_summary(coverage: pd.DataFrame, interval: pd.DataFrame, crossing: pd.D
             on=["model", "split", "target"],
             how="left",
         )
-    return cal.sort_values(["split", "target_group", "target", "model_label"]).reset_index(drop=True)
+    return sort_target_frame(cal, target_col="target", extra_cols=["split", "model_label"])
 
 
 def _format_num(v: Any, digits: int = 4) -> str:
@@ -549,39 +587,38 @@ def build_main_summary_table(summary: pd.DataFrame, *, split: str) -> pd.DataFra
             {
                 "target": target,
                 "target_label": str(best["target_label"]),
-                "TFT_MACE": vals.get("TFT", np.nan),
-                "XGB_MACE": vals.get("XGB", np.nan),
                 "RLQR_MACE": vals.get("RLQR", np.nan),
+                "XGB_MACE": vals.get("XGB", np.nan),
+                "TFT_MACE": vals.get("TFT", np.nan),
                 "best_calibrated": str(best["model_label"]),
                 "p10_p90_coverage": float(best.get("p10_p90_interval_coverage", np.nan)),
                 "main_issue": _main_issue_for_target(part),
             }
         )
-    return pd.DataFrame(rows).sort_values("target_label").reset_index(drop=True)
+    return sort_target_frame(pd.DataFrame(rows), target_col="target_label")
 
 
 def write_latex_summary(summary: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
     d = build_main_summary_table(summary, split=split)
     if d.empty:
         return None
-    headers = ["Target", "TFT MACE", "XGB MACE", "RLQR MACE", "Best calibrated", "p10-p90 coverage", "Main issue"]
+    headers = ["Target", "RLQR MACE", "XGB MACE", "TFT MACE", "Best calibrated", "p10-p90 coverage"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
-        r"    \begin{tabular}{@{}lrrrlrl@{}}",
+        r"    \begin{tabular}{@{}lrrrlr@{}}",
         r"        \toprule",
-        "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
+        "        " + " & ".join(_stacked_header(h) for h in headers) + r" \\",
         r"        \midrule",
     ]
     for _, row in d.iterrows():
         vals = [
             _latex_escape(row["target_label"]),
-            _format_num(row.get("TFT_MACE")),
-            _format_num(row.get("XGB_MACE")),
             _format_num(row.get("RLQR_MACE")),
+            _format_num(row.get("XGB_MACE")),
+            _format_num(row.get("TFT_MACE")),
             _latex_escape(row["best_calibrated"]),
             _format_num(row.get("p10_p90_coverage")),
-            _latex_escape(row["main_issue"]),
         ]
         lines.append("        " + " & ".join(vals) + r" \\")
     lines.extend(
@@ -604,8 +641,9 @@ def write_latex_quantile_coverage_appendix(coverage: pd.DataFrame, *, out_dir: P
     d = coverage.loc[coverage["split"] == split].copy()
     if d.empty:
         return None
+    d = sort_target_frame(d, target_col="target", extra_cols=["quantile", "model_label"])
     rows: list[dict[str, Any]] = []
-    for (target, q), part in d.groupby(["target", "quantile"], sort=True):
+    for (target, q), part in d.groupby(["target", "quantile"], sort=False):
         vals = {
             str(r["model_label"]): float(r["empirical_coverage"])
             for _, r in part.iterrows()
@@ -622,16 +660,16 @@ def write_latex_quantile_coverage_appendix(coverage: pd.DataFrame, *, out_dir: P
             {
                 "target_label": label,
                 "quantile": float(q),
-                "TFT": vals.get("TFT", np.nan),
-                "XGB": vals.get("XGB", np.nan),
                 "RLQR": vals.get("RLQR", np.nan),
+                "XGB": vals.get("XGB", np.nan),
+                "TFT": vals.get("TFT", np.nan),
                 "ideal": float(q),
                 "best_error": float(abs_errs[best]) if best else np.nan,
                 "best_model": best,
             }
         )
-    table = pd.DataFrame(rows).sort_values(["target_label", "quantile"])
-    headers = ["Target", "Quantile", "TFT empirical coverage", "XGB empirical coverage", "RLQR empirical coverage", "Ideal coverage", "Best model abs. error"]
+    table = sort_target_frame(pd.DataFrame(rows), target_col="target_label", extra_cols=["quantile"])
+    headers = ["Target", "Quantile", "RLQR empirical coverage", "XGB empirical coverage", "TFT empirical coverage", "Ideal coverage", "Best model abs. error"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
@@ -645,9 +683,9 @@ def write_latex_quantile_coverage_appendix(coverage: pd.DataFrame, *, out_dir: P
         vals = [
             _latex_escape(row["target_label"]),
             _format_num(row["quantile"], 2),
-            _format_num(row["TFT"]),
-            _format_num(row["XGB"]),
             _format_num(row["RLQR"]),
+            _format_num(row["XGB"]),
+            _format_num(row["TFT"]),
             _format_num(row["ideal"], 2),
             _latex_escape(best_error),
         ]
@@ -672,7 +710,7 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
     d = interval.loc[interval["split"] == split].copy()
     if d.empty:
         return None
-    d = d.sort_values(["target_label", "interval", "model_label"])
+    d = sort_target_frame(d, target_col="target_label", extra_cols=["interval", "model_label"])
     headers = ["Target", "Interval", "Model", "Nominal coverage", "Empirical coverage", "Coverage error", "Mean width", "Median width", "Interval score"]
     lines = [
         r"\begin{table}[ht]",
@@ -715,7 +753,7 @@ def write_latex_crossing_appendix(crossing: pd.DataFrame, *, out_dir: Path, spli
     d = crossing.loc[crossing["split"] == split].copy()
     if d.empty:
         return None
-    d = d.sort_values(["target_label", "model_label"])
+    d = sort_target_frame(d, target_col="target_label", extra_cols=["model_label"])
     headers = ["Target", "Model", "Crossing rate", "Mean crossing magnitude", "Max crossing magnitude"]
     lines = [
         r"\begin{table}[ht]",
@@ -762,21 +800,23 @@ def _group_panel_axes(groups: list[str]):
 
 def plot_reliability_by_target_group(coverage: pd.DataFrame, fig_dir: Path) -> Path | None:
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
 
     if coverage.empty:
         return None
     apply_geo_style()
     d = (
-        coverage.groupby(["target_group", "model", "model_label", "quantile"], as_index=False)
+        coverage.groupby(["target", "target_label", "target_group", "model", "model_label", "quantile"], as_index=False)
         .agg(empirical_coverage=("empirical_coverage", "mean"), n_obs=("n_obs", "sum"))
-        .sort_values(["target_group", "model_label", "quantile"])
     )
-    groups = sorted(d["target_group"].dropna().unique())
-    fig, axes = _group_panel_axes(groups)
-    fig.suptitle("Empirical coverage vs nominal quantile", y=1.01)
-    for ax, group in zip(axes, groups):
-        g = d[d["target_group"] == group]
-        for _, mg in g.groupby("model"):
+    d = sort_target_frame(d, target_col="target", extra_cols=["model_label", "quantile"])
+    targets = ordered_unique(d["target_label"].dropna().unique())
+    fig, axes = _group_panel_axes(targets)
+    fig.suptitle(thesis_titlecase("Empirical coverage vs nominal quantile"), y=1.01)
+    for ax, target_label in zip(axes, targets):
+        g = d[d["target_label"] == target_label]
+        for model in sorted(g["model"].dropna().unique(), key=model_sort_key):
+            mg = g[g["model"].eq(model)]
             mg = mg.sort_values("quantile")
             ax.plot(
                 mg["quantile"],
@@ -786,15 +826,23 @@ def plot_reliability_by_target_group(coverage: pd.DataFrame, fig_dir: Path) -> P
                 color=get_model_color(str(mg["model"].iloc[0])),
             )
         ax.plot([0, 1], [0, 1], linestyle="--", color=THESIS_PALETTE["neutral_dark"], label="Ideal")
-        ax.set_title(f"{group} (n={int(g['n_obs'].sum())})")
+        n_obs = pd.to_numeric(g["n_obs"], errors="coerce").dropna()
+        n_label = int(n_obs.min()) if not n_obs.empty else 0
+        ax.set_title(thesis_titlecase(f"{target_label} (n={n_label})"))
         ax.set_xlabel("Nominal quantile")
         ax.set_ylabel("Empirical coverage")
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
+        ticks = np.array([0.10, 0.30, 0.50, 0.70, 0.90], dtype=float)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        pct = FuncFormatter(lambda value, _: f"{value * 100:.0f}%")
+        ax.xaxis.set_major_formatter(pct)
+        ax.yaxis.set_major_formatter(pct)
         ax.legend(ncol=4, loc="upper left")
     fig.tight_layout()
     fig_dir.mkdir(parents=True, exist_ok=True)
-    path = fig_dir / "rq1_4_1_2_calibration_reliability_by_target_group.png"
+    path = fig_dir / "rq1_4_1_2_calibration_reliability_by_target.png"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -802,21 +850,27 @@ def plot_reliability_by_target_group(coverage: pd.DataFrame, fig_dir: Path) -> P
 
 def plot_interval_coverage_by_target_group(interval: pd.DataFrame, fig_dir: Path) -> Path | None:
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
 
     if interval.empty:
         return None
     apply_geo_style()
     d = (
-        interval.groupby(["target_group", "model", "model_label", "interval", "nominal_interval_coverage"], as_index=False)
+        interval.groupby(["target_group", "model", "model_label", "nominal_interval_coverage"], as_index=False)
         .agg(interval_coverage=("interval_coverage", "mean"), n_obs=("n_obs", "sum"))
         .sort_values(["target_group", "model_label", "nominal_interval_coverage"])
     )
-    groups = sorted(d["target_group"].dropna().unique())
+    if d.empty:
+        return None
+    groups = ordered_unique(d["target_group"].dropna().unique(), group=True)
     fig, axes = _group_panel_axes(groups)
-    fig.suptitle("Empirical interval coverage vs nominal interval coverage", y=1.01)
+    fig.suptitle(thesis_titlecase("Interval coverage vs nominal interval coverage"), y=1.01)
+    ticks = np.array([0.40, 0.80, 0.90, 0.98], dtype=float)
+    pct = FuncFormatter(lambda value, _: f"{value * 100:.0f}%")
     for ax, group in zip(axes, groups):
-        g = d[d["target_group"] == group].copy()
-        for _, mg in g.groupby("model"):
+        g = d[d["target_group"] == group]
+        for model in sorted(g["model"].dropna().unique(), key=model_sort_key):
+            mg = g[g["model"].eq(model)]
             mg = mg.sort_values("nominal_interval_coverage")
             ax.plot(
                 mg["nominal_interval_coverage"],
@@ -825,14 +879,16 @@ def plot_interval_coverage_by_target_group(interval: pd.DataFrame, fig_dir: Path
                 label=str(mg["model_label"].iloc[0]),
                 color=get_model_color(str(mg["model"].iloc[0])),
             )
-            for _, row in mg.iterrows():
-                ax.annotate(str(row["interval"]), (row["nominal_interval_coverage"], row["interval_coverage"]), fontsize=7, xytext=(3, 3), textcoords="offset points")
         ax.plot([0, 1], [0, 1], linestyle="--", color=THESIS_PALETTE["neutral_dark"], label="Ideal")
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.set_title(f"{group} (n={int(g['n_obs'].sum())})")
+        ax.set_title(thesis_titlecase(f"{group} (n={int(g['n_obs'].sum())})"))
         ax.set_xlabel("Nominal interval coverage")
         ax.set_ylabel("Empirical interval coverage")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.xaxis.set_major_formatter(pct)
+        ax.yaxis.set_major_formatter(pct)
         ax.legend(ncol=4, loc="upper left")
     fig.tight_layout()
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -853,19 +909,21 @@ def plot_interval_width_by_target_group(interval: pd.DataFrame, fig_dir: Path) -
         .agg(interval_width_mean=("interval_width_mean", "mean"), n_obs=("n_obs", "sum"))
     )
     order = ["p30-p70", "p10-p90", "p05-p95", "p01-p99"]
-    groups = sorted(d["target_group"].dropna().unique())
+    groups = ordered_unique(d["target_group"].dropna().unique(), group=True)
     fig, axes = _group_panel_axes(groups)
     for ax, group in zip(axes, groups):
         g = d[d["target_group"] == group].copy()
         intervals = [x for x in order if x in set(g["interval"])]
         x = np.arange(len(intervals), dtype=float)
         width = 0.22
-        for i, (_, mg) in enumerate(g.groupby("model")):
+        models = sorted(g["model"].dropna().unique(), key=model_sort_key)
+        for i, model in enumerate(models):
+            mg = g[g["model"].eq(model)]
             vals = [float(mg.loc[mg["interval"] == it, "interval_width_mean"].mean()) for it in intervals]
             ax.bar(x + (i - 1) * width, vals, width=width, label=str(mg["model_label"].iloc[0]), color=get_model_color(str(mg["model"].iloc[0])))
         ax.set_xticks(x)
         ax.set_xticklabels(intervals)
-        ax.set_title(f"{group} (n={int(g['n_obs'].sum())})")
+        ax.set_title(thesis_titlecase(f"{group} (n={int(g['n_obs'].sum())})"))
         ax.set_ylabel("Mean interval width")
         ax.legend(ncol=4, loc="upper left")
     fig.tight_layout()
@@ -883,17 +941,19 @@ def plot_crossing_by_target_group(crossing: pd.DataFrame, fig_dir: Path) -> Path
         return None
     apply_geo_style()
     d = crossing.groupby(["target_group", "model", "model_label"], as_index=False).agg(crossing_rate=("crossing_rate", "mean"), n_obs=("n_obs", "sum"))
-    groups = sorted(d["target_group"].dropna().unique())
+    groups = ordered_unique(d["target_group"].dropna().unique(), group=True)
     x = np.arange(len(groups), dtype=float)
     width = 0.24
     fig, ax = plt.subplots(figsize=(10, 4.8))
-    for i, (_, mg) in enumerate(d.groupby("model")):
+    models = sorted(d["model"].dropna().unique(), key=model_sort_key)
+    for i, model in enumerate(models):
+        mg = d[d["model"].eq(model)]
         vals = [float(mg.loc[mg["target_group"] == g, "crossing_rate"].mean()) for g in groups]
         ax.bar(x + (i - 1) * width, vals, width=width, label=str(mg["model_label"].iloc[0]), color=get_model_color(str(mg["model"].iloc[0])))
     ax.set_xticks(x)
     ax.set_xticklabels(groups, rotation=20, ha="right")
     ax.set_ylabel("Quantile crossing rate")
-    ax.set_title("Quantile crossing rate by target group")
+    ax.set_title(thesis_titlecase("Quantile crossing rate by target group"))
     ax.legend(ncol=3, loc="upper left")
     fig.tight_layout()
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -909,9 +969,17 @@ def plot_calibration_error_heatmap(coverage: pd.DataFrame, fig_dir: Path) -> Pat
     if coverage.empty:
         return None
     apply_geo_style()
-    d = coverage.groupby(["target_group", "model_label", "quantile"], as_index=False).agg(calibration_error=("calibration_error", "mean"))
+    d = (
+        coverage.groupby(["target_group", "model_label", "quantile"], as_index=False)
+        .agg(calibration_error=("calibration_error", "mean"))
+    )
+    d["_target_group_order"] = d["target_group"].map(lambda x: target_sort_key(x)[0])
+    d["_model_order"] = d["model_label"].map(lambda x: model_sort_key(x)[0])
+    d = d.sort_values(["_target_group_order", "_model_order", "quantile"])
     d["row"] = d["target_group"] + " | " + d["model_label"]
     pivot = d.pivot_table(index="row", columns="quantile", values="calibration_error", aggfunc="mean")
+    row_order = d["row"].drop_duplicates().tolist()
+    pivot = pivot.reindex(row_order)
     if pivot.empty:
         return None
     fig, ax = plt.subplots(figsize=(10, max(4, 0.35 * len(pivot))))
@@ -920,7 +988,7 @@ def plot_calibration_error_heatmap(coverage: pd.DataFrame, fig_dir: Path) -> Pat
     ax.set_xticklabels([_qcol(float(q)) for q in pivot.columns])
     ax.set_yticks(np.arange(len(pivot.index)))
     ax.set_yticklabels(pivot.index)
-    ax.set_title("Calibration error by target group, model and quantile")
+    ax.set_title(thesis_titlecase("Calibration error by target group, model and quantile"))
     fig.colorbar(im, ax=ax, label="Empirical coverage - nominal quantile")
     fig.tight_layout()
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -965,7 +1033,7 @@ def write_legacy_flat_aliases(outputs: dict[str, pd.DataFrame], *, out_dir: Path
         source_dir / "latex" / f"rq1_4_1_2_calibration_quantile_coverage_{split}_appendix.tex": out_dir / "latex" / f"calibration_quantile_coverage_{split}_appendix.tex",
         source_dir / "latex" / f"rq1_4_1_2_calibration_interval_quality_{split}_appendix.tex": out_dir / "latex" / f"calibration_interval_quality_{split}_appendix.tex",
         source_dir / "latex" / f"rq1_4_1_2_calibration_quantile_crossing_{split}_appendix.tex": out_dir / "latex" / f"calibration_quantile_crossing_{split}_appendix.tex",
-        source_dir / "figures" / "rq1_4_1_2_calibration_reliability_by_target_group.png": out_dir / "figures" / "calibration_reliability_by_target_group.png",
+        source_dir / "figures" / "rq1_4_1_2_calibration_reliability_by_target.png": out_dir / "figures" / "calibration_reliability_by_target.png",
         source_dir / "figures" / "rq1_4_1_2_calibration_interval_coverage_by_target_group.png": out_dir / "figures" / "calibration_interval_coverage_by_target_group.png",
         source_dir / "figures" / "rq1_4_1_2_calibration_interval_width_by_target_group.png": out_dir / "figures" / "calibration_interval_width_by_target_group.png",
         source_dir / "figures" / "rq1_4_1_2_calibration_quantile_crossing_by_target_group.png": out_dir / "figures" / "calibration_quantile_crossing_by_target_group.png",
@@ -1068,9 +1136,9 @@ def write_outputs(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build final RQ1 calibration and uncertainty-quality outputs.")
-    p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
+    p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_2_calibration_uncertainty")
+    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/4_1_2_calibration_uncertainty")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -1078,7 +1146,9 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated splits to load/export. Defaults to test only; --split selects the main reported split.",
     )
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
-    p.add_argument("--legacy-flat-out-dir", default="artifacts/final_benchmark/_raw_outputs/calibration")
+    p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
+    p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
+    p.add_argument("--legacy-flat-out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/calibration")
     p.add_argument("--no-legacy-flat-aliases", action="store_true")
     return p.parse_args()
 
@@ -1093,7 +1163,13 @@ def main() -> int:
         Path(args.benchmark_root),
         Path(args.benchmark_dir) if args.benchmark_dir else None,
     )
-    outputs = build_calibration_outputs(benchmark_dir=benchmark_dir, models=models, splits=splits)
+    outputs = build_calibration_outputs(
+        benchmark_dir=benchmark_dir,
+        models=models,
+        splits=splits,
+        eval_origin_start=_parse_utc_bound(args.eval_origin_start),
+        eval_origin_end=_parse_utc_bound(args.eval_origin_end),
+    )
     legacy_flat_out_dir = None if args.no_legacy_flat_aliases else Path(args.legacy_flat_out_dir)
     paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, legacy_flat_out_dir=legacy_flat_out_dir)
     print("[OK] Built RQ1 calibration and uncertainty-quality outputs.")

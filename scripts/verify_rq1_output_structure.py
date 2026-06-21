@@ -14,8 +14,7 @@ SUBSECTION_DIRS = [
     "4_1_3_per_lead",
     "4_1_4_gate_specific",
     "4_1_5_tail_spike",
-    "4_1_6_interim_answer",
-    "4_1_7_example_weeks",
+    "4_1_6_example_weeks",
 ]
 
 TIERS = [
@@ -47,11 +46,27 @@ def _check_latex_table(path: Path) -> list[str]:
 def _check_latex_figure(path: Path) -> list[str]:
     errors: list[str] = []
     text = path.read_text(encoding="utf-8")
-    for token in [r"\begin{figure}", r"\includegraphics", r"\caption", r"\label", r"\end{figure}"]:
+    if path.name.startswith("calibration_reliability_"):
+        stripped = text.strip()
+        if not stripped.startswith(r"\begin{tikzpicture}"):
+            errors.append(f"{path} does not start with a TikZ picture fragment.")
+        if not stripped.endswith(r"\end{tikzpicture}"):
+            errors.append(f"{path} does not end with a TikZ picture fragment.")
+        for token in [r"\begin{figure}", r"\caption", r"\label", r"\end{figure}", r"\includegraphics"]:
+            if token in text:
+                errors.append(f"{path} contains forbidden float/import token {token}.")
+        if r"\begin{axis}" not in text and r"\begin{groupplot}" not in text:
+            errors.append(f"{path} is missing a pgfplots axis or groupplot environment.")
+        return errors
+    for token in [r"\begin{figure}", r"\begin{tikzpicture}", r"\caption", r"\label", r"\end{figure}"]:
         if token not in text:
             errors.append(f"{path} is missing {token}.")
-    if r"width=\textwidth" not in text or r"keepaspectratio" not in text:
-        errors.append(f"{path} does not use A4-safe includegraphics sizing.")
+    if r"\begin{axis}" not in text and r"\begin{groupplot}" not in text:
+        errors.append(f"{path} is missing a pgfplots axis or groupplot environment.")
+    if r"\includegraphics" in text:
+        errors.append(f"{path} imports an image instead of recreating the figure in LaTeX.")
+    if r"\resizebox{\linewidth}{!}" not in text:
+        errors.append(f"{path} does not use A4-safe TikZ resizing.")
     if "2E7D32" not in text:
         errors.append(f"{path} does not include the style.py perfect_foresight color.")
     return errors
@@ -107,7 +122,7 @@ def verify(rq1_root: Path) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Verify organized RQ1 output structure.")
-    p.add_argument("--rq1-root", default="artifacts/final_benchmark")
+    p.add_argument("--rq1-root", default="artifacts/rq1_ml_model_benchmark")
     return p.parse_args()
 
 

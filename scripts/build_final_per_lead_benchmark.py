@@ -28,7 +28,8 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from energy_trading.visualization.style import apply_geo_style, get_model_color
+from energy_trading.visualization.style import apply_geo_style, get_model_color, thesis_titlecase
+from energy_trading.evaluation.rq1_target_order import MODEL_LABELS, model_sort_key, ordered_unique, sort_target_frame, target_sort_key
 
 
 MODEL_KEYS = {
@@ -42,20 +43,20 @@ MODEL_KEYS = {
 TARGET_GROUPS = {
     "pred_da_price": ("da_price", "DA price", "DA price"),
     "target_da_price": ("da_price", "DA price", "DA price"),
-    "pred_afrr_capacity_price_pos": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price positive"),
-    "target_afrr_capacity_price_pos": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price positive"),
-    "pred_afrr_capacity_price_neg": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price negative"),
-    "target_afrr_capacity_price_neg": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price negative"),
-    "pred_afrr_activation_price_pos": ("afrr_activation_price", "aFRR activation price", "aFRR activation price positive"),
-    "target_afrr_activation_price_pos": ("afrr_activation_price", "aFRR activation price", "aFRR activation price positive"),
-    "target_afrr_activation_price_vwap_pos": ("afrr_activation_price", "aFRR activation price", "aFRR activation price positive"),
-    "pred_afrr_activation_price_neg": ("afrr_activation_price", "aFRR activation price", "aFRR activation price negative"),
-    "target_afrr_activation_price_neg": ("afrr_activation_price", "aFRR activation price", "aFRR activation price negative"),
-    "target_afrr_activation_price_vwap_neg": ("afrr_activation_price", "aFRR activation price", "aFRR activation price negative"),
-    "pred_afrr_activation_rate_pos": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate positive"),
-    "target_afrr_activation_rate_pos": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate positive"),
-    "pred_afrr_activation_rate_neg": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate negative"),
-    "target_afrr_activation_rate_neg": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate negative"),
+    "pred_afrr_capacity_price_pos": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price +"),
+    "target_afrr_capacity_price_pos": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price +"),
+    "pred_afrr_capacity_price_neg": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price -"),
+    "target_afrr_capacity_price_neg": ("afrr_capacity_price", "aFRR capacity price", "aFRR capacity price -"),
+    "pred_afrr_activation_price_pos": ("afrr_activation_price", "aFRR activation price", "aFRR activation price +"),
+    "target_afrr_activation_price_pos": ("afrr_activation_price", "aFRR activation price", "aFRR activation price +"),
+    "target_afrr_activation_price_vwap_pos": ("afrr_activation_price", "aFRR activation price", "aFRR activation price +"),
+    "pred_afrr_activation_price_neg": ("afrr_activation_price", "aFRR activation price", "aFRR activation price -"),
+    "target_afrr_activation_price_neg": ("afrr_activation_price", "aFRR activation price", "aFRR activation price -"),
+    "target_afrr_activation_price_vwap_neg": ("afrr_activation_price", "aFRR activation price", "aFRR activation price -"),
+    "pred_afrr_activation_rate_pos": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate +"),
+    "target_afrr_activation_rate_pos": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate +"),
+    "pred_afrr_activation_rate_neg": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate -"),
+    "target_afrr_activation_rate_neg": ("afrr_activation_rate", "aFRR activation rate", "aFRR activation rate -"),
 }
 
 GROUP_ORDER = ["da_price", "afrr_capacity_price", "afrr_activation_price", "afrr_activation_rate"]
@@ -85,6 +86,8 @@ LEAD_RANGE_LABELS = {
     "long_h17_48": "h17-h48",
 }
 QCOL_RE = re.compile(r"^p(\d{1,2})$", re.IGNORECASE)
+DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
+DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
 
 
 @dataclass(frozen=True)
@@ -179,6 +182,8 @@ def _read_joined(path: Path) -> pd.DataFrame:
         df["forecast_time_utc"] = pd.to_datetime(df["forecast_time_utc"], utc=True, errors="coerce")
     elif "snapshot_time_utc" in df.columns:
         df["forecast_time_utc"] = pd.to_datetime(df["snapshot_time_utc"], utc=True, errors="coerce")
+    else:
+        df["forecast_time_utc"] = df["target_time_utc"] - pd.to_timedelta(df["lead_time_h"], unit="h")
     df["lead_time_h"] = pd.to_numeric(df["lead_time_h"], errors="coerce")
     df["y_true"] = pd.to_numeric(df["y_true"], errors="coerce")
     if "p50" not in df.columns and "predicted_value" in df.columns:
@@ -186,6 +191,24 @@ def _read_joined(path: Path) -> pd.DataFrame:
     if "p50" not in df.columns:
         raise ValueError(f"{path} must contain p50 or predicted_value.")
     return df
+
+
+def _parse_utc_bound(raw: str | None) -> pd.Timestamp | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    return pd.to_datetime(raw, utc=True)
+
+
+def _apply_forecast_origin_window(df: pd.DataFrame, *, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    if start is None and end is None:
+        return df
+    origin = pd.to_datetime(df["forecast_time_utc"], utc=True, errors="coerce")
+    mask = origin.notna()
+    if start is not None:
+        mask &= origin.ge(start)
+    if end is not None:
+        mask &= origin.le(end)
+    return df.loc[mask].copy()
 
 
 def _key_cols(loaded: dict[str, pd.DataFrame]) -> list[str]:
@@ -259,6 +282,8 @@ def build_per_lead_outputs(
     models: list[ModelSpec],
     splits: list[str],
     horizon: int,
+    eval_origin_start: pd.Timestamp | None,
+    eval_origin_end: pd.Timestamp | None,
 ) -> dict[str, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -267,7 +292,7 @@ def build_per_lead_outputs(
         if parsed is not None:
             files[parsed] = path
 
-    targets = sorted({target for _, split, target in files if split in set(splits)})
+    targets = sorted({target for _, split, target in files if split in set(splits)}, key=target_sort_key)
     if not targets:
         raise FileNotFoundError(f"No joined prediction parquet files for splits={splits} in {joined_dir}.")
 
@@ -284,7 +309,11 @@ def build_per_lead_outputs(
                 path = files.get((model.key, split, target))
                 if path is None:
                     raise FileNotFoundError(f"Missing joined predictions for model={model.key}, split={split}, target={target}.")
-                df = _read_joined(path)
+                df = _apply_forecast_origin_window(
+                    _read_joined(path),
+                    start=eval_origin_start,
+                    end=eval_origin_end,
+                )
                 loaded[model.key] = df
                 qmaps[model.key] = _quantile_cols(df)
                 if 0.50 not in qmaps[model.key]:
@@ -355,6 +384,8 @@ def build_per_lead_outputs(
                             "quantiles_available": ",".join(_qcol(q) for q in sorted(qmaps[model.key])),
                             "quantiles_used": quantiles_used,
                             "row_intersection_key": ",".join(["split", "target", *key_cols]),
+                            "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
+                            "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
                         }
                     )
                     eval_df = valid[model.key].merge(key_df, on=key_cols, how="inner").sort_values(key_cols)
@@ -376,8 +407,8 @@ def build_per_lead_outputs(
                         }
                     )
 
-    metrics = pd.DataFrame(metric_rows).sort_values(["split", "target_group", "target", "lead_time_h", "model_label"]).reset_index(drop=True)
-    row_counts = pd.DataFrame(row_rows).sort_values(["split", "target", "lead_time_h", "model_label"]).reset_index(drop=True)
+    metrics = sort_target_frame(pd.DataFrame(metric_rows), target_col="target", extra_cols=["split", "lead_time_h", "model_label"])
+    row_counts = sort_target_frame(pd.DataFrame(row_rows), target_col="target", extra_cols=["split", "lead_time_h", "model_label"])
     warnings = pd.DataFrame(warning_rows, columns=["split", "target", "severity", "message"])
     range_summary = build_range_summary(metrics)
     return {"metrics": metrics, "range_summary": range_summary, "row_counts": row_counts, "warnings": warnings}
@@ -390,12 +421,14 @@ def build_range_summary(metrics: pd.DataFrame) -> pd.DataFrame:
     d["lead_range"] = d["lead_time_h"].map(assign_lead_range)
     d = d[d["lead_range"].notna()].copy()
     rows: list[dict[str, Any]] = []
-    for keys, part in d.groupby(["split", "target_group", "target_slug", "lead_range", "model", "model_label"], sort=True):
-        split, target_group, target_slug, lead_range, model, model_label = keys
+    for keys, part in d.groupby(["split", "target", "target_label", "target_group", "target_slug", "lead_range", "model", "model_label"], sort=False):
+        split, target, target_label, target_group, target_slug, lead_range, model, model_label = keys
         weights = pd.to_numeric(part["n_obs"], errors="coerce").to_numpy(dtype=float)
         weights = np.where(np.isfinite(weights), weights, 0.0)
         row = {
             "split": split,
+            "target": target,
+            "target_label": target_label,
             "target_group": target_group,
             "target_slug": target_slug,
             "lead_range": lead_range,
@@ -408,7 +441,7 @@ def build_range_summary(metrics: pd.DataFrame) -> pd.DataFrame:
             mask = np.isfinite(vals) & (weights > 0)
             row[metric] = float(np.average(vals[mask], weights=weights[mask])) if mask.any() else float("nan")
         rows.append(row)
-    return pd.DataFrame(rows).sort_values(["split", "target_group", "lead_range", "model_label"]).reset_index(drop=True)
+    return sort_target_frame(pd.DataFrame(rows), target_col="target", extra_cols=["split", "lead_range", "model_label"])
 
 
 def build_thesis_range_table(range_summary: pd.DataFrame, *, split: str) -> pd.DataFrame:
@@ -416,7 +449,9 @@ def build_thesis_range_table(range_summary: pd.DataFrame, *, split: str) -> pd.D
     if d.empty:
         return pd.DataFrame()
     rows: list[dict[str, Any]] = []
-    for (target_group, lead_range), part in d.groupby(["target_group", "lead_range"], sort=True):
+    target_col = "target" if "target" in d.columns else "target_label"
+    d = sort_target_frame(d, target_col=target_col, extra_cols=["lead_range", "model_label"])
+    for (target_label, lead_range), part in d.groupby(["target_label", "lead_range"], sort=False):
         values = {
             str(label): float(pd.to_numeric(group["mean_pinball_loss"], errors="coerce").mean())
             for label, group in part.groupby("model_label")
@@ -425,11 +460,12 @@ def build_thesis_range_table(range_summary: pd.DataFrame, *, split: str) -> pd.D
         best = min(values, key=values.get) if values else ""
         rows.append(
             {
-                "target": target_group,
+                "target": target_label,
+                "_sort_target": str(part["target"].iloc[0]) if "target" in part.columns else target_label,
                 "lead_range": LEAD_RANGE_LABELS.get(str(lead_range), str(lead_range)),
-                "TFT": values.get("TFT", np.nan),
-                "XGB": values.get("XGB", np.nan),
                 "RLQR": values.get("RLQR", np.nan),
+                "XGB": values.get("XGB", np.nan),
+                "TFT": values.get("TFT", np.nan),
                 "best_model": best,
                 "n_obs": int(part.groupby("model_label")["n_obs"].first().min()) if not part.empty else 0,
             }
@@ -437,9 +473,9 @@ def build_thesis_range_table(range_summary: pd.DataFrame, *, split: str) -> pd.D
     order = {name: i for i, (name, _, _) in enumerate(LEAD_RANGES)}
     label_order = {LEAD_RANGE_LABELS[name]: idx for name, idx in order.items()}
     table = pd.DataFrame(rows)
-    table["_group_order"] = table["target"].map(lambda x: GROUP_ORDER.index(_slug_for_group(x)) if _slug_for_group(x) in GROUP_ORDER else 99)
     table["_range_order"] = table["lead_range"].map(label_order)
-    return table.sort_values(["_group_order", "_range_order"]).drop(columns=["_group_order", "_range_order"]).reset_index(drop=True)
+    table = sort_target_frame(table, target_col="_sort_target", extra_cols=["_range_order"])
+    return table.drop(columns=["_sort_target", "_range_order"]).reset_index(drop=True)
 
 
 def _slug_for_group(group: Any) -> str:
@@ -457,6 +493,10 @@ def _slug_for_group(group: Any) -> str:
 
 def _latex_escape(value: Any) -> str:
     s = str(value)
+    minus_token = "@@RQ1MINUS@@"
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} -", f"{label} {minus_token}")
+        s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -470,7 +510,7 @@ def _latex_escape(value: Any) -> str:
         "^": r"\textasciicircum{}",
     }.items():
         s = s.replace(old, new)
-    return s
+    return s.replace(minus_token, "$-$")
 
 
 def _fmt_num(value: Any) -> str:
@@ -484,11 +524,11 @@ def _fmt_num(value: Any) -> str:
 def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
     if table.empty:
         return None
-    headers = ["Target", "Lead range", "TFT", "XGB", "RLQR", "Best model", "N"]
+    headers = ["Target", "Lead range", "RLQR", "XGB", "TFT", "Best model"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
-        r"    \begin{tabular}{@{}llrrrrr@{}}",
+        r"    \begin{tabular}{@{}llrrrl@{}}",
         r"        \toprule",
         "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
         r"        \midrule",
@@ -499,11 +539,10 @@ def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -
         vals = [
             r"\textbf{" + _latex_escape(group) + "}" if group != previous_group else "",
             _latex_escape(row["lead_range"]),
-            _fmt_num(row["TFT"]),
-            _fmt_num(row["XGB"]),
             _fmt_num(row["RLQR"]),
+            _fmt_num(row["XGB"]),
+            _fmt_num(row["TFT"]),
             _latex_escape(row["best_model"]),
-            str(int(row["n_obs"])) if pd.notna(row["n_obs"]) else "-",
         ]
         lines.append("        " + " & ".join(vals) + r" \\")
         previous_group = group
@@ -523,14 +562,14 @@ def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -
     return path
 
 
-def _figure_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, target_slug: str, metric: str) -> list[Path]:
+def _figure_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, target_slug: str, metric: str, skip_pdf: bool = False) -> list[Path]:
     import matplotlib.pyplot as plt
 
     d = metrics.loc[(metrics["split"] == split) & (metrics["target_slug"] == target_slug)].copy()
     if d.empty or metric not in d.columns:
         return []
     apply_geo_style()
-    targets = sorted(d["target_label"].dropna().unique())
+    targets = ordered_unique(d["target_label"].dropna().unique())
     n = max(1, len(targets))
     fig, axes = plt.subplots(n, 1, figsize=(10, max(3.2, 2.8 * n)), sharex=True)
     if n == 1:
@@ -538,36 +577,40 @@ def _figure_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, target_s
     group_label = str(d["target_group"].iloc[0])
     for ax, target_label in zip(axes, targets):
         panel = d[d["target_label"] == target_label].copy()
-        for _, mg in panel.groupby("model"):
+        for model in sorted(panel["model"].dropna().unique(), key=model_sort_key):
+            mg = panel[panel["model"].eq(model)]
             mg = mg.sort_values("lead_time_h")
+            show_markers = metric != "mean_pinball_loss"
             ax.plot(
                 mg["lead_time_h"],
                 mg[metric],
-                marker="o",
-                markersize=3.8,
+                marker="o" if show_markers else None,
+                markersize=3.8 if show_markers else 0,
                 linewidth=1.8,
                 label=str(mg["model_label"].iloc[0]),
                 color=get_model_color(str(mg["model"].iloc[0])),
             )
-        ax.set_title(str(target_label))
+        ax.set_title(thesis_titlecase(str(target_label)))
         ax.set_ylabel(METRIC_LABELS.get(metric, metric))
         ax.set_xlim(1, max(48, int(pd.to_numeric(d["lead_time_h"], errors="coerce").max())))
         ax.set_xticks([1, 8, 16, 24, 32, 40, 48])
         ax.legend(ncol=3, loc="upper left")
     axes[-1].set_xlabel("Lead hour h1-h48")
-    fig.suptitle(f"{group_label}: {METRIC_LABELS.get(metric, metric)} by lead hour (lower is better)", y=1.01)
+    fig.suptitle(thesis_titlecase(f"{group_label}: {METRIC_LABELS.get(metric, metric)} by lead hour (lower is better)"), y=1.01)
     fig.tight_layout()
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     stem = f"per_lead_{'pinball' if metric == 'mean_pinball_loss' else metric}_{GROUP_FILE_STEMS[target_slug]}"
-    paths = [fig_dir / f"{stem}.png", fig_dir / f"{stem}.svg", fig_dir / f"{stem}.pdf"]
+    paths = [fig_dir / f"{stem}.png"]
+    if not skip_pdf:
+        paths.append(fig_dir / f"{stem}.pdf")
     for path in paths:
         fig.savefig(path)
     plt.close(fig)
     return paths
 
 
-def _figure_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str, target_slug: str) -> list[Path]:
+def _figure_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str, target_slug: str, skip_pdf: bool = False) -> list[Path]:
     import matplotlib.pyplot as plt
 
     d = metrics.loc[(metrics["split"] == split) & (metrics["target_slug"] == target_slug)].copy()
@@ -589,7 +632,7 @@ def _figure_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str
     if pivot.empty:
         return []
     apply_geo_style()
-    targets = sorted(pivot["target_label"].dropna().unique())
+    targets = ordered_unique(pivot["target_label"].dropna().unique())
     n = max(1, len(targets))
     fig, axes = plt.subplots(n, 1, figsize=(10, max(3.2, 2.8 * n)), sharex=True)
     if n == 1:
@@ -597,7 +640,8 @@ def _figure_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str
     group_label = str(d["target_group"].iloc[0])
     for ax, target_label in zip(axes, targets):
         panel = pivot[pivot["target_label"] == target_label].copy().sort_values("lead_time_h")
-        for model_label, model_key in [("TFT", "tft"), ("XGB", "xgb")]:
+        ax.axhline(1.0, color=get_model_color("linear"), linewidth=1.0, linestyle="--", label="RLQR baseline")
+        for model_label, model_key in [("XGB", "xgb"), ("TFT", "tft")]:
             if model_label not in panel.columns:
                 continue
             rel = pd.to_numeric(panel[model_label], errors="coerce") / pd.to_numeric(panel["RLQR"], errors="coerce")
@@ -610,26 +654,27 @@ def _figure_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str
                 label=model_label,
                 color=get_model_color(model_key),
             )
-        ax.axhline(1.0, color="#333333", linewidth=1.0, linestyle="--", label="RLQR baseline")
-        ax.set_title(str(target_label))
+        ax.set_title(thesis_titlecase(str(target_label)))
         ax.set_ylabel("Pinball loss / RLQR")
         ax.set_xlim(1, max(48, int(pd.to_numeric(pivot["lead_time_h"], errors="coerce").max())))
         ax.set_xticks([1, 8, 16, 24, 32, 40, 48])
         ax.legend(ncol=3, loc="upper left")
     axes[-1].set_xlabel("Lead hour h1-h48")
-    fig.suptitle(f"{group_label}: mean pinball loss relative to RLQR by lead hour (below 1 is better)", y=1.01)
+    fig.suptitle(thesis_titlecase(f"{group_label}: mean pinball loss relative to RLQR by lead hour (below 1 is better)"), y=1.01)
     fig.tight_layout()
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     stem = f"per_lead_relative_pinball_{GROUP_FILE_STEMS[target_slug]}"
-    paths = [fig_dir / f"{stem}.png", fig_dir / f"{stem}.svg", fig_dir / f"{stem}.pdf"]
+    paths = [fig_dir / f"{stem}.png"]
+    if not skip_pdf:
+        paths.append(fig_dir / f"{stem}.pdf")
     for path in paths:
         fig.savefig(path)
     plt.close(fig)
     return paths
 
 
-def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str, structured_out_dir: Path | None = None) -> list[Path]:
+def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str, structured_out_dir: Path | None = None, skip_pdf: bool = False) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "latex").mkdir(parents=True, exist_ok=True)
@@ -657,8 +702,8 @@ def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str
 
     for target_slug in GROUP_ORDER:
         for metric in ["mean_pinball_loss", "mae_p50", "rmse_p50"]:
-            paths.extend(_figure_metric(metrics, out_dir=out_dir, split=split, target_slug=target_slug, metric=metric))
-        paths.extend(_figure_relative_pinball(metrics, out_dir=out_dir, split=split, target_slug=target_slug))
+            paths.extend(_figure_metric(metrics, out_dir=out_dir, split=split, target_slug=target_slug, metric=metric, skip_pdf=skip_pdf))
+        paths.extend(_figure_relative_pinball(metrics, out_dir=out_dir, split=split, target_slug=target_slug, skip_pdf=skip_pdf))
 
     manifest = {
         "description": "RQ1 4.1.3 per-lead-hour forecast benchmark outputs.",
@@ -697,10 +742,10 @@ def _mirror_structured(paths: list[Path], *, root_out_dir: Path, structured_out_
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build final RQ1 4.1.3 per-lead-hour benchmark outputs.")
-    p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
+    p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/shared")
-    p.add_argument("--structured-out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_3_per_lead")
+    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/shared")
+    p.add_argument("--structured-out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/4_1_3_per_lead")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -709,7 +754,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
     p.add_argument("--horizon", type=int, default=48)
+    p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
+    p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--no-structured-copy", action="store_true")
+    p.add_argument("--skip-pdf", action="store_true", help="Do not render PDF figures; PNG and LaTeX outputs are still generated.")
     return p.parse_args()
 
 
@@ -728,9 +776,11 @@ def main() -> int:
         models=models,
         splits=splits,
         horizon=int(args.horizon),
+        eval_origin_start=_parse_utc_bound(args.eval_origin_start),
+        eval_origin_end=_parse_utc_bound(args.eval_origin_end),
     )
     structured_out_dir = None if args.no_structured_copy else Path(args.structured_out_dir)
-    paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, structured_out_dir=structured_out_dir)
+    paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, structured_out_dir=structured_out_dir, skip_pdf=bool(args.skip_pdf))
     print("[OK] Built RQ1 4.1.3 per-lead-hour outputs.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     for path in paths:

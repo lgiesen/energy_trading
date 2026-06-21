@@ -27,8 +27,15 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from energy_trading.visualization.style import apply_geo_style, get_model_color
-
+from energy_trading.evaluation.rq1_target_order import (MODEL_LABELS,
+                                                        model_sort_key,
+                                                        sort_model_frame,
+                                                        sort_target_frame,
+                                                        target_sort_key)
+from energy_trading.visualization.style import (THESIS_PALETTE,
+                                                apply_geo_style,
+                                                get_model_color,
+                                                thesis_titlecase)
 
 MODEL_KEYS = {
     "tft": ("tft", "TFT"),
@@ -41,18 +48,18 @@ MODEL_KEYS = {
 TARGET_GROUPS = {
     "pred_da_price": ("DA", "DA price"),
     "target_da_price": ("DA", "DA price"),
-    "pred_afrr_capacity_price_pos": ("aFRR capacity", "aFRR capacity price positive"),
-    "target_afrr_capacity_price_pos": ("aFRR capacity", "aFRR capacity price positive"),
-    "pred_afrr_capacity_price_neg": ("aFRR capacity", "aFRR capacity price negative"),
-    "target_afrr_capacity_price_neg": ("aFRR capacity", "aFRR capacity price negative"),
-    "pred_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "target_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "pred_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "target_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "pred_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate positive"),
-    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate positive"),
-    "pred_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate negative"),
-    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate negative"),
+    "pred_afrr_capacity_price_pos": ("aFRR capacity", "aFRR capacity price +"),
+    "target_afrr_capacity_price_pos": ("aFRR capacity", "aFRR capacity price +"),
+    "pred_afrr_capacity_price_neg": ("aFRR capacity", "aFRR capacity price -"),
+    "target_afrr_capacity_price_neg": ("aFRR capacity", "aFRR capacity price -"),
+    "pred_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price +"),
+    "target_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price +"),
+    "pred_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price -"),
+    "target_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price -"),
+    "pred_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
+    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
+    "pred_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
+    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
 }
 
 METRICS = ["mean_pinball_loss", "mae_p50", "rmse_p50", "bias_p50"]
@@ -72,6 +79,9 @@ METRIC_LABELS = {
 QCOL_RE = re.compile(r"^p(\d{1,2})$")
 KEY_COLS = ["target_time_utc", "lead_time_h"]
 ROW_INTERSECTION_KEY = "split,target,target_time_utc,lead_time_h"
+DEFAULT_TRAINING_DAYS = 365.0
+DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
+DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
 
 
 @dataclass(frozen=True)
@@ -168,6 +178,35 @@ def _read_joined_prediction(path: Path) -> pd.DataFrame:
     return df
 
 
+def _parse_utc_bound(raw: str | None) -> pd.Timestamp | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    return pd.to_datetime(raw, utc=True)
+
+
+def _forecast_origin_utc(df: pd.DataFrame) -> pd.Series:
+    if "forecast_time_utc" in df.columns:
+        return pd.to_datetime(df["forecast_time_utc"], utc=True, errors="coerce")
+    if "snapshot_time_utc" in df.columns:
+        return pd.to_datetime(df["snapshot_time_utc"], utc=True, errors="coerce")
+    return pd.to_datetime(df["target_time_utc"], utc=True, errors="coerce") - pd.to_timedelta(
+        pd.to_numeric(df["lead_time_h"], errors="coerce"),
+        unit="h",
+    )
+
+
+def _apply_forecast_origin_window(df: pd.DataFrame, *, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    if start is None and end is None:
+        return df
+    origin = _forecast_origin_utc(df)
+    mask = origin.notna()
+    if start is not None:
+        mask &= origin.ge(start)
+    if end is not None:
+        mask &= origin.le(end)
+    return df.loc[mask].copy()
+
+
 def _row_key_frame(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -229,6 +268,8 @@ def build_full_metrics(
     benchmark_dir: Path,
     models: list[ModelSpec],
     splits: list[str],
+    eval_origin_start: pd.Timestamp | None,
+    eval_origin_end: pd.Timestamp | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -237,7 +278,7 @@ def build_full_metrics(
         if parsed is not None:
             files[parsed] = path
 
-    targets = sorted({target for _, split, target in files if split in splits})
+    targets = sorted({target for _, split, target in files if split in splits}, key=target_sort_key)
     if not targets:
         raise FileNotFoundError(f"No joined prediction parquet files for splits={splits} in {joined_dir}.")
 
@@ -254,7 +295,11 @@ def build_full_metrics(
                         f"Missing joined predictions for model={model.key}, split={split}, target={target}. "
                         f"Expected file like {joined_dir / f'{model.key}__{split}__{target}.parquet'}."
                     )
-                df = _read_joined_prediction(path)
+                df = _apply_forecast_origin_window(
+                    _read_joined_prediction(path),
+                    start=eval_origin_start,
+                    end=eval_origin_end,
+                )
                 _assert_unique_keys(df, model=model.key, split=split, target=target)
                 loaded[model.key] = df
                 qmaps[model.key] = _quantile_cols(df)
@@ -300,6 +345,8 @@ def build_full_metrics(
                     "lead_max": float(lead_values.max()),
                     "quantiles_used": quantiles_used,
                     "row_intersection_key": ROW_INTERSECTION_KEY,
+                    "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
+                    "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
                 }
                 for metric in METRICS:
                     rows.append(
@@ -322,16 +369,22 @@ def build_full_metrics(
                         "quantiles_used": quantiles_used,
                         "lead_min": float(lead_values.min()),
                         "lead_max": float(lead_values.max()),
+                        "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
+                        "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
                     }
                 )
 
-    metrics = pd.DataFrame(rows).sort_values(["split", "target_group", "target", "metric", "model_label"]).reset_index(drop=True)
-    diag = pd.DataFrame(diagnostics).sort_values(["split", "target", "model"]).reset_index(drop=True)
+    metrics = sort_target_frame(pd.DataFrame(rows), target_col="target", extra_cols=["split", "metric", "model_label"])
+    diag = sort_target_frame(pd.DataFrame(diagnostics), target_col="target", extra_cols=["split", "model"])
     return metrics, diag
 
 
 def _latex_escape(value: Any) -> str:
     s = str(value)
+    minus_token = "@@RQ1MINUS@@"
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} -", f"{label} {minus_token}")
+        s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     repl = {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -346,17 +399,17 @@ def _latex_escape(value: Any) -> str:
     }
     for old, new in repl.items():
         s = s.replace(old, new)
-    return s
+    return s.replace(minus_token, "$-$")
 
 
-def _fmt_value(value: Any, *, pct: bool = False) -> str:
+def _fmt_value(value: Any, *, pct: bool = False, decimals: int = 4) -> str:
     try:
         x = float(value)
     except Exception:
         return "-"
     if not np.isfinite(x):
         return "-"
-    return f"{x:.2f}" if pct else f"{x:.4f}"
+    return f"{x:.2f}" if pct else f"{x:.{decimals}f}"
 
 
 def _fmt_blankable(value: Any, *, pct: bool = False) -> str:
@@ -369,6 +422,33 @@ def _fmt_blankable(value: Any, *, pct: bool = False) -> str:
     return f"{x:.2f}" if pct else f"{x:.4f}"
 
 
+def _fmt_int(value: Any) -> str:
+    try:
+        x = float(value)
+    except Exception:
+        return "-"
+    if not np.isfinite(x):
+        return "-"
+    return f"{int(round(x)):,}"
+
+
+def _caption_n_suffix(table: pd.DataFrame) -> str:
+    if "n_obs" not in table.columns:
+        return ""
+    vals = sorted({int(v) for v in table["n_obs"].dropna().to_list() if np.isfinite(float(v))})
+    if not vals:
+        return ""
+    if len(vals) == 1:
+        return f" (N = {_fmt_int(vals[0])})"
+    return f" (N = {_fmt_int(vals[0])}-{_fmt_int(vals[-1])})"
+
+
+def _latex_header(label: str) -> str:
+    raw = str(label)
+    body = raw if raw.startswith("\\") else _latex_escape(raw)
+    return r"\textbf{" + body + "}"
+
+
 def _pivot_metric(metrics: pd.DataFrame, *, split: str, metric: str) -> pd.DataFrame:
     d = metrics.loc[(metrics["split"] == split) & (metrics["metric"] == metric)].copy()
     if d.empty:
@@ -379,7 +459,7 @@ def _pivot_metric(metrics: pd.DataFrame, *, split: str, metric: str) -> pd.DataF
         .reset_index()
         .rename_axis(None, axis=1)
     )
-    for col in ["TFT", "XGB", "RLQR"]:
+    for col in MODEL_LABELS:
         if col not in pivot.columns:
             pivot[col] = np.nan
     return pivot
@@ -397,7 +477,7 @@ def _add_best_and_improvement(table: pd.DataFrame) -> pd.DataFrame:
             continue
         vals = {
             label: float(row[label])
-            for label in ["TFT", "XGB", "RLQR"]
+            for label in MODEL_LABELS
             if label in row and pd.notna(row[label]) and np.isfinite(float(row[label]))
         }
         if not vals:
@@ -422,9 +502,9 @@ def build_primary_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     primary = primary.rename(columns={"n_valid_rows": "n_obs"})
     cols = [
         "target",
-        "TFT",
-        "XGB",
         "RLQR",
+        "XGB",
+        "TFT",
         "best_model",
         "relative_improvement_vs_RLQR_pct",
         "n_obs",
@@ -432,7 +512,7 @@ def build_primary_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
         "lead_min",
         "lead_max",
     ]
-    return primary[cols].sort_values(["target"]).reset_index(drop=True)
+    return sort_target_frame(primary[cols], target_col="target")
 
 
 def build_detailed_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
@@ -444,9 +524,9 @@ def build_detailed_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     cols = [
         "target",
         "metric",
-        "TFT",
-        "XGB",
         "RLQR",
+        "XGB",
+        "TFT",
         "best_model",
         "relative_improvement_vs_RLQR_pct",
         "n_obs",
@@ -456,7 +536,7 @@ def build_detailed_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     ]
     metric_order = {m: i for i, m in enumerate(METRICS)}
     d["_metric_order"] = d["metric"].map(metric_order)
-    return d[cols + ["_metric_order"]].sort_values(["target", "_metric_order"]).drop(columns=["_metric_order"]).reset_index(drop=True)
+    return sort_target_frame(d[cols + ["_metric_order"]], target_col="target", extra_cols=["_metric_order"]).drop(columns=["_metric_order"]).reset_index(drop=True)
 
 
 def _latex_table(
@@ -467,6 +547,8 @@ def _latex_table(
     caption: str,
     label: str,
     path: Path,
+    bold_best_model_values: bool = False,
+    value_decimals: int = 4,
 ) -> None:
     d = table[columns].copy()
     if len(headers) != len(columns):
@@ -477,7 +559,7 @@ def _latex_table(
         r"    \centering",
         rf"    \begin{{tabular}}{{{colspec}}}",
         r"        \toprule",
-        "        " + " & ".join(r"\textbf{" + _latex_escape(c) + "}" for c in headers) + r" \\",
+        "        " + " & ".join(_latex_header(c) for c in headers) + r" \\",
         r"        \midrule",
     ]
     for _, row in d.iterrows():
@@ -485,7 +567,19 @@ def _latex_table(
         for col in d.columns:
             val = row[col]
             if col in {"TFT", "XGB", "RLQR"}:
-                vals.append(_fmt_value(val))
+                formatted = _fmt_value(val, decimals=value_decimals)
+                if bold_best_model_values and str(row.get("best_model", "")) == col and formatted != "-":
+                    formatted = rf"\textbf{{{formatted}}}"
+                vals.append(formatted)
+            elif col in {
+                "final_training_observed_hours",
+                "final_training_scaled_hours_365d",
+                "hpo_observed_hours_display",
+                "hpo_scaled_hours_display",
+                "training_days_h1",
+            }:
+                formatted = _fmt_value(val)
+                vals.append(_latex_escape(val) if formatted == "-" and str(val).strip() else formatted)
             elif col == "relative_improvement_vs_RLQR_pct":
                 vals.append(_fmt_blankable(val, pct=True))
             elif col == "n_obs":
@@ -519,20 +613,18 @@ def write_latex_tables(primary: pd.DataFrame, detailed: pd.DataFrame, *, out_dir
     detailed_path = latex_dir / f"rq1_4_1_1_forecast_metrics_full_detailed_{split}.tex"
     _latex_table(
         primary,
-        columns=["target", "TFT", "XGB", "RLQR", "best_model", "relative_improvement_vs_RLQR_pct", "n_obs"],
-        headers=["Target", "TFT", "XGB", "RLQR", "Best model", "Improvement vs RLQR (%)", "N"],
-        caption=(
-            "Full unweighted probabilistic forecast benchmark on the test split. "
-            "The table reports mean pinball loss over the common quantile grid p10, p30, p50, p70 and p90. "
-            "Lower values indicate better probabilistic forecast accuracy."
-        ),
+        columns=["target", "RLQR", "XGB", "TFT", "best_model", "relative_improvement_vs_RLQR_pct"],
+        headers=["Target", "RLQR", "XGB", "TFT", "Best model", r"\shortstack{Improvement\\vs RLQR (\%)}"],
+        caption="Model Mean Pinball Loss",
         label="tab:forecast_metrics_full_primary",
         path=primary_path,
+        bold_best_model_values=True,
+        value_decimals=2,
     )
     _latex_table(
         detailed,
-        columns=["target", "metric", "TFT", "XGB", "RLQR", "best_model", "relative_improvement_vs_RLQR_pct", "n_obs"],
-        headers=["Target", "Metric", "TFT", "XGB", "RLQR", "Best model", "Improvement vs RLQR (%)", "N"],
+        columns=["target", "metric", "RLQR", "XGB", "TFT", "best_model", "relative_improvement_vs_RLQR_pct", "n_obs"],
+        headers=["Target", "Metric", "RLQR", "XGB", "TFT", "Best model", r"\shortstack{Improvement\\vs RLQR (\%)}", "N"],
         caption=(
             "Detailed full unweighted forecast metrics on the test split. "
             "Lower values are better for mean pinball loss, MAE and RMSE. "
@@ -544,11 +636,242 @@ def write_latex_tables(primary: pd.DataFrame, detailed: pd.DataFrame, *, out_dir
     return [primary_path, detailed_path]
 
 
-def write_relative_pinball_figure(primary: pd.DataFrame, *, out_dir: Path, split: str) -> list[Path]:
+def _resolve_manifest_pointer(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return path.resolve()
+    manifest_path = data.get("manifest_path_abs") or data.get("manifest_path")
+    if manifest_path:
+        p = Path(str(manifest_path))
+        if not p.is_absolute():
+            p = (path.parent / p).resolve()
+        if p.exists():
+            return p.resolve()
+    if "training" in data:
+        return path.resolve()
+    return None
+
+
+def _resolve_model_manifest_paths(benchmark_dir: Path) -> list[Path]:
+    input_manifest = benchmark_dir / "input_manifest.json"
+    raw_paths: list[Any] = []
+    try:
+        data = json.loads(input_manifest.read_text(encoding="utf-8")) if input_manifest.exists() else {}
+        raw_paths.extend(data.get("model_run_manifests", []))
+    except Exception:
+        pass
+    if not raw_paths:
+        raw_paths.extend(
+            [
+                ROOT / "artifacts/model_runs/latest_xgboost.json",
+                ROOT / "artifacts/model_runs/latest_linear.json",
+                ROOT / "artifacts/model_runs/latest_tft.json",
+            ]
+        )
+    paths: list[Path] = []
+    for raw in raw_paths:
+        p = Path(str(raw)).expanduser()
+        if not p.is_absolute():
+            p = (benchmark_dir / p).resolve()
+            if not p.exists():
+                p = (ROOT / str(raw)).resolve()
+        resolved = _resolve_manifest_pointer(p)
+        if resolved and resolved.exists():
+            paths.append(resolved.resolve())
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for p in paths:
+        if p not in seen:
+            deduped.append(p)
+            seen.add(p)
+    return deduped
+
+
+def _model_label_from_type(model_type: str, run_id: str = "") -> tuple[str, str]:
+    key = str(model_type or run_id).strip().lower()
+    if "xgb" in key or "xgboost" in key:
+        return "xgb", "XGB"
+    if "tft" in key:
+        return "tft", "TFT"
+    if "linear" in key or "rlqr" in key:
+        return "linear", "RLQR"
+    return key or "unknown", str(model_type or run_id or "unknown")
+
+
+def _hpo_duration_for_model(manifest: dict[str, Any], manifest_path: Path, *, train_rows_h1: float | None) -> dict[str, Any]:
+    hpo_map = manifest.get("training", {}).get("hpo_artifacts_by_target", {})
+    total_s = 0.0
+    trials_with_timing = 0
+    trial_rows_without_timing = 0
+    trial_files = 0
+    for raw in hpo_map.values() if isinstance(hpo_map, dict) else []:
+        hpo_json = Path(str(raw))
+        if not hpo_json.is_absolute():
+            hpo_json = (manifest_path.parent / hpo_json).resolve()
+        trials_csv = hpo_json.with_name(hpo_json.stem + "_trials.csv")
+        if not trials_csv.exists():
+            continue
+        trial_files += 1
+        try:
+            df = pd.read_csv(trials_csv)
+        except Exception:
+            continue
+        if "duration_seconds" not in df.columns:
+            trial_rows_without_timing += int(len(df))
+            continue
+        vals = pd.to_numeric(df["duration_seconds"], errors="coerce").dropna()
+        total_s += float(vals.sum())
+        trials_with_timing += int(vals.shape[0])
+        trial_rows_without_timing += int(len(df) - vals.shape[0])
+    factor = (DEFAULT_TRAINING_DAYS * 24.0 / train_rows_h1) if train_rows_h1 and train_rows_h1 > 0 else np.nan
+    if trials_with_timing:
+        status = "directly recorded"
+    elif trial_files:
+        status = "trials recorded without timing"
+    else:
+        status = "not recorded"
+    return {
+        "hpo_observed_hours": total_s / 3600.0 if trials_with_timing else np.nan,
+        "hpo_scaled_hours_365d": total_s * factor / 3600.0 if trials_with_timing and np.isfinite(factor) else np.nan,
+        "hpo_trials_with_timing": trials_with_timing,
+        "hpo_trial_files_found": trial_files,
+        "hpo_trial_rows_without_timing": trial_rows_without_timing,
+        "hpo_timing_status": status,
+    }
+
+
+def build_computational_cost_table(benchmark_dir: Path) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for manifest_path in _resolve_model_manifest_paths(benchmark_dir):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        run_dir = manifest_path.parent
+        ctx_path = run_dir / str(manifest.get("training", {}).get("context_path", "training_run_context.json"))
+        if not ctx_path.exists():
+            continue
+        try:
+            context = json.loads(ctx_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        model_key, model_label = _model_label_from_type(str(manifest.get("training", {}).get("model_type", "")), str(manifest.get("run_id", "")))
+        data_report_path = run_dir / str(manifest.get("training", {}).get("data_integrity_report_path", "data_integrity_report.json"))
+        train_rows = np.nan
+        train_start = ""
+        train_end = ""
+        if data_report_path.exists():
+            try:
+                report = json.loads(data_report_path.read_text(encoding="utf-8"))
+                train = report.get("da_base_dir_report", {}).get("bundles", {}).get("da", {}).get("files", {}).get("train", {})
+                train_rows = float(train.get("rows", np.nan))
+                train_start = str(train.get("timestamp_min", ""))
+                train_end = str(train.get("timestamp_max", ""))
+            except Exception:
+                pass
+        factor = (DEFAULT_TRAINING_DAYS * 24.0 / train_rows) if np.isfinite(train_rows) and train_rows > 0 else np.nan
+        duration_s = float(context.get("duration_seconds", np.nan))
+        row = {
+            "model": model_key,
+            "model_label": model_label,
+            "run_id": manifest.get("run_id", run_dir.name),
+            "final_training_observed_hours": duration_s / 3600.0 if np.isfinite(duration_s) else np.nan,
+            "final_training_scaled_hours_365d": duration_s * factor / 3600.0 if np.isfinite(duration_s) and np.isfinite(factor) else np.nan,
+            "training_rows_h1": train_rows,
+            "training_days_h1": train_rows / 24.0 if np.isfinite(train_rows) else np.nan,
+            "scaling_factor_to_365d": factor,
+            "train_start_utc": train_start,
+            "train_end_utc": train_end,
+            "runtime_source": str(ctx_path),
+        }
+        row.update(_hpo_duration_for_model(manifest, manifest_path, train_rows_h1=train_rows if np.isfinite(train_rows) else None))
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(by="model", key=lambda s: s.map(lambda value: model_sort_key(value)[0])).reset_index(drop=True)
+
+
+def write_computational_cost_latex_table(costs: pd.DataFrame, *, out_dir: Path) -> Path | None:
+    if costs.empty:
+        return None
+    table = costs.copy()
+    table = sort_model_frame(table, model_col="model_label")
+    path = out_dir / "latex" / "rq1_4_1_1_computational_cost_365d.tex"
+    _latex_table(
+        table,
+        columns=[
+            "model_label",
+            "final_training_observed_hours",
+            "final_training_scaled_hours_365d",
+            "training_days_h1",
+        ],
+        headers=[
+            "Model",
+            "Training observed (h)",
+            "Training scaled to 365d (h)",
+            "Observed train days",
+        ],
+        caption="Computational Cost of Each Model Scaled for 365 Days of Training Data.",
+        label="tab:rq1-4-1-1-computational-cost-365d",
+        path=path,
+    )
+    return path
+
+
+def write_computational_cost_figure(costs: pd.DataFrame, *, out_dir: Path, skip_pdf: bool = False) -> list[Path]:
+    if costs.empty:
+        return []
     import matplotlib.pyplot as plt
 
-    d = primary.copy()
-    for col in ["TFT", "XGB", "RLQR"]:
+    d = costs.dropna(subset=["final_training_scaled_hours_365d"]).copy()
+    if d.empty:
+        return []
+    d = sort_model_frame(d, model_col="model_label")
+    apply_geo_style()
+    colors = [get_model_color(str(m)) for m in d["model"]]
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    training_bars = ax.bar(
+        d["model_label"],
+        d["final_training_scaled_hours_365d"],
+        color=colors,
+        edgecolor=colors,
+        width=0.62,
+        zorder=3,
+        label="Training",
+    )
+    ax.set_ylabel("Time (h)")
+    ax.set_title(thesis_titlecase("Computational Cost of Each Model Scaled for 365 Days of Training Data"))
+    ax.bar_label(training_bars, labels=[f"{v:.2f}" for v in d["final_training_scaled_hours_365d"]], padding=4, fontsize=9)
+    ax.set_ylim(0, max(0.1, float(d["final_training_scaled_hours_365d"].max()) * 1.18))
+    ax.text(
+        0.01,
+        -0.18,
+        "Scaling: observed final-training wall-clock time x (365 days / observed hourly train-days).",
+        transform=ax.transAxes,
+        fontsize=8.5,
+        color=THESIS_PALETTE["neutral_dark"],
+        va="top",
+    )
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths = [fig_dir / "rq1_4_1_1_computational_cost_365d.png"]
+    if not skip_pdf:
+        paths.append(fig_dir / "rq1_4_1_1_computational_cost_365d.pdf")
+    for path in paths:
+        fig.savefig(path)
+    plt.close(fig)
+    return paths
+
+
+def write_relative_pinball_figure(primary: pd.DataFrame, *, out_dir: Path, split: str, skip_pdf: bool = False) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    d = sort_target_frame(primary, target_col="target")
+    for col in MODEL_LABELS:
         d[col] = pd.to_numeric(d[col], errors="coerce")
     d = d[np.isfinite(d["RLQR"]) & (d["RLQR"].abs() > 1e-12)].copy()
     if d.empty:
@@ -558,28 +881,67 @@ def write_relative_pinball_figure(primary: pd.DataFrame, *, out_dir: Path, split
     x = np.arange(len(d), dtype=float)
     width = 0.36
     fig, ax = plt.subplots(figsize=(12, 6))
-    for model, offset in [("TFT", -width / 2), ("XGB", width / 2)]:
+    ax.axhline(1.0, color=get_model_color("linear"), linewidth=1.3, linestyle=":", label="RLQR")
+    for model, offset in [("XGB", -width / 2), ("TFT", width / 2)]:
         rel = d[model].to_numpy(dtype=float) / d["RLQR"].to_numpy(dtype=float)
-        ax.bar(x + offset, rel, width=width, label=model, color=get_model_color(model.lower()), zorder=3)
-    ax.axhline(1.0, color="#333333", linewidth=1.0, linestyle="--", label="RLQR baseline")
+        color = get_model_color(model.lower())
+        ax.bar(x + offset, rel, width=width, label=model, color=color, edgecolor=color, zorder=3)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right")
     ax.set_ylabel("Mean pinball loss relative to RLQR")
-    ax.set_title("Relative mean pinball loss by target (RLQR = 1; lower is better)")
+    ax.set_title(thesis_titlecase("Mean pinball loss by target relative to RLQR"))
     ax.legend(ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.14))
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     png = fig_dir / f"rq1_4_1_1_forecast_metrics_full_relative_pinball_{split}.png"
-    svg = fig_dir / f"rq1_4_1_1_forecast_metrics_full_relative_pinball_{split}.svg"
-    pdf = fig_dir / f"rq1_4_1_1_forecast_metrics_full_relative_pinball_{split}.pdf"
     fig.savefig(png)
-    fig.savefig(svg)
-    fig.savefig(pdf)
+    paths = [png]
+    if not skip_pdf:
+        pdf = fig_dir / f"rq1_4_1_1_forecast_metrics_full_relative_pinball_{split}.pdf"
+        fig.savefig(pdf)
+        paths.append(pdf)
     plt.close(fig)
-    return [png, svg, pdf]
+    return paths
 
 
-def write_outputs(metrics: pd.DataFrame, diagnostics: pd.DataFrame, *, out_dir: Path, split: str) -> list[Path]:
+def write_relative_mae_figure(detailed: pd.DataFrame, *, out_dir: Path, split: str, skip_pdf: bool = False) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    d = sort_target_frame(detailed.loc[detailed["metric"].eq("mae_p50")].copy(), target_col="target")
+    for col in MODEL_LABELS:
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d[np.isfinite(d["RLQR"]) & (d["RLQR"].abs() > 1e-12)].copy()
+    if d.empty:
+        return []
+    apply_geo_style()
+    labels = [_target_label(t) for t in d["target"]]
+    x = np.arange(len(d), dtype=float)
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.axhline(1.0, color=get_model_color("linear"), linewidth=1.3, linestyle=":", label="RLQR")
+    for model, offset in [("XGB", -width / 2), ("TFT", width / 2)]:
+        rel = d[model].to_numpy(dtype=float) / d["RLQR"].to_numpy(dtype=float)
+        color = get_model_color(model.lower())
+        ax.bar(x + offset, rel, width=width, label=model, color=color, edgecolor=color, zorder=3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.set_ylabel("MAE p50 relative to RLQR")
+    ax.set_title(thesis_titlecase("Relative MAE p50 by target (RLQR = 1; lower is better)"))
+    ax.legend(ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.14))
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    png = fig_dir / f"rq1_4_1_1_forecast_metrics_full_relative_mae_p50_{split}.png"
+    fig.savefig(png)
+    paths = [png]
+    if not skip_pdf:
+        pdf = fig_dir / f"rq1_4_1_1_forecast_metrics_full_relative_mae_p50_{split}.pdf"
+        fig.savefig(pdf)
+        paths.append(pdf)
+    plt.close(fig)
+    return paths
+
+
+def write_outputs(metrics: pd.DataFrame, diagnostics: pd.DataFrame, *, benchmark_dir: Path, out_dir: Path, split: str, skip_pdf: bool = False) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_dir = out_dir / "csv"
     csv_dir.mkdir(parents=True, exist_ok=True)
@@ -601,7 +963,18 @@ def write_outputs(metrics: pd.DataFrame, diagnostics: pd.DataFrame, *, out_dir: 
     outputs.extend([primary_path, detailed_path, align_path])
 
     outputs.extend(write_latex_tables(primary, detailed, out_dir=out_dir, split=split))
-    outputs.extend(write_relative_pinball_figure(primary, out_dir=out_dir, split=split))
+    outputs.extend(write_relative_pinball_figure(primary, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
+    outputs.extend(write_relative_mae_figure(detailed, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
+
+    costs = build_computational_cost_table(benchmark_dir)
+    if not costs.empty:
+        cost_csv = csv_dir / "rq1_4_1_1_computational_cost_365d.csv"
+        costs.to_csv(cost_csv, index=False)
+        outputs.append(cost_csv)
+        cost_table = write_computational_cost_latex_table(costs, out_dir=out_dir)
+        if cost_table is not None:
+            outputs.append(cost_table)
+        outputs.extend(write_computational_cost_figure(costs, out_dir=out_dir, skip_pdf=skip_pdf))
 
     manifest = {
         "description": "RQ1 4.1.1 full unweighted forecast metrics. Main-text metric is mean pinball loss only.",
@@ -609,6 +982,8 @@ def write_outputs(metrics: pd.DataFrame, diagnostics: pd.DataFrame, *, out_dir: 
         "row_intersection_key": ROW_INTERSECTION_KEY,
         "metrics": METRICS,
         "main_text_metric": "mean_pinball_loss",
+        "computational_cost_scaling_days": DEFAULT_TRAINING_DAYS,
+        "computational_cost_note": "Thesis-facing computational-cost table and figure report final-training wall-clock only. HPO timing fields remain in the backup CSV for provenance where available.",
         "excluded_from_4_1_1": ["winkler_score", "picp", "pinaw", "coverage", "interval_width", "lead_weighting", "gate_weighting", "tail_weighting"],
         "outputs": [str(p) for p in outputs],
     }
@@ -620,9 +995,9 @@ def write_outputs(metrics: pd.DataFrame, diagnostics: pd.DataFrame, *, out_dir: 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build final RQ1 4.1.1 full unweighted forecast metrics.")
-    p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
+    p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", action="append", default=[])
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_1_full_unweighted")
+    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/4_1_1_full_unweighted")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -630,6 +1005,9 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated splits to load/export. Defaults to test only; --split selects the main reported split.",
     )
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
+    p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
+    p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
+    p.add_argument("--skip-pdf", action="store_true", help="Do not render PDF figures; PNG and LaTeX outputs are still generated.")
     return p.parse_args()
 
 
@@ -641,8 +1019,16 @@ def main() -> int:
         splits.append(args.split)
     benchmark_dirs = _discover_benchmark_dirs(Path(args.benchmark_root), [Path(p) for p in args.benchmark_dir])
     benchmark_dir = benchmark_dirs[0]
-    metrics, diagnostics = build_full_metrics(benchmark_dir=benchmark_dir, models=models, splits=splits)
-    outputs = write_outputs(metrics, diagnostics, out_dir=Path(args.out_dir), split=args.split)
+    eval_origin_start = _parse_utc_bound(args.eval_origin_start)
+    eval_origin_end = _parse_utc_bound(args.eval_origin_end)
+    metrics, diagnostics = build_full_metrics(
+        benchmark_dir=benchmark_dir,
+        models=models,
+        splits=splits,
+        eval_origin_start=eval_origin_start,
+        eval_origin_end=eval_origin_end,
+    )
+    outputs = write_outputs(metrics, diagnostics, benchmark_dir=benchmark_dir, out_dir=Path(args.out_dir), split=args.split, skip_pdf=bool(args.skip_pdf))
     print("[OK] Built RQ1 4.1.1 full unweighted forecast metrics.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     for path in outputs:

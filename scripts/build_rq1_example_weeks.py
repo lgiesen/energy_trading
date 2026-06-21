@@ -19,7 +19,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from energy_trading.visualization.style import apply_geo_style, get_model_color
+from energy_trading.visualization.style import THESIS_PALETTE, apply_geo_style, get_model_color, thesis_titlecase
+from energy_trading.evaluation.rq1_target_order import model_sort_key, sort_target_frame, target_sort_key
 
 
 DEFAULT_HIGH_VOLATILITY_START_UTC = "2025-10-05T22:00:00Z"
@@ -39,12 +40,12 @@ MODEL_KEYS = {
 
 TARGET_LABELS = {
     "pred_da_price": ("DA", "DA price"),
-    "pred_afrr_capacity_price_pos": ("aFRR capacity", "aFRR capacity price positive"),
-    "pred_afrr_capacity_price_neg": ("aFRR capacity", "aFRR capacity price negative"),
-    "pred_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "pred_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "pred_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate positive"),
-    "pred_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate negative"),
+    "pred_afrr_capacity_price_pos": ("aFRR capacity", "aFRR capacity price +"),
+    "pred_afrr_capacity_price_neg": ("aFRR capacity", "aFRR capacity price -"),
+    "pred_afrr_activation_price_pos": ("aFRR activation price", "aFRR activation price +"),
+    "pred_afrr_activation_price_neg": ("aFRR activation price", "aFRR activation price -"),
+    "pred_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
+    "pred_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
 }
 
 QUANTILE_RE = re.compile(r"^p(\d{1,2})$")
@@ -79,7 +80,7 @@ def _parse_models(raw: str) -> list[ModelSpec]:
         out.append(ModelSpec(canonical, label))
     if not out:
         raise ValueError("At least one model is required.")
-    return out
+    return sorted(out, key=lambda model: model_sort_key(model.label))
 
 
 def _parse_quantile(raw: str) -> str:
@@ -252,6 +253,109 @@ def _safe_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_").lower()
 
 
+def _latex_escape(value: Any) -> str:
+    s = str(value)
+    minus_token = "@@RQ1MINUS@@"
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} -", f"{label} {minus_token}")
+        s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
+    for old, new in {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }.items():
+        s = s.replace(old, new)
+    return s.replace(minus_token, "$-$")
+
+
+def _latex_color_name(role: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", role).lower()
+
+
+def _tex_num(value: Any) -> str:
+    try:
+        x = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(x):
+        return "nan"
+    return f"{x:.6g}"
+
+
+def _model_color_name(model_key: str) -> str:
+    return {"tft": "tertiary", "xgb": "primary", "linear": "secondary", "truth": "perfectforesight"}.get(model_key, "neutraldark")
+
+
+def write_example_week_latex(
+    *,
+    view: pd.DataFrame,
+    target_label: str,
+    week: WeekSpec,
+    models: list[ModelSpec],
+    lead_h: float,
+    quantile: str,
+    out_path: Path,
+) -> Path:
+    d = view.copy()
+    d["plot_idx"] = np.arange(len(d), dtype=int)
+    color_lines = [
+        f"\\definecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
+        for role, hex_color in THESIS_PALETTE.items()
+    ]
+    lines = [
+        r"% Requires: \usepackage{pgfplots}",
+        r"% Requires: \usepackage{xcolor}",
+        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+        *color_lines,
+        r"\begin{figure}[htbp]",
+        r"    \centering",
+        r"    \resizebox{\linewidth}{!}{%",
+        r"        \begin{tikzpicture}",
+        r"            \begin{axis}[",
+        r"                width=0.98\textwidth,",
+        r"                height=7cm,",
+        rf"                title={{{_latex_escape(f'{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}')}}},",
+        r"                xlabel={Hour in selected week},",
+        r"                ylabel={Value},",
+        r"                legend style={at={(0.5,1.10)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend cell align={left},",
+        r"                axis lines*=left,",
+        r"                grid=major,",
+        r"            ]",
+    ]
+    truth_coords = " ".join(f"({_tex_num(i)},{_tex_num(y)})" for i, y in zip(d["plot_idx"], d["y_true"]))
+    lines.append(rf"                \addplot[color=perfectforesight, mark=none, line width=1.2pt] coordinates {{{truth_coords}}};")
+    legends = ["Truth"]
+    for model in models:
+        col = f"{model.key}_pred"
+        if col not in d.columns:
+            continue
+        coords = " ".join(f"({_tex_num(i)},{_tex_num(y)})" for i, y in zip(d["plot_idx"], d[col]))
+        lines.append(rf"                \addplot[color={_model_color_name(model.key)}, mark=none, line width=0.9pt] coordinates {{{coords}}};")
+        legends.append(model.label)
+    lines.append("                \\legend{" + ",".join(_latex_escape(x) for x in legends) + "}")
+    lines.extend(
+        [
+            r"            \end{axis}",
+            r"        \end{tikzpicture}}",
+            f"    \\caption{{{_latex_escape(f'{week.label} example-week forecasts for {target_label} at lead {lead_h:g}h and {quantile.upper()}.')}}}",
+            f"    \\label{{fig:rq1-example-week-{_safe_slug(week.key)}-{_safe_slug(target_label)}}}",
+            r"\end{figure}",
+            "",
+        ]
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
 def plot_example_week(
     *,
     view: pd.DataFrame,
@@ -297,7 +401,7 @@ def plot_example_week(
             color=get_model_color(model.key),
             linewidth=1.8,
         )
-    ax.set_title(f"{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}")
+    ax.set_title(thesis_titlecase(f"{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}"))
     ax.set_xlabel(f"Local time ({LOCAL_TZ})")
     ax.set_ylabel("Value")
     ax.tick_params(axis="x", rotation=20)
@@ -325,7 +429,7 @@ def build_example_weeks(
     rows: list[dict[str, Any]] = []
     outputs: list[Path] = []
     figures_dir = out_dir / "figures"
-    for target in targets:
+    for target in sorted(targets, key=target_sort_key):
         target_group, target_label = _target_info(target)
         merged = load_merged_target(
             benchmark_dir=benchmark_dir,
@@ -343,6 +447,7 @@ def build_example_weeks(
                     f"lead={lead_h}, quantile={quantile}."
                 )
             out_path = figures_dir / week.key / f"{_safe_slug(target)}__lead{int(lead_h)}__{quantile}.png"
+            tex_path = figures_dir / week.key / f"{_safe_slug(target)}__lead{int(lead_h)}__{quantile}.tex"
             row = plot_example_week(
                 view=view,
                 target=target,
@@ -354,10 +459,21 @@ def build_example_weeks(
                 window_hours=window_hours,
                 out_path=out_path,
             )
+            write_example_week_latex(
+                view=view,
+                target_label=target_label,
+                week=week,
+                models=models,
+                lead_h=lead_h,
+                quantile=quantile,
+                out_path=tex_path,
+            )
             row["target_group"] = target_group
+            row["latex_path"] = str(tex_path)
             rows.append(row)
             outputs.append(out_path)
-    summary = pd.DataFrame(rows).sort_values(["week", "target_group", "target"]).reset_index(drop=True)
+            outputs.append(tex_path)
+    summary = sort_target_frame(pd.DataFrame(rows), target_col="target", extra_cols=["week"])
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "example_week_metrics.csv"
     summary.to_csv(summary_path, index=False)
@@ -385,9 +501,9 @@ def build_example_weeks(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build RQ1 example-week forecast figures.")
-    p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
+    p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_7_example_weeks")
+    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/4_1_6_example_weeks")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
     p.add_argument("--targets", default="", help="Optional comma-separated prediction targets. Default: all common targets.")

@@ -29,11 +29,14 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from energy_trading.evaluation.style import THESIS_PALETTE, apply_geo_style, get_model_color
+from energy_trading.evaluation.style import THESIS_PALETTE, apply_geo_style, get_model_color, thesis_titlecase
+from energy_trading.evaluation.rq1_target_order import model_sort_key, ordered_unique, sort_target_frame, target_sort_key
 
 
 BERLIN = ZoneInfo("Europe/Berlin")
 QCOL_RE = re.compile(r"^p(\d{1,2})$", re.IGNORECASE)
+DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
+DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
 
 MODEL_KEYS = {
     "tft": ("tft", "TFT"),
@@ -64,12 +67,12 @@ TARGET_ALIASES = {
 
 TARGET_GROUPS = {
     "target_da_price": ("DA price", "DA price"),
-    "target_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price positive"),
-    "target_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price negative"),
-    "target_afrr_activation_price_vwap_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "target_afrr_activation_price_vwap_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate positive"),
-    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate negative"),
+    "target_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price +"),
+    "target_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price -"),
+    "target_afrr_activation_price_vwap_pos": ("aFRR activation price", "aFRR activation price +"),
+    "target_afrr_activation_price_vwap_neg": ("aFRR activation price", "aFRR activation price -"),
+    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
+    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
 }
 
 CAPACITY_TARGETS = {"target_afrr_capacity_price_pos", "target_afrr_capacity_price_neg"}
@@ -126,6 +129,17 @@ BUCKETS = [
         tuple(range(1, 9)),
     ),
 ]
+
+BUCKET_LABELS = {
+    "full_h1_48": "Full horizon (h1--h48)",
+    "short_h1_8": "Short horizon (h1--h8)",
+    "medium_h9_16": "Medium horizon (h9--h16)",
+    "long_h17_48": "Long horizon (h17--h48)",
+}
+
+
+def _bucket_label(bucket: Any) -> str:
+    return BUCKET_LABELS.get(str(bucket), str(bucket))
 
 
 def _parse_models(raw: str) -> list[ModelSpec]:
@@ -250,6 +264,24 @@ def _read_joined(path: Path, *, source_target: str, derive_forecast_time: bool) 
         raise ValueError(f"{path} must contain p50 or predicted_value.")
     df["target"] = canonical_target(source_target)
     return df, warnings
+
+
+def _parse_utc_bound(raw: str | None) -> pd.Timestamp | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    return pd.to_datetime(raw, utc=True)
+
+
+def _apply_forecast_origin_window(df: pd.DataFrame, *, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    if start is None and end is None:
+        return df
+    origin = pd.to_datetime(df["forecast_time_utc"], utc=True, errors="coerce")
+    mask = origin.notna()
+    if start is not None:
+        mask &= origin.ge(start)
+    if end is not None:
+        mask &= origin.le(end)
+    return df.loc[mask].copy()
 
 
 def bucket_mask(df: pd.DataFrame, bucket: str) -> pd.Series:
@@ -380,6 +412,8 @@ def build_gate_bucket_outputs(
     models: list[ModelSpec],
     splits: list[str],
     derive_forecast_time: bool,
+    eval_origin_start: pd.Timestamp | None,
+    eval_origin_end: pd.Timestamp | None,
 ) -> dict[str, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -387,7 +421,7 @@ def build_gate_bucket_outputs(
         parsed = _parse_joined_name(path)
         if parsed is not None:
             files[parsed] = path
-    targets = sorted({target for _, split, target in files if split in set(splits) and canonical_target(target) in ALL_CANONICAL_TARGETS})
+    targets = sorted({target for _, split, target in files if split in set(splits) and canonical_target(target) in ALL_CANONICAL_TARGETS}, key=target_sort_key)
     if not targets:
         raise FileNotFoundError(f"No supported joined prediction parquet files for splits={splits} in {joined_dir}.")
 
@@ -407,6 +441,7 @@ def build_gate_bucket_outputs(
                 if path is None:
                     raise FileNotFoundError(f"Missing joined predictions for model={model.key}, split={split}, target={source_target}.")
                 df, read_warnings = _read_joined(path, source_target=source_target, derive_forecast_time=derive_forecast_time)
+                df = _apply_forecast_origin_window(df, start=eval_origin_start, end=eval_origin_end)
                 for warning in read_warnings:
                     warning_rows.append({**warning, "split": split})
                 loaded[model.key] = df
@@ -501,6 +536,8 @@ def build_gate_bucket_outputs(
                             "quantiles_available": ",".join(_qcol(q) for q in sorted(qmaps[model.key])),
                             "quantiles_used": quantiles_used,
                             "row_intersection_key": "split,target,forecast_time_utc,target_time_utc,lead_time_h",
+                            "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
+                            "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
                         }
                     )
                     eval_df = valid[model.key].merge(key_df, on=["forecast_time_utc", "target_time_utc", "lead_time_h"], how="inner")
@@ -520,16 +557,20 @@ def build_gate_bucket_outputs(
                     )
 
     return {
-        "metrics": pd.DataFrame(metric_rows).sort_values(["split", "bucket", "target_group", "target", "model_label"]).reset_index(drop=True),
-        "row_counts": pd.DataFrame(row_rows).sort_values(["split", "bucket", "target", "model_label"]).reset_index(drop=True),
+        "metrics": sort_target_frame(pd.DataFrame(metric_rows), target_col="target", extra_cols=["split", "bucket", "model_label"]),
+        "row_counts": sort_target_frame(pd.DataFrame(row_rows), target_col="target", extra_cols=["split", "bucket", "model_label"]),
         "definitions": _bucket_definitions_frame(),
-        "observed_leads": pd.DataFrame(lead_rows).sort_values(["split", "bucket", "target"]).reset_index(drop=True),
+        "observed_leads": sort_target_frame(pd.DataFrame(lead_rows), target_col="target", extra_cols=["split", "bucket"]),
         "warnings": pd.DataFrame(warning_rows, columns=["split", "target", "bucket", "severity", "message"]),
     }
 
 
 def _latex_escape(value: Any) -> str:
     s = str(value)
+    minus_token = "@@RQ1MINUS@@"
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} -", f"{label} {minus_token}")
+        s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -543,7 +584,7 @@ def _latex_escape(value: Any) -> str:
         "^": r"\textasciicircum{}",
     }.items():
         s = s.replace(old, new)
-    return s
+    return s.replace(minus_token, "$-$")
 
 
 def _fmt(value: Any) -> str:
@@ -558,8 +599,9 @@ def _main_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     d = metrics.loc[metrics["split"] == split].copy()
     if d.empty:
         return pd.DataFrame()
+    d = sort_target_frame(d, target_col="target", extra_cols=["bucket", "model_label"])
     rows: list[dict[str, Any]] = []
-    for (bucket, target_group), part in d.groupby(["bucket", "target_group"], sort=True):
+    for (bucket, target_group), part in d.groupby(["bucket", "target_group"], sort=False):
         vals = {
             str(label): float(group["mean_pinball_loss"].mean())
             for label, group in part.groupby("model_label")
@@ -570,21 +612,26 @@ def _main_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
             {
                 "bucket": bucket,
                 "target_group": target_group,
-                "TFT": vals.get("TFT", np.nan),
-                "XGB": vals.get("XGB", np.nan),
                 "RLQR": vals.get("RLQR", np.nan),
+                "XGB": vals.get("XGB", np.nan),
+                "TFT": vals.get("TFT", np.nan),
                 "best_model": best,
                 "n_obs": int(part.groupby("model_label")["n_obs"].sum().min()) if not part.empty else 0,
             }
         )
-    return pd.DataFrame(rows).reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["_target_order"] = out["target_group"].map(lambda x: target_sort_key(str(x))[0])
+    out["_bucket_order"] = out["bucket"].map({spec.bucket: i for i, spec in enumerate(BUCKETS)}).fillna(99)
+    return out.sort_values(["_target_order", "_bucket_order"]).drop(columns=["_target_order", "_bucket_order"]).reset_index(drop=True)
 
 
 def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
     table = _main_table(metrics, split=split)
     if table.empty:
         return None
-    headers = ["Bucket", "Target group", "TFT", "XGB", "RLQR", "Best model", "N"]
+    headers = ["Bucket", "Target group", "RLQR", "XGB", "TFT", "Best model", "N"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
@@ -595,11 +642,11 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     ]
     for _, row in table.iterrows():
         vals = [
-            r"\textbf{" + _latex_escape(row["bucket"]) + "}",
+            r"\textbf{" + _latex_escape(_bucket_label(row["bucket"])) + "}",
             _latex_escape(row["target_group"]),
-            _fmt(row["TFT"]),
-            _fmt(row["XGB"]),
             _fmt(row["RLQR"]),
+            _fmt(row["XGB"]),
+            _fmt(row["TFT"]),
             _latex_escape(row["best_model"]),
             str(int(row["n_obs"])),
         ]
@@ -627,28 +674,93 @@ def _plot_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, metric: st
     if d.empty or metric not in d.columns:
         return None
     apply_geo_style()
-    groups = sorted(d["target_group"].dropna().unique())
+    groups = ordered_unique(d["target_group"].dropna().unique(), group=True)
     fig, axes = plt.subplots(len(groups), 1, figsize=(12, max(3.2, 2.7 * len(groups))), sharex=False)
     if len(groups) == 1:
         axes = [axes]
     for ax, group in zip(axes, groups):
         panel = d[d["target_group"] == group].copy()
-        agg = panel.groupby(["bucket", "model", "model_label"], as_index=False).agg(value=(metric, "mean"), n_obs=("n_obs", "sum"))
-        buckets = sorted(agg["bucket"].unique())
+        agg = panel.groupby(["bucket", "model", "model_label"], as_index=False, sort=False).agg(value=(metric, "mean"), n_obs=("n_obs", "sum"))
+        bucket_order = {spec.bucket: i for i, spec in enumerate(BUCKETS)}
+        buckets = sorted(agg["bucket"].unique(), key=lambda b: bucket_order.get(str(b), 99))
         x = np.arange(len(buckets), dtype=float)
         width = 0.24
-        for idx, (model, mg) in enumerate(agg.groupby("model")):
+        models = sorted(agg["model"].dropna().unique(), key=model_sort_key)
+        for idx, model in enumerate(models):
+            mg = agg[agg["model"].eq(model)]
             vals = [float(mg.loc[mg["bucket"] == b, "value"].mean()) for b in buckets]
             ax.bar(x + (idx - 1) * width, vals, width=width, label=str(mg["model_label"].iloc[0]), color=get_model_color(str(model)))
         for i, bucket in enumerate(buckets):
             n = int(agg.loc[agg["bucket"] == bucket, "n_obs"].max()) if not agg.loc[agg["bucket"] == bucket].empty else 0
             ax.text(i, ax.get_ylim()[1] * 0.98, f"n={n}", ha="center", va="top", fontsize=7)
-        ax.set_title(group)
+        ax.set_title(thesis_titlecase(group))
         ax.set_ylabel(ylabel)
         ax.set_xticks(x)
-        ax.set_xticklabels(buckets, rotation=25, ha="right")
+        ax.set_xticklabels([_bucket_label(bucket) for bucket in buckets], rotation=25, ha="right")
         ax.legend(ncol=3, loc="upper left")
-    fig.suptitle(f"{ylabel} by gate/actionable bucket ({split}; lower is better except coverage)", y=1.01)
+    fig.suptitle(thesis_titlecase(f"{ylabel} by gate/actionable bucket ({split}; lower is better except coverage)"), y=1.01)
+    fig.tight_layout()
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    path = fig_dir / filename
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str, filename: str) -> Path | None:
+    import matplotlib.pyplot as plt
+
+    d = metrics.loc[metrics["split"] == split].copy()
+    required = {"target_group", "bucket", "model", "model_label", "mean_pinball_loss", "n_obs"}
+    if d.empty or not required.issubset(d.columns):
+        return None
+    apply_geo_style()
+    groups = ordered_unique(d["target_group"].dropna().unique(), group=True)
+    fig, axes = plt.subplots(len(groups), 1, figsize=(12, max(3.2, 2.7 * len(groups))), sharex=False)
+    if len(groups) == 1:
+        axes = [axes]
+    bucket_order = {spec.bucket: i for i, spec in enumerate(BUCKETS)}
+    for ax, group in zip(axes, groups):
+        panel = d[d["target_group"].eq(group)].copy()
+        agg = panel.groupby(["bucket", "model_label"], as_index=False, sort=False).agg(
+            value=("mean_pinball_loss", "mean"),
+            n_obs=("n_obs", "sum"),
+        )
+        pivot = agg.pivot_table(index="bucket", columns="model_label", values="value", aggfunc="mean").reset_index()
+        counts = agg.groupby("bucket", as_index=False)["n_obs"].max()
+        pivot = pivot.merge(counts, on="bucket", how="left")
+        if "RLQR" not in pivot.columns:
+            continue
+        pivot = pivot[pd.to_numeric(pivot["RLQR"], errors="coerce").notna() & pd.to_numeric(pivot["RLQR"], errors="coerce").ne(0)].copy()
+        if pivot.empty:
+            continue
+        buckets = sorted(pivot["bucket"].dropna().unique(), key=lambda b: bucket_order.get(str(b), 99))
+        x = np.arange(len(buckets), dtype=float)
+        width = 0.32
+        ax.axhline(1.0, color=get_model_color("linear"), linewidth=1.4, linestyle=":", label="RLQR")
+        for idx, (label, model_key) in enumerate([("XGB", "xgb"), ("TFT", "tft")]):
+            if label not in pivot.columns:
+                continue
+            vals: list[float] = []
+            for bucket in buckets:
+                row = pivot[pivot["bucket"].eq(bucket)]
+                if row.empty:
+                    vals.append(float("nan"))
+                    continue
+                denom = float(row["RLQR"].iloc[0])
+                value = float(row[label].iloc[0]) if pd.notna(row[label].iloc[0]) else float("nan")
+                vals.append(value / denom if np.isfinite(denom) and abs(denom) > 1e-12 else float("nan"))
+            ax.bar(x + (idx - 0.5) * width, vals, width=width, label=label, color=get_model_color(model_key))
+        for i, bucket in enumerate(buckets):
+            n = int(pivot.loc[pivot["bucket"] == bucket, "n_obs"].max()) if not pivot.loc[pivot["bucket"] == bucket].empty else 0
+            ax.text(i, ax.get_ylim()[1] * 0.98, f"n={n}", ha="center", va="top", fontsize=7)
+        ax.set_title(thesis_titlecase(group))
+        ax.set_ylabel("Mean pinball loss relative to RLQR")
+        ax.set_xticks(x)
+        ax.set_xticklabels([_bucket_label(bucket) for bucket in buckets], rotation=25, ha="right")
+        ax.legend(ncol=3, loc="upper left")
+    fig.suptitle(thesis_titlecase("Gate-specific relative mean pinball loss (RLQR = 1)"), y=1.01)
     fig.tight_layout()
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -665,8 +777,8 @@ def _plot_observed_leads(observed: pd.DataFrame, *, out_dir: Path, split: str) -
     if d.empty:
         return None
     apply_geo_style()
-    d["label"] = d["bucket"] + " | " + d["target_group"]
-    d = d.sort_values(["bucket", "target_group", "target"])
+    d["label"] = d["bucket"].map(_bucket_label) + " | " + d["target_group"]
+    d = sort_target_frame(d, target_col="target", extra_cols=["bucket"])
     y = np.arange(len(d), dtype=float)
     fig, ax = plt.subplots(figsize=(12, max(4, 0.28 * len(d))))
     mins = pd.to_numeric(d["observed_lead_min"], errors="coerce")
@@ -677,7 +789,7 @@ def _plot_observed_leads(observed: pd.DataFrame, *, out_dir: Path, split: str) -
     ax.set_yticks(y)
     ax.set_yticklabels(d["label"])
     ax.set_xlabel("Observed lead hour")
-    ax.set_title("Observed lead ranges by gate/actionable bucket")
+    ax.set_title(thesis_titlecase("Observed lead ranges by gate/actionable bucket"))
     ax.set_xlim(0, 49)
     fig.tight_layout()
     fig_dir = out_dir / "figures"
@@ -709,7 +821,7 @@ def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str
     if tex is not None:
         paths.append(tex)
     for p in [
-        _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mean_pinball_loss", filename="gate_bucket_pinball_by_target_group.png", ylabel="Mean pinball loss"),
+        _plot_relative_pinball(outputs["metrics"], out_dir=out_dir, split=split, filename="gate_bucket_pinball_by_target_group.png"),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mae_p50", filename="gate_bucket_mae_p50_by_target_group.png", ylabel="MAE p50"),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="coverage_p10_p90", filename="gate_bucket_coverage_p10_p90_by_target_group.png", ylabel="p10-p90 empirical coverage"),
         _plot_observed_leads(outputs["observed_leads"], out_dir=out_dir, split=split),
@@ -750,10 +862,10 @@ def _mirror_structured(paths: list[Path], *, root_out_dir: Path, structured_out_
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build final RQ1 gate-specific actionable bucket benchmark outputs.")
-    p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
+    p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/shared")
-    p.add_argument("--structured-out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_4_gate_specific")
+    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/shared")
+    p.add_argument("--structured-out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/4_1_4_gate_specific")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -761,7 +873,9 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated splits to load/export. Defaults to test only; --split selects the main reported split.",
     )
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
-    p.add_argument("--derive-forecast-time-from-lead", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--derive-forecast-time-from-lead", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
+    p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--no-structured-copy", action="store_true")
     return p.parse_args()
 
@@ -781,6 +895,8 @@ def main() -> int:
         models=models,
         splits=splits,
         derive_forecast_time=bool(args.derive_forecast_time_from_lead),
+        eval_origin_start=_parse_utc_bound(args.eval_origin_start),
+        eval_origin_end=_parse_utc_bound(args.eval_origin_end),
     )
     structured_out_dir = None if args.no_structured_copy else Path(args.structured_out_dir)
     paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, structured_out_dir=structured_out_dir)

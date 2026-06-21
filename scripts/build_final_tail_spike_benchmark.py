@@ -27,11 +27,14 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from energy_trading.evaluation.style import THESIS_PALETTE, apply_geo_style, get_model_color
+from energy_trading.evaluation.style import THESIS_PALETTE, apply_geo_style, get_model_color, thesis_titlecase
+from energy_trading.evaluation.rq1_target_order import model_sort_key, ordered_model_labels, sort_target_frame, target_sort_key
 
 
 QCOL_RE = re.compile(r"^p(\d{1,2})$", re.IGNORECASE)
 EPSILON_DEFAULT = 1e-9
+DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
+DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
 
 MODEL_KEYS = {
     "tft": ("tft", "TFT"),
@@ -62,12 +65,12 @@ TARGET_ALIASES = {
 
 TARGET_GROUPS = {
     "target_da_price": ("DA price", "DA price"),
-    "target_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price positive"),
-    "target_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price negative"),
-    "target_afrr_activation_price_vwap_pos": ("aFRR activation price", "aFRR activation price positive"),
-    "target_afrr_activation_price_vwap_neg": ("aFRR activation price", "aFRR activation price negative"),
-    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate positive"),
-    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate negative"),
+    "target_afrr_capacity_price_pos": ("aFRR capacity price", "aFRR capacity price +"),
+    "target_afrr_capacity_price_neg": ("aFRR capacity price", "aFRR capacity price -"),
+    "target_afrr_activation_price_vwap_pos": ("aFRR activation price", "aFRR activation price +"),
+    "target_afrr_activation_price_vwap_neg": ("aFRR activation price", "aFRR activation price -"),
+    "target_afrr_activation_rate_pos": ("aFRR activation rate", "aFRR activation rate +"),
+    "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
 }
 
 REGIME_LABELS = {
@@ -101,7 +104,8 @@ TARGET_GROUP_ORDER = [
     "aFRR activation rate",
 ]
 
-MODEL_ORDER = {"xgb": 0, "tft": 1, "linear": 2}
+MODEL_ORDER = {"linear": 0, "xgb": 1, "tft": 2}
+REGIME_ORDER = {regime: i for i, regime in enumerate(REGIME_LABELS)}
 
 DA_TARGET = "target_da_price"
 ACTIVATION_PRICE_TARGETS = {"target_afrr_activation_price_vwap_pos", "target_afrr_activation_price_vwap_neg"}
@@ -256,6 +260,24 @@ def _read_joined(path: Path, *, source_target: str, derive_forecast_time: bool) 
     return df
 
 
+def _parse_utc_bound(raw: str | None) -> pd.Timestamp | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    return pd.to_datetime(raw, utc=True)
+
+
+def _apply_forecast_origin_window(df: pd.DataFrame, *, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    if start is None and end is None:
+        return df
+    origin = pd.to_datetime(df["forecast_time_utc"], utc=True, errors="coerce")
+    mask = origin.notna()
+    if start is not None:
+        mask &= origin.ge(start)
+    if end is not None:
+        mask &= origin.le(end)
+    return df.loc[mask].copy()
+
+
 def _pinball_values(y: np.ndarray, pred: np.ndarray, q: float) -> np.ndarray:
     err = y - pred
     return np.maximum(q * err, (q - 1.0) * err)
@@ -320,7 +342,7 @@ def compute_target_thresholds(
     epsilon: float,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for target, df in sorted(reference_by_target.items()):
+    for target, df in sorted(reference_by_target.items(), key=lambda item: target_sort_key(item[0])):
         y = pd.to_numeric(df["y_true"], errors="coerce")
         group, _ = _target_info(target)
         if target == DA_TARGET:
@@ -373,9 +395,10 @@ def regime_masks_for_target(df: pd.DataFrame, thresholds: pd.DataFrame, *, epsil
 
 def select_high_volatility_weeks(base: pd.DataFrame, *, top_share: float = 0.10) -> pd.DataFrame:
     d = base.copy()
+    d = sort_target_frame(d, target_col="target", extra_cols=["split"])
     d["week_start_utc"] = _week_start_utc(d["target_time_utc"])
     rows: list[pd.DataFrame] = []
-    for (split, target_group), part in d.groupby(["split", "target_group"], sort=True):
+    for (split, target_group), part in d.groupby(["split", "target_group"], sort=False):
         weekly = part.groupby("week_start_utc", as_index=False).agg(
             volatility_score=("y_true", "std"),
             n_rows=("y_true", "size"),
@@ -393,7 +416,8 @@ def select_high_volatility_weeks(base: pd.DataFrame, *, top_share: float = 0.10)
 
 def select_spike_weeks(base: pd.DataFrame, thresholds: pd.DataFrame, *, epsilon: float, top_share: float = 0.10) -> pd.DataFrame:
     parts = []
-    for target, part in base.groupby("target", sort=True):
+    base = sort_target_frame(base, target_col="target", extra_cols=["split"])
+    for target, part in base.groupby("target", sort=False):
         masks = regime_masks_for_target(part, thresholds, epsilon=epsilon)
         event_masks = [m for name, m in masks.items() if name != "normal"]
         event = pd.concat(event_masks, axis=1).any(axis=1) if event_masks else part["y_true"].abs().ge(part["y_true"].abs().quantile(0.95))
@@ -403,9 +427,10 @@ def select_spike_weeks(base: pd.DataFrame, thresholds: pd.DataFrame, *, epsilon:
     if not parts:
         return pd.DataFrame()
     d = pd.concat(parts, ignore_index=True)
+    d = sort_target_frame(d, target_col="target", extra_cols=["split"])
     d["week_start_utc"] = _week_start_utc(d["target_time_utc"])
     rows: list[pd.DataFrame] = []
-    for (split, target_group), part in d.groupby(["split", "target_group"], sort=True):
+    for (split, target_group), part in d.groupby(["split", "target_group"], sort=False):
         weekly = part.groupby("week_start_utc", as_index=False).agg(
             spike_count=("event", "sum"),
             n_rows=("event", "size"),
@@ -474,6 +499,8 @@ def build_tail_spike_outputs(
     main_split: str,
     epsilon: float,
     derive_forecast_time: bool,
+    eval_origin_start: pd.Timestamp | None,
+    eval_origin_end: pd.Timestamp | None,
 ) -> dict[str, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -481,7 +508,7 @@ def build_tail_spike_outputs(
         parsed = _parse_joined_name(path)
         if parsed is not None:
             files[parsed] = path
-    source_targets = sorted({target for _, split, target in files if split in set(splits) and canonical_target(target) in ALL_TARGETS})
+    source_targets = sorted({target for _, split, target in files if split in set(splits) and canonical_target(target) in ALL_TARGETS}, key=target_sort_key)
     if not source_targets:
         raise FileNotFoundError(f"No supported joined prediction files for splits={splits} in {joined_dir}.")
 
@@ -496,7 +523,11 @@ def build_tail_spike_outputs(
                 path = files.get((model.key, split, source_target))
                 if path is None:
                     continue
-                df = _read_joined(path, source_target=source_target, derive_forecast_time=derive_forecast_time)
+                df = _apply_forecast_origin_window(
+                    _read_joined(path, source_target=source_target, derive_forecast_time=derive_forecast_time),
+                    start=eval_origin_start,
+                    end=eval_origin_end,
+                )
                 loaded[(model.key, split, canonical)] = df
                 qmaps[(model.key, split, canonical)] = _quantile_cols(df)
                 if 0.50 not in qmaps[(model.key, split, canonical)]:
@@ -522,7 +553,7 @@ def build_tail_spike_outputs(
     metric_rows: list[dict[str, Any]] = []
     row_rows: list[dict[str, Any]] = []
     point_rows: list[pd.DataFrame] = []
-    targets = sorted({target for _, _, target in loaded})
+    targets = sorted({target for _, _, target in loaded}, key=target_sort_key)
     for split in splits:
         for target in targets:
             if not all((m.key, split, target) in loaded for m in models):
@@ -585,6 +616,8 @@ def build_tail_spike_outputs(
                             "quantiles_available": ",".join(_qcol(q) for q in sorted(qmaps[(model.key, split, target)])),
                             "quantiles_used": quantiles_used,
                             "row_intersection_key": "split,target,forecast_time_utc,target_time_utc,lead_time_h",
+                            "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
+                            "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
                         }
                     )
                     eval_df = valid[model.key].merge(key_df, on=["forecast_time_utc", "target_time_utc", "lead_time_h"], how="inner")
@@ -629,8 +662,8 @@ def build_tail_spike_outputs(
                     point_rows.append(points)
 
     return {
-        "metrics": pd.DataFrame(metric_rows).sort_values(["split", "target_group", "target", "regime", "model_label"]).reset_index(drop=True),
-        "row_counts": pd.DataFrame(row_rows).sort_values(["split", "target", "regime", "model_label"]).reset_index(drop=True),
+        "metrics": sort_target_frame(pd.DataFrame(metric_rows), target_col="target", extra_cols=["split", "regime", "model_label"]),
+        "row_counts": sort_target_frame(pd.DataFrame(row_rows), target_col="target", extra_cols=["split", "regime", "model_label"]),
         "definitions": _regime_definitions(),
         "thresholds": thresholds,
         "selected_weeks": selected_weeks,
@@ -641,6 +674,10 @@ def build_tail_spike_outputs(
 
 def _latex_escape(value: Any) -> str:
     s = str(value)
+    minus_token = "@@RQ1MINUS@@"
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} -", f"{label} {minus_token}")
+        s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -654,7 +691,7 @@ def _latex_escape(value: Any) -> str:
         "^": r"\textasciicircum{}",
     }.items():
         s = s.replace(old, new)
-    return s
+    return s.replace(minus_token, "$-$")
 
 
 def _fmt(value: Any) -> str:
@@ -670,7 +707,8 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     if d.empty:
         return None
     rows: list[dict[str, Any]] = []
-    for (target_group, regime), part in d.groupby(["target_group", "regime"], sort=True):
+    d = sort_target_frame(d, target_col="target", extra_cols=["regime", "model_label"])
+    for (target_group, regime), part in d.groupby(["target_group", "regime"], sort=False):
         vals = {str(label): float(g["mean_pinball_loss"].mean()) for label, g in part.groupby("model_label")}
         best = min(vals, key=vals.get) if vals else ""
         rows.append(
@@ -679,20 +717,19 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
                 "target_group_label": str(target_group),
                 "regime": regime,
                 "regime_label": _clean_regime_label(regime),
-                "TFT": vals.get("TFT", np.nan),
-                "XGB": vals.get("XGB", np.nan),
                 "RLQR": vals.get("RLQR", np.nan),
+                "XGB": vals.get("XGB", np.nan),
+                "TFT": vals.get("TFT", np.nan),
                 "best_model": best,
                 "n_obs": int(part.groupby("model_label")["n_obs"].sum().min()),
                 "main_issue": _main_issue(regime),
             }
         )
     table = pd.DataFrame(rows)
-    table = table.sort_values(
-        by=["target_group", "regime_label"],
-        key=lambda s: s.map(_target_group_sort_key) if s.name == "target_group" else s,
-    )
-    headers = ["Regime", "Target group", "TFT", "XGB", "RLQR", "Best model", "N", "Main issue"]
+    table["_target_group_order"] = table["target_group"].map(lambda x: _target_group_sort_key(x)[0])
+    table["_regime_order"] = table["regime"].map(lambda x: REGIME_ORDER.get(str(x), 99))
+    table = table.sort_values(["_target_group_order", "_regime_order"]).drop(columns=["_target_group_order", "_regime_order"])
+    headers = ["Regime", "Target group", "RLQR", "XGB", "TFT", "Best model", "N", "Main issue"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
@@ -708,9 +745,9 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
                 [
                     _latex_escape(row["regime_label"]),
                     r"\textbf{" + _latex_escape(row["target_group_label"]) + "}",
-                    _fmt(row["TFT"]),
-                    _fmt(row["XGB"]),
                     _fmt(row["RLQR"]),
+                    _fmt(row["XGB"]),
+                    _fmt(row["TFT"]),
                     _latex_escape(row["best_model"]),
                     str(int(row["n_obs"])),
                     _latex_escape(row["main_issue"]),
@@ -747,20 +784,22 @@ def _plot_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, metric: st
         axes = [axes]
     for ax, group in zip(axes, groups):
         p = d[d["target_group"].eq(group)].copy()
-        agg = p.groupby(["regime", "model", "model_label"], as_index=False).agg(value=(metric, "mean"), n_obs=("n_obs", "sum"))
-        regimes = sorted(agg["regime"].unique())
+        agg = p.groupby(["regime", "model", "model_label"], as_index=False, sort=False).agg(value=(metric, "mean"), n_obs=("n_obs", "sum"))
+        regimes = sorted(agg["regime"].unique(), key=lambda r: REGIME_ORDER.get(str(r), 99))
         x = np.arange(len(regimes), dtype=float)
         width = 0.24
-        for i, (model, mg) in enumerate(agg.groupby("model")):
+        models = sorted(agg["model"].dropna().unique(), key=model_sort_key)
+        for i, model in enumerate(models):
+            mg = agg[agg["model"].eq(model)]
             vals = [float(mg.loc[mg["regime"].eq(r), "value"].mean()) for r in regimes]
             ax.bar(x + (i - 1) * width, vals, width=width, label=str(mg["model_label"].iloc[0]), color=get_model_color(str(model)))
-        ax.set_title(group)
+        ax.set_title(thesis_titlecase(group))
         ax.set_ylabel(ylabel)
         ax.set_xticks(x)
         labels = [_clean_regime_label(r) for r in regimes]
         ax.set_xticklabels(labels, rotation=25, ha="right")
         ax.legend(ncol=3, loc="upper left")
-    fig.suptitle(f"{ylabel} by tail/spike regime ({split})", y=1.01)
+    fig.suptitle(thesis_titlecase(f"{ylabel} by tail/spike regime ({split})"), y=1.01)
     fig.tight_layout()
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -789,7 +828,7 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) 
     counts = d.groupby(["target_group", "target", "regime", "model_label"], as_index=False)["n_obs"].min()
     n_by_key = counts.groupby(["target_group", "target", "regime"], as_index=False)["n_obs"].min()
     pivot = pivot.merge(n_by_key, on=["target_group", "target", "regime"], how="left")
-    for label in ["TFT", "XGB"]:
+    for label in ["XGB", "TFT"]:
         if label not in pivot.columns:
             continue
         part = pivot.loc[pivot["RLQR"].notna() & pivot[label].notna() & pivot["RLQR"].ne(0)].copy()
@@ -808,31 +847,31 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) 
         axes = [axes]
     for ax, group in zip(axes, groups):
         p = rel[rel["target_group"].eq(group)].copy()
-        agg = p.groupby(["regime", "model", "model_label"], as_index=False).agg(
+        agg = p.groupby(["regime", "model", "model_label"], as_index=False, sort=False).agg(
             value=("relative_pinball", "mean"),
             n_obs=("n_obs", "min"),
         )
-        regimes = sorted(agg["regime"].unique(), key=lambda r: _clean_regime_label(r))
+        regimes = sorted(agg["regime"].unique(), key=lambda r: REGIME_ORDER.get(str(r), 99))
         x = np.arange(len(regimes), dtype=float)
         width = 0.32
-        for i, label in enumerate(["TFT", "XGB"]):
+        ax.axhline(1.0, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=1.5, label="RLQR baseline")
+        for i, label in enumerate(["XGB", "TFT"]):
             mg = agg[agg["model_label"].eq(label)]
             if mg.empty:
                 continue
             vals = [float(mg.loc[mg["regime"].eq(r), "value"].mean()) if mg["regime"].eq(r).any() else np.nan for r in regimes]
             model_key = "tft" if label == "TFT" else "xgb"
             ax.bar(x + (i - 0.5) * width, vals, width=width, label=label, color=get_model_color(model_key))
-        ax.axhline(1.0, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=1.5, label="RLQR baseline")
         n_labels = []
         for regime in regimes:
             n = agg.loc[agg["regime"].eq(regime), "n_obs"].min()
             n_labels.append(f"{_clean_regime_label(regime)}\nN={int(n)}" if pd.notna(n) else _clean_regime_label(regime))
-        ax.set_title(str(group))
+        ax.set_title(thesis_titlecase(str(group)))
         ax.set_ylabel("Mean pinball / RLQR")
         ax.set_xticks(x)
         ax.set_xticklabels(n_labels, rotation=25, ha="right")
         ax.legend(ncol=3, loc="upper left")
-    fig.suptitle(f"Tail/spike mean pinball loss relative to RLQR ({split})", y=1.01)
+    fig.suptitle(thesis_titlecase(f"Tail/spike mean pinball loss relative to RLQR ({split})"), y=1.01)
     fig.tight_layout()
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -850,7 +889,7 @@ def _plot_hexbin(metrics_source: pd.DataFrame, *, out_dir: Path) -> Path | None:
     apply_geo_style()
     d = metrics_source.copy()
     groups = sorted(d["target_group"].dropna().unique(), key=_target_group_sort_key)
-    models = [m for m in ["XGB", "TFT", "RLQR"] if m in set(d["model_label"])]
+    models = [m for m in ordered_model_labels(d["model_label"].dropna().unique()) if m in set(d["model_label"])]
     if not groups or not models:
         return None
     fig, axes = plt.subplots(len(groups), len(models), figsize=(4.2 * len(models), 3.2 * len(groups)), squeeze=False)
@@ -865,10 +904,10 @@ def _plot_hexbin(metrics_source: pd.DataFrame, *, out_dir: Path) -> Path | None:
             lo = float(np.nanmin([p["y_true"].min(), p["p50"].min()]))
             hi = float(np.nanmax([p["y_true"].max(), p["p50"].max()]))
             ax.plot([lo, hi], [lo, hi], linestyle="--", color=THESIS_PALETTE["neutral_dark"], linewidth=1.2)
-            ax.set_title(f"{group}: {model_label}")
+            ax.set_title(thesis_titlecase(f"{group}: {model_label}"))
             ax.set_xlabel("Truth")
             ax.set_ylabel("p50 forecast")
-    fig.suptitle("Truth vs p50 forecast density by target group", y=1.01)
+    fig.suptitle(thesis_titlecase("Truth vs p50 forecast density by target group"), y=1.01)
     fig.tight_layout()
     path = out_dir / "figures" / "tail_spike_true_vs_p50_hexbin.png"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -890,7 +929,7 @@ def _plot_residual_distribution(metrics_source: pd.DataFrame, *, out_dir: Path) 
         subset=["model", "target_group", "target", "regime_class", "forecast_time_utc", "target_time_utc", "lead_time_h"]
     )
     groups = sorted(d["target_group"].dropna().unique(), key=_target_group_sort_key)
-    models = [m for m in ["XGB", "TFT", "RLQR"] if m in set(d["model_label"])]
+    models = [m for m in ordered_model_labels(d["model_label"].dropna().unique()) if m in set(d["model_label"])]
     if not groups or not models:
         return []
     fig, axes = plt.subplots(len(groups), len(models), figsize=(4.2 * len(models), 3.0 * len(groups)), squeeze=False)
@@ -915,11 +954,11 @@ def _plot_residual_distribution(metrics_source: pd.DataFrame, *, out_dir: Path) 
                     color=colors[regime_class],
                 )
             ax.axvline(0.0, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=1.1)
-            ax.set_title(f"{group}: {model_label}")
+            ax.set_title(thesis_titlecase(f"{group}: {model_label}"))
             ax.set_xlabel("p50 prediction - realized value")
             ax.set_ylabel("Density")
             ax.legend(fontsize=8)
-    fig.suptitle("Residual distribution in normal vs tail/spike regimes", y=1.01)
+    fig.suptitle(thesis_titlecase("Residual distribution in normal vs tail/spike regimes"), y=1.01)
     fig.tight_layout()
     path = out_dir / "figures" / "tail_spike_residual_distribution_by_regime.png"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -943,11 +982,11 @@ def _plot_residual_distribution(metrics_source: pd.DataFrame, *, out_dir: Path) 
                     continue
                 ax.hist(g["residual"], bins=35, alpha=0.38, label=regime_class, density=True, color=colors[regime_class])
             ax.axvline(0.0, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=1.1)
-            ax.set_title(model_label)
+            ax.set_title(thesis_titlecase(model_label))
             ax.set_xlabel("p50 prediction - realized value")
             ax.set_ylabel("Density")
             ax.legend(fontsize=8)
-        fig_g.suptitle(f"Residual distribution: {group}", y=1.01)
+        fig_g.suptitle(thesis_titlecase(f"Residual distribution: {group}"), y=1.01)
         fig_g.tight_layout()
         group_path = out_dir / "figures" / f"tail_spike_residual_distribution_{_target_group_slug(group)}.png"
         fig_g.savefig(group_path)
@@ -981,7 +1020,7 @@ def plot_forecast_band_example(df: pd.DataFrame, *, out_path: Path, lead: int | 
         ax.fill_between(x, d["p10"], d["p90"], color=THESIS_PALETTE["secondary"], alpha=0.22, label="p10-p90")
     if {"p30", "p70"} <= set(d.columns):
         ax.fill_between(x, d["p30"], d["p70"], color=THESIS_PALETTE["tertiary"], alpha=0.18, label="p30-p70")
-    ax.set_title(f"Forecast-band example ({selector})")
+    ax.set_title(thesis_titlecase(f"Forecast-band example ({selector})"))
     ax.set_xlabel("Target time")
     ax.set_ylabel("Value")
     ax.legend(ncol=4, loc="upper left")
@@ -998,7 +1037,7 @@ def _plot_selected_week_band(points: pd.DataFrame, selected_weeks: pd.DataFrame,
     weeks = selected_weeks.loc[selected_weeks["split"].eq(split)].copy()
     if weeks.empty:
         return None
-    week = weeks.sort_values(["selection_type", "target_group", "week_start_utc"]).iloc[0]
+    week = sort_target_frame(weeks, target_col="target_group", extra_cols=["selection_type", "week_start_utc"]).iloc[0]
     start = pd.to_datetime(week["week_start_utc"], utc=True)
     end = start + pd.Timedelta(days=7)
     d = points.loc[
@@ -1092,10 +1131,10 @@ def _mirror_structured(paths: list[Path], *, root_out_dir: Path, structured_out_
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build final RQ1 tail/spike benchmark outputs.")
-    p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
+    p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark/_raw_outputs/shared")
-    p.add_argument("--structured-out-dir", default="artifacts/final_benchmark/_raw_outputs/4_1_5_tail_spike")
+    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/shared")
+    p.add_argument("--structured-out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/4_1_5_tail_spike")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -1106,7 +1145,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
     p.add_argument("--epsilon", type=float, default=EPSILON_DEFAULT)
-    p.add_argument("--derive-forecast-time-from-lead", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--derive-forecast-time-from-lead", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
+    p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--no-structured-copy", action="store_true")
     return p.parse_args()
 
@@ -1125,6 +1166,8 @@ def main() -> int:
         main_split=args.split,
         epsilon=float(args.epsilon),
         derive_forecast_time=bool(args.derive_forecast_time_from_lead),
+        eval_origin_start=_parse_utc_bound(args.eval_origin_start),
+        eval_origin_end=_parse_utc_bound(args.eval_origin_end),
     )
     structured_out_dir = None if args.no_structured_copy else Path(args.structured_out_dir)
     paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, structured_out_dir=structured_out_dir)

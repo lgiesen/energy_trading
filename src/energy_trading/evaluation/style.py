@@ -15,4 +15,5 @@ from energy_trading.visualization.style import (  # noqa: F401
     get_backtest_line_style,
     get_color,
     get_model_color,
+    thesis_titlecase,
 )

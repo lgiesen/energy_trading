@@ -10,17 +10,41 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPLIT = "test"
 DEFAULT_SPLITS = "test"
 DEFAULT_MODELS = "tft,xgboost,linear"
+DEFAULT_BENCHMARK_DIR = "artifacts/rq1_ml_model_benchmark"
+DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
+DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
+DEFAULT_EXPORT_DIR = (
+    "/Users/leori/Desktop/ uni/3 Master IS/25 MA/"
+    "MA___Elevated_Energy_Trading__Forecasting_Expected_Profit_From_Participating_in_the_Day_Ahead_and_Balancing_Markets/"
+    "figures/4-results/rq1_ml_model_benchmark"
+)
+JOINED_TARGETS = [
+    "pred_da_price",
+    "pred_afrr_capacity_price_pos",
+    "pred_afrr_capacity_price_neg",
+    "pred_afrr_activation_price_pos",
+    "pred_afrr_activation_price_neg",
+    "pred_afrr_activation_rate_pos",
+    "pred_afrr_activation_rate_neg",
+]
+MODEL_JOINED_KEYS = {
+    "tft": "tft",
+    "xgb": "xgb",
+    "xgboost": "xgb",
+    "linear": "linear",
+    "rlqr": "linear",
+}
 
 
 def _split_csv(raw: str) -> list[str]:
@@ -59,11 +83,155 @@ def _run_step(name: str, cmd: list[str], *, log_dir: Path) -> dict[str, Any]:
     }
 
 
+def _export_output_tree(source: Path, destination: Path) -> None:
+    if not source.is_dir():
+        raise FileNotFoundError(f"Cannot export missing RQ1 output directory: {source}")
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination)
+
+
+def _prune_extensions(root: Path, suffixes: set[str]) -> dict[str, int]:
+    if not suffixes or not root.exists():
+        return {}
+    counts = {suffix: 0 for suffix in sorted(suffixes)}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in suffixes:
+            continue
+        path.unlink()
+        counts[suffix] += 1
+    return counts
+
+
+def _prune_subsection_extensions(root: Path, suffixes: set[str]) -> dict[str, int]:
+    if not suffixes or not root.exists():
+        return {}
+    counts = {suffix: 0 for suffix in sorted(suffixes)}
+    subsection_dirs = [
+        root / "4_1_1_full_unweighted",
+        root / "4_1_2_calibration_uncertainty",
+        root / "4_1_3_per_lead",
+        root / "4_1_4_gate_specific",
+        root / "4_1_5_tail_spike",
+        root / "4_1_6_example_weeks",
+    ]
+    for subsection in subsection_dirs:
+        if not subsection.exists():
+            continue
+        for path in sorted(subsection.rglob("*")):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix not in suffixes:
+                continue
+            path.unlink()
+            counts[suffix] += 1
+    return counts
+
+
+def _remove_pruned_manifest_entries(root: Path, suffixes: set[str]) -> int:
+    if not suffixes:
+        return 0
+    manifest_path = root / "rq1_output_manifest.json"
+    if not manifest_path.exists():
+        return 0
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, list):
+        return 0
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for entry in outputs:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
+        path = Path(str(entry.get("path", "")))
+        should_prune = path.suffix.lower() in suffixes
+        if should_prune and not path.exists():
+            removed += 1
+            continue
+        kept.append(entry)
+    if removed:
+        manifest["outputs"] = kept
+        manifest["pruned_manifest_entries"] = {
+            **dict(manifest.get("pruned_manifest_entries", {})),
+            **{suffix: sum(1 for entry in outputs if isinstance(entry, dict) and Path(str(entry.get("path", ""))).suffix.lower() == suffix and not Path(str(entry.get("path", ""))).exists()) for suffix in sorted(suffixes)},
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return removed
+
+
+def _canonical_model_keys(raw: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in _split_csv(raw):
+        key = item.lower()
+        if key not in MODEL_JOINED_KEYS:
+            raise ValueError(f"Unknown model key {item!r}. Supported: {', '.join(sorted(MODEL_JOINED_KEYS))}")
+        canonical = MODEL_JOINED_KEYS[key]
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        out.append(canonical)
+    if not out:
+        raise ValueError("At least one model is required.")
+    return out
+
+
+def _validate_joined_predictions(*, benchmark_dir: Path, splits: list[str], models: list[str]) -> None:
+    joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
+    missing = [
+        joined_dir / f"{model}__{split}__{target}.parquet"
+        for split in splits
+        for model in models
+        for target in JOINED_TARGETS
+        if not (joined_dir / f"{model}__{split}__{target}.parquet").exists()
+    ]
+    if not missing:
+        return
+    existing = sorted(joined_dir.glob("*.parquet")) if joined_dir.exists() else []
+    preview = "\n".join(f"  - {p}" for p in missing[:12])
+    if len(missing) > 12:
+        preview += f"\n  - ... {len(missing) - 12} more"
+    raise FileNotFoundError(
+        "RQ1 requires a complete joined-prediction benchmark before subsection scripts run.\n"
+        f"Missing {len(missing)} expected parquet file(s) under {joined_dir}:\n"
+        f"{preview}\n"
+        f"Currently found {len(existing)} joined parquet file(s). Rebuild the benchmark with:\n"
+        "./.venv/bin/python scripts/run_forecast_benchmark.py --no-make-figures"
+    )
+
+
+def _prepare_benchmark_snapshot(*, benchmark_dir: Path, snapshot_dir: Path) -> Path:
+    joined_src = benchmark_dir / "diagnostics" / "joined_predictions"
+    if not joined_src.is_dir():
+        raise FileNotFoundError(f"Missing joined predictions directory: {joined_src}")
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir)
+    joined_dst = snapshot_dir / "diagnostics" / "joined_predictions"
+    joined_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(joined_src, joined_dst)
+    for name in ["input_manifest.json", "benchmark_config_resolved.yaml", "benchmark_manifest.json"]:
+        src = benchmark_dir / name
+        if src.exists():
+            dst = snapshot_dir / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+    return snapshot_dir
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run implemented RQ1 thesis analyses.")
-    p.add_argument("--benchmark-root", default="artifacts/forecast_benchmarks")
-    p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/final_benchmark")
+    p.add_argument("--benchmark-root", default="artifacts")
+    p.add_argument("--benchmark-dir", default=DEFAULT_BENCHMARK_DIR)
+    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark")
     p.add_argument("--split", default=DEFAULT_SPLIT, help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",
@@ -73,6 +241,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--models", default=DEFAULT_MODELS, help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
+    p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
+    p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--targets", default="", help="Optional comma-separated targets for example-week plots.")
     p.add_argument("--lead", type=float, default=24.0)
     p.add_argument("--quantile", default="p50")
@@ -87,6 +257,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-tail-spike", action="store_true")
     p.add_argument("--skip-example-weeks", action="store_true")
     p.add_argument("--skip-organize", action="store_true")
+    p.add_argument("--skip-pdf", action="store_true", help="Do not keep PDF outputs. Where supported, PDF rendering is skipped; remaining PDFs are pruned from the final output tree.")
+    p.add_argument("--skip-csv", action="store_true", help="Prune CSV files from the final organized output tree after derived tables and LaTeX figures are generated.")
+    p.add_argument("--skip-json", action="store_true", help="Prune JSON files from the final organized output tree after generation.")
+    p.add_argument("--export-dir", default=DEFAULT_EXPORT_DIR, help="Destination thesis folder for the organized rq1_ml_model_benchmark output.")
+    p.add_argument("--skip-export", action="store_true", help="Do not copy rq1_ml_model_benchmark to the thesis figures folder.")
     return p.parse_args()
 
 
@@ -99,15 +274,43 @@ def main() -> int:
     per_lead_dir = out_dir / "4_1_3_per_lead"
     gate_dir = out_dir / "4_1_4_gate_specific"
     tail_dir = out_dir / "4_1_5_tail_spike"
-    interim_dir = out_dir / "4_1_6_interim_answer"
-    example_dir = out_dir / "4_1_7_example_weeks"
+    example_dir = out_dir / "4_1_6_example_weeks"
     log_dir = out_dir / "logs" / "rq1_wrapper"
     steps: list[dict[str, Any]] = []
     py = sys.executable
+    source_benchmark_dir = Path(args.benchmark_dir)
+    if not source_benchmark_dir.is_absolute():
+        source_benchmark_dir = ROOT / source_benchmark_dir
+    benchmark_dir = source_benchmark_dir
+    needs_joined = not all(
+        [
+            args.skip_full_metrics,
+            args.skip_calibration,
+            args.skip_per_lead,
+            args.skip_gate_buckets,
+            args.skip_tail_spike,
+            args.skip_example_weeks,
+        ]
+    )
+    if needs_joined:
+        _validate_joined_predictions(
+            benchmark_dir=source_benchmark_dir,
+            splits=_split_csv(args.splits),
+            models=_canonical_model_keys(args.models),
+        )
+        benchmark_dir = _prepare_benchmark_snapshot(
+            benchmark_dir=source_benchmark_dir,
+            snapshot_dir=out_dir / "_rq1_benchmark_inputs",
+        )
 
     benchmark_args: list[str] = ["--benchmark-root", args.benchmark_root]
-    if args.benchmark_dir:
-        benchmark_args.extend(["--benchmark-dir", args.benchmark_dir])
+    benchmark_args.extend(["--benchmark-dir", str(benchmark_dir)])
+    eval_window_args = [
+        "--eval-origin-start",
+        str(args.eval_origin_start),
+        "--eval-origin-end",
+        str(args.eval_origin_end),
+    ]
 
     if not args.skip_full_metrics:
         cmd = [
@@ -122,7 +325,10 @@ def main() -> int:
             str(args.splits),
             "--models",
             str(args.models),
+            *eval_window_args,
         ]
+        if args.skip_pdf:
+            cmd.append("--skip-pdf")
         steps.append(_run_step("rq1_4_1_1_full_unweighted_metrics", cmd, log_dir=log_dir))
 
     if not args.skip_calibration:
@@ -140,6 +346,7 @@ def main() -> int:
             str(args.splits),
             "--models",
             str(args.models),
+            *eval_window_args,
         ]
         steps.append(_run_step("rq1_4_1_2_calibration_uncertainty", cmd, log_dir=log_dir))
 
@@ -158,7 +365,10 @@ def main() -> int:
             str(args.splits),
             "--models",
             str(args.models),
+            *eval_window_args,
         ]
+        if args.skip_pdf:
+            cmd.append("--skip-pdf")
         steps.append(_run_step("rq1_4_1_3_per_lead_hour", cmd, log_dir=log_dir))
 
     if not args.skip_gate_buckets:
@@ -176,6 +386,7 @@ def main() -> int:
             str(args.splits),
             "--models",
             str(args.models),
+            *eval_window_args,
         ]
         steps.append(_run_step("rq1_4_1_4_gate_actionable", cmd, log_dir=log_dir))
 
@@ -194,6 +405,7 @@ def main() -> int:
             str(args.splits),
             "--models",
             str(args.models),
+            *eval_window_args,
         ]
         steps.append(_run_step("rq1_4_1_5_tail_spike", cmd, log_dir=log_dir))
 
@@ -203,7 +415,7 @@ def main() -> int:
             "scripts/build_rq1_example_weeks.py",
             *benchmark_args,
             "--out-dir",
-            str(work_dir / "4_1_7_example_weeks"),
+            str(work_dir / "4_1_6_example_weeks"),
             "--split",
             str(args.split),
             "--models",
@@ -224,7 +436,7 @@ def main() -> int:
             cmd.extend(["--targets", ",".join(targets)])
         if args.date:
             cmd.extend(["--date", str(args.date)])
-        steps.append(_run_step("rq1_4_1_7_example_weeks", cmd, log_dir=log_dir))
+        steps.append(_run_step("rq1_4_1_6_example_weeks", cmd, log_dir=log_dir))
 
     if not args.skip_organize:
         cmd = [
@@ -243,8 +455,12 @@ def main() -> int:
     manifest = {
         "description": "RQ1 wrapper manifest for implemented thesis analysis scripts.",
         "out_dir": str(out_dir),
+        "source_benchmark_dir": str(source_benchmark_dir),
+        "benchmark_input_snapshot_dir": str(benchmark_dir),
         "split": args.split,
         "models": args.models,
+        "eval_origin_start_utc": str(args.eval_origin_start),
+        "eval_origin_end_utc": str(args.eval_origin_end),
         "subsections": [
             {
                 "section": "4.1.1",
@@ -278,12 +494,6 @@ def main() -> int:
             },
             {
                 "section": "4.1.6",
-                "name": "Interim answer to RQ1",
-                "status": "not_implemented",
-                "output_dir": str(interim_dir),
-            },
-            {
-                "section": "4.1.7",
                 "name": "Example weeks",
                 "status": "skipped" if args.skip_example_weeks else "implemented",
                 "output_dir": str(example_dir),
@@ -294,22 +504,48 @@ def main() -> int:
             "root": str(out_dir),
             "subsection_tiers": ["result_section", "appendix", "backup"],
             "artifact_subfolders": {
-                "result_section": ["figures", "tables"],
-                "appendix": ["figures", "tables"],
+                "result_section": ["figures", "latex_figures", "tables"],
+                "appendix": ["figures", "latex_figures", "tables"],
                 "backup": ["csv", "diagnostics", "warnings"],
             },
         },
         "expected_example_week_outputs_dir": str(example_dir),
         "organized_manifest": str(out_dir / "rq1_output_manifest.json"),
+        "export_dir": str(args.export_dir),
+        "export_skipped": bool(args.skip_export),
+        "prune_requested": {
+            "pdf": bool(args.skip_pdf),
+            "csv": bool(args.skip_csv),
+            "json": bool(args.skip_json),
+        },
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     for subsection in manifest["subsections"]:
         Path(str(subsection["output_dir"])).mkdir(parents=True, exist_ok=True)
     example_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = interim_dir / "backup" / "diagnostics" / "rq1_wrapper_manifest.json"
+    manifest_path = out_dir / "diagnostics" / "rq1_wrapper_manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"[OK] RQ1 wrapper complete: {manifest_path}")
+    prune_suffixes: set[str] = set()
+    if args.skip_pdf:
+        prune_suffixes.add(".pdf")
+    if args.skip_csv:
+        prune_suffixes.add(".csv")
+    if args.skip_json:
+        prune_suffixes.add(".json")
+    prune_counts = _prune_subsection_extensions(out_dir, prune_suffixes)
+    if prune_counts:
+        manifest_removed = _remove_pruned_manifest_entries(out_dir, prune_suffixes)
+        print("[OK] Pruned final RQ1 output files: " + ", ".join(f"{k}={v}" for k, v in sorted(prune_counts.items())))
+        if manifest_removed:
+            print(f"[OK] Removed pruned entries from RQ1 output manifest: {manifest_removed}")
+    if not args.skip_export:
+        _export_output_tree(out_dir, Path(args.export_dir))
+        print(f"[OK] Exported RQ1 benchmark folder: {args.export_dir}")
+    if args.skip_json:
+        print(f"[OK] RQ1 wrapper complete; JSON manifests were pruned from {out_dir}")
+    else:
+        print(f"[OK] RQ1 wrapper complete: {manifest_path}")
     return 0
 
 
