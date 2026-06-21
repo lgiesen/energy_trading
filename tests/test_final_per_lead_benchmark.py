@@ -111,7 +111,7 @@ def test_range_table_and_latex_are_compact(tmp_path: Path) -> None:
     benchmark = _small_benchmark(tmp_path)
     outputs = build_per_lead_outputs(benchmark_dir=benchmark, models=MODELS, splits=["test"], horizon=2)
     table = build_thesis_range_table(outputs["range_summary"], split="test")
-    assert list(table.columns) == ["target", "lead_range", "TFT", "XGB", "RLQR", "best_model", "n_obs"]
+    assert list(table.columns) == ["target", "lead_range", "RLQR", "XGB", "TFT", "best_model", "n_obs"]
     assert set(table["lead_range"]) == {"h1-h8"}
     path = write_latex_range_table(table, out_dir=tmp_path, split="test")
     assert path is not None
@@ -123,3 +123,33 @@ def test_range_table_and_latex_are_compact(tmp_path: Path) -> None:
     assert "pinball" in tex.lower()
     assert "MAE" not in tex
     assert "RMSE" not in tex
+
+
+def test_range_table_breaks_afrr_target_names(tmp_path: Path) -> None:
+    table = pd.DataFrame(
+        [
+            {
+                "target": "aFRR activation rate -",
+                "lead_range": "h1-h8",
+                "TFT": 0.0020,
+                "XGB": 0.0021,
+                "RLQR": 0.0026,
+                "best_model": "TFT",
+                "n_obs": 10,
+            },
+            {
+                "target": "aFRR capacity price +",
+                "lead_range": "h1-h8",
+                "TFT": 6.2,
+                "XGB": 6.3,
+                "RLQR": 7.4,
+                "best_model": "TFT",
+                "n_obs": 10,
+            },
+        ]
+    )
+    path = write_latex_range_table(table, out_dir=tmp_path, split="test")
+    assert path is not None
+    tex = path.read_text(encoding="utf-8")
+    assert r"\textbf{\shortstack{aFRR\\activation rate $-$}}" in tex
+    assert r"\textbf{\shortstack{aFRR\\capacity price +}}" in tex

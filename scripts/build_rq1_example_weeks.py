@@ -29,6 +29,7 @@ DEFAULT_LEAD_H = 24
 DEFAULT_QUANTILE = "p50"
 DEFAULT_WINDOW_HOURS = 24 * 7
 LOCAL_TZ = "Europe/Berlin"
+MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 MODEL_KEYS = {
     "tft": ("tft", "TFT"),
@@ -249,6 +250,67 @@ def _window_slice(df: pd.DataFrame, start_utc: pd.Timestamp, window_hours: int) 
     return df.loc[(ts >= start_utc) & (ts < end_utc)].copy()
 
 
+def _target_scale_key(target: str) -> str:
+    if target.endswith("_pos") or target.endswith("_neg"):
+        return target.rsplit("_", 1)[0]
+    return target
+
+
+def _plot_value_array(view: pd.DataFrame, models: list[ModelSpec]) -> np.ndarray:
+    values: list[np.ndarray] = [pd.to_numeric(view["y_true"], errors="coerce").to_numpy(dtype=float)]
+    for model in models:
+        col = f"{model.key}_pred"
+        if col in view.columns:
+            values.append(pd.to_numeric(view[col], errors="coerce").to_numpy(dtype=float))
+    if not values:
+        return np.array([], dtype=float)
+    arr = np.concatenate(values)
+    return arr[np.isfinite(arr)]
+
+
+def _padded_ylim(values: np.ndarray) -> tuple[float, float] | None:
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    lo = float(np.min(values))
+    hi = float(np.max(values))
+    span = hi - lo
+    if span <= 0:
+        pad = max(abs(hi) * 0.05, 1.0)
+    else:
+        pad = max(span * 0.06, 1e-9)
+    ymin = lo - pad
+    ymax = hi + pad
+    if lo >= 0 and ymin < 0:
+        ymin = 0.0
+    return ymin, ymax
+
+
+def _compute_shared_y_limits(
+    views: dict[tuple[str, str], pd.DataFrame],
+    *,
+    targets: list[str],
+    weeks: list[WeekSpec],
+    models: list[ModelSpec],
+) -> dict[tuple[str, str], tuple[float, float]]:
+    by_scale: dict[tuple[str, str], list[np.ndarray]] = {}
+    for target in targets:
+        scale_key = _target_scale_key(target)
+        for week in weeks:
+            view = views.get((target, week.key))
+            if view is None or view.empty:
+                continue
+            by_scale.setdefault((week.key, scale_key), []).append(_plot_value_array(view, models))
+
+    limits: dict[tuple[str, str], tuple[float, float]] = {}
+    for key, arrays in by_scale.items():
+        values = np.concatenate([a for a in arrays if a.size]) if any(a.size for a in arrays) else np.array([], dtype=float)
+        ylim = _padded_ylim(values)
+        if ylim is not None:
+            limits[key] = ylim
+    return limits
+
+
 def _safe_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_").lower()
 
@@ -289,6 +351,43 @@ def _tex_num(value: Any) -> str:
     return f"{x:.6g}"
 
 
+def _format_week_tick(ts: pd.Timestamp) -> tuple[str, str]:
+    stamp = pd.Timestamp(ts)
+    return f"{stamp.day:02d} {MONTH_ABBR[stamp.month - 1]}", f"{stamp.hour:02d}:{stamp.minute:02d}"
+
+
+def _week_date_range_label(view: pd.DataFrame) -> str:
+    ts = pd.to_datetime(view["target_time_utc"], utc=True, errors="coerce").dropna()
+    if ts.empty:
+        return ""
+    local = ts.dt.tz_convert(LOCAL_TZ)
+    start = pd.Timestamp(local.min())
+    end = pd.Timestamp(local.max())
+    return f"{start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M}"
+
+
+def _latex_week_ticks(view: pd.DataFrame) -> tuple[str, str]:
+    if view.empty:
+        return "", ""
+    d = view.copy()
+    d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True, errors="coerce").dt.tz_convert(LOCAL_TZ)
+    d = d.dropna(subset=["local_time"]).reset_index(drop=True)
+    if d.empty:
+        return "", ""
+    tick_rows = d.index[d["local_time"].dt.hour.eq(0) & d["local_time"].dt.minute.eq(0)].tolist()
+    if not tick_rows:
+        tick_rows = list(range(0, len(d), 24))
+    xticks: list[str] = []
+    labels: list[str] = []
+    for idx in tick_rows:
+        if idx < 0 or idx >= len(d):
+            continue
+        date_part, time_part = _format_week_tick(pd.Timestamp(d.loc[idx, "local_time"]))
+        xticks.append(str(int(idx)))
+        labels.append(rf"\shortstack{{{date_part}\\{time_part}}}")
+    return ",".join(xticks), ",".join(labels)
+
+
 def _model_color_name(model_key: str) -> str:
     return {"tft": "tertiary", "xgb": "primary", "linear": "secondary", "truth": "perfectforesight"}.get(model_key, "neutraldark")
 
@@ -302,9 +401,12 @@ def write_example_week_latex(
     lead_h: float,
     quantile: str,
     out_path: Path,
+    ylim: tuple[float, float] | None = None,
 ) -> Path:
     d = view.copy()
     d["plot_idx"] = np.arange(len(d), dtype=int)
+    xticks, xticklabels = _latex_week_ticks(d)
+    date_range = _week_date_range_label(d)
     color_lines = [
         f"\\definecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
         for role, hex_color in THESIS_PALETTE.items()
@@ -322,7 +424,7 @@ def write_example_week_latex(
         r"                width=0.98\textwidth,",
         r"                height=7cm,",
         rf"                title={{{_latex_escape(f'{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}')}}},",
-        r"                xlabel={Hour in selected week},",
+        r"                xlabel={Time},",
         r"                ylabel={Value},",
         r"                legend style={at={(0.5,1.10)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
@@ -330,6 +432,15 @@ def write_example_week_latex(
         r"                grid=major,",
         r"            ]",
     ]
+    if xticks and xticklabels:
+        insert_at = lines.index(r"                grid=major,") + 1
+        lines.insert(insert_at, r"                xticklabel style={align=center, rotate=0},")
+        lines.insert(insert_at, rf"                xticklabels={{{xticklabels}}},")
+        lines.insert(insert_at, rf"                xtick={{{xticks}}},")
+    if ylim is not None:
+        insert_at = lines.index(r"                grid=major,") + 1
+        lines.insert(insert_at, rf"                ymax={_tex_num(ylim[1])},")
+        lines.insert(insert_at, rf"                ymin={_tex_num(ylim[0])},")
     truth_coords = " ".join(f"({_tex_num(i)},{_tex_num(y)})" for i, y in zip(d["plot_idx"], d["y_true"]))
     lines.append(rf"                \addplot[color=perfectforesight, mark=none, line width=1.2pt] coordinates {{{truth_coords}}};")
     legends = ["Truth"]
@@ -345,7 +456,7 @@ def write_example_week_latex(
         [
             r"            \end{axis}",
             r"        \end{tikzpicture}}",
-            f"    \\caption{{{_latex_escape(f'{week.label} example-week forecasts for {target_label} at lead {lead_h:g}h and {quantile.upper()}.')}}}",
+            f"    \\caption{{{_latex_escape(f'{week.label} example-week forecasts for {target_label} at lead {lead_h:g}h and {quantile.upper()}. Selected period: {date_range}.')}}}",
             f"    \\label{{fig:rq1-example-week-{_safe_slug(week.key)}-{_safe_slug(target_label)}}}",
             r"\end{figure}",
             "",
@@ -367,6 +478,7 @@ def plot_example_week(
     quantile: str,
     window_hours: int,
     out_path: Path,
+    ylim: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     import matplotlib.pyplot as plt
 
@@ -402,9 +514,18 @@ def plot_example_week(
             linewidth=1.8,
         )
     ax.set_title(thesis_titlecase(f"{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}"))
-    ax.set_xlabel(f"Local time ({LOCAL_TZ})")
+    ax.set_xlabel("Time")
     ax.set_ylabel("Value")
-    ax.tick_params(axis="x", rotation=20)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    tick_rows = d.index[d["local_time"].dt.hour.eq(0) & d["local_time"].dt.minute.eq(0)].tolist()
+    if not tick_rows:
+        tick_rows = list(range(0, len(d), 24))
+    tick_positions = [d.loc[i, "local_time"] for i in tick_rows if i in d.index]
+    tick_labels = ["\n".join(_format_week_tick(pd.Timestamp(t))) for t in tick_positions]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels)
+    ax.tick_params(axis="x", rotation=0)
     ax.legend(ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.24))
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -429,9 +550,11 @@ def build_example_weeks(
     rows: list[dict[str, Any]] = []
     outputs: list[Path] = []
     figures_dir = out_dir / "figures"
-    for target in sorted(targets, key=target_sort_key):
-        target_group, target_label = _target_info(target)
-        merged = load_merged_target(
+    ordered_targets = sorted(targets, key=target_sort_key)
+    merged_by_target: dict[str, pd.DataFrame] = {}
+    views: dict[tuple[str, str], pd.DataFrame] = {}
+    for target in ordered_targets:
+        merged_by_target[target] = load_merged_target(
             benchmark_dir=benchmark_dir,
             models=models,
             split=split,
@@ -440,12 +563,21 @@ def build_example_weeks(
             quantile=quantile,
         )
         for week in weeks:
-            view = _window_slice(merged, week.start_utc, window_hours)
+            view = _window_slice(merged_by_target[target], week.start_utc, window_hours)
             if view.empty:
                 raise ValueError(
                     f"No rows for target={target}, week={week.key}, start={week.start_utc.isoformat()}, "
                     f"lead={lead_h}, quantile={quantile}."
                 )
+            views[(target, week.key)] = view
+
+    y_limits = _compute_shared_y_limits(views, targets=ordered_targets, weeks=weeks, models=models)
+
+    for target in ordered_targets:
+        target_group, target_label = _target_info(target)
+        for week in weeks:
+            view = views[(target, week.key)]
+            ylim = y_limits.get((week.key, _target_scale_key(target)))
             out_path = figures_dir / week.key / f"{_safe_slug(target)}__lead{int(lead_h)}__{quantile}.png"
             tex_path = figures_dir / week.key / f"{_safe_slug(target)}__lead{int(lead_h)}__{quantile}.tex"
             row = plot_example_week(
@@ -458,6 +590,7 @@ def build_example_weeks(
                 quantile=quantile,
                 window_hours=window_hours,
                 out_path=out_path,
+                ylim=ylim,
             )
             write_example_week_latex(
                 view=view,
@@ -467,6 +600,7 @@ def build_example_weeks(
                 lead_h=lead_h,
                 quantile=quantile,
                 out_path=tex_path,
+                ylim=ylim,
             )
             row["target_group"] = target_group
             row["latex_path"] = str(tex_path)

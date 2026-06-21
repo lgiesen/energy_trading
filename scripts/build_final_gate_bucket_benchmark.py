@@ -426,8 +426,8 @@ def build_gate_bucket_outputs(
     models: list[ModelSpec],
     splits: list[str],
     derive_forecast_time: bool,
-    eval_origin_start: pd.Timestamp | None,
-    eval_origin_end: pd.Timestamp | None,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> dict[str, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -616,6 +616,17 @@ def _fmt_best(value: Any, *, model: str, best_model: Any) -> str:
     return formatted
 
 
+def _latex_header(value: str) -> str:
+    replacements = {
+        "Best model": r"\shortstack{Best\\model}",
+        "XGB / RLQR": r"\shortstack{XGB\\RLQR}",
+        "TFT / RLQR": r"\shortstack{TFT\\RLQR}",
+    }
+    if value in replacements:
+        return replacements[value]
+    return _latex_escape(value)
+
+
 def _table_target_label(value: Any) -> str:
     text = str(value)
     if text.startswith("aFRR "):
@@ -639,6 +650,20 @@ def _table_bucket_label(bucket: Any, target_label: Any = "") -> str:
         "actionable_bem_short_h1_8": "BEM activation rate h01--h08" if "rate" in target_s else "BEM activation price h01--h08",
     }
     return _latex_escape(labels.get(bucket_s, _bucket_label(bucket_s)))
+
+
+def _table_target_caption_label(value: Any) -> str:
+    text = str(value)
+    if text.endswith(" -"):
+        return _latex_escape(text[:-2]) + r" $-$"
+    return _latex_escape(text)
+
+
+def _table_target_slug(value: Any) -> str:
+    slug = str(value).lower()
+    slug = slug.replace("+", "pos").replace("-", "neg")
+    slug = re.sub(r"[^a-z0-9]+", "_", slug).strip("_")
+    return slug or "target"
 
 
 def _main_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
@@ -687,36 +712,41 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     table = _main_table(metrics, split=split)
     if table.empty:
         return None
-    headers = ["Bucket", "Target", "RLQR (= 1)", "XGB / RLQR", "TFT / RLQR", "Best model", "N"]
-    lines = [
-        r"\begin{table}[ht]",
-        r"    \centering",
-        r"    \begin{tabular}{@{}llrrrrr@{}}",
-        r"        \toprule",
-        "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
-        r"        \midrule",
-    ]
-    for _, row in table.iterrows():
-        vals = [
-            r"\textbf{" + _table_bucket_label(row["bucket"], row["target_label"]) + "}",
-            _table_target_label(row["target_label"]),
-            _fmt_best(row["RLQR"], model="RLQR", best_model=row["best_model"]),
-            _fmt_best(row["XGB"], model="XGB", best_model=row["best_model"]),
-            _fmt_best(row["TFT"], model="TFT", best_model=row["best_model"]),
-            _latex_escape(row["best_model"]),
-            str(int(row["n_obs"])),
-        ]
-        lines.append("        " + " & ".join(vals) + r" \\")
-    lines.extend(
-        [
-            r"        \bottomrule",
-            r"    \end{tabular}",
-            r"    \caption{Gate-specific and horizon-bucket mean pinball loss relative to RLQR on the test split. RLQR is fixed at 1. Values below 1 indicate lower mean pinball loss than RLQR.}",
-            r"    \label{tab:gate_bucket_metrics_test}",
-            r"\end{table}",
-            "",
-        ]
-    )
+    headers = ["Bucket", "RLQR", "XGB / RLQR", "TFT / RLQR", "Best model", "N"]
+    lines: list[str] = []
+    for target_label, part in table.groupby("target_label", sort=False):
+        caption_label = _table_target_caption_label(target_label)
+        slug = _table_target_slug(target_label)
+        lines.extend(
+            [
+                r"\begin{table}[ht]",
+                r"    \centering",
+                r"    \begin{tabular}{@{}lrrrrr@{}}",
+                r"        \toprule",
+                "        " + " & ".join(r"\textbf{" + _latex_header(h) + "}" for h in headers) + r" \\",
+                r"        \midrule",
+            ]
+        )
+        for _, row in part.iterrows():
+            vals = [
+                r"\textbf{" + _table_bucket_label(row["bucket"], row["target_label"]) + "}",
+                _fmt_best(row["RLQR"], model="RLQR", best_model=row["best_model"]),
+                _fmt_best(row["XGB"], model="XGB", best_model=row["best_model"]),
+                _fmt_best(row["TFT"], model="TFT", best_model=row["best_model"]),
+                _latex_escape(row["best_model"]),
+                str(int(row["n_obs"])),
+            ]
+            lines.append("        " + " & ".join(vals) + r" \\")
+        lines.extend(
+            [
+                r"        \bottomrule",
+                r"    \end{tabular}",
+                rf"    \caption{{Gate-specific and horizon-bucket mean pinball loss relative to RLQR for {caption_label} on the test split. RLQR is fixed at 1. Values below 1 indicate lower mean pinball loss than RLQR.}}",
+                rf"    \label{{tab:gate_bucket_metrics_{split}_{slug}}}",
+                r"\end{table}",
+                "",
+            ]
+        )
     path = out_dir / "latex" / f"gate_bucket_metrics_{split}.tex"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")

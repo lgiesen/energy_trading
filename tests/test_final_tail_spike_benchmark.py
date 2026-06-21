@@ -140,4 +140,6 @@ def test_latex_table_booktabs(tmp_path: Path) -> None:
     assert "\\toprule" in text
     assert "\\midrule" in text
     assert "\\bottomrule" in text
-    assert "\\textbf{Target group}" in text
+    assert r"\textbf{\shortstack{Target\\group}}" in text
+    assert r"\textbf{\shortstack{Best\\model}}" in text
+    assert r"\textbf{\shortstack{Main\\issue}}" in text

@@ -149,6 +149,10 @@ def _latex_escape(value: Any) -> str:
     s = str(value)
     minus_token = "@@RQ1MINUS@@"
     for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+        s = s.replace(f"{label} positive", f"{label} +")
+        s = s.replace(f"{label} Positive", f"{label} +")
+        s = s.replace(f"{label} negative", f"{label} {minus_token}")
+        s = s.replace(f"{label} Negative", f"{label} {minus_token}")
         s = s.replace(f"{label} -", f"{label} {minus_token}")
         s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {

@@ -150,6 +150,11 @@ def test_common_row_intersection_and_latex(tmp_path: Path) -> None:
     assert "\\midrule" in content
     assert "\\bottomrule" in content
     assert "\\textbf{Bucket}" in content
+    assert "\\textbf{RLQR}" in content
+    assert "\\textbf{\\shortstack{XGB\\\\RLQR}}" in content
+    assert "\\textbf{\\shortstack{TFT\\\\RLQR}}" in content
+    assert "\\textbf{\\shortstack{Best\\\\model}}" in content
+    assert "RLQR (= 1)" not in content
 
 
 def test_actionable_bucket_missing_timestamps_fail_clearly() -> None:

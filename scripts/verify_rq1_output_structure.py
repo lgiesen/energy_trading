@@ -46,11 +46,6 @@ def _check_latex_table(path: Path) -> list[str]:
 def _check_latex_figure(path: Path) -> list[str]:
     errors: list[str] = []
     text = path.read_text(encoding="utf-8")
-    if path.name == "da_price_p50_absolute_error_tolerance_curve.tex":
-        for token in [r"\begin{figure}", r"\includegraphics", r"\caption", r"\label", r"\end{figure}"]:
-            if token not in text:
-                errors.append(f"{path} is missing {token}.")
-        return errors
     if path.name.startswith("calibration_reliability_"):
         stripped = text.strip()
         if not stripped.startswith(r"\begin{tikzpicture}"):

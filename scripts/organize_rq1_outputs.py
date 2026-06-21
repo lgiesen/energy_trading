@@ -89,9 +89,6 @@ def build_routes(split: str) -> list[Route]:
     routes = [
         _route("4.1.1", "result_section", "figure", f"figures/forecast_metrics_full_relative_pinball_{split}.png", _sub_sources("4.1.1", f"figures/rq1_4_1_1_forecast_metrics_full_relative_pinball_{split}.png"), "mean_pinball_loss", "main thesis figure", "Relative mean pinball loss against RLQR."),
         _route("4.1.1", "result_section", "figure", "figures/computational_cost_365d.png", _sub_sources("4.1.1", "figures/rq1_4_1_1_computational_cost_365d.png"), "computational_cost", "main thesis figure", "Computational Cost of Each Model Scaled for 365 Days of Training Data."),
-        _route("4.1.1", "result_section", "figure", "figures/da_price_p50_absolute_error_tolerance_curve.png", _sub_sources("4.1.1", "figures/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.png"), "p50 absolute error tolerance", "secondary interpretability figure", "DA price cumulative absolute p50 error tolerance curve."),
-        _route("4.1.1", "result_section", "figure", "figures/da_price_p50_absolute_error_tolerance_curve.pdf", _sub_sources("4.1.1", "figures/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.pdf"), "p50 absolute error tolerance", "secondary interpretability figure", "DA price cumulative absolute p50 error tolerance curve PDF.", required=False),
-        _route("4.1.1", "result_section", "latex_figure", "figures/da_price_p50_absolute_error_tolerance_curve.tex", _sub_sources("4.1.1", "figures/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex"), "p50 absolute error tolerance", "secondary interpretability figure", "LaTeX includegraphics snippet for DA price p50 error tolerance curve."),
         _route("4.1.1", "appendix", "figure", f"figures/forecast_metrics_full_relative_mae_p50_{split}.png", _sub_sources("4.1.1", f"figures/rq1_4_1_1_forecast_metrics_full_relative_mae_p50_{split}.png"), "mae_p50", "appendix figure", "Relative p50 MAE against RLQR by target."),
         _route("4.1.1", "result_section", "latex_table", f"tables/forecast_metrics_full_primary_{split}.tex", _sub_sources("4.1.1", f"latex/rq1_4_1_1_forecast_metrics_full_primary_{split}.tex"), "mean_pinball_loss", "main thesis table", "Primary full-sample mean pinball table."),
         _route("4.1.1", "result_section", "latex_table", "tables/computational_cost_365d.tex", _sub_sources("4.1.1", "latex/rq1_4_1_1_computational_cost_365d.tex"), "computational_cost", "main thesis table", "Observed and 365-day-scaled computational cost table."),
@@ -101,8 +98,10 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.1", "backup", "csv", f"csv/forecast_metrics_full_primary_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_primary_{split}.csv"), "mean_pinball_loss", "backup data", "Primary full metrics CSV."),
         _route("4.1.1", "backup", "csv", f"csv/forecast_metrics_full_detailed_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_detailed_{split}.csv"), "point_and_probabilistic_errors", "backup data", "Detailed full metrics CSV."),
         _route("4.1.1", "backup", "csv", "csv/computational_cost_365d.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_computational_cost_365d.csv"), "computational_cost", "backup data", "Observed and scaled computational cost source CSV."),
-        _route("4.1.1", "backup", "csv", "csv/da_price_p50_absolute_error_tolerance_curve.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.csv"), "p50 absolute error tolerance", "backup data", "DA price p50 absolute error tolerance curve source CSV."),
-        _route("4.1.1", "backup", "csv", f"csv/da_price_p50_error_tolerance_summary_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_da_price_p50_error_tolerance_summary_{split}.csv"), "p50 absolute error tolerance", "backup data", "DA price p50 absolute error tolerance summary CSV."),
+        _route("4.1.1", "backup", "csv", "csv/price_p50_absolute_error_tolerance_curve.csv", _sub_sources("4.1.1", "csv/rq1_4_1_1_price_p50_absolute_error_tolerance_curve.csv"), "p50 absolute error tolerance", "backup data", "Price p50 absolute error tolerance curve source CSV."),
+        _route("4.1.1", "backup", "csv", f"csv/price_p50_error_tolerance_summary_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_price_p50_error_tolerance_summary_{split}.csv"), "p50 absolute error tolerance", "backup data", "Price p50 absolute error tolerance summary CSV."),
+        _route("4.1.1", "backup", "csv", f"csv/price_p50_error_tolerance_performance_values_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_price_p50_error_tolerance_performance_values_{split}.csv"), "p50 absolute error tolerance", "backup data", "Price p50 absolute error tolerance performance values CSV."),
+        _route("4.1.1", "backup", "diagnostics", f"diagnostics/price_p50_error_tolerance_performance_values_{split}.txt", _sub_sources("4.1.1", f"diagnostics/rq1_4_1_1_price_p50_error_tolerance_performance_values_{split}.txt"), "p50 absolute error tolerance", "diagnostics", "Readable price p50 absolute error tolerance performance values."),
         _route("4.1.1", "backup", "diagnostics", f"diagnostics/forecast_metrics_full_alignment_diagnostics_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_alignment_diagnostics_{split}.csv"), "alignment", "diagnostics", "Alignment diagnostics for full metrics."),
         _route("4.1.2", "result_section", "figure", "figures/calibration_reliability_by_target.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_reliability_by_target.png"), "calibration", "main thesis figure", "Quantile reliability by target."),
         _route("4.1.2", "result_section", "figure", "figures/calibration_interval_coverage_by_target_group.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_interval_coverage_by_target_group.png"), "interval_coverage", "main thesis figure", "Interval coverage reliability by target group.", required=False),
@@ -148,6 +147,21 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_relative_pinball_by_regime_all_in_one.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_all_in_one.png") + ["figures/tail_spike_relative_pinball_by_regime_all_in_one.png"], "relative_mean_pinball_loss", "diagnostic figure", "Dense all-in-one tail/spike relative mean pinball chart.", required=False),
         _route("4.1.5", "backup", "warnings", "warnings/tail_spike_warnings.csv", _sub_sources("4.1.5", "tail_spike_warnings.csv") + ["tail_spike_warnings.csv"], "warnings", "warnings", "Tail/spike warnings."),
     ]
+    price_tolerance_stems = [
+        "da_price",
+        "afrr_capacity_price_pos",
+        "afrr_capacity_price_neg",
+        "afrr_activation_price_pos",
+        "afrr_activation_price_neg",
+    ]
+    for stem in price_tolerance_stems:
+        routes.extend(
+            [
+                _route("4.1.1", "result_section", "figure", f"figures/{stem}_p50_absolute_error_tolerance_curve.png", _sub_sources("4.1.1", f"figures/rq1_4_1_1_{stem}_p50_absolute_error_tolerance_curve.png"), "p50 absolute error tolerance", "secondary interpretability figure", f"{stem} cumulative absolute p50 error tolerance curve."),
+                _route("4.1.1", "result_section", "figure", f"figures/{stem}_p50_absolute_error_tolerance_curve.pdf", _sub_sources("4.1.1", f"figures/rq1_4_1_1_{stem}_p50_absolute_error_tolerance_curve.pdf"), "p50 absolute error tolerance", "secondary interpretability figure", f"{stem} cumulative absolute p50 error tolerance curve PDF.", required=False),
+                _route("4.1.1", "result_section", "latex_figure", f"latex_figures/{stem}_p50_absolute_error_tolerance_curve.tex", _sub_sources("4.1.1", f"latex_figures/rq1_4_1_1_{stem}_p50_absolute_error_tolerance_curve.tex"), "p50 absolute error tolerance", "secondary interpretability figure", f"LaTeX includegraphics snippet for {stem} p50 error tolerance curve."),
+            ]
+        )
     target_stems = [
         "da_price",
         "afrr_capacity_price",
@@ -473,6 +487,16 @@ def prune_legacy_outputs(*, rq1_root: Path, final_root: Path) -> list[str]:
         / "tail_spike_relative_pinball_by_regime.png",
         removed,
     )
+    _remove_path(
+        rq1_root
+        / SUBSECTIONS["4.1.5"]
+        / "result_section"
+        / "figures"
+        / "tail_spike_relative_pinball_by_regime_main.png",
+        removed,
+    )
+    for path in (rq1_root / SUBSECTIONS["4.1.1"] / "result_section" / "figures").glob("*_p50_absolute_error_tolerance_curve.tex"):
+        _remove_path(path, removed)
 
     return removed
 
@@ -538,6 +562,13 @@ def _copy_file(src: Path, dst: Path) -> None:
 def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[str, Any]], *, final_root: Path, rq1_root: Path) -> None:
     subsection = "4.1.6"
     target_root = rq1_root / SUBSECTIONS[subsection]
+    result_week_keys = {"typical", "high_volatility"}
+    for stale_dir in [
+        target_root / "appendix" / "figures" / "high_volatility",
+        target_root / "appendix" / "latex_figures" / "high_volatility",
+    ]:
+        if stale_dir.exists():
+            shutil.rmtree(stale_dir)
     source_dirs = _find_example_source_dirs(final_root, rq1_root)
     if not source_dirs:
         missing.append(
@@ -574,7 +605,7 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
     if figures_root.exists():
         for src in sorted(figures_root.rglob("*.png")):
             rel = src.relative_to(figures_root)
-            tier = "result_section" if rel.parts and rel.parts[0] == "typical" else "appendix"
+            tier = "result_section" if rel.parts and rel.parts[0] in result_week_keys else "appendix"
             dst = target_root / tier / "figures" / rel
             _copy_file(src, dst)
             entries.append(
@@ -592,7 +623,7 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
             rel = src.relative_to(figures_root)
             if r"\includegraphics" in src.read_text(encoding="utf-8", errors="ignore"):
                 continue
-            tier = "result_section" if rel.parts and rel.parts[0] == "typical" else "appendix"
+            tier = "result_section" if rel.parts and rel.parts[0] in result_week_keys else "appendix"
             dst = target_root / tier / "latex_figures" / rel
             _copy_file(src, dst)
             entries.append(
@@ -794,6 +825,29 @@ TAIL_SPIKE_ACTIVATION_TARGETS = [
     "aFRR activation rate -",
 ]
 
+P50_TOLERANCE_TEX_CONFIG = {
+    "pred_da_price": ("da_price", "DA price", (1.0, 5.0, 10.0), "€/MWh"),
+    "pred_afrr_capacity_price_pos": ("afrr_capacity_price_pos", "aFRR capacity price +", (1.0, 5.0, 10.0), "€/MW"),
+    "pred_afrr_capacity_price_neg": ("afrr_capacity_price_neg", "aFRR capacity price $-$", (1.0, 5.0, 10.0), "€/MW"),
+    "pred_afrr_activation_price_pos": ("afrr_activation_price_pos", "aFRR activation price +", (10.0, 50.0, 100.0), "€/MWh"),
+    "pred_afrr_activation_price_neg": ("afrr_activation_price_neg", "aFRR activation price $-$", (10.0, 50.0, 100.0), "€/MWh"),
+}
+
+
+def _p50_tolerance_title_label(target: str) -> str:
+    labels = {
+        "pred_da_price": "DA Price",
+        "pred_afrr_capacity_price_pos": "aFRR Capacity Price Positive",
+        "pred_afrr_capacity_price_neg": "aFRR Capacity Price Negative",
+        "pred_afrr_activation_price_pos": "aFRR Activation Price Positive",
+        "pred_afrr_activation_price_neg": "aFRR Activation Price Negative",
+    }
+    return labels.get(str(target), _tex_label(target))
+
+
+def _p50_tolerance_title(target: str) -> str:
+    return f"Cumulative Absolute P50 Error Tolerance for {_p50_tolerance_title_label(target)}"
+
 
 def _tail_spike_regime_label(regime: Any) -> str:
     return TAIL_SPIKE_REGIME_LABELS.get(str(regime), _tex_label(regime))
@@ -981,7 +1035,7 @@ def _write_gate_bucket_relative_tex(
         r"        \begin{tikzpicture}",
         r"            \begin{axis}[",
         r"                xbar,",
-        r"                bar width=8pt,",
+        r"                bar width=10pt,",
         r"                width=0.96\textwidth,",
         r"                height=7.2cm,",
         r"                xlabel={Mean pinball loss relative to RLQR},",
@@ -997,7 +1051,7 @@ def _write_gate_bucket_relative_tex(
         r"                y dir=reverse,",
         r"            ]",
     ]
-    lines.append(rf"                \draw[color=secondary, densely dotted, line width=1.2pt] (axis cs:1,{y_symbols[0]}) -- (axis cs:1,{y_symbols[-1]});")
+    lines.append(rf"                \draw[color=secondary, densely dotted, line width=1.2pt, shorten <=-8mm, shorten >=-8mm] (axis cs:1,{y_symbols[0]}) -- (axis cs:1,{y_symbols[-1]});")
     lines.append(r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}")
     lines.append(r"                \addlegendentry{RLQR}")
     for model in ["XGB", "TFT"]:
@@ -1059,7 +1113,7 @@ def _write_tail_spike_relative_tex(
 
     def _build_panels(targets: list[str]) -> list[tuple[str, pd.DataFrame, list[str], list[str]]]:
         panels: list[tuple[str, pd.DataFrame, list[str], list[str]]] = []
-        for target_label in targets:
+        for panel_idx, target_label in enumerate(targets, start=1):
             regimes = TAIL_SPIKE_MAIN_REGIMES_BY_TARGET[target_label]
             part = pivot[pivot["target_label"].astype(str).eq(target_label) & pivot["regime"].astype(str).isin(regimes)].copy()
             if part.empty:
@@ -1068,7 +1122,7 @@ def _write_tail_spike_relative_tex(
             part["_order"] = part["regime"].astype(str).map(order).fillna(99)
             part = part.sort_values(["_order", "regime"]).reset_index(drop=True)
             labels = [_tail_spike_regime_label(regime) for regime in part["regime"]]
-            symbols = [_tex_symbol(f"{target_label}_{label}") for label in labels]
+            symbols = [f"panel_{panel_idx}_regime_{i}" for i in range(1, len(labels) + 1)]
             panels.append((target_label, part, labels, symbols))
         return panels
 
@@ -1076,6 +1130,7 @@ def _write_tail_spike_relative_tex(
         *,
         panels: list[tuple[str, pd.DataFrame, list[str], list[str]]],
         figure_caption: str,
+        short_caption: str,
         figure_label: str,
         height_cm: float,
     ) -> list[str]:
@@ -1086,8 +1141,8 @@ def _write_tail_spike_relative_tex(
             r"    \centering",
             r"    \begin{tikzpicture}",
             r"        \begin{groupplot}[",
-            rf"            group style={{group size=1 by {len(panels)}, vertical sep=1.00cm}},",
-            r"            width=0.86\linewidth,",
+            rf"            group style={{group size=1 by {len(panels)}, vertical sep=1.20cm}},",
+            r"            width=\linewidth,",
             rf"            height={height_cm:.2f}cm,",
             r"            xlabel={Mean pinball loss relative to RLQR},",
             r"            legend style={at={(0.5,1.26)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
@@ -1106,7 +1161,7 @@ def _write_tail_spike_relative_tex(
                 [
                     r"            \nextgroupplot[",
                     r"                xbar,",
-                    r"                bar width=5pt,",
+                    r"                bar width=8pt,",
                     rf"                title={{{_latex_escape(thesis_titlecase(target_label))}}},",
                     rf"                symbolic y coords={{{symbol_list}}},",
                     rf"                ytick={{{symbol_list}}},",
@@ -1120,7 +1175,7 @@ def _write_tail_spike_relative_tex(
             if not legend_written:
                 lines.append(r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}")
                 lines.append(r"                \addlegendentry{RLQR baseline}")
-            for model in ["XGB", "TFT"]:
+            for model, bar_shift in [("XGB", "-4pt"), ("TFT", "4pt")]:
                 if model not in part.columns:
                     continue
                 color = _model_color_role(model)
@@ -1130,7 +1185,7 @@ def _write_tail_spike_relative_tex(
                         coords.append(f"({_tex_num(value)},{symbol})")
                 if not coords:
                     continue
-                lines.append(rf"                \addplot[xbar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+                lines.append(rf"                \addplot[xbar, bar shift={bar_shift}, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
                 if not legend_written:
                     lines.append(rf"                \addlegendentry{{{_latex_escape(model)}}}")
             legend_written = True
@@ -1138,7 +1193,7 @@ def _write_tail_spike_relative_tex(
             [
                 r"        \end{groupplot}",
                 r"    \end{tikzpicture}",
-                f"    \\caption{{{_latex_escape(figure_caption)}}}",
+                f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
                 f"    \\label{{{figure_label}}}",
                 r"\end{figure}",
                 "",
@@ -1163,6 +1218,7 @@ def _write_tail_spike_relative_tex(
             _figure_block(
                 panels=price_capacity_panels,
                 figure_caption="Tail and spike performance by regime for DA and aFRR capacity price forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+                short_caption="Tail and spike performance: DA and aFRR capacity price",
                 figure_label="fig:tail_spike_relative_pinball_by_regime_price_capacity",
                 height_cm=3.05,
             )
@@ -1172,6 +1228,7 @@ def _write_tail_spike_relative_tex(
             _figure_block(
                 panels=activation_panels,
                 figure_caption="Tail and spike performance by regime for aFRR activation price and activation rate forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+                short_caption="Tail and spike performance: aFRR activation price and rate",
                 figure_label="fig:tail_spike_relative_pinball_by_regime_activation",
                 height_cm=2.85,
             )
@@ -1291,6 +1348,88 @@ def _write_computational_cost_tex(
     return _write_lines(path, lines)
 
 
+def _write_p50_tolerance_curve_tex(
+    path: Path,
+    *,
+    data: pd.DataFrame,
+    target: str,
+    split: str,
+    placement: str = "htbp",
+) -> Path | None:
+    if data.empty or target not in P50_TOLERANCE_TEX_CONFIG:
+        return None
+    slug, label, thresholds, unit = P50_TOLERANCE_TEX_CONFIG[target]
+    d = data[(data["split"].astype(str).eq(split)) & (data["target"].astype(str).eq(target))].copy()
+    if d.empty:
+        return None
+    d["threshold"] = pd.to_numeric(d["threshold"], errors="coerce")
+    d["share_within_threshold"] = pd.to_numeric(d["share_within_threshold"], errors="coerce")
+    d = d.dropna(subset=["threshold", "share_within_threshold"])
+    if d.empty:
+        return None
+    xmax = float(d["threshold"].max())
+    xticks = [0.0, *[float(x) for x in thresholds if float(x) <= xmax], xmax]
+    # Preserve order while avoiding duplicate xmax when it is also a threshold.
+    xticks = list(dict.fromkeys(round(x, 8) for x in xticks))
+    x_tick_values = ",".join(_tex_num(x) for x in xticks)
+    x_tick_labels = ",".join(_latex_escape(f"{x:g}") for x in xticks)
+    caption = _p50_tolerance_title(target)
+    lines = [
+        r"% Requires: \usepackage{pgfplots}",
+        r"% Requires: \usepackage{xcolor}",
+        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+        *_latex_color_defs(),
+        rf"\begin{{figure}}[{placement}]",
+        r"    \centering",
+        r"    \resizebox{\linewidth}{!}{%",
+        r"        \begin{tikzpicture}",
+        r"            \begin{axis}[",
+        r"                width=0.96\textwidth,",
+        r"                height=7cm,",
+        rf"                xlabel={{Absolute p50 error threshold in {_latex_escape(unit)}}},",
+        r"                ylabel={Share Within Threshold},",
+        r"                ymin=0,",
+        r"                ymax=1,",
+        r"                xmin=0,",
+        rf"                xmax={_tex_num(xmax)},",
+        rf"                xtick={{{x_tick_values}}},",
+        rf"                xticklabels={{{x_tick_labels}}},",
+        r"                ytick={0,0.2,0.4,0.6,0.8,1},",
+        r"                yticklabels={0\%,20\%,40\%,60\%,80\%,100\%},",
+        r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend cell align={left},",
+        r"                axis lines*=left,",
+        r"                grid=major,",
+        r"            ]",
+    ]
+    for threshold in thresholds:
+        threshold_f = float(threshold)
+        if 0.0 <= threshold_f <= xmax:
+            lines.append(rf"                \addplot[color=neutraldark, dashed, mark=none, line width=0.8pt, forget plot] coordinates {{({_tex_num(threshold_f)},0) ({_tex_num(threshold_f)},1)}};")
+    legends: list[str] = []
+    for model in MODEL_LABELS:
+        part = d[d["model"].astype(str).eq(model)].sort_values("threshold")
+        if part.empty:
+            continue
+        coords = " ".join(f"({_tex_num(x)},{_tex_num(y)})" for x, y in zip(part["threshold"], part["share_within_threshold"]))
+        color = _model_color_role(model)
+        lines.append(rf"                \addplot[color={color}, mark=none, line width=1.3pt] coordinates {{{coords}}};")
+        legends.append(_latex_escape(model))
+    if legends:
+        lines.append("                \\legend{" + ",".join(legends) + "}")
+    lines.extend(
+        [
+            r"            \end{axis}",
+            r"        \end{tikzpicture}}",
+            f"    \\caption{{{_latex_escape(caption)}}}",
+            rf"    \label{{fig:{slug}_p50_absolute_error_tolerance_curve}}",
+            r"\end{figure}",
+            "",
+        ]
+    )
+    return _write_lines(path, lines)
+
+
 def _write_line_tex(
     path: Path,
     *,
@@ -1327,6 +1466,10 @@ def _write_line_tex(
             r"                legend cell align={left},",
             r"                axis lines*=left,",
             r"                grid=major,",
+            *((
+                r"                scaled y ticks=false,",
+                r"                y tick label style={/pgf/number format/fixed},",
+            ) if y_col == "mean_pinball_loss" else ()),
             *([rf"                xmin={_tex_num(xlim[0])},", rf"                xmax={_tex_num(xlim[1])},"] if xlim is not None else []),
             *([rf"                ymin={_tex_num(ylim[0])},", rf"                ymax={_tex_num(ylim[1])},"] if ylim is not None else []),
             *((
@@ -1437,6 +1580,10 @@ def _write_line_panel_tex(
         r"                legend cell align={left},",
         r"                axis lines*=left,",
         r"                grid=major,",
+        *((
+            r"                scaled y ticks=false,",
+            r"                y tick label style={/pgf/number format/fixed},",
+        ) if y_col == "mean_pinball_loss" else ()),
         *([rf"                xmin={_tex_num(xlim[0])},", rf"                xmax={_tex_num(xlim[1])},"] if xlim is not None else []),
         *([rf"                ymin={_tex_num(ylim[0])},", rf"                ymax={_tex_num(ylim[1])},"] if ylim is not None else []),
         *(_percent_tick_options(percent_ticks) if percent_ticks is not None else []),
@@ -1489,6 +1636,23 @@ def _write_line_panel_tex(
         ]
     )
     return _write_lines(path, lines)
+
+
+def _padded_ylim(data: pd.DataFrame, value_col: str, *, include: tuple[float, ...] = ()) -> tuple[float, float] | None:
+    if data.empty or value_col not in data.columns:
+        return None
+    values = pd.to_numeric(data[value_col], errors="coerce").dropna()
+    if include:
+        values = pd.concat([values, pd.Series(include, dtype=float)], ignore_index=True)
+    if values.empty:
+        return None
+    ymin = float(values.min())
+    ymax = float(values.max())
+    if not np.isfinite(ymin) or not np.isfinite(ymax):
+        return None
+    span = ymax - ymin
+    pad = max(abs(ymax) * 0.02, 1e-9) if span <= 0 else span * 0.06
+    return ymin - pad, ymax + pad
 
 
 def _write_heatmap_tex(
@@ -1607,6 +1771,14 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
         )
         if path:
             _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="computational_cost", description="Native pgfplots computational-cost bar chart.")
+    tolerance_csv = root / "backup" / "csv" / "price_p50_absolute_error_tolerance_curve.csv"
+    if tolerance_csv.exists():
+        tolerance = pd.read_csv(tolerance_csv)
+        for target, (slug, _label, _thresholds, _unit) in P50_TOLERANCE_TEX_CONFIG.items():
+            out = root / "result_section" / "latex_figures" / f"{slug}_p50_absolute_error_tolerance_curve.tex"
+            path = _write_p50_tolerance_curve_tex(out, data=tolerance, target=target, split=split)
+            if path:
+                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="p50 absolute error tolerance", description=f"Native pgfplots p50 absolute error tolerance curve for {slug}.")
 
     # 4.1.2 calibration and uncertainty.
     sec = "4.1.2"
@@ -1689,6 +1861,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 out = root / tier / "latex_figures" / f"{stem}_{target_slug}.tex"
                 target_label = _tex_label(group["target_label"].iloc[0])
                 if group["target_label"].nunique(dropna=True) > 1:
+                    shared_ylim = _padded_ylim(group, metric)
                     path = _write_line_panel_tex(
                         out,
                         data=group,
@@ -1701,6 +1874,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         ylabel=_tex_label(metric),
                         placement="htbp" if tier == "result_section" else "p",
                         show_markers=metric != "mean_pinball_loss",
+                        ylim=shared_ylim,
                     )
                 else:
                     path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss")
@@ -1717,6 +1891,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 out = root / "result_section" / "latex_figures" / f"per_lead_relative_pinball_{target_slug}.tex"
                 target_label = _tex_label(group["target_label"].iloc[0])
                 if group["target_label"].nunique(dropna=True) > 1:
+                    shared_ylim = _padded_ylim(rel, "relative", include=(1.0,))
                     path = _write_line_panel_tex(
                         out,
                         data=rel,
@@ -1729,6 +1904,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         ylabel="Mean pinball loss relative to RLQR",
                         reference_y=1.0,
                         reference_label="RLQR",
+                        ylim=shared_ylim,
                     )
                 else:
                     path = _write_line_tex(out, data=rel, x_col="lead_time_h", y_col="relative", series_col="model_label", caption=f"Relative mean pinball loss by lead hour for {target_label} (RLQR = 1).", label=f"fig:rq1-4-1-3-per-lead-relative-pinball-{target_slug.replace('_','-')}", ylabel="Mean pinball loss relative to RLQR", reference_y=1.0, reference_label="RLQR")
@@ -1796,6 +1972,8 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
 def _prune_latex_figure_imports(rq1_root: Path) -> None:
     for tex in rq1_root.rglob("*.tex"):
         if "latex_figures" not in tex.parts:
+            continue
+        if tex.name.endswith("_p50_absolute_error_tolerance_curve.tex"):
             continue
         if tex.read_text(encoding="utf-8", errors="ignore").find(r"\includegraphics") >= 0:
             tex.unlink()

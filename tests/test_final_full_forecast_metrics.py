@@ -7,6 +7,7 @@ import pandas as pd
 
 from scripts.build_final_full_forecast_metrics import (
     ModelSpec,
+    _latex_table,
     build_p50_error_tolerance_outputs,
     build_detailed_table,
     build_full_metrics,
@@ -143,6 +144,45 @@ def test_primary_table_is_mean_pinball_only(tmp_path: Path) -> None:
     assert primary["best_model"].iloc[0] in {"TFT", "XGB", "RLQR"}
 
 
+def test_primary_table_keeps_activation_rate_pinball_precision(tmp_path: Path) -> None:
+    table = pd.DataFrame(
+        [
+            {
+                "target": "pred_afrr_activation_rate_pos",
+                "RLQR": 0.00261,
+                "XGB": 0.00225,
+                "TFT": 0.00226,
+                "best_model": "XGB",
+                "relative_improvement_vs_RLQR_pct": 13.65,
+            },
+            {
+                "target": "pred_da_price",
+                "RLQR": 14.591,
+                "XGB": 8.824,
+                "TFT": 10.565,
+                "best_model": "XGB",
+                "relative_improvement_vs_RLQR_pct": 39.53,
+            },
+        ]
+    )
+    path = tmp_path / "primary.tex"
+    _latex_table(
+        table,
+        columns=["target", "RLQR", "XGB", "TFT", "best_model", "relative_improvement_vs_RLQR_pct"],
+        headers=["Target", "RLQR", "XGB", "TFT", "Best model", r"\shortstack{Improvement\\vs RLQR (\%)}"],
+        caption="Model Mean Pinball Loss",
+        label="tab:forecast_metrics_full_primary",
+        path=path,
+        bold_best_model_values=True,
+        value_decimals=2,
+        activation_rate_value_decimals=5,
+    )
+
+    tex = path.read_text(encoding="utf-8")
+    assert r"aFRR activation rate + & 0.00261 & \textbf{0.00225} & 0.00226" in tex
+    assert r"DA price & 14.59 & \textbf{8.82} & 10.56" in tex
+
+
 def test_detailed_table_contains_all_four_metrics(tmp_path: Path) -> None:
     metrics, _ = _build_small_metrics(tmp_path)
     detailed = build_detailed_table(metrics, split="test")
@@ -261,13 +301,13 @@ def test_p50_absolute_error_tolerance_outputs_and_latex_snippet(tmp_path: Path) 
         p50_tolerance_summary=summary,
     )
     names = {p.name for p in outputs}
-    assert "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.csv" in names
+    assert "rq1_4_1_1_price_p50_absolute_error_tolerance_curve.csv" in names
     assert "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.png" in names
     assert "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex" in names
-    assert "rq1_4_1_1_da_price_p50_error_tolerance_summary_test.csv" in names
+    assert "rq1_4_1_1_price_p50_error_tolerance_summary_test.csv" in names
     assert "rq1_4_1_1_da_price_p50_error_tolerance_summary_test.tex" in names
 
-    tex = (tmp_path / "out" / "figures" / "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex").read_text(encoding="utf-8")
+    tex = (tmp_path / "out" / "latex_figures" / "rq1_4_1_1_da_price_p50_absolute_error_tolerance_curve.tex").read_text(encoding="utf-8")
     assert r"\includegraphics" in tex
     assert r"\caption" in tex
     assert r"\label{fig:da_price_p50_absolute_error_tolerance_curve}" in tex

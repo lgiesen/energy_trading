@@ -782,6 +782,18 @@ def _fmt(value: Any) -> str:
     return f"{x:.4f}" if np.isfinite(x) else "-"
 
 
+def _latex_header(label: str) -> str:
+    stacks = {
+        "Target group": r"Target\\group",
+        "Best model": r"Best\\model",
+        "Main issue": r"Main\\issue",
+    }
+    body = stacks.get(str(label))
+    if body is None:
+        body = _latex_escape(label)
+    return r"\textbf{\shortstack{" + body + r"}}"
+
+
 def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
     d = metrics.loc[metrics["split"].eq(split)].copy()
     if d.empty:
@@ -815,7 +827,7 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
         r"    \centering",
         r"    \begin{tabular}{@{}llrrrrll@{}}",
         r"        \toprule",
-        "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
+        "        " + " & ".join(_latex_header(h) for h in headers) + r" \\",
         r"        \midrule",
     ]
     for _, row in table.iterrows():

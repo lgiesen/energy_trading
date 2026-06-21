@@ -282,8 +282,8 @@ def build_per_lead_outputs(
     models: list[ModelSpec],
     splits: list[str],
     horizon: int,
-    eval_origin_start: pd.Timestamp | None,
-    eval_origin_end: pd.Timestamp | None,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> dict[str, pd.DataFrame]:
     joined_dir = benchmark_dir / "diagnostics" / "joined_predictions"
     files: dict[tuple[str, str, str], Path] = {}
@@ -521,6 +521,22 @@ def _fmt_num(value: Any) -> str:
     return f"{x:.4f}" if np.isfinite(x) else "-"
 
 
+def _latex_target_cell(value: Any) -> str:
+    text = str(value)
+    escaped = _latex_escape(text)
+    prefixes = [
+        "aFRR capacity price",
+        "aFRR activation price",
+        "aFRR activation rate",
+    ]
+    for prefix in prefixes:
+        escaped_prefix = _latex_escape(prefix)
+        if escaped.startswith(escaped_prefix):
+            suffix = escaped[len(escaped_prefix):].strip()
+            return r"\shortstack{aFRR\\" + _latex_escape(prefix.removeprefix("aFRR ")) + (f" {suffix}" if suffix else "") + "}"
+    return escaped
+
+
 def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
     if table.empty:
         return None
@@ -537,7 +553,7 @@ def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -
     for _, row in table.iterrows():
         group = row["target"]
         vals = [
-            r"\textbf{" + _latex_escape(group) + "}" if group != previous_group else "",
+            r"\textbf{" + _latex_target_cell(group) + "}" if group != previous_group else "",
             _latex_escape(row["lead_range"]),
             _fmt_num(row["RLQR"]),
             _fmt_num(row["XGB"]),
