@@ -618,7 +618,7 @@ def build_outputs(*, log_root: Path, out_dir: Path, final_run: str, include_tria
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build thesis-ready figures from TensorBoard logs.")
     p.add_argument("--log-root", default="artifacts/tensorboard_logs", help="Root containing TensorBoard run folders.")
-    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/tensorboard_training_diagnostics", help="Output directory for PNG, LaTeX, CSV and manifest files.")
+    p.add_argument("--out-dir", default="artifacts/benchmark/tensorboard_training_diagnostics", help="Output directory for PNG, LaTeX, CSV and manifest files.")
     p.add_argument("--final-run", default="tft_20260526_123034", help="Final TFT run folder to visualize by target.")
     p.add_argument("--no-trials", action="store_true", help="Skip trial_XXXX HPO diagnostics.")
     return p.parse_args()

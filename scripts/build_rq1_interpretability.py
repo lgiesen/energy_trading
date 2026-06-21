@@ -746,7 +746,7 @@ def build_interpretability_outputs(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build lightweight RQ1 interpretability outputs.")
     p.add_argument("--model-runs-root", default="artifacts/model_runs")
-    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/diagnostics/rq1_interpretability")
+    p.add_argument("--out-dir", default="artifacts/benchmark/rq1_ml_model_benchmark/diagnostics/rq1_interpretability")
     p.add_argument("--lead", type=int, default=24)
     p.add_argument("--quantile", default="p50")
     return p.parse_args()

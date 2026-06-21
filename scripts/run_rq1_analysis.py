@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPLIT = "test"
 DEFAULT_SPLITS = "test"
 DEFAULT_MODELS = "tft,xgboost,linear"
-DEFAULT_BENCHMARK_DIR = "artifacts/rq1_ml_model_benchmark"
+DEFAULT_BENCHMARK_DIR = "artifacts/benchmark/rq1_ml_model_benchmark"
 DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
 DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
 DEFAULT_EXPORT_DIR = (
@@ -231,7 +231,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run implemented RQ1 thesis analyses.")
     p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", default=DEFAULT_BENCHMARK_DIR)
-    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark")
+    p.add_argument("--out-dir", default="artifacts/benchmark/rq1_ml_model_benchmark")
     p.add_argument("--split", default=DEFAULT_SPLIT, help="Main thesis/reporting split. Defaults to test.")
     p.add_argument(
         "--splits",

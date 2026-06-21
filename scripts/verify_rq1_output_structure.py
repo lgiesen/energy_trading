@@ -148,7 +148,7 @@ def verify(rq1_root: Path) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Verify organized RQ1 output structure.")
-    p.add_argument("--rq1-root", default="artifacts/rq1_ml_model_benchmark")
+    p.add_argument("--rq1-root", default="artifacts/benchmark/rq1_ml_model_benchmark")
     return p.parse_args()
 
 

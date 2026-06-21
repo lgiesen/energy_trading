@@ -15,7 +15,7 @@ DEFAULT_MODEL_RUN_MANIFESTS = [
     "artifacts/model_runs/latest_linear.json",
     "artifacts/model_runs/latest_tft.json",
 ]
-DEFAULT_OUT_DIR = "artifacts/rq1_ml_model_benchmark"
+DEFAULT_OUT_DIR = "artifacts/benchmark/rq1_ml_model_benchmark"
 
 
 def _load_config(path: Path) -> dict[str, Any]:

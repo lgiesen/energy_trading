@@ -117,13 +117,23 @@ MARKET_ACTIONABLE_SPECS = [
 
 RESULT_MARKET_ACTIONABLE = {
     ("typical", "da_dminus1_11", "target_da_price"),
+    ("typical", "bcm_dplus1_08", "target_afrr_capacity_price_pos"),
     ("typical", "bcm_dplus1_08", "target_afrr_capacity_price_neg"),
+    ("typical", "bcm_dplus1_08", "target_afrr_activation_price_vwap_pos"),
+    ("typical", "bcm_dplus1_08", "target_afrr_activation_price_vwap_neg"),
+    ("typical", "bem_h1", "target_afrr_activation_price_vwap_pos"),
     ("typical", "bem_h1", "target_afrr_activation_price_vwap_neg"),
     ("typical", "bem_h1", "target_afrr_activation_rate_pos"),
+    ("typical", "bem_h1", "target_afrr_activation_rate_neg"),
     ("high_volatility", "da_dminus1_11", "target_da_price"),
+    ("high_volatility", "bcm_dplus1_08", "target_afrr_capacity_price_pos"),
     ("high_volatility", "bcm_dplus1_08", "target_afrr_capacity_price_neg"),
+    ("high_volatility", "bcm_dplus1_08", "target_afrr_activation_price_vwap_pos"),
+    ("high_volatility", "bcm_dplus1_08", "target_afrr_activation_price_vwap_neg"),
+    ("high_volatility", "bem_h1", "target_afrr_activation_price_vwap_pos"),
     ("high_volatility", "bem_h1", "target_afrr_activation_price_vwap_neg"),
     ("high_volatility", "bem_h1", "target_afrr_activation_rate_pos"),
+    ("high_volatility", "bem_h1", "target_afrr_activation_rate_neg"),
 }
 
 QUANTILE_RE = re.compile(r"^p(\d{1,2})$")
@@ -1064,7 +1074,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build RQ1 example-week forecast figures.")
     p.add_argument("--benchmark-root", default="artifacts")
     p.add_argument("--benchmark-dir", default=None)
-    p.add_argument("--out-dir", default="artifacts/rq1_ml_model_benchmark/_raw_outputs/4_1_6_example_weeks")
+    p.add_argument("--out-dir", default="artifacts/benchmark/rq1_ml_model_benchmark/_raw_outputs/4_1_6_example_weeks")
     p.add_argument("--split", default="test", help="Main thesis/reporting split. Defaults to test.")
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
     p.add_argument("--targets", default="", help="Optional comma-separated prediction targets. Default: all common targets.")

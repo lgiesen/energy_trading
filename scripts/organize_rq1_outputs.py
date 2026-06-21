@@ -2044,8 +2044,8 @@ def organize(*, final_root: Path, rq1_root: Path, split: str, prune_legacy: bool
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Organize final RQ1 outputs into thesis-facing tiers.")
-    p.add_argument("--final-root", default="artifacts/rq1_ml_model_benchmark")
-    p.add_argument("--rq1-root", default="artifacts/rq1_ml_model_benchmark")
+    p.add_argument("--final-root", default="artifacts/benchmark/rq1_ml_model_benchmark")
+    p.add_argument("--rq1-root", default="artifacts/benchmark/rq1_ml_model_benchmark")
     p.add_argument("--split", default="test")
     p.add_argument("--prune-legacy", action="store_true", help="Remove known generated legacy/unstructured copies after organizing.")
     return p.parse_args()
