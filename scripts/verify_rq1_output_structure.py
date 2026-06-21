@@ -46,6 +46,26 @@ def _check_latex_table(path: Path) -> list[str]:
 def _check_latex_figure(path: Path) -> list[str]:
     errors: list[str] = []
     text = path.read_text(encoding="utf-8")
+    tail_spike_include_files = {
+        "tail_spike_relative_pinball_by_regime_price_capacity.tex",
+        "tail_spike_relative_pinball_by_regime_activation.tex",
+    }
+    if path.name == "tail_spike_relative_pinball_by_regime.tex":
+        for token in [
+            "tail_spike_relative_pinball_by_regime_price_capacity.tex",
+            "tail_spike_relative_pinball_by_regime_activation.tex",
+        ]:
+            if token not in text:
+                errors.append(f"{path} is missing split figure input {token}.")
+        return errors
+    if path.name in tail_spike_include_files:
+        for token in [r"\begin{figure}", r"\includegraphics[width=\linewidth]", r"\caption", r"\label", r"\end{figure}"]:
+            if token not in text:
+                errors.append(f"{path} is missing {token}.")
+        for token in [r"\begin{tikzpicture}", r"\begin{axis}", r"\begin{groupplot}", r"\resizebox"]:
+            if token in text:
+                errors.append(f"{path} should remain an image-backed thesis wrapper, but contains {token}.")
+        return errors
     if path.name.startswith("calibration_reliability_"):
         stripped = text.strip()
         if not stripped.startswith(r"\begin{tikzpicture}"):

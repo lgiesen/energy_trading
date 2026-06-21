@@ -151,5 +151,6 @@ def test_range_table_breaks_afrr_target_names(tmp_path: Path) -> None:
     path = write_latex_range_table(table, out_dir=tmp_path, split="test")
     assert path is not None
     tex = path.read_text(encoding="utf-8")
-    assert r"\textbf{\shortstack{aFRR\\activation rate $-$}}" in tex
-    assert r"\textbf{\shortstack{aFRR\\capacity price +}}" in tex
+    assert r"\begin{tabular}[c]{@{}l@{}}\textbf{aFRR}\\\textbf{activation rate $-$}\end{tabular}" in tex
+    assert r"\begin{tabular}[c]{@{}l@{}}\textbf{aFRR}\\\textbf{capacity price +}\end{tabular}" in tex
+    assert r"\shortstack{aFRR" not in tex

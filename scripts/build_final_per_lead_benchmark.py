@@ -533,8 +533,14 @@ def _latex_target_cell(value: Any) -> str:
         escaped_prefix = _latex_escape(prefix)
         if escaped.startswith(escaped_prefix):
             suffix = escaped[len(escaped_prefix):].strip()
-            return r"\shortstack{aFRR\\" + _latex_escape(prefix.removeprefix("aFRR ")) + (f" {suffix}" if suffix else "") + "}"
-    return escaped
+            second_line = _latex_escape(prefix.removeprefix("aFRR ")) + (f" {suffix}" if suffix else "")
+            return (
+                r"\begin{tabular}[c]{@{}l@{}}"
+                r"\textbf{aFRR}\\"
+                rf"\textbf{{{second_line}}}"
+                r"\end{tabular}"
+            )
+    return r"\textbf{" + escaped + "}"
 
 
 def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
@@ -553,7 +559,7 @@ def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -
     for _, row in table.iterrows():
         group = row["target"]
         vals = [
-            r"\textbf{" + _latex_target_cell(group) + "}" if group != previous_group else "",
+            _latex_target_cell(group) if group != previous_group else "",
             _latex_escape(row["lead_range"]),
             _fmt_num(row["RLQR"]),
             _fmt_num(row["XGB"]),

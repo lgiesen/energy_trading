@@ -784,7 +784,7 @@ def _fmt(value: Any) -> str:
 
 def _latex_header(label: str) -> str:
     stacks = {
-        "Target group": r"Target\\group",
+        "Target": r"Target",
         "Best model": r"Best\\model",
         "Main issue": r"Main\\issue",
     }
@@ -800,13 +800,13 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
         return None
     rows: list[dict[str, Any]] = []
     d = sort_target_frame(d, target_col="target", extra_cols=["regime", "model_label"])
-    for (target_group, regime), part in d.groupby(["target_group", "regime"], sort=False):
+    for (target, target_label, regime), part in d.groupby(["target", "target_label", "regime"], sort=False):
         vals = {str(label): float(g["mean_pinball_loss"].mean()) for label, g in part.groupby("model_label")}
         best = min(vals, key=vals.get) if vals else ""
         rows.append(
             {
-                "target_group": target_group,
-                "target_group_label": str(target_group),
+                "target": target,
+                "target_label": str(target_label),
                 "regime": regime,
                 "regime_label": _clean_regime_label(regime),
                 "RLQR": vals.get("RLQR", np.nan),
@@ -818,10 +818,10 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
             }
         )
     table = pd.DataFrame(rows)
-    table["_target_group_order"] = table["target_group"].map(lambda x: _target_group_sort_key(x)[0])
+    table["_target_order"] = table["target"].map(lambda x: target_sort_key(x)[0])
     table["_regime_order"] = table["regime"].map(lambda x: REGIME_ORDER.get(str(x), 99))
-    table = table.sort_values(["_target_group_order", "_regime_order"]).drop(columns=["_target_group_order", "_regime_order"])
-    headers = ["Regime", "Target group", "RLQR", "XGB", "TFT", "Best model", "N", "Main issue"]
+    table = table.sort_values(["_target_order", "_regime_order"]).drop(columns=["_target_order", "_regime_order"])
+    headers = ["Regime", "Target", "RLQR", "XGB", "TFT", "Best model", "N", "Main issue"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
@@ -836,7 +836,7 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
             + " & ".join(
                 [
                     _latex_escape(row["regime_label"]),
-                    r"\textbf{" + _latex_escape(row["target_group_label"]) + "}",
+                    r"\textbf{" + _latex_escape(row["target_label"]) + "}",
                     _fmt(row["RLQR"]),
                     _fmt(row["XGB"]),
                     _fmt(row["TFT"]),

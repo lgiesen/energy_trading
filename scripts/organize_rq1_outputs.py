@@ -1088,152 +1088,68 @@ def _write_tail_spike_relative_tex(
     label: str,
     placement: str = "htbp",
 ) -> Path | None:
-    required = {"target_label", "regime", "model_label", "mean_pinball_loss"}
-    if data.empty or not required.issubset(data.columns):
+    root = path.parents[2]
+    figure_dir = root / "result_section" / "figures"
+    latex_dir = path.parent
+    price_capacity_png = figure_dir / "tail_spike_relative_pinball_by_regime_price_capacity.png"
+    activation_png = figure_dir / "tail_spike_relative_pinball_by_regime_activation.png"
+    available = {
+        "price_capacity": price_capacity_png.exists(),
+        "activation": activation_png.exists(),
+    }
+    if not any(available.values()):
         return None
-    d = data.copy()
-    d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
-    d = d.dropna(subset=["mean_pinball_loss"])
-    if d.empty:
-        return None
-    agg = (
-        d.groupby(["target_label", "regime", "model_label"], as_index=False, sort=False)
-        .agg(mean_pinball_loss=("mean_pinball_loss", "mean"))
-    )
-    pivot = agg.pivot_table(index=["target_label", "regime"], columns="model_label", values="mean_pinball_loss", aggfunc="mean").reset_index()
-    if "RLQR" not in pivot.columns:
-        return None
-    denom = pd.to_numeric(pivot["RLQR"], errors="coerce")
-    pivot = pivot.loc[denom.notna() & denom.abs().gt(1e-12)].copy()
-    if pivot.empty:
-        return None
-    for model in ["XGB", "TFT"]:
-        if model in pivot.columns:
-            pivot[model] = pd.to_numeric(pivot[model], errors="coerce") / pd.to_numeric(pivot["RLQR"], errors="coerce")
 
-    def _build_panels(targets: list[str]) -> list[tuple[str, pd.DataFrame, list[str], list[str]]]:
-        panels: list[tuple[str, pd.DataFrame, list[str], list[str]]] = []
-        for panel_idx, target_label in enumerate(targets, start=1):
-            regimes = TAIL_SPIKE_MAIN_REGIMES_BY_TARGET[target_label]
-            part = pivot[pivot["target_label"].astype(str).eq(target_label) & pivot["regime"].astype(str).isin(regimes)].copy()
-            if part.empty:
-                continue
-            order = {regime: i for i, regime in enumerate(regimes)}
-            part["_order"] = part["regime"].astype(str).map(order).fillna(99)
-            part = part.sort_values(["_order", "regime"]).reset_index(drop=True)
-            labels = [_tail_spike_regime_label(regime) for regime in part["regime"]]
-            symbols = [f"panel_{panel_idx}_regime_{i}" for i in range(1, len(labels) + 1)]
-            panels.append((target_label, part, labels, symbols))
-        return panels
+    thesis_root = "figures/4-results/rq1_ml_model_benchmark/4_1_5_tail_spike/result_section"
 
-    def _figure_block(
+    def _include_file(
+        filename: str,
         *,
-        panels: list[tuple[str, pd.DataFrame, list[str], list[str]]],
+        image_name: str,
         figure_caption: str,
         short_caption: str,
         figure_label: str,
-        height_cm: float,
-    ) -> list[str]:
-        if not panels:
-            return []
+    ) -> Path:
+        out = latex_dir / filename
         lines = [
-            rf"\begin{{figure}}[{placement}]",
+            r"\begin{figure}[htbp]",
             r"    \centering",
-            r"    \begin{tikzpicture}",
-            r"        \begin{groupplot}[",
-            rf"            group style={{group size=1 by {len(panels)}, vertical sep=1.20cm}},",
-            r"            width=\linewidth,",
-            rf"            height={height_cm:.2f}cm,",
-            r"            xlabel={Mean pinball loss relative to RLQR},",
-            r"            legend style={at={(0.5,1.26)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
-            r"            legend cell align={left},",
-            r"            area legend,",
-            r"            axis lines*=left,",
-            r"            xmin=0,",
-            r"            grid=major,",
-            r"        ]",
+            rf"    \includegraphics[width=\linewidth]{{{thesis_root}/figures/{image_name}}}",
+            f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
+            f"    \\label{{{figure_label}}}",
+            r"\end{figure}",
+            "",
         ]
-        legend_written = False
-        for target_label, part, labels, symbols in panels:
-            symbol_list = ",".join(symbols)
-            label_list = ",".join(_latex_escape(label) for label in labels)
-            lines.extend(
-                [
-                    r"            \nextgroupplot[",
-                    r"                xbar,",
-                    r"                bar width=8pt,",
-                    rf"                title={{{_latex_escape(thesis_titlecase(target_label))}}},",
-                    rf"                symbolic y coords={{{symbol_list}}},",
-                    rf"                ytick={{{symbol_list}}},",
-                    rf"                yticklabels={{{label_list}}},",
-                    r"                y dir=reverse,",
-                    r"                enlarge y limits=0.22,",
-                    r"            ]",
-                    rf"                \draw[color=secondary, densely dotted, line width=1.2pt] (axis cs:1,{symbols[0]}) -- (axis cs:1,{symbols[-1]});",
-                ]
-            )
-            if not legend_written:
-                lines.append(r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}")
-                lines.append(r"                \addlegendentry{RLQR baseline}")
-            for model, bar_shift in [("XGB", "-4pt"), ("TFT", "4pt")]:
-                if model not in part.columns:
-                    continue
-                color = _model_color_role(model)
-                coords: list[str] = []
-                for symbol, value in zip(symbols, pd.to_numeric(part[model], errors="coerce")):
-                    if pd.notna(value) and np.isfinite(float(value)):
-                        coords.append(f"({_tex_num(value)},{symbol})")
-                if not coords:
-                    continue
-                lines.append(rf"                \addplot[xbar, bar shift={bar_shift}, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
-                if not legend_written:
-                    lines.append(rf"                \addlegendentry{{{_latex_escape(model)}}}")
-            legend_written = True
-        lines.extend(
-            [
-                r"        \end{groupplot}",
-                r"    \end{tikzpicture}",
-                f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
-                f"    \\label{{{figure_label}}}",
-                r"\end{figure}",
-                "",
-            ]
-        )
-        return lines
+        return _write_lines(out, lines)
 
-    price_capacity_panels = _build_panels(TAIL_SPIKE_PRICE_CAPACITY_TARGETS)
-    activation_panels = _build_panels(TAIL_SPIKE_ACTIVATION_TARGETS)
-    if not price_capacity_panels and not activation_panels:
-        return None
-
-    lines = [
-        r"% Requires: \usepackage{pgfplots}",
-        r"% Requires: \usepackage{xcolor}",
-        r"% Requires: \usepgfplotslibrary{groupplots}",
-        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
-        *_latex_color_defs(),
-    ]
-    if price_capacity_panels:
-        lines.extend(
-            _figure_block(
-                panels=price_capacity_panels,
-                figure_caption="Tail and spike performance by regime for DA and aFRR capacity price forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+    written: list[Path] = []
+    if available["price_capacity"]:
+        written.append(
+            _include_file(
+                "tail_spike_relative_pinball_by_regime_price_capacity.tex",
+                image_name="tail_spike_relative_pinball_by_regime_price_capacity.png",
+                figure_caption="Tail and spike performance for DA and aFRR capacity price forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
                 short_caption="Tail and spike performance: DA and aFRR capacity price",
-                figure_label="fig:tail_spike_relative_pinball_by_regime_price_capacity",
-                height_cm=3.05,
+                figure_label="fig:tail_spike_relative_pinball_price_capacity",
             )
         )
-    if activation_panels:
-        lines.extend(
-            _figure_block(
-                panels=activation_panels,
-                figure_caption="Tail and spike performance by regime for aFRR activation price and activation rate forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
-                short_caption="Tail and spike performance: aFRR activation price and rate",
-                figure_label="fig:tail_spike_relative_pinball_by_regime_activation",
-                height_cm=2.85,
+    if available["activation"]:
+        written.append(
+            _include_file(
+                "tail_spike_relative_pinball_by_regime_activation.tex",
+                image_name="tail_spike_relative_pinball_by_regime_activation.png",
+                figure_caption="Tail and spike performance for aFRR activation forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+                short_caption="Tail and spike performance: aFRR activation",
+                figure_label="fig:tail_spike_relative_pinball_activation",
             )
         )
-    return _write_lines(path, lines)
+
+    wrapper_lines = [
+        rf"\input{{{thesis_root}/latex_figures/{p.name}}}"
+        for p in written
+    ]
+    wrapper_lines.append("")
+    return _write_lines(path, wrapper_lines)
 
 
 def _model_color_role(model: Any) -> str:
@@ -1708,6 +1624,29 @@ def _add_tikz_entry(entries: list[dict[str, Any]], *, subsection: str, tier: str
     )
 
 
+def _add_latex_figure_entry(
+    entries: list[dict[str, Any]],
+    *,
+    subsection: str,
+    tier: str,
+    path: Path,
+    metric_family: str,
+    thesis_use: str,
+    description: str,
+) -> None:
+    entries.append(
+        {
+            "subsection": subsection,
+            "tier": tier,
+            "artifact_type": "latex_figure",
+            "path": str(path),
+            "metric_family": metric_family,
+            "thesis_use": thesis_use,
+            "brief_description": description,
+        }
+    )
+
+
 def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, split: str) -> None:
     # 4.1.1 relative full-sample pinball bar chart.
     sec = "4.1.1"
@@ -1957,7 +1896,30 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             label="fig:rq1-4-1-5-tail-spike-relative-pinball",
         )
         if path:
-            _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="relative_mean_pinball_loss", description="Native pgfplots tail/spike relative pinball horizontal bar chart.")
+            _add_latex_figure_entry(
+                entries,
+                subsection=sec,
+                tier="result_section",
+                path=path,
+                metric_family="relative_mean_pinball_loss",
+                thesis_use="main thesis figure",
+                description="LaTeX wrapper for split tail/spike relative pinball figures.",
+            )
+            for split_name, description in [
+                ("tail_spike_relative_pinball_by_regime_price_capacity.tex", "LaTeX includegraphics snippet for DA and aFRR capacity tail/spike relative pinball figure."),
+                ("tail_spike_relative_pinball_by_regime_activation.tex", "LaTeX includegraphics snippet for aFRR activation tail/spike relative pinball figure."),
+            ]:
+                split_path = path.parent / split_name
+                if split_path.exists():
+                    _add_latex_figure_entry(
+                        entries,
+                        subsection=sec,
+                        tier="result_section",
+                        path=split_path,
+                        metric_family="relative_mean_pinball_loss",
+                        thesis_use="main thesis figure",
+                        description=description,
+                    )
         d["x"] = d["regime"].astype(str) + " / " + d["target_group"].astype(str)
         x_order = d["x"].drop_duplicates().tolist()
         pivot = d.pivot_table(index="x", columns="model_label", values="coverage_p10_p90", aggfunc="mean").reset_index()
@@ -1970,22 +1932,22 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
 
 
 def _prune_latex_figure_imports(rq1_root: Path) -> None:
+    keep_includegraphics = {
+        "tail_spike_relative_pinball_by_regime.tex",
+        "tail_spike_relative_pinball_by_regime_price_capacity.tex",
+        "tail_spike_relative_pinball_by_regime_activation.tex",
+    }
     for tex in rq1_root.rglob("*.tex"):
         if "latex_figures" not in tex.parts:
             continue
-        if tex.name.endswith("_p50_absolute_error_tolerance_curve.tex"):
+        if tex.name.endswith("_p50_absolute_error_tolerance_curve.tex") or tex.name in keep_includegraphics:
             continue
         if tex.read_text(encoding="utf-8", errors="ignore").find(r"\includegraphics") >= 0:
             tex.unlink()
 
 
 def _add_latex_figure_snippets(entries: list[dict[str, Any]], *, rq1_root: Path, split: str) -> None:
-    """Generate native LaTeX figures from CSV data.
-
-    Deliberately does not emit includegraphics wrappers. If the source figure is
-    image-only and the plotted data are not available, no LaTeX figure is
-    generated.
-    """
+    """Generate thesis-facing LaTeX figure snippets from organized outputs."""
     _prune_latex_figure_imports(rq1_root)
     _generate_latex_figures(entries, rq1_root=rq1_root, split=split)
 
