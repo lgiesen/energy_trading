@@ -42,6 +42,7 @@ DEFAULT_OUT_ROOT = Path("artifacts/benchmark/rq2_simulation_benchmark")
 DEFAULT_FORECAST_BENCHMARK_DIR = Path("artifacts/benchmark/rq1_ml_model_benchmark")
 DEFAULT_MODELS = ("linear", "xgb", "tft")
 DEFAULT_QUANTILES = ("p10", "p30", "p50", "p70", "p90")
+TRUTH_REFERENCE_COLOR = "#000000"
 MODEL_LABELS = {"linear": "RLQR", "xgb": "XGB", "tft": "TFT"}
 MODEL_ORDER = ["RLQR", "XGB", "TFT"]
 BENCHMARK_ORDER = ["Naive", "RHPF"]
@@ -738,16 +739,14 @@ def build_market_dispatch_soc_day(
     for col in ["real_power_violation_charge_mw", "real_power_violation_discharge_mw", "real_protected_soc_violation_pos_mwh", "real_protected_soc_violation_neg_mwh"]:
         d[col] = _num_col(d, col)
     d["activity_mw"] = d[["da_charge_mw", "da_discharge_mw", "bem_charge_mw", "bem_discharge_mw", "bcm_charge_mw", "bcm_discharge_mw"]].abs().sum(axis=1)
+    d["non_da_activity_mw"] = d[["bem_charge_mw", "bem_discharge_mw", "bcm_charge_mw", "bcm_discharge_mw"]].abs().sum(axis=1)
     d["direct_violation"] = d[["real_power_violation_charge_mw", "real_power_violation_discharge_mw", "real_protected_soc_violation_pos_mwh", "real_protected_soc_violation_neg_mwh"]].abs().sum(axis=1)
 
-    first_week_dates = _first_full_week_dates(d["timestamp_utc"])
-    candidates = d.loc[d["date"].isin(first_week_dates)].copy()
-    if candidates.empty:
-        candidates = d.copy()
-        warnings.append({"severity": "warning", "scenario": str(best["folder"]), "message": "Could not isolate first full week; selected day from full available horizon."})
+    candidates = d.copy()
     daily = candidates.groupby("date", as_index=False).agg(
         n_rows=("timestamp_utc", "size"),
         activity_mw=("activity_mw", "sum"),
+        non_da_activity_mw=("non_da_activity_mw", "sum"),
         direct_violation=("direct_violation", "sum"),
     )
     complete = daily.loc[daily["n_rows"] >= 24].copy()
@@ -756,9 +755,20 @@ def build_market_dispatch_soc_day(
         warnings.append({"severity": "warning", "scenario": str(best["folder"]), "message": "No complete 24-row day available for dispatch/SOC example-day figure."})
     no_direct_viol = complete.loc[complete["direct_violation"].abs() <= 1e-9].copy()
     selector = no_direct_viol if not no_direct_viol.empty else complete
-    selected_day = selector.sort_values(["activity_mw", "date"], ascending=[False, True]).iloc[0]["date"]
+    selected_row = selector.sort_values(["non_da_activity_mw", "activity_mw", "date"], ascending=[False, False, True]).iloc[0]
+    selected_day = selected_row["date"]
     day = d.loc[d["date"].eq(selected_day)].copy()
     day["cumulative_pnl_eur"] = pd.to_numeric(day["pnl_eur"], errors="coerce").fillna(0.0).cumsum()
+    warnings.append(
+        {
+            "severity": "info",
+            "scenario": str(best["folder"]),
+            "message": "Selected dispatch day maximizes non-DA activation activity among complete no-direct-violation days in the available simulation window.",
+            "selected_day": str(selected_day),
+            "non_da_activity_mw": float(selected_row.get("non_da_activity_mw", math.nan)),
+            "activity_mw": float(selected_row.get("activity_mw", math.nan)),
+        }
+    )
 
     scenario_invalid = str(best.get("invalid_reason", "") or "")
     sim_valid = _safe_float(best.get("simulation_valid", np.nan))
@@ -1322,12 +1332,12 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
         "BCM positive activation",
     ]
     label_map = {
-        "DA buy": "DA buy",
-        "DA sell": "DA sell",
-        "BEM negative activation": "BEM activation $-$",
-        "BEM positive activation": "BEM activation +",
-        "BCM negative activation": "BCM activation $-$",
-        "BCM positive activation": "BCM activation +",
+        "DA buy": "DA buy/sell",
+        "DA sell": "DA buy/sell",
+        "BEM negative activation": "BEM activation +/-",
+        "BEM positive activation": "BEM activation +/-",
+        "BCM negative activation": "BCM activation +/-",
+        "BCM positive activation": "BCM activation +/-",
     }
     color_map = {
         "DA buy": MARKET_COLOR_MAP["DA"],
@@ -1356,8 +1366,8 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
             width=width,
             bottom=bottom,
             color=color_map[component],
-            edgecolor="white",
-            linewidth=0.5,
+            edgecolor="none",
+            linewidth=0.0,
             label=None,
         )
         if np.nanmean(values) >= 0:
@@ -1377,7 +1387,9 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     ax2.plot(x, soc, color=THESIS_PALETTE["perfect_foresight"], linewidth=2.2, label="SoC")
     ax2.set_ylabel("SoC (MWh)")
     ax2.tick_params(axis="y", colors=THESIS_PALETTE["perfect_foresight"])
+    ax2.spines["right"].set_visible(True)
     ax2.spines["right"].set_color(THESIS_PALETTE["perfect_foresight"])
+    ax2.spines["right"].set_linewidth(1.0)
     pnl = (
         data[["timestamp_utc", "cumulative_pnl_eur"]]
         .drop_duplicates("timestamp_utc")
@@ -1392,9 +1404,15 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     ax3.plot(x, pnl, color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit")
     ax3.set_ylabel("Cumulative Net Profit (EUR)")
     ax3.tick_params(axis="y", colors=pnl_color)
+    ax3.spines["right"].set_visible(True)
     ax3.spines["right"].set_color(pnl_color)
+    ax3.spines["right"].set_linewidth(1.0)
 
     ax.axhline(0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.9)
+    ax.grid(False)
+    ax2.grid(False)
+    ax3.grid(False)
+    ax.set_axisbelow(True)
     ax.set_ylim(-10, 10)
     ax.set_ylabel("Power (MW): charge (+), discharge (-)")
     ax.set_xlabel("Time")
@@ -1412,7 +1430,8 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
-    handles = [Patch(facecolor=color_map[component], edgecolor="white", label=label_map[component]) for component in component_order]
+    legend_components = ["DA buy", "BEM negative activation", "BCM negative activation"]
+    handles = [Patch(facecolor=color_map[component], edgecolor="none", label=label_map[component]) for component in legend_components]
     handles.extend(
         [
             Line2D([0], [0], color=THESIS_PALETTE["perfect_foresight"], linewidth=2.2, label="SoC"),
@@ -1451,7 +1470,7 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
 
     color_map = {
         "Naive": THESIS_PALETTE["naive"],
-        "RHPF": THESIS_PALETTE["perfect_foresight"],
+        "RHPF": TRUTH_REFERENCE_COLOR,
         "RLQR": get_model_color("linear"),
         "XGB": get_model_color("xgb"),
         "TFT": get_model_color("tft"),

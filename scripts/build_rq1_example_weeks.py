@@ -32,6 +32,7 @@ DEFAULT_WINDOW_HOURS = 24 * 7
 LOCAL_TZ = "Europe/Berlin"
 LOCAL_ZONE = ZoneInfo(LOCAL_TZ)
 MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+TRUTH_COLOR = "#000000"
 
 MODEL_KEYS = {
     "tft": ("tft", "TFT"),
@@ -502,7 +503,7 @@ def _plot_market_actionable(
     target_display = _market_target_label(canonical_target)
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(13.5, 4.6))
-    ax.plot(d["local_time"], d["y_true"], label="Truth", color=get_model_color("truth"), linewidth=2.3)
+    ax.plot(d["local_time"], d["y_true"], label="Truth", color=TRUTH_COLOR, linewidth=2.3)
     row: dict[str, Any] = {
         "week_type": week.key,
         "market_context": spec["market_context"],
@@ -826,7 +827,7 @@ def _latex_week_ticks(view: pd.DataFrame) -> tuple[str, str]:
 
 
 def _model_color_name(model_key: str) -> str:
-    return {"tft": "tertiary", "xgb": "primary", "linear": "secondary", "truth": "perfectforesight"}.get(model_key, "neutraldark")
+    return {"tft": "tertiary", "xgb": "primary", "linear": "secondary", "truth": "black"}.get(model_key, "neutraldark")
 
 
 def write_example_week_latex(
@@ -879,7 +880,7 @@ def write_example_week_latex(
         lines.insert(insert_at, rf"                ymax={_tex_num(ylim[1])},")
         lines.insert(insert_at, rf"                ymin={_tex_num(ylim[0])},")
     truth_coords = " ".join(f"({_tex_num(i)},{_tex_num(y)})" for i, y in zip(d["plot_idx"], d["y_true"]))
-    lines.append(rf"                \addplot[color=perfectforesight, mark=none, line width=1.2pt] coordinates {{{truth_coords}}};")
+    lines.append(rf"                \addplot[color=black, mark=none, line width=1.2pt] coordinates {{{truth_coords}}};")
     legends = ["Truth"]
     for model in models:
         col = f"{model.key}_pred"
@@ -925,7 +926,7 @@ def plot_example_week(
     d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(14, 4.8))
-    ax.plot(d["local_time"], d["y_true"], label="Truth", color=get_model_color("truth"), linewidth=2.4)
+    ax.plot(d["local_time"], d["y_true"], label="Truth", color=TRUTH_COLOR, linewidth=2.4)
     row: dict[str, Any] = {
         "week": week.key,
         "week_label": week.label,

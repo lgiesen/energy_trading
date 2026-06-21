@@ -766,7 +766,7 @@ def _plot_cumulative_pnl(
         d[ts_col],
         d["perfect_foresight_cum_pnl_eur"],
         label="RHPF",
-        **get_backtest_line_style("rolling_perfect_foresight"),
+        **(get_backtest_line_style("rolling_perfect_foresight") | {"color": "#000000"}),
     )
     ax.set_title("Cumulative PnL Contribution")
     ax.set_xlabel("Time (UTC)")
