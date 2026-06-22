@@ -32,7 +32,8 @@ def test_da_tail_threshold_regimes_select_expected_rows() -> None:
     )
     thresholds = compute_target_thresholds({"target_da_price": df}, threshold_source="test_conditional", epsilon=1e-9)
     masks = regime_masks_for_target(df, thresholds, epsilon=1e-9)
-    assert masks["da_abs_tail_top5"].sum() >= 1
+    assert "da_abs_tail_top5" not in masks
+    assert not thresholds["regime"].eq("da_abs_tail_top5").any()
     assert df.loc[masks["da_positive_spike_top5"], "y_true"].min() >= thresholds.loc[thresholds["regime"].eq("da_positive_spike_top5"), "threshold_value"].iloc[0]
     assert df.loc[masks["da_negative_spike_bottom5"], "y_true"].max() <= thresholds.loc[thresholds["regime"].eq("da_negative_spike_bottom5"), "threshold_value"].iloc[0]
 

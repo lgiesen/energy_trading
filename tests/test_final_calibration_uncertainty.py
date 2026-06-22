@@ -298,7 +298,7 @@ def test_latex_and_figure_outputs_use_style(tmp_path: Path) -> None:
     assert "Best" in tex and "calibrated" in tex
     assert "p10-p90" in tex and "coverage" in tex
     assert (
-        "\\caption{MACE for each target variable and p10-p90 coverage for best calibrated model.}"
+        "\\caption{MACE and p10-p90 coverage in percentage points for each target variable.}"
         in tex
     )
     assert "Mean MACE" in tex

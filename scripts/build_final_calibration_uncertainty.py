@@ -704,7 +704,7 @@ def write_latex_summary(summary: pd.DataFrame, *, out_dir: Path, split: str) -> 
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{MACE for each target variable and p10-p90 coverage for best calibrated model.}",
+            r"    \caption{MACE and p10-p90 coverage in percentage points for each target variable.}",
             r"    \label{tab:calibration_summary_test}",
             r"\end{table}",
             "",

@@ -133,20 +133,20 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.4", "backup", "diagnostics", "diagnostics/gate_bucket_row_counts.csv", _sub_sources("4.1.4", "gate_bucket_row_counts.csv") + ["gate_bucket_row_counts.csv"], "row_counts", "diagnostics", "Gate bucket row counts."),
         _route("4.1.4", "backup", "diagnostics", "diagnostics/gate_bucket_observed_leads.csv", _sub_sources("4.1.4", "gate_bucket_observed_leads.csv") + ["gate_bucket_observed_leads.csv"], "observed_leads", "diagnostics", "Gate bucket observed leads."),
         _route("4.1.4", "backup", "warnings", "warnings/gate_bucket_warnings.csv", _sub_sources("4.1.4", "gate_bucket_warnings.csv") + ["gate_bucket_warnings.csv"], "warnings", "warnings", "Gate bucket warnings."),
-        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_price_capacity.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_price_capacity.png") + ["figures/tail_spike_relative_pinball_by_regime_price_capacity.png"], "relative_mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime for DA and capacity price targets."),
-        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_activation.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_activation.png") + ["figures/tail_spike_relative_pinball_by_regime_activation.png"], "relative_mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime for activation price and rate targets."),
-        _route("4.1.5", "result_section", "figure", "figures/tail_spike_residual_distribution_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_residual_distribution_by_regime.png") + ["figures/tail_spike_residual_distribution_by_regime.png"], "residuals", "main thesis figure", "Tail/spike residual distributions."),
-        _route("4.1.5", "result_section", "latex_table", f"tables/tail_spike_metrics_{split}.tex", _sub_sources("4.1.5", f"latex/tail_spike_metrics_{split}.tex") + [f"latex/tail_spike_metrics_{split}.tex"], "mean_pinball_loss", "main thesis table", "Tail/spike mean pinball table."),
-        _route("4.1.5", "appendix", "figure", "figures/tail_spike_coverage_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_coverage_by_regime.png") + ["figures/tail_spike_coverage_by_regime.png"], "interval_coverage", "appendix figure", "Tail/spike p10-p90 coverage."),
-        _route("4.1.5", "appendix", "figure", "figures/tail_spike_mae_p50_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_mae_p50_by_regime.png") + ["figures/tail_spike_mae_p50_by_regime.png"], "mae_p50", "appendix figure", "Tail/spike p50 MAE."),
-        _route("4.1.5", "appendix", "figure", "figures/tail_spike_forecast_band_selected_week.png", _sub_sources("4.1.5", "figures/tail_spike_forecast_band_*.png") + ["figures/tail_spike_forecast_band_*.png"], "forecast_band", "appendix figure", "Selected-week tail/spike forecast-band example.", required=False),
-        _route("4.1.5", "backup", "csv", f"csv/tail_spike_metrics_{split}.csv", _sub_sources("4.1.5", f"tail_spike_metrics_{split}.csv") + [f"tail_spike_metrics_{split}.csv"], "tail_spike_metrics", "backup data", "Tail/spike metrics CSV."),
-        _route("4.1.5", "backup", "csv", "csv/tail_spike_regime_definitions.csv", _sub_sources("4.1.5", "tail_spike_regime_definitions.csv") + ["tail_spike_regime_definitions.csv"], "definitions", "backup data", "Tail/spike regime definitions."),
-        _route("4.1.5", "backup", "csv", "csv/tail_spike_thresholds.csv", _sub_sources("4.1.5", "tail_spike_thresholds.csv") + ["tail_spike_thresholds.csv"], "thresholds", "backup data", "Tail/spike thresholds."),
-        _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_row_counts.csv", _sub_sources("4.1.5", "tail_spike_row_counts.csv") + ["tail_spike_row_counts.csv"], "row_counts", "diagnostics", "Tail/spike row counts."),
-        _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_selected_weeks.csv", _sub_sources("4.1.5", "tail_spike_selected_weeks.csv") + ["tail_spike_selected_weeks.csv"], "selected_weeks", "diagnostics", "Tail/spike selected weeks."),
-        _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_relative_pinball_by_regime_all_in_one.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_all_in_one.png") + ["figures/tail_spike_relative_pinball_by_regime_all_in_one.png"], "relative_mean_pinball_loss", "diagnostic figure", "Dense all-in-one tail/spike relative mean pinball chart.", required=False),
-        _route("4.1.5", "backup", "warnings", "warnings/tail_spike_warnings.csv", _sub_sources("4.1.5", "tail_spike_warnings.csv") + ["tail_spike_warnings.csv"], "warnings", "warnings", "Tail/spike warnings."),
+        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_price_capacity.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_price_capacity.png") + ["_raw_outputs/4_1_5_tail_spike/figures/tail_spike_relative_pinball_by_regime_price_capacity.png", "_raw_outputs/shared/figures/tail_spike_relative_pinball_by_regime_price_capacity.png", "figures/tail_spike_relative_pinball_by_regime_price_capacity.png"], "relative_mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime for DA and capacity price targets."),
+        _route("4.1.5", "result_section", "figure", "figures/tail_spike_relative_pinball_by_regime_activation.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_activation.png") + ["_raw_outputs/4_1_5_tail_spike/figures/tail_spike_relative_pinball_by_regime_activation.png", "_raw_outputs/shared/figures/tail_spike_relative_pinball_by_regime_activation.png", "figures/tail_spike_relative_pinball_by_regime_activation.png"], "relative_mean_pinball_loss", "main thesis figure", "Tail/spike relative mean pinball by regime for activation price and rate targets."),
+        _route("4.1.5", "result_section", "figure", "figures/tail_spike_residual_distribution_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_residual_distribution_by_regime.png") + ["_raw_outputs/4_1_5_tail_spike/figures/tail_spike_residual_distribution_by_regime.png", "_raw_outputs/shared/figures/tail_spike_residual_distribution_by_regime.png", "figures/tail_spike_residual_distribution_by_regime.png"], "residuals", "main thesis figure", "Tail/spike residual distributions."),
+        _route("4.1.5", "result_section", "latex_table", f"tables/tail_spike_metrics_{split}.tex", _sub_sources("4.1.5", f"latex/tail_spike_metrics_{split}.tex") + [f"_raw_outputs/4_1_5_tail_spike/latex/tail_spike_metrics_{split}.tex", f"_raw_outputs/shared/latex/tail_spike_metrics_{split}.tex", f"latex/tail_spike_metrics_{split}.tex"], "mean_pinball_loss", "main thesis table", "Tail/spike mean pinball table."),
+        _route("4.1.5", "appendix", "figure", "figures/tail_spike_coverage_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_coverage_by_regime.png") + ["_raw_outputs/4_1_5_tail_spike/figures/tail_spike_coverage_by_regime.png", "_raw_outputs/shared/figures/tail_spike_coverage_by_regime.png", "figures/tail_spike_coverage_by_regime.png"], "interval_coverage", "appendix figure", "Tail/spike p10-p90 coverage."),
+        _route("4.1.5", "appendix", "figure", "figures/tail_spike_mae_p50_by_regime.png", _sub_sources("4.1.5", "figures/tail_spike_mae_p50_by_regime.png") + ["_raw_outputs/4_1_5_tail_spike/figures/tail_spike_mae_p50_by_regime.png", "_raw_outputs/shared/figures/tail_spike_mae_p50_by_regime.png", "figures/tail_spike_mae_p50_by_regime.png"], "mae_p50", "appendix figure", "Tail/spike p50 MAE."),
+        _route("4.1.5", "appendix", "figure", "figures/tail_spike_forecast_band_selected_week.png", _sub_sources("4.1.5", "figures/tail_spike_forecast_band_*.png") + ["_raw_outputs/4_1_5_tail_spike/figures/tail_spike_forecast_band_*.png", "_raw_outputs/shared/figures/tail_spike_forecast_band_*.png", "figures/tail_spike_forecast_band_*.png"], "forecast_band", "appendix figure", "Selected-week tail/spike forecast-band example.", required=False),
+        _route("4.1.5", "backup", "csv", f"csv/tail_spike_metrics_{split}.csv", _sub_sources("4.1.5", f"tail_spike_metrics_{split}.csv") + [f"_raw_outputs/4_1_5_tail_spike/tail_spike_metrics_{split}.csv", f"_raw_outputs/shared/tail_spike_metrics_{split}.csv", f"tail_spike_metrics_{split}.csv"], "tail_spike_metrics", "backup data", "Tail/spike metrics CSV."),
+        _route("4.1.5", "backup", "csv", "csv/tail_spike_regime_definitions.csv", _sub_sources("4.1.5", "tail_spike_regime_definitions.csv") + ["_raw_outputs/4_1_5_tail_spike/tail_spike_regime_definitions.csv", "_raw_outputs/shared/tail_spike_regime_definitions.csv", "tail_spike_regime_definitions.csv"], "definitions", "backup data", "Tail/spike regime definitions."),
+        _route("4.1.5", "backup", "csv", "csv/tail_spike_thresholds.csv", _sub_sources("4.1.5", "tail_spike_thresholds.csv") + ["_raw_outputs/4_1_5_tail_spike/tail_spike_thresholds.csv", "_raw_outputs/shared/tail_spike_thresholds.csv", "tail_spike_thresholds.csv"], "thresholds", "backup data", "Tail/spike thresholds."),
+        _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_row_counts.csv", _sub_sources("4.1.5", "tail_spike_row_counts.csv") + ["_raw_outputs/4_1_5_tail_spike/tail_spike_row_counts.csv", "_raw_outputs/shared/tail_spike_row_counts.csv", "tail_spike_row_counts.csv"], "row_counts", "diagnostics", "Tail/spike row counts."),
+        _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_selected_weeks.csv", _sub_sources("4.1.5", "tail_spike_selected_weeks.csv") + ["_raw_outputs/4_1_5_tail_spike/tail_spike_selected_weeks.csv", "_raw_outputs/shared/tail_spike_selected_weeks.csv", "tail_spike_selected_weeks.csv"], "selected_weeks", "diagnostics", "Tail/spike selected weeks."),
+        _route("4.1.5", "backup", "diagnostics", "diagnostics/tail_spike_relative_pinball_by_regime_all_in_one.png", _sub_sources("4.1.5", "figures/tail_spike_relative_pinball_by_regime_all_in_one.png") + ["_raw_outputs/4_1_5_tail_spike/figures/tail_spike_relative_pinball_by_regime_all_in_one.png", "_raw_outputs/shared/figures/tail_spike_relative_pinball_by_regime_all_in_one.png", "figures/tail_spike_relative_pinball_by_regime_all_in_one.png"], "relative_mean_pinball_loss", "diagnostic figure", "Dense all-in-one tail/spike relative mean pinball chart.", required=False),
+        _route("4.1.5", "backup", "warnings", "warnings/tail_spike_warnings.csv", _sub_sources("4.1.5", "tail_spike_warnings.csv") + ["_raw_outputs/4_1_5_tail_spike/tail_spike_warnings.csv", "_raw_outputs/shared/tail_spike_warnings.csv", "tail_spike_warnings.csv"], "warnings", "warnings", "Tail/spike warnings."),
     ]
     price_tolerance_stems = [
         "da_price",
@@ -858,7 +858,6 @@ def _actionable_label(bucket: Any, target_group: Any) -> str:
 
 TAIL_SPIKE_REGIME_LABELS = {
     "normal": "Normal",
-    "da_abs_tail_top5": "Abs. tail top 5%",
     "da_positive_spike_top5": "Positive spike top 5%",
     "da_negative_spike_bottom5": "Negative spike bottom 5%",
     "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
@@ -871,7 +870,6 @@ TAIL_SPIKE_REGIME_LABELS = {
 TAIL_SPIKE_MAIN_REGIMES_BY_TARGET = {
     "DA price": [
         "normal",
-        "da_abs_tail_top5",
         "da_positive_spike_top5",
         "da_negative_spike_bottom5",
         "high_volatility_week",
@@ -1193,48 +1191,172 @@ def _write_tail_spike_relative_tex(
         return None
 
     thesis_root = "figures/4-results/rq1_ml_model_benchmark/4_1_5_tail_spike/result_section"
-    figure_root = latex_dir.parent / "figures"
+    regime_labels = {
+        "normal": "Normal",
+        "da_positive_spike_top5": "Positive spike top 5%",
+        "da_negative_spike_bottom5": "Negative spike bottom 5%",
+        "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
+        "activation_nonzero": "Activation nonzero",
+        "activation_zero_or_nearzero": "Activation zero / near-zero",
+        "high_volatility_week": "High-volatility week",
+        "spike_week": "Spike week",
+    }
+    main_regimes_by_target = {
+        "DA price": [
+            "normal",
+            "da_positive_spike_top5",
+            "da_negative_spike_bottom5",
+            "high_volatility_week",
+            "spike_week",
+        ],
+        "aFRR capacity price +": ["normal", "high_volatility_week", "spike_week"],
+        "aFRR capacity price -": ["normal", "high_volatility_week", "spike_week"],
+        "aFRR activation price +": ["normal", "afrr_activation_price_abs_tail_top5", "high_volatility_week", "spike_week"],
+        "aFRR activation price -": ["normal", "afrr_activation_price_abs_tail_top5", "high_volatility_week", "spike_week"],
+        "aFRR activation rate +": ["activation_zero_or_nearzero", "activation_nonzero", "high_volatility_week", "spike_week"],
+        "aFRR activation rate -": ["activation_zero_or_nearzero", "activation_nonzero", "high_volatility_week", "spike_week"],
+    }
+    target_orders = {
+        "price_capacity": ["DA price", "aFRR capacity price +", "aFRR capacity price -"],
+        "activation": [
+            "aFRR activation price +",
+            "aFRR activation price -",
+            "aFRR activation rate +",
+            "aFRR activation rate -",
+        ],
+    }
 
-    def _write_includegraphics_file(
+    def _clean_regime_label(regime: Any) -> str:
+        return regime_labels.get(str(regime), _tex_label(regime))
+
+    def _write_native_relative_file(
         filename: str,
         *,
-        image_stem: str,
+        target_key: str,
         figure_caption: str,
         short_caption: str,
         figure_label: str,
     ) -> Path | None:
         out = latex_dir / filename
-        image_path = figure_root / f"{image_stem}.pdf"
-        image_ext = "pdf"
-        if not image_path.exists():
-            image_path = figure_root / f"{image_stem}.png"
-            image_ext = "png"
-        if not image_path.exists():
+        target_labels = target_orders[target_key]
+        d = data.loc[data["target_label"].isin(target_labels)].copy()
+        d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+        d = d.dropna(subset=["mean_pinball_loss"])
+        if d.empty:
             return None
+
+        rows: list[dict[str, Any]] = []
+        for target_label in target_labels:
+            target_part = d.loc[d["target_label"].eq(target_label)].copy()
+            if target_part.empty:
+                continue
+            regimes = main_regimes_by_target.get(target_label, target_part["regime"].dropna().astype(str).drop_duplicates().tolist())
+            for regime in regimes:
+                regime_part = target_part.loc[target_part["regime"].eq(regime)]
+                if regime_part.empty:
+                    continue
+                values = (
+                    regime_part.groupby("model_label", as_index=True)["mean_pinball_loss"]
+                    .mean()
+                    .to_dict()
+                )
+                baseline = values.get("RLQR")
+                if baseline is None or not np.isfinite(float(baseline)) or abs(float(baseline)) <= 1e-12:
+                    continue
+                row_label = f"{_tex_label(target_label)} / {_clean_regime_label(regime)}"
+                row: dict[str, Any] = {"label": row_label}
+                for model in ["XGB", "TFT"]:
+                    value = values.get(model)
+                    if value is not None and np.isfinite(float(value)):
+                        row[model] = float(value) / float(baseline)
+                if "XGB" in row or "TFT" in row:
+                    rows.append(row)
+        if not rows:
+            return None
+
+        labels = [str(row["label"]) for row in rows]
+        y_symbols = [_tex_symbol(f"row_{idx}_{label}") for idx, label in enumerate(labels)]
+        y_symbol_list = ",".join(y_symbols)
+        y_tick_labels = ",".join(_latex_escape(label) for label in labels)
+        height_cm = max(7.4, min(13.5, 0.47 * len(labels) + 2.0))
+        max_x = max(
+            [1.0]
+            + [
+                float(row[model])
+                for row in rows
+                for model in ["XGB", "TFT"]
+                if model in row and np.isfinite(float(row[model]))
+            ]
+        )
+        xmax = max(1.25, min(max_x * 1.12, max_x + 0.35))
+
         lines = [
+            r"% Requires: \usepackage{pgfplots}",
+            r"% Requires: \usepackage{xcolor}",
+            r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+            *_latex_color_defs(),
             rf"\begin{{figure}}[{placement}]",
             r"    \centering",
-            rf"    \includegraphics[width=\linewidth]{{{thesis_root}/figures/{image_stem}.{image_ext}}}",
+            r"    \resizebox{\linewidth}{!}{%",
+            r"        \begin{tikzpicture}",
+            r"            \begin{axis}[",
+            r"                xbar,",
+            r"                bar width=7pt,",
+            r"                width=0.98\textwidth,",
+            rf"                height={_tex_num(height_cm)}cm,",
+            r"                xlabel={Mean pinball loss relative to RLQR},",
+            r"                legend style={at={(0.5,1.12)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+            r"                legend cell align={left},",
+            r"                area legend,",
+            r"                axis lines*=left,",
+            r"                xmin=0,",
+            rf"                xmax={_tex_num(xmax)},",
+            r"                grid=major,",
+            rf"                symbolic y coords={{{y_symbol_list}}},",
+            rf"                ytick={{{y_symbol_list}}},",
+            rf"                yticklabels={{{y_tick_labels}}},",
+            r"                yticklabel style={font=\scriptsize, text width=4.9cm, align=right},",
+            r"                y dir=reverse,",
+            r"            ]",
+            rf"                \draw[color=secondary, densely dotted, line width=1.2pt, shorten <=-8mm, shorten >=-8mm] (axis cs:1,{y_symbols[0]}) -- (axis cs:1,{y_symbols[-1]});",
+            r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}",
+            r"                \addlegendentry{RLQR}",
+        ]
+        for model in ["XGB", "TFT"]:
+            coords: list[str] = []
+            for row, y_symbol in zip(rows, y_symbols):
+                value = row.get(model)
+                if value is not None and np.isfinite(float(value)):
+                    coords.append(f"({_tex_num(value)},{y_symbol})")
+            if coords:
+                color = _model_color_role(model)
+                lines.append(rf"                \addplot[xbar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+                lines.append(rf"                \addlegendentry{{{model}}}")
+        lines.extend(
+            [
+            r"            \end{axis}",
+            r"        \end{tikzpicture}}",
             f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
             f"    \\label{{{figure_label}}}",
             r"\end{figure}",
             "",
-        ]
+            ]
+        )
         return _write_lines(out, lines)
 
     written: list[Path] = []
-    price_capacity = _write_includegraphics_file(
+    price_capacity = _write_native_relative_file(
         "tail_spike_relative_pinball_by_regime_price_capacity.tex",
-        image_stem="tail_spike_relative_pinball_by_regime_price_capacity",
+        target_key="price_capacity",
         figure_caption="Tail and spike performance for DA and aFRR capacity price forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
         short_caption="Tail and spike performance: DA and aFRR capacity price",
         figure_label="fig:tail_spike_relative_pinball_price_capacity",
     )
     if price_capacity is not None and price_capacity.exists():
         written.append(price_capacity)
-    activation = _write_includegraphics_file(
+    activation = _write_native_relative_file(
         "tail_spike_relative_pinball_by_regime_activation.tex",
-        image_stem="tail_spike_relative_pinball_by_regime_activation",
+        target_key="activation",
         figure_caption="Tail and spike performance for aFRR activation forecasts. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
         short_caption="Tail and spike performance: aFRR activation",
         figure_label="fig:tail_spike_relative_pinball_activation",
@@ -1384,6 +1506,7 @@ def _write_p50_tolerance_curve_tex(
     if d.empty:
         return None
     xmax = float(d["threshold"].max())
+    x_den = xmax if abs(xmax) > 1e-12 else 1.0
     # Keep dense reference thresholds off the x-axis. Labels such as 1/5/10
     # otherwise collide near the origin for large price-error ranges.
     xticks = [round(xmax, 8)]
@@ -1412,7 +1535,8 @@ def _write_p50_tolerance_curve_tex(
         rf"                xticklabels={{{x_tick_labels}}},",
         r"                ytick={0,0.2,0.4,0.6,0.8,1},",
         r"                yticklabels={0\%,20\%,40\%,60\%,80\%,100\%},",
-        r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                clip=false,",
+        r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
         r"                axis lines*=left,",
         r"                grid=major,",
@@ -1422,9 +1546,9 @@ def _write_p50_tolerance_curve_tex(
         threshold_f = float(threshold)
         if 0.0 <= threshold_f <= xmax:
             lines.append(rf"                \addplot[color=neutraldark, dashed, mark=none, line width=0.8pt, forget plot] coordinates {{({_tex_num(threshold_f)},0) ({_tex_num(threshold_f)},1)}};")
-            y_pos = 0.94 - 0.08 * (list(thresholds).index(threshold) % 3)
+            x_rel = threshold_f / x_den
             threshold_label = _latex_escape(f"{threshold_f:g} {unit}")
-            lines.append(rf"                \node[font=\scriptsize, rotate=90, anchor=east, fill=white, fill opacity=0.85, text opacity=1, inner sep=1pt] at (axis cs:{_tex_num(threshold_f)},{_tex_num(y_pos)}) {{{threshold_label}}};")
+            lines.append(rf"                \node[font=\scriptsize, anchor=south, fill=white, fill opacity=0.9, text opacity=1, inner sep=1pt] at (rel axis cs:{_tex_num(x_rel)},1.03) {{{threshold_label}}};")
     legends: list[str] = []
     for model in MODEL_LABELS:
         part = d[d["model"].astype(str).eq(model)].sort_values("threshold")
@@ -1469,10 +1593,14 @@ def _write_line_tex(
     percent_axes: bool = False,
     show_markers: bool = True,
     fragment_only: bool = False,
+    highlight_spans: tuple[tuple[float, float], ...] = (),
 ) -> Path | None:
     if data.empty:
         return None
     colors = {"TFT": "tertiary", "XGB": "primary", "RLQR": "secondary", "linear": "secondary", "tft": "tertiary", "xgb": "primary"}
+    x_values_all = pd.to_numeric(data[x_col], errors="coerce").dropna()
+    x_min = float(xlim[0]) if xlim is not None else (float(x_values_all.min()) if not x_values_all.empty else 0.0)
+    x_max = float(xlim[1]) if xlim is not None else (float(x_values_all.max()) if not x_values_all.empty else 1.0)
     lines = [r"\begin{tikzpicture}"] if fragment_only else _tikz_header(caption, label, placement=placement)
     lines.extend(
         [
@@ -1504,6 +1632,12 @@ def _write_line_tex(
     grouped = {str(series): group for series, group in data.groupby(series_col, sort=False)}
     ordered_series = [s for s in ordered_model_labels(grouped.keys()) if s in grouped]
     ordered_series.extend([s for s in grouped if s not in ordered_series])
+    for left, right in highlight_spans:
+        left_rel = (float(left) - x_min) / (x_max - x_min) if abs(x_max - x_min) > 1e-12 else 0.0
+        right_rel = (float(right) - x_min) / (x_max - x_min) if abs(x_max - x_min) > 1e-12 else 1.0
+        lines.append(
+            rf"                \fill[black!8, draw=none] (rel axis cs:{_tex_num(left_rel)},0) rectangle (rel axis cs:{_tex_num(right_rel)},1);"
+        )
     if reference_y is not None:
         x_values = pd.to_numeric(data[x_col], errors="coerce").dropna()
         if not x_values.empty:
@@ -1556,9 +1690,13 @@ def _write_line_panel_tex(
     ylim: tuple[float, float] | None = None,
     percent_ticks: tuple[float, ...] | None = None,
     show_markers: bool = True,
+    highlight_spans: tuple[tuple[float, float], ...] = (),
 ) -> Path | None:
     if data.empty:
         return None
+    x_values_all = pd.to_numeric(data[x_col], errors="coerce").dropna()
+    x_min = float(xlim[0]) if xlim is not None else (float(x_values_all.min()) if not x_values_all.empty else 0.0)
+    x_max = float(xlim[1]) if xlim is not None else (float(x_values_all.max()) if not x_values_all.empty else 1.0)
     panels = ordered_unique(data[panel_col].dropna().astype(str).drop_duplicates().tolist())
     if not panels:
         return None
@@ -1612,6 +1750,12 @@ def _write_line_panel_tex(
     for panel_i, panel in enumerate(panels):
         panel_df = data[data[panel_col].astype(str).eq(panel)].copy()
         lines.append(rf"                \nextgroupplot[title={{{_latex_escape(thesis_titlecase(_tex_label(panel)))}}}]")
+        for left, right in highlight_spans:
+            left_rel = (float(left) - x_min) / (x_max - x_min) if abs(x_max - x_min) > 1e-12 else 0.0
+            right_rel = (float(right) - x_min) / (x_max - x_min) if abs(x_max - x_min) > 1e-12 else 1.0
+            lines.append(
+                rf"                    \fill[black!8, draw=none] (rel axis cs:{_tex_num(left_rel)},0) rectangle (rel axis cs:{_tex_num(right_rel)},1);"
+            )
         grouped = {str(series): group for series, group in panel_df.groupby(series_col, sort=False)}
         ordered_series = [s for s in ordered_model_labels(grouped.keys()) if s in grouped]
         ordered_series.extend([s for s in grouped if s not in ordered_series])
@@ -1821,7 +1965,12 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
         )
         if path:
             _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="computational_cost", description="Native pgfplots computational-cost bar chart.")
-    tolerance_csv = root / "backup" / "csv" / "price_p50_absolute_error_tolerance_curve.csv"
+    tolerance_candidates = [
+        root / "backup" / "csv" / "price_p50_absolute_error_tolerance_curve.csv",
+        rq1_root / "_raw_outputs" / "4_1_1_full_unweighted" / "csv" / "rq1_4_1_1_price_p50_absolute_error_tolerance_curve.csv",
+        rq1_root / "_raw_outputs" / "4_1_1_full_unweighted_metrics" / "csv" / "rq1_4_1_1_price_p50_absolute_error_tolerance_curve.csv",
+    ]
+    tolerance_csv = next((path for path in tolerance_candidates if path.exists()), tolerance_candidates[0])
     if tolerance_csv.exists():
         tolerance = pd.read_csv(tolerance_csv)
         for target, (slug, _label, _thresholds, _unit) in P50_TOLERANCE_TEX_CONFIG.items():
@@ -1931,9 +2080,20 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
     # 4.1.3 per-lead line charts.
     sec = "4.1.3"
     root = rq1_root / SUBSECTIONS[sec]
-    per_lead = root / "backup" / "csv" / f"per_lead_metrics_{split}.csv"
+    per_lead_candidates = [
+        root / "backup" / "csv" / f"per_lead_metrics_{split}.csv",
+        rq1_root / "_raw_outputs" / "4_1_3_per_lead" / f"per_lead_metrics_{split}.csv",
+        rq1_root / "_raw_outputs" / "4_1_3_per_lead_hour" / f"per_lead_metrics_{split}.csv",
+    ]
+    per_lead = next((path for path in per_lead_candidates if path.exists()), per_lead_candidates[0])
     if per_lead.exists():
         df = pd.read_csv(per_lead)
+        pinball_highlight_spans = {
+            "da_price": ((13.0, 36.0),),
+            "afrr_capacity_price": ((16.0, 39.0),),
+            "afrr_activation_price": ((0.0, 8.0), (16.0, 39.0)),
+            "afrr_activation_rate": ((0.0, 8.0), (16.0, 39.0)),
+        }
         for target_slug in sorted(df["target_slug"].dropna().unique(), key=target_sort_key):
             group = sort_target_frame(df[df["target_slug"].eq(target_slug)].copy(), target_col="target_label")
             for metric, stem, tier in [
@@ -1943,6 +2103,9 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             ]:
                 out = root / tier / "latex_figures" / f"{stem}_{target_slug}.tex"
                 target_label = _tex_label(group["target_label"].iloc[0])
+                highlight_spans = pinball_highlight_spans.get(str(target_slug), ()) if metric == "mean_pinball_loss" and tier == "result_section" else ()
+                xlim = (0.0, 48.0) if highlight_spans else None
+                caption_suffix = " Relevant forecast lead highlighted in grey." if highlight_spans else ""
                 if group["target_label"].nunique(dropna=True) > 1:
                     shared_ylim = _padded_ylim(group, metric)
                     path = _write_line_panel_tex(
@@ -1952,15 +2115,17 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         x_col="lead_time_h",
                         y_col=metric,
                         series_col="model_label",
-                        caption=f"{_tex_label(metric)} by lead hour for {_tex_label(group['target_group'].iloc[0])}.",
+                        caption=f"{_tex_label(metric)} by lead hour for {_tex_label(group['target_group'].iloc[0])}.{caption_suffix}",
                         label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}",
                         ylabel=_tex_label(metric),
                         placement="htbp" if tier == "result_section" else "p",
                         show_markers=metric != "mean_pinball_loss",
                         ylim=shared_ylim,
+                        xlim=xlim,
+                        highlight_spans=highlight_spans,
                     )
                 else:
-                    path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss")
+                    path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.{caption_suffix}", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss", xlim=xlim, highlight_spans=highlight_spans)
                 if path:
                     _add_tikz_entry(entries, subsection=sec, tier=tier, path=path, metric_family=metric, description=f"Native pgfplots {metric} per-lead line chart for {target_slug}.")
             pivot = group.pivot_table(index=["target_label", "lead_time_h"], columns="model_label", values="mean_pinball_loss", aggfunc="first").reset_index()
@@ -2027,7 +2192,12 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
     # 4.1.5 tail/spike bars from regime metrics.
     sec = "4.1.5"
     root = rq1_root / SUBSECTIONS[sec]
-    tail = root / "backup" / "csv" / f"tail_spike_metrics_{split}.csv"
+    tail_candidates = [
+        root / "backup" / "csv" / f"tail_spike_metrics_{split}.csv",
+        rq1_root / "_raw_outputs" / "4_1_5_tail_spike" / f"tail_spike_metrics_{split}.csv",
+        rq1_root / "_raw_outputs" / "shared" / f"tail_spike_metrics_{split}.csv",
+    ]
+    tail = next((candidate for candidate in tail_candidates if candidate.exists()), tail_candidates[0])
     if tail.exists():
         df = pd.read_csv(tail)
         d = df.copy()
@@ -2050,8 +2220,8 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 description="LaTeX wrapper for split tail/spike relative pinball figures.",
             )
             for split_name, description in [
-                ("tail_spike_relative_pinball_by_regime_price_capacity.tex", "LaTeX includegraphics wrapper for DA and aFRR capacity tail/spike relative pinball figure."),
-                ("tail_spike_relative_pinball_by_regime_activation.tex", "LaTeX includegraphics wrapper for aFRR activation tail/spike relative pinball figure."),
+                ("tail_spike_relative_pinball_by_regime_price_capacity.tex", "Native pgfplots DA and aFRR capacity tail/spike relative pinball figure."),
+                ("tail_spike_relative_pinball_by_regime_activation.tex", "Native pgfplots aFRR activation tail/spike relative pinball figure."),
             ]:
                 split_path = path.parent / split_name
                 if split_path.exists():

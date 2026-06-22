@@ -75,7 +75,6 @@ TARGET_GROUPS = {
 
 REGIME_LABELS = {
     "normal": "Normal",
-    "da_abs_tail_top5": "Abs. tail top 5%",
     "da_positive_spike_top5": "Positive spike top 5%",
     "da_negative_spike_bottom5": "Negative spike bottom 5%",
     "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
@@ -87,7 +86,6 @@ REGIME_LABELS = {
 
 MAIN_ISSUES = {
     "normal": "Reference regime",
-    "da_abs_tail_top5": "Large price magnitude",
     "da_positive_spike_top5": "Positive price spike",
     "da_negative_spike_bottom5": "Negative price spike",
     "afrr_activation_price_abs_tail_top5": "Large activation price",
@@ -110,7 +108,6 @@ REGIME_ORDER = {regime: i for i, regime in enumerate(REGIME_LABELS)}
 MAIN_REGIMES_BY_TARGET_LABEL = {
     "DA price": [
         "normal",
-        "da_abs_tail_top5",
         "da_positive_spike_top5",
         "da_negative_spike_bottom5",
         "high_volatility_week",
@@ -411,7 +408,6 @@ def compute_target_thresholds(
         if target == DA_TARGET:
             rows.extend(
                 [
-                    {"target": target, "target_group": group, "regime": "da_abs_tail_top5", "threshold_name": "abs_q95", "threshold_value": _threshold(y.abs(), 0.95), "threshold_source": threshold_source},
                     {"target": target, "target_group": group, "regime": "da_positive_spike_top5", "threshold_name": "q95", "threshold_value": _threshold(y, 0.95), "threshold_source": threshold_source},
                     {"target": target, "target_group": group, "regime": "da_negative_spike_bottom5", "threshold_name": "q05", "threshold_value": _threshold(y, 0.05), "threshold_source": threshold_source},
                 ]
@@ -438,7 +434,7 @@ def regime_masks_for_target(df: pd.DataFrame, thresholds: pd.DataFrame, *, epsil
     for _, row in t.iterrows():
         regime = str(row["regime"])
         thr = float(row["threshold_value"])
-        if regime in {"da_abs_tail_top5", "afrr_activation_price_abs_tail_top5"}:
+        if regime == "afrr_activation_price_abs_tail_top5":
             masks[regime] = y.abs().ge(thr)
         elif regime == "da_positive_spike_top5":
             masks[regime] = y.ge(thr)
@@ -542,7 +538,6 @@ def _regime_definitions() -> pd.DataFrame:
     return pd.DataFrame(
         [
             {"regime": "normal", "definition": "Rows not belonging to a selected tail/spike regime for the same target."},
-            {"regime": "da_abs_tail_top5", "definition": "target_da_price rows with abs(y_true) at or above abs 95th percentile threshold."},
             {"regime": "da_positive_spike_top5", "definition": "target_da_price rows with y_true at or above 95th percentile threshold."},
             {"regime": "da_negative_spike_bottom5", "definition": "target_da_price rows with y_true at or below 5th percentile threshold."},
             {"regime": "afrr_activation_price_abs_tail_top5", "definition": "activation price rows with abs(y_true) at or above abs 95th percentile threshold."},
