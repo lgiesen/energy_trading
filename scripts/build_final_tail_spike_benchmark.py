@@ -77,7 +77,9 @@ REGIME_LABELS = {
     "normal": "Normal",
     "da_positive_spike_top5": "Positive spike top 5%",
     "da_negative_spike_bottom5": "Negative spike bottom 5%",
+    "afrr_capacity_price_high_tail_top5": "High tail top 5%",
     "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
+    "afrr_activation_rate_high_tail_top5": "High activation-rate tail top 5%",
     "activation_nonzero": "Activation nonzero",
     "activation_zero_or_nearzero": "Activation zero / near-zero",
     "high_volatility_week": "High-volatility week",
@@ -88,7 +90,9 @@ MAIN_ISSUES = {
     "normal": "Reference regime",
     "da_positive_spike_top5": "Positive price spike",
     "da_negative_spike_bottom5": "Negative price spike",
+    "afrr_capacity_price_high_tail_top5": "Capacity price high tail",
     "afrr_activation_price_abs_tail_top5": "Large activation price",
+    "afrr_activation_rate_high_tail_top5": "High activation rate",
     "activation_nonzero": "Activation occurrence",
     "activation_zero_or_nearzero": "No/near-zero activation",
     "high_volatility_week": "Volatile week",
@@ -115,11 +119,13 @@ MAIN_REGIMES_BY_TARGET_LABEL = {
     ],
     "aFRR capacity price +": [
         "normal",
+        "afrr_capacity_price_high_tail_top5",
         "high_volatility_week",
         "spike_week",
     ],
     "aFRR capacity price -": [
         "normal",
+        "afrr_capacity_price_high_tail_top5",
         "high_volatility_week",
         "spike_week",
     ],
@@ -162,9 +168,10 @@ MAIN_ACTIVATION_TARGETS = [
 ]
 
 DA_TARGET = "target_da_price"
+CAPACITY_PRICE_TARGETS = {"target_afrr_capacity_price_pos", "target_afrr_capacity_price_neg"}
 ACTIVATION_PRICE_TARGETS = {"target_afrr_activation_price_vwap_pos", "target_afrr_activation_price_vwap_neg"}
 ACTIVATION_RATE_TARGETS = {"target_afrr_activation_rate_pos", "target_afrr_activation_rate_neg"}
-ALL_TARGETS = {DA_TARGET, "target_afrr_capacity_price_pos", "target_afrr_capacity_price_neg", *ACTIVATION_PRICE_TARGETS, *ACTIVATION_RATE_TARGETS}
+ALL_TARGETS = {DA_TARGET, *CAPACITY_PRICE_TARGETS, *ACTIVATION_PRICE_TARGETS, *ACTIVATION_RATE_TARGETS}
 
 
 @dataclass(frozen=True)
@@ -390,6 +397,22 @@ def choose_threshold_source(splits: list[str], requested_split: str) -> tuple[st
     return "test_conditional" if requested_split == "test" else requested_split, [requested_split]
 
 
+def resolve_threshold_source(splits: list[str], requested_split: str, threshold_source: str) -> tuple[str, list[str]]:
+    source = str(threshold_source).strip().lower()
+    if source == "test":
+        return "test_conditional", [requested_split]
+    if source == "validation":
+        if "val" not in splits:
+            raise ValueError("--threshold-source validation requires --splits to include val.")
+        return "validation", ["val"]
+    if source == "train_validation":
+        missing = [s for s in ["train", "val"] if s not in splits]
+        if missing:
+            raise ValueError(f"--threshold-source train_validation requires --splits to include {missing}.")
+        return "train_validation", ["train", "val"]
+    raise ValueError(f"Unsupported threshold source {threshold_source!r}.")
+
+
 def _threshold(y: pd.Series, q: float) -> float:
     vals = pd.to_numeric(y, errors="coerce").dropna()
     return float(vals.quantile(q)) if not vals.empty else float("nan")
@@ -400,25 +423,51 @@ def compute_target_thresholds(
     *,
     threshold_source: str,
     epsilon: float,
+    source_splits: list[str] | None = None,
+    selection_split: str | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    source_splits_s = ",".join(source_splits or [])
     for target, df in sorted(reference_by_target.items(), key=lambda item: target_sort_key(item[0])):
         y = pd.to_numeric(df["y_true"], errors="coerce")
-        group, _ = _target_info(target)
+        group, target_display = _target_info(target)
+        common = {
+            "target": target,
+            "target_display": target_display,
+            "target_group": group,
+            "threshold_source": threshold_source,
+            "source_splits": source_splits_s,
+            "selection_split": selection_split or "",
+        }
         if target == DA_TARGET:
             rows.extend(
                 [
-                    {"target": target, "target_group": group, "regime": "da_positive_spike_top5", "threshold_name": "q95", "threshold_value": _threshold(y, 0.95), "threshold_source": threshold_source},
-                    {"target": target, "target_group": group, "regime": "da_negative_spike_bottom5", "threshold_name": "q05", "threshold_value": _threshold(y, 0.05), "threshold_source": threshold_source},
+                    {**common, "regime": "da_positive_spike_top5", "threshold_name": "q95", "threshold_value": _threshold(y, 0.95)},
+                    {**common, "regime": "da_negative_spike_bottom5", "threshold_name": "q05", "threshold_value": _threshold(y, 0.05)},
                 ]
             )
+        if target in CAPACITY_PRICE_TARGETS:
+            rows.append(
+                {
+                    **common,
+                    "regime": "afrr_capacity_price_high_tail_top5",
+                    "threshold_name": "capacity_price_high_tail_q95",
+                    "threshold_value": _threshold(y, 0.95),
+                }
+            )
         if target in ACTIVATION_PRICE_TARGETS:
-            rows.append({"target": target, "target_group": group, "regime": "afrr_activation_price_abs_tail_top5", "threshold_name": "abs_q95", "threshold_value": _threshold(y.abs(), 0.95), "threshold_source": threshold_source})
+            rows.append({**common, "regime": "afrr_activation_price_abs_tail_top5", "threshold_name": "abs_q95", "threshold_value": _threshold(y.abs(), 0.95)})
         if target in ACTIVATION_RATE_TARGETS:
             rows.extend(
                 [
-                    {"target": target, "target_group": group, "regime": "activation_nonzero", "threshold_name": "epsilon", "threshold_value": float(epsilon), "threshold_source": "domain"},
-                    {"target": target, "target_group": group, "regime": "activation_zero_or_nearzero", "threshold_name": "epsilon", "threshold_value": float(epsilon), "threshold_source": "domain"},
+                    {
+                        **common,
+                        "regime": "afrr_activation_rate_high_tail_top5",
+                        "threshold_name": "activation_rate_high_tail_q95",
+                        "threshold_value": _threshold(y, 0.95),
+                    },
+                    {**common, "regime": "activation_nonzero", "threshold_name": "epsilon", "threshold_value": float(epsilon), "threshold_source": "domain"},
+                    {**common, "regime": "activation_zero_or_nearzero", "threshold_name": "epsilon", "threshold_value": float(epsilon), "threshold_source": "domain"},
                 ]
             )
     return pd.DataFrame(rows)
@@ -436,6 +485,10 @@ def regime_masks_for_target(df: pd.DataFrame, thresholds: pd.DataFrame, *, epsil
         thr = float(row["threshold_value"])
         if regime == "afrr_activation_price_abs_tail_top5":
             masks[regime] = y.abs().ge(thr)
+        elif regime == "afrr_capacity_price_high_tail_top5":
+            masks[regime] = y.ge(thr)
+        elif regime == "afrr_activation_rate_high_tail_top5":
+            masks[regime] = y.gt(float(epsilon)) & y.ge(thr)
         elif regime == "da_positive_spike_top5":
             masks[regime] = y.ge(thr)
         elif regime == "da_negative_spike_bottom5":
@@ -452,12 +505,32 @@ def regime_masks_for_target(df: pd.DataFrame, thresholds: pd.DataFrame, *, epsil
     return masks
 
 
+def _spike_event_regimes_for_target(target: str) -> set[str]:
+    target = canonical_target(target)
+    if target == DA_TARGET:
+        return {"da_positive_spike_top5", "da_negative_spike_bottom5"}
+    if target in CAPACITY_PRICE_TARGETS:
+        return {"afrr_capacity_price_high_tail_top5"}
+    if target in ACTIVATION_PRICE_TARGETS:
+        return {"afrr_activation_price_abs_tail_top5"}
+    if target in ACTIVATION_RATE_TARGETS:
+        return {"afrr_activation_rate_high_tail_top5"}
+    return set()
+
+
+def _spike_selection_rule_for_target(target: str) -> str:
+    if canonical_target(target) in ACTIVATION_RATE_TARGETS:
+        return "Top 10% weeks by target-specific high-activation-rate tail share and count, selected separately per split and target."
+    return "Top 10% weeks by target-specific spike_share and spike_count, selected separately per split and target."
+
+
 def select_high_volatility_weeks(base: pd.DataFrame, *, top_share: float = 0.10) -> pd.DataFrame:
     d = base.copy()
     d = sort_target_frame(d, target_col="target", extra_cols=["split"])
     d["week_start_utc"] = _week_start_utc(d["target_time_utc"])
     rows: list[pd.DataFrame] = []
-    for (split, target_group), part in d.groupby(["split", "target_group"], sort=False):
+    for (split, target), part in d.groupby(["split", "target"], sort=False):
+        target_group, target_display = _target_info(str(target))
         weekly = part.groupby("week_start_utc", as_index=False).agg(
             volatility_score=("y_true", "std"),
             n_rows=("y_true", "size"),
@@ -465,23 +538,54 @@ def select_high_volatility_weeks(base: pd.DataFrame, *, top_share: float = 0.10)
         if weekly.empty:
             continue
         n = max(1, int(np.ceil(len(weekly) * float(top_share))))
-        top = weekly.sort_values("volatility_score", ascending=False).head(n).copy()
+        top = weekly.sort_values(["volatility_score", "week_start_utc"], ascending=[False, True]).head(n).copy()
         top["split"] = split
+        top["target"] = target
+        top["target_display"] = target_display
         top["target_group"] = target_group
         top["selection_type"] = "high_volatility_week"
+        top["selection_rank"] = np.arange(1, len(top) + 1)
+        top["selection_scope"] = "target"
+        top["selection_rule"] = "Top 10% weeks by weekly std(y_true), selected separately per split and target."
         rows.append(top)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-def select_spike_weeks(base: pd.DataFrame, thresholds: pd.DataFrame, *, epsilon: float, top_share: float = 0.10) -> pd.DataFrame:
+def select_spike_weeks(
+    base: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    *,
+    epsilon: float,
+    top_share: float = 0.10,
+    warnings: list[dict[str, Any]] | None = None,
+) -> pd.DataFrame:
     parts = []
     base = sort_target_frame(base, target_col="target", extra_cols=["split"])
     for target, part in base.groupby("target", sort=False):
         masks = regime_masks_for_target(part, thresholds, epsilon=epsilon)
-        event_masks = [m for name, m in masks.items() if name != "normal"]
-        event = pd.concat(event_masks, axis=1).any(axis=1) if event_masks else part["y_true"].abs().ge(part["y_true"].abs().quantile(0.95))
+        spike_regimes = _spike_event_regimes_for_target(str(target))
+        event_masks = [m for name, m in masks.items() if name in spike_regimes]
+        if not event_masks:
+            if warnings is not None:
+                warnings.append(
+                    {
+                        "split": ",".join(sorted(map(str, part["split"].dropna().unique()))) if "split" in part.columns else "",
+                        "target": target,
+                        "regime": "spike_week",
+                        "severity": "warning",
+                        "message": "No target-specific spike threshold was available for the formal spike-event regimes; spike_week selection skipped for this target.",
+                    }
+                )
+            continue
+        threshold_part = thresholds.loc[thresholds["target"].eq(target) & thresholds["regime"].isin(spike_regimes)].copy()
+        threshold_names = ",".join(str(x) for x in threshold_part["threshold_name"].dropna().unique()) if "threshold_name" in threshold_part.columns else ""
+        finite_thresholds = pd.to_numeric(threshold_part.get("threshold_value", pd.Series(dtype=float)), errors="coerce").dropna()
+        threshold_value = float(finite_thresholds.max()) if not finite_thresholds.empty else np.nan
+        event = pd.concat(event_masks, axis=1).any(axis=1)
         p = part.copy()
         p["event"] = event.to_numpy(dtype=bool)
+        p["threshold_name"] = threshold_names
+        p["threshold_value"] = threshold_value
         parts.append(p)
     if not parts:
         return pd.DataFrame()
@@ -489,17 +593,25 @@ def select_spike_weeks(base: pd.DataFrame, thresholds: pd.DataFrame, *, epsilon:
     d = sort_target_frame(d, target_col="target", extra_cols=["split"])
     d["week_start_utc"] = _week_start_utc(d["target_time_utc"])
     rows: list[pd.DataFrame] = []
-    for (split, target_group), part in d.groupby(["split", "target_group"], sort=False):
+    for (split, target), part in d.groupby(["split", "target"], sort=False):
+        target_group, target_display = _target_info(str(target))
         weekly = part.groupby("week_start_utc", as_index=False).agg(
             spike_count=("event", "sum"),
             n_rows=("event", "size"),
+            threshold_name=("threshold_name", "first"),
+            threshold_value=("threshold_value", "max"),
         )
         weekly["spike_share"] = weekly["spike_count"] / weekly["n_rows"].replace(0, np.nan)
         n = max(1, int(np.ceil(len(weekly) * float(top_share))))
-        top = weekly.sort_values(["spike_share", "spike_count"], ascending=[False, False]).head(n).copy()
+        top = weekly.sort_values(["spike_share", "spike_count", "week_start_utc"], ascending=[False, False, True]).head(n).copy()
         top["split"] = split
+        top["target"] = target
+        top["target_display"] = target_display
         top["target_group"] = target_group
         top["selection_type"] = "spike_week"
+        top["selection_rank"] = np.arange(1, len(top) + 1)
+        top["selection_scope"] = "target"
+        top["selection_rule"] = _spike_selection_rule_for_target(str(target))
         rows.append(top)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
@@ -540,11 +652,13 @@ def _regime_definitions() -> pd.DataFrame:
             {"regime": "normal", "definition": "Rows not belonging to a selected tail/spike regime for the same target."},
             {"regime": "da_positive_spike_top5", "definition": "target_da_price rows with y_true at or above 95th percentile threshold."},
             {"regime": "da_negative_spike_bottom5", "definition": "target_da_price rows with y_true at or below 5th percentile threshold."},
+            {"regime": "afrr_capacity_price_high_tail_top5", "definition": "Capacity price rows with y_true at or above the target-specific 95th percentile threshold."},
             {"regime": "afrr_activation_price_abs_tail_top5", "definition": "activation price rows with abs(y_true) at or above abs 95th percentile threshold."},
+            {"regime": "afrr_activation_rate_high_tail_top5", "definition": "Activation-rate rows with y_true at or above the target-specific 95th percentile threshold; used for spike-week selection, not as the activation occurrence regime."},
             {"regime": "activation_nonzero", "definition": "activation rate rows with y_true > epsilon."},
             {"regime": "activation_zero_or_nearzero", "definition": "activation rate rows with y_true <= epsilon."},
-            {"regime": "high_volatility_week", "definition": "Rows in top 10% weeks by weekly realized standard deviation per split and target group."},
-            {"regime": "spike_week", "definition": "Rows in top 10% weeks by realized event share per split and target group."},
+            {"regime": "high_volatility_week", "definition": "Rows in top 10% weeks by weekly realized standard deviation per split and target."},
+            {"regime": "spike_week", "definition": "Rows in top 10% weeks by target-specific formal spike-event share per split and target."},
         ]
     )
 
@@ -556,7 +670,8 @@ def build_tail_spike_outputs(
     splits: list[str],
     main_split: str,
     epsilon: float,
-    derive_forecast_time: bool,
+    threshold_source: str = "test",
+    derive_forecast_time: bool = True,
     eval_origin_start: pd.Timestamp | None = None,
     eval_origin_end: pd.Timestamp | None = None,
 ) -> dict[str, pd.DataFrame]:
@@ -599,14 +714,48 @@ def build_tail_spike_outputs(
                 base_parts.append(b)
 
     base = pd.concat(base_parts, ignore_index=True) if base_parts else pd.DataFrame()
-    source_name, reference_splits = choose_threshold_source(splits, main_split)
+    source_name, reference_splits = resolve_threshold_source(splits, main_split, threshold_source)
     if source_name == "test_conditional":
-        warnings.append({"split": main_split, "target": "", "regime": "", "severity": "warning", "message": "Tail thresholds are test-conditional because RQ1 is configured to load the test split only."})
+        warnings.append({"split": main_split, "target": "", "regime": "", "severity": "warning", "message": "Tail thresholds are test-conditional because --threshold-source defaults to test for this RQ1 thesis output."})
     ref = base[base["split"].isin(reference_splits)].copy()
-    thresholds = compute_target_thresholds({t: g for t, g in ref.groupby("target")}, threshold_source=source_name, epsilon=epsilon)
-    hv_weeks = select_high_volatility_weeks(base)
-    spike_weeks = select_spike_weeks(base, thresholds, epsilon=epsilon)
+    thresholds = compute_target_thresholds(
+        {t: g for t, g in ref.groupby("target")},
+        threshold_source=source_name,
+        epsilon=epsilon,
+        source_splits=reference_splits,
+        selection_split=main_split,
+    )
+    for _, row in thresholds.loc[
+        thresholds["regime"].eq("afrr_activation_rate_high_tail_top5")
+        & pd.to_numeric(thresholds["threshold_value"], errors="coerce").le(float(epsilon))
+    ].iterrows():
+        warnings.append(
+            {
+                "split": main_split,
+                "target": str(row.get("target", "")),
+                "regime": "afrr_activation_rate_high_tail_top5",
+                "severity": "warning",
+                "message": "Activation-rate q95 is less than or equal to epsilon; spike mask uses y_true > epsilon and y_true >= q95.",
+            }
+        )
+    warnings.append(
+        {
+            "split": main_split,
+            "target": "",
+            "regime": "high_volatility_week,spike_week",
+            "severity": "info",
+            "message": f"Selected high-volatility and spike weeks are restricted to the main reporting split: {main_split}.",
+        }
+    )
+    selection_base = base.loc[base["split"].eq(main_split)].copy()
+    hv_weeks = select_high_volatility_weeks(selection_base)
+    spike_weeks = select_spike_weeks(selection_base, thresholds, epsilon=epsilon, warnings=warnings)
     selected_weeks = pd.concat([x for x in [hv_weeks, spike_weeks] if not x.empty], ignore_index=True) if (not hv_weeks.empty or not spike_weeks.empty) else pd.DataFrame()
+    if not selected_weeks.empty:
+        bad = selected_weeks.loc[~selected_weeks["split"].eq(main_split)]
+        if not bad.empty:
+            warnings.append({"split": main_split, "target": "", "regime": "selected_weeks", "severity": "error", "message": "Selected weeks outside the main reporting split were excluded."})
+            selected_weeks = selected_weeks.loc[selected_weeks["split"].eq(main_split)].copy()
 
     metric_rows: list[dict[str, Any]] = []
     row_rows: list[dict[str, Any]] = []
@@ -621,8 +770,16 @@ def build_tail_spike_outputs(
             masks = regime_masks_for_target(base_target, thresholds, epsilon=epsilon)
             if not selected_weeks.empty:
                 week = _week_start_utc(base_target["target_time_utc"])
-                hv = selected_weeks[(selected_weeks["split"].eq(split)) & (selected_weeks["target_group"].eq(group)) & (selected_weeks["selection_type"].eq("high_volatility_week"))]
-                sp = selected_weeks[(selected_weeks["split"].eq(split)) & (selected_weeks["target_group"].eq(group)) & (selected_weeks["selection_type"].eq("spike_week"))]
+                hv = selected_weeks[
+                    (selected_weeks["split"].eq(split))
+                    & (selected_weeks["target"].eq(target))
+                    & (selected_weeks["selection_type"].eq("high_volatility_week"))
+                ]
+                sp = selected_weeks[
+                    (selected_weeks["split"].eq(split))
+                    & (selected_weeks["target"].eq(target))
+                    & (selected_weeks["selection_type"].eq("spike_week"))
+                ]
                 if not hv.empty:
                     masks["high_volatility_week"] = week.isin(pd.to_datetime(hv["week_start_utc"], utc=True))
                 if not sp.empty:
@@ -920,6 +1077,64 @@ def _relative_pinball_frame(metrics: pd.DataFrame, *, split: str) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
+def relative_pinball_plot_source(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
+    rel = _relative_pinball_frame(metrics, split=split)
+    if rel.empty:
+        return rel
+    d = metrics.loc[metrics["split"].eq(split)].copy()
+    rlqr = d.loc[d["model_label"].eq("RLQR"), ["target_group", "target_label", "target", "regime", "mean_pinball_loss"]].rename(
+        columns={"mean_pinball_loss": "rlqr_mean_pinball_loss"}
+    )
+    model_vals = d[["target_group", "target_label", "target", "regime", "model", "model_label", "mean_pinball_loss", "n_obs"]].copy()
+    out = model_vals.merge(rlqr, on=["target_group", "target_label", "target", "regime"], how="inner")
+    out = out.loc[out["model_label"].isin(["XGB", "TFT"])].copy()
+    out["relative_pinball_loss"] = out["mean_pinball_loss"] / out["rlqr_mean_pinball_loss"].replace(0.0, np.nan)
+    out = out.rename(columns={"target_label": "target_display"})
+    cols = [
+        "split",
+        "target",
+        "target_display",
+        "target_group",
+        "regime",
+        "model",
+        "model_label",
+        "mean_pinball_loss",
+        "rlqr_mean_pinball_loss",
+        "relative_pinball_loss",
+        "n_obs",
+    ]
+    out["split"] = split
+    return out[[c for c in cols if c in out.columns]]
+
+
+def residual_distribution_source(points: pd.DataFrame, *, split: str) -> pd.DataFrame:
+    if points.empty:
+        return pd.DataFrame()
+    d = points.loc[points["split"].eq(split)].copy()
+    if d.empty:
+        return d
+    d = d.rename(columns={"target_label": "target_display"})
+    d["residual_p50"] = pd.to_numeric(d["p50"], errors="coerce") - pd.to_numeric(d["y_true"], errors="coerce")
+    d["abs_error_p50"] = d["residual_p50"].abs()
+    cols = [
+        "split",
+        "target",
+        "target_display",
+        "target_group",
+        "regime",
+        "model",
+        "model_label",
+        "target_time_utc",
+        "forecast_time_utc",
+        "lead_time_h",
+        "y_true",
+        "p50",
+        "residual_p50",
+        "abs_error_p50",
+    ]
+    return d[[c for c in cols if c in d.columns]].copy()
+
+
 def _plot_relative_pinball_all_in_one(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
     import matplotlib.pyplot as plt
 
@@ -1205,18 +1420,79 @@ def plot_forecast_band_example(df: pd.DataFrame, *, out_path: Path, lead: int | 
     return out_path
 
 
-def _plot_selected_week_band(points: pd.DataFrame, selected_weeks: pd.DataFrame, *, out_dir: Path, split: str) -> Path | None:
-    if points.empty or selected_weeks.empty:
-        return None
+def select_example_week(
+    selected_weeks: pd.DataFrame,
+    *,
+    split: str,
+    selection_type: str | None = None,
+    target: str | None = None,
+    target_group: str | None = None,
+) -> tuple[pd.Series | None, str, str, float]:
+    if selected_weeks.empty:
+        return None, "", "", float("nan")
     weeks = selected_weeks.loc[selected_weeks["split"].eq(split)].copy()
     if weeks.empty:
+        return None, "", "", float("nan")
+    if selection_type is not None:
+        weeks = weeks.loc[weeks["selection_type"].eq(selection_type)].copy()
+    if target is not None and "target" in weeks.columns:
+        weeks = weeks.loc[weeks["target"].eq(canonical_target(target))].copy()
+    if target_group is not None and "target_group" in weeks.columns:
+        weeks = weeks.loc[weeks["target_group"].eq(target_group)].copy()
+    if weeks.empty:
+        return None, "", "", float("nan")
+
+    stype = str(selection_type or weeks["selection_type"].iloc[0])
+    if stype == "high_volatility_week":
+        ordered = weeks.sort_values(["volatility_score", "n_rows", "week_start_utc"], ascending=[False, False, True]).copy()
+        metric = "volatility_score"
+        reason_metric = "highest volatility_score"
+    elif stype == "spike_week":
+        ordered = weeks.sort_values(["spike_share", "spike_count", "n_rows", "week_start_utc"], ascending=[False, False, False, True]).copy()
+        metric = "spike_share"
+        reason_metric = "highest spike_share and spike_count"
+    else:
+        ordered = sort_target_frame(weeks, target_col="target", extra_cols=["selection_type", "week_start_utc"]).copy()
+        metric = "week_start_utc"
+        reason_metric = "deterministic selected-week order"
+    ordered["_example_selection_rank"] = np.arange(1, len(ordered) + 1)
+    row = ordered.iloc[0]
+    metric_value = float(row[metric]) if metric in row.index and pd.notna(row[metric]) and metric != "week_start_utc" else float("nan")
+    target_label = str(row.get("target_display", row.get("target", "")))
+    reason = f"Selected {reason_metric} among {stype} rows for split={split} and target={target_label}."
+    return row, metric, reason, metric_value
+
+
+def _plot_selected_week_band(
+    points: pd.DataFrame,
+    selected_weeks: pd.DataFrame,
+    *,
+    out_dir: Path,
+    split: str,
+    selection_type: str | None = None,
+    target: str | None = None,
+    target_group: str | None = None,
+    diagnostics: list[dict[str, Any]] | None = None,
+    plot_values: list[pd.DataFrame] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+) -> Path | None:
+    if points.empty or selected_weeks.empty:
         return None
-    week = sort_target_frame(weeks, target_col="target_group", extra_cols=["selection_type", "week_start_utc"]).iloc[0]
+    week, selection_metric, selection_reason, selection_metric_value = select_example_week(
+        selected_weeks,
+        split=split,
+        selection_type=selection_type,
+        target=target,
+        target_group=target_group,
+    )
+    if week is None:
+        return None
     start = pd.to_datetime(week["week_start_utc"], utc=True)
     end = start + pd.Timedelta(days=7)
+    selected_target = canonical_target(str(week["target"])) if "target" in week.index else ""
     d = points.loc[
         points["split"].eq(split)
-        & points["target_group"].eq(str(week["target_group"]))
+        & points["target"].eq(selected_target)
         & pd.to_datetime(points["target_time_utc"], utc=True).between(start, end, inclusive="left")
     ].copy()
     if d.empty:
@@ -1226,10 +1502,112 @@ def _plot_selected_week_band(points: pd.DataFrame, selected_weeks: pd.DataFrame,
     model = str(d.sort_values("_model_order")["model"].iloc[0])
     d = d[d["model"].eq(model)].copy()
     lead = int(pd.to_numeric(d["lead_time_h"], errors="coerce").dropna().min())
-    group_slug = str(week["target_group"]).lower().replace(" ", "_").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+    plot_d = d.loc[pd.to_numeric(d["lead_time_h"], errors="coerce").eq(float(lead))].copy()
+    group_slug = str(week["target_display"] if "target_display" in week.index else week["target_group"]).lower().replace(" ", "_").replace("+", "pos").replace("-", "neg").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
     selection = str(week["selection_type"])
     out_path = out_dir / "figures" / f"tail_spike_forecast_band_{selection}_{group_slug}_lead_h{lead}.png"
+    if diagnostics is not None:
+        diagnostics.append(
+            {
+                "split": split,
+                "selection_type": selection,
+                "target": selected_target,
+                "target_display": str(week.get("target_display", selected_target)),
+                "target_group": str(week.get("target_group", "")),
+                "week_start_utc": start.isoformat(),
+                "week_end_utc": end.isoformat(),
+                "model": model,
+                "model_label": str(d["model_label"].iloc[0]) if "model_label" in d.columns and not d.empty else model,
+                "lead_time_h": lead,
+                "selection_metric": selection_metric,
+                "selection_metric_value": selection_metric_value,
+                "selection_rank": int(week.get("_example_selection_rank", 1)),
+                "selection_reason": selection_reason,
+                "n_rows": int(week.get("n_rows", len(d))),
+                "source_selected_weeks_file": "tail_spike_selected_weeks.csv",
+            }
+        )
+    if plot_values is not None:
+        value_df = plot_d.copy()
+        for col in ["p10", "p90"]:
+            if col not in value_df.columns:
+                value_df[col] = np.nan
+                if warnings is not None:
+                    warnings.append(
+                        {
+                            "split": split,
+                            "target": selected_target,
+                            "regime": selection,
+                            "severity": "warning",
+                            "message": f"Example-week plot source is missing {col}; column is written as missing in tail_spike_example_week_plot_values.csv.",
+                        }
+                    )
+        value_df = value_df.rename(columns={"target_label": "target_display"})
+        value_df["selection_type"] = selection
+        value_df["week_start_utc"] = start.isoformat()
+        value_df["week_end_utc"] = end.isoformat()
+        value_df["selection_metric"] = selection_metric
+        value_df["selection_metric_value"] = selection_metric_value
+        value_df["selection_reason"] = selection_reason
+        value_df["residual_p50"] = pd.to_numeric(value_df["p50"], errors="coerce") - pd.to_numeric(value_df["y_true"], errors="coerce")
+        cols = [
+            "selection_type",
+            "split",
+            "target",
+            "target_display",
+            "target_group",
+            "week_start_utc",
+            "week_end_utc",
+            "model",
+            "model_label",
+            "lead_time_h",
+            "target_time_utc",
+            "forecast_time_utc",
+            "y_true",
+            "p10",
+            "p50",
+            "p90",
+            "residual_p50",
+            "selection_metric",
+            "selection_metric_value",
+            "selection_reason",
+        ]
+        plot_values.append(value_df[[c for c in cols if c in value_df.columns]].copy())
     return plot_forecast_band_example(d, out_path=out_path, lead=lead)
+
+
+def validate_tail_spike_outputs(
+    *,
+    out_dir: Path,
+    split: str,
+    selected_weeks: pd.DataFrame,
+    points_test: pd.DataFrame,
+    relative_source: pd.DataFrame,
+    example_selection: pd.DataFrame,
+    example_values: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    if not selected_weeks.empty and not selected_weeks["split"].eq(split).all():
+        raise ValueError("tail_spike_selected_weeks contains rows outside the main reporting split.")
+    if points_test.empty:
+        warnings.append({"split": split, "target": "", "regime": "points", "severity": "warning", "message": "tail_spike_points_test.csv source data is empty."})
+    if relative_source.empty:
+        warnings.append({"split": split, "target": "", "regime": "relative_pinball", "severity": "warning", "message": "Relative pinball plot source data is empty for the plotted split."})
+    if not example_selection.empty and example_values.empty:
+        warnings.append({"split": split, "target": "", "regime": "example_week", "severity": "warning", "message": "Example-week selection exists but tail_spike_example_week_plot_values.csv is empty."})
+    if not example_values.empty and example_selection.empty:
+        warnings.append({"split": split, "target": "", "regime": "example_week", "severity": "warning", "message": "Example-week plot values exist but tail_spike_example_week_selection.csv is empty."})
+    for filename, frame in [
+        ("tail_spike_points_test.csv", points_test),
+        ("tail_spike_plot_source_relative_pinball.csv", relative_source),
+        ("tail_spike_example_week_plot_values.csv", example_values),
+    ]:
+        path = out_dir / filename
+        if not path.exists():
+            warnings.append({"split": split, "target": "", "regime": "output_validation", "severity": "warning", "message": f"Expected plot/source CSV was not written: {filename}."})
+        elif frame.empty:
+            warnings.append({"split": split, "target": "", "regime": "output_validation", "severity": "warning", "message": f"Plot/source CSV is empty: {filename}."})
+    return warnings
 
 
 def write_outputs(
@@ -1241,6 +1619,26 @@ def write_outputs(
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
+    runtime_warnings = outputs.get("warnings", pd.DataFrame()).copy()
+    points = outputs.get("points", pd.DataFrame())
+    points_split = points.loc[points["split"].eq(split)].copy() if not points.empty and "split" in points.columns else pd.DataFrame()
+    rel_source = relative_pinball_plot_source(outputs["metrics"], split=split)
+    rel_price_capacity = rel_source.loc[rel_source["target_display"].isin(MAIN_PRICE_CAPACITY_TARGETS)].copy() if not rel_source.empty else pd.DataFrame()
+    rel_activation = rel_source.loc[rel_source["target_display"].isin(MAIN_ACTIVATION_TARGETS)].copy() if not rel_source.empty else pd.DataFrame()
+    residual_source = residual_distribution_source(points, split=split)
+    hexbin_source = points_split.copy()
+    if not hexbin_source.empty:
+        hexbin_source = hexbin_source.rename(columns={"target_label": "target_display"})
+    if rel_source.empty:
+        runtime_warnings = pd.concat(
+            [runtime_warnings, pd.DataFrame([{"split": split, "target": "", "regime": "relative_pinball", "severity": "warning", "message": "Relative pinball plot source data is empty for the plotted split."}])],
+            ignore_index=True,
+        )
+    if residual_source.empty:
+        runtime_warnings = pd.concat(
+            [runtime_warnings, pd.DataFrame([{"split": split, "target": "", "regime": "residual_distribution", "severity": "warning", "message": "Residual distribution plot source data is empty for the plotted split."}])],
+            ignore_index=True,
+        )
     csvs = [
         ("tail_spike_metrics.csv", outputs["metrics"]),
         (f"tail_spike_metrics_{split}.csv", outputs["metrics"].loc[outputs["metrics"]["split"].eq(split)]),
@@ -1248,7 +1646,16 @@ def write_outputs(
         ("tail_spike_thresholds.csv", outputs["thresholds"]),
         ("tail_spike_row_counts.csv", outputs["row_counts"]),
         ("tail_spike_selected_weeks.csv", outputs["selected_weeks"]),
-        ("tail_spike_warnings.csv", outputs["warnings"]),
+        ("tail_spike_warnings.csv", runtime_warnings),
+        ("tail_spike_selection_warnings.csv", runtime_warnings),
+        ("tail_spike_points.csv", points),
+        (f"tail_spike_points_{split}.csv", points_split),
+        ("tail_spike_plot_source_relative_pinball.csv", rel_source),
+        ("tail_spike_plot_source_relative_pinball_price_capacity.csv", rel_price_capacity),
+        ("tail_spike_plot_source_relative_pinball_activation.csv", rel_activation),
+        ("tail_spike_plot_source_residual_distribution.csv", residual_source),
+        ("tail_spike_residual_distribution.csv", residual_source),
+        ("tail_spike_plot_source_hexbin.csv", hexbin_source),
     ]
     for name, df in csvs:
         path = out_dir / name
@@ -1257,6 +1664,9 @@ def write_outputs(
     tex = write_latex_table(outputs["metrics"], out_dir=out_dir, split=split)
     if tex is not None:
         paths.append(tex)
+    example_week_selection: list[dict[str, Any]] = []
+    example_week_values: list[pd.DataFrame] = []
+    plot_warnings: list[dict[str, Any]] = []
     plot_results = [
         _plot_relative_pinball_main(outputs["metrics"], out_dir=out_dir, split=split),
         _plot_relative_pinball_all_in_one(outputs["metrics"], out_dir=out_dir, split=split),
@@ -1265,7 +1675,8 @@ def write_outputs(
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="coverage_p10_p90", filename="tail_spike_coverage_by_regime.png", ylabel="p10-p90 coverage"),
         _plot_hexbin(outputs.get("points", pd.DataFrame()).loc[outputs.get("points", pd.DataFrame()).get("split", pd.Series(dtype=str)).eq(split)] if not outputs.get("points", pd.DataFrame()).empty else pd.DataFrame(), out_dir=out_dir),
         _plot_residual_distribution(outputs.get("points", pd.DataFrame()).loc[outputs.get("points", pd.DataFrame()).get("split", pd.Series(dtype=str)).eq(split)] if not outputs.get("points", pd.DataFrame()).empty else pd.DataFrame(), out_dir=out_dir),
-        _plot_selected_week_band(outputs.get("points", pd.DataFrame()), outputs.get("selected_weeks", pd.DataFrame()), out_dir=out_dir, split=split),
+        _plot_selected_week_band(outputs.get("points", pd.DataFrame()), outputs.get("selected_weeks", pd.DataFrame()), out_dir=out_dir, split=split, selection_type="high_volatility_week", diagnostics=example_week_selection, plot_values=example_week_values, warnings=plot_warnings),
+        _plot_selected_week_band(outputs.get("points", pd.DataFrame()), outputs.get("selected_weeks", pd.DataFrame()), out_dir=out_dir, split=split, selection_type="spike_week", diagnostics=example_week_selection, plot_values=example_week_values, warnings=plot_warnings),
     ]
     for p in plot_results:
         if p is not None:
@@ -1273,6 +1684,29 @@ def write_outputs(
                 paths.extend(p)
             else:
                 paths.append(p)
+    example_path = out_dir / "tail_spike_example_week_selection.csv"
+    example_selection_df = pd.DataFrame(example_week_selection)
+    example_selection_df.to_csv(example_path, index=False)
+    paths.append(example_path)
+    example_values_path = out_dir / "tail_spike_example_week_plot_values.csv"
+    example_values_df = pd.concat(example_week_values, ignore_index=True) if example_week_values else pd.DataFrame()
+    example_values_df.to_csv(example_values_path, index=False)
+    paths.append(example_values_path)
+    validation_warnings = validate_tail_spike_outputs(
+        out_dir=out_dir,
+        split=split,
+        selected_weeks=outputs["selected_weeks"],
+        points_test=points_split,
+        relative_source=rel_source,
+        example_selection=example_selection_df,
+        example_values=example_values_df,
+    )
+    if validation_warnings:
+        plot_warnings.extend(validation_warnings)
+    if plot_warnings:
+        runtime_warnings = pd.concat([runtime_warnings, pd.DataFrame(plot_warnings)], ignore_index=True)
+        for warning_name in ["tail_spike_warnings.csv", "tail_spike_selection_warnings.csv"]:
+            runtime_warnings.to_csv(out_dir / warning_name, index=False)
     manifest = {
         "description": "RQ1 tail/spike behavior outputs.",
         "split": split,
@@ -1320,6 +1754,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--models", default="tft,xgboost,linear", help="Models to compare. Defaults to all RQ1 models: TFT, XGB and RLQR.")
     p.add_argument("--epsilon", type=float, default=EPSILON_DEFAULT)
+    p.add_argument("--threshold-source", choices=["test", "validation", "train_validation"], default="test", help="Source split(s) for tail/spike thresholds. Defaults to test for thesis outputs.")
     p.add_argument("--derive-forecast-time-from-lead", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
     p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
@@ -1340,6 +1775,7 @@ def main() -> int:
         splits=splits,
         main_split=args.split,
         epsilon=float(args.epsilon),
+        threshold_source=str(args.threshold_source),
         derive_forecast_time=bool(args.derive_forecast_time_from_lead),
         eval_origin_start=_parse_utc_bound(args.eval_origin_start),
         eval_origin_end=_parse_utc_bound(args.eval_origin_end),

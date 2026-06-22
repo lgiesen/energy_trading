@@ -1195,7 +1195,9 @@ def _write_tail_spike_relative_tex(
         "normal": "Normal",
         "da_positive_spike_top5": "Positive spike top 5%",
         "da_negative_spike_bottom5": "Negative spike bottom 5%",
+        "afrr_capacity_price_high_tail_top5": "High tail top 5%",
         "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
+        "afrr_activation_rate_high_tail_top5": "High activation-rate tail top 5%",
         "activation_nonzero": "Activation nonzero",
         "activation_zero_or_nearzero": "Activation zero / near-zero",
         "high_volatility_week": "High-volatility week",
@@ -1209,14 +1211,15 @@ def _write_tail_spike_relative_tex(
             "high_volatility_week",
             "spike_week",
         ],
-        "aFRR capacity price +": ["normal", "high_volatility_week", "spike_week"],
-        "aFRR capacity price -": ["normal", "high_volatility_week", "spike_week"],
+        "aFRR capacity price +": ["normal", "afrr_capacity_price_high_tail_top5", "high_volatility_week", "spike_week"],
+        "aFRR capacity price -": ["normal", "afrr_capacity_price_high_tail_top5", "high_volatility_week", "spike_week"],
         "aFRR activation price +": ["normal", "afrr_activation_price_abs_tail_top5", "high_volatility_week", "spike_week"],
         "aFRR activation price -": ["normal", "afrr_activation_price_abs_tail_top5", "high_volatility_week", "spike_week"],
         "aFRR activation rate +": ["activation_zero_or_nearzero", "activation_nonzero", "high_volatility_week", "spike_week"],
         "aFRR activation rate -": ["activation_zero_or_nearzero", "activation_nonzero", "high_volatility_week", "spike_week"],
     }
     target_orders = {
+        "da_price": ["DA price"],
         "price_capacity": ["DA price", "aFRR capacity price +", "aFRR capacity price -"],
         "activation": [
             "aFRR activation price +",
@@ -1224,6 +1227,32 @@ def _write_tail_spike_relative_tex(
             "aFRR activation rate +",
             "aFRR activation rate -",
         ],
+        "all_targets": [
+            "DA price",
+            "aFRR capacity price +",
+            "aFRR capacity price -",
+            "aFRR activation price +",
+            "aFRR activation price -",
+            "aFRR activation rate +",
+            "aFRR activation rate -",
+        ],
+    }
+    aggregate_specs = {
+        "capacity_price_aggregate": {
+            "target_group": "aFRR capacity price",
+            "label": "aFRR capacity price",
+            "regimes": ["normal", "high_volatility_week", "spike_week"],
+        },
+        "activation_price_aggregate": {
+            "target_group": "aFRR activation price",
+            "label": "aFRR activation price",
+            "regimes": ["normal", "afrr_activation_price_abs_tail_top5", "high_volatility_week", "spike_week"],
+        },
+        "activation_rate_aggregate": {
+            "target_group": "aFRR activation rate",
+            "label": "aFRR activation rate",
+            "regimes": ["activation_zero_or_nearzero", "activation_nonzero", "high_volatility_week", "spike_week"],
+        },
     }
 
     def _clean_regime_label(regime: Any) -> str:
@@ -1232,53 +1261,110 @@ def _write_tail_spike_relative_tex(
     def _write_native_relative_file(
         filename: str,
         *,
-        target_key: str,
+        target_key: str | None = None,
+        aggregate_key: str | None = None,
         figure_caption: str,
         short_caption: str,
         figure_label: str,
+        compact_target_sections: bool = False,
     ) -> Path | None:
         out = latex_dir / filename
-        target_labels = target_orders[target_key]
-        d = data.loc[data["target_label"].isin(target_labels)].copy()
+        if target_key is not None:
+            target_labels = target_orders[target_key]
+            d = data.loc[data["target_label"].isin(target_labels)].copy()
+        elif aggregate_key is not None:
+            spec = aggregate_specs[aggregate_key]
+            d = data.loc[data["target_group"].eq(spec["target_group"])].copy()
+            target_labels = [str(spec["label"])]
+        else:
+            return None
         d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
         d = d.dropna(subset=["mean_pinball_loss"])
         if d.empty:
             return None
 
+        def _model_regime_values(frame: pd.DataFrame) -> dict[str, float]:
+            if "n_obs" in frame.columns:
+                weighted = frame.copy()
+                weighted["n_obs"] = pd.to_numeric(weighted["n_obs"], errors="coerce")
+                weighted = weighted.loc[weighted["n_obs"].notna() & weighted["n_obs"].gt(0)].copy()
+                if not weighted.empty:
+                    weighted["_weighted_loss"] = weighted["mean_pinball_loss"] * weighted["n_obs"]
+                    grouped = weighted.groupby("model_label", as_index=True).agg(
+                        weighted_loss=("_weighted_loss", "sum"),
+                        n_obs=("n_obs", "sum"),
+                    )
+                    grouped = grouped.loc[grouped["n_obs"].gt(0)].copy()
+                    if not grouped.empty:
+                        return (grouped["weighted_loss"] / grouped["n_obs"]).astype(float).to_dict()
+            return frame.groupby("model_label", as_index=True)["mean_pinball_loss"].mean().to_dict()
+
         rows: list[dict[str, Any]] = []
-        for target_label in target_labels:
-            target_part = d.loc[d["target_label"].eq(target_label)].copy()
-            if target_part.empty:
-                continue
-            regimes = main_regimes_by_target.get(target_label, target_part["regime"].dropna().astype(str).drop_duplicates().tolist())
-            for regime in regimes:
-                regime_part = target_part.loc[target_part["regime"].eq(regime)]
+        section_starts: list[int] = []
+        if aggregate_key is not None:
+            spec = aggregate_specs[aggregate_key]
+            target_label = str(spec["label"])
+            for regime in spec["regimes"]:
+                regime_part = d.loc[d["regime"].eq(regime)]
                 if regime_part.empty:
                     continue
-                values = (
-                    regime_part.groupby("model_label", as_index=True)["mean_pinball_loss"]
-                    .mean()
-                    .to_dict()
-                )
+                values = _model_regime_values(regime_part)
                 baseline = values.get("RLQR")
                 if baseline is None or not np.isfinite(float(baseline)) or abs(float(baseline)) <= 1e-12:
                     continue
                 row_label = f"{_tex_label(target_label)} / {_clean_regime_label(regime)}"
-                row: dict[str, Any] = {"label": row_label}
+                row: dict[str, Any] = {"label": row_label, "target_label": target_label, "regime_label": _clean_regime_label(regime)}
                 for model in ["XGB", "TFT"]:
                     value = values.get(model)
                     if value is not None and np.isfinite(float(value)):
                         row[model] = float(value) / float(baseline)
                 if "XGB" in row or "TFT" in row:
                     rows.append(row)
+        else:
+            for target_label in target_labels:
+                target_part = d.loc[d["target_label"].eq(target_label)].copy()
+                if target_part.empty:
+                    continue
+                target_section_start = len(rows)
+                regimes = main_regimes_by_target.get(target_label, target_part["regime"].dropna().astype(str).drop_duplicates().tolist())
+                for regime in regimes:
+                    regime_part = target_part.loc[target_part["regime"].eq(regime)]
+                    if regime_part.empty:
+                        continue
+                    values = _model_regime_values(regime_part)
+                    baseline = values.get("RLQR")
+                    if baseline is None or not np.isfinite(float(baseline)) or abs(float(baseline)) <= 1e-12:
+                        continue
+                    regime_label = _clean_regime_label(regime)
+                    row_label = f"{_tex_label(target_label)} / {regime_label}"
+                    row: dict[str, Any] = {"label": row_label, "target_label": str(target_label), "regime_label": regime_label}
+                    for model in ["XGB", "TFT"]:
+                        value = values.get(model)
+                        if value is not None and np.isfinite(float(value)):
+                            row[model] = float(value) / float(baseline)
+                    if "XGB" in row or "TFT" in row:
+                        rows.append(row)
+                if compact_target_sections and len(rows) > target_section_start:
+                    section_starts.append(target_section_start)
         if not rows:
             return None
 
         labels = [str(row["label"]) for row in rows]
         y_symbols = [_tex_symbol(f"row_{idx}_{label}") for idx, label in enumerate(labels)]
         y_symbol_list = ",".join(y_symbols)
-        y_tick_labels = ",".join(_latex_escape(label) for label in labels)
-        height_cm = max(7.4, min(13.5, 0.47 * len(labels) + 2.0))
+        if compact_target_sections:
+            tick_label_parts: list[str] = []
+            starts = set(section_starts)
+            for idx, row in enumerate(rows):
+                regime_label = _latex_escape(row.get("regime_label", row["label"]))
+                if idx in starts:
+                    tick_label_parts.append(r"\textbf{" + _latex_escape(row.get("target_label", "")) + r"}\\" + regime_label)
+                else:
+                    tick_label_parts.append(regime_label)
+            y_tick_labels = ",".join(tick_label_parts)
+        else:
+            y_tick_labels = ",".join(_latex_escape(label) for label in labels)
+        height_cm = max(7.4, min(22.0 if compact_target_sections else 13.5, 0.47 * len(labels) + 2.0))
         max_x = max(
             [1.0]
             + [
@@ -1322,6 +1408,12 @@ def _write_tail_spike_relative_tex(
             r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}",
             r"                \addlegendentry{RLQR}",
         ]
+        if compact_target_sections:
+            for start_idx in section_starts[1:]:
+                sep_symbol = y_symbols[start_idx]
+                lines.append(
+                    rf"                \draw[color=gray, dashed, line width=0.6pt] ([yshift=-0.24cm]axis cs:0,{sep_symbol}) -- ([yshift=-0.24cm]axis cs:{_tex_num(xmax)},{sep_symbol});"
+                )
         for model in ["XGB", "TFT"]:
             coords: list[str] = []
             for row, y_symbol in zip(rows, y_symbols):
@@ -1345,6 +1437,15 @@ def _write_tail_spike_relative_tex(
         return _write_lines(out, lines)
 
     written: list[Path] = []
+    da_price = _write_native_relative_file(
+        "tail_spike_relative_pinball_by_regime_da_price.tex",
+        target_key="da_price",
+        figure_caption="Tail and spike performance for DA price forecasts. Bars show mean pinball loss relative to RLQR across normal, positive spike, negative spike, high-volatility week and spike-week regimes. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+        short_caption="Tail and spike performance: DA price",
+        figure_label="fig:tail_spike_relative_pinball_da_price",
+    )
+    if da_price is not None and da_price.exists():
+        written.append(da_price)
     price_capacity = _write_native_relative_file(
         "tail_spike_relative_pinball_by_regime_price_capacity.tex",
         target_key="price_capacity",
@@ -1363,6 +1464,46 @@ def _write_tail_spike_relative_tex(
     )
     if activation is not None and activation.exists():
         written.append(activation)
+    all_targets = _write_native_relative_file(
+        "tail_spike_relative_pinball_by_regime_all_targets.tex",
+        target_key="all_targets",
+        figure_caption="Tail and spike performance across all target variables. Bars show mean pinball loss relative to RLQR for each target-specific regime. Target sections are separated by dashed grey horizontal lines; values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+        short_caption="Tail and spike performance across all target variables",
+        figure_label="fig:tail_spike_relative_pinball_all_targets",
+        compact_target_sections=True,
+    )
+    if all_targets is not None and all_targets.exists():
+        written.append(all_targets)
+    for aggregate_key, filename, figure_caption, short_caption, figure_label in [
+        (
+            "capacity_price_aggregate",
+            "tail_spike_relative_pinball_by_regime_capacity_price_aggregate.tex",
+            "Tail and spike performance for aFRR capacity price forecasts with positive and negative directions aggregated. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+            "Tail and spike performance: aggregated aFRR capacity price",
+            "fig:tail_spike_relative_pinball_capacity_price_aggregate",
+        ),
+        (
+            "activation_price_aggregate",
+            "tail_spike_relative_pinball_by_regime_activation_price_aggregate.tex",
+            "Tail and spike performance for aFRR activation price forecasts with positive and negative directions aggregated. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+            "Tail and spike performance: aggregated aFRR activation price",
+            "fig:tail_spike_relative_pinball_activation_price_aggregate",
+        ),
+        (
+            "activation_rate_aggregate",
+            "tail_spike_relative_pinball_by_regime_activation_rate_aggregate.tex",
+            "Tail and spike performance for aFRR activation rate forecasts with positive and negative directions aggregated. Bars show mean pinball loss relative to RLQR. Values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+            "Tail and spike performance: aggregated aFRR activation rate",
+            "fig:tail_spike_relative_pinball_activation_rate_aggregate",
+        ),
+    ]:
+        _write_native_relative_file(
+            filename,
+            aggregate_key=aggregate_key,
+            figure_caption=figure_caption,
+            short_caption=short_caption,
+            figure_label=figure_label,
+        )
     if not written:
         return None
 
@@ -2220,8 +2361,13 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 description="LaTeX wrapper for split tail/spike relative pinball figures.",
             )
             for split_name, description in [
+                ("tail_spike_relative_pinball_by_regime_da_price.tex", "Native pgfplots DA price tail/spike relative pinball figure."),
                 ("tail_spike_relative_pinball_by_regime_price_capacity.tex", "Native pgfplots DA and aFRR capacity tail/spike relative pinball figure."),
                 ("tail_spike_relative_pinball_by_regime_activation.tex", "Native pgfplots aFRR activation tail/spike relative pinball figure."),
+                ("tail_spike_relative_pinball_by_regime_all_targets.tex", "Native pgfplots combined tail/spike relative pinball figure across all target variables."),
+                ("tail_spike_relative_pinball_by_regime_capacity_price_aggregate.tex", "Native pgfplots aFRR capacity tail/spike relative pinball figure with positive and negative directions aggregated."),
+                ("tail_spike_relative_pinball_by_regime_activation_price_aggregate.tex", "Native pgfplots aFRR activation-price tail/spike relative pinball figure with positive and negative directions aggregated."),
+                ("tail_spike_relative_pinball_by_regime_activation_rate_aggregate.tex", "Native pgfplots aFRR activation-rate tail/spike relative pinball figure with positive and negative directions aggregated."),
             ]:
                 split_path = path.parent / split_name
                 if split_path.exists():
