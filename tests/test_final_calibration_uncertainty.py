@@ -11,9 +11,11 @@ from scripts.build_final_calibration_uncertainty import (
     _crossing_metrics,
     _interval_metrics,
     _quantile_coverage,
+    aggregate_activation_reliability,
     build_calibration_outputs,
     build_main_summary_table,
     build_summary,
+    plot_reliability_activation_aggregates,
     plot_reliability_by_target_group,
     write_latex_summary,
     write_outputs,
@@ -236,7 +238,13 @@ def test_quantile_crossing_rate_and_magnitude() -> None:
 
 def test_common_row_intersection_and_optional_quantile_warning(tmp_path: Path) -> None:
     benchmark = _small_benchmark(tmp_path, tft_extra=False, with_optional=False)
-    outputs = build_calibration_outputs(benchmark_dir=benchmark, models=MODELS, splits=["test"])
+    outputs = build_calibration_outputs(
+        benchmark_dir=benchmark,
+        models=MODELS,
+        splits=["test"],
+        eval_origin_start=None,
+        eval_origin_end=None,
+    )
     row_counts = outputs["row_counts"]
     assert set(row_counts["retained_common_rows"]) == {2}
     assert row_counts.loc[row_counts["model"] == "xgb", "dropped_rows"].iloc[0] == 1
@@ -247,12 +255,24 @@ def test_common_row_intersection_and_optional_quantile_warning(tmp_path: Path) -
 def test_missing_required_p50_fails(tmp_path: Path) -> None:
     benchmark = _small_benchmark(tmp_path, with_p50=False)
     with pytest.raises(ValueError, match="Missing required p50"):
-        build_calibration_outputs(benchmark_dir=benchmark, models=MODELS, splits=["test"])
+        build_calibration_outputs(
+            benchmark_dir=benchmark,
+            models=MODELS,
+            splits=["test"],
+            eval_origin_start=None,
+            eval_origin_end=None,
+        )
 
 
 def test_latex_and_figure_outputs_use_style(tmp_path: Path) -> None:
     benchmark = _small_benchmark(tmp_path, with_optional=True)
-    outputs = build_calibration_outputs(benchmark_dir=benchmark, models=MODELS, splits=["test"])
+    outputs = build_calibration_outputs(
+        benchmark_dir=benchmark,
+        models=MODELS,
+        splits=["test"],
+        eval_origin_start=None,
+        eval_origin_end=None,
+    )
     written = write_outputs(
         outputs,
         out_dir=tmp_path / "calibration",
@@ -264,29 +284,33 @@ def test_latex_and_figure_outputs_use_style(tmp_path: Path) -> None:
     assert "rq1_4_1_2_calibration_quantile_coverage_test_appendix.tex" in names
     assert "rq1_4_1_2_calibration_interval_quality_test_appendix.tex" in names
     assert "rq1_4_1_2_calibration_quantile_crossing_test_appendix.tex" in names
-    assert "rq1_4_1_2_calibration_reliability_by_target_group.png" in names
-    assert "rq1_4_1_2_calibration_interval_coverage_by_target_group.png" in names
+    assert "calibration_interval_coverage_by_target_group.png" in names
     assert "rq1_4_1_2_calibration_summary_test.csv" in names
     tex = (tmp_path / "calibration" / "latex" / "rq1_4_1_2_calibration_summary_test.tex").read_text(encoding="utf-8")
     assert "\\toprule" in tex
     assert "\\midrule" in tex
     assert "\\bottomrule" in tex
-    assert "\\textbf{Target}" in tex
-    assert "\\textbf{TFT MACE}" in tex
-    assert "\\textbf{XGB MACE}" in tex
-    assert "\\textbf{RLQR MACE}" in tex
-    assert "\\textbf{Best calibrated}" in tex
-    assert "\\textbf{p10-p90 coverage}" in tex
-    assert "\\textbf{Main issue}" in tex
+    assert "\\textbf{\\shortstack{" in tex
+    assert "Target" in tex
+    assert "TFT" in tex and "MACE" in tex
+    assert "XGB" in tex
+    assert "RLQR" in tex
+    assert "Best" in tex and "calibrated" in tex
+    assert "p10-p90" in tex and "coverage" in tex
+    assert (
+        "\\caption{MACE for each target variable and p10-p90 coverage for best calibrated model.}"
+        in tex
+    )
+    assert "Mean MACE" in tex
+    assert "\\textbf{0." in tex
+    assert "Compact calibration summary" not in tex
     assert "MAE" not in tex
     assert "RMSE" not in tex
     assert "pinball" not in tex.lower()
     assert "pred_da_price" not in tex
     assert "\\label{tab:calibration_summary_test}" in tex
-    assert (tmp_path / "calibration" / "figures" / "rq1_4_1_2_calibration_reliability_by_target_group.png").exists()
     assert (tmp_path / "legacy_calibration" / "calibration_quantile_coverage_test.csv").exists()
     assert (tmp_path / "legacy_calibration" / "latex" / "calibration_summary_test.tex").exists()
-    assert (tmp_path / "legacy_calibration" / "figures" / "calibration_reliability_by_target_group.png").exists()
 
 
 def test_reliability_figure_can_be_created_from_synthetic_metrics(tmp_path: Path) -> None:
@@ -303,3 +327,59 @@ def test_reliability_figure_can_be_created_from_synthetic_metrics(tmp_path: Path
     assert out.exists()
     source = Path("scripts/build_final_calibration_uncertainty.py").read_text(encoding="utf-8")
     assert "apply_geo_style" in source
+
+
+def test_activation_reliability_aggregate_merges_pos_neg(tmp_path: Path) -> None:
+    coverage = pd.DataFrame(
+        [
+            {
+                "target": "pred_afrr_activation_price_pos",
+                "target_label": "aFRR activation price +",
+                "target_group": "aFRR activation price",
+                "model": "xgb",
+                "model_label": "XGB",
+                "quantile": 0.1,
+                "empirical_coverage": 0.2,
+                "n_obs": 2,
+            },
+            {
+                "target": "pred_afrr_activation_price_neg",
+                "target_label": "aFRR activation price -",
+                "target_group": "aFRR activation price",
+                "model": "xgb",
+                "model_label": "XGB",
+                "quantile": 0.1,
+                "empirical_coverage": 0.8,
+                "n_obs": 6,
+            },
+            {
+                "target": "pred_afrr_activation_rate_pos",
+                "target_label": "aFRR activation rate +",
+                "target_group": "aFRR activation rate",
+                "model": "linear",
+                "model_label": "RLQR",
+                "quantile": 0.9,
+                "empirical_coverage": 0.75,
+                "n_obs": 4,
+            },
+            {
+                "target": "pred_afrr_activation_rate_neg",
+                "target_label": "aFRR activation rate -",
+                "target_group": "aFRR activation rate",
+                "model": "linear",
+                "model_label": "RLQR",
+                "quantile": 0.9,
+                "empirical_coverage": 1.0,
+                "n_obs": 4,
+            },
+        ]
+    )
+    agg = aggregate_activation_reliability(coverage)
+    price = agg.loc[(agg["target"].eq("afrr_activation_price")) & agg["model"].eq("xgb")].iloc[0]
+    assert price["empirical_coverage"] == pytest.approx((0.2 * 2 + 0.8 * 6) / 8)
+    rate = agg.loc[(agg["target"].eq("afrr_activation_rate")) & agg["model"].eq("linear")].iloc[0]
+    assert rate["empirical_coverage"] == pytest.approx(0.875)
+    out = plot_reliability_activation_aggregates(coverage, tmp_path)
+    assert out is not None
+    assert out.name == "rq1_4_1_2_calibration_reliability_activation_aggregates.png"
+    assert out.exists()

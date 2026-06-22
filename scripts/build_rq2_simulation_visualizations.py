@@ -1009,7 +1009,7 @@ def _format_eur(value: Any) -> str:
     if not math.isfinite(val):
         return r"--"
     sign = "-" if val < 0 else ""
-    return f"{sign}€{abs(val):,.0f}"
+    return f"{sign}{abs(val):,.0f} EUR"
 
 
 def _format_pct(value: Any) -> str:
@@ -1156,7 +1156,7 @@ def plot_heatmap(table: pd.DataFrame, out_base: Path, formats: list[str]) -> lis
     for i, model in enumerate(rows):
         for j, q in enumerate(quantiles):
             val = pivot.loc[model, q]
-            txt = "n/a" if not math.isfinite(_safe_float(val)) else f"€{val/1000:,.0f}k"
+            txt = "n/a" if not math.isfinite(_safe_float(val)) else f"{val/1000:,.0f} kEUR"
             text_color = "white" if model == "RHPF" else THESIS_PALETTE["neutral_dark"]
             ax.text(j, i, txt, ha="center", va="center", color=text_color, fontsize=9)
     cbar = fig.colorbar(im, ax=ax)
@@ -1243,7 +1243,7 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
             if not math.isfinite(float(yi)):
                 continue
             ax.annotate(
-                f"€{yi/1000:,.0f}k",
+                f"{yi/1000:,.0f} kEUR",
                 (xi, yi),
                 textcoords="offset points",
                 xytext=(0, _label_offset(model, q)),
@@ -1454,7 +1454,7 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     ax3 = ax.twinx()
     ax3.spines["right"].set_position(("axes", 1.08))
     ax3.plot(x, pnl_keur, color=pnl_color, linewidth=2.0, linestyle="--", label="Cumulative Net Profit")
-    ax3.set_ylabel("Cumulative Net Profit (k€)")
+    ax3.set_ylabel("Cumulative Net Profit (kEUR)")
     ax3.tick_params(axis="y", colors=pnl_color)
     ax3.spines["right"].set_visible(True)
     ax3.spines["right"].set_color(pnl_color)
@@ -1609,7 +1609,7 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
                         color=THESIS_PALETTE["neutral_dark"],
                     )
             ax.set_xlabel("Mean pinball loss")
-            ax.set_ylabel("Annualized Net Profit (k€ / year)")
+            ax.set_ylabel("Annualized Net Profit (kEUR / year)")
             ax.legend(title="Model", loc="best")
         ax.set_title(f"RQ2 Pinball Loss vs Net Profit: {label}")
         fig.tight_layout()
@@ -1671,7 +1671,7 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
             linestyle="--",
             linewidth=1.3,
             alpha=0.8,
-            label="Idealized lower-loss / higher-profit relationship",
+            label="VoF reference line",
             zorder=1,
         )
         for model in MODEL_ORDER:
@@ -1770,7 +1770,7 @@ def plot_total_pinball_net_profit_scatter(scatter_data: pd.DataFrame, out_base: 
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         ax.set_xlabel("Total mean pinball loss")
-        ax.set_ylabel("Annualized Net Profit (k€ / year)")
+        ax.set_ylabel("Annualized Net Profit (kEUR / year)")
         ax.legend(title="Model", loc="best")
     ax.set_title("Total Mean Pinball Loss vs Net Profit")
     ax.text(
@@ -1929,7 +1929,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         _write_latex_include(
             latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex",
             _thesis_figure_rel(out_root, "5_pinball_loss_vs_net_profit_total_normalized.png"),
-            "Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line shows the idealized negative association between lower forecast loss and higher profit.",
+            "Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line is the VoF reference line.",
             "fig:5_pinball_loss_vs_net_profit_total_normalized",
         )
         for target, label in TARGET_LABELS.items():
@@ -1952,7 +1952,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         _write_latex_include(
             latex_figures_dir / "6_market_dispatch_soc_selected_day.tex",
             _thesis_figure_rel(out_root, "6_market_dispatch_soc_selected_day.png"),
-            "Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero, discharging actions below zero, the green line shows SoC, and the blue dashed line shows cumulative realized Net Profit in k€.",
+            "Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero, discharging actions below zero, the green line shows SoC, and the blue dashed line shows cumulative realized Net Profit in kEUR.",
             "fig:6_market_dispatch_soc_selected_day",
         )
         _write_latex_include(

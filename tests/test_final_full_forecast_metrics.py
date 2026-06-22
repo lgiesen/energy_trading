@@ -208,6 +208,8 @@ def test_outputs_exclude_interval_metrics_from_4_1_1(tmp_path: Path) -> None:
     detailed_tex = (tmp_path / "out" / "latex" / "rq1_4_1_1_forecast_metrics_full_detailed_test.tex").read_text(encoding="utf-8")
     assert r"\textbf{Target} & \textbf{RLQR} & \textbf{XGB} & \textbf{TFT} & \textbf{Best model}" in primary_tex
     assert r"\shortstack{Improvement\\vs RLQR (\%)}" in primary_tex
+    assert "Mean &" in primary_tex
+    assert "Average &" not in primary_tex
     assert r"\textbf{Target group}" not in primary_tex
     assert r"\textbf{Quantiles}" not in primary_tex
     assert r"\textbf{Metric}" not in primary_tex

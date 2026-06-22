@@ -59,6 +59,11 @@ TARGET_GROUPS = {
     "target_afrr_activation_rate_neg": ("aFRR activation rate", "aFRR activation rate -"),
 }
 
+ACTIVATION_RELIABILITY_AGGREGATES = (
+    ("afrr_activation_price", "aFRR activation price"),
+    ("afrr_activation_rate", "aFRR activation rate"),
+)
+
 REQUIRED_INTERVAL = (0.10, 0.90)
 INTERVAL_PAIRS = [(0.30, 0.70), (0.10, 0.90), (0.05, 0.95), (0.01, 0.99)]
 OPTIONAL_PAIRS = [(0.05, 0.95), (0.01, 0.99)]
@@ -558,6 +563,19 @@ def _format_num(v: Any, digits: int = 4) -> str:
     return f"{x:.{digits}f}"
 
 
+def _format_num_bold_if_best(v: Any, best: float, digits: int = 4, tol: float = 1e-12) -> str:
+    formatted = _format_num(v, digits=digits)
+    if formatted == "-":
+        return formatted
+    try:
+        x = float(v)
+    except Exception:
+        return formatted
+    if np.isfinite(x) and np.isfinite(float(best)) and abs(x - float(best)) <= float(tol):
+        return r"\textbf{" + formatted + "}"
+    return formatted
+
+
 def _main_issue_for_target(part: pd.DataFrame) -> str:
     crossing = pd.to_numeric(part.get("crossing_rate"), errors="coerce")
     if crossing.notna().any() and float(crossing.max()) > 1e-9:
@@ -616,20 +634,54 @@ def write_latex_summary(summary: pd.DataFrame, *, out_dir: Path, split: str) -> 
         r"        \midrule",
     ]
     for _, row in d.iterrows():
+        mace_values = [
+            float(row.get(col))
+            for col in ("RLQR_MACE", "XGB_MACE", "TFT_MACE")
+            if pd.notna(row.get(col)) and np.isfinite(float(row.get(col)))
+        ]
+        best_mace = min(mace_values) if mace_values else float("nan")
         vals = [
             _latex_escape(row["target_label"]),
-            _format_num(row.get("RLQR_MACE")),
-            _format_num(row.get("XGB_MACE")),
-            _format_num(row.get("TFT_MACE")),
+            _format_num_bold_if_best(row.get("RLQR_MACE"), best_mace),
+            _format_num_bold_if_best(row.get("XGB_MACE"), best_mace),
+            _format_num_bold_if_best(row.get("TFT_MACE"), best_mace),
             _latex_escape(row["best_calibrated"]),
             _format_num(row.get("p10_p90_coverage")),
         ]
         lines.append("        " + " & ".join(vals) + r" \\")
+    mean_mace_by_col: dict[str, float] = {}
+    for col in ("RLQR_MACE", "XGB_MACE", "TFT_MACE"):
+        values = pd.to_numeric(d[col], errors="coerce") if col in d.columns else pd.Series(dtype=float)
+        finite_values = values[np.isfinite(values)]
+        mean_mace_by_col[col] = float(finite_values.mean()) if not finite_values.empty else float("nan")
+    finite_means = [v for v in mean_mace_by_col.values() if np.isfinite(v)]
+    best_mean_mace = min(finite_means) if finite_means else float("nan")
+    best_mean_model = "-"
+    for label, col in (("RLQR", "RLQR_MACE"), ("XGB", "XGB_MACE"), ("TFT", "TFT_MACE")):
+        value = mean_mace_by_col[col]
+        if np.isfinite(value) and np.isfinite(best_mean_mace) and abs(value - best_mean_mace) <= 1e-12:
+            best_mean_model = label
+            break
+    lines.append(r"        \midrule")
+    lines.append(
+        "        "
+        + " & ".join(
+            [
+                "Mean MACE",
+                _format_num_bold_if_best(mean_mace_by_col["RLQR_MACE"], best_mean_mace),
+                _format_num_bold_if_best(mean_mace_by_col["XGB_MACE"], best_mean_mace),
+                _format_num_bold_if_best(mean_mace_by_col["TFT_MACE"], best_mean_mace),
+                _latex_escape(best_mean_model),
+                "-",
+            ]
+        )
+        + r" \\"
+    )
     lines.extend(
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{Compact calibration summary on the test split. MACE is the mean absolute calibration error across available quantiles. p10-p90 coverage is reported for the best-calibrated model and should be close to the nominal 0.80 interval coverage.}",
+            r"    \caption{MACE for each target variable and p10-p90 coverage for best calibrated model.}",
             r"    \label{tab:calibration_summary_test}",
             r"\end{table}",
             "",
@@ -802,6 +854,43 @@ def _group_panel_axes(groups: list[str]):
     return fig, axes
 
 
+def aggregate_activation_reliability(coverage: pd.DataFrame) -> pd.DataFrame:
+    """Merge positive and negative activation targets for reliability plots."""
+    if coverage.empty:
+        return pd.DataFrame()
+    required = {"target_group", "model", "model_label", "quantile", "empirical_coverage", "n_obs"}
+    if not required.issubset(coverage.columns):
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    for aggregate_slug, aggregate_label in ACTIVATION_RELIABILITY_AGGREGATES:
+        part = coverage.loc[coverage["target_group"].eq(aggregate_label)].copy()
+        if part.empty:
+            continue
+        part["n_obs"] = pd.to_numeric(part["n_obs"], errors="coerce")
+        part["empirical_coverage"] = pd.to_numeric(part["empirical_coverage"], errors="coerce")
+        part = part.loc[part["n_obs"].notna() & part["empirical_coverage"].notna() & (part["n_obs"] > 0)].copy()
+        if part.empty:
+            continue
+        part["_weighted_empirical_coverage"] = part["empirical_coverage"] * part["n_obs"]
+        grouped = (
+            part.groupby(["model", "model_label", "quantile"], as_index=False)
+            .agg(
+                weighted_empirical_coverage=("_weighted_empirical_coverage", "sum"),
+                n_obs=("n_obs", "sum"),
+            )
+        )
+        grouped["empirical_coverage"] = grouped["weighted_empirical_coverage"] / grouped["n_obs"]
+        grouped["calibration_error"] = grouped["empirical_coverage"] - pd.to_numeric(grouped["quantile"], errors="coerce")
+        grouped["target"] = aggregate_slug
+        grouped["target_label"] = aggregate_label
+        grouped["target_group"] = aggregate_label
+        frames.append(grouped.drop(columns=["weighted_empirical_coverage"]))
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    return out.sort_values(["target_label", "model_label", "quantile"]).reset_index(drop=True)
+
+
 def plot_reliability_by_target_group(coverage: pd.DataFrame, fig_dir: Path) -> Path | None:
     import matplotlib.pyplot as plt
     from matplotlib.ticker import FuncFormatter
@@ -847,6 +936,51 @@ def plot_reliability_by_target_group(coverage: pd.DataFrame, fig_dir: Path) -> P
     fig.tight_layout()
     fig_dir.mkdir(parents=True, exist_ok=True)
     path = fig_dir / "rq1_4_1_2_calibration_reliability_by_target.png"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def plot_reliability_activation_aggregates(coverage: pd.DataFrame, fig_dir: Path) -> Path | None:
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    d = aggregate_activation_reliability(coverage)
+    if d.empty:
+        return None
+    apply_geo_style()
+    targets = ordered_unique(d["target_label"].dropna().unique())
+    fig, axes = _group_panel_axes(targets)
+    fig.suptitle(thesis_titlecase("Aggregate empirical coverage vs nominal quantile"), y=1.01)
+    for ax, target_label in zip(axes, targets):
+        g = d[d["target_label"] == target_label]
+        for model in sorted(g["model"].dropna().unique(), key=model_sort_key):
+            mg = g[g["model"].eq(model)].sort_values("quantile")
+            ax.plot(
+                mg["quantile"],
+                mg["empirical_coverage"],
+                marker="o",
+                label=str(mg["model_label"].iloc[0]),
+                color=get_model_color(str(mg["model"].iloc[0])),
+            )
+        ax.plot([0, 1], [0, 1], linestyle="--", color=THESIS_PALETTE["neutral_dark"], label="Ideal")
+        n_obs = pd.to_numeric(g["n_obs"], errors="coerce").dropna()
+        n_label = int(n_obs.min()) if not n_obs.empty else 0
+        ax.set_title(thesis_titlecase(f"{target_label} (+/- merged, n={n_label})"))
+        ax.set_xlabel("Nominal quantile")
+        ax.set_ylabel("Empirical coverage")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ticks = np.array([0.10, 0.30, 0.50, 0.70, 0.90], dtype=float)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        pct = FuncFormatter(lambda value, _: f"{value * 100:.0f}%")
+        ax.xaxis.set_major_formatter(pct)
+        ax.yaxis.set_major_formatter(pct)
+        ax.legend(ncol=4, loc="upper left")
+    fig.tight_layout()
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    path = fig_dir / "rq1_4_1_2_calibration_reliability_activation_aggregates.png"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -1042,6 +1176,7 @@ def write_legacy_flat_aliases(outputs: dict[str, pd.DataFrame], *, out_dir: Path
         source_dir / "figures" / "rq1_4_1_2_calibration_interval_width_by_target_group.png": out_dir / "figures" / "calibration_interval_width_by_target_group.png",
         source_dir / "figures" / "rq1_4_1_2_calibration_quantile_crossing_by_target_group.png": out_dir / "figures" / "calibration_quantile_crossing_by_target_group.png",
         source_dir / "figures" / "rq1_4_1_2_calibration_error_heatmap.png": out_dir / "figures" / "calibration_error_heatmap.png",
+        source_dir / "figures" / "rq1_4_1_2_calibration_reliability_activation_aggregates.png": out_dir / "figures" / "calibration_reliability_activation_aggregates.png",
     }
     for src, dst in copy_aliases.items():
         if not src.exists():
@@ -1109,6 +1244,7 @@ def write_outputs(
     crossing_split = _split_frame(outputs["quantile_crossing"], split)
     for p in [
         plot_reliability_by_target_group(coverage_split, fig_dir),
+        plot_reliability_activation_aggregates(coverage_split, fig_dir),
         plot_interval_coverage_by_target_group(interval_split, fig_dir),
         plot_interval_width_by_target_group(interval_split, fig_dir),
         plot_crossing_by_target_group(crossing_split, fig_dir),

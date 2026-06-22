@@ -91,35 +91,35 @@ PRICE_P50_TOLERANCE_CONFIG = {
         "label": "DA price",
         "thresholds": (1.0, 5.0, 10.0),
         "unit": "EUR/MWh",
-        "unit_latex": "€/MWh",
+        "unit_latex": "EUR/MWh",
     },
     "pred_afrr_capacity_price_pos": {
         "slug": "afrr_capacity_price_pos",
         "label": "aFRR capacity price +",
         "thresholds": (1.0, 5.0, 10.0),
         "unit": "EUR/MW",
-        "unit_latex": "€/MW",
+        "unit_latex": "EUR/MW",
     },
     "pred_afrr_capacity_price_neg": {
         "slug": "afrr_capacity_price_neg",
         "label": "aFRR capacity price -",
         "thresholds": (1.0, 5.0, 10.0),
         "unit": "EUR/MW",
-        "unit_latex": "€/MW",
+        "unit_latex": "EUR/MW",
     },
     "pred_afrr_activation_price_pos": {
         "slug": "afrr_activation_price_pos",
         "label": "aFRR activation price +",
         "thresholds": (10.0, 50.0, 100.0),
         "unit": "EUR/MWh",
-        "unit_latex": "€/MWh",
+        "unit_latex": "EUR/MWh",
     },
     "pred_afrr_activation_price_neg": {
         "slug": "afrr_activation_price_neg",
         "label": "aFRR activation price -",
         "thresholds": (10.0, 50.0, 100.0),
         "unit": "EUR/MWh",
-        "unit_latex": "€/MWh",
+        "unit_latex": "EUR/MWh",
     },
 }
 PRICE_P50_TOLERANCE_TARGETS = tuple(PRICE_P50_TOLERANCE_CONFIG)
@@ -137,7 +137,7 @@ def _p50_tolerance_title_label(target: str) -> str:
 
 
 def _p50_tolerance_title(target: str) -> str:
-    return f"Cumulative Absolute P50 Error Tolerance for {_p50_tolerance_title_label(target)}"
+    return f"Cumulative Absolute p50 Error Tolerance for {_p50_tolerance_title_label(target)}"
 
 
 @dataclass(frozen=True)
@@ -876,6 +876,29 @@ def build_detailed_table(metrics: pd.DataFrame, *, split: str) -> pd.DataFrame:
     return sort_target_frame(d[cols + ["_metric_order"]], target_col="target", extra_cols=["_metric_order"]).drop(columns=["_metric_order"]).reset_index(drop=True)
 
 
+def add_primary_average_row(primary: pd.DataFrame) -> pd.DataFrame:
+    """Append an arithmetic mean row across target-level pinball losses."""
+    if primary.empty:
+        return primary
+    model_cols = [col for col in ["RLQR", "XGB", "TFT"] if col in primary.columns]
+    if not model_cols:
+        return primary
+    row: dict[str, Any] = {col: np.nan for col in primary.columns}
+    row["target"] = "Mean"
+    for col in model_cols:
+        row[col] = pd.to_numeric(primary[col], errors="coerce").mean()
+    vals = {col: float(row[col]) for col in model_cols if np.isfinite(float(row[col]))}
+    if vals:
+        best = min(vals, key=vals.get)
+        row["best_model"] = best
+        rlqr = vals.get("RLQR", float("nan"))
+        best_val = vals[best]
+        row["relative_improvement_vs_RLQR_pct"] = 100.0 * (rlqr - best_val) / abs(rlqr) if np.isfinite(rlqr) and abs(rlqr) > 1e-12 else np.nan
+    if "n_obs" in primary.columns:
+        row["n_obs"] = pd.to_numeric(primary["n_obs"], errors="coerce").sum()
+    return pd.concat([primary, pd.DataFrame([row])], ignore_index=True)
+
+
 def _latex_table(
     table: pd.DataFrame,
     *,
@@ -1391,7 +1414,7 @@ def write_p50_error_tolerance_summary_latex(summary: pd.DataFrame, *, out_dir: P
         r"    \centering",
         r"    \begin{tabular}{@{}lrrrrrr@{}}",
         r"        \toprule",
-        r"        \textbf{Model} & \textbf{$\leq$1 €/MWh} & \textbf{$\leq$5 €/MWh} & \textbf{$\leq$10 €/MWh} & \textbf{Median absolute error} & \textbf{MAE p50} & \textbf{N} \\",
+        r"        \textbf{Model} & \textbf{$\leq$1 EUR/MWh} & \textbf{$\leq$5 EUR/MWh} & \textbf{$\leq$10 EUR/MWh} & \textbf{Median absolute error} & \textbf{MAE p50} & \textbf{N} \\",
         r"        \midrule",
     ]
     for _, row in d.iterrows():
@@ -1480,16 +1503,17 @@ def write_outputs(
 
     primary = build_primary_table(metrics, split=split)
     detailed = build_detailed_table(metrics, split=split)
+    primary_with_average = add_primary_average_row(primary)
 
     primary_path = csv_dir / f"rq1_4_1_1_forecast_metrics_full_primary_{split}.csv"
     detailed_path = csv_dir / f"rq1_4_1_1_forecast_metrics_full_detailed_{split}.csv"
     align_path = csv_dir / f"rq1_4_1_1_forecast_metrics_full_alignment_diagnostics_{split}.csv"
-    primary.to_csv(primary_path, index=False)
+    primary_with_average.to_csv(primary_path, index=False)
     detailed.to_csv(detailed_path, index=False)
     diagnostics.loc[diagnostics["split"] == split].to_csv(align_path, index=False)
     outputs.extend([primary_path, detailed_path, align_path])
 
-    outputs.extend(write_latex_tables(primary, detailed, out_dir=out_dir, split=split))
+    outputs.extend(write_latex_tables(primary_with_average, detailed, out_dir=out_dir, split=split))
     outputs.extend(write_relative_pinball_figure(primary, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
     outputs.extend(write_relative_mae_figure(detailed, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
 

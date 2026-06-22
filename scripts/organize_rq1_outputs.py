@@ -104,6 +104,7 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.1", "backup", "diagnostics", f"diagnostics/price_p50_error_tolerance_performance_values_{split}.txt", _sub_sources("4.1.1", f"diagnostics/rq1_4_1_1_price_p50_error_tolerance_performance_values_{split}.txt"), "p50 absolute error tolerance", "diagnostics", "Readable price p50 absolute error tolerance performance values."),
         _route("4.1.1", "backup", "diagnostics", f"diagnostics/forecast_metrics_full_alignment_diagnostics_{split}.csv", _sub_sources("4.1.1", f"csv/rq1_4_1_1_forecast_metrics_full_alignment_diagnostics_{split}.csv"), "alignment", "diagnostics", "Alignment diagnostics for full metrics."),
         _route("4.1.2", "result_section", "figure", "figures/calibration_reliability_by_target.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_reliability_by_target.png"), "calibration", "main thesis figure", "Quantile reliability by target."),
+        _route("4.1.2", "result_section", "figure", "figures/calibration_reliability_activation_aggregates.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_reliability_activation_aggregates.png") + ["_raw_outputs/4_1_2_calibration_uncertainty/figures/rq1_4_1_2_calibration_reliability_activation_aggregates.png", "_raw_outputs/calibration/figures/calibration_reliability_activation_aggregates.png"], "calibration", "main thesis figure", "Quantile reliability for activation price and rate with positive/negative directions merged.", required=False),
         _route("4.1.2", "result_section", "figure", "figures/calibration_interval_coverage_by_target_group.png", _sub_sources("4.1.2", "figures/rq1_4_1_2_calibration_interval_coverage_by_target_group.png"), "interval_coverage", "main thesis figure", "Interval coverage reliability by target group.", required=False),
         _route("4.1.2", "result_section", "latex_table", f"tables/calibration_summary_{split}.tex", _sub_sources("4.1.2", f"latex/rq1_4_1_2_calibration_summary_{split}.tex"), "calibration", "main thesis table", "Calibration summary table."),
         _route("4.1.2", "appendix", "latex_table", f"tables/calibration_quantile_coverage_{split}_appendix.tex", _sub_sources("4.1.2", f"latex/rq1_4_1_2_calibration_quantile_coverage_{split}_appendix.tex"), "calibration", "appendix table", "Quantile coverage appendix table."),
@@ -787,7 +788,7 @@ def _tex_label(value: Any) -> str:
     if parts and parts[-1].lower() == "pos":
         parts[-1] = "+"
     elif parts and parts[-1].lower() == "neg":
-        parts[-1] = "$-$"
+        parts[-1] = "-"
     return " ".join(parts)
 
 
@@ -797,6 +798,44 @@ BUCKET_LABELS = {
     "medium_h9_16": "Medium horizon (h9--h16)",
     "long_h17_48": "Long horizon (h17--h48)",
 }
+
+
+ACTIVATION_RELIABILITY_AGGREGATES = (
+    ("afrr_activation_price_aggregate", "aFRR activation price"),
+    ("afrr_activation_rate_aggregate", "aFRR activation rate"),
+)
+
+
+def _aggregate_activation_reliability(df: pd.DataFrame) -> pd.DataFrame:
+    required = {"target_group", "model", "model_label", "quantile", "empirical_coverage", "n_obs"}
+    if df.empty or not required.issubset(df.columns):
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    for aggregate_slug, aggregate_label in ACTIVATION_RELIABILITY_AGGREGATES:
+        part = df.loc[df["target_group"].eq(aggregate_label)].copy()
+        if part.empty:
+            continue
+        part["n_obs"] = pd.to_numeric(part["n_obs"], errors="coerce")
+        part["empirical_coverage"] = pd.to_numeric(part["empirical_coverage"], errors="coerce")
+        part = part.loc[part["n_obs"].notna() & part["empirical_coverage"].notna() & (part["n_obs"] > 0)].copy()
+        if part.empty:
+            continue
+        part["_weighted_empirical_coverage"] = part["empirical_coverage"] * part["n_obs"]
+        grouped = (
+            part.groupby(["model", "model_label", "quantile"], as_index=False)
+            .agg(
+                weighted_empirical_coverage=("_weighted_empirical_coverage", "sum"),
+                n_obs=("n_obs", "sum"),
+            )
+        )
+        grouped["empirical_coverage"] = grouped["weighted_empirical_coverage"] / grouped["n_obs"]
+        grouped["target"] = aggregate_slug
+        grouped["target_label"] = aggregate_label
+        grouped["target_group"] = aggregate_label
+        frames.append(grouped.drop(columns=["weighted_empirical_coverage"]))
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).sort_values(["target_label", "model_label", "quantile"])
 
 
 def _bucket_label(bucket: Any) -> str:
@@ -883,11 +922,11 @@ TAIL_SPIKE_ACTIVATION_TARGETS = [
 ]
 
 P50_TOLERANCE_TEX_CONFIG = {
-    "pred_da_price": ("da_price", "DA price", (1.0, 5.0, 10.0), "€/MWh"),
-    "pred_afrr_capacity_price_pos": ("afrr_capacity_price_pos", "aFRR capacity price +", (1.0, 5.0, 10.0), "€/MW"),
-    "pred_afrr_capacity_price_neg": ("afrr_capacity_price_neg", "aFRR capacity price $-$", (1.0, 5.0, 10.0), "€/MW"),
-    "pred_afrr_activation_price_pos": ("afrr_activation_price_pos", "aFRR activation price +", (10.0, 50.0, 100.0), "€/MWh"),
-    "pred_afrr_activation_price_neg": ("afrr_activation_price_neg", "aFRR activation price $-$", (10.0, 50.0, 100.0), "€/MWh"),
+    "pred_da_price": ("da_price", "DA price", (1.0, 5.0, 10.0), "EUR/MWh"),
+    "pred_afrr_capacity_price_pos": ("afrr_capacity_price_pos", "aFRR capacity price +", (1.0, 5.0, 10.0), "EUR/MW"),
+    "pred_afrr_capacity_price_neg": ("afrr_capacity_price_neg", "aFRR capacity price $-$", (1.0, 5.0, 10.0), "EUR/MW"),
+    "pred_afrr_activation_price_pos": ("afrr_activation_price_pos", "aFRR activation price +", (10.0, 50.0, 100.0), "EUR/MWh"),
+    "pred_afrr_activation_price_neg": ("afrr_activation_price_neg", "aFRR activation price $-$", (10.0, 50.0, 100.0), "EUR/MWh"),
 }
 
 
@@ -903,7 +942,7 @@ def _p50_tolerance_title_label(target: str) -> str:
 
 
 def _p50_tolerance_title(target: str) -> str:
-    return f"Cumulative Absolute P50 Error Tolerance for {_p50_tolerance_title_label(target)}"
+    return f"Cumulative Absolute p50 Error Tolerance for {_p50_tolerance_title_label(target)}"
 
 
 def _tail_spike_regime_label(regime: Any) -> str:
@@ -972,9 +1011,10 @@ def _coordinates(rows: list[tuple[Any, Any]]) -> str:
     return " ".join(f"({_tex_symbol(x)},{_tex_num(y)})" for x, y in rows)
 
 
-def _symbolic_axis_options(labels: list[Any]) -> list[str]:
+def _symbolic_axis_options(labels: list[Any], tick_labels_raw: list[Any] | None = None) -> list[str]:
     symbols = [_tex_symbol(x) for x in labels]
-    tick_labels = [_latex_escape(_tex_label(x)) for x in labels]
+    tick_label_values = tick_labels_raw if tick_labels_raw is not None else labels
+    tick_labels = [_latex_escape(_tex_label(x)) for x in tick_label_values]
     return [
         "                symbolic x coords={" + ",".join(symbols) + "},",
         "                xtick={" + ",".join(symbols) + "},",
@@ -995,12 +1035,14 @@ def _write_grouped_bar_tex(
     placement: str = "htbp",
     reference_y: float | None = None,
     reference_label: str | None = None,
+    x_tick_label_col: str | None = None,
 ) -> Path | None:
     if data.empty or not series_cols:
         return None
     del colors
     series_cols = [c for c in ordered_model_labels(series_cols) if c in series_cols]
     labels = data[x_col].astype(str).tolist()
+    tick_labels = data[x_tick_label_col].astype(str).tolist() if x_tick_label_col and x_tick_label_col in data.columns else None
     lines = _tikz_header(caption, label, placement=placement)
     lines.extend(
         [
@@ -1016,7 +1058,7 @@ def _write_grouped_bar_tex(
             r"                area legend,",
             r"                axis lines*=left,",
             r"                ymin=0,",
-            *_symbolic_axis_options(labels),
+            *_symbolic_axis_options(labels, tick_labels),
             r"            ]",
         ]
     )
@@ -1342,9 +1384,9 @@ def _write_p50_tolerance_curve_tex(
     if d.empty:
         return None
     xmax = float(d["threshold"].max())
-    xticks = [0.0, *[float(x) for x in thresholds if float(x) <= xmax], xmax]
-    # Preserve order while avoiding duplicate xmax when it is also a threshold.
-    xticks = list(dict.fromkeys(round(x, 8) for x in xticks))
+    # Keep dense reference thresholds off the x-axis. Labels such as 1/5/10
+    # otherwise collide near the origin for large price-error ranges.
+    xticks = [round(xmax, 8)]
     x_tick_values = ",".join(_tex_num(x) for x in xticks)
     x_tick_labels = ",".join(_latex_escape(f"{x:g}") for x in xticks)
     caption = _p50_tolerance_title(target)
@@ -1380,6 +1422,9 @@ def _write_p50_tolerance_curve_tex(
         threshold_f = float(threshold)
         if 0.0 <= threshold_f <= xmax:
             lines.append(rf"                \addplot[color=neutraldark, dashed, mark=none, line width=0.8pt, forget plot] coordinates {{({_tex_num(threshold_f)},0) ({_tex_num(threshold_f)},1)}};")
+            y_pos = 0.94 - 0.08 * (list(thresholds).index(threshold) % 3)
+            threshold_label = _latex_escape(f"{threshold_f:g} {unit}")
+            lines.append(rf"                \node[font=\scriptsize, rotate=90, anchor=east, fill=white, fill opacity=0.85, text opacity=1, inner sep=1pt] at (axis cs:{_tex_num(threshold_f)},{_tex_num(y_pos)}) {{{threshold_label}}};")
     legends: list[str] = []
     for model in MODEL_LABELS:
         part = d[d["model"].astype(str).eq(model)].sort_values("threshold")
@@ -1712,17 +1757,25 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
     primary = root / "backup" / "csv" / f"forecast_metrics_full_primary_{split}.csv"
     if primary.exists():
         df = pd.read_csv(primary)
+        df = df[~df["target"].astype(str).isin(["Average", "Mean"])].copy()
         df["target_label"] = df["target"].map(lambda x: _tex_label(str(x).replace("pred_", "")))
         df = sort_target_frame(df, target_col="target")
         for col in ["XGB", "TFT"]:
             df[col] = pd.to_numeric(df[col], errors="coerce") / pd.to_numeric(df["RLQR"], errors="coerce")
+        avg_row = {col: np.nan for col in df.columns}
+        avg_row["target"] = "relative_average"
+        avg_row["target_label"] = "Mean"
+        avg_row["XGB"] = pd.to_numeric(df["XGB"], errors="coerce").mean()
+        avg_row["TFT"] = pd.to_numeric(df["TFT"], errors="coerce").mean()
+        df = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
         out = root / "result_section" / "latex_figures" / f"forecast_metrics_full_relative_pinball_{split}.tex"
         path = _write_grouped_bar_tex(
             out,
             data=df,
-            x_col="target_label",
+            x_col="target",
+            x_tick_label_col="target_label",
             series_cols=["XGB", "TFT"],
-            caption="Relative mean pinball loss by target (RLQR = 1; lower is better).",
+            caption="Mean pinball loss by target relative to RLQR",
             label="fig:rq1-4-1-1-forecast-metrics-full-relative-pinball",
             ylabel="Mean pinball loss relative to RLQR",
             reference_y=1.0,
@@ -1780,7 +1833,16 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
     # 4.1.2 calibration and uncertainty.
     sec = "4.1.2"
     root = rq1_root / SUBSECTIONS[sec]
-    cal = root / "backup" / "csv" / f"calibration_quantile_coverage_{split}.csv"
+    cal_candidates = [
+        root / "backup" / "csv" / f"calibration_quantile_coverage_{split}.csv",
+        rq1_root
+        / "_raw_outputs"
+        / "4_1_2_calibration_uncertainty"
+        / "csv"
+        / f"rq1_4_1_2_calibration_quantile_coverage_{split}.csv",
+        rq1_root / "_raw_outputs" / "calibration" / f"calibration_quantile_coverage_{split}.csv",
+    ]
+    cal = next((path for path in cal_candidates if path.exists()), cal_candidates[0])
     if cal.exists():
         for stale in (root / "result_section" / "latex_figures").glob("calibration_reliability_*.tex"):
             stale.unlink()
@@ -1812,6 +1874,30 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             )
             if path:
                 _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="calibration", description=f"Native pgfplots quantile reliability for {target_label}.")
+        aggregate_df = _aggregate_activation_reliability(df)
+        for aggregate_slug, aggregate_label in ACTIVATION_RELIABILITY_AGGREGATES:
+            group = aggregate_df.loc[aggregate_df["target"].eq(aggregate_slug)].copy() if not aggregate_df.empty else pd.DataFrame()
+            if group.empty:
+                continue
+            out = root / "result_section" / "latex_figures" / f"calibration_reliability_{aggregate_slug}.tex"
+            path = _write_line_tex(
+                out,
+                data=group,
+                x_col="quantile",
+                y_col="empirical_coverage",
+                series_col="model_label",
+                caption=f"Aggregate quantile reliability for {aggregate_label} with positive and negative directions merged.",
+                label=f"fig:rq1-4-1-2-calibration-reliability-{aggregate_slug.replace('_', '-')}",
+                ylabel="Empirical coverage",
+                xlabel="Nominal quantile",
+                ideal_diagonal=True,
+                xlim=(0.0, 1.0),
+                ylim=(0.0, 1.0),
+                percent_axes=True,
+                fragment_only=True,
+            )
+            if path:
+                _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="calibration", description=f"Native pgfplots aggregate quantile reliability for {aggregate_label}.")
     interval = root / "backup" / "csv" / f"calibration_interval_coverage_width_{split}.csv"
     if interval.exists():
         df = pd.read_csv(interval)
