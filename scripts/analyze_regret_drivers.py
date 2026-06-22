@@ -24,7 +24,7 @@ from energy_trading.evaluation.style import THESIS_PALETTE, apply_geo_style, get
 
 
 DEFAULT_RUN_DIR = Path("artifacts/simulation_runs/thesis_final_multi_2m_20260620T091938Z")
-DEFAULT_OUT_DIR = Path("results/regret_drivers")
+DEFAULT_OUT_DIR = Path("artifacts/benchmark/rq2_simulation_benchmark/regret_drivers")
 MODEL_DISPLAY = {"linear": "RLQR", "rlqr": "RLQR", "xgb": "XGB", "xgboost": "XGB", "tft": "TFT"}
 REASON_EMPTY = {"", "none", "nan", "null", "[]", "{}"}
 
@@ -63,6 +63,15 @@ ROLE_CANDIDATES: dict[str, list[str]] = {
     "thesis_reportable": ["thesis_reportable", "reportable", "is_reportable"],
     "invalid_reason": ["invalid_reason", "invalid_reasons", "validation_reason"],
 }
+
+ANNUALIZED_PROFIT_CANDIDATES = [
+    "annualized_realized_net_revenue_eur",
+    "annualized_realized_net_profit_eur",
+    "annualized_net_profit_eur",
+    "annualized_profit_eur",
+    "annualized_realized_total_pnl_eur",
+    "annualized_realized_net_revenue_eur_per_year",
+]
 
 COMPONENT_CANDIDATES: dict[str, list[str]] = {
     "DA_profit_eur": ["da_net_revenue_eur", "da_pnl_eur", "da_profit_eur", "DA revenue/profit"],
@@ -442,6 +451,121 @@ def calculate_regret_values(realized_profit: float, benchmark_profit: float, pla
         "relative_regret": relative,
         "model_vs_benchmark_pct": model_vs_benchmark,
     }
+
+
+def _annualization_factor(row: pd.Series, lookup: ColumnLookup, source: str) -> tuple[float, str | None]:
+    factor_col = discover_column(row.index, ["annualization_factor"], role="annualization_factor", source=source, lookup=lookup)
+    factor = _safe_float(_series_value(row, factor_col))
+    if math.isfinite(factor):
+        return factor, factor_col
+    days_col = discover_column(row.index, ["n_days", "duration_days", "simulation_days"], role="annualization_days", source=source, lookup=lookup)
+    days = _safe_float(_series_value(row, days_col))
+    if math.isfinite(days) and days > 0:
+        return 365.0 / days, days_col
+    hours_col = discover_column(row.index, ["n_hours", "duration_hours", "simulation_hours"], role="annualization_hours", source=source, lookup=lookup)
+    hours = _safe_float(_series_value(row, hours_col))
+    if math.isfinite(hours) and hours > 0:
+        return 365.0 * 24.0 / hours, hours_col
+    return math.nan, None
+
+
+def _annualized_profit_from_row(row: pd.Series, *, source: str, lookup: ColumnLookup, role_prefix: str) -> tuple[float, str | None]:
+    annualized_col = discover_column(
+        row.index,
+        ANNUALIZED_PROFIT_CANDIDATES,
+        role=f"{role_prefix}_annualized_profit",
+        source=source,
+        lookup=lookup,
+    )
+    if annualized_col is not None:
+        return _safe_float(_series_value(row, annualized_col)), annualized_col
+    realized_col = discover_column(
+        row.index,
+        ROLE_CANDIDATES["realized_profit"],
+        role=f"{role_prefix}_realized_profit_for_annualization",
+        source=source,
+        lookup=lookup,
+    )
+    realized = _safe_float(_series_value(row, realized_col))
+    factor, factor_col = _annualization_factor(row, lookup, source)
+    if math.isfinite(realized) and math.isfinite(factor):
+        return realized * factor, f"{realized_col}*annualization_factor({factor_col})"
+    return math.nan, None
+
+
+def _benchmark_annualized_profit_for(
+    scenario: Scenario,
+    benchmark_scenario: Scenario | None,
+    benchmark: str,
+    lookup: ColumnLookup,
+) -> tuple[float, str | None]:
+    row = _first_row(scenario.metrics)
+    source = str(scenario.scenario_dir / "performance_metrics.csv")
+    benchmark_specific = [
+        f"annualized_{benchmark.lower()}_profit_eur",
+        f"{benchmark.lower()}_annualized_profit_eur",
+        f"annualized_{benchmark.lower()}_net_revenue_eur",
+        f"{benchmark.lower()}_annualized_net_revenue_eur",
+        f"PnL {benchmark.upper()} annualized (€)",
+    ]
+    col = discover_column(row.index, benchmark_specific, role=f"{benchmark}_annualized_profit", source=source, lookup=lookup)
+    if col is not None:
+        return _safe_float(_series_value(row, col)), col
+    if benchmark_scenario is not None and not benchmark_scenario.metrics.empty:
+        bench_row = _first_row(benchmark_scenario.metrics)
+        bench_source = str(benchmark_scenario.scenario_dir / "performance_metrics.csv")
+        value, used = _annualized_profit_from_row(bench_row, source=bench_source, lookup=lookup, role_prefix=f"benchmark_{benchmark}")
+        if used is not None:
+            return value, f"benchmark_scenario:{benchmark_scenario.scenario_dir}:{used}"
+    return math.nan, None
+
+
+def build_annualized_regret_table(scenarios: list[Scenario], *, benchmark: str, lookup: ColumnLookup) -> pd.DataFrame:
+    benchmark_scenario = _benchmark_scenario(scenarios, benchmark)
+    columns = [
+        "Model",
+        "Quantile",
+        "Annualized net profit",
+        "RHPF annualized profit",
+        "Regret vs RHPF",
+        "Regret share",
+        "Model/RHPF (%)",
+        "model_annualized_column_used",
+        "benchmark_annualized_column_used",
+    ]
+    rows: list[dict[str, Any]] = []
+    for scenario in scenarios:
+        if scenario.is_benchmark:
+            continue
+        row = _first_row(scenario.metrics)
+        source = str(scenario.scenario_dir / "performance_metrics.csv")
+        annualized_model, model_col = _annualized_profit_from_row(row, source=source, lookup=lookup, role_prefix="model")
+        annualized_benchmark, benchmark_col = _benchmark_annualized_profit_for(scenario, benchmark_scenario, benchmark, lookup)
+        regret = annualized_benchmark - annualized_model if math.isfinite(annualized_model) and math.isfinite(annualized_benchmark) else math.nan
+        regret_share = regret / abs(annualized_benchmark) * 100.0 if math.isfinite(regret) and math.isfinite(annualized_benchmark) and annualized_benchmark != 0 else math.nan
+        model_vs_benchmark = annualized_model / annualized_benchmark * 100.0 if math.isfinite(annualized_model) and math.isfinite(annualized_benchmark) and annualized_benchmark != 0 else math.nan
+        rows.append(
+            {
+                "Model": scenario.model,
+                "Quantile": scenario.quantile,
+                "Annualized net profit": annualized_model,
+                "RHPF annualized profit": annualized_benchmark,
+                "Regret vs RHPF": regret,
+                "Regret share": regret_share,
+                "Model/RHPF (%)": model_vs_benchmark,
+                "model_annualized_column_used": model_col,
+                "benchmark_annualized_column_used": benchmark_col,
+            }
+        )
+    out = pd.DataFrame(rows, columns=columns)
+    if not out.empty:
+        model_order = {"RLQR": 0, "XGB": 1, "TFT": 2}
+        quantile_order = {"p10": 0, "p30": 1, "p50": 2, "p70": 3, "p90": 4}
+        out = out.assign(
+            _model_order=out["Model"].map(model_order).fillna(99),
+            _quantile_order=out["Quantile"].map(quantile_order).fillna(99),
+        ).sort_values(["_model_order", "_quantile_order", "Model", "Quantile"]).drop(columns=["_model_order", "_quantile_order"]).reset_index(drop=True)
+    return out
 
 
 def _benchmark_scenario(scenarios: list[Scenario], benchmark: str) -> Scenario | None:
@@ -1035,6 +1159,64 @@ def write_latex_table(df: pd.DataFrame, path: Path, *, caption: str, label: str,
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_annualized_regret_latex(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "Model",
+        "Quantile",
+        "Annualized net profit",
+        "RHPF annualized profit",
+        "Regret vs RHPF",
+        "Regret share",
+        "Model/RHPF (%)",
+    ]
+    view = df[columns].copy() if set(columns).issubset(df.columns) else pd.DataFrame(columns=columns)
+
+    def eur(value: Any) -> str:
+        x = _safe_float(value)
+        return "" if not math.isfinite(x) else f"{x:,.0f}"
+
+    def pct(value: Any) -> str:
+        x = _safe_float(value)
+        return "" if not math.isfinite(x) else f"{x:,.1f}\\%"
+
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\small",
+        r"\begin{tabular}{llrrrrr}",
+        r"\toprule",
+        r"Model & Quantile & Annualized net profit & RHPF annualized profit & Regret vs RHPF & Regret share & Model/RHPF (\%) \\",
+        r"\midrule",
+    ]
+    for _, row in view.iterrows():
+        lines.append(
+            " & ".join(
+                [
+                    _latex_escape(row["Model"]),
+                    _latex_escape(row["Quantile"]),
+                    eur(row["Annualized net profit"]),
+                    eur(row["RHPF annualized profit"]),
+                    eur(row["Regret vs RHPF"]),
+                    pct(row["Regret share"]),
+                    pct(row["Model/RHPF (%)"]),
+                ]
+            )
+            + r" \\"
+        )
+    lines.extend(
+        [
+            r"\bottomrule",
+            r"\end{tabular}",
+            r"\caption{Annualized net profit and regret relative to RHPF. Regret share reports the percentage of RHPF annualized profit not achieved by the model.}",
+            r"\label{tab:annualized_regret_vs_rhpf}",
+            r"\end{table}",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _write_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
@@ -1186,6 +1368,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
     print(f"[DISCOVERY] strategies={sorted({s.strategy for s in scenarios})}")
 
     bridge = build_regret_bridge(scenarios, benchmark=str(args.benchmark), lookup=lookup, strict=bool(args.strict))
+    annualized_regret = build_annualized_regret_table(scenarios, benchmark=str(args.benchmark), lookup=lookup)
     pnl = build_pnl_by_market(scenarios, lookup)
     planned = build_planned_vs_realized(scenarios, lookup)
     execution = build_bid_execution(scenarios, lookup)
@@ -1199,6 +1382,20 @@ def run_analysis(args: argparse.Namespace) -> Path:
     latex = out_root / "latex"
     figures = out_root / "figures"
     _write_csv(bridge, tables / "regret_bridge.csv")
+    _write_csv(
+        annualized_regret[
+            [
+                "Model",
+                "Quantile",
+                "Annualized net profit",
+                "RHPF annualized profit",
+                "Regret vs RHPF",
+                "Regret share",
+                "Model/RHPF (%)",
+            ]
+        ],
+        tables / "annualized_regret_vs_rhpf.csv",
+    )
     _write_csv(pnl, tables / "pnl_by_market.csv")
     _write_csv(planned, tables / "planned_vs_realized_by_component.csv")
     _write_csv(execution, tables / "bid_execution_diagnostics.csv")
@@ -1208,6 +1405,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
     _write_csv(daily, tables / "daily_regret.csv")
     _write_csv(top_events, tables / "top_regret_events.csv")
     write_latex_table(bridge, latex / "regret_bridge.tex", caption="Regret bridge by model and quantile.", label="tab:regret_bridge")
+    write_annualized_regret_latex(annualized_regret, latex / "annualized_regret_vs_rhpf.tex")
     write_latex_table(pnl, latex / "pnl_by_market.tex", caption="Realized PnL decomposition by market.", label="tab:pnl_by_market")
     write_latex_table(planned, latex / "planned_vs_realized_by_component.tex", caption="Planned versus realized component gaps.", label="tab:planned_vs_realized_by_component")
     write_latex_table(tail, latex / "tail_event_regret.tex", caption="Regret occurring during tail periods.", label="tab:tail_event_regret")

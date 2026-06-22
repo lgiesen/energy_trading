@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -32,3 +33,36 @@ def test_required_column_missing_raises_without_fallback() -> None:
             source="synthetic",
             required=True,
         )
+
+
+def test_annualized_regret_table_uses_rhpf_share_definition() -> None:
+    model = regret.Scenario(
+        folder="xgb_p50",
+        model_key="xgb",
+        model="XGB",
+        quantile="p50",
+        strategy="multi",
+        scenario_dir=Path("run") / "xgb_p50" / "multi" / "p50_p50",
+        is_benchmark=False,
+        metrics=pd.DataFrame({"annualized_realized_net_revenue_eur": [80.0]}),
+    )
+    rhpf = regret.Scenario(
+        folder="benchmarks_rhpf",
+        model_key="rhpf",
+        model="RHPF",
+        quantile="benchmark",
+        strategy="multi",
+        scenario_dir=Path("run") / "benchmarks_rhpf" / "multi" / "p50_p50",
+        is_benchmark=True,
+        benchmark_name="RHPF",
+        metrics=pd.DataFrame({"annualized_realized_net_revenue_eur": [100.0]}),
+    )
+    out = regret.build_annualized_regret_table([model, rhpf], benchmark="rhpf", lookup=regret.ColumnLookup())
+    row = out.iloc[0]
+    assert row["Model"] == "XGB"
+    assert row["Quantile"] == "p50"
+    assert row["Annualized net profit"] == 80.0
+    assert row["RHPF annualized profit"] == 100.0
+    assert row["Regret vs RHPF"] == 20.0
+    assert row["Regret share"] == 20.0
+    assert row["Model/RHPF (%)"] == 80.0
