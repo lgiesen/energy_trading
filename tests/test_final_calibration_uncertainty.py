@@ -302,7 +302,9 @@ def test_latex_and_figure_outputs_use_style(tmp_path: Path) -> None:
         in tex
     )
     assert "Mean MACE" in tex
-    assert "\\textbf{0." in tex
+    assert "\\textbf{" in tex and " pp" in tex
+    assert "\\%" not in tex
+    assert "0.8223" not in tex
     assert "Compact calibration summary" not in tex
     assert "MAE" not in tex
     assert "RMSE" not in tex

@@ -576,6 +576,29 @@ def _format_num_bold_if_best(v: Any, best: float, digits: int = 4, tol: float = 
     return formatted
 
 
+def _format_pp(v: Any, digits: int = 2) -> str:
+    try:
+        x = float(v)
+    except Exception:
+        return "-"
+    if not np.isfinite(x):
+        return "-"
+    return f"{x * 100.0:.{digits}f} pp"
+
+
+def _format_pp_bold_if_best(v: Any, best: float, digits: int = 2, tol: float = 1e-12) -> str:
+    formatted = _format_pp(v, digits=digits)
+    if formatted == "-":
+        return formatted
+    try:
+        x = float(v)
+    except Exception:
+        return formatted
+    if np.isfinite(x) and np.isfinite(float(best)) and abs(x - float(best)) <= float(tol):
+        return r"\textbf{" + formatted + "}"
+    return formatted
+
+
 def _main_issue_for_target(part: pd.DataFrame) -> str:
     crossing = pd.to_numeric(part.get("crossing_rate"), errors="coerce")
     if crossing.notna().any() and float(crossing.max()) > 1e-9:
@@ -642,11 +665,11 @@ def write_latex_summary(summary: pd.DataFrame, *, out_dir: Path, split: str) -> 
         best_mace = min(mace_values) if mace_values else float("nan")
         vals = [
             _latex_escape(row["target_label"]),
-            _format_num_bold_if_best(row.get("RLQR_MACE"), best_mace),
-            _format_num_bold_if_best(row.get("XGB_MACE"), best_mace),
-            _format_num_bold_if_best(row.get("TFT_MACE"), best_mace),
+            _format_pp_bold_if_best(row.get("RLQR_MACE"), best_mace),
+            _format_pp_bold_if_best(row.get("XGB_MACE"), best_mace),
+            _format_pp_bold_if_best(row.get("TFT_MACE"), best_mace),
             _latex_escape(row["best_calibrated"]),
-            _format_num(row.get("p10_p90_coverage")),
+            _format_pp(row.get("p10_p90_coverage")),
         ]
         lines.append("        " + " & ".join(vals) + r" \\")
     mean_mace_by_col: dict[str, float] = {}
@@ -668,9 +691,9 @@ def write_latex_summary(summary: pd.DataFrame, *, out_dir: Path, split: str) -> 
         + " & ".join(
             [
                 "Mean MACE",
-                _format_num_bold_if_best(mean_mace_by_col["RLQR_MACE"], best_mean_mace),
-                _format_num_bold_if_best(mean_mace_by_col["XGB_MACE"], best_mean_mace),
-                _format_num_bold_if_best(mean_mace_by_col["TFT_MACE"], best_mean_mace),
+                _format_pp_bold_if_best(mean_mace_by_col["RLQR_MACE"], best_mean_mace),
+                _format_pp_bold_if_best(mean_mace_by_col["XGB_MACE"], best_mean_mace),
+                _format_pp_bold_if_best(mean_mace_by_col["TFT_MACE"], best_mean_mace),
                 _latex_escape(best_mean_model),
                 "-",
             ]
