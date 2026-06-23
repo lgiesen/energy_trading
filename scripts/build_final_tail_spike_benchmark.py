@@ -977,7 +977,9 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     def _compact_target_label(value: Any) -> str:
         label = str(value)
         if label.startswith("aFRR "):
-            return label[len("aFRR ") :]
+            label = label[len("aFRR ") :]
+        if label:
+            label = label[0].upper() + label[1:]
         return label
 
     headers = ["Regime", "Target", "RLQR", "XGB", "TFT"]
@@ -995,7 +997,9 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
         target_label = str(row["target_label"])
         next_section = "aFRR" if target_label.startswith("aFRR ") else ""
         if next_section and next_section != section:
+            lines.append(r"        \midrule")
             lines.append(r"        \multicolumn{5}{@{}l}{\textit{aFRR}} \\")
+            lines.append(r"        \midrule")
             section = next_section
         lines.append(
             "        "

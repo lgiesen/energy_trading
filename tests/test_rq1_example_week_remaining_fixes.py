@@ -8,17 +8,21 @@ import pytest
 
 from scripts.build_rq1_example_weeks import (
     WEEK_TIMEZONE,
+    _latex_escape,
     _prepare_tail_spike_high_vol_source,
     validate_algorithmic_outputs,
     target_y_axis_label,
+    target_y_axis_unit_label,
 )
 
 
-def test_target_y_axis_labels_use_units_and_activation_rate_share() -> None:
+def test_target_y_axis_labels_use_units_and_activation_rate_percent() -> None:
     assert target_y_axis_label("target_da_price") == "DA price (EUR/MWh)"
-    assert target_y_axis_label("target_afrr_capacity_price_neg") == "aFRR capacity price - (EUR/MW)"
-    assert target_y_axis_label("target_afrr_activation_price_vwap_pos") == "aFRR activation price + (EUR/MWh)"
-    assert target_y_axis_label("target_afrr_activation_rate_neg") == "aFRR activation rate - (share)"
+    assert target_y_axis_label("target_afrr_capacity_price_neg") == "Capacity price - (EUR/MW)"
+    assert target_y_axis_label("target_afrr_activation_price_vwap_pos") == "Activation price + (EUR/MWh)"
+    assert target_y_axis_label("target_afrr_activation_rate_neg") == "Activation rate - (%)"
+    assert target_y_axis_unit_label("target_afrr_activation_rate_neg") == "Activation rate - (%)"
+    assert _latex_escape(target_y_axis_unit_label("target_afrr_activation_rate_neg")) == r"Activation rate - (\%)"
 
 
 def test_tail_spike_source_missing_rank_is_ranked_by_volatility_score(tmp_path: Path) -> None:

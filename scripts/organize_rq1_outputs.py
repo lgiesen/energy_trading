@@ -1526,7 +1526,7 @@ def _write_tail_spike_relative_tex(
             rf"                ymax={len(rows) - 1},",
             rf"                ytick={{{y_tick_values}}},",
             rf"                yticklabels={{{y_tick_labels}}},",
-            rf"                yticklabel style={{font=\{'small' if use_all_target_compact_layout else 'scriptsize'}, align=right}},",
+            rf"                yticklabel style={{font=\{'small' if use_all_target_compact_layout else 'scriptsize'}, align=right{', xshift=0.18cm' if use_all_target_compact_layout else ''}}},",
             rf"                enlarge y limits={{abs={'0.45' if compact_target_sections else '0.28'}}},",
             r"                y dir=reverse,",
             r"            ]",
@@ -1554,8 +1554,8 @@ def _write_tail_spike_relative_tex(
             )
         if compact_target_sections:
             use_compact_target_labels = use_all_target_compact_layout
-            target_label_xshift = "-4.55cm"
-            brace_xshift = "-4.02cm" if use_compact_target_labels else "-1.05cm"
+            target_label_xshift = "-5.05cm" if use_compact_target_labels else "-4.55cm"
+            brace_xshift = "-4.52cm" if use_compact_target_labels else "-1.05cm"
             target_label_font = r"\small" if use_compact_target_labels else r"\scriptsize"
             for start_idx, end_idx, target_label in section_ranges:
                 y_min = start_idx - 0.38
@@ -1622,8 +1622,8 @@ def _write_tail_spike_relative_tex(
     all_targets = _write_native_relative_file(
         path.name,
         target_key="all_targets",
-        figure_caption="Tail and spike performance across all target variables. Bars show mean pinball loss relative to RLQR for each target-specific regime. Target sections are separated by dashed grey horizontal lines; values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
-        short_caption="Tail and spike performance across all target variables",
+        figure_caption="Tail and spike performance across forecast targets. Bars show mean pinball loss relative to RLQR; values below 1 indicate lower loss.",
+        short_caption="Tail and spike performance across forecast targets",
         figure_label="fig:tail_spike_relative_pinball_all_targets",
         compact_target_sections=True,
     )
@@ -1632,8 +1632,8 @@ def _write_tail_spike_relative_tex(
     all_targets_copy = _write_native_relative_file(
         "tail_spike_relative_pinball_by_regime_all_targets.tex",
         target_key="all_targets",
-        figure_caption="Tail and spike performance across all target variables. Bars show mean pinball loss relative to RLQR for each target-specific regime. Target sections are separated by dashed grey horizontal lines; values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
-        short_caption="Tail and spike performance across all target variables",
+        figure_caption="Tail and spike performance across forecast targets. Bars show mean pinball loss relative to RLQR; values below 1 indicate lower loss.",
+        short_caption="Tail and spike performance across forecast targets",
         figure_label="fig:tail_spike_relative_pinball_all_targets",
         compact_target_sections=True,
     )

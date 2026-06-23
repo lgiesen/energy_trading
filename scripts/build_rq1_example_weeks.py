@@ -108,12 +108,12 @@ MARKET_ACTIONABLE_LABEL_SLUGS = {
 
 TARGET_Y_AXIS_LABELS = {
     "target_da_price": "DA price (EUR/MWh)",
-    "target_afrr_capacity_price_pos": "aFRR capacity price + (EUR/MW)",
-    "target_afrr_capacity_price_neg": "aFRR capacity price - (EUR/MW)",
-    "target_afrr_activation_price_vwap_pos": "aFRR activation price + (EUR/MWh)",
-    "target_afrr_activation_price_vwap_neg": "aFRR activation price - (EUR/MWh)",
-    "target_afrr_activation_rate_pos": "aFRR activation rate + (share)",
-    "target_afrr_activation_rate_neg": "aFRR activation rate - (share)",
+    "target_afrr_capacity_price_pos": "Capacity price + (EUR/MW)",
+    "target_afrr_capacity_price_neg": "Capacity price - (EUR/MW)",
+    "target_afrr_activation_price_vwap_pos": "Activation price + (EUR/MWh)",
+    "target_afrr_activation_price_vwap_neg": "Activation price - (EUR/MWh)",
+    "target_afrr_activation_rate_pos": "Activation rate + (%)",
+    "target_afrr_activation_rate_neg": "Activation rate - (%)",
 }
 
 MARKET_ACTIONABLE_SPECS = [
@@ -379,13 +379,26 @@ def target_y_axis_label(target: str, target_display: str | None = None) -> str:
 
 def target_y_axis_unit_label(target: str) -> str:
     canonical_target = _canonical_target(str(target))
-    if "activation_rate" in canonical_target:
-        return "Share"
-    if "capacity_price" in canonical_target:
-        return "EUR/MW"
-    if "price" in canonical_target:
-        return "EUR/MWh"
     return target_y_axis_label(canonical_target)
+
+
+def _is_activation_rate_target(target: str) -> bool:
+    return "activation_rate" in _canonical_target(str(target))
+
+
+def _plot_y_scale(target: str) -> float:
+    return 100.0 if _is_activation_rate_target(target) else 1.0
+
+
+def _scale_plot_frame_for_target(frame: pd.DataFrame, *, target: str, columns: list[str]) -> pd.DataFrame:
+    scale = _plot_y_scale(target)
+    if abs(scale - 1.0) <= 1e-12:
+        return frame
+    out = frame.copy()
+    for col in columns:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce") * scale
+    return out
 
 
 def _window_slice(df: pd.DataFrame, start_utc: pd.Timestamp, window_hours: int) -> pd.DataFrame:
@@ -908,6 +921,7 @@ def _plot_market_actionable(
     d = truth.join(pivot, how="inner").reset_index()
     d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE)
     d["plot_idx"] = np.arange(len(d), dtype=int)
+    d = _scale_plot_frame_for_target(d, target=canonical_target, columns=["y_true", *[model.key for model in models]])
     target_display = _market_target_label(canonical_target)
     figure_title = _market_actionable_title(spec, _market_actionable_target_title(canonical_target))
     figure_subtitle = _market_actionable_subtitle(week, spec, canonical_target)
@@ -936,8 +950,8 @@ def _plot_market_actionable(
         mae = float(np.mean(np.abs(pd.to_numeric(d[model.key], errors="coerce") - pd.to_numeric(d["y_true"], errors="coerce"))))
         ax.plot(d["plot_idx"], d[model.key], label=f"{model.label} p50 (MAE={mae:.3f})", color=get_model_color(model.key), linewidth=1.8)
         row[f"mae_{model.key}"] = mae
-    fig.suptitle(figure_title, y=0.98)
-    ax.set_title(figure_subtitle, fontsize=10, pad=8)
+    fig.suptitle(figure_title, y=0.965)
+    ax.set_title(figure_subtitle, fontsize=10, pad=3)
     ax.set_xlabel("Time")
     ax.set_ylabel(y_axis_label)
     ax.set_xlim(0, max(len(d) - 1, 1))
@@ -949,8 +963,8 @@ def _plot_market_actionable(
     ax.set_xticklabels(tick_labels)
     ax.tick_params(axis="x", rotation=0)
     handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.885))
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.80))
+    fig.legend(handles, labels, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.90))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.84))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -985,6 +999,7 @@ def _write_market_actionable_latex(
     d = _market_actionable_frame(selected)
     if d.empty:
         raise ValueError(f"Empty market-actionable LaTeX data for {week.key}/{spec['market_context']}/{canonical_target}.")
+    d = _scale_plot_frame_for_target(d, target=canonical_target, columns=["y_true", *[model.key for model in models]])
     date_range = _week_date_range_label(d)
     xticks, xticklabels = _latex_week_ticks(d, week)
     xmin, xmax = _plot_index_xlim(d)
@@ -1010,10 +1025,10 @@ def _write_market_actionable_latex(
         r"                width=0.98\textwidth,",
         r"                height=7cm,",
         rf"                title={{{_latex_escape(_market_actionable_title(spec, _market_actionable_target_title(canonical_target)))}}},",
-        r"                title style={at={(0.5,1.30)}, anchor=south},",
+        r"                title style={at={(0.5,1.16)}, anchor=south},",
         r"                xlabel={Time},",
         rf"                ylabel={{{_latex_escape(target_y_axis_unit_label(canonical_target))}}},",
-        r"                legend style={at={(0.5,1.12)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend style={at={(0.5,1.06)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
         r"                axis lines*=left,",
         r"                grid=major,",
@@ -1513,12 +1528,13 @@ def _target_scale_key(target: str) -> str:
     return target
 
 
-def _plot_value_array(view: pd.DataFrame, models: list[ModelSpec]) -> np.ndarray:
-    values: list[np.ndarray] = [pd.to_numeric(view["y_true"], errors="coerce").to_numpy(dtype=float)]
+def _plot_value_array(view: pd.DataFrame, models: list[ModelSpec], *, target: str) -> np.ndarray:
+    d = _scale_plot_frame_for_target(view, target=target, columns=["y_true", *[f"{model.key}_pred" for model in models]])
+    values: list[np.ndarray] = [pd.to_numeric(d["y_true"], errors="coerce").to_numpy(dtype=float)]
     for model in models:
         col = f"{model.key}_pred"
-        if col in view.columns:
-            values.append(pd.to_numeric(view[col], errors="coerce").to_numpy(dtype=float))
+        if col in d.columns:
+            values.append(pd.to_numeric(d[col], errors="coerce").to_numpy(dtype=float))
     if not values:
         return np.array([], dtype=float)
     arr = np.concatenate(values)
@@ -1557,7 +1573,7 @@ def _compute_shared_y_limits(
             view = views.get((target, week.key))
             if view is None or view.empty:
                 continue
-            by_scale.setdefault((week.key, scale_key), []).append(_plot_value_array(view, models))
+            by_scale.setdefault((week.key, scale_key), []).append(_plot_value_array(view, models, target=target))
 
     limits: dict[tuple[str, str], tuple[float, float]] = {}
     for key, arrays in by_scale.items():
@@ -1684,6 +1700,7 @@ def write_example_week_latex(
 ) -> Path:
     d = view.copy()
     d["plot_idx"] = np.arange(len(d), dtype=int)
+    d = _scale_plot_frame_for_target(d, target=target, columns=["y_true", *[f"{model.key}_pred" for model in models]])
     xticks, xticklabels = _latex_week_ticks(d, week)
     xmin, xmax = _plot_index_xlim(d)
     date_range = _week_date_range_label(d)
@@ -1705,10 +1722,10 @@ def write_example_week_latex(
         r"                width=0.98\textwidth,",
         r"                height=7cm,",
         rf"                title={{{_latex_escape(f'{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}')}}},",
-        r"                title style={at={(0.5,1.30)}, anchor=south},",
+        r"                title style={at={(0.5,1.16)}, anchor=south},",
         r"                xlabel={Time},",
         rf"                ylabel={{{_latex_escape(y_axis_label)}}},",
-        r"                legend style={at={(0.5,1.12)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend style={at={(0.5,1.06)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
         r"                axis lines*=left,",
         r"                grid=major,",
@@ -1773,6 +1790,7 @@ def plot_example_week(
     d = view.copy()
     d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
     d["plot_idx"] = np.arange(len(d), dtype=int)
+    d = _scale_plot_frame_for_target(d, target=target, columns=["y_true", *[f"{model.key}_pred" for model in models]])
     y_axis_label = target_y_axis_label(target, target_label)
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(14, 4.8))
@@ -1803,7 +1821,7 @@ def plot_example_week(
             linewidth=1.8,
         )
     title = thesis_titlecase(f"{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}")
-    fig.suptitle(title, y=0.98)
+    fig.suptitle(title, y=0.965)
     ax.set_xlabel("Time")
     ax.set_ylabel(y_axis_label)
     if ylim is not None:
@@ -1817,8 +1835,8 @@ def plot_example_week(
     ax.set_xticklabels(tick_labels)
     ax.tick_params(axis="x", rotation=0)
     handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.91))
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.84))
+    fig.legend(handles, labels, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.90))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.87))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
