@@ -1010,7 +1010,7 @@ def _plot_market_actionable(
     ax.set_xlim(*_plot_index_xlim(d))
     ax.margins(x=0)
     xticks, xticklabels = _latex_week_ticks(d, week)
-    tick_positions = [int(x) for x in xticks.split(",") if x] if xticks else []
+    tick_positions = [float(x) for x in xticks.split(",") if x] if xticks else []
     tick_labels = xticklabels.split(",") if xticklabels else []
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)
@@ -1095,7 +1095,7 @@ def _write_market_actionable_latex(
             [
                 rf"                xtick={{{xticks}}},",
                 rf"                xticklabels={{{xticklabels}}},",
-                r"                xticklabel style={align=center, rotate=0},",
+                _latex_week_ticklabel_style(),
             ]
         )
     if ylim is not None:
@@ -1699,7 +1699,7 @@ def _plot_index_xlim(frame: pd.DataFrame) -> tuple[float, float]:
     if frame.empty:
         return 0.0, 1.0
     xmax = max(float(len(frame) - 1), 1.0)
-    pad = max(1.0, min(2.0, xmax * 0.012))
+    pad = max(3.0, min(6.0, xmax * 0.025))
     return -pad, xmax + pad
 
 
@@ -1741,11 +1741,16 @@ def _latex_week_ticks(view: pd.DataFrame, week: WeekSpec) -> tuple[str, str]:
     if d.empty:
         return "", ""
     d["local_date"] = d["local_time"].dt.normalize()
-    first_per_date = d.groupby("local_date", sort=True)["plot_idx"].min().reset_index()
-    first_per_date = first_per_date.head(7)
-    xticks = [str(int(idx)) for idx in first_per_date["plot_idx"]]
-    labels = [_latex_escape(_format_week_date_label(ts)) for ts in first_per_date["local_date"]]
+    day_ranges = d.groupby("local_date", sort=True)["plot_idx"].agg(["min", "max"]).reset_index()
+    day_ranges = day_ranges.head(7)
+    day_ranges["midpoint"] = (pd.to_numeric(day_ranges["min"], errors="coerce") + pd.to_numeric(day_ranges["max"], errors="coerce")) / 2.0
+    xticks = [_tex_num(idx) for idx in day_ranges["midpoint"]]
+    labels = [_latex_escape(_format_week_date_label(ts)) for ts in day_ranges["local_date"]]
     return ",".join(xticks), ",".join(labels)
+
+
+def _latex_week_ticklabel_style() -> str:
+    return r"                xticklabel style={align=center, rotate=0, font=\small, yshift=-0.6ex},"
 
 
 def _model_color_name(model_key: str) -> str:
@@ -1803,7 +1808,7 @@ def write_example_week_latex(
     ]
     if xticks and xticklabels:
         insert_at = lines.index(r"                grid=major,") + 1
-        lines.insert(insert_at, r"                xticklabel style={align=center, rotate=0},")
+        lines.insert(insert_at, _latex_week_ticklabel_style())
         lines.insert(insert_at, rf"                xticklabels={{{xticklabels}}},")
         lines.insert(insert_at, rf"                xtick={{{xticks}}},")
     if ylim is not None:
@@ -1895,7 +1900,7 @@ def plot_example_week(
     ax.set_xlim(*_plot_index_xlim(d))
     ax.margins(x=0)
     xticks, xticklabels = _latex_week_ticks(d, week)
-    tick_positions = [int(x) for x in xticks.split(",") if x] if xticks else []
+    tick_positions = [float(x) for x in xticks.split(",") if x] if xticks else []
     tick_labels = xticklabels.split(",") if xticklabels else []
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)

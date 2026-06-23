@@ -169,9 +169,9 @@ MAIN_ACTIVATION_TARGETS = [
 ]
 
 AFRR_MAIN_REGIME_LABELS = {
-    "baseline": "Baseline",
-    "stress_week": "Stress week",
-    "high_tail_top5": "High-tail top 5%",
+    "baseline": "Non-stress regime",
+    "stress_week": "Stress regime",
+    "high_tail_top5": "High tail 5%",
 }
 AFRR_MAIN_REGIME_ORDER = {regime: i for i, regime in enumerate(["baseline", "stress_week", "high_tail_top5"])}
 
@@ -659,10 +659,22 @@ def _metrics(df: pd.DataFrame, qcols: dict[float, str]) -> dict[str, Any]:
 
 def _afrr_main_high_tail_mask(target: str, y: pd.Series, threshold: float, *, epsilon: float) -> pd.Series:
     target = canonical_target(target)
-    mask = pd.to_numeric(y, errors="coerce").ge(float(threshold))
+    values = pd.to_numeric(y, errors="coerce")
+    if target in ACTIVATION_PRICE_TARGETS:
+        mask = values.abs().ge(float(threshold))
+    else:
+        mask = values.ge(float(threshold))
     if target in ACTIVATION_RATE_TARGETS:
-        mask &= pd.to_numeric(y, errors="coerce").gt(float(epsilon))
+        mask &= values.gt(float(epsilon))
     return mask.fillna(False)
+
+
+def _afrr_three_regime_high_tail_threshold(target: str, y: pd.Series) -> tuple[float, str]:
+    target = canonical_target(target)
+    values = pd.to_numeric(y, errors="coerce")
+    if target in ACTIVATION_PRICE_TARGETS:
+        return _threshold(values.abs(), 0.95), "absolute_high_tail_5pct"
+    return _threshold(values, 0.95), "q95_high_tail_5pct"
 
 
 def _stress_week_rows_for_target(
@@ -677,13 +689,14 @@ def _stress_week_rows_for_target(
         selected = selected_weeks.loc[
             selected_weeks["split"].eq(split)
             & selected_weeks["target"].eq(target)
-            & selected_weeks["selection_type"].eq("high_volatility_week")
+            & selected_weeks["selection_type"].isin(["high_volatility_week", "spike_week"])
         ].copy()
         if not selected.empty:
-            selected["source_selection_type"] = "high_volatility_week"
+            selected["source_selection_type"] = selected["selection_type"].astype(str)
             selected["selection_type"] = "stress_week"
             selected["selection_scope"] = "target"
-            selected["selection_rule"] = "Target-specific high-volatility week selected by weekly std(y_true)."
+            selected["selection_rule"] = "Target-specific union of high-volatility and spike-event weeks."
+            selected = selected.sort_values("week_start_utc").drop_duplicates("week_start_utc", keep="first")
             return selected
     computed = select_high_volatility_weeks(base_target.assign(split=split, target=target))
     if computed.empty:
@@ -691,7 +704,7 @@ def _stress_week_rows_for_target(
     computed["source_selection_type"] = "computed_high_volatility_week"
     computed["selection_type"] = "stress_week"
     computed["selection_scope"] = "target"
-    computed["selection_rule"] = "Target-specific high-volatility week selected by weekly std(y_true)."
+    computed["selection_rule"] = "Target-specific high-volatility week selected by weekly std(y_true); spike-week metadata unavailable."
     return computed
 
 
@@ -745,8 +758,9 @@ def build_afrr_main_regime_outputs(
             base_target["split"] = split
             base_target["target"] = target
             y = pd.to_numeric(base_target["y_true"], errors="coerce")
-            q95 = _threshold(y, 0.95)
-            if target in ACTIVATION_RATE_TARGETS and np.isfinite(q95) and q95 <= float(epsilon):
+            high_tail_threshold, high_tail_rule = _afrr_three_regime_high_tail_threshold(target, y)
+            stress_rule = "stress_week = high_volatility_week OR spike_week; stress rows exclude high-tail rows."
+            if target in ACTIVATION_RATE_TARGETS and np.isfinite(high_tail_threshold) and high_tail_threshold <= float(epsilon):
                 warnings.append(
                     {
                         "split": split,
@@ -766,10 +780,11 @@ def build_afrr_main_regime_outputs(
                     "regime_label": AFRR_MAIN_REGIME_LABELS["high_tail_top5"],
                     "definition_type": "threshold",
                     "threshold_name": "q95",
-                    "threshold_value": q95,
+                    "threshold_value": high_tail_threshold,
+                    "high_tail_rule": high_tail_rule,
                     "epsilon": float(epsilon) if target in ACTIVATION_RATE_TARGETS else np.nan,
                     "selection_scope": "target",
-                    "selection_rule": "Target-specific upper 5% realizations based on q95(y_true).",
+                    "selection_rule": "Target-specific high-tail observations; activation price uses abs(y_true), other aFRR targets use y_true.",
                 }
             )
             definition_rows.append(
@@ -783,12 +798,15 @@ def build_afrr_main_regime_outputs(
                     "definition_type": "complement",
                     "threshold_name": "",
                     "threshold_value": np.nan,
+                    "high_tail_rule": high_tail_rule,
                     "epsilon": float(epsilon) if target in ACTIVATION_RATE_TARGETS else np.nan,
                     "selection_scope": "target",
                     "selection_rule": "Complement of stress-week and high-tail observations after high-tail priority assignment.",
                 }
             )
             stress_weeks = _stress_week_rows_for_target(base_target, split=split, target=target, selected_weeks=selected_weeks)
+            if stress_weeks.empty:
+                warnings.append({"split": split, "target": target, "regime": "stress_week", "severity": "warning", "message": "Missing stress-week metadata for aFRR three-regime figure; falling back to empty stress-week mask."})
             if not stress_weeks.empty:
                 for _, row in stress_weeks.iterrows():
                     definition_rows.append(
@@ -806,10 +824,10 @@ def build_afrr_main_regime_outputs(
                             "volatility_score": row.get("volatility_score", np.nan),
                             "n_rows": row.get("n_rows", np.nan),
                             "selection_scope": "target",
-                            "selection_rule": "Target-specific high-volatility week selected by weekly std(y_true).",
+                            "selection_rule": "Target-specific union of high-volatility and spike-event weeks.",
                         }
                     )
-            high_tail = _afrr_main_high_tail_mask(target, y, q95, epsilon=epsilon)
+            high_tail = _afrr_main_high_tail_mask(target, y, high_tail_threshold, epsilon=epsilon)
             week = _week_start_utc(base_target["target_time_utc"])
             stress_week_values = (
                 pd.to_datetime(stress_weeks["week_start_utc"], utc=True)
@@ -876,9 +894,14 @@ def build_afrr_main_regime_outputs(
                             "main_regime": main_regime,
                             "regime": main_regime,
                             "regime_label": AFRR_MAIN_REGIME_LABELS[main_regime],
+                            "regime_display": AFRR_MAIN_REGIME_LABELS[main_regime],
+                            "regime_internal": main_regime,
                             "quantiles_used": quantiles_used,
-                            "threshold_value": q95 if main_regime == "high_tail_top5" else np.nan,
+                            "threshold_value": high_tail_threshold if main_regime == "high_tail_top5" else np.nan,
                             "threshold_name": "q95" if main_regime == "high_tail_top5" else "",
+                            "high_tail_rule": high_tail_rule,
+                            "stress_rule": stress_rule,
+                            "mutually_exclusive_assignment": True,
                             "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
                             "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
                             **_metrics(eval_df, common_qcols[model.key]),
@@ -910,6 +933,11 @@ def build_afrr_main_regime_outputs(
                     points["main_regime"] = main_regime
                     points["regime"] = main_regime
                     points["regime_label"] = AFRR_MAIN_REGIME_LABELS[main_regime]
+                    points["regime_display"] = AFRR_MAIN_REGIME_LABELS[main_regime]
+                    points["regime_internal"] = main_regime
+                    points["high_tail_rule"] = high_tail_rule
+                    points["stress_rule"] = stress_rule
+                    points["mutually_exclusive_assignment"] = True
                     point_rows.append(points)
     metrics = sort_target_frame(pd.DataFrame(metric_rows), target_col="target", extra_cols=["main_regime", "model_label"])
     metrics = _add_relative_vs_rlqr(metrics, warnings, split=",".join(splits)) if not metrics.empty else metrics
@@ -1415,6 +1443,62 @@ def relative_pinball_plot_source(metrics: pd.DataFrame, *, split: str) -> pd.Dat
     return out[[c for c in cols if c in out.columns]]
 
 
+def afrr_three_regime_plot_source(metrics: pd.DataFrame, *, split: str, warnings: list[dict[str, Any]] | None = None) -> pd.DataFrame:
+    if metrics.empty or "split" not in metrics.columns:
+        return pd.DataFrame()
+    d = metrics.loc[metrics["split"].eq(split)].copy()
+    required = {
+        "target",
+        "target_display",
+        "target_group",
+        "model",
+        "model_label",
+        "regime_display",
+        "regime_internal",
+        "mean_pinball_loss",
+        "n_obs",
+        "relative_pinball_loss_vs_rlqr",
+        "rlqr_mean_pinball_loss",
+        "high_tail_rule",
+        "stress_rule",
+        "mutually_exclusive_assignment",
+    }
+    if d.empty or not required.issubset(d.columns):
+        return pd.DataFrame()
+    allowed = {"Non-stress regime", "Stress regime", "High tail 5%"}
+    out = d.loc[d["model_label"].isin(["XGB", "TFT"])].copy()
+    bad_labels = set(out["regime_display"].dropna().astype(str)) - allowed
+    if bad_labels and warnings is not None:
+        warnings.append({"split": split, "target": "", "regime": "afrr_three_regime", "severity": "warning", "message": f"Unexpected aFRR three-regime labels excluded: {sorted(bad_labels)}"})
+    out = out.loc[out["regime_display"].isin(allowed)].copy()
+    if out.empty:
+        return out
+    target_count = out["target"].nunique()
+    if target_count < len(AFRR_TARGETS) and warnings is not None:
+        missing = sorted(AFRR_TARGETS - set(out["target"].dropna().astype(str)), key=target_sort_key)
+        warnings.append({"split": split, "target": "", "regime": "afrr_three_regime", "severity": "warning", "message": f"aFRR targets missing from three-regime plot source: {missing}"})
+    cols = [
+        "split",
+        "target",
+        "target_display",
+        "target_group",
+        "model",
+        "model_label",
+        "regime_display",
+        "regime_internal",
+        "mean_pinball_loss",
+        "rlqr_mean_pinball_loss",
+        "relative_pinball_loss",
+        "n_obs",
+        "high_tail_rule",
+        "stress_rule",
+        "mutually_exclusive_assignment",
+    ]
+    out["relative_pinball_loss"] = out["relative_pinball_loss_vs_rlqr"]
+    out = sort_target_frame(out, target_col="target", extra_cols=["regime_internal", "model_label"])
+    return out[[c for c in cols if c in out.columns]].copy()
+
+
 def residual_distribution_source(points: pd.DataFrame, *, split: str) -> pd.DataFrame:
     if points.empty:
         return pd.DataFrame()
@@ -1579,14 +1663,14 @@ def _plot_relative_pinball_main(metrics: pd.DataFrame, *, out_dir: Path, split: 
     return paths
 
 
-def _plot_afrr_main_regime_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> list[Path]:
+def _plot_afrr_main_regime_relative_pinball(source: pd.DataFrame, *, out_dir: Path, split: str) -> list[Path]:
     import matplotlib.pyplot as plt
 
-    d = metrics.loc[metrics["split"].eq(split)].copy() if not metrics.empty and "split" in metrics.columns else pd.DataFrame()
-    if d.empty or "relative_pinball_loss_vs_rlqr" not in d.columns:
+    d = source.loc[source["split"].eq(split)].copy() if not source.empty and "split" in source.columns else pd.DataFrame()
+    if d.empty or "relative_pinball_loss" not in d.columns:
         return []
     d = d.loc[d["model_label"].isin(["XGB", "TFT"])].copy()
-    d = d.dropna(subset=["relative_pinball_loss_vs_rlqr"])
+    d = d.dropna(subset=["relative_pinball_loss"])
     if d.empty:
         return []
     apply_geo_style()
@@ -1605,8 +1689,8 @@ def _plot_afrr_main_regime_relative_pinball(metrics: pd.DataFrame, *, out_dir: P
     fig, axes = plt.subplots(len(target_labels), 1, figsize=(11.4, fig_height), sharex=True)
     axes_flat = [axes] if len(target_labels) == 1 else list(axes)
     for ax, target_label in zip(axes_flat, target_labels):
-        p = d.loc[d["target_label"].eq(target_label)].copy()
-        regimes = [regime for regime in AFRR_MAIN_REGIME_ORDER if regime in set(p["main_regime"])]
+        p = d.loc[d["target_display"].eq(target_label)].copy()
+        regimes = [regime for regime in AFRR_MAIN_REGIME_ORDER if regime in set(p["regime_internal"])]
         y = np.arange(len(regimes), dtype=float)
         height = 0.42
         center_sep = height * 0.55
@@ -1616,8 +1700,8 @@ def _plot_afrr_main_regime_relative_pinball(metrics: pd.DataFrame, *, out_dir: P
             if mg.empty:
                 continue
             vals = [
-                float(mg.loc[mg["main_regime"].eq(regime), "relative_pinball_loss_vs_rlqr"].mean())
-                if mg["main_regime"].eq(regime).any()
+                float(mg.loc[mg["regime_internal"].eq(regime), "relative_pinball_loss"].mean())
+                if mg["regime_internal"].eq(regime).any()
                 else np.nan
                 for regime in regimes
             ]
@@ -1637,33 +1721,53 @@ def _plot_afrr_main_regime_relative_pinball(metrics: pd.DataFrame, *, out_dir: P
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    for suffix in ["png", "pdf"]:
-        path = fig_dir / f"tail_spike_afrr_main_regime_relative_pinball.{suffix}"
-        fig.savefig(path)
-        paths.append(path)
+    for stem in ["tail_spike_afrr_main_regime_relative_pinball", "tail_spike_relative_pinball_by_regime_all_targets_da_aggregated"]:
+        for suffix in ["png", "pdf"]:
+            path = fig_dir / f"{stem}.{suffix}"
+            fig.savefig(path)
+            paths.append(path)
     plt.close(fig)
     return paths
 
 
-def write_afrr_main_regime_latex_figure(*, out_dir: Path) -> Path:
+def write_afrr_main_regime_latex_figure(*, out_dir: Path) -> list[Path]:
     tex_dir = out_dir / "latex_figures"
     tex_dir.mkdir(parents=True, exist_ok=True)
-    path = tex_dir / "tail_spike_afrr_main_regime_relative_pinball.tex"
-    image_path = (
-        "figures/4-results/rq1_ml_model_benchmark/4_1_5_tail_spike/result_section/"
-        "figures/tail_spike_afrr_main_regime_relative_pinball.png"
+    caption = (
+        r"Relative mean pinball loss across non-stress, stress and high-tail regimes for aFRR targets. "
+        r"Values are normalized to the RLQR baseline, where values below one indicate lower loss than RLQR. "
+        r"Regimes are mutually exclusive: high-tail observations are assigned to the high-tail regime, "
+        r"stress-regime observations exclude high-tail observations, and non-stress observations exclude both stress and high-tail observations."
     )
-    lines = [
-        r"\begin{figure}[htbp]",
-        r"    \centering",
-        rf"    \includegraphics[width=\linewidth]{{{image_path}}}",
-        r"    \caption[aFRR forecast robustness by regime]{Relative mean pinball loss for aFRR forecasts across mutually exclusive baseline, stress-week, and high-tail regimes. Stress weeks are target-specific weeks with the largest weekly standard deviation of realized values, while high-tail observations are target-specific q95 realizations. Bars compare XGB and TFT against the RLQR baseline at one; values below one indicate lower loss than RLQR.}",
-        r"    \label{fig:tail_spike_afrr_main_regime_relative_pinball}",
-        r"\end{figure}",
-        "",
+    specs = [
+        (
+            "tail_spike_afrr_main_regime_relative_pinball",
+            "fig:tail_spike_afrr_main_regime_relative_pinball",
+        ),
+        (
+            "tail_spike_relative_pinball_by_regime_all_targets_da_aggregated",
+            "fig:tail_spike_relative_pinball_all_targets_da_aggregated",
+        ),
     ]
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
+    paths: list[Path] = []
+    for stem, label in specs:
+        image_path = (
+            "figures/4-results/rq1_ml_model_benchmark/4_1_5_tail_spike/result_section/"
+            f"figures/{stem}.png"
+        )
+        lines = [
+            r"\begin{figure}[htbp]",
+            r"    \centering",
+            rf"    \includegraphics[width=\linewidth]{{{image_path}}}",
+            rf"    \caption{{{caption}}}",
+            rf"    \label{{{label}}}",
+            r"\end{figure}",
+            "",
+        ]
+        path = tex_dir / f"{stem}.tex"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        paths.append(path)
+    return paths
 
 
 def _plot_hexbin(metrics_source: pd.DataFrame, *, out_dir: Path) -> Path | None:
@@ -2019,6 +2123,9 @@ def write_outputs(
     points = outputs.get("points", pd.DataFrame())
     points_split = points.loc[points["split"].eq(split)].copy() if not points.empty and "split" in points.columns else pd.DataFrame()
     rel_source = relative_pinball_plot_source(outputs["metrics"], split=split)
+    warning_records: list[dict[str, Any]] = []
+    afrr_three_regime_source = afrr_three_regime_plot_source(outputs.get("afrr_main_regime_metrics", pd.DataFrame()), split=split, warnings=warning_records)
+    afrr_three_regime_warnings = pd.DataFrame(warning_records, columns=["split", "target", "regime", "severity", "message"])
     rel_price_capacity = rel_source.loc[rel_source["target_display"].isin(MAIN_PRICE_CAPACITY_TARGETS)].copy() if not rel_source.empty else pd.DataFrame()
     rel_activation = rel_source.loc[rel_source["target_display"].isin(MAIN_ACTIVATION_TARGETS)].copy() if not rel_source.empty else pd.DataFrame()
     residual_source = residual_distribution_source(points, split=split)
@@ -2056,6 +2163,8 @@ def write_outputs(
         ("tail_spike_afrr_main_regime_points.csv", outputs.get("afrr_main_regime_points", pd.DataFrame())),
         ("tail_spike_afrr_main_regime_definitions.csv", outputs.get("afrr_main_regime_definitions", pd.DataFrame())),
         ("tail_spike_afrr_main_regime_overlap.csv", outputs.get("afrr_main_regime_overlap", pd.DataFrame())),
+        ("tail_spike_afrr_three_regime_plot_source.csv", afrr_three_regime_source),
+        ("tail_spike_afrr_three_regime_warnings.csv", afrr_three_regime_warnings),
     ]
     for name, df in csvs:
         path = out_dir / name
@@ -2069,7 +2178,7 @@ def write_outputs(
     plot_warnings: list[dict[str, Any]] = []
     plot_results = [
         _plot_relative_pinball_main(outputs["metrics"], out_dir=out_dir, split=split),
-        _plot_afrr_main_regime_relative_pinball(outputs.get("afrr_main_regime_metrics", pd.DataFrame()), out_dir=out_dir, split=split),
+        _plot_afrr_main_regime_relative_pinball(afrr_three_regime_source, out_dir=out_dir, split=split),
         _plot_relative_pinball_all_in_one(outputs["metrics"], out_dir=out_dir, split=split),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mean_pinball_loss", filename="tail_spike_pinball_by_regime.png", ylabel="Mean pinball loss"),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mae_p50", filename="tail_spike_mae_p50_by_regime.png", ylabel="MAE p50"),
@@ -2085,8 +2194,8 @@ def write_outputs(
                 paths.extend(p)
             else:
                 paths.append(p)
-    if not outputs.get("afrr_main_regime_metrics", pd.DataFrame()).empty:
-        paths.append(write_afrr_main_regime_latex_figure(out_dir=out_dir))
+    if not afrr_three_regime_source.empty:
+        paths.extend(write_afrr_main_regime_latex_figure(out_dir=out_dir))
     example_path = out_dir / "tail_spike_example_week_selection.csv"
     example_selection_df = pd.DataFrame(example_week_selection)
     example_selection_df.to_csv(example_path, index=False)
