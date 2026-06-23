@@ -1851,6 +1851,7 @@ def _write_tail_spike_relative_tex(
             r"                bar width=7pt,",
             r"                width=0.74\textwidth,",
             rf"                height={_tex_num(height_cm)}cm,",
+            r"                title={Tail and Spike Performance Across Forecast Targets},",
             r"                xlabel={Mean pinball loss relative to RLQR},",
             r"                legend style={at={(0.5,1.12)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
             r"                legend cell align={left},",
@@ -2339,6 +2340,7 @@ def _write_line_tex(
     fragment_only: bool = False,
     highlight_spans: tuple[tuple[float, float], ...] = (),
     axis_height: str | None = None,
+    axis_title: str | None = None,
 ) -> Path | None:
     if data.empty:
         return None
@@ -2352,6 +2354,7 @@ def _write_line_tex(
             r"            \begin{axis}[",
             r"                width=0.96\textwidth,",
             rf"                height={axis_height or '7cm'},",
+            *([rf"                title={{{_latex_escape(axis_title)}}},"] if axis_title else []),
             rf"                xlabel={{{_latex_escape(xlabel)}}},",
             rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
             r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
@@ -2439,6 +2442,7 @@ def _write_line_panel_tex(
     axis_height: str | None = None,
     y_tick_precision: int | None = None,
     y_scale: float = 1.0,
+    y_label_x: float = -0.11,
 ) -> Path | None:
     if data.empty:
         return None
@@ -2480,7 +2484,7 @@ def _write_line_panel_tex(
         rf"                height={axis_height},",
         rf"                xlabel={{{_latex_escape(xlabel)}}},",
         rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
-        r"                y label style={at={(-0.11,0.5)}},",
+        rf"                y label style={{at={{({_tex_num(y_label_x)},0.5)}}}},",
         r"                legend style={at={(0.5,1.22)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
         r"                axis lines*=left,",
@@ -2869,15 +2873,20 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 xlim = (0.0, 48.0) if highlight_spans else None
                 caption_suffix = " Relevant forecast lead highlighted in grey." if highlight_spans else ""
                 if group["target_label"].nunique(dropna=True) > 1:
+                    is_afrr_result_pinball = (
+                        metric == "mean_pinball_loss"
+                        and tier == "result_section"
+                        and target_slug in {"afrr_capacity_price", "afrr_activation_price", "afrr_activation_rate"}
+                    )
                     if target_slug == "afrr_activation_rate" and metric == "mean_pinball_loss":
-                        shared_ylim = _zero_based_ylim(group, metric)
-                        axis_height = "5.4cm"
+                        shared_ylim = _padded_ylim(group, metric)
+                        axis_height = "5.0cm" if is_afrr_result_pinball else None
                         y_tick_precision = 2
                         y_scale = 1000.0
                         y_label = "Mean pinball loss (1e-3)"
                     else:
                         shared_ylim = _padded_ylim(group, metric)
-                        axis_height = None
+                        axis_height = "5.0cm" if is_afrr_result_pinball else None
                         y_tick_precision = None
                         y_scale = 1.0
                         y_label = _tex_label(metric)
@@ -2899,10 +2908,12 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         axis_height=axis_height,
                         y_tick_precision=y_tick_precision,
                         y_scale=y_scale,
+                        y_label_x=-0.07 if target_slug == "afrr_activation_rate" and metric == "mean_pinball_loss" and tier == "result_section" else -0.11,
                     )
                 else:
                     axis_height = "5.6cm" if target_slug == "da_price" and metric == "mean_pinball_loss" and tier == "result_section" else None
-                    path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.{caption_suffix}", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss", xlim=xlim, highlight_spans=highlight_spans, axis_height=axis_height)
+                    axis_title = "DA Price" if target_slug == "da_price" and metric == "mean_pinball_loss" and tier == "result_section" else None
+                    path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.{caption_suffix}", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss", xlim=xlim, highlight_spans=highlight_spans, axis_height=axis_height, axis_title=axis_title)
                 if path:
                     _add_tikz_entry(entries, subsection=sec, tier=tier, path=path, metric_family=metric, description=f"Native pgfplots {metric} per-lead line chart for {target_slug}.")
             pivot = group.pivot_table(index=["target_label", "lead_time_h"], columns="model_label", values="mean_pinball_loss", aggfunc="first").reset_index()
