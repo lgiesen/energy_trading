@@ -87,7 +87,6 @@ COMPONENT_COLUMNS = [
     ("realized_degradation_cost_eur", "Degradation cost"),
     ("realized_aux_cost_eur", "Auxiliary cost"),
     ("transaction_cost_eur", "Transaction cost"),
-    ("offer_cost_eur", "Offer cost"),
     ("penalty_cost_eur", "Penalty cost"),
     ("terminal_soc_repair_cost_eur", "Terminal SoC repair"),
 ]
@@ -95,7 +94,6 @@ COMPONENT_COST_COLUMNS = {
     "realized_degradation_cost_eur",
     "realized_aux_cost_eur",
     "transaction_cost_eur",
-    "offer_cost_eur",
     "penalty_cost_eur",
     "terminal_soc_repair_cost_eur",
 }
@@ -108,7 +106,6 @@ MARKET_COMPONENT_COLORS = {
     "Degradation cost": "#F0746E",
     "Auxiliary cost": "#DC3977",
     "Transaction cost": "#7A7A7A",
-    "Offer cost": "#9EC9E2",
     "Penalty cost": "#333333",
     "Terminal SoC repair": "#045275",
 }
@@ -1295,7 +1292,7 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
         columns="component",
         values="annualized_component_value_eur_per_year",
         aggfunc="sum",
-    ).reindex(index=models, columns=component_order).fillna(0.0)
+    ).reindex(index=models, columns=component_order).fillna(0.0) / 1000.0
     pos_bottom = np.zeros(len(models))
     neg_bottom = np.zeros(len(models))
     for component in component_order:
@@ -1325,7 +1322,7 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     ax.axhline(0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.9)
     ax.set_xticks(x)
     ax.set_xticklabels([f"{m}\n{q}" if q else m for m, q in zip(models, best_quantiles)])
-    ax.set_ylabel("Annualized component value (EUR/year)")
+    ax.set_ylabel("Annualized component value (kEUR/year)")
     ax.set_xlabel("Model and best quantile")
     ax.set_title("RQ2 Revenue and Cost Components at Best Quantile", pad=12)
     handles, labels = ax.get_legend_handles_labels()
@@ -1803,6 +1800,524 @@ def _write_latex_include(path: Path, figure_rel: str, caption: str, label: str) 
     )
 
 
+def _hex_to_rgb01(color: str) -> tuple[float, float, float]:
+    color = str(color).strip().lstrip("#")
+    if len(color) != 6:
+        return (0.0, 0.0, 0.0)
+    return (int(color[0:2], 16) / 255.0, int(color[2:4], 16) / 255.0, int(color[4:6], 16) / 255.0)
+
+
+def _tex_color_def(name: str, color: str) -> str:
+    r, g, b = _hex_to_rgb01(color)
+    return rf"\definecolor{{{name}}}{{rgb}}{{{r:.4f},{g:.4f},{b:.4f}}}"
+
+
+def _rq2_latex_color_defs() -> list[str]:
+    return [
+        _tex_color_def("rqTwoNeutral", THESIS_PALETTE["neutral_dark"]),
+        _tex_color_def("rqTwoGrid", THESIS_PALETTE.get("grid", "#D8D8D8")),
+        _tex_color_def("rqTwoNaive", THESIS_PALETTE["naive"]),
+        _tex_color_def("rqTwoRHPF", TRUTH_REFERENCE_COLOR),
+        _tex_color_def("rqTwoRLQR", get_model_color("linear")),
+        _tex_color_def("rqTwoXGB", get_model_color("xgb")),
+        _tex_color_def("rqTwoTFT", get_model_color("tft")),
+        _tex_color_def("rqTwoDA", MARKET_COLOR_MAP["DA"]),
+        _tex_color_def("rqTwoID", MARKET_COLOR_MAP["ID"]),
+        _tex_color_def("rqTwoBCMCapacity", MARKET_COLOR_MAP["BCM capacity"]),
+        _tex_color_def("rqTwoBCMActivation", MARKET_COLOR_MAP["BCM activation"]),
+        _tex_color_def("rqTwoBEM", MARKET_COLOR_MAP["BEM"]),
+        _tex_color_def("rqTwoPNL", GEO_SEQUENTIAL_BLUE["seq_7"]),
+        _tex_color_def("rqTwoSoC", THESIS_PALETTE.get("perfect_foresight", "#2E7D32")),
+        _tex_color_def("rqTwoReference", GEO_SEQUENTIAL_BLUE["seq_4"]),
+        _tex_color_def("rqTwoCostDegradation", MARKET_COMPONENT_COLORS["Degradation cost"]),
+        _tex_color_def("rqTwoCostAuxiliary", MARKET_COMPONENT_COLORS["Auxiliary cost"]),
+        _tex_color_def("rqTwoCostTransaction", MARKET_COMPONENT_COLORS["Transaction cost"]),
+        _tex_color_def("rqTwoCostPenalty", MARKET_COMPONENT_COLORS["Penalty cost"]),
+        _tex_color_def("rqTwoCostTerminal", MARKET_COMPONENT_COLORS["Terminal SoC repair"]),
+    ]
+
+
+def _tex_model_color(model: str) -> str:
+    return {
+        "Naive": "rqTwoNaive",
+        "RHPF": "rqTwoRHPF",
+        "RLQR": "rqTwoRLQR",
+        "XGB": "rqTwoXGB",
+        "TFT": "rqTwoTFT",
+    }.get(str(model), "rqTwoNeutral")
+
+
+def _tex_component_color(component: str) -> str:
+    return {
+        "DA net": "rqTwoDA",
+        "ID net": "rqTwoID",
+        "BCM capacity": "rqTwoBCMCapacity",
+        "BCM activation": "rqTwoBCMActivation",
+        "BEM activation": "rqTwoBEM",
+        "Degradation cost": "rqTwoCostDegradation",
+        "Auxiliary cost": "rqTwoCostAuxiliary",
+        "Transaction cost": "rqTwoCostTransaction",
+        "Penalty cost": "rqTwoCostPenalty",
+        "Terminal SoC repair": "rqTwoCostTerminal",
+    }.get(str(component), "rqTwoNeutral")
+
+
+def _tex_float(value: Any, digits: int = 3) -> str:
+    number = _safe_float(value)
+    if not math.isfinite(number):
+        return "nan"
+    return f"{number:.{digits}f}"
+
+
+def _tex_k_eur(value: Any, digits: int = 1) -> str:
+    number = _safe_float(value)
+    if not math.isfinite(number):
+        return "nan"
+    return f"{number / 1000.0:.{digits}f}"
+
+
+def _write_native_latex(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _axis_common_options() -> list[str]:
+    return [
+        "tick align=outside,",
+        "axis line style={rqTwoNeutral},",
+        "tick style={rqTwoNeutral},",
+        "label style={font=\\small},",
+        "tick label style={font=\\small},",
+        "title style={font=\\bfseries\\small},",
+        "legend style={font=\\small, draw=none, fill=none},",
+        "grid=major,",
+        "grid style={rqTwoGrid!55, line width=0.2pt},",
+    ]
+
+
+def write_latex_profit_heatmap(path: Path, table: pd.DataFrame) -> None:
+    rows = ["Naive", "RHPF", *MODEL_ORDER]
+    quantiles = table["quantile"].astype(str).tolist() if "quantile" in table.columns else list(DEFAULT_QUANTILES)
+    points: list[tuple[int, int, float, str, str]] = []
+    vals: list[float] = []
+    for yi, row_label in enumerate(rows):
+        for xi, q in enumerate(quantiles):
+            match = table.loc[table["quantile"].astype(str).eq(q)] if "quantile" in table.columns else pd.DataFrame()
+            value = _safe_float(match[row_label].iloc[0]) if not match.empty and row_label in match.columns else math.nan
+            if math.isfinite(value):
+                vals.append(value / 1000.0)
+            txt = "n/a" if not math.isfinite(value) else f"{value / 1000.0:,.0f}"
+            text_color = "white" if row_label == "RHPF" else "rqTwoNeutral"
+            points.append((xi, yi, value / 1000.0 if math.isfinite(value) else math.nan, txt, text_color))
+    meta_min = min(vals) if vals else 0.0
+    meta_max = max(vals) if vals else 1.0
+    coordinates = "\n".join(
+        f"({xi},{yi}) [{_tex_float(meta, 3)}]" for xi, yi, meta, _txt, _tc in points if math.isfinite(meta)
+    )
+    nodes = "\n".join(
+        rf"\node[text={tc}, font=\scriptsize] at (axis cs:{xi},{yi}) {{{_latex_escape(txt)}}};"
+        for xi, yi, _meta, txt, tc in points
+    )
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=\linewidth,",
+        r"height=0.54\linewidth,",
+        r"title={Net Profit},",
+        r"xlabel={Quantile policy},",
+        r"ylabel={Strategy},",
+        "xmin=-0.5, xmax=" + _tex_float(len(quantiles) - 0.5, 1) + ",",
+        "ymin=-0.5, ymax=" + _tex_float(len(rows) - 0.5, 1) + ",",
+        "xtick={" + ",".join(str(i) for i in range(len(quantiles))) + "},",
+        "xticklabels={" + ",".join(_latex_escape(q) for q in quantiles) + "},",
+        "ytick={" + ",".join(str(i) for i in range(len(rows))) + "},",
+        "yticklabels={" + ",".join(_latex_escape(r) for r in rows) + "},",
+        r"y dir=reverse,",
+        r"point meta min=" + _tex_float(meta_min, 2) + ",",
+        r"point meta max=" + _tex_float(meta_max, 2) + ",",
+        r"colormap={rq2blue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
+        r"colorbar,",
+        r"colorbar style={ylabel={Annualized Net Profit (kEUR/year)}, tick label style={font=\small}},",
+        r"]",
+        r"\addplot[scatter, only marks, mark=square*, mark size=18pt, scatter/use mapped color={fill=mapped color, draw=white}] coordinates {",
+        coordinates,
+        r"};",
+        nodes,
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Net Profit by strategy and quantile policy. Cell values are annualized Net Profit in kEUR per year; validity flags are reported in the source CSV.}",
+        r"\label{fig:1_profit_heatmap}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: list[str]) -> None:
+    x_by_q = {q: i for i, q in enumerate(quantiles)}
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=\linewidth,",
+        r"height=0.56\linewidth,",
+        r"title={Quantile Sweep: Net Profit by Model},",
+        r"xlabel={Quantile policy},",
+        r"ylabel={Annualized Net Profit (kEUR)},",
+        r"xtick={" + ",".join(str(i) for i in range(len(quantiles))) + "},",
+        r"xticklabels={" + ",".join(_latex_escape(q) for q in quantiles) + "},",
+        r"legend columns=5,",
+        r"legend pos=north west,",
+        r"]",
+    ]
+    for model in ["Naive", "RHPF"]:
+        g = sweep_data.loc[sweep_data["series"].astype(str).eq(model)].copy() if not sweep_data.empty else pd.DataFrame()
+        if g.empty:
+            continue
+        q = "p50" if "p50" in x_by_q else quantiles[len(quantiles) // 2]
+        match = g.loc[g["quantile"].astype(str).eq(q)]
+        if match.empty:
+            match = g.head(1)
+        value = _safe_float(match["annualized_net_profit_eur_per_year"].iloc[0]) / 1000.0
+        if not math.isfinite(value):
+            continue
+        lines += [
+            rf"\addplot+[color={_tex_model_color(model)}, mark=none, line width=1.6pt] coordinates {{(0,{_tex_float(value, 2)}) ({len(quantiles)-1},{_tex_float(value, 2)})}};",
+            rf"\addlegendentry{{{model}}}",
+        ]
+    for model in MODEL_ORDER:
+        g = sweep_data.loc[sweep_data["series"].astype(str).eq(model)].copy() if not sweep_data.empty else pd.DataFrame()
+        if g.empty:
+            continue
+        coords = []
+        for q in quantiles:
+            match = g.loc[g["quantile"].astype(str).eq(q)]
+            if match.empty:
+                continue
+            value = _safe_float(match["annualized_net_profit_eur_per_year"].iloc[0]) / 1000.0
+            if math.isfinite(value):
+                coords.append(f"({x_by_q[q]},{_tex_float(value, 2)})")
+        if not coords:
+            continue
+        marker = {"RLQR": "*", "XGB": "square*", "TFT": "triangle*"}.get(model, "*")
+        lines += [
+            rf"\addplot+[color={_tex_model_color(model)}, mark={marker}, line width=1.8pt] coordinates {{{' '.join(coords)}}};",
+            rf"\addlegendentry{{{model}}}",
+        ]
+    lines += [
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Quantile sweep of annualized Net Profit by model and benchmark. Naive and RHPF are shown as benchmark reference lines.}",
+        r"\label{fig:2_quantile_sweep_net_profit_by_model}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame) -> None:
+    models = list(MODEL_ORDER) if not component_data.empty else []
+    component_order = [label for _col, label in COMPONENT_COLUMNS if not component_data.empty and label in set(component_data["component"])]
+    cost_labels = {display for col, display in COMPONENT_COLUMNS if col in COMPONENT_COST_COLUMNS}
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=\linewidth,",
+        r"height=0.58\linewidth,",
+        r"ybar stacked,",
+        r"bar width=22pt,",
+        r"title={Revenue and Cost Components at Best Quantile},",
+        r"xlabel={Model and best quantile},",
+        r"ylabel={Annualized component value (kEUR/year)},",
+        r"symbolic x coords={" + ",".join(_latex_escape(m) for m in models) + "},",
+        r"xtick=data,",
+        r"legend columns=2,",
+        r"legend style={at={(1.02,1)}, anchor=north west, font=\scriptsize, draw=none, fill=none},",
+        r"]",
+    ]
+    if not component_data.empty and models and component_order:
+        pivot = component_data.pivot_table(
+            index="model",
+            columns="component",
+            values="annualized_component_value_eur_per_year",
+            aggfunc="sum",
+        ).reindex(index=MODEL_ORDER, columns=component_order).fillna(0.0)
+        ordered = [c for c in component_order if c not in cost_labels] + [c for c in component_order if c in cost_labels]
+        for component in ordered:
+            coords_parts = [
+                f"({_latex_escape(model)},{_tex_float(_safe_float(pivot.loc[model, component]) / 1000.0, 2)})"
+                for model in models
+            ]
+            if len(coords_parts) != len(models):
+                raise ValueError(
+                    f"Stacked revenue/cost LaTeX component {component!r} has {len(coords_parts)} coordinates "
+                    f"but expected {len(models)} model coordinates."
+                )
+            coords = " ".join(coords_parts)
+            lines += [
+                rf"\addplot+[fill={_tex_component_color(component)}, draw=white] coordinates {{{coords}}};",
+                rf"\addlegendentry{{{_latex_escape(component)}}}",
+            ]
+    lines += [
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Values are annualized and reported in kEUR per year.}",
+        r"\label{fig:3_revenue_cost_components_best_quantile}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
+    data = cumulative.copy()
+    if not data.empty:
+        data["timestamp_utc"] = pd.to_datetime(data["timestamp_utc"], errors="coerce", utc=True)
+        data = data.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc").copy()
+        data["date"] = data["timestamp_utc"].dt.date
+        daily = data.sort_values("timestamp_utc").groupby(["model", "series", "date"], as_index=False).tail(1)
+        dates = sorted(daily["date"].unique())
+    else:
+        daily = pd.DataFrame()
+        dates = []
+    date_index = {d: i for i, d in enumerate(dates)}
+    tick_step = max(1, len(dates) // 6) if dates else 1
+    tick_positions = list(range(0, len(dates), tick_step))
+    if dates and tick_positions[-1] != len(dates) - 1:
+        tick_positions.append(len(dates) - 1)
+    tick_labels = [pd.Timestamp(dates[i]).strftime("%d %b") for i in tick_positions] if dates else []
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=\linewidth,",
+        r"height=0.56\linewidth,",
+        r"title={Cumulative Net Profit: Model Comparison Over Test Period},",
+        r"xlabel={Date},",
+        r"ylabel={Cumulative Net Profit (kEUR)},",
+        r"xmin=0,",
+        r"xmax=" + _tex_float(max(len(dates) - 1, 0), 1) + ",",
+        r"xtick={" + ",".join(str(i) for i in tick_positions) + "},",
+        r"xticklabels={" + ",".join(_latex_escape(x) for x in tick_labels) + "},",
+        r"legend columns=3,",
+        r"legend pos=north west,",
+        r"]",
+    ]
+    for model in ["Naive", "RHPF", *MODEL_ORDER]:
+        g = daily.loc[daily["model"].astype(str).eq(model)].sort_values("date") if not daily.empty else pd.DataFrame()
+        if g.empty:
+            continue
+        coords = " ".join(
+            f"({date_index[row['date']]},{_tex_float(_safe_float(row['cum_pnl_eur']) / 1000.0, 2)})"
+            for _, row in g.iterrows()
+            if row["date"] in date_index and math.isfinite(_safe_float(row["cum_pnl_eur"]))
+        )
+        if not coords:
+            continue
+        label = str(g["series"].iloc[0])
+        lines += [
+            rf"\addplot+[color={_tex_model_color(model)}, mark=none, line width=1.9pt] coordinates {{{coords}}};",
+            rf"\addlegendentry{{{_latex_escape(label)}}}",
+        ]
+    lines += [
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Cumulative Net Profit over the test period for Naive, RHPF and each model at its best numeric quantile policy.}",
+        r"\label{fig:4_cumulative_net_profit_model_comparison_test_period}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFrame) -> None:
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=0.82\linewidth,",
+        r"height=0.62\linewidth,",
+        r"title={Normalized Total Forecast Loss vs Net Profit},",
+        r"xlabel={Normalized total mean pinball loss},",
+        r"ylabel={Normalized annualized net profit},",
+        r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
+        r"legend columns=4,",
+        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
+        r"]",
+        r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
+        r"\addlegendentry{VoF reference line}",
+    ]
+    for model in MODEL_ORDER:
+        g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
+        if g.empty:
+            continue
+        marker = {"RLQR": "*", "XGB": "square*", "TFT": "triangle*"}.get(model, "*")
+        coords = " ".join(
+            f"({_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)})"
+            for _, row in g.iterrows()
+        )
+        lines += [
+            rf"\addplot+[only marks, color={_tex_model_color(model)}, mark={marker}, mark size=2.4pt] coordinates {{{coords}}};",
+            rf"\addlegendentry{{{model}}}",
+        ]
+        for _, row in g.iterrows():
+            lines.append(
+                rf"\node[font=\scriptsize, anchor=west, text=rqTwoNeutral] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(row['quantile'])}}};"
+            )
+    lines += [
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line is the VoF reference line.}",
+        r"\label{fig:5_pinball_loss_vs_net_profit_total_normalized}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> None:
+    data = dispatch_data.copy()
+    if not data.empty:
+        data["timestamp_utc"] = pd.to_datetime(data["timestamp_utc"], errors="coerce", utc=True)
+        data = data.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc").copy()
+    times = sorted(data["timestamp_utc"].dropna().unique()) if not data.empty else []
+    x_by_time = {ts: i for i, ts in enumerate(times)}
+    selected_date = pd.Timestamp(times[0]).date() if times else None
+    selected_date_label = f"{selected_date.day} {MONTH_ABBR_FULL[selected_date.month]} {selected_date.year}" if selected_date else ""
+    components = [
+        ("DA buy", "rqTwoDA", "DA buy/sell", False),
+        ("DA sell", "rqTwoDA", "DA buy/sell", True),
+        ("BEM negative activation", "rqTwoBEM", "BEM activation +/-", False),
+        ("BEM positive activation", "rqTwoBEM", "BEM activation +/-", True),
+        ("BCM negative activation", "rqTwoBCMActivation", "BCM activation +/-", False),
+        ("BCM positive activation", "rqTwoBCMActivation", "BCM activation +/-", True),
+    ]
+    tick_step = 4
+    tick_positions = list(range(0, len(times), tick_step)) if times else []
+    if times and tick_positions[-1] != len(times) - 1:
+        tick_positions.append(len(times) - 1)
+    tick_labels = [pd.Timestamp(times[i]).strftime("%H:%M") for i in tick_positions] if times else []
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"name=dispatchaxis,",
+        r"width=\linewidth,",
+        r"height=0.56\linewidth,",
+        r"ybar stacked,",
+        r"bar width=7pt,",
+        r"title={Exemplary Trading Day with TFT p90 and a Multi-Market Strategy},",
+        rf"xlabel={{Time ({_latex_escape(selected_date_label)})}},",
+        r"ylabel={Power (MW): charge (+), discharge (-)},",
+        r"ymin=-10, ymax=10,",
+        r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
+        r"xtick={" + ",".join(str(i) for i in tick_positions) + "},",
+        r"xticklabels={" + ",".join(_latex_escape(x) for x in tick_labels) + "},",
+        r"legend columns=3,",
+        r"legend style={at={(0.5,-0.20)}, anchor=north, font=\scriptsize, draw=none, fill=none},",
+        r"]",
+    ]
+    legend_seen: set[str] = set()
+    for component, color, label, already_seen in components:
+        coords: list[str] = []
+        g = data.loc[data["component"].astype(str).eq(component)].copy() if not data.empty else pd.DataFrame()
+        by_x = {x_by_time[row["timestamp_utc"]]: _safe_float(row["mw_signed"]) for _, row in g.iterrows() if row["timestamp_utc"] in x_by_time}
+        for i in range(len(times)):
+            coords.append(f"({i},{_tex_float(by_x.get(i, 0.0), 3)})")
+        lines.append(rf"\addplot+[fill={color}, draw=white] coordinates {{{' '.join(coords)}}};")
+        if label not in legend_seen:
+            lines.append(rf"\addlegendentry{{{_latex_escape(label)}}}")
+            legend_seen.add(label)
+        else:
+            lines.append(r"\addlegendentry{}")
+    lines += [
+        r"\addplot+[black, mark=none, line width=0.8pt] coordinates {(0,0) (" + str(max(len(times) - 1, 0)) + r",0)};",
+        r"\addlegendentry{}",
+        r"\end{axis}",
+        r"\begin{axis}[",
+        r"name=lineaxis,",
+        r"at={(dispatchaxis.south west)},",
+        r"anchor=south west,",
+        r"width=\linewidth,",
+        r"height=0.56\linewidth,",
+        r"axis x line=none,",
+        r"axis y line*=right,",
+        r"ylabel={SoC / cumulative Net Profit (kEUR)},",
+        r"ylabel style={font=\small},",
+        r"tick label style={font=\small},",
+        r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
+        r"legend columns=1,",
+        r"legend style={at={(1.0,-0.20)}, anchor=north east, font=\scriptsize, draw=none, fill=none},",
+        r"grid=none,",
+        r"]",
+    ]
+    if times:
+        soc = data[["timestamp_utc", "soc_mwh"]].drop_duplicates("timestamp_utc").set_index("timestamp_utc").reindex(times)["soc_mwh"]
+        pnl = data[["timestamp_utc", "cumulative_pnl_eur"]].drop_duplicates("timestamp_utc").set_index("timestamp_utc").reindex(times)["cumulative_pnl_eur"] / 1000.0
+        soc_coords = " ".join(f"({i},{_tex_float(v, 3)})" for i, v in enumerate(soc.to_numpy(dtype=float)) if math.isfinite(_safe_float(v)))
+        pnl_coords = " ".join(f"({i},{_tex_float(v, 3)})" for i, v in enumerate(pnl.to_numpy(dtype=float)) if math.isfinite(_safe_float(v)))
+        lines += [
+            rf"\addplot+[color=rqTwoSoC, mark=none, line width=2.0pt] coordinates {{{soc_coords}}};",
+            r"\addlegendentry{SoC}",
+            rf"\addplot+[color=rqTwoPNL, mark=none, dashed, line width=1.8pt] coordinates {{{pnl_coords}}};",
+            r"\addlegendentry{Cumulative Net Profit}",
+        ]
+    lines += [
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero and discharging actions below zero.}",
+        r"\label{fig:6_market_dispatch_soc_selected_day}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_result_section_native_latex_figures(
+    *,
+    latex_figures_dir: Path,
+    heatmap_table: pd.DataFrame,
+    sweep_data: pd.DataFrame,
+    component_data: pd.DataFrame,
+    cumulative_data: pd.DataFrame,
+    normalized_total_scatter_data: pd.DataFrame,
+    dispatch_soc_data: pd.DataFrame,
+    quantiles: list[str],
+) -> None:
+    write_latex_profit_heatmap(latex_figures_dir / "1_profit_heatmap.tex", heatmap_table)
+    write_latex_quantile_sweep(latex_figures_dir / "2_quantile_sweep_net_profit_by_model.tex", sweep_data, quantiles)
+    write_latex_revenue_cost_components(latex_figures_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
+    write_latex_cumulative_pnl(latex_figures_dir / "4_cumulative_net_profit_model_comparison_test_period.tex", cumulative_data)
+    write_latex_normalized_pinball_profit(latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex", normalized_total_scatter_data)
+    write_latex_market_dispatch_soc(latex_figures_dir / "6_market_dispatch_soc_selected_day.tex", dispatch_soc_data)
+
+
 def _thesis_figure_rel(out_root: Path, figure_name: str) -> str:
     """Return thesis-project include path for a generated result-section figure."""
     return f"figures/4-results/{out_root.name}/result_section/figures/{figure_name}"
@@ -1908,29 +2423,15 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         appendix_figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, appendix_figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
         result_figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
         result_figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
-        _write_latex_include(
-            latex_figures_dir / "2_quantile_sweep_net_profit_by_model.tex",
-            _thesis_figure_rel(out_root, "2_quantile_sweep_net_profit_by_model.png"),
-            "Quantile sweep of annualized Net Profit by model and benchmark. The plot shows all numeric simulation rows; validity flags are reported in the source CSV.",
-            "fig:2_quantile_sweep_net_profit_by_model",
-        )
-        _write_latex_include(
-            latex_figures_dir / "3_revenue_cost_components_best_quantile.tex",
-            _thesis_figure_rel(out_root, "3_revenue_cost_components_best_quantile.png"),
-            "Revenue and cost components for each model at its best numeric quantile policy. Values are annualized from the simulation duration; costs are plotted below zero. Validity flags are reported in the source CSV.",
-            "fig:3_revenue_cost_components_best_quantile",
-        )
-        _write_latex_include(
-            latex_figures_dir / "4_cumulative_net_profit_model_comparison_test_period.tex",
-            _thesis_figure_rel(out_root, "4_cumulative_net_profit_model_comparison_test_period.png"),
-            "Cumulative Net Profit over the test period for Naive, RHPF and each model at its best numeric quantile policy. If a model path exceeds RHPF, interpret this as an accounting and timing diagnostic: rising energy prices may create value that was not fully valued at the decision time, and RHPF is a same-rules diagnostic rather than a global oracle. Validity flags are reported in the source CSV.",
-            "fig:4_cumulative_net_profit_model_comparison_test_period",
-        )
-        _write_latex_include(
-            latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex",
-            _thesis_figure_rel(out_root, "5_pinball_loss_vs_net_profit_total_normalized.png"),
-            "Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line is the VoF reference line.",
-            "fig:5_pinball_loss_vs_net_profit_total_normalized",
+        write_result_section_native_latex_figures(
+            latex_figures_dir=latex_figures_dir,
+            heatmap_table=heatmap_table,
+            sweep_data=sweep_data,
+            component_data=component_data,
+            cumulative_data=cumulative_data,
+            normalized_total_scatter_data=normalized_total_scatter_data,
+            dispatch_soc_data=dispatch_soc_data,
+            quantiles=quantiles,
         )
         for target, label in TARGET_LABELS.items():
             slug = TARGET_SLUGS[target]
@@ -1948,18 +2449,6 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
             _thesis_appendix_figure_rel(out_root, "5_pinball_loss_vs_net_profit_total.png"),
             "Total mean pinball loss and annualized Net Profit by model and quantile policy. The forecast metric is the observation-weighted raw mean pinball loss across all target variables.",
             "fig:5_pinball_loss_vs_net_profit_total",
-        )
-        _write_latex_include(
-            latex_figures_dir / "6_market_dispatch_soc_selected_day.tex",
-            _thesis_figure_rel(out_root, "6_market_dispatch_soc_selected_day.png"),
-            "Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero, discharging actions below zero, the green line shows SoC, and the blue dashed line shows cumulative realized Net Profit in kEUR.",
-            "fig:6_market_dispatch_soc_selected_day",
-        )
-        _write_latex_include(
-            latex_figures_dir / "1_profit_heatmap.tex",
-            _thesis_figure_rel(out_root, "1_profit_heatmap.png"),
-            "Net Profit heatmap by strategy and quantile policy. Values show all numeric simulation rows from the scenario folders; validity flags are reported in the source CSV.",
-            "fig:1_profit_heatmap",
         )
 
     created = datetime.now(timezone.utc).isoformat()

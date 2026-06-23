@@ -1234,7 +1234,8 @@ def _plot_relative_pinball_main_figure(
         )
         regimes = sorted(agg["regime"].dropna().unique(), key=lambda r: _main_regime_order_key(target_label, r))
         y = np.arange(len(regimes), dtype=float)
-        height = 0.34
+        height = 0.42
+        center_sep = height * 0.5
         ax.axvline(1.0, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=1.3, label="RLQR baseline")
         for i, label in enumerate(["XGB", "TFT"]):
             mg = agg[agg["model_label"].eq(label)]
@@ -1242,11 +1243,11 @@ def _plot_relative_pinball_main_figure(
                 continue
             vals = [float(mg.loc[mg["regime"].eq(r), "value"].mean()) if mg["regime"].eq(r).any() else np.nan for r in regimes]
             model_key = "tft" if label == "TFT" else "xgb"
-            ax.barh(y + (i - 0.5) * height, vals, height=height, label=label, color=get_model_color(model_key))
+            ax.barh(y + (i - 0.5) * center_sep, vals, height=height, label=label, color=get_model_color(model_key), alpha=1.0)
         ax.set_title(thesis_titlecase(target_label))
         ax.set_yticks(y)
         ax.set_yticklabels([_clean_regime_label(r) for r in regimes])
-        ax.invert_yaxis()
+        ax.set_ylim(len(regimes) - 0.45, -0.45)
         ax.grid(axis="x", alpha=0.25)
     handles, labels = axes_flat[0].get_legend_handles_labels()
     if handles:

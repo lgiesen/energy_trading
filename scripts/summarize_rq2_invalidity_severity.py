@@ -242,9 +242,15 @@ def update_manifest(root: Path, paths: dict[str, Path]) -> None:
 
 
 def build_outputs(root: Path) -> dict[str, Path]:
-    summary_path = root / "backup" / "diagnostics" / "rq2_invalidity_severity_summary.csv"
-    hourly_path = root / "backup" / "diagnostics" / "rq2_invalidity_severity_by_hour.csv"
-    warnings_path = root / "backup" / "warnings" / "rq2_invalidity_severity_warnings.csv"
+    summary_path = root / "backup" / "diagnostics" / "simulation_invalidity_severity_summary.csv"
+    hourly_path = root / "backup" / "diagnostics" / "simulation_invalidity_severity_by_hour.csv"
+    warnings_path = root / "backup" / "warnings" / "simulation_invalidity_severity_warnings.csv"
+    if not summary_path.exists():
+        summary_path = root / "backup" / "diagnostics" / "rq2_invalidity_severity_summary.csv"
+    if not hourly_path.exists():
+        hourly_path = root / "backup" / "diagnostics" / "rq2_invalidity_severity_by_hour.csv"
+    if not warnings_path.exists():
+        warnings_path = root / "backup" / "warnings" / "rq2_invalidity_severity_warnings.csv"
     summary = _read_required(summary_path)
     hourly = _read_required(hourly_path)
     warnings_df = pd.read_csv(warnings_path) if warnings_path.exists() else pd.DataFrame(columns=["scenario", "metric", "warning", "details"])

@@ -833,11 +833,8 @@ def _plot_market_actionable(
     ax.set_title(thesis_titlecase(_market_actionable_title(spec, target_display)))
     ax.set_xlabel("Time")
     ax.set_ylabel(y_axis_label)
-    tick_rows = d.index[d["local_time"].dt.hour.eq(0) & d["local_time"].dt.minute.eq(0)].tolist()
-    if not tick_rows:
-        tick_rows = list(range(0, len(d), max(1, len(d) // 7)))
-    tick_positions = [d.loc[i, "local_time"] for i in tick_rows if i in d.index]
-    tick_labels = ["\n".join(_format_week_tick(pd.Timestamp(t))) for t in tick_positions]
+    tick_positions = _selected_week_local_dates(week)
+    tick_labels = [_format_week_date_label(t) for t in tick_positions]
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)
     ax.tick_params(axis="x", rotation=0)
@@ -1295,6 +1292,19 @@ def _format_week_tick(ts: pd.Timestamp) -> tuple[str, str]:
     return f"{stamp.day:02d} {MONTH_ABBR[stamp.month - 1]}", f"{stamp.hour:02d}:{stamp.minute:02d}"
 
 
+def _format_week_date_label(ts: pd.Timestamp) -> str:
+    stamp = pd.Timestamp(ts)
+    return f"{stamp.day:02d} {MONTH_ABBR[stamp.month - 1]}"
+
+
+def _selected_week_local_dates(week: WeekSpec, *, n_days: int = 7) -> list[pd.Timestamp]:
+    start = pd.Timestamp(week.start_utc)
+    if start.tzinfo is None:
+        start = start.tz_localize("UTC")
+    local_start = start.tz_convert(LOCAL_TZ).normalize()
+    return [local_start + pd.Timedelta(days=i) for i in range(n_days)]
+
+
 def _week_date_range_label(view: pd.DataFrame) -> str:
     ts = pd.to_datetime(view["target_time_utc"], utc=True, errors="coerce").dropna()
     if ts.empty:
@@ -1305,7 +1315,7 @@ def _week_date_range_label(view: pd.DataFrame) -> str:
     return f"{start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M}"
 
 
-def _latex_week_ticks(view: pd.DataFrame) -> tuple[str, str]:
+def _latex_week_ticks(view: pd.DataFrame, week: WeekSpec) -> tuple[str, str]:
     if view.empty:
         return "", ""
     d = view.copy()
@@ -1313,17 +1323,15 @@ def _latex_week_ticks(view: pd.DataFrame) -> tuple[str, str]:
     d = d.dropna(subset=["local_time"]).reset_index(drop=True)
     if d.empty:
         return "", ""
-    tick_rows = d.index[d["local_time"].dt.hour.eq(0) & d["local_time"].dt.minute.eq(0)].tolist()
-    if not tick_rows:
-        tick_rows = list(range(0, len(d), 24))
     xticks: list[str] = []
     labels: list[str] = []
-    for idx in tick_rows:
-        if idx < 0 or idx >= len(d):
+    for tick_time in _selected_week_local_dates(week):
+        distances = (d["local_time"] - tick_time).abs()
+        if distances.empty or distances.isna().all():
             continue
-        date_part, time_part = _format_week_tick(pd.Timestamp(d.loc[idx, "local_time"]))
-        xticks.append(str(int(idx)))
-        labels.append(rf"\shortstack{{{date_part}\\{time_part}}}")
+        idx = int(distances.idxmin())
+        xticks.append(str(idx))
+        labels.append(_latex_escape(_format_week_date_label(tick_time)))
     return ",".join(xticks), ",".join(labels)
 
 
@@ -1345,7 +1353,7 @@ def write_example_week_latex(
 ) -> Path:
     d = view.copy()
     d["plot_idx"] = np.arange(len(d), dtype=int)
-    xticks, xticklabels = _latex_week_ticks(d)
+    xticks, xticklabels = _latex_week_ticks(d, week)
     date_range = _week_date_range_label(d)
     color_lines = [
         f"\\definecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
@@ -1461,11 +1469,8 @@ def plot_example_week(
     ax.set_ylabel(y_axis_label)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    tick_rows = d.index[d["local_time"].dt.hour.eq(0) & d["local_time"].dt.minute.eq(0)].tolist()
-    if not tick_rows:
-        tick_rows = list(range(0, len(d), 24))
-    tick_positions = [d.loc[i, "local_time"] for i in tick_rows if i in d.index]
-    tick_labels = ["\n".join(_format_week_tick(pd.Timestamp(t))) for t in tick_positions]
+    tick_positions = _selected_week_local_dates(week)
+    tick_labels = [_format_week_date_label(t) for t in tick_positions]
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)
     ax.tick_params(axis="x", rotation=0)

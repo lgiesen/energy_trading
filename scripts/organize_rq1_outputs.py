@@ -1231,11 +1231,21 @@ def _write_tail_spike_relative_tex(
             "DA price",
             "aFRR capacity price +",
             "aFRR capacity price -",
-            "aFRR activation price +",
-            "aFRR activation price -",
-            "aFRR activation rate +",
-            "aFRR activation rate -",
+            "aFRR activation price",
+            "aFRR activation rate",
         ],
+    }
+    aggregate_targets_by_key = {
+        "all_targets": {
+            "aFRR activation price": {
+                "target_group": "aFRR activation price",
+                "regimes": ["normal", "afrr_activation_price_abs_tail_top5", "high_volatility_week", "spike_week"],
+            },
+            "aFRR activation rate": {
+                "target_group": "aFRR activation rate",
+                "regimes": ["activation_zero_or_nearzero", "activation_nonzero", "high_volatility_week", "spike_week"],
+            },
+        }
     }
     aggregate_specs = {
         "capacity_price_aggregate": {
@@ -1271,7 +1281,13 @@ def _write_tail_spike_relative_tex(
         out = latex_dir / filename
         if target_key is not None:
             target_labels = target_orders[target_key]
-            d = data.loc[data["target_label"].isin(target_labels)].copy()
+            aggregate_targets = aggregate_targets_by_key.get(str(target_key), {})
+            if aggregate_targets:
+                raw_target_labels = [label for label in target_labels if label not in aggregate_targets]
+                aggregate_target_groups = [str(spec["target_group"]) for spec in aggregate_targets.values()]
+                d = data.loc[data["target_label"].isin(raw_target_labels) | data["target_group"].isin(aggregate_target_groups)].copy()
+            else:
+                d = data.loc[data["target_label"].isin(target_labels)].copy()
         elif aggregate_key is not None:
             spec = aggregate_specs[aggregate_key]
             d = data.loc[data["target_group"].eq(spec["target_group"])].copy()
@@ -1321,12 +1337,18 @@ def _write_tail_spike_relative_tex(
                 if "XGB" in row or "TFT" in row:
                     rows.append(row)
         else:
+            aggregate_targets = aggregate_targets_by_key.get(str(target_key), {})
             for target_label in target_labels:
-                target_part = d.loc[d["target_label"].eq(target_label)].copy()
+                target_spec = aggregate_targets.get(str(target_label))
+                if target_spec is not None:
+                    target_part = d.loc[d["target_group"].eq(target_spec["target_group"])].copy()
+                    regimes = list(target_spec["regimes"])
+                else:
+                    target_part = d.loc[d["target_label"].eq(target_label)].copy()
+                    regimes = main_regimes_by_target.get(target_label, target_part["regime"].dropna().astype(str).drop_duplicates().tolist())
                 if target_part.empty:
                     continue
                 target_section_start = len(rows)
-                regimes = main_regimes_by_target.get(target_label, target_part["regime"].dropna().astype(str).drop_duplicates().tolist())
                 for regime in regimes:
                     regime_part = target_part.loc[target_part["regime"].eq(regime)]
                     if regime_part.empty:
@@ -1402,6 +1424,7 @@ def _write_tail_spike_relative_tex(
             rf"                ytick={{{y_symbol_list}}},",
             rf"                yticklabels={{{y_tick_labels}}},",
             r"                yticklabel style={font=\scriptsize, text width=4.9cm, align=right},",
+            r"                enlarge y limits={abs=0.08},",
             r"                y dir=reverse,",
             r"            ]",
             rf"                \draw[color=secondary, densely dotted, line width=1.2pt, shorten <=-8mm, shorten >=-8mm] (axis cs:1,{y_symbols[0]}) -- (axis cs:1,{y_symbols[-1]});",
@@ -1414,6 +1437,7 @@ def _write_tail_spike_relative_tex(
                 lines.append(
                     rf"                \draw[color=naive, dashed, line width=0.6pt] ([yshift=-0.24cm]axis cs:0,{sep_symbol}) -- ([yshift=-0.24cm]axis cs:{_tex_num(xmax)},{sep_symbol});"
                 )
+        bar_shift_by_model = {"XGB": "-1.75pt", "TFT": "1.75pt"}
         for model in ["XGB", "TFT"]:
             coords: list[str] = []
             for row, y_symbol in zip(rows, y_symbols):
@@ -1422,7 +1446,8 @@ def _write_tail_spike_relative_tex(
                     coords.append(f"({_tex_num(value)},{y_symbol})")
             if coords:
                 color = _model_color_role(model)
-                lines.append(rf"                \addplot[xbar, bar shift=0pt, fill={color}, draw={color}, fill opacity=0.72, draw opacity=1, area legend] coordinates {{{' '.join(coords)}}};")
+                bar_shift = bar_shift_by_model.get(model, "0pt")
+                lines.append(rf"                \addplot[xbar, bar shift={bar_shift}, fill={color}, draw={color}, fill opacity=1, draw opacity=1, area legend] coordinates {{{' '.join(coords)}}};")
                 lines.append(rf"                \addlegendentry{{{model}}}")
         lines.extend(
             [
