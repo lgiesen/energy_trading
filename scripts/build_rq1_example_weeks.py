@@ -1052,7 +1052,7 @@ def _write_market_actionable_latex(
         [
             r"            \end{axis}",
             r"        \end{tikzpicture}}",
-            f"    \\caption[{_latex_escape(_market_actionable_short_caption(canonical_target))}]{{{_latex_escape(caption)} Selected period: {_latex_escape(date_range)}.}}",
+            f"    \\caption[{_latex_escape(_market_actionable_short_caption(canonical_target))}]{{{_latex_caption_escape(caption)} Selected period: {_latex_escape(date_range)}.}}",
             f"    \\label{{{label}}}",
             r"\end{figure}",
             "",
@@ -1592,6 +1592,10 @@ def _latex_escape(value: Any) -> str:
     }.items():
         s = s.replace(old, new)
     return s.replace(minus_token, "$-$")
+
+
+def _latex_caption_escape(value: Any) -> str:
+    return _latex_escape(value).replace(r"D\$-1\$", r"D$-1$")
 
 
 def _latex_color_name(role: str) -> str:

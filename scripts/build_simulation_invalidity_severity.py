@@ -1018,6 +1018,10 @@ def _latex_escape(value: Any) -> str:
     return "".join(repl.get(ch, ch) for ch in text)
 
 
+def _latex_table_cell(value: Any) -> str:
+    return _latex_escape(value).replace(r"\textbackslash{}\textbackslash{}", r"\\")
+
+
 def _numeric_sum_or_nan(df: pd.DataFrame, column: str) -> float:
     if column not in df:
         return float("nan")
@@ -1085,9 +1089,9 @@ def build_invalidity_context_table(summary: pd.DataFrame, *, include_benchmarks:
             "scope": scope,
         },
         {
-            "invalid_reason": "Infeasible DA lockbook position",
-            "occurrence": _fmt_occurrence(da_mwh, "MWh", digits=1),
-            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(da_mwh, total_trade, "total planned traded volume", num_unit="MWh", den_unit="MWh", digits=1),
+            "invalid_reason": r"Infeasible DA lockbook\\position",
+            "occurrence": _fmt_occurrence(da_mwh, "MWh", digits=2),
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(da_mwh, total_trade, "total planned traded volume", num_unit="MWh", den_unit="MWh", digits=2),
             "scope": scope,
         },
         {
@@ -1097,19 +1101,19 @@ def build_invalidity_context_table(summary: pd.DataFrame, *, include_benchmarks:
             "scope": scope,
         },
         {
-            "invalid_reason": "Missed activations, count",
+            "invalid_reason": "Missed activation counts",
             "occurrence": _fmt_occurrence(missed_count, "", digits=0),
             "share_compared_to_total_possible_occurrences": _fmt_ratio_text(missed_count, activation_count, "total BEM/BCM activation events", digits=0),
             "scope": scope,
         },
         {
-            "invalid_reason": "Missed activations, size",
+            "invalid_reason": "Missed activations size",
             "occurrence": _fmt_occurrence(missed_mwh, "MWh", digits=3),
             "share_compared_to_total_possible_occurrences": _fmt_ratio_text(missed_mwh, activation_mwh, "total BEM/BCM activation volume", num_unit="MWh", den_unit="MWh", digits=3),
             "scope": scope,
         },
         {
-            "invalid_reason": "Final SoC violation magnitude",
+            "invalid_reason": r"Final SoC violation\\magnitude",
             "occurrence": f"sum {_fmt_occurrence(soc_sum, 'MWh', digits=2)}; max {_fmt_occurrence(float(soc_max), 'MWh', digits=2)}",
             "share_compared_to_total_possible_occurrences": _fmt_ratio_text(soc_hours, total_hours, "total simulated scenario-hours", num_unit="hours", digits=0),
             "scope": scope,
@@ -1132,7 +1136,7 @@ def write_invalidity_context_latex(table: pd.DataFrame, path: Path, label: str) 
         r"\small",
         r"\begin{tabular}{@{}p{0.30\linewidth}p{0.20\linewidth}p{0.40\linewidth}@{}}",
         r"\toprule",
-        r"Invalid reason & Occurrence & Share compared to total possible occurrences \\",
+        r"\textbf{Invalid reason} & \textbf{Occurrence} & \textbf{Share compared to total possible occurrences} \\",
         r"\midrule",
     ]
     if table.empty:
@@ -1142,9 +1146,9 @@ def write_invalidity_context_latex(table: pd.DataFrame, path: Path, label: str) 
             rows.append(
                 " & ".join(
                     [
-                        _latex_escape(row.get("invalid_reason", "")),
-                        _latex_escape(row.get("occurrence", "")),
-                        _latex_escape(row.get("share_compared_to_total_possible_occurrences", "")),
+                        _latex_table_cell(row.get("invalid_reason", "")),
+                        _latex_table_cell(row.get("occurrence", "")),
+                        _latex_table_cell(row.get("share_compared_to_total_possible_occurrences", "")),
                     ]
                 )
                 + r" \\"
