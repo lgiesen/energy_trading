@@ -599,7 +599,7 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
         dst = target_root / "backup" / "csv" / "example_week_metrics.csv"
         _copy_file(metrics, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "csv", "path": str(dst), "metric_family": "example_weeks", "thesis_use": "backup data", "brief_description": "Example-week plot inventory and diagnostics."})
-    for src in sorted((source_dir / "backup" / "csv").glob("example_week_market_actionable_*.csv")):
+    for src in sorted((source_dir / "backup" / "csv").glob("example_week*.csv")):
         dst = target_root / "backup" / "csv" / src.name
         _copy_file(src, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "csv", "path": str(dst), "metric_family": "market_actionable_example_weeks", "thesis_use": "backup data", "brief_description": f"Market-actionable example-week data: {src.name}."})
@@ -610,11 +610,11 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
         dst = target_root / "backup" / "diagnostics" / "example_week_manifest.json"
         _copy_file(manifest, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "diagnostics", "path": str(dst), "metric_family": "example_weeks", "thesis_use": "diagnostics", "brief_description": "Example-week generation manifest."})
-    for src in sorted((source_dir / "backup" / "diagnostics").glob("example_week_market_actionable_*.csv")):
+    for src in sorted((source_dir / "backup" / "diagnostics").glob("example_week*.csv")):
         dst = target_root / "backup" / "diagnostics" / src.name
         _copy_file(src, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "diagnostics", "path": str(dst), "metric_family": "market_actionable_example_weeks", "thesis_use": "diagnostics", "brief_description": f"Market-actionable example-week diagnostics: {src.name}."})
-    for src in sorted((source_dir / "backup" / "warnings").glob("example_week_market_actionable_*.csv")):
+    for src in sorted((source_dir / "backup" / "warnings").glob("example_week*.csv")):
         dst = target_root / "backup" / "warnings" / src.name
         _copy_file(src, dst)
         entries.append({"subsection": subsection, "tier": "backup", "artifact_type": "warnings", "path": str(dst), "metric_family": "market_actionable_example_weeks", "thesis_use": "warnings", "brief_description": f"Market-actionable example-week warnings: {src.name}."})
@@ -1364,7 +1364,7 @@ def _write_tail_spike_relative_tex(
             y_tick_labels = ",".join(tick_label_parts)
         else:
             y_tick_labels = ",".join(_latex_escape(label) for label in labels)
-        height_cm = max(7.4, min(22.0 if compact_target_sections else 13.5, 0.47 * len(labels) + 2.0))
+        height_cm = max(7.8, min(29.0 if compact_target_sections else 16.0, 0.62 * len(labels) + 2.0))
         max_x = max(
             [1.0]
             + [
@@ -1412,7 +1412,7 @@ def _write_tail_spike_relative_tex(
             for start_idx in section_starts[1:]:
                 sep_symbol = y_symbols[start_idx]
                 lines.append(
-                    rf"                \draw[color=gray, dashed, line width=0.6pt] ([yshift=-0.24cm]axis cs:0,{sep_symbol}) -- ([yshift=-0.24cm]axis cs:{_tex_num(xmax)},{sep_symbol});"
+                    rf"                \draw[color=naive, dashed, line width=0.6pt] ([yshift=-0.24cm]axis cs:0,{sep_symbol}) -- ([yshift=-0.24cm]axis cs:{_tex_num(xmax)},{sep_symbol});"
                 )
         for model in ["XGB", "TFT"]:
             coords: list[str] = []
@@ -1422,7 +1422,7 @@ def _write_tail_spike_relative_tex(
                     coords.append(f"({_tex_num(value)},{y_symbol})")
             if coords:
                 color = _model_color_role(model)
-                lines.append(rf"                \addplot[xbar, fill={color}, draw={color}, area legend] coordinates {{{' '.join(coords)}}};")
+                lines.append(rf"                \addplot[xbar, bar shift=0pt, fill={color}, draw={color}, fill opacity=0.72, draw opacity=1, area legend] coordinates {{{' '.join(coords)}}};")
                 lines.append(rf"                \addlegendentry{{{model}}}")
         lines.extend(
             [
@@ -1465,7 +1465,7 @@ def _write_tail_spike_relative_tex(
     if activation is not None and activation.exists():
         written.append(activation)
     all_targets = _write_native_relative_file(
-        "tail_spike_relative_pinball_by_regime_all_targets.tex",
+        path.name,
         target_key="all_targets",
         figure_caption="Tail and spike performance across all target variables. Bars show mean pinball loss relative to RLQR for each target-specific regime. Target sections are separated by dashed grey horizontal lines; values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
         short_caption="Tail and spike performance across all target variables",
@@ -1474,6 +1474,16 @@ def _write_tail_spike_relative_tex(
     )
     if all_targets is not None and all_targets.exists():
         written.append(all_targets)
+    all_targets_copy = _write_native_relative_file(
+        "tail_spike_relative_pinball_by_regime_all_targets.tex",
+        target_key="all_targets",
+        figure_caption="Tail and spike performance across all target variables. Bars show mean pinball loss relative to RLQR for each target-specific regime. Target sections are separated by dashed grey horizontal lines; values below 1 indicate lower loss than RLQR, while values above 1 indicate worse performance.",
+        short_caption="Tail and spike performance across all target variables",
+        figure_label="fig:tail_spike_relative_pinball_all_targets",
+        compact_target_sections=True,
+    )
+    if all_targets_copy is not None and all_targets_copy.exists():
+        written.append(all_targets_copy)
     for aggregate_key, filename, figure_caption, short_caption, figure_label in [
         (
             "capacity_price_aggregate",
@@ -1504,6 +1514,8 @@ def _write_tail_spike_relative_tex(
             short_caption=short_caption,
             figure_label=figure_label,
         )
+    if all_targets is not None and all_targets.exists():
+        return all_targets
     if not written:
         return None
 

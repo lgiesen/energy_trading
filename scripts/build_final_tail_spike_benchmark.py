@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -907,7 +908,7 @@ def build_tail_spike_outputs(
 def _latex_escape(value: Any) -> str:
     s = str(value)
     minus_token = "@@RQ1MINUS@@"
-    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate", "capacity price", "activation price", "activation rate"]:
         s = s.replace(f"{label} -", f"{label} {minus_token}")
         s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
@@ -972,22 +973,36 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
     table["_target_order"] = table["target"].map(lambda x: target_sort_key(x)[0])
     table["_regime_order"] = table["regime"].map(lambda x: REGIME_ORDER.get(str(x), 99))
     table = table.sort_values(["_target_order", "_regime_order"]).drop(columns=["_target_order", "_regime_order"])
+
+    def _compact_target_label(value: Any) -> str:
+        label = str(value)
+        if label.startswith("aFRR "):
+            return label[len("aFRR ") :]
+        return label
+
     headers = ["Regime", "Target", "RLQR", "XGB", "TFT"]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        r"    \small",
         r"    \begin{tabular}{@{}llrrr@{}}",
         r"        \toprule",
         "        " + " & ".join(_latex_header(h) for h in headers) + r" \\",
         r"        \midrule",
     ]
+    section = ""
     for _, row in table.iterrows():
+        target_label = str(row["target_label"])
+        next_section = "aFRR" if target_label.startswith("aFRR ") else ""
+        if next_section and next_section != section:
+            lines.append(r"        \multicolumn{5}{@{}l}{\textit{aFRR}} \\")
+            section = next_section
         lines.append(
             "        "
             + " & ".join(
                 [
                     _latex_escape(row["regime_label"]),
-                    _latex_escape(row["target_label"]),
+                    _latex_escape(_compact_target_label(target_label)),
                     _fmt_best(row["RLQR"], model="RLQR", best_model=row["best_model"]),
                     _fmt_best(row["XGB"], model="XGB", best_model=row["best_model"]),
                     _fmt_best(row["TFT"], model="TFT", best_model=row["best_model"]),
@@ -1733,7 +1748,19 @@ def _mirror_structured(paths: list[Path], *, root_out_dir: Path, structured_out_
             continue
         dst = structured_out_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        if dst.exists() or dst.is_symlink():
+            try:
+                if src.samefile(dst):
+                    mirrored.append(dst)
+                    continue
+            except OSError:
+                pass
+            dst.unlink()
+        try:
+            os.link(src, dst)
+            shutil.copystat(src, dst, follow_symlinks=True)
+        except OSError:
+            shutil.copy2(src, dst)
         mirrored.append(dst)
     return mirrored
 

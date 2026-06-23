@@ -246,6 +246,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--targets", default="", help="Optional comma-separated targets for example-week plots.")
     p.add_argument("--lead", type=float, default=24.0)
     p.add_argument("--quantile", default="p50")
+    p.add_argument("--selection-mode", choices=["algorithmic", "legacy"], default="algorithmic")
     p.add_argument("--date", default=None, help="Optional custom week start for example-week plots.")
     p.add_argument("--typical-start", default="2025-03-30T22:00:00Z")
     p.add_argument("--high-volatility-start", default="2025-10-05T22:00:00Z")
@@ -427,6 +428,8 @@ def main() -> int:
             str(args.lead),
             "--quantile",
             str(args.quantile),
+            "--selection-mode",
+            str(args.selection_mode),
             "--typical-start",
             str(args.typical_start),
             "--high-volatility-start",
