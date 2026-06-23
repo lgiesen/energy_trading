@@ -167,6 +167,13 @@ def _latex_escape(value: Any) -> str:
     return "".join(repl.get(ch, ch) for ch in text)
 
 
+def _ensure_caption_period(caption: Any) -> str:
+    text = str(caption).strip()
+    if not text:
+        return "."
+    return text if text.endswith(".") else text + "."
+
+
 def _safe_float(value: Any) -> float:
     try:
         out = float(value)
@@ -1884,7 +1891,7 @@ def _write_latex_include(path: Path, figure_rel: str, caption: str, label: str) 
                 r"\begin{figure}[htbp]",
                 r"\centering",
                 rf"\includegraphics[width=\linewidth]{{{figure_rel}}}",
-                rf"\caption{{{_latex_escape(caption)}}}",
+                rf"\caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
                 rf"\label{{{label}}}",
                 r"\end{figure}",
                 "",

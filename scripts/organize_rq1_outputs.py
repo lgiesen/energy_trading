@@ -238,6 +238,13 @@ def _fmt(value: Any) -> str:
     return f"{x:.4f}" if np.isfinite(x) else "-"
 
 
+def _ensure_caption_period(caption: Any) -> str:
+    text = str(caption).strip()
+    if not text:
+        return "."
+    return text if text.endswith(".") else text + "."
+
+
 def _write_table(path: Path, headers: list[str], rows: list[list[Any]], caption: str, label: str) -> Path | None:
     if not rows:
         return None
@@ -252,7 +259,7 @@ def _write_table(path: Path, headers: list[str], rows: list[list[Any]], caption:
     ]
     for row in rows:
         lines.append("        " + " & ".join(_latex_escape(v) if not isinstance(v, (float, int, np.floating, np.integer)) else _fmt(v) for v in row) + r" \\")
-    lines.extend([r"        \bottomrule", r"    \end{tabular}", f"    \\caption{{{_latex_escape(caption)}}}", f"    \\label{{{_latex_escape(label)}}}", r"\end{table}", ""])
+    lines.extend([r"        \bottomrule", r"    \end{tabular}", f"    \\caption{{{_latex_escape(_ensure_caption_period(caption))}}}", f"    \\label{{{_latex_escape(label)}}}", r"\end{table}", ""])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -1043,7 +1050,7 @@ def _tikz_header(caption: str, label: str, *, placement: str = "htbp") -> list[s
 
 
 def _tikz_footer(caption: str, label: str, *, titlecase_caption: bool = True) -> list[str]:
-    display_caption = thesis_titlecase(caption) if titlecase_caption else caption
+    display_caption = _ensure_caption_period(thesis_titlecase(caption) if titlecase_caption else caption)
     return [
         r"        \end{tikzpicture}}",
         f"    \\caption{{{_latex_escape(display_caption)}}}",
@@ -1089,9 +1096,10 @@ def _with_combined_per_lead_layout(lines: list[str], filename: str) -> list[str]
     }
     for line in lines:
         if is_afrr_panel:
-            line = line.replace("horizontal sep=1.25cm", "horizontal sep=1.65cm")
+            line = line.replace("horizontal sep=1.25cm", "horizontal sep=2.05cm")
+            line = line.replace("horizontal sep=1.65cm", "horizontal sep=2.05cm")
         if needs_y_label_shift and "y label style={at={" in line:
-            line = re.sub(r"y label style=\{at=\{\(-?\d+(?:\.\d+)?,0\.5\)\}\}", r"y label style={at={(-0.17,0.5)}}", line)
+            line = re.sub(r"y label style=\{at=\{\(-?\d+(?:\.\d+)?,0\.5\)\}\}", r"y label style={at={(-0.22,0.5)}}", line)
         out.append(line)
     return out
 
@@ -1276,7 +1284,7 @@ def _write_gate_bucket_relative_tex(
         [
             r"            \end{axis}",
             r"        \end{tikzpicture}}",
-            f"    \\caption{{{_latex_escape(thesis_titlecase(caption))}}}",
+            f"    \\caption{{{_latex_escape(_ensure_caption_period(thesis_titlecase(caption)))}}}",
             f"    \\label{{{label}}}",
             r"\end{figure}",
             "",
@@ -1659,7 +1667,7 @@ def _write_tail_spike_relative_tex(
             [
             r"            \end{axis}",
             r"        \end{tikzpicture}}",
-            f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
+            f"    \\caption[{_latex_escape(_ensure_caption_period(short_caption))}]{{{_latex_escape(_ensure_caption_period(figure_caption))}}}",
             f"    \\label{{{figure_label}}}",
             r"\end{figure}",
             "",
@@ -1975,7 +1983,7 @@ def _write_tail_spike_relative_tex(
             [
                 r"            \end{axis}",
                 r"        \end{tikzpicture}}",
-                f"    \\caption[{_latex_escape(short_caption)}]{{{_latex_escape(figure_caption)}}}",
+                f"    \\caption[{_latex_escape(_ensure_caption_period(short_caption))}]{{{_latex_escape(_ensure_caption_period(figure_caption))}}}",
                 f"    \\label{{{figure_label}}}",
                 r"\end{figure}",
                 "",
@@ -2369,7 +2377,7 @@ def _write_p50_tolerance_curve_tex(
         [
             r"            \end{axis}",
             r"        \end{tikzpicture}}",
-            f"    \\caption{{{_latex_escape(caption)}}}",
+            f"    \\caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
             rf"    \label{{fig:{slug}_p50_absolute_error_tolerance_curve}}",
             r"\end{figure}",
             "",
@@ -2609,7 +2617,7 @@ def _write_line_panel_tex(
         [
             r"            \end{groupplot}",
             r"        \end{tikzpicture}}",
-            f"    \\caption{{{_latex_escape(thesis_titlecase(caption) if titlecase_caption else caption)}}}",
+            f"    \\caption{{{_latex_escape(_ensure_caption_period(thesis_titlecase(caption) if titlecase_caption else caption))}}}",
             f"    \\label{{{label}}}",
             r"\end{figure}",
             "",
@@ -2661,9 +2669,12 @@ def _write_combined_per_lead_pinball_tex(root: Path) -> Path | None:
         r"    \centering",
         r"    \captionsetup[subfigure]{font=small,skip=0.2em}",
         r"    \begin{tikzpicture}",
-        r"        \draw[color=secondary, line width=1pt] (0,0) -- (0.55,0) node[right, text=black] {RLQR};",
-        r"        \draw[color=primary, line width=1pt] (2.20,0) -- (2.75,0) node[right, text=black] {XGB};",
-        r"        \draw[color=tertiary, line width=1pt] (4.05,0) -- (4.60,0) node[right, text=black] {TFT};",
+        r"        \draw[color=secondary, line width=1pt] (0.00,0) -- (0.70,0);",
+        r"        \node[anchor=west, text=black] at (0.90,0) {RLQR};",
+        r"        \draw[color=primary, line width=1pt] (3.25,0) -- (3.95,0);",
+        r"        \node[anchor=west, text=black] at (4.15,0) {XGB};",
+        r"        \draw[color=tertiary, line width=1pt] (6.25,0) -- (6.95,0);",
+        r"        \node[anchor=west, text=black] at (7.15,0) {TFT};",
         r"    \end{tikzpicture}",
         r"    \vspace{0.15em}",
     ]
@@ -2683,6 +2694,7 @@ def _write_combined_per_lead_pinball_tex(root: Path) -> Path | None:
         lines.extend(
             [
                 r"        }",
+                r"        \phantomcaption",
                 f"        \\label{{{label}}}",
                 r"    \end{subfigure}",
             ]
@@ -2691,7 +2703,7 @@ def _write_combined_per_lead_pinball_tex(root: Path) -> Path | None:
             lines.append(r"    \vspace{0.25em}")
     lines.extend(
         [
-            r"    \caption{Mean pinball loss by lead hour across forecast targets. Grey bands mark decision-relevant lead ranges.}",
+            rf"    \caption{{{_latex_escape(_ensure_caption_period('Mean pinball loss by lead hour across forecast targets. Grey bands mark decision-relevant lead ranges.'))}}}",
             r"    \label{fig:rq1-4-1-3-per-lead-pinball-combined}",
             r"\end{figure}",
             "",

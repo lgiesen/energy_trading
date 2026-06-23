@@ -76,6 +76,14 @@ METRIC_LABELS = {
     "bias_p50": "Bias p50",
 }
 
+
+def _ensure_caption_period(caption: Any) -> str:
+    text = str(caption).strip()
+    if not text:
+        return "."
+    return text if text.endswith(".") else text + "."
+
+
 QCOL_RE = re.compile(r"^p(\d{1,2})$")
 KEY_COLS = ["target_time_utc", "lead_time_h"]
 ROW_INTERSECTION_KEY = "split,target,target_time_utc,lead_time_h"
@@ -961,7 +969,7 @@ def _latex_table(
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            rf"    \caption{{{_latex_escape(caption)}}}",
+            rf"    \caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
             rf"    \label{{{label}}}",
             r"\end{table}",
             "",
@@ -979,7 +987,7 @@ def write_latex_tables(primary: pd.DataFrame, detailed: pd.DataFrame, *, out_dir
         primary,
         columns=["target", "RLQR", "XGB", "TFT", "best_model", "relative_improvement_vs_RLQR_pct"],
         headers=["Target", "RLQR", "XGB", "TFT", "Best model", r"\shortstack{Improvement\\vs RLQR (\%)}"],
-        caption="Model Mean Pinball Loss",
+        caption="Model Mean Pinball Loss.",
         label="tab:forecast_metrics_full_primary",
         path=primary_path,
         bold_best_model_values=True,
@@ -1382,7 +1390,7 @@ def write_p50_error_tolerance_latex_figures(*, out_dir: Path, split: str) -> lis
             r"\begin{figure}[htbp]",
             r"    \centering",
             rf"    \includegraphics[width=\linewidth]{{{stem}.png}}",
-            f"    \\caption{{{caption}}}",
+            f"    \\caption{{{_ensure_caption_period(caption)}}}",
             rf"    \label{{fig:{stem}}}",
             r"\end{figure}",
             "",
