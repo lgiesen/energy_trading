@@ -2338,6 +2338,7 @@ def _write_line_tex(
     show_markers: bool = True,
     fragment_only: bool = False,
     highlight_spans: tuple[tuple[float, float], ...] = (),
+    axis_height: str | None = None,
 ) -> Path | None:
     if data.empty:
         return None
@@ -2350,7 +2351,7 @@ def _write_line_tex(
         [
             r"            \begin{axis}[",
             r"                width=0.96\textwidth,",
-            r"                height=7cm,",
+            rf"                height={axis_height or '7cm'},",
             rf"                xlabel={{{_latex_escape(xlabel)}}},",
             rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
             r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
@@ -2437,6 +2438,7 @@ def _write_line_panel_tex(
     highlight_spans: tuple[tuple[float, float], ...] = (),
     axis_height: str | None = None,
     y_tick_precision: int | None = None,
+    y_scale: float = 1.0,
 ) -> Path | None:
     if data.empty:
         return None
@@ -2490,7 +2492,7 @@ def _write_line_panel_tex(
             + "},",
         ) if y_col == "mean_pinball_loss" else ()),
         *([rf"                xmin={_tex_num(xlim[0])},", rf"                xmax={_tex_num(xlim[1])},"] if xlim is not None else []),
-        *([rf"                ymin={_tex_num(ylim[0])},", rf"                ymax={_tex_num(ylim[1])},"] if ylim is not None else []),
+        *([rf"                ymin={_tex_num(float(ylim[0]) * float(y_scale))},", rf"                ymax={_tex_num(float(ylim[1]) * float(y_scale))},"] if ylim is not None else []),
         *(_percent_tick_options(percent_ticks) if percent_ticks is not None else []),
         r"            ]",
         ]
@@ -2524,7 +2526,7 @@ def _write_line_panel_tex(
                 continue
             # Defensive aggregation: one plotted point per panel/model/lead.
             group = group.groupby(x_col, as_index=False)[y_col].mean()
-            coords = " ".join(f"({_tex_num(x)},{_tex_num(y)})" for x, y in zip(group[x_col], group[y_col]))
+            coords = " ".join(f"({_tex_num(x)},{_tex_num(float(y) * float(y_scale))})" for x, y in zip(group[x_col], group[y_col]))
             color = colors.get(series, "neutraldark")
             marker_style = rf"mark=*, mark options={{fill={color}, draw={color}}}" if show_markers else "mark=none"
             lines.append(rf"                    \addplot[color={color}, {marker_style}, line width=1pt] coordinates {{{coords}}};")
@@ -2870,11 +2872,15 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                     if target_slug == "afrr_activation_rate" and metric == "mean_pinball_loss":
                         shared_ylim = _zero_based_ylim(group, metric)
                         axis_height = "5.4cm"
-                        y_tick_precision = 4
+                        y_tick_precision = 2
+                        y_scale = 1000.0
+                        y_label = "Mean pinball loss (1e-3)"
                     else:
                         shared_ylim = _padded_ylim(group, metric)
                         axis_height = None
                         y_tick_precision = None
+                        y_scale = 1.0
+                        y_label = _tex_label(metric)
                     path = _write_line_panel_tex(
                         out,
                         data=group,
@@ -2884,7 +2890,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         series_col="model_label",
                         caption=f"{_tex_label(metric)} by lead hour for {_tex_label(group['target_group'].iloc[0])}.{caption_suffix}",
                         label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}",
-                        ylabel=_tex_label(metric),
+                        ylabel=y_label,
                         placement="htbp" if tier == "result_section" else "p",
                         show_markers=metric != "mean_pinball_loss",
                         ylim=shared_ylim,
@@ -2892,9 +2898,11 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         highlight_spans=highlight_spans,
                         axis_height=axis_height,
                         y_tick_precision=y_tick_precision,
+                        y_scale=y_scale,
                     )
                 else:
-                    path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.{caption_suffix}", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss", xlim=xlim, highlight_spans=highlight_spans)
+                    axis_height = "5.6cm" if target_slug == "da_price" and metric == "mean_pinball_loss" and tier == "result_section" else None
+                    path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.{caption_suffix}", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss", xlim=xlim, highlight_spans=highlight_spans, axis_height=axis_height)
                 if path:
                     _add_tikz_entry(entries, subsection=sec, tier=tier, path=path, metric_family=metric, description=f"Native pgfplots {metric} per-lead line chart for {target_slug}.")
             pivot = group.pivot_table(index=["target_label", "lead_time_h"], columns="model_label", values="mean_pinball_loss", aggfunc="first").reset_index()
