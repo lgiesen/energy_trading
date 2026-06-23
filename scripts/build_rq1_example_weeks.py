@@ -27,6 +27,8 @@ from energy_trading.evaluation.rq1_target_order import model_sort_key, sort_targ
 
 DEFAULT_HIGH_VOLATILITY_START_UTC = "2025-10-05T22:00:00Z"
 DEFAULT_TYPICAL_START_UTC = "2025-03-30T22:00:00Z"
+DEFAULT_EVAL_ORIGIN_START_UTC = "2025-01-13T23:00:00Z"
+DEFAULT_EVAL_ORIGIN_END_UTC = "2026-02-26T21:00:00Z"
 DEFAULT_LEAD_H = 24
 DEFAULT_QUANTILE = "p50"
 DEFAULT_WINDOW_HOURS = 24 * 7
@@ -220,6 +222,35 @@ def _parse_timestamp(raw: str) -> pd.Timestamp:
     return pd.Timestamp(ts)
 
 
+def _parse_optional_timestamp(raw: str | None) -> pd.Timestamp | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    return _parse_timestamp(str(raw))
+
+
+def _normalize_forecast_time_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "forecast_time_utc" not in df.columns and "snapshot_time_utc" in df.columns:
+        return df.rename(columns={"snapshot_time_utc": "forecast_time_utc"})
+    return df
+
+
+def _filter_eval_origin_window(
+    df: pd.DataFrame,
+    *,
+    eval_origin_start: pd.Timestamp | None,
+    eval_origin_end: pd.Timestamp | None,
+) -> pd.DataFrame:
+    if "forecast_time_utc" not in df.columns:
+        return df
+    out = df.copy()
+    out["forecast_time_utc"] = pd.to_datetime(out["forecast_time_utc"], utc=True, errors="coerce")
+    if eval_origin_start is not None:
+        out = out.loc[out["forecast_time_utc"].ge(eval_origin_start)].copy()
+    if eval_origin_end is not None:
+        out = out.loc[out["forecast_time_utc"].le(eval_origin_end)].copy()
+    return out
+
+
 def _discover_benchmark_dir(benchmark_root: Path, benchmark_dir: Path | None) -> Path:
     if benchmark_dir is not None:
         out = benchmark_dir.resolve()
@@ -298,11 +329,13 @@ def _read_model_target(
     target: str,
     lead_h: float,
     quantile: str,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     path = benchmark_dir / "diagnostics" / "joined_predictions" / f"{model.key}__{split}__{target}.parquet"
     if not path.exists():
         raise FileNotFoundError(f"Missing joined prediction file: {path}")
-    df = pd.read_parquet(path)
+    df = _normalize_forecast_time_column(pd.read_parquet(path))
     required = {"target_time_utc", "lead_time_h", "y_true"}
     missing = required - set(df.columns)
     if missing:
@@ -314,7 +347,9 @@ def _read_model_target(
             raise ValueError(f"{path} does not contain requested quantile column {quantile!r}.")
     else:
         pred_col = quantile
-    out = df[["target_time_utc", "lead_time_h", "y_true", pred_col]].copy()
+    optional_time_cols = ["forecast_time_utc"] if "forecast_time_utc" in df.columns else []
+    out = df[[*optional_time_cols, "target_time_utc", "lead_time_h", "y_true", pred_col]].copy()
+    out = _filter_eval_origin_window(out, eval_origin_start=eval_origin_start, eval_origin_end=eval_origin_end)
     out["target_time_utc"] = pd.to_datetime(out["target_time_utc"], utc=True, errors="coerce")
     out["lead_time_h"] = pd.to_numeric(out["lead_time_h"], errors="coerce")
     out["y_true"] = pd.to_numeric(out["y_true"], errors="coerce")
@@ -335,6 +370,8 @@ def load_merged_target(
     target: str,
     lead_h: float,
     quantile: str,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     merged: pd.DataFrame | None = None
     for model in models:
@@ -345,6 +382,8 @@ def load_merged_target(
             target=target,
             lead_h=lead_h,
             quantile=quantile,
+            eval_origin_start=eval_origin_start,
+            eval_origin_end=eval_origin_end,
         )
         if merged is None:
             merged = part.rename(columns={f"{model.key}_{quantile}": f"{model.key}_pred"})
@@ -422,17 +461,21 @@ def _read_week_selection_base(
     model: ModelSpec,
     split: str,
     canonical_target: str,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     target = _prediction_target(canonical_target)
     path = benchmark_dir / "diagnostics" / "joined_predictions" / f"{model.key}__{split}__{target}.parquet"
     if not path.exists():
         raise FileNotFoundError(f"Missing joined prediction file for week selection: {path}")
-    df = pd.read_parquet(path)
+    df = _normalize_forecast_time_column(pd.read_parquet(path))
     required = {"target_time_utc", "y_true"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"{path} is missing required week-selection columns: {sorted(missing)}")
-    out = df[["target_time_utc", "y_true"]].copy()
+    optional_time_cols = ["forecast_time_utc"] if "forecast_time_utc" in df.columns else []
+    out = df[[*optional_time_cols, "target_time_utc", "y_true"]].copy()
+    out = _filter_eval_origin_window(out, eval_origin_start=eval_origin_start, eval_origin_end=eval_origin_end)
     out["target_time_utc"] = pd.to_datetime(out["target_time_utc"], utc=True, errors="coerce")
     out["y_true"] = pd.to_numeric(out["y_true"], errors="coerce")
     out = out.dropna(subset=["target_time_utc", "y_true"]).copy()
@@ -659,11 +702,20 @@ def build_algorithmic_selected_weeks(
     split: str,
     canonical_targets: list[str],
     tail_spike_selected_weeks: str | None = None,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if split != "test":
         raise ValueError(f"Algorithmic final example-week mode only supports test split by default; got split={split!r}.")
     base_parts = [
-        _read_week_selection_base(benchmark_dir=benchmark_dir, model=models[0], split=split, canonical_target=target)
+        _read_week_selection_base(
+            benchmark_dir=benchmark_dir,
+            model=models[0],
+            split=split,
+            canonical_target=target,
+            eval_origin_start=eval_origin_start,
+            eval_origin_end=eval_origin_end,
+        )
         for target in canonical_targets
     ]
     base = pd.concat(base_parts, ignore_index=True) if base_parts else pd.DataFrame()
@@ -713,14 +765,14 @@ def _read_market_actionable_model_target(
     model: ModelSpec,
     split: str,
     canonical_target: str,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     target = _prediction_target(canonical_target)
     path = benchmark_dir / "diagnostics" / "joined_predictions" / f"{model.key}__{split}__{target}.parquet"
     if not path.exists():
         raise FileNotFoundError(f"Missing joined prediction file: {path}")
-    df = pd.read_parquet(path)
-    if "forecast_time_utc" not in df.columns and "snapshot_time_utc" in df.columns:
-        df = df.rename(columns={"snapshot_time_utc": "forecast_time_utc"})
+    df = _normalize_forecast_time_column(pd.read_parquet(path))
     required = {"forecast_time_utc", "target_time_utc", "lead_time_h", "y_true"}
     missing = required - set(df.columns)
     if missing:
@@ -735,6 +787,7 @@ def _read_market_actionable_model_target(
     out = df[["forecast_time_utc", "target_time_utc", "lead_time_h", "y_true", pred_col, *optional_quantiles]].copy()
     out["forecast_time_utc"] = pd.to_datetime(out["forecast_time_utc"], utc=True, errors="coerce")
     out["target_time_utc"] = pd.to_datetime(out["target_time_utc"], utc=True, errors="coerce")
+    out = _filter_eval_origin_window(out, eval_origin_start=eval_origin_start, eval_origin_end=eval_origin_end)
     out["lead_time_h"] = pd.to_numeric(out["lead_time_h"], errors="coerce")
     out["y_true"] = pd.to_numeric(out["y_true"], errors="coerce")
     out["p50"] = pd.to_numeric(out[pred_col], errors="coerce")
@@ -954,7 +1007,7 @@ def _plot_market_actionable(
     ax.set_title(figure_subtitle, fontsize=10, pad=3)
     ax.set_xlabel("Time")
     ax.set_ylabel(y_axis_label)
-    ax.set_xlim(0, max(len(d) - 1, 1))
+    ax.set_xlim(*_plot_index_xlim(d))
     ax.margins(x=0)
     xticks, xticklabels = _latex_week_ticks(d, week)
     tick_positions = [int(x) for x in xticks.split(",") if x] if xticks else []
@@ -1174,6 +1227,8 @@ def build_market_actionable_examples(
     selection_mode: str = "legacy",
     selected_weeks: pd.DataFrame | None = None,
     initial_warnings: pd.DataFrame | None = None,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> list[Path]:
     outputs: list[Path] = []
     plot_value_rows: list[pd.DataFrame] = []
@@ -1204,6 +1259,8 @@ def build_market_actionable_examples(
                     model=model,
                     split=split,
                     canonical_target=canonical_target,
+                    eval_origin_start=eval_origin_start,
+                    eval_origin_end=eval_origin_end,
                 )
             all_model_rows = pd.concat([cache[(model.key, canonical_target)] for model in models], ignore_index=True)
             if selection_mode == "algorithmic":
@@ -1641,7 +1698,9 @@ def _tex_num(value: Any) -> str:
 def _plot_index_xlim(frame: pd.DataFrame) -> tuple[float, float]:
     if frame.empty:
         return 0.0, 1.0
-    return 0.0, max(float(len(frame) - 1), 1.0)
+    xmax = max(float(len(frame) - 1), 1.0)
+    pad = max(1.0, min(2.0, xmax * 0.012))
+    return -pad, xmax + pad
 
 
 def _format_week_tick(ts: pd.Timestamp) -> tuple[str, str]:
@@ -1833,7 +1892,7 @@ def plot_example_week(
     ax.set_ylabel(y_axis_label)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    ax.set_xlim(0, max(len(d) - 1, 1))
+    ax.set_xlim(*_plot_index_xlim(d))
     ax.margins(x=0)
     xticks, xticklabels = _latex_week_ticks(d, week)
     tick_positions = [int(x) for x in xticks.split(",") if x] if xticks else []
@@ -1862,6 +1921,8 @@ def build_example_weeks(
     lead_h: float,
     quantile: str,
     window_hours: int,
+    eval_origin_start: pd.Timestamp | None = None,
+    eval_origin_end: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, list[Path]]:
     rows: list[dict[str, Any]] = []
     outputs: list[Path] = []
@@ -1877,6 +1938,8 @@ def build_example_weeks(
             target=target,
             lead_h=lead_h,
             quantile=quantile,
+            eval_origin_start=eval_origin_start,
+            eval_origin_end=eval_origin_end,
         )
         for week in weeks:
             view = _window_slice(merged_by_target[target], week.start_utc, window_hours)
@@ -2141,6 +2204,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--date", default=None, help="Optional custom UTC/local-parseable week start. If set, only this custom week is plotted.")
     p.add_argument("--typical-start", default=DEFAULT_TYPICAL_START_UTC)
     p.add_argument("--high-volatility-start", default=DEFAULT_HIGH_VOLATILITY_START_UTC)
+    p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound. Empty string disables the lower bound.")
+    p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound. Empty string disables the upper bound.")
     p.add_argument("--window-hours", type=int, default=DEFAULT_WINDOW_HOURS)
     return p.parse_args()
 
@@ -2153,6 +2218,8 @@ def main() -> int:
         Path(args.benchmark_root),
         Path(args.benchmark_dir) if args.benchmark_dir else None,
     )
+    eval_origin_start = _parse_optional_timestamp(args.eval_origin_start)
+    eval_origin_end = _parse_optional_timestamp(args.eval_origin_end)
     requested_targets = [t.strip() for t in str(args.targets).split(",") if t.strip()] or None
     targets = discover_targets(benchmark_dir, split=args.split, models=models, requested_targets=requested_targets)
     out_dir = Path(args.out_dir)
@@ -2170,6 +2237,8 @@ def main() -> int:
             lead_h=float(args.lead),
             quantile=quantile,
             window_hours=int(args.window_hours),
+            eval_origin_start=eval_origin_start,
+            eval_origin_end=eval_origin_end,
         )
         outputs.extend(
             build_market_actionable_examples(
@@ -2180,6 +2249,8 @@ def main() -> int:
                 weeks=weeks,
                 window_hours=int(args.window_hours),
                 selection_mode="legacy",
+                eval_origin_start=eval_origin_start,
+                eval_origin_end=eval_origin_end,
             )
         )
     else:
@@ -2193,6 +2264,8 @@ def main() -> int:
             split=args.split,
             canonical_targets=canonical_targets,
             tail_spike_selected_weeks=str(args.tail_spike_selected_weeks).strip() or None,
+            eval_origin_start=eval_origin_start,
+            eval_origin_end=eval_origin_end,
         )
         legacy_warning_rows: list[dict[str, Any]] = []
         if float(args.lead) != float(DEFAULT_LEAD_H):
@@ -2216,6 +2289,8 @@ def main() -> int:
                 selection_mode="algorithmic",
                 selected_weeks=selected_weeks,
                 initial_warnings=selection_warnings,
+                eval_origin_start=eval_origin_start,
+                eval_origin_end=eval_origin_end,
             )
         )
         validate_algorithmic_outputs(out_dir=out_dir, split=args.split)

@@ -86,10 +86,41 @@ def _run_step(name: str, cmd: list[str], *, log_dir: Path) -> dict[str, Any]:
 def _export_output_tree(source: Path, destination: Path) -> None:
     if not source.is_dir():
         raise FileNotFoundError(f"Cannot export missing RQ1 output directory: {source}")
-    if destination.exists():
-        shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    excluded_top_level = {
+        "_raw_outputs",
+        "_rq1_benchmark_inputs",
+        "diagnostics",
+        "logs",
+        "metrics",
+    }
+    exported_names: set[str] = set()
+    for child in sorted(source.iterdir()):
+        if child.name in excluded_top_level or child.name.startswith("."):
+            continue
+        if not (child.is_dir() or child.is_file()):
+            continue
+        target = destination / child.name
+        if target.exists() or target.is_symlink():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        if child.is_dir():
+            shutil.copytree(child, target)
+        else:
+            shutil.copy2(child, target)
+        exported_names.add(child.name)
+    for stale in excluded_top_level:
+        target = destination / stale
+        if target.exists() or target.is_symlink():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+    if not exported_names:
+        raise FileNotFoundError(f"No thesis-facing RQ1 output folders were available for export from {source}")
 
 
 def _prune_extensions(root: Path, suffixes: set[str]) -> dict[str, int]:
@@ -457,6 +488,7 @@ def main() -> int:
             str(args.high_volatility_start),
             "--window-hours",
             str(args.window_hours),
+            *eval_window_args,
         ]
         targets = _split_csv(args.targets)
         if targets:

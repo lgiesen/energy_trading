@@ -168,10 +168,18 @@ MAIN_ACTIVATION_TARGETS = [
     "aFRR activation rate -",
 ]
 
+AFRR_MAIN_REGIME_LABELS = {
+    "baseline": "Baseline",
+    "stress_week": "Stress week",
+    "high_tail_top5": "High-tail top 5%",
+}
+AFRR_MAIN_REGIME_ORDER = {regime: i for i, regime in enumerate(["baseline", "stress_week", "high_tail_top5"])}
+
 DA_TARGET = "target_da_price"
 CAPACITY_PRICE_TARGETS = {"target_afrr_capacity_price_pos", "target_afrr_capacity_price_neg"}
 ACTIVATION_PRICE_TARGETS = {"target_afrr_activation_price_vwap_pos", "target_afrr_activation_price_vwap_neg"}
 ACTIVATION_RATE_TARGETS = {"target_afrr_activation_rate_pos", "target_afrr_activation_rate_neg"}
+AFRR_TARGETS = {*CAPACITY_PRICE_TARGETS, *ACTIVATION_PRICE_TARGETS, *ACTIVATION_RATE_TARGETS}
 ALL_TARGETS = {DA_TARGET, *CAPACITY_PRICE_TARGETS, *ACTIVATION_PRICE_TARGETS, *ACTIVATION_RATE_TARGETS}
 
 
@@ -527,6 +535,8 @@ def _spike_selection_rule_for_target(target: str) -> str:
 
 def select_high_volatility_weeks(base: pd.DataFrame, *, top_share: float = 0.10) -> pd.DataFrame:
     d = base.copy()
+    if "target" not in d.columns:
+        d["target"] = d["target_group"] if "target_group" in d.columns else ""
     d = sort_target_frame(d, target_col="target", extra_cols=["split"])
     d["week_start_utc"] = _week_start_utc(d["target_time_utc"])
     rows: list[pd.DataFrame] = []
@@ -645,6 +655,270 @@ def _metrics(df: pd.DataFrame, qcols: dict[float, str]) -> dict[str, Any]:
             out[f"coverage_{label}"] = float(np.mean((lo <= y) & (y <= hi)))
             out[f"interval_width_{label}_mean"] = float(np.mean(hi - lo))
     return out
+
+
+def _afrr_main_high_tail_mask(target: str, y: pd.Series, threshold: float, *, epsilon: float) -> pd.Series:
+    target = canonical_target(target)
+    mask = pd.to_numeric(y, errors="coerce").ge(float(threshold))
+    if target in ACTIVATION_RATE_TARGETS:
+        mask &= pd.to_numeric(y, errors="coerce").gt(float(epsilon))
+    return mask.fillna(False)
+
+
+def _stress_week_rows_for_target(
+    base_target: pd.DataFrame,
+    *,
+    split: str,
+    target: str,
+    selected_weeks: pd.DataFrame,
+) -> pd.DataFrame:
+    target = canonical_target(target)
+    if not selected_weeks.empty and {"split", "target", "selection_type", "week_start_utc"} <= set(selected_weeks.columns):
+        selected = selected_weeks.loc[
+            selected_weeks["split"].eq(split)
+            & selected_weeks["target"].eq(target)
+            & selected_weeks["selection_type"].eq("high_volatility_week")
+        ].copy()
+        if not selected.empty:
+            selected["source_selection_type"] = "high_volatility_week"
+            selected["selection_type"] = "stress_week"
+            selected["selection_scope"] = "target"
+            selected["selection_rule"] = "Target-specific high-volatility week selected by weekly std(y_true)."
+            return selected
+    computed = select_high_volatility_weeks(base_target.assign(split=split, target=target))
+    if computed.empty:
+        return computed
+    computed["source_selection_type"] = "computed_high_volatility_week"
+    computed["selection_type"] = "stress_week"
+    computed["selection_scope"] = "target"
+    computed["selection_rule"] = "Target-specific high-volatility week selected by weekly std(y_true)."
+    return computed
+
+
+def _add_relative_vs_rlqr(metrics: pd.DataFrame, warnings: list[dict[str, Any]], *, split: str) -> pd.DataFrame:
+    if metrics.empty:
+        return metrics
+    out = metrics.copy()
+    out["relative_pinball_loss_vs_rlqr"] = np.nan
+    idx_cols = ["split", "target", "main_regime"]
+    rlqr = out.loc[out["model_label"].eq("RLQR"), [*idx_cols, "mean_pinball_loss"]].rename(columns={"mean_pinball_loss": "rlqr_mean_pinball_loss"})
+    out = out.merge(rlqr, on=idx_cols, how="left")
+    valid = out["rlqr_mean_pinball_loss"].notna() & out["rlqr_mean_pinball_loss"].ne(0)
+    out.loc[valid, "relative_pinball_loss_vs_rlqr"] = out.loc[valid, "mean_pinball_loss"] / out.loc[valid, "rlqr_mean_pinball_loss"]
+    bad = out.loc[~valid, idx_cols + ["target_label"]].drop_duplicates()
+    for _, row in bad.iterrows():
+        warnings.append(
+            {
+                "split": str(row.get("split", split)),
+                "target": str(row.get("target", "")),
+                "regime": str(row.get("main_regime", "")),
+                "severity": "warning",
+                "message": "RLQR denominator missing or zero for aFRR main-regime relative pinball loss; relative value set to NaN.",
+            }
+        )
+    return out
+
+
+def build_afrr_main_regime_outputs(
+    *,
+    loaded: dict[tuple[str, str, str], pd.DataFrame],
+    qmaps: dict[tuple[str, str, str], dict[float, str]],
+    models: list[ModelSpec],
+    splits: list[str],
+    selected_weeks: pd.DataFrame,
+    epsilon: float,
+    warnings: list[dict[str, Any]],
+    eval_origin_start: pd.Timestamp | None,
+    eval_origin_end: pd.Timestamp | None,
+) -> dict[str, pd.DataFrame]:
+    metric_rows: list[dict[str, Any]] = []
+    point_rows: list[pd.DataFrame] = []
+    definition_rows: list[dict[str, Any]] = []
+    overlap_rows: list[dict[str, Any]] = []
+    targets = sorted({target for _, _, target in loaded if target in AFRR_TARGETS}, key=target_sort_key)
+    for split in splits:
+        for target in targets:
+            if not all((m.key, split, target) in loaded for m in models):
+                continue
+            group, label = _target_info(target)
+            base_target = loaded[(models[0].key, split, target)][["forecast_time_utc", "target_time_utc", "lead_time_h", "y_true", "target"]].copy()
+            base_target["split"] = split
+            base_target["target"] = target
+            y = pd.to_numeric(base_target["y_true"], errors="coerce")
+            q95 = _threshold(y, 0.95)
+            if target in ACTIVATION_RATE_TARGETS and np.isfinite(q95) and q95 <= float(epsilon):
+                warnings.append(
+                    {
+                        "split": split,
+                        "target": target,
+                        "regime": "high_tail_top5",
+                        "severity": "warning",
+                        "message": "Activation-rate q95 is less than or equal to epsilon for aFRR main regime; high-tail mask still uses y_true > epsilon and y_true >= q95.",
+                    }
+                )
+            definition_rows.append(
+                {
+                    "split": split,
+                    "target": target,
+                    "target_display": label,
+                    "target_group": group,
+                    "regime": "high_tail_top5",
+                    "regime_label": AFRR_MAIN_REGIME_LABELS["high_tail_top5"],
+                    "definition_type": "threshold",
+                    "threshold_name": "q95",
+                    "threshold_value": q95,
+                    "epsilon": float(epsilon) if target in ACTIVATION_RATE_TARGETS else np.nan,
+                    "selection_scope": "target",
+                    "selection_rule": "Target-specific upper 5% realizations based on q95(y_true).",
+                }
+            )
+            definition_rows.append(
+                {
+                    "split": split,
+                    "target": target,
+                    "target_display": label,
+                    "target_group": group,
+                    "regime": "baseline",
+                    "regime_label": AFRR_MAIN_REGIME_LABELS["baseline"],
+                    "definition_type": "complement",
+                    "threshold_name": "",
+                    "threshold_value": np.nan,
+                    "epsilon": float(epsilon) if target in ACTIVATION_RATE_TARGETS else np.nan,
+                    "selection_scope": "target",
+                    "selection_rule": "Complement of stress-week and high-tail observations after high-tail priority assignment.",
+                }
+            )
+            stress_weeks = _stress_week_rows_for_target(base_target, split=split, target=target, selected_weeks=selected_weeks)
+            if not stress_weeks.empty:
+                for _, row in stress_weeks.iterrows():
+                    definition_rows.append(
+                        {
+                            "split": split,
+                            "target": target,
+                            "target_display": label,
+                            "target_group": group,
+                            "regime": "stress_week",
+                            "regime_label": AFRR_MAIN_REGIME_LABELS["stress_week"],
+                            "definition_type": "selected_week",
+                            "week_start_utc": pd.to_datetime(row.get("week_start_utc"), utc=True).isoformat(),
+                            "selection_type": "stress_week",
+                            "source_selection_type": str(row.get("source_selection_type", "high_volatility_week")),
+                            "volatility_score": row.get("volatility_score", np.nan),
+                            "n_rows": row.get("n_rows", np.nan),
+                            "selection_scope": "target",
+                            "selection_rule": "Target-specific high-volatility week selected by weekly std(y_true).",
+                        }
+                    )
+            high_tail = _afrr_main_high_tail_mask(target, y, q95, epsilon=epsilon)
+            week = _week_start_utc(base_target["target_time_utc"])
+            stress_week_values = (
+                pd.to_datetime(stress_weeks["week_start_utc"], utc=True)
+                if not stress_weeks.empty and "week_start_utc" in stress_weeks.columns
+                else pd.DatetimeIndex([], tz="UTC")
+            )
+            stress_raw = week.isin(stress_week_values)
+            overlap = high_tail & stress_raw
+            overlap_rows.append(
+                {
+                    "split": split,
+                    "target": target,
+                    "target_display": label,
+                    "target_group": group,
+                    "n_rows": int(len(base_target)),
+                    "stress_week_rows_before_priority": int(stress_raw.sum()),
+                    "high_tail_rows_before_priority": int(high_tail.sum()),
+                    "overlap_rows_before_priority": int(overlap.sum()),
+                    "overlap_share_of_rows": int(overlap.sum()) / len(base_target) if len(base_target) else np.nan,
+                    "priority_rule": "high_tail_top5 > stress_week > baseline",
+                }
+            )
+            regime_masks = {
+                "baseline": ~(stress_raw | high_tail),
+                "stress_week": stress_raw & ~high_tail,
+                "high_tail_top5": high_tail,
+            }
+            for main_regime, mask in regime_masks.items():
+                mask = pd.Series(mask, index=base_target.index).fillna(False)
+                if int(mask.sum()) == 0:
+                    warnings.append({"split": split, "target": target, "regime": main_regime, "severity": "warning", "message": "aFRR main regime selected zero rows."})
+                    continue
+                regime_keys = base_target.loc[mask, ["forecast_time_utc", "target_time_utc", "lead_time_h"]].copy()
+                selected = {
+                    m.key: loaded[(m.key, split, target)].merge(
+                        regime_keys,
+                        on=["forecast_time_utc", "target_time_utc", "lead_time_h"],
+                        how="inner",
+                    )
+                    for m in models
+                }
+                common_qs = set.intersection(*(set(qmaps[(m.key, split, target)]) for m in models))
+                if not common_qs:
+                    raise ValueError(f"No common quantile grid for split={split}, target={target}, main_regime={main_regime}.")
+                common_qcols = {m.key: {q: qmaps[(m.key, split, target)][q] for q in sorted(common_qs)} for m in models}
+                valid = {m.key: _valid_frame(selected[m.key], common_qcols[m.key]) for m in models}
+                common_keys = set.intersection(*(_key_tuples(valid[m.key]) for m in models))
+                if not common_keys:
+                    warnings.append({"split": split, "target": target, "regime": main_regime, "severity": "warning", "message": "aFRR main-regime common valid row intersection is empty."})
+                    continue
+                key_df = pd.DataFrame(list(common_keys), columns=["forecast_time_utc", "target_time_utc", "lead_time_h"])
+                quantiles_used = ",".join(_qcol(q) for q in sorted(common_qs))
+                for model in models:
+                    eval_df = valid[model.key].merge(key_df, on=["forecast_time_utc", "target_time_utc", "lead_time_h"], how="inner")
+                    metric_rows.append(
+                        {
+                            "model": model.key,
+                            "model_label": model.label,
+                            "split": split,
+                            "target": target,
+                            "target_label": label,
+                            "target_display": label,
+                            "target_group": group,
+                            "main_regime": main_regime,
+                            "regime": main_regime,
+                            "regime_label": AFRR_MAIN_REGIME_LABELS[main_regime],
+                            "quantiles_used": quantiles_used,
+                            "threshold_value": q95 if main_regime == "high_tail_top5" else np.nan,
+                            "threshold_name": "q95" if main_regime == "high_tail_top5" else "",
+                            "eval_origin_start_utc": eval_origin_start.isoformat() if eval_origin_start is not None else "",
+                            "eval_origin_end_utc": eval_origin_end.isoformat() if eval_origin_end is not None else "",
+                            **_metrics(eval_df, common_qcols[model.key]),
+                        }
+                    )
+                    keep_cols = [
+                        c
+                        for c in [
+                            "forecast_time_utc",
+                            "target_time_utc",
+                            "lead_time_h",
+                            "y_true",
+                            "p10",
+                            "p30",
+                            "p50",
+                            "p70",
+                            "p90",
+                        ]
+                        if c in eval_df.columns
+                    ]
+                    points = eval_df[keep_cols].copy()
+                    points["model"] = model.key
+                    points["model_label"] = model.label
+                    points["split"] = split
+                    points["target"] = target
+                    points["target_label"] = label
+                    points["target_display"] = label
+                    points["target_group"] = group
+                    points["main_regime"] = main_regime
+                    points["regime"] = main_regime
+                    points["regime_label"] = AFRR_MAIN_REGIME_LABELS[main_regime]
+                    point_rows.append(points)
+    metrics = sort_target_frame(pd.DataFrame(metric_rows), target_col="target", extra_cols=["main_regime", "model_label"])
+    metrics = _add_relative_vs_rlqr(metrics, warnings, split=",".join(splits)) if not metrics.empty else metrics
+    return {
+        "metrics": metrics,
+        "points": pd.concat(point_rows, ignore_index=True) if point_rows else pd.DataFrame(),
+        "definitions": sort_target_frame(pd.DataFrame(definition_rows), target_col="target", extra_cols=["regime"]) if definition_rows else pd.DataFrame(),
+        "overlap": sort_target_frame(pd.DataFrame(overlap_rows), target_col="target", extra_cols=["split"]) if overlap_rows else pd.DataFrame(),
+    }
 
 
 def _regime_definitions() -> pd.DataFrame:
@@ -893,6 +1167,17 @@ def build_tail_spike_outputs(
                             "message": "Regime requested for thesis main tail/spike figure is unavailable for this target; no placeholder bar is drawn.",
                         }
                     )
+    afrr_main = build_afrr_main_regime_outputs(
+        loaded=loaded,
+        qmaps=qmaps,
+        models=models,
+        splits=splits,
+        selected_weeks=selected_weeks,
+        epsilon=epsilon,
+        warnings=warnings,
+        eval_origin_start=eval_origin_start,
+        eval_origin_end=eval_origin_end,
+    )
 
     return {
         "metrics": metrics_df,
@@ -902,6 +1187,10 @@ def build_tail_spike_outputs(
         "selected_weeks": selected_weeks,
         "warnings": pd.DataFrame(warnings, columns=["split", "target", "regime", "severity", "message"]),
         "points": pd.concat(point_rows, ignore_index=True) if point_rows else pd.DataFrame(),
+        "afrr_main_regime_metrics": afrr_main["metrics"],
+        "afrr_main_regime_points": afrr_main["points"],
+        "afrr_main_regime_definitions": afrr_main["definitions"],
+        "afrr_main_regime_overlap": afrr_main["overlap"],
     }
 
 
@@ -1290,6 +1579,93 @@ def _plot_relative_pinball_main(metrics: pd.DataFrame, *, out_dir: Path, split: 
     return paths
 
 
+def _plot_afrr_main_regime_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    d = metrics.loc[metrics["split"].eq(split)].copy() if not metrics.empty and "split" in metrics.columns else pd.DataFrame()
+    if d.empty or "relative_pinball_loss_vs_rlqr" not in d.columns:
+        return []
+    d = d.loc[d["model_label"].isin(["XGB", "TFT"])].copy()
+    d = d.dropna(subset=["relative_pinball_loss_vs_rlqr"])
+    if d.empty:
+        return []
+    apply_geo_style()
+    target_labels = [
+        "aFRR capacity price +",
+        "aFRR capacity price -",
+        "aFRR activation price +",
+        "aFRR activation price -",
+        "aFRR activation rate +",
+        "aFRR activation rate -",
+    ]
+    target_labels = [label for label in target_labels if label in set(d["target_label"])]
+    if not target_labels:
+        return []
+    fig_height = max(7.6, 1.95 * len(target_labels))
+    fig, axes = plt.subplots(len(target_labels), 1, figsize=(11.4, fig_height), sharex=True)
+    axes_flat = [axes] if len(target_labels) == 1 else list(axes)
+    for ax, target_label in zip(axes_flat, target_labels):
+        p = d.loc[d["target_label"].eq(target_label)].copy()
+        regimes = [regime for regime in AFRR_MAIN_REGIME_ORDER if regime in set(p["main_regime"])]
+        y = np.arange(len(regimes), dtype=float)
+        height = 0.42
+        center_sep = height * 0.55
+        ax.axvline(1.0, color=THESIS_PALETTE["neutral_dark"], linestyle="--", linewidth=1.3, label="RLQR baseline")
+        for i, label in enumerate(["XGB", "TFT"]):
+            mg = p.loc[p["model_label"].eq(label)].copy()
+            if mg.empty:
+                continue
+            vals = [
+                float(mg.loc[mg["main_regime"].eq(regime), "relative_pinball_loss_vs_rlqr"].mean())
+                if mg["main_regime"].eq(regime).any()
+                else np.nan
+                for regime in regimes
+            ]
+            model_key = "tft" if label == "TFT" else "xgb"
+            ax.barh(y + (i - 0.5) * center_sep, vals, height=height, label=label, color=get_model_color(model_key), alpha=1.0)
+        ax.set_title(thesis_titlecase(target_label))
+        ax.set_yticks(y)
+        ax.set_yticklabels([AFRR_MAIN_REGIME_LABELS[regime] for regime in regimes])
+        ax.set_ylim(len(regimes) - 0.45, -0.45)
+        ax.grid(axis="x", alpha=0.25)
+    handles, legend_labels = axes_flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, legend_labels, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 0.995), frameon=False)
+    axes_flat[-1].set_xlabel("Mean pinball loss relative to RLQR")
+    fig.suptitle("aFRR Forecast Robustness by Regime", y=0.965)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for suffix in ["png", "pdf"]:
+        path = fig_dir / f"tail_spike_afrr_main_regime_relative_pinball.{suffix}"
+        fig.savefig(path)
+        paths.append(path)
+    plt.close(fig)
+    return paths
+
+
+def write_afrr_main_regime_latex_figure(*, out_dir: Path) -> Path:
+    tex_dir = out_dir / "latex_figures"
+    tex_dir.mkdir(parents=True, exist_ok=True)
+    path = tex_dir / "tail_spike_afrr_main_regime_relative_pinball.tex"
+    image_path = (
+        "figures/4-results/rq1_ml_model_benchmark/4_1_5_tail_spike/result_section/"
+        "figures/tail_spike_afrr_main_regime_relative_pinball.png"
+    )
+    lines = [
+        r"\begin{figure}[htbp]",
+        r"    \centering",
+        rf"    \includegraphics[width=\linewidth]{{{image_path}}}",
+        r"    \caption[aFRR forecast robustness by regime]{Relative mean pinball loss for aFRR forecasts across mutually exclusive baseline, stress-week, and high-tail regimes. Stress weeks are target-specific weeks with the largest weekly standard deviation of realized values, while high-tail observations are target-specific q95 realizations. Bars compare XGB and TFT against the RLQR baseline at one; values below one indicate lower loss than RLQR.}",
+        r"    \label{fig:tail_spike_afrr_main_regime_relative_pinball}",
+        r"\end{figure}",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
 def _plot_hexbin(metrics_source: pd.DataFrame, *, out_dir: Path) -> Path | None:
     import matplotlib.pyplot as plt
 
@@ -1676,6 +2052,10 @@ def write_outputs(
         ("tail_spike_plot_source_residual_distribution.csv", residual_source),
         ("tail_spike_residual_distribution.csv", residual_source),
         ("tail_spike_plot_source_hexbin.csv", hexbin_source),
+        ("tail_spike_afrr_main_regime_metrics.csv", outputs.get("afrr_main_regime_metrics", pd.DataFrame())),
+        ("tail_spike_afrr_main_regime_points.csv", outputs.get("afrr_main_regime_points", pd.DataFrame())),
+        ("tail_spike_afrr_main_regime_definitions.csv", outputs.get("afrr_main_regime_definitions", pd.DataFrame())),
+        ("tail_spike_afrr_main_regime_overlap.csv", outputs.get("afrr_main_regime_overlap", pd.DataFrame())),
     ]
     for name, df in csvs:
         path = out_dir / name
@@ -1689,6 +2069,7 @@ def write_outputs(
     plot_warnings: list[dict[str, Any]] = []
     plot_results = [
         _plot_relative_pinball_main(outputs["metrics"], out_dir=out_dir, split=split),
+        _plot_afrr_main_regime_relative_pinball(outputs.get("afrr_main_regime_metrics", pd.DataFrame()), out_dir=out_dir, split=split),
         _plot_relative_pinball_all_in_one(outputs["metrics"], out_dir=out_dir, split=split),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mean_pinball_loss", filename="tail_spike_pinball_by_regime.png", ylabel="Mean pinball loss"),
         _plot_metric(outputs["metrics"], out_dir=out_dir, split=split, metric="mae_p50", filename="tail_spike_mae_p50_by_regime.png", ylabel="MAE p50"),
@@ -1704,6 +2085,8 @@ def write_outputs(
                 paths.extend(p)
             else:
                 paths.append(p)
+    if not outputs.get("afrr_main_regime_metrics", pd.DataFrame()).empty:
+        paths.append(write_afrr_main_regime_latex_figure(out_dir=out_dir))
     example_path = out_dir / "tail_spike_example_week_selection.csv"
     example_selection_df = pd.DataFrame(example_week_selection)
     example_selection_df.to_csv(example_path, index=False)
