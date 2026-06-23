@@ -1183,7 +1183,7 @@ def _write_gate_bucket_relative_tex(
         r"                xbar,",
         r"                bar width=10pt,",
         r"                width=0.96\textwidth,",
-        r"                height=7.2cm,",
+        r"                height=5.8cm,",
         r"                xlabel={Mean pinball loss relative to RLQR},",
         r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
@@ -1895,10 +1895,10 @@ def _write_tail_spike_relative_tex(
             y_max = end_idx + 0.38
             y_mid = (start_idx + end_idx) / 2.0
             lines.append(
-                rf"                \draw[decorate, decoration={{brace, amplitude=4pt, mirror}}, color=neutraldark, line width=0.55pt] ([xshift=-5.22cm]axis cs:0,{_tex_num(y_min)}) -- ([xshift=-5.22cm]axis cs:0,{_tex_num(y_max)});"
+                rf"                \draw[decorate, decoration={{brace, amplitude=4pt, mirror}}, color=neutraldark, line width=0.55pt] ([xshift=-4.82cm]axis cs:0,{_tex_num(y_min)}) -- ([xshift=-4.82cm]axis cs:0,{_tex_num(y_max)});"
             )
             lines.append(
-                rf"                \node[rotate=90, anchor=center, text=neutraldark, font=\small] at ([xshift=-5.75cm]axis cs:0,{_tex_num(y_mid)}) {{{_compact_target_label_tex(target_label)}}};"
+                rf"                \node[rotate=90, anchor=center, text=neutraldark, font=\small] at ([xshift=-5.35cm]axis cs:0,{_tex_num(y_mid)}) {{{_compact_target_label_tex(target_label)}}};"
             )
         for start_idx in section_starts[1:]:
             lines.append(
@@ -1945,35 +1945,35 @@ def _write_tail_spike_relative_tex(
                     "id": "da_stress_week",
                     "target_label": "DA price",
                     "target_label_out": "DA price",
-                    "regime_label": "High-volatility/spike week",
+                    "regime_label": "Stress regime",
                     "regimes": {"high_volatility_week", "spike_week"},
                 },
                 {
                     "id": "capacity_pos_stress_week",
                     "target_label": "aFRR capacity price +",
                     "target_label_out": "aFRR capacity price +",
-                    "regime_label": "High-volatility/spike week",
+                    "regime_label": "Stress regime",
                     "regimes": {"high_volatility_week", "spike_week"},
                 },
                 {
                     "id": "capacity_neg_stress_week",
                     "target_label": "aFRR capacity price -",
                     "target_label_out": "aFRR capacity price -",
-                    "regime_label": "High-volatility/spike week",
+                    "regime_label": "Stress regime",
                     "regimes": {"high_volatility_week", "spike_week"},
                 },
                 {
                     "id": "activation_price_stress_week",
                     "target_group": "aFRR activation price",
                     "target_label_out": "aFRR activation price",
-                    "regime_label": "High-volatility/spike week",
+                    "regime_label": "Stress regime",
                     "regimes": {"high_volatility_week", "spike_week"},
                 },
                 {
                     "id": "activation_rate_stress_week",
                     "target_group": "aFRR activation rate",
                     "target_label_out": "aFRR activation rate",
-                    "regime_label": "High-volatility/spike week",
+                    "regime_label": "Stress regime",
                     "regimes": {"high_volatility_week", "spike_week"},
                 },
             ]
@@ -2014,8 +2014,8 @@ def _write_tail_spike_relative_tex(
             "tail_spike_relative_pinball_by_regime_all_targets_da_aggregated.tex",
             rows=rows,
             section_starts=section_starts,
-            figure_caption="Tail and spike performance across forecast targets with stress weeks aggregated. High-volatility and spike-week regimes are combined as target-specific unions, so overlapping hours are counted once.",
-            short_caption="Tail and spike performance across forecast targets with aggregated stress weeks",
+            figure_caption="Tail and spike performance across forecast targets. The stress regime combines target-specific high-volatility weeks, defined as the top 10% of weeks by weekly realized standard deviation, and spike-event weeks, defined as the top 10% of weeks by target-specific spike-event share; overlapping hours are counted once.",
+            short_caption="Tail and spike performance across forecast targets",
             figure_label="fig:tail_spike_relative_pinball_all_targets_da_aggregated",
         )
 
