@@ -1311,8 +1311,8 @@ def _write_tail_spike_relative_tex(
             "DA price": r"\shortstack{DA\\price}",
             "aFRR capacity price +": r"\shortstack{aFRR capacity\\price +}",
             "aFRR capacity price -": r"\shortstack{aFRR capacity\\price $-$}",
-            "aFRR activation price": r"\shortstack{aFRR activation\\price}",
-            "aFRR activation rate": r"\shortstack{aFRR activation\\rate}",
+            "aFRR activation price": r"\shortstack{aFRR activation\\prices (+/$-$)}",
+            "aFRR activation rate": r"\shortstack{aFRR activation\\rate (+/$-$)}",
         }
         return labels.get(label, _latex_escape(label))
 
@@ -1554,8 +1554,8 @@ def _write_tail_spike_relative_tex(
             )
         if compact_target_sections:
             use_compact_target_labels = use_all_target_compact_layout
-            target_label_xshift = "-5.05cm" if use_compact_target_labels else "-4.55cm"
-            brace_xshift = "-4.52cm" if use_compact_target_labels else "-1.05cm"
+            target_label_xshift = "-4.75cm" if use_compact_target_labels else "-4.55cm"
+            brace_xshift = "-4.22cm" if use_compact_target_labels else "-1.05cm"
             target_label_font = r"\small" if use_compact_target_labels else r"\scriptsize"
             for start_idx, end_idx, target_label in section_ranges:
                 y_min = start_idx - 0.38
@@ -1999,6 +1999,8 @@ def _write_line_panel_tex(
     percent_ticks: tuple[float, ...] | None = None,
     show_markers: bool = True,
     highlight_spans: tuple[tuple[float, float], ...] = (),
+    axis_height: str | None = None,
+    y_tick_precision: int | None = None,
 ) -> Path | None:
     if data.empty:
         return None
@@ -2011,7 +2013,7 @@ def _write_line_panel_tex(
     group_cols = min(len(panels), 2)
     group_rows = int(np.ceil(len(panels) / group_cols))
     axis_width = "0.47\\textwidth" if group_cols > 1 else "0.86\\textwidth"
-    axis_height = "6.2cm" if y_col == "mean_pinball_loss" else "5.8cm"
+    axis_height = axis_height or ("6.2cm" if y_col == "mean_pinball_loss" else "5.8cm")
     colors = {"TFT": "tertiary", "XGB": "primary", "RLQR": "secondary", "linear": "secondary", "tft": "tertiary", "xgb": "primary"}
     all_series = {str(series) for series in data[series_col].dropna().unique()}
     ordered_all_series = [s for s in ordered_model_labels(all_series) if s in all_series]
@@ -2047,7 +2049,9 @@ def _write_line_panel_tex(
         r"                grid=major,",
         *((
             r"                scaled y ticks=false,",
-            r"                y tick label style={/pgf/number format/fixed},",
+            "                y tick label style={/pgf/number format/fixed"
+            + (f", /pgf/number format/precision={int(y_tick_precision)}" if y_tick_precision is not None else "")
+            + "},",
         ) if y_col == "mean_pinball_loss" else ()),
         *([rf"                xmin={_tex_num(xlim[0])},", rf"                xmax={_tex_num(xlim[1])},"] if xlim is not None else []),
         *([rf"                ymin={_tex_num(ylim[0])},", rf"                ymax={_tex_num(ylim[1])},"] if ylim is not None else []),
@@ -2124,6 +2128,18 @@ def _padded_ylim(data: pd.DataFrame, value_col: str, *, include: tuple[float, ..
     span = ymax - ymin
     pad = max(abs(ymax) * 0.02, 1e-9) if span <= 0 else span * 0.06
     return ymin - pad, ymax + pad
+
+
+def _zero_based_ylim(data: pd.DataFrame, value_col: str, *, top_pad_fraction: float = 0.08) -> tuple[float, float] | None:
+    if data.empty or value_col not in data.columns:
+        return None
+    values = pd.to_numeric(data[value_col], errors="coerce").dropna()
+    if values.empty:
+        return None
+    ymax = float(values.max())
+    if not np.isfinite(ymax):
+        return None
+    return 0.0, max(ymax * (1.0 + top_pad_fraction), 1e-9)
 
 
 def _write_heatmap_tex(
@@ -2415,7 +2431,14 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 xlim = (0.0, 48.0) if highlight_spans else None
                 caption_suffix = " Relevant forecast lead highlighted in grey." if highlight_spans else ""
                 if group["target_label"].nunique(dropna=True) > 1:
-                    shared_ylim = _padded_ylim(group, metric)
+                    if target_slug == "afrr_activation_rate" and metric == "mean_pinball_loss":
+                        shared_ylim = _zero_based_ylim(group, metric)
+                        axis_height = "5.4cm"
+                        y_tick_precision = 4
+                    else:
+                        shared_ylim = _padded_ylim(group, metric)
+                        axis_height = None
+                        y_tick_precision = None
                     path = _write_line_panel_tex(
                         out,
                         data=group,
@@ -2431,6 +2454,8 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         ylim=shared_ylim,
                         xlim=xlim,
                         highlight_spans=highlight_spans,
+                        axis_height=axis_height,
+                        y_tick_precision=y_tick_precision,
                     )
                 else:
                     path = _write_line_tex(out, data=group, x_col="lead_time_h", y_col=metric, series_col="model_label", caption=f"{_tex_label(metric)} by lead hour for {target_label}.{caption_suffix}", label=f"fig:rq1-4-1-3-{stem.replace('_','-')}-{target_slug.replace('_','-')}", ylabel=_tex_label(metric), placement="htbp" if tier == "result_section" else "p", show_markers=metric != "mean_pinball_loss", xlim=xlim, highlight_spans=highlight_spans)

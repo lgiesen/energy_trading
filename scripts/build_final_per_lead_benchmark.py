@@ -597,6 +597,13 @@ def _figure_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, target_s
     if n == 1:
         axes = [axes]
     group_label = str(d["target_group"].iloc[0])
+    shared_ylim: tuple[float, float] | None = None
+    if target_slug == "afrr_activation_rate" and metric == "mean_pinball_loss" and n > 1:
+        values = pd.to_numeric(d[metric], errors="coerce").dropna()
+        if not values.empty:
+            ymax = float(values.max())
+            if np.isfinite(ymax):
+                shared_ylim = (0.0, max(ymax * 1.08, 1e-9))
     for ax, target_label in zip(axes, targets):
         panel = d[d["target_label"] == target_label].copy()
         for model in sorted(panel["model"].dropna().unique(), key=model_sort_key):
@@ -614,6 +621,9 @@ def _figure_metric(metrics: pd.DataFrame, *, out_dir: Path, split: str, target_s
             )
         ax.set_title(thesis_titlecase(str(target_label)))
         ax.set_ylabel(METRIC_LABELS.get(metric, metric))
+        if shared_ylim is not None:
+            ax.set_ylim(*shared_ylim)
+            ax.ticklabel_format(axis="y", style="plain", useOffset=False)
         ax.set_xlim(1, max(48, int(pd.to_numeric(d["lead_time_h"], errors="coerce").max())))
         ax.set_xticks([1, 8, 16, 24, 32, 40, 48])
         ax.legend(ncol=3, loc="upper left")

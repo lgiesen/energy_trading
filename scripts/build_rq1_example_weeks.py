@@ -79,11 +79,11 @@ MARKET_ACTIONABLE_TARGET_LABELS = {
 MARKET_ACTIONABLE_TITLE_LABELS = {
     "target_da_price": "DA Price",
     "target_afrr_capacity_price_pos": "aFRR Capacity Price +",
-    "target_afrr_capacity_price_neg": "aFRR Capacity Price −",
+    "target_afrr_capacity_price_neg": "aFRR Capacity Price -",
     "target_afrr_activation_price_vwap_pos": "aFRR Activation Price +",
-    "target_afrr_activation_price_vwap_neg": "aFRR Activation Price −",
+    "target_afrr_activation_price_vwap_neg": "aFRR Activation Price -",
     "target_afrr_activation_rate_pos": "aFRR Activation Rate +",
-    "target_afrr_activation_rate_neg": "aFRR Activation Rate −",
+    "target_afrr_activation_rate_neg": "aFRR Activation Rate -",
 }
 
 MARKET_ACTIONABLE_CAPTION_LABELS = {
@@ -843,7 +843,7 @@ def _week_type_label(week: WeekSpec) -> str:
 
 
 def _market_actionable_target_title(canonical_target: str) -> str:
-    return MARKET_ACTIONABLE_TITLE_LABELS.get(canonical_target, _market_target_label(canonical_target).replace(" -", " −"))
+    return MARKET_ACTIONABLE_TITLE_LABELS.get(canonical_target, _market_target_label(canonical_target))
 
 
 def _market_actionable_caption_target(canonical_target: str) -> str:
@@ -856,7 +856,7 @@ def _is_activation_assumption_target(canonical_target: str) -> bool:
 
 def _market_snapshot_label(spec: dict[str, Any], canonical_target: str, *, latex: bool = False) -> str:
     context = str(spec["market_context"])
-    dminus = "D$-1$" if latex else "D−1"
+    dminus = "D$-1$" if latex else "D-1"
     if context == "da_dminus1_11":
         return f"DA {dminus} 11:00 Europe/Berlin forecast snapshot"
     if context == "bcm_dplus1_08":
@@ -1591,7 +1591,17 @@ def _safe_slug(value: str) -> str:
 def _latex_escape(value: Any) -> str:
     s = str(value)
     minus_token = "@@RQ1MINUS@@"
-    for label in ["aFRR capacity price", "aFRR activation price", "aFRR activation rate"]:
+    for label in [
+        "aFRR capacity price",
+        "aFRR activation price",
+        "aFRR activation rate",
+        "aFRR Capacity Price",
+        "aFRR Activation Price",
+        "aFRR Activation Rate",
+        "Capacity price",
+        "Activation price",
+        "Activation rate",
+    ]:
         s = s.replace(f"{label} -", f"{label} {minus_token}")
         s = s.replace(f"{label} \u2212", f"{label} {minus_token}")
     for old, new in {
@@ -1663,6 +1673,7 @@ def _week_date_range_label(view: pd.DataFrame) -> str:
 
 
 def _latex_week_ticks(view: pd.DataFrame, week: WeekSpec) -> tuple[str, str]:
+    del week
     if view.empty:
         return "", ""
     d = view.copy()
@@ -1670,15 +1681,11 @@ def _latex_week_ticks(view: pd.DataFrame, week: WeekSpec) -> tuple[str, str]:
     d = d.dropna(subset=["local_time"]).reset_index(drop=True)
     if d.empty:
         return "", ""
-    xticks: list[str] = []
-    labels: list[str] = []
-    for tick_time in _selected_week_local_dates(week):
-        distances = (d["local_time"] - tick_time).abs()
-        if distances.empty or distances.isna().all():
-            continue
-        idx = int(distances.idxmin())
-        xticks.append(str(idx))
-        labels.append(_latex_escape(_format_week_date_label(tick_time)))
+    d["local_date"] = d["local_time"].dt.normalize()
+    first_per_date = d.groupby("local_date", sort=True)["plot_idx"].min().reset_index()
+    first_per_date = first_per_date.head(7)
+    xticks = [str(int(idx)) for idx in first_per_date["plot_idx"]]
+    labels = [_latex_escape(_format_week_date_label(ts)) for ts in first_per_date["local_date"]]
     return ",".join(xticks), ",".join(labels)
 
 
