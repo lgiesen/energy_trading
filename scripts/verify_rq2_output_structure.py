@@ -55,10 +55,30 @@ REQUIRED_FILES = [
     "rq2_output_manifest.json",
 ]
 
+INVALIDITY_SEVERITY_FILES = [
+    "appendix/tables/simulation_invalidity_severity_summary.tex",
+    "appendix/tables/simulation_invalidity_context_table.tex",
+    "appendix/tables/simulation_invalidity_reason_matrix.tex",
+    "appendix/figures/simulation_invalidity_reason_severity_heatmap.png",
+    "appendix/latex_figures/simulation_invalidity_reason_severity_heatmap.tex",
+    "backup/diagnostics/simulation_invalidity_severity_summary.csv",
+    "backup/diagnostics/simulation_invalidity_severity_by_hour.csv",
+    "backup/diagnostics/simulation_invalidity_source_inventory.csv",
+    "backup/diagnostics/simulation_invalidity_metric_sources.csv",
+    "backup/diagnostics/simulation_invalidity_context_table.csv",
+    "backup/diagnostics/simulation_invalidity_reason_matrix.csv",
+    "backup/diagnostics/simulation_invalidity_reason_severity_heatmap.csv",
+    "backup/diagnostics/simulation_invalidity_limitation_summary.txt",
+    "backup/warnings/simulation_invalidity_severity_warnings.csv",
+]
 
-def verify(out_root: Path) -> list[str]:
+
+def verify(out_root: Path, *, require_invalidity_severity: bool = False) -> list[str]:
     errors: list[str] = []
-    for rel in REQUIRED_FILES:
+    required = list(REQUIRED_FILES)
+    if require_invalidity_severity:
+        required.extend(INVALIDITY_SEVERITY_FILES)
+    for rel in required:
         if not (out_root / rel).exists():
             errors.append(f"Missing required file: {out_root / rel}")
 
@@ -108,8 +128,9 @@ def verify(out_root: Path) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Verify RQ2 thesis output structure.")
     ap.add_argument("--out-root", default="artifacts/benchmark/rq2_simulation_benchmark")
+    ap.add_argument("--require-invalidity-severity", action="store_true", help="Also require invalidity severity limitation outputs.")
     args = ap.parse_args()
-    errors = verify(Path(args.out_root))
+    errors = verify(Path(args.out_root), require_invalidity_severity=bool(args.require_invalidity_severity))
     if errors:
         for err in errors:
             print(f"[ERROR] {err}")

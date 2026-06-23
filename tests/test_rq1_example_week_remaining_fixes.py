@@ -108,6 +108,13 @@ def test_validate_algorithmic_outputs_fails_and_logs_missing_figure_path(tmp_pat
             "target_display": ["DA price"],
             "target_group": ["DA"],
             "y_axis_label": ["DA price (EUR/MWh)"],
+            "figure_title": ["DA Price: p50 Forecast"],
+            "figure_subtitle": ["Typical week | DA D−1 11:00 Europe/Berlin forecast snapshot"],
+            "caption": [
+                "Example-week DA price forecasts for the algorithmically selected typical week using the DA D$-1$ 11:00 Europe/Berlin forecast snapshot. The figure compares realized values with p50 forecasts from RLQR, XGB and TFT."
+            ],
+            "short_caption": ["Example-week DA price forecasts"],
+            "market_context_label": ["DA D−1 11:00 Europe/Berlin forecast snapshot"],
             "week_start_utc": ["2025-01-06T00:00:00Z"],
             "week_end_utc": ["2025-01-13T00:00:00Z"],
             "weekly_std": [1.0],

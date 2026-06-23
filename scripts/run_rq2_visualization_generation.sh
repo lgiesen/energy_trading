@@ -13,6 +13,7 @@ REGRET_BENCHMARK="${REGRET_BENCHMARK:-rhpf}"
 REGRET_MODELS="${REGRET_MODELS:-xgb,tft,linear}"
 REGRET_QUANTILES="${REGRET_QUANTILES:-p10,p30,p50,p70,p90}"
 REGRET_STRICT="${REGRET_STRICT:-1}"
+RUN_INVALIDITY_SEVERITY="${RUN_INVALIDITY_SEVERITY:-1}"
 
 "${PYTHON_BIN}" scripts/build_rq2_simulation_visualizations.py \
   --run-root "${RUN_ROOT}" \
@@ -39,8 +40,21 @@ if [[ "${RUN_REGRET_DRIVERS}" != "0" ]]; then
   "${REGRET_CMD[@]}"
 fi
 
-"${PYTHON_BIN}" scripts/verify_rq2_output_structure.py \
+if [[ "${RUN_INVALIDITY_SEVERITY}" != "0" ]]; then
+  "${PYTHON_BIN}" scripts/build_simulation_invalidity_severity.py \
+    --run-root "${RUN_ROOT}" \
+    --out-root "${OUT_ROOT}" \
+    --label rq2
+fi
+
+VERIFY_CMD=(
+  "${PYTHON_BIN}" scripts/verify_rq2_output_structure.py
   --out-root "${OUT_ROOT}"
+)
+if [[ "${RUN_INVALIDITY_SEVERITY}" != "0" ]]; then
+  VERIFY_CMD+=(--require-invalidity-severity)
+fi
+"${VERIFY_CMD[@]}"
 
 if [[ "${SKIP_EXPORT}" != "1" ]]; then
   EXPORT_DEST="${EXPORT_ROOT}/$(basename "${OUT_ROOT}")"

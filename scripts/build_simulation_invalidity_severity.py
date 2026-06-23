@@ -18,6 +18,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from energy_trading.evaluation.style import GEO_SEQUENTIAL_BLUE, THESIS_PALETTE, apply_geo_style
+
 
 DEFAULT_RUN_ROOT = Path("artifacts/simulation_runs/thesis_final_multi_2m_20260620T091938Z")
 DEFAULT_OUT_ROOT = Path("artifacts/final_benchmark/rq2/thesis_final_multi_2m_20260620T091938Z")
@@ -344,9 +346,10 @@ def _bool_flag(df: pd.DataFrame, candidates: list[str], *, contains: str | None 
         if contains:
             out = out | df[col].fillna("").astype(str).str.contains(contains, case=False, regex=True)
         else:
-            parsed = df[col].map(parse_bool)
+            parsed = df[col].map(parse_bool).astype("boolean")
             numeric = _num(df[col])
-            col_flag = parsed.fillna(numeric.abs() > 1e-9).fillna(False).astype(bool)
+            numeric_flag = numeric.abs().gt(1e-9).astype("boolean")
+            col_flag = parsed.where(parsed.notna(), numeric_flag).fillna(False).astype(bool)
             out = out | col_flag
     return out.astype(float), cols
 
@@ -407,6 +410,75 @@ def _metric_source(
     )
 
 
+def _supports_any(df: pd.DataFrame, candidates: list[str]) -> bool:
+    return bool(_find_cols(df, candidates))
+
+
+def _support_metrics_for_file(name: str, sample: pd.DataFrame) -> list[str]:
+    supported: list[str] = []
+    if sample.empty:
+        return supported
+    if name.startswith("backtest_hourly"):
+        if _timestamp_col(sample):
+            supported.append("total_hours")
+        if _supports_any(sample, ["optimizer_fallback_used", "fallback_used", "is_fallback_hour"]):
+            supported.append("fallback_optimization_count")
+        if _supports_any(sample, ["optimization_error_code", "real_optimization_error_code", "solver_status"]):
+            supported.append("optimization_infeasible")
+        if _supports_any(
+            sample,
+            [
+                "real_act_pos_mwh",
+                "real_act_neg_mwh",
+                "act_pos_mwh",
+                "act_neg_mwh",
+                "real_bem_only_executed_pos_mwh",
+                "real_bem_only_executed_neg_mwh",
+                "real_bcm_linked_pos_activation_mwh",
+                "real_bcm_linked_neg_activation_mwh",
+            ],
+        ):
+            supported.append("total_activation_mwh")
+        if _supports_any(sample, ["real_missed_activation_mwh", "missed_activation_mwh", "real_missed_activation_pos_mwh", "real_missed_activation_neg_mwh"]):
+            supported.append("missed_activation_mwh")
+        if _supports_any(sample, ["real_protected_soc_violation_pos_mwh", "real_protected_soc_violation_neg_mwh", "final_soc_shortfall_mwh", "real_soc_violation_mwh"]):
+            supported.append("soc_violation_mwh")
+        else:
+            soc_col = _find_col(sample, ["real_soc_mwh", "final_soc_mwh", "final_soc_after_terminal_closure_mwh"])
+            min_col = _find_col(sample, ["physical_soc_min_mwh", "soc_min_mwh"])
+            max_col = _find_col(sample, ["physical_soc_max_mwh", "soc_max_mwh"])
+            if soc_col and min_col and max_col and not any(token in soc_col.lower() for token in ["planned", "projected", "optimizer", "forecast"]):
+                supported.append("soc_violation_mwh")
+        if _supports_any(sample, ["headroom_violation_mwh", "headroom_violation_mw", "real_headroom_violation_pos_mwh", "real_headroom_violation_neg_mwh", "reserve_headroom_shortfall_mw", "real_reserve_headroom_shortfall_mw"]):
+            supported.append("reserve_headroom_shortfall_mw")
+    elif name == "da_precommit_debug.csv":
+        if _supports_any(sample, ["da_hourly_lock_infeasible_buy_mwh", "da_hourly_lock_infeasible_sell_mwh", "da_lockbook_infeasible_mwh", "da_existing_lockbook_physical_feasibility_passed", "da_combined_lockbook_physical_feasibility_passed"]):
+            supported.append("da_lockbook_infeasible_mwh")
+    elif name in {"optimization_log.csv", "optimization_failure_debug.csv", "optimization_infeasibility_attribution.csv"}:
+        if _supports_any(sample, ["optimizer_fallback_used", "fallback_used", "is_fallback_hour"]):
+            supported.append("fallback_optimization_count")
+            supported.append("total_optimization_count")
+        if _supports_any(sample, ["optimization_error_code", "solver_status", "status"]):
+            supported.append("optimization_infeasible")
+    elif name.startswith("realized_ledger"):
+        if _supports_any(sample, ["real_act_pos_mwh", "real_act_neg_mwh", "act_pos_mwh", "act_neg_mwh", "real_bem_only_executed_pos_mwh", "real_bem_only_executed_neg_mwh", "real_bcm_linked_pos_activation_mwh", "real_bcm_linked_neg_activation_mwh"]):
+            supported.append("total_activation_mwh")
+        if _supports_any(sample, ["real_missed_activation_mwh", "missed_activation_mwh", "real_missed_activation_pos_mwh", "real_missed_activation_neg_mwh"]):
+            supported.append("missed_activation_mwh")
+    elif name == "reserve_commitment_debug.csv":
+        if _supports_any(sample, ["headroom_violation_mwh", "headroom_violation_mw", "real_headroom_violation_pos_mwh", "real_headroom_violation_neg_mwh", "reserve_headroom_shortfall_mw", "real_reserve_headroom_shortfall_mw"]):
+            supported.append("reserve_headroom_shortfall_mw")
+    elif name in {"performance_metrics.csv", "metrics.csv"}:
+        if _supports_any(sample, ["da_bid_abs_mwh_total", "bem_bid_abs_mwh_total", "id_abs_mwh_total", "bcm_bid_abs_mwh_total", "planned_trade_abs_mwh_total"]):
+            supported.append("total_planned_trade_mwh")
+        if _supports_any(sample, ["simulation_valid", "thesis_reportable", "invalid_reason"]):
+            supported.append("validity_summary")
+    elif name in {"backtest_summary.json", "summary.json", "simulation_summary.csv", "report.json", "manifest.json"}:
+        if _supports_any(sample, ["simulation_valid", "thesis_reportable", "invalid_reason"]):
+            supported.append("validity_summary")
+    return sorted(set(supported))
+
+
 def _inventory(info: ScenarioInfo) -> tuple[pd.DataFrame, dict[str, Path]]:
     rows: list[dict[str, Any]] = []
     used: dict[str, Path] = {}
@@ -425,27 +497,21 @@ def _inventory(info: ScenarioInfo) -> tuple[pd.DataFrame, dict[str, Path]]:
                     row_count = int(len(sample))
                     columns = list(sample.columns)
                     ts_col = _timestamp_col(sample) or ""
+                    supported = _support_metrics_for_file(name, sample)
                     reason = ""
-                    if name.startswith("backtest_hourly"):
-                        supported += ["total_hours", "fallback_optimization", "missed_activation", "soc_violation", "reserve_headroom_shortfall"]
+                    if name.startswith("backtest_hourly") and supported:
                         used.setdefault("hourly", path)
-                    elif name == "da_precommit_debug.csv":
-                        supported.append("da_lockbook_infeasible")
+                    elif name == "da_precommit_debug.csv" and supported:
                         used.setdefault("da_precommit", path)
-                    elif name in {"optimization_log.csv", "optimization_failure_debug.csv", "optimization_infeasibility_attribution.csv"}:
-                        supported.append("optimization_infeasible")
+                    elif name in {"optimization_log.csv", "optimization_failure_debug.csv", "optimization_infeasibility_attribution.csv"} and supported:
                         used.setdefault("optimization", path)
-                    elif name.startswith("realized_ledger"):
-                        supported.append("activation_volume")
+                    elif name.startswith("realized_ledger") and supported:
                         used.setdefault("realized_ledger", path)
-                    elif name == "reserve_commitment_debug.csv":
-                        supported.append("reserve_headroom_shortfall")
+                    elif name == "reserve_commitment_debug.csv" and supported:
                         used.setdefault("reserve", path)
-                    elif name in {"performance_metrics.csv", "metrics.csv"}:
-                        supported.append("scenario_metrics")
+                    elif name in {"performance_metrics.csv", "metrics.csv"} and supported:
                         used.setdefault("metrics", path)
-                    elif name in {"backtest_summary.json", "summary.json", "simulation_summary.csv", "report.json", "manifest.json"}:
-                        supported.append("validity_summary")
+                    elif name in {"backtest_summary.json", "summary.json", "simulation_summary.csv", "report.json", "manifest.json"} and supported:
                         used.setdefault("summary", path)
                     if not supported:
                         reason = "file_exists_but_no_supported_invalidity_metrics_detected"
@@ -456,20 +522,48 @@ def _inventory(info: ScenarioInfo) -> tuple[pd.DataFrame, dict[str, Path]]:
                     "scenario": info.scenario,
                     "candidate_file": str(path),
                     "exists": bool(exists),
-                    "used": bool(supported),
+                    "supports_metric": bool(supported),
+                    "selected_for_extraction": False,
+                    "used": False,
                     "row_count": row_count,
                     "timestamp_column": ts_col,
                     "available_columns": ";".join(columns),
-                    "metrics_supported": ";".join(supported),
+                    "metrics_supported": ",".join(supported),
+                    "metrics_selected": "",
                     "reason_if_not_used": reason,
                 }
             )
-    selected_paths = {str(path) for path in used.values()}
-    for row in rows:
-        row["used"] = str(row["candidate_file"]) in selected_paths
-        if row["exists"] and row["metrics_supported"] and not row["used"]:
-            row["reason_if_not_used"] = "supported_file_exists_but_another_candidate_was_selected"
     return pd.DataFrame(rows), used
+
+
+def _annotate_inventory_selection(inventory: pd.DataFrame, metric_sources: pd.DataFrame) -> pd.DataFrame:
+    if inventory.empty:
+        return inventory
+    out = inventory.copy()
+    if "supports_metric" not in out.columns:
+        out["supports_metric"] = out.get("metrics_supported", "").astype(str).ne("")
+    out["selected_for_extraction"] = False
+    out["used"] = False
+    out["metrics_selected"] = ""
+    if not metric_sources.empty and {"source_file", "metric_name", "metric_status"}.issubset(metric_sources.columns):
+        selected = metric_sources.loc[
+            metric_sources["metric_status"].isin(["computed", "computed_from_fallback"])
+            & metric_sources["source_file"].fillna("").astype(str).ne("")
+        ].copy()
+        if not selected.empty:
+            selected_by_file = (
+                selected.groupby("source_file")["metric_name"]
+                .apply(lambda s: ",".join(sorted(set(str(x) for x in s if str(x)))))
+                .to_dict()
+            )
+            out["metrics_selected"] = out["candidate_file"].map(selected_by_file).fillna("")
+            out["selected_for_extraction"] = out["metrics_selected"].astype(str).ne("")
+            out["used"] = out["selected_for_extraction"]
+    supported = out["supports_metric"].map(parse_bool).fillna(False)
+    selected_flag = out["selected_for_extraction"].map(parse_bool).fillna(False)
+    out.loc[selected_flag, "reason_if_not_used"] = ""
+    out.loc[supported & ~selected_flag, "reason_if_not_used"] = "supported_file_exists_but_not_selected_for_extraction"
+    return out
 
 
 def _empty_hourly() -> pd.DataFrame:
@@ -890,7 +984,9 @@ def build_scenario(info: ScenarioInfo) -> tuple[pd.DataFrame, dict[str, Any], pd
             _warn(warnings, info.scenario, metric, "share_out_of_bounds", str(value))
     if np.isfinite(combined_hours) and np.isfinite(total_hours) and combined_hours > total_hours:
         _warn(warnings, info.scenario, "combined_infeasibility_hours", "validation_error", "combined_infeasibility_hours > total_hours")
-    return hourly_out.reindex(columns=HOURLY_COLUMNS), row, inventory, pd.DataFrame(metric_sources), warnings
+    metric_sources_df = pd.DataFrame(metric_sources)
+    inventory = _annotate_inventory_selection(inventory, metric_sources_df)
+    return hourly_out.reindex(columns=HOURLY_COLUMNS), row, inventory, metric_sources_df, warnings
 
 
 def _fmt_pct(value: Any) -> str:
@@ -920,6 +1016,438 @@ def _latex_escape(value: Any) -> str:
     text = "" if value is None else str(value)
     repl = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$", "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}"}
     return "".join(repl.get(ch, ch) for ch in text)
+
+
+def _numeric_sum_or_nan(df: pd.DataFrame, column: str) -> float:
+    if column not in df:
+        return float("nan")
+    values = pd.to_numeric(df[column], errors="coerce")
+    if values.notna().sum() == 0:
+        return float("nan")
+    return float(values.sum(skipna=True))
+
+
+def _num_scalar(value: Any) -> float:
+    return float(pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0])
+
+
+def _fmt_occurrence(value: float, unit: str, *, digits: int = 1) -> str:
+    if not np.isfinite(value):
+        return "--"
+    if unit:
+        return f"{value:,.{digits}f} {unit}"
+    if abs(value - round(value)) <= 1e-9:
+        return f"{int(round(value)):,}"
+    return f"{value:,.{digits}f}"
+
+
+def _fmt_ratio_text(numerator: float, denominator: float, denominator_label: str, *, num_unit: str = "", den_unit: str = "", digits: int = 1) -> str:
+    if not np.isfinite(numerator) or not np.isfinite(denominator) or abs(float(denominator)) <= 1e-12:
+        return "--"
+    pct = 100.0 * float(numerator) / float(denominator)
+    num = _fmt_occurrence(float(numerator), num_unit, digits=digits)
+    den = _fmt_occurrence(float(denominator), den_unit, digits=digits)
+    pct_digits = 2 if 0.0 < abs(pct) < 1.0 else 1
+    return f"{num} / {den} {denominator_label} = {pct:.{pct_digits}f}%"
+
+
+def build_invalidity_context_table(summary: pd.DataFrame, *, include_benchmarks: bool = False) -> pd.DataFrame:
+    """Aggregate invalidity metrics into a compact thesis limitation table."""
+    if summary.empty:
+        return pd.DataFrame(columns=["invalid_reason", "occurrence", "share_compared_to_total_possible_occurrences", "scope"])
+    d = summary.copy()
+    if "is_benchmark" in d.columns and not include_benchmarks:
+        d = d.loc[~d["is_benchmark"].map(parse_bool).fillna(False)].copy()
+
+    total_hours = _numeric_sum_or_nan(d, "total_hours")
+    combined_hours = _numeric_sum_or_nan(d, "combined_infeasibility_hours")
+    da_mwh = _numeric_sum_or_nan(d, "da_lockbook_infeasible_mwh")
+    total_trade = _numeric_sum_or_nan(d, "total_planned_trade_mwh")
+    fallback_count = _numeric_sum_or_nan(d, "fallback_optimization_count")
+    total_opt = _numeric_sum_or_nan(d, "total_optimization_count")
+    missed_count = _numeric_sum_or_nan(d, "missed_activation_count")
+    activation_count = _numeric_sum_or_nan(d, "total_activation_count")
+    missed_mwh = _numeric_sum_or_nan(d, "missed_activation_mwh")
+    activation_mwh = _numeric_sum_or_nan(d, "total_activation_mwh")
+    soc_hours = _numeric_sum_or_nan(d, "soc_violation_hours")
+    soc_sum = _numeric_sum_or_nan(d, "sum_soc_violation_mwh")
+    soc_max = pd.to_numeric(d.get("max_soc_violation_mwh", pd.Series(dtype=float)), errors="coerce").max()
+    reserve_hours = _numeric_sum_or_nan(d, "reserve_headroom_shortfall_hours")
+    reserve_sum = _numeric_sum_or_nan(d, "sum_reserve_headroom_shortfall_mw_hours")
+    reserve_max = pd.to_numeric(d.get("max_reserve_headroom_shortfall_mw", pd.Series(dtype=float)), errors="coerce").max()
+
+    scope = "model scenarios" if not include_benchmarks else "all scenarios"
+    rows = [
+        {
+            "invalid_reason": "Hours with any infeasibility",
+            "occurrence": _fmt_occurrence(combined_hours, "hours", digits=0),
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(combined_hours, total_hours, "total simulated scenario-hours", num_unit="hours", digits=0),
+            "scope": scope,
+        },
+        {
+            "invalid_reason": "Infeasible DA lockbook position",
+            "occurrence": _fmt_occurrence(da_mwh, "MWh", digits=1),
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(da_mwh, total_trade, "total planned traded volume", num_unit="MWh", den_unit="MWh", digits=1),
+            "scope": scope,
+        },
+        {
+            "invalid_reason": "Fallback optimizations",
+            "occurrence": _fmt_occurrence(fallback_count, "", digits=0),
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(fallback_count, total_opt, "total optimizations", digits=0),
+            "scope": scope,
+        },
+        {
+            "invalid_reason": "Missed activations, count",
+            "occurrence": _fmt_occurrence(missed_count, "", digits=0),
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(missed_count, activation_count, "total BEM/BCM activation events", digits=0),
+            "scope": scope,
+        },
+        {
+            "invalid_reason": "Missed activations, size",
+            "occurrence": _fmt_occurrence(missed_mwh, "MWh", digits=3),
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(missed_mwh, activation_mwh, "total BEM/BCM activation volume", num_unit="MWh", den_unit="MWh", digits=3),
+            "scope": scope,
+        },
+        {
+            "invalid_reason": "Final SoC violation magnitude",
+            "occurrence": f"sum {_fmt_occurrence(soc_sum, 'MWh', digits=2)}; max {_fmt_occurrence(float(soc_max), 'MWh', digits=2)}",
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(soc_hours, total_hours, "total simulated scenario-hours", num_unit="hours", digits=0),
+            "scope": scope,
+        },
+        {
+            "invalid_reason": "Reserve headroom shortfall magnitude",
+            "occurrence": f"sum {_fmt_occurrence(reserve_sum, 'MW-h', digits=2)}; max {_fmt_occurrence(float(reserve_max), 'MW', digits=2)}",
+            "share_compared_to_total_possible_occurrences": _fmt_ratio_text(reserve_hours, total_hours, "total simulated scenario-hours", num_unit="hours", digits=0),
+            "scope": scope,
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def write_invalidity_context_latex(table: pd.DataFrame, path: Path, label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\small",
+        r"\begin{tabular}{@{}p{0.30\linewidth}p{0.20\linewidth}p{0.40\linewidth}@{}}",
+        r"\toprule",
+        r"Invalid reason & Occurrence & Share compared to total possible occurrences \\",
+        r"\midrule",
+    ]
+    if table.empty:
+        rows.append(r"-- & -- & -- \\")
+    else:
+        for _, row in table.iterrows():
+            rows.append(
+                " & ".join(
+                    [
+                        _latex_escape(row.get("invalid_reason", "")),
+                        _latex_escape(row.get("occurrence", "")),
+                        _latex_escape(row.get("share_compared_to_total_possible_occurrences", "")),
+                    ]
+                )
+                + r" \\"
+            )
+    rows += [
+        r"\bottomrule",
+        r"\end{tabular}",
+        rf"\caption{{Aggregate simulation invalidity context for {label.upper()} model scenarios. The first row counts unique scenario-hours with at least one infeasibility flag; multiple infeasibilities in the same scenario-hour are counted once. SoC and reserve rows report magnitude together with affected-hour shares because no physical maximum-denominator column is available in the extracted diagnostics.}}",
+        rf"\label{{tab:{label}_simulation_invalidity_context}}",
+        r"\end{table}",
+        "",
+    ]
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+
+def _scenario_display_label(row: pd.Series) -> str:
+    model = str(row.get("model_label", row.get("model", ""))).strip()
+    quantile = str(row.get("quantile", "")).strip()
+    if not model:
+        model = str(row.get("scenario", "")).strip()
+    if quantile and quantile.lower() not in {"nan", "benchmark"}:
+        return f"{model} {quantile}"
+    return model
+
+
+def build_invalidity_reason_matrix(summary: pd.DataFrame, *, include_benchmarks: bool = False) -> pd.DataFrame:
+    """Scenario-by-reason occurrence matrix with denominator row."""
+    columns = [
+        "run",
+        "hours_with_any_infeasibility",
+        "infeasible_da_lockbook_position",
+        "fallback_optimizations",
+        "missed_activations_count",
+        "missed_activations_size",
+        "final_soc_violation",
+        "reserve_headroom_shortfall",
+    ]
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    d = summary.copy()
+    if "is_benchmark" in d.columns and not include_benchmarks:
+        d = d.loc[~d["is_benchmark"].map(parse_bool).fillna(False)].copy()
+    if d.empty:
+        return pd.DataFrame(columns=columns)
+    d["_model_order"] = d["model_label"].map({"RLQR": 0, "XGB": 1, "TFT": 2, "Naive": 3, "RHPF": 4}).fillna(99)
+    d["_quantile_order"] = d["quantile"].map({"p10": 10, "p30": 30, "p50": 50, "p70": 70, "p90": 90, "benchmark": 999}).fillna(998)
+    d = d.sort_values(["is_benchmark", "_model_order", "_quantile_order", "scenario"]).reset_index(drop=True)
+
+    rows: list[dict[str, str]] = []
+    for _, row in d.iterrows():
+        rows.append(
+            {
+                "run": _scenario_display_label(row),
+                "hours_with_any_infeasibility": _fmt_occurrence(_num_scalar(row.get("combined_infeasibility_hours")), "h", digits=0),
+                "infeasible_da_lockbook_position": _fmt_occurrence(_num_scalar(row.get("da_lockbook_infeasible_mwh")), "MWh", digits=1),
+                "fallback_optimizations": _fmt_occurrence(_num_scalar(row.get("fallback_optimization_count")), "", digits=0),
+                "missed_activations_count": _fmt_occurrence(_num_scalar(row.get("missed_activation_count")), "", digits=0),
+                "missed_activations_size": _fmt_occurrence(_num_scalar(row.get("missed_activation_mwh")), "MWh", digits=3),
+                "final_soc_violation": f"{_fmt_occurrence(_num_scalar(row.get('sum_soc_violation_mwh')), 'MWh', digits=2)}; {_fmt_occurrence(_num_scalar(row.get('soc_violation_hours')), 'h', digits=0)}",
+                "reserve_headroom_shortfall": f"{_fmt_occurrence(_num_scalar(row.get('sum_reserve_headroom_shortfall_mw_hours')), 'MW-h', digits=2)}; {_fmt_occurrence(_num_scalar(row.get('reserve_headroom_shortfall_hours')), 'h', digits=0)}",
+            }
+        )
+
+    rows.append(
+        {
+            "run": "Total possible occurrences",
+            "hours_with_any_infeasibility": _fmt_occurrence(_numeric_sum_or_nan(d, "total_hours"), "h", digits=0),
+            "infeasible_da_lockbook_position": _fmt_occurrence(_numeric_sum_or_nan(d, "total_planned_trade_mwh"), "MWh", digits=1),
+            "fallback_optimizations": _fmt_occurrence(_numeric_sum_or_nan(d, "total_optimization_count"), "", digits=0),
+            "missed_activations_count": _fmt_occurrence(_numeric_sum_or_nan(d, "total_activation_count"), "", digits=0),
+            "missed_activations_size": _fmt_occurrence(_numeric_sum_or_nan(d, "total_activation_mwh"), "MWh", digits=3),
+            "final_soc_violation": _fmt_occurrence(_numeric_sum_or_nan(d, "total_hours"), "h", digits=0),
+            "reserve_headroom_shortfall": _fmt_occurrence(_numeric_sum_or_nan(d, "total_hours"), "h", digits=0),
+        }
+    )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _matrix_column_label(column: str) -> str:
+    labels = {
+        "run": "Run",
+        "hours_with_any_infeasibility": "Any infeas. hours",
+        "infeasible_da_lockbook_position": "DA lockbook infeas.",
+        "fallback_optimizations": "Fallback opt.",
+        "missed_activations_count": "Missed act. count",
+        "missed_activations_size": "Missed act. size",
+        "final_soc_violation": "Final SoC viol.",
+        "reserve_headroom_shortfall": "Reserve shortfall",
+    }
+    return labels.get(column, column)
+
+
+def write_invalidity_reason_matrix_latex(table: pd.DataFrame, path: Path, label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = list(table.columns) if not table.empty else [
+        "run",
+        "hours_with_any_infeasibility",
+        "infeasible_da_lockbook_position",
+        "fallback_optimizations",
+        "missed_activations_count",
+        "missed_activations_size",
+        "final_soc_violation",
+        "reserve_headroom_shortfall",
+    ]
+    header = " & ".join(_latex_escape(_matrix_column_label(c)) for c in cols) + r" \\"
+    rows = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\scriptsize",
+        r"\setlength{\tabcolsep}{3pt}",
+        r"\resizebox{\linewidth}{!}{%",
+        r"\begin{tabular}{@{}lrrrrrrr@{}}",
+        r"\toprule",
+        header,
+        r"\midrule",
+    ]
+    if table.empty:
+        rows.append(r"-- & -- & -- & -- & -- & -- & -- & -- \\")
+    else:
+        for idx, row in table.iterrows():
+            cells = [_latex_escape(row.get(c, "")) for c in cols]
+            line = " & ".join(cells) + r" \\"
+            if idx == len(table) - 1:
+                rows.append(r"\midrule")
+                rows.append(r"\textbf{" + cells[0] + "} & " + " & ".join(cells[1:]) + r" \\")
+            else:
+                rows.append(line)
+    rows += [
+        r"\bottomrule",
+        r"\end{tabular}%",
+        r"}",
+        rf"\caption{{Invalidity reason occurrence matrix for {label.upper()} model scenarios. Cells report the observed occurrence magnitude per run. The final row reports the denominator used for contextualization: simulated scenario-hours for hour-based diagnostics, total planned traded MWh for DA lockbook infeasibility, total optimizations for fallback optimizations, and total activation events or MWh for missed activations. SoC and reserve shortfall cells report magnitude followed by affected hours.}}",
+        rf"\label{{tab:{label}_simulation_invalidity_reason_matrix}}",
+        r"\end{table}",
+        "",
+    ]
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+
+HEATMAP_REASON_SPECS = [
+    ("Any infeas. hours", "combined_infeasibility_hours", "total_hours"),
+    ("DA lockbook", "da_lockbook_infeasible_mwh", "total_planned_trade_mwh"),
+    ("Fallback opt.", "fallback_optimization_count", "total_optimization_count"),
+    ("Missed act. count", "missed_activation_count", "total_activation_count"),
+    ("Missed act. volume", "missed_activation_mwh", "total_activation_mwh"),
+    ("SoC violation hours", "soc_violation_hours", "total_hours"),
+    ("Reserve shortfall hours", "reserve_headroom_shortfall_hours", "total_hours"),
+]
+
+
+def build_invalidity_reason_severity_heatmap(summary: pd.DataFrame, *, include_benchmarks: bool = False) -> pd.DataFrame:
+    """Long-form normalized severity values for the invalidity heatmap."""
+    if summary.empty:
+        return pd.DataFrame(columns=["run", "reason", "severity_share", "severity_percent", "numerator", "denominator"])
+    d = summary.copy()
+    if "is_benchmark" in d.columns and not include_benchmarks:
+        d = d.loc[~d["is_benchmark"].map(parse_bool).fillna(False)].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["run", "reason", "severity_share", "severity_percent", "numerator", "denominator"])
+    d["_model_order"] = d["model_label"].map({"RLQR": 0, "XGB": 1, "TFT": 2, "Naive": 3, "RHPF": 4}).fillna(99)
+    d["_quantile_order"] = d["quantile"].map({"p10": 10, "p30": 30, "p50": 50, "p70": 70, "p90": 90, "benchmark": 999}).fillna(998)
+    d = d.sort_values(["is_benchmark", "_model_order", "_quantile_order", "scenario"]).reset_index(drop=True)
+    rows: list[dict[str, Any]] = []
+    for _, row in d.iterrows():
+        run = _scenario_display_label(row)
+        for reason, num_col, den_col in HEATMAP_REASON_SPECS:
+            numerator = _num_scalar(row.get(num_col))
+            denominator = _num_scalar(row.get(den_col))
+            share = numerator / denominator if np.isfinite(numerator) and np.isfinite(denominator) and abs(denominator) > 1e-12 else float("nan")
+            rows.append(
+                {
+                    "run": run,
+                    "reason": reason,
+                    "severity_share": share,
+                    "severity_percent": 100.0 * share if np.isfinite(share) else float("nan"),
+                    "numerator": numerator,
+                    "denominator": denominator,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def plot_invalidity_reason_severity_heatmap(data: pd.DataFrame, path: Path) -> Path | None:
+    if data.empty:
+        return None
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    apply_geo_style()
+    runs = data["run"].astype(str).drop_duplicates().tolist()
+    reasons = data["reason"].astype(str).drop_duplicates().tolist()
+    pivot = data.pivot(index="run", columns="reason", values="severity_percent").reindex(index=runs, columns=reasons)
+    arr = pivot.to_numpy(dtype=float)
+    vmax = float(np.nanmax(arr)) if np.isfinite(arr).any() else 1.0
+    vmax = max(vmax, 1.0)
+    cmap = LinearSegmentedColormap.from_list(
+        "geo_sequential_blue",
+        [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)],
+    )
+    cmap.set_bad("#F2F2F2")
+    fig_h = max(5.2, 0.34 * len(runs) + 1.8)
+    fig, ax = plt.subplots(figsize=(10.4, fig_h))
+    im = ax.imshow(np.ma.masked_invalid(arr), aspect="auto", cmap=cmap, vmin=0.0, vmax=vmax)
+    ax.grid(False)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.set_xticks(np.arange(len(reasons)))
+    ax.set_xticklabels(reasons, rotation=35, ha="right")
+    ax.set_yticks(np.arange(len(runs)))
+    ax.set_yticklabels(runs)
+    ax.set_xlabel("Invalidity reason")
+    ax.set_ylabel("Simulation run")
+    ax.set_title("Invalidity Reason Severity by Simulation Run")
+    for yi, run in enumerate(runs):
+        for xi, reason in enumerate(reasons):
+            val = float(pivot.loc[run, reason]) if pd.notna(pivot.loc[run, reason]) else float("nan")
+            if not np.isfinite(val):
+                txt = "--"
+                color = THESIS_PALETTE["neutral_dark"]
+            else:
+                txt = f"{val:.1f}%"
+                color = "white" if val > 0.55 * vmax else THESIS_PALETTE["neutral_dark"]
+            ax.text(xi, yi, txt, ha="center", va="center", fontsize=7.5, color=color)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Severity share (%)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+    return path
+
+
+def _hex_to_rgb255(hex_color: str) -> tuple[int, int, int]:
+    clean = hex_color.strip().lstrip("#")
+    return int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16)
+
+
+def write_invalidity_reason_severity_heatmap_latex(data: pd.DataFrame, path: Path, label: str) -> Path | None:
+    if data.empty:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    runs = data["run"].astype(str).drop_duplicates().tolist()
+    reasons = data["reason"].astype(str).drop_duplicates().tolist()
+    values = pd.to_numeric(data["severity_percent"], errors="coerce")
+    vmax = float(values.max()) if values.notna().any() else 1.0
+    vmax = max(vmax, 1.0)
+    points: list[str] = []
+    nodes: list[str] = []
+    for _, row in data.iterrows():
+        xi = reasons.index(str(row["reason"]))
+        yi = runs.index(str(row["run"]))
+        val = _num_scalar(row.get("severity_percent"))
+        if not np.isfinite(val):
+            continue
+        points.append(f"({xi},{yi}) [{val:.6g}]")
+        text_color = "white" if val > 0.55 * vmax else "neutraldark"
+        nodes.append(rf"\node[text={text_color}, font=\tiny] at (axis cs:{xi},{yi}) {{{val:.1f}\%}};")
+    color_stops = []
+    for idx, key in enumerate([f"seq_{i}" for i in range(1, 8)]):
+        r, g, b = _hex_to_rgb255(GEO_SEQUENTIAL_BLUE[key])
+        color_stops.append(f"rgb255({idx}cm)=({r},{g},{b})")
+    rows = [
+        r"% Requires: \usepackage{pgfplots}",
+        r"% Requires: \pgfplotsset{compat=1.18}",
+        r"\definecolor{neutraldark}{HTML}{333333}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        r"\begin{axis}[",
+        r"width=\linewidth,",
+        r"height=0.62\linewidth,",
+        r"title={Invalidity Reason Severity by Simulation Run},",
+        r"xlabel={Invalidity reason},",
+        r"ylabel={Simulation run},",
+        f"xmin=-0.5, xmax={len(reasons) - 0.5:.1f},",
+        f"ymin=-0.5, ymax={len(runs) - 0.5:.1f},",
+        "xtick={" + ",".join(str(i) for i in range(len(reasons))) + "},",
+        "xticklabels={" + ",".join("{" + _latex_escape(r) + "}" for r in reasons) + "},",
+        r"x tick label style={rotate=35, anchor=east, font=\scriptsize},",
+        "ytick={" + ",".join(str(i) for i in range(len(runs))) + "},",
+        "yticklabels={" + ",".join("{" + _latex_escape(r) + "}" for r in runs) + "},",
+        r"yticklabel style={font=\scriptsize},",
+        r"y dir=reverse,",
+        r"axis lines*=left,",
+        r"grid=none,",
+        r"point meta min=0,",
+        f"point meta max={vmax:.6g},",
+        r"colormap={rq2invalidityblue}{" + "; ".join(color_stops) + "},",
+        r"colorbar,",
+        r"colorbar style={ylabel={Severity share (\%)}, tick label style={font=\small}},",
+        r"]",
+        r"\addplot[scatter, only marks, mark=square*, mark size=15pt, scatter/use mapped color={fill=mapped color, draw=white}] coordinates {",
+        *points,
+        r"};",
+        *nodes,
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        rf"\caption{{Invalidity reason severity by simulation run for {label.upper()}. Values are normalized by each reason's total possible occurrence denominator. SoC and reserve columns use affected-hour shares because no physical maximum-magnitude denominator is available in the extracted diagnostics.}}",
+        rf"\label{{fig:{label}_simulation_invalidity_reason_severity_heatmap}}",
+        r"\end{figure}",
+        "",
+    ]
+    path.write_text("\n".join(rows), encoding="utf-8")
+    return path
 
 
 def write_latex_table(summary: pd.DataFrame, path: Path, label: str) -> None:
@@ -956,7 +1484,7 @@ def write_latex_table(summary: pd.DataFrame, path: Path, label: str) -> None:
     rows += [
         r"\bottomrule",
         r"\end{tabular}",
-        rf"\caption{{Simulation invalidity severity diagnostics for {label.upper()}. Unavailable metrics are shown as --.}}",
+        rf"\caption{{Simulation invalidity severity diagnostics for {label.upper()}. Unavailable metrics are shown as --. Ratios are calculated using the available recorded denominator; unavailable denominators are reported as missing rather than zero.}}",
         rf"\label{{tab:{label}_simulation_invalidity_severity}}",
         r"\end{table}",
         "",
@@ -969,7 +1497,11 @@ def write_limitation_summary(summary: pd.DataFrame, warnings: pd.DataFrame, path
     n = len(summary)
     valid = summary.get("simulation_valid", pd.Series(dtype=object)).map(parse_bool) if n else pd.Series(dtype=object)
     invalid = int(valid.eq(False).sum()) if n else 0
-    model_df = summary.loc[~summary.get("is_benchmark", pd.Series(dtype=bool)).astype(bool)].copy() if n else pd.DataFrame()
+    if n and "is_benchmark" in summary.columns:
+        is_benchmark = summary["is_benchmark"].map(parse_bool).fillna(False)
+        model_df = summary.loc[~is_benchmark].copy()
+    else:
+        model_df = pd.DataFrame()
     model_valid = model_df.get("simulation_valid", pd.Series(dtype=object)).map(parse_bool) if not model_df.empty else pd.Series(dtype=object)
     invalid_model = int(model_valid.eq(False).sum()) if not model_df.empty else 0
     reasons = []
@@ -1027,9 +1559,13 @@ def build_outputs(run_root: Path, out_root: Path, *, label: str) -> dict[str, Pa
     diag_dir = out_root / "backup" / "diagnostics"
     warn_dir = out_root / "backup" / "warnings"
     appendix_tables = out_root / "appendix" / "tables"
+    appendix_figures = out_root / "appendix" / "figures"
+    appendix_latex_figures = out_root / "appendix" / "latex_figures"
     diag_dir.mkdir(parents=True, exist_ok=True)
     warn_dir.mkdir(parents=True, exist_ok=True)
     appendix_tables.mkdir(parents=True, exist_ok=True)
+    appendix_figures.mkdir(parents=True, exist_ok=True)
+    appendix_latex_figures.mkdir(parents=True, exist_ok=True)
 
     summary_df = pd.DataFrame(summary_rows).reindex(columns=SUMMARY_COLUMNS).sort_values(["is_benchmark", "model_label", "quantile", "scenario"]).reset_index(drop=True)
     hourly_df = pd.concat(hourly_parts, ignore_index=True) if hourly_parts else _empty_hourly()
@@ -1061,16 +1597,33 @@ def build_outputs(run_root: Path, out_root: Path, *, label: str) -> dict[str, Pa
         "hourly": diag_dir / "simulation_invalidity_severity_by_hour.csv",
         "inventory": diag_dir / "simulation_invalidity_source_inventory.csv",
         "metric_sources": diag_dir / "simulation_invalidity_metric_sources.csv",
+        "context_table_csv": diag_dir / "simulation_invalidity_context_table.csv",
+        "reason_matrix_csv": diag_dir / "simulation_invalidity_reason_matrix.csv",
+        "reason_severity_heatmap_csv": diag_dir / "simulation_invalidity_reason_severity_heatmap.csv",
         "warnings": warn_dir / "simulation_invalidity_severity_warnings.csv",
         "latex": appendix_tables / "simulation_invalidity_severity_summary.tex",
+        "context_table_latex": appendix_tables / "simulation_invalidity_context_table.tex",
+        "reason_matrix_latex": appendix_tables / "simulation_invalidity_reason_matrix.tex",
+        "reason_severity_heatmap_png": appendix_figures / "simulation_invalidity_reason_severity_heatmap.png",
+        "reason_severity_heatmap_latex": appendix_latex_figures / "simulation_invalidity_reason_severity_heatmap.tex",
         "limitation_summary": diag_dir / "simulation_invalidity_limitation_summary.txt",
     }
+    context_table = build_invalidity_context_table(summary_df, include_benchmarks=False)
+    reason_matrix = build_invalidity_reason_matrix(summary_df, include_benchmarks=False)
+    reason_heatmap = build_invalidity_reason_severity_heatmap(summary_df, include_benchmarks=False)
     summary_df.to_csv(paths["summary"], index=False)
     hourly_df.to_csv(paths["hourly"], index=False)
     inventory_df.to_csv(paths["inventory"], index=False)
     metric_sources_df.to_csv(paths["metric_sources"], index=False)
+    context_table.to_csv(paths["context_table_csv"], index=False)
+    reason_matrix.to_csv(paths["reason_matrix_csv"], index=False)
+    reason_heatmap.to_csv(paths["reason_severity_heatmap_csv"], index=False)
     warnings_df.to_csv(paths["warnings"], index=False)
     write_latex_table(summary_df, paths["latex"], label)
+    write_invalidity_context_latex(context_table, paths["context_table_latex"], label)
+    write_invalidity_reason_matrix_latex(reason_matrix, paths["reason_matrix_latex"], label)
+    plot_invalidity_reason_severity_heatmap(reason_heatmap, paths["reason_severity_heatmap_png"])
+    write_invalidity_reason_severity_heatmap_latex(reason_heatmap, paths["reason_severity_heatmap_latex"], label)
     write_limitation_summary(summary_df, warnings_df, paths["limitation_summary"], label)
     return paths
 

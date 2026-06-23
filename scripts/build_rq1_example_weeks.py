@@ -76,6 +76,36 @@ MARKET_ACTIONABLE_TARGET_LABELS = {
     "target_afrr_activation_rate_neg": "aFRR activation rate -",
 }
 
+MARKET_ACTIONABLE_TITLE_LABELS = {
+    "target_da_price": "DA Price",
+    "target_afrr_capacity_price_pos": "aFRR Capacity Price +",
+    "target_afrr_capacity_price_neg": "aFRR Capacity Price −",
+    "target_afrr_activation_price_vwap_pos": "aFRR Activation Price +",
+    "target_afrr_activation_price_vwap_neg": "aFRR Activation Price −",
+    "target_afrr_activation_rate_pos": "aFRR Activation Rate +",
+    "target_afrr_activation_rate_neg": "aFRR Activation Rate −",
+}
+
+MARKET_ACTIONABLE_CAPTION_LABELS = {
+    "target_da_price": "DA price",
+    "target_afrr_capacity_price_pos": "aFRR capacity price positive",
+    "target_afrr_capacity_price_neg": "aFRR capacity price negative",
+    "target_afrr_activation_price_vwap_pos": "aFRR activation price positive",
+    "target_afrr_activation_price_vwap_neg": "aFRR activation price negative",
+    "target_afrr_activation_rate_pos": "aFRR activation rate positive",
+    "target_afrr_activation_rate_neg": "aFRR activation rate negative",
+}
+
+MARKET_ACTIONABLE_LABEL_SLUGS = {
+    "target_da_price": "da-price",
+    "target_afrr_capacity_price_pos": "capacity-price-pos",
+    "target_afrr_capacity_price_neg": "capacity-price-neg",
+    "target_afrr_activation_price_vwap_pos": "activation-price-pos",
+    "target_afrr_activation_price_vwap_neg": "activation-price-neg",
+    "target_afrr_activation_rate_pos": "activation-rate-pos",
+    "target_afrr_activation_rate_neg": "activation-rate-neg",
+}
+
 TARGET_Y_AXIS_LABELS = {
     "target_da_price": "DA price (EUR/MWh)",
     "target_afrr_capacity_price_pos": "aFRR capacity price + (EUR/MW)",
@@ -129,14 +159,10 @@ MARKET_ACTIONABLE_SPECS = [
 ]
 
 RESULT_MARKET_ACTIONABLE = {
-    ("typical_week", "da_dminus1_11", "target_da_price"),
-    ("typical_week", "bcm_dplus1_08", "target_afrr_capacity_price_neg"),
-    ("typical_week", "bem_h1", "target_afrr_activation_price_vwap_neg"),
-    ("typical_week", "bem_h1", "target_afrr_activation_rate_pos"),
-    ("high_volatility_week", "da_dminus1_11", "target_da_price"),
-    ("high_volatility_week", "bcm_dplus1_08", "target_afrr_capacity_price_neg"),
-    ("high_volatility_week", "bem_h1", "target_afrr_activation_price_vwap_neg"),
-    ("high_volatility_week", "bem_h1", "target_afrr_activation_rate_pos"),
+    (week_key, str(spec["market_context"]), str(target))
+    for week_key in ("typical_week", "high_volatility_week")
+    for spec in MARKET_ACTIONABLE_SPECS
+    for target in spec["targets"]
 }
 
 QUANTILE_RE = re.compile(r"^p(\d{1,2})$")
@@ -349,6 +375,17 @@ def _market_target_label(canonical_target: str) -> str:
 def target_y_axis_label(target: str, target_display: str | None = None) -> str:
     canonical_target = _canonical_target(str(target))
     return TARGET_Y_AXIS_LABELS.get(canonical_target, str(target_display or _market_target_label(canonical_target)))
+
+
+def target_y_axis_unit_label(target: str) -> str:
+    canonical_target = _canonical_target(str(target))
+    if "activation_rate" in canonical_target:
+        return "Share"
+    if "capacity_price" in canonical_target:
+        return "EUR/MW"
+    if "price" in canonical_target:
+        return "EUR/MWh"
+    return target_y_axis_label(canonical_target)
 
 
 def _window_slice(df: pd.DataFrame, start_utc: pd.Timestamp, window_hours: int) -> pd.DataFrame:
@@ -776,17 +813,76 @@ def _market_actionable_filename(spec: dict[str, Any], canonical_target: str, wee
 
 
 def _market_actionable_title(spec: dict[str, Any], target_display: str) -> str:
-    if spec["market_context"] == "da_dminus1_11":
-        return "DA price | D-1 11:00 forecast snapshot | p50"
-    return f"{spec['title_prefix']} | {target_display} | p50"
+    del spec
+    return f"{target_display}: p50 Forecast"
 
 
-def _market_actionable_caption(week: WeekSpec, spec: dict[str, Any], target_display: str) -> str:
-    selection_label = "high-volatility" if week.key == "high_volatility_week" else "typical" if week.key == "typical_week" else week.label.lower()
+def _week_type_label(week: WeekSpec) -> str:
+    if week.key == "typical_week":
+        return "Typical week"
+    if week.key == "high_volatility_week":
+        return "High-volatility week"
+    if week.key == "typical":
+        return "Typical week"
+    if week.key in {"high_volatility", "high-volatility"}:
+        return "High-volatility week"
+    return f"{week.label} week".strip()
+
+
+def _market_actionable_target_title(canonical_target: str) -> str:
+    return MARKET_ACTIONABLE_TITLE_LABELS.get(canonical_target, _market_target_label(canonical_target).replace(" -", " −"))
+
+
+def _market_actionable_caption_target(canonical_target: str) -> str:
+    return MARKET_ACTIONABLE_CAPTION_LABELS.get(canonical_target, _market_target_label(canonical_target))
+
+
+def _is_activation_assumption_target(canonical_target: str) -> bool:
+    return "activation_price" in canonical_target or "activation_rate" in canonical_target
+
+
+def _market_snapshot_label(spec: dict[str, Any], canonical_target: str, *, latex: bool = False) -> str:
+    context = str(spec["market_context"])
+    dminus = "D$-1$" if latex else "D−1"
+    if context == "da_dminus1_11":
+        return f"DA {dminus} 11:00 Europe/Berlin forecast snapshot"
+    if context == "bcm_dplus1_08":
+        if _is_activation_assumption_target(canonical_target):
+            if latex:
+                return f"BCM {dminus} 08:00 Europe/Berlin activation-assumption forecast snapshot"
+            return f"BCM {dminus} 08:00 Europe/Berlin activation assumption"
+        return f"BCM {dminus} 08:00 Europe/Berlin forecast snapshot"
+    if context == "bem_h1":
+        return "BEM h1 forecast"
+    return str(spec.get("snapshot_description", "")).strip()
+
+
+def _market_actionable_subtitle(week: WeekSpec, spec: dict[str, Any], canonical_target: str) -> str:
+    return f"{_week_type_label(week)} | {_market_snapshot_label(spec, canonical_target, latex=False)}"
+
+
+def _market_actionable_short_caption(canonical_target: str) -> str:
+    return f"Example-week {_market_actionable_caption_target(canonical_target)} forecasts"
+
+
+def _market_actionable_caption(week: WeekSpec, spec: dict[str, Any], canonical_target: str) -> str:
+    selection_label = _week_type_label(week).lower()
     return (
-        f"Example-week {target_display} forecasts for the algorithmically selected {selection_label} week using the "
-        f"{spec['snapshot_description']} The figure compares realized values with p50 forecasts from RLQR, XGB and TFT."
+        f"Example-week {_market_actionable_caption_target(canonical_target)} forecasts for the algorithmically selected {selection_label} using the "
+        f"{_market_snapshot_label(spec, canonical_target, latex=True)}. The figure compares realized values with p50 forecasts from RLQR, XGB and TFT."
     )
+
+
+def _market_actionable_figure_label(week: WeekSpec, spec: dict[str, Any], canonical_target: str) -> str:
+    week_slug = _safe_slug(_week_type_label(week).replace(" week", "").replace("-", " "))
+    target_slug = MARKET_ACTIONABLE_LABEL_SLUGS.get(canonical_target, _safe_slug(canonical_target).replace("_", "-"))
+    context = str(spec["market_context"])
+    context_suffix = ""
+    if context == "bem_h1":
+        context_suffix = "-bem"
+    elif context == "bcm_dplus1_08" and _is_activation_assumption_target(canonical_target):
+        context_suffix = "-bcm"
+    return f"fig:rq1-example-week-{target_slug}{context_suffix}-{week_slug}"
 
 
 def _plot_market_actionable(
@@ -811,11 +907,16 @@ def _plot_market_actionable(
     truth = selected[["target_time_utc", "y_true"]].drop_duplicates("target_time_utc").set_index("target_time_utc").sort_index()
     d = truth.join(pivot, how="inner").reset_index()
     d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE)
+    d["plot_idx"] = np.arange(len(d), dtype=int)
     target_display = _market_target_label(canonical_target)
+    figure_title = _market_actionable_title(spec, _market_actionable_target_title(canonical_target))
+    figure_subtitle = _market_actionable_subtitle(week, spec, canonical_target)
+    caption = _market_actionable_caption(week, spec, canonical_target)
+    short_caption = _market_actionable_short_caption(canonical_target)
     y_axis_label = target_y_axis_label(canonical_target, target_display)
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(13.5, 4.6))
-    ax.plot(d["local_time"], d["y_true"], label="Truth", color=TRUTH_COLOR, linewidth=2.3)
+    ax.plot(d["plot_idx"], d["y_true"], label="Truth", color=TRUTH_COLOR, linewidth=2.3)
     row: dict[str, Any] = {
         "week_type": week.key,
         "market_context": spec["market_context"],
@@ -823,27 +924,143 @@ def _plot_market_actionable(
         "target_display": target_display,
         "y_axis_label": y_axis_label,
         "figure_path": str(out_path),
+        "figure_title": figure_title,
+        "figure_subtitle": figure_subtitle,
+        "caption": caption,
+        "short_caption": short_caption,
+        "market_context_label": _market_snapshot_label(spec, canonical_target, latex=False),
     }
     for model in models:
         if model.key not in d.columns:
             continue
         mae = float(np.mean(np.abs(pd.to_numeric(d[model.key], errors="coerce") - pd.to_numeric(d["y_true"], errors="coerce"))))
-        ax.plot(d["local_time"], d[model.key], label=f"{model.label} p50 (MAE={mae:.3f})", color=get_model_color(model.key), linewidth=1.8)
+        ax.plot(d["plot_idx"], d[model.key], label=f"{model.label} p50 (MAE={mae:.3f})", color=get_model_color(model.key), linewidth=1.8)
         row[f"mae_{model.key}"] = mae
-    ax.set_title(thesis_titlecase(_market_actionable_title(spec, target_display)))
+    fig.suptitle(figure_title, y=0.98)
+    ax.set_title(figure_subtitle, fontsize=10, pad=8)
     ax.set_xlabel("Time")
     ax.set_ylabel(y_axis_label)
-    tick_positions = _selected_week_local_dates(week)
-    tick_labels = [_format_week_date_label(t) for t in tick_positions]
+    ax.set_xlim(0, max(len(d) - 1, 1))
+    ax.margins(x=0)
+    xticks, xticklabels = _latex_week_ticks(d, week)
+    tick_positions = [int(x) for x in xticks.split(",") if x] if xticks else []
+    tick_labels = xticklabels.split(",") if xticklabels else []
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)
     ax.tick_params(axis="x", rotation=0)
-    ax.legend(ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.24))
-    fig.tight_layout()
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.885))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.80))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     return row
+
+
+def _market_actionable_frame(selected: pd.DataFrame) -> pd.DataFrame:
+    pivot = selected.pivot_table(
+        index="target_time_utc",
+        columns="model",
+        values="p50",
+        aggfunc="first",
+    ).sort_index()
+    truth = selected[["target_time_utc", "y_true"]].drop_duplicates("target_time_utc").set_index("target_time_utc").sort_index()
+    d = truth.join(pivot, how="inner").reset_index()
+    d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_ZONE)
+    d["plot_idx"] = np.arange(len(d), dtype=int)
+    return d
+
+
+def _write_market_actionable_latex(
+    *,
+    selected: pd.DataFrame,
+    spec: dict[str, Any],
+    week: WeekSpec,
+    canonical_target: str,
+    models: list[ModelSpec],
+    tex_path: Path,
+    caption: str,
+    label: str,
+) -> Path:
+    d = _market_actionable_frame(selected)
+    if d.empty:
+        raise ValueError(f"Empty market-actionable LaTeX data for {week.key}/{spec['market_context']}/{canonical_target}.")
+    date_range = _week_date_range_label(d)
+    xticks, xticklabels = _latex_week_ticks(d, week)
+    xmin, xmax = _plot_index_xlim(d)
+    y_values = [pd.to_numeric(d["y_true"], errors="coerce").to_numpy(dtype=float)]
+    for model in models:
+        if model.key in d.columns:
+            y_values.append(pd.to_numeric(d[model.key], errors="coerce").to_numpy(dtype=float))
+    ylim = _padded_ylim(np.concatenate(y_values)) if y_values else None
+    color_lines = [
+        f"\\definecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
+        for role, hex_color in THESIS_PALETTE.items()
+    ]
+    lines = [
+        r"% Requires: \usepackage{pgfplots}",
+        r"% Requires: \usepackage{xcolor}",
+        r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
+        *color_lines,
+        r"\begin{figure}[htbp]",
+        r"    \centering",
+        r"    \resizebox{\linewidth}{!}{%",
+        r"        \begin{tikzpicture}",
+        r"            \begin{axis}[",
+        r"                width=0.98\textwidth,",
+        r"                height=7cm,",
+        rf"                title={{{_latex_escape(_market_actionable_title(spec, _market_actionable_target_title(canonical_target)))}}},",
+        r"                title style={at={(0.5,1.30)}, anchor=south},",
+        r"                xlabel={Time},",
+        rf"                ylabel={{{_latex_escape(target_y_axis_unit_label(canonical_target))}}},",
+        r"                legend style={at={(0.5,1.12)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend cell align={left},",
+        r"                axis lines*=left,",
+        r"                grid=major,",
+        rf"                xmin={_tex_num(xmin)},",
+        rf"                xmax={_tex_num(xmax)},",
+        r"                enlarge x limits=false,",
+        r"                clip mode=individual,",
+    ]
+    if xticks and xticklabels:
+        lines.extend(
+            [
+                rf"                xtick={{{xticks}}},",
+                rf"                xticklabels={{{xticklabels}}},",
+                r"                xticklabel style={align=center, rotate=0},",
+            ]
+        )
+    if ylim is not None:
+        lines.extend(
+            [
+                rf"                ymin={_tex_num(ylim[0])},",
+                rf"                ymax={_tex_num(ylim[1])},",
+            ]
+        )
+    lines.append(r"            ]")
+    truth_coords = " ".join(f"({_tex_num(i)},{_tex_num(y)})" for i, y in zip(d["plot_idx"], d["y_true"]))
+    lines.append(rf"                \addplot[color=black, mark=none, line width=1.2pt] coordinates {{{truth_coords}}};")
+    legends = ["Truth"]
+    for model in models:
+        if model.key not in d.columns:
+            continue
+        coords = " ".join(f"({_tex_num(i)},{_tex_num(y)})" for i, y in zip(d["plot_idx"], d[model.key]))
+        lines.append(rf"                \addplot[color={_model_color_name(model.key)}, mark=none, line width=0.9pt] coordinates {{{coords}}};")
+        legends.append(model.label)
+    lines.append("                \\legend{" + ",".join(_latex_escape(x) for x in legends) + "}")
+    lines.extend(
+        [
+            r"            \end{axis}",
+            r"        \end{tikzpicture}}",
+            f"    \\caption[{_latex_escape(_market_actionable_short_caption(canonical_target))}]{{{_latex_escape(caption)} Selected period: {_latex_escape(date_range)}.}}",
+            f"    \\label{{{label}}}",
+            r"\end{figure}",
+            "",
+        ]
+    )
+    tex_path.parent.mkdir(parents=True, exist_ok=True)
+    tex_path.write_text("\n".join(lines), encoding="utf-8")
+    return tex_path
 
 
 def _write_includegraphics_tex(*, image_path: Path, tex_path: Path, caption: str, label: str) -> Path:
@@ -867,6 +1084,41 @@ def _write_includegraphics_tex(*, image_path: Path, tex_path: Path, caption: str
     tex_path.parent.mkdir(parents=True, exist_ok=True)
     tex_path.write_text("\n".join(lines), encoding="utf-8")
     return tex_path
+
+
+def _prune_example_week_includegraphics_wrappers(out_dir: Path) -> list[Path]:
+    removed: list[Path] = []
+    for tex in sorted(out_dir.glob("**/latex_figures/**/*.tex")):
+        text = tex.read_text(encoding="utf-8", errors="ignore")
+        if r"\includegraphics" not in text:
+            continue
+        tex.unlink()
+        removed.append(tex)
+    return removed
+
+
+def _prune_legacy_week_aliases(out_dir: Path) -> list[Path]:
+    removed: list[Path] = []
+    suffix_pairs = [
+        ("_typical", "_typical_week"),
+        ("_high_volatility", "_high_volatility_week"),
+    ]
+    canonical_names = {path.name for path in out_dir.glob("**/*") if path.is_file()}
+    for folder_name in ["figures", "latex_figures"]:
+        for path in sorted(out_dir.glob(f"**/{folder_name}/*")):
+            if not path.is_file():
+                continue
+            stem = path.stem
+            for legacy_suffix, canonical_suffix in suffix_pairs:
+                if not stem.endswith(legacy_suffix):
+                    continue
+                canonical = path.with_name(stem[: -len(legacy_suffix)] + canonical_suffix + path.suffix)
+                canonical_name = stem[: -len(legacy_suffix)] + canonical_suffix + path.suffix
+                if canonical.exists() or canonical_name in canonical_names:
+                    path.unlink()
+                    removed.append(path)
+                break
+    return removed
 
 
 SELECTION_METADATA_COLUMNS = [
@@ -954,7 +1206,11 @@ def build_market_actionable_examples(
                 week_meta = week_meta_by_key.get(week.key)
                 week_start = pd.Timestamp(week_meta["week_start_utc"]) if week_meta is not None else week.start_utc
                 week_end = pd.Timestamp(week_meta["week_end_utc"]) if week_meta is not None and pd.notna(week_meta["week_end_utc"]) else week.start_utc + pd.Timedelta(hours=int(window_hours))
-                forecast_rule = str(spec["snapshot_description"])
+                figure_title = _market_actionable_title(spec, _market_actionable_target_title(canonical_target))
+                figure_subtitle = _market_actionable_subtitle(week, spec, canonical_target)
+                caption = _market_actionable_caption(week, spec, canonical_target)
+                short_caption = _market_actionable_short_caption(canonical_target)
+                forecast_rule = _market_snapshot_label(spec, canonical_target, latex=False)
                 selection_meta = _selection_metadata(
                     week_meta,
                     fallback_rule=str(week_meta["selection_rule"]) if week_meta is not None and "selection_rule" in week_meta.index else diag["selection_rule"],
@@ -966,6 +1222,11 @@ def build_market_actionable_examples(
                     "target": canonical_target,
                     "target_display": target_display,
                     "y_axis_label": target_y_axis_label(canonical_target, target_display),
+                    "figure_title": figure_title,
+                    "figure_subtitle": figure_subtitle,
+                    "caption": caption,
+                    "short_caption": short_caption,
+                    "market_context_label": forecast_rule,
                     "forecast_snapshot_rule": forecast_rule,
                     "split": split,
                     "week_start_utc": week_start.isoformat(),
@@ -988,11 +1249,15 @@ def build_market_actionable_examples(
                 plot_row = _plot_market_actionable(selected=selected, spec=spec, week=week, canonical_target=canonical_target, models=models, out_path=fig_path)
                 outputs.append(fig_path)
                 tex_path = out_dir / tier / "latex_figures" / filename.replace(".png", ".tex")
-                _write_includegraphics_tex(
-                    image_path=fig_path,
+                _write_market_actionable_latex(
+                    selected=selected,
+                    spec=spec,
+                    week=week,
+                    canonical_target=canonical_target,
+                    models=models,
                     tex_path=tex_path,
-                    caption=_market_actionable_caption(week, spec, target_display),
-                    label=f"fig:rq1-market-actionable-{_safe_slug(week.key)}-{_safe_slug(spec['market_context'])}-{_safe_slug(target_display)}",
+                    caption=caption,
+                    label=_market_actionable_figure_label(week, spec, canonical_target),
                 )
                 outputs.append(tex_path)
                 plot_row["latex_path"] = str(tex_path)
@@ -1000,6 +1265,11 @@ def build_market_actionable_examples(
                 selected["selection_mode"] = selection_mode
                 selected["selection_type"] = week.key
                 selected["market_context"] = spec["market_context"]
+                selected["market_context_label"] = forecast_rule
+                selected["figure_title"] = figure_title
+                selected["figure_subtitle"] = figure_subtitle
+                selected["caption"] = caption
+                selected["short_caption"] = short_caption
                 selected["forecast_snapshot_rule"] = forecast_rule
                 selected["split"] = split
                 selected["target_group"] = _target_info(_prediction_target(canonical_target))[0]
@@ -1021,12 +1291,17 @@ def build_market_actionable_examples(
                             "selection_mode",
                             "selection_type",
                             "market_context",
+                            "market_context_label",
                             "forecast_snapshot_rule",
                             "split",
                             "target",
                             "target_display",
                             "target_group",
                             "y_axis_label",
+                            "figure_title",
+                            "figure_subtitle",
+                            "caption",
+                            "short_caption",
                             "week_start_utc",
                             "week_end_utc",
                             *SELECTION_METADATA_COLUMNS,
@@ -1056,12 +1331,17 @@ def build_market_actionable_examples(
                             "selection_mode": selection_mode,
                             "selection_type": week.key,
                             "market_context": spec["market_context"],
+                            "market_context_label": forecast_rule,
                             "forecast_snapshot_rule": forecast_rule,
                             "split": split,
                             "target": canonical_target,
                             "target_display": target_display,
                             "target_group": _target_info(_prediction_target(canonical_target))[0],
                             "y_axis_label": target_y_axis_label(canonical_target, target_display),
+                            "figure_title": figure_title,
+                            "figure_subtitle": figure_subtitle,
+                            "caption": caption,
+                            "short_caption": short_caption,
                             "model": model.key,
                             "model_label": model.label,
                             "mae_p50": float(part["abs_error_p50"].mean()),
@@ -1086,6 +1366,11 @@ def build_market_actionable_examples(
                         "y_axis_label": target_y_axis_label(canonical_target, target_display),
                         "selection_type": week.key,
                         "market_context": spec["market_context"],
+                        "market_context_label": forecast_rule,
+                        "figure_title": figure_title,
+                        "figure_subtitle": figure_subtitle,
+                        "caption": caption,
+                        "short_caption": short_caption,
                         "forecast_snapshot_rule": forecast_rule,
                         "split": split,
                         "source_week_rule": str(week_meta["selection_rule"]) if week_meta is not None and "selection_rule" in week_meta.index else "legacy fixed-date week",
@@ -1161,7 +1446,41 @@ def build_market_actionable_examples(
     if plot_value_rows:
         pd.concat(plot_value_rows, ignore_index=True).to_csv(plot_values_path, index=False)
     else:
-        pd.DataFrame(columns=["selection_mode", "selection_type", "market_context", "forecast_snapshot_rule", "split", "target", "target_display", "target_group", "y_axis_label", "week_start_utc", "week_end_utc", *SELECTION_METADATA_COLUMNS, "target_time_utc", "target_time_local", "forecast_time_utc", "forecast_time_local", "lead_time_h", "model", "model_label", "y_true", "p10", "p50", "p90", "residual_p50", "abs_error_p50", "figure_path"]).to_csv(plot_values_path, index=False)
+        pd.DataFrame(
+            columns=[
+                "selection_mode",
+                "selection_type",
+                "market_context",
+                "market_context_label",
+                "forecast_snapshot_rule",
+                "split",
+                "target",
+                "target_display",
+                "target_group",
+                "y_axis_label",
+                "figure_title",
+                "figure_subtitle",
+                "caption",
+                "short_caption",
+                "week_start_utc",
+                "week_end_utc",
+                *SELECTION_METADATA_COLUMNS,
+                "target_time_utc",
+                "target_time_local",
+                "forecast_time_utc",
+                "forecast_time_local",
+                "lead_time_h",
+                "model",
+                "model_label",
+                "y_true",
+                "p10",
+                "p50",
+                "p90",
+                "residual_p50",
+                "abs_error_p50",
+                "figure_path",
+            ]
+        ).to_csv(plot_values_path, index=False)
     pd.DataFrame(metric_rows).to_csv(metrics_path, index=False)
     pd.DataFrame(warning_rows).to_csv(warn_path, index=False)
     manifest = {
@@ -1183,6 +1502,8 @@ def build_market_actionable_examples(
     manifest_path = out_dir / "example_week_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     outputs.extend([selected_weeks_path, plot_values_path, metrics_path, warn_path, manifest_path])
+    _prune_example_week_includegraphics_wrappers(out_dir)
+    _prune_legacy_week_aliases(out_dir)
     return outputs
 
 
@@ -1287,6 +1608,12 @@ def _tex_num(value: Any) -> str:
     return f"{x:.6g}"
 
 
+def _plot_index_xlim(frame: pd.DataFrame) -> tuple[float, float]:
+    if frame.empty:
+        return 0.0, 1.0
+    return 0.0, max(float(len(frame) - 1), 1.0)
+
+
 def _format_week_tick(ts: pd.Timestamp) -> tuple[str, str]:
     stamp = pd.Timestamp(ts)
     return f"{stamp.day:02d} {MONTH_ABBR[stamp.month - 1]}", f"{stamp.hour:02d}:{stamp.minute:02d}"
@@ -1354,12 +1681,13 @@ def write_example_week_latex(
     d = view.copy()
     d["plot_idx"] = np.arange(len(d), dtype=int)
     xticks, xticklabels = _latex_week_ticks(d, week)
+    xmin, xmax = _plot_index_xlim(d)
     date_range = _week_date_range_label(d)
     color_lines = [
         f"\\definecolor{{{_latex_color_name(role)}}}{{HTML}}{{{hex_color.lstrip('#').upper()}}}"
         for role, hex_color in THESIS_PALETTE.items()
     ]
-    y_axis_label = target_y_axis_label(target, target_label)
+    y_axis_label = target_y_axis_unit_label(target)
     lines = [
         r"% Requires: \usepackage{pgfplots}",
         r"% Requires: \usepackage{xcolor}",
@@ -1373,12 +1701,17 @@ def write_example_week_latex(
         r"                width=0.98\textwidth,",
         r"                height=7cm,",
         rf"                title={{{_latex_escape(f'{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}')}}},",
+        r"                title style={at={(0.5,1.30)}, anchor=south},",
         r"                xlabel={Time},",
         rf"                ylabel={{{_latex_escape(y_axis_label)}}},",
-        r"                legend style={at={(0.5,1.10)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+        r"                legend style={at={(0.5,1.12)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
         r"                axis lines*=left,",
         r"                grid=major,",
+        rf"                xmin={_tex_num(xmin)},",
+        rf"                xmax={_tex_num(xmax)},",
+        r"                enlarge x limits=false,",
+        r"                clip mode=individual,",
         r"            ]",
     ]
     if xticks and xticklabels:
@@ -1435,10 +1768,11 @@ def plot_example_week(
         raise ValueError(f"Empty view for target={target}, week={week.key}.")
     d = view.copy()
     d["local_time"] = pd.to_datetime(d["target_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
+    d["plot_idx"] = np.arange(len(d), dtype=int)
     y_axis_label = target_y_axis_label(target, target_label)
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(14, 4.8))
-    ax.plot(d["local_time"], d["y_true"], label="Truth", color=TRUTH_COLOR, linewidth=2.4)
+    ax.plot(d["plot_idx"], d["y_true"], label="Truth", color=TRUTH_COLOR, linewidth=2.4)
     row: dict[str, Any] = {
         "week": week.key,
         "week_label": week.label,
@@ -1458,26 +1792,31 @@ def plot_example_week(
         mae = float(np.mean(np.abs(pd.to_numeric(d[col], errors="coerce") - pd.to_numeric(d["y_true"], errors="coerce"))))
         row[f"mae_{model.key}"] = mae
         ax.plot(
-            d["local_time"],
+            d["plot_idx"],
             d[col],
             label=f"{model.label} {quantile.upper()} (MAE={mae:.3f})",
             color=get_model_color(model.key),
             linewidth=1.8,
         )
-    ax.set_title(thesis_titlecase(f"{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}"))
+    title = thesis_titlecase(f"{week.label} week | {target_label} | lead={lead_h:g}h | {quantile.upper()}")
+    fig.suptitle(title, y=0.98)
     ax.set_xlabel("Time")
     ax.set_ylabel(y_axis_label)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    tick_positions = _selected_week_local_dates(week)
-    tick_labels = [_format_week_date_label(t) for t in tick_positions]
+    ax.set_xlim(0, max(len(d) - 1, 1))
+    ax.margins(x=0)
+    xticks, xticklabels = _latex_week_ticks(d, week)
+    tick_positions = [int(x) for x in xticks.split(",") if x] if xticks else []
+    tick_labels = xticklabels.split(",") if xticklabels else []
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)
     ax.tick_params(axis="x", rotation=0)
-    ax.legend(ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.24))
-    fig.tight_layout()
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.91))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.84))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     row["figure_path"] = str(out_path)
     return row
@@ -1654,10 +1993,41 @@ def validate_algorithmic_outputs(*, out_dir: Path, split: str) -> None:
     missing = sorted(value_keys - selected_keys)
     if missing:
         raise ValueError(f"Plot values have no selected-week metadata rows for: {missing[:10]}")
-    required_value_cols = set(SELECTION_METADATA_COLUMNS + ["y_axis_label"])
+    required_value_cols = set(
+        SELECTION_METADATA_COLUMNS
+        + [
+            "y_axis_label",
+            "figure_title",
+            "figure_subtitle",
+            "caption",
+            "short_caption",
+            "market_context_label",
+            "forecast_snapshot_rule",
+        ]
+    )
     missing_value_cols = sorted(required_value_cols - set(values.columns))
     if missing_value_cols:
         raise ValueError(f"example_week_plot_values.csv is missing selection metadata columns: {missing_value_cols}")
+    titles = values["figure_title"].dropna().astype(str).unique().tolist()
+    invalid_titles = [title for title in titles if "|" in title or "Forecast Snapshot" in title]
+    if invalid_titles:
+        raise ValueError(f"Example-week figure titles still contain pipe-separated or snapshot metadata: {invalid_titles[:5]}")
+    bad_title_pattern = [title for title in titles if not title.endswith(": p50 Forecast")]
+    if bad_title_pattern:
+        raise ValueError(f"Example-week figure titles must follow '<target display>: p50 Forecast': {bad_title_pattern[:5]}")
+    captions = values["caption"].dropna().astype(str).unique().tolist()
+    bad_captions: list[str] = []
+    for caption in captions:
+        caption_lower = caption.lower()
+        if not ("typical week" in caption_lower or "high-volatility week" in caption_lower):
+            bad_captions.append(caption)
+            continue
+        for token in ["forecast", "realized values", "p50 forecasts", "rlqr", "xgb", "tft"]:
+            if token not in caption_lower:
+                bad_captions.append(caption)
+                break
+    if bad_captions:
+        raise ValueError(f"Example-week captions are missing required thesis context: {bad_captions[:5]}")
     figures = values["figure_path"].dropna().astype(str).unique().tolist()
     for fig in figures:
         part = values.loc[values["figure_path"].astype(str).eq(fig)]

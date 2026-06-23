@@ -75,7 +75,7 @@ TARGET_GROUPS = {
 }
 
 REGIME_LABELS = {
-    "normal": "Normal",
+    "normal": "Non-stress regime",
     "da_positive_spike_top5": "Positive spike top 5%",
     "da_negative_spike_bottom5": "Negative spike bottom 5%",
     "afrr_capacity_price_high_tail_top5": "High tail top 5%",

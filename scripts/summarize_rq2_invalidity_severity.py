@@ -13,13 +13,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from scripts.build_simulation_invalidity_severity import parse_bool
 
-DEFAULT_RQ2_ROOT = Path("artifacts/benchmark/rq2_simulation_benchmark")
+
+DEFAULT_RQ2_ROOT = Path("artifacts/final_benchmark/rq2/thesis_final_multi_2m_20260620T091938Z")
 
 
 COMPACT_COLUMNS = [
     "Scenario",
-    "Validity",
+    "Severity class",
     "Invalid hours (%)",
     "DA infeasible MWh / trade MWh (%)",
     "Fallback optimizations (%)",
@@ -38,17 +40,20 @@ def _read_required(path: Path) -> pd.DataFrame:
 def _scenario_label(row: pd.Series) -> str:
     label = str(row.get("model_label", row.get("model", ""))).strip() or "Unknown"
     q = str(row.get("quantile", "")).strip()
-    if bool(row.get("is_benchmark", False)):
+    if parse_bool(row.get("is_benchmark")) is True:
         return label
     return f"{label} {q}".strip()
 
 
-def _validity_label(row: pd.Series) -> str:
-    sim_valid = pd.to_numeric(pd.Series([row.get("simulation_valid")]), errors="coerce").iloc[0]
-    reportable = pd.to_numeric(pd.Series([row.get("thesis_reportable")]), errors="coerce").iloc[0]
-    if np.isfinite(sim_valid) and sim_valid >= 0.5 and np.isfinite(reportable) and reportable >= 0.5:
+def _severity_or_validity_label(row: pd.Series) -> str:
+    severity = str(row.get("invalidity_severity_class", "")).strip()
+    if severity and severity.lower() != "nan":
+        return severity
+    sim_valid = parse_bool(row.get("simulation_valid"))
+    reportable = parse_bool(row.get("thesis_reportable"))
+    if sim_valid is True and reportable is True:
         return "valid"
-    if np.isfinite(reportable) and reportable < 0.5:
+    if reportable is False:
         return "invalid"
     return "unknown"
 
@@ -94,7 +99,7 @@ def make_compact_table(summary: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(
         {
             "Scenario": d.apply(_scenario_label, axis=1),
-            "Validity": d.apply(_validity_label, axis=1),
+            "Severity class": d.apply(_severity_or_validity_label, axis=1),
             "Invalid hours (%)": d["combined_infeasibility_hours_share"].map(_fmt_pct),
             "DA infeasible MWh / trade MWh (%)": d["da_lockbook_infeasible_mwh_share_of_total_planned_trade"].map(_fmt_pct),
             "Fallback optimizations (%)": d["fallback_optimization_share"].map(_fmt_pct),
@@ -113,7 +118,7 @@ def write_latex_table(compact: pd.DataFrame, path: Path) -> None:
     display = compact[COMPACT_COLUMNS].copy()
     header = [
         r"\textbf{Scenario}",
-        r"\textbf{Validity}",
+        r"\textbf{Severity class}",
         r"\textbf{\begin{tabular}[c]{@{}r@{}}Invalid\\hours (\%)\end{tabular}}",
         r"\textbf{\begin{tabular}[c]{@{}r@{}}DA infeas.\\share (\%)\end{tabular}}",
         r"\textbf{\begin{tabular}[c]{@{}r@{}}Fallback\\opt. (\%)\end{tabular}}",
@@ -127,7 +132,7 @@ def write_latex_table(compact: pd.DataFrame, path: Path) -> None:
             " & ".join(
                 [
                     _latex_escape(row["Scenario"]),
-                    _latex_escape(row["Validity"]),
+                    _latex_escape(row["Severity class"]),
                     _latex_escape(row["Invalid hours (%)"]),
                     _latex_escape(row["DA infeasible MWh / trade MWh (%)"]),
                     _latex_escape(row["Fallback optimizations (%)"]),
@@ -142,7 +147,7 @@ def write_latex_table(compact: pd.DataFrame, path: Path) -> None:
         r"\begin{table}[htbp]",
         r"\centering",
         r"\scriptsize",
-        r"\caption{RQ2 invalidity severity diagnostics. Percentages are based on existing diagnostic outputs; unavailable values are shown as --.}",
+        r"\caption{RQ2 invalidity severity diagnostics. Percentages are based on existing diagnostic outputs; unavailable values are shown as --. Ratios are calculated using the available recorded denominator; unavailable denominators are reported as missing rather than zero.}",
         r"\label{tab:rq2_invalidity_severity_summary}",
         r"\begin{tabular}{@{}llrrrrrr@{}}",
         r"\toprule",
@@ -179,9 +184,12 @@ def _stat_line(label: str, series: pd.Series, *, pct: bool = True) -> str:
 
 def write_text_summary(summary: pd.DataFrame, warnings_df: pd.DataFrame, path: Path) -> None:
     total = int(len(summary))
-    invalid = int((pd.to_numeric(summary["thesis_reportable"], errors="coerce").fillna(0.0) < 0.5).sum())
-    model_based = summary.loc[~summary["is_benchmark"].astype(bool)].copy()
-    invalid_model = int((pd.to_numeric(model_based["thesis_reportable"], errors="coerce").fillna(0.0) < 0.5).sum())
+    reportable = summary["thesis_reportable"].map(parse_bool) if "thesis_reportable" in summary else pd.Series(dtype=object)
+    invalid = int(reportable.eq(False).sum())
+    is_benchmark = summary["is_benchmark"].map(parse_bool).fillna(False) if "is_benchmark" in summary else pd.Series(False, index=summary.index)
+    model_based = summary.loc[~is_benchmark].copy()
+    model_reportable = model_based["thesis_reportable"].map(parse_bool) if "thesis_reportable" in model_based else pd.Series(dtype=object)
+    invalid_model = int(model_reportable.eq(False).sum())
     reasons = _reason_counts(summary).head(8)
     max_soc = pd.to_numeric(summary["max_soc_violation_mwh"], errors="coerce").replace([np.inf, -np.inf], np.nan).max()
     max_reserve = pd.to_numeric(summary["max_reserve_headroom_shortfall_mw"], errors="coerce").replace([np.inf, -np.inf], np.nan).max()
@@ -203,7 +211,7 @@ def write_text_summary(summary: pd.DataFrame, warnings_df: pd.DataFrame, path: P
         f"- Missing or unavailable severity metrics generated {missing_count} warning rows.",
         "",
         "Limitation statement:",
-        "The RQ2 simulation results should be interpreted as diagnostic backtest evidence rather than fully validated trading-performance estimates. "
+        "The economic results should be interpreted as diagnostic backtest evidence rather than fully validated physically feasible trading-performance estimates. "
         "The invalidity diagnostics show that model-based runs contain physical or optimization-related violations, including infeasible DA lockbook positions, fallback optimizations, missed activations, SoC violations or reserve headroom shortfalls. "
         "The severity metrics quantify these issues relative to total simulated hours and trading/activation volumes. Invalid runs should therefore not be described as fully valid trading-performance results, and physical feasibility should not be claimed where violations exist.",
         "",
@@ -241,19 +249,53 @@ def update_manifest(root: Path, paths: dict[str, Path]) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def _resolve_input_path(root: Path, generic_rel: str, legacy_rel: str) -> tuple[Path, bool]:
+    generic = root / generic_rel
+    if generic.exists():
+        return generic, False
+    legacy = root / legacy_rel
+    if legacy.exists():
+        return legacy, True
+    return generic, False
+
+
 def build_outputs(root: Path) -> dict[str, Path]:
-    summary_path = root / "backup" / "diagnostics" / "simulation_invalidity_severity_summary.csv"
-    hourly_path = root / "backup" / "diagnostics" / "simulation_invalidity_severity_by_hour.csv"
-    warnings_path = root / "backup" / "warnings" / "simulation_invalidity_severity_warnings.csv"
-    if not summary_path.exists():
-        summary_path = root / "backup" / "diagnostics" / "rq2_invalidity_severity_summary.csv"
-    if not hourly_path.exists():
-        hourly_path = root / "backup" / "diagnostics" / "rq2_invalidity_severity_by_hour.csv"
-    if not warnings_path.exists():
-        warnings_path = root / "backup" / "warnings" / "rq2_invalidity_severity_warnings.csv"
+    summary_path, summary_legacy = _resolve_input_path(
+        root,
+        "backup/diagnostics/simulation_invalidity_severity_summary.csv",
+        "backup/diagnostics/rq2_invalidity_severity_summary.csv",
+    )
+    hourly_path, hourly_legacy = _resolve_input_path(
+        root,
+        "backup/diagnostics/simulation_invalidity_severity_by_hour.csv",
+        "backup/diagnostics/rq2_invalidity_severity_by_hour.csv",
+    )
+    warnings_path, warnings_legacy = _resolve_input_path(
+        root,
+        "backup/warnings/simulation_invalidity_severity_warnings.csv",
+        "backup/warnings/rq2_invalidity_severity_warnings.csv",
+    )
     summary = _read_required(summary_path)
     hourly = _read_required(hourly_path)
     warnings_df = pd.read_csv(warnings_path) if warnings_path.exists() else pd.DataFrame(columns=["scenario", "metric", "warning", "details"])
+    legacy_inputs = [
+        str(path)
+        for path, used_legacy in [(summary_path, summary_legacy), (hourly_path, hourly_legacy), (warnings_path, warnings_legacy)]
+        if used_legacy
+    ]
+    if legacy_inputs:
+        legacy_warning = pd.DataFrame(
+            [
+                {
+                    "scenario": "",
+                    "metric": "input_filename",
+                    "warning": "legacy_filename_used",
+                    "details": f"Summarizer used legacy rq2_* input file: {path}",
+                }
+                for path in legacy_inputs
+            ]
+        )
+        warnings_df = pd.concat([warnings_df, legacy_warning], ignore_index=True)
 
     if hourly.duplicated(["scenario", "timestamp_utc"]).any():
         raise ValueError("Hourly invalidity severity input has duplicate scenario/timestamp rows.")

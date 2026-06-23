@@ -257,6 +257,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-gate-buckets", action="store_true")
     p.add_argument("--skip-tail-spike", action="store_true")
     p.add_argument("--skip-example-weeks", action="store_true")
+    p.add_argument(
+        "--skip-raw-generation",
+        action="store_true",
+        help=(
+            "Reuse existing _raw_outputs and skip all subsection builder scripts. "
+            "This is useful for fast re-organization, LaTeX regeneration, pruning and export."
+        ),
+    )
+    p.add_argument(
+        "--organize-only",
+        dest="skip_raw_generation",
+        action="store_true",
+        help="Alias for --skip-raw-generation.",
+    )
     p.add_argument("--skip-organize", action="store_true")
     p.add_argument("--skip-pdf", action=argparse.BooleanOptionalAction, default=True, help="Do not keep PDF outputs. Defaults to true; use --no-skip-pdf or --include-pdf to keep PDF outputs.")
     p.add_argument("--include-pdf", dest="skip_pdf", action="store_false", help="Keep PDF outputs.")
@@ -271,6 +285,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.skip_raw_generation:
+        args.skip_full_metrics = True
+        args.skip_calibration = True
+        args.skip_per_lead = True
+        args.skip_gate_buckets = True
+        args.skip_tail_spike = True
+        args.skip_example_weeks = True
     out_dir = Path(args.out_dir)
     work_dir = out_dir / "_raw_outputs"
     full_dir = out_dir / "4_1_1_full_unweighted"
@@ -525,6 +546,7 @@ def main() -> int:
             "csv": bool(args.skip_csv),
             "json": bool(args.skip_json),
         },
+        "raw_generation_skipped": bool(args.skip_raw_generation),
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     for subsection in manifest["subsections"]:

@@ -592,6 +592,36 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
         )
         return
     source_dir = source_dirs[0]
+
+    def _is_stale_week_alias(path: Path) -> bool:
+        suffix_pairs = [
+            ("_typical", "_typical_week"),
+            ("_high_volatility", "_high_volatility_week"),
+        ]
+        for legacy_suffix, canonical_suffix in suffix_pairs:
+            if not path.stem.endswith(legacy_suffix):
+                continue
+            canonical_name = path.stem[: -len(legacy_suffix)] + canonical_suffix + path.suffix
+            return any(candidate.name == canonical_name for candidate in source_dir.rglob(canonical_name))
+        return False
+
+    def _prune_target_stale_week_aliases() -> None:
+        suffix_pairs = [
+            ("_typical", "_typical_week"),
+            ("_high_volatility", "_high_volatility_week"),
+        ]
+        canonical_names = {path.name for path in target_root.glob("**/*") if path.is_file()}
+        for path in sorted(target_root.glob("**/*")):
+            if not path.is_file() or path.suffix.lower() not in {".tex", ".png"}:
+                continue
+            for legacy_suffix, canonical_suffix in suffix_pairs:
+                if not path.stem.endswith(legacy_suffix):
+                    continue
+                canonical_name = path.stem[: -len(legacy_suffix)] + canonical_suffix + path.suffix
+                if canonical_name in canonical_names:
+                    path.unlink()
+                break
+
     metrics = source_dir / "example_week_metrics.csv"
     if not metrics.exists():
         metrics = source_dir / "backup" / "csv" / "example_week_metrics.csv"
@@ -637,6 +667,8 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
                 }
             )
         for src in sorted(figures_root.rglob("*.tex")):
+            if _is_stale_week_alias(src):
+                continue
             rel = src.relative_to(figures_root)
             if r"\includegraphics" in src.read_text(encoding="utf-8", errors="ignore"):
                 continue
@@ -672,6 +704,8 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
                     }
                 )
             for src in sorted((source_dir / tier / "latex_figures").rglob("*.tex")):
+                if _is_stale_week_alias(src):
+                    continue
                 rel = src.relative_to(source_dir / tier / "latex_figures")
                 if r"\includegraphics" in src.read_text(encoding="utf-8", errors="ignore"):
                     continue
@@ -710,6 +744,8 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
         latex_dir = source_dir / tier / "latex_figures"
         if latex_dir.exists():
             for src in sorted(latex_dir.rglob("*.tex")):
+                if _is_stale_week_alias(src):
+                    continue
                 rel = src.relative_to(latex_dir)
                 dst = target_root / tier / "latex_figures" / rel
                 _copy_file(src, dst)
@@ -724,6 +760,7 @@ def _add_example_week_outputs(entries: list[dict[str, Any]], missing: list[dict[
                         "brief_description": f"LaTeX includegraphics snippet for market-actionable example-week plot: {rel}",
                     }
                 )
+    _prune_target_stale_week_aliases()
 
 
 def _latex_color_name(role: str) -> str:
@@ -857,12 +894,12 @@ def _actionable_label(bucket: Any, target_group: Any) -> str:
 
 
 TAIL_SPIKE_REGIME_LABELS = {
-    "normal": "Normal",
+    "normal": "Non-stress regime",
     "da_positive_spike_top5": "Positive spike top 5%",
-    "da_negative_spike_bottom5": "Negative spike bottom 5%",
+    "da_negative_spike_bottom5": "Neg. spike bottom 5%",
     "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
     "activation_nonzero": "Activation nonzero",
-    "activation_zero_or_nearzero": "Activation zero / near-zero",
+    "activation_zero_or_nearzero": "Activation (near-)zero",
     "high_volatility_week": "High-volatility week",
     "spike_week": "Spike week",
 }
@@ -1192,14 +1229,14 @@ def _write_tail_spike_relative_tex(
 
     thesis_root = "figures/4-results/rq1_ml_model_benchmark/4_1_5_tail_spike/result_section"
     regime_labels = {
-        "normal": "Normal",
+        "normal": "Non-stress regime",
         "da_positive_spike_top5": "Positive spike top 5%",
-        "da_negative_spike_bottom5": "Negative spike bottom 5%",
+        "da_negative_spike_bottom5": "Neg. spike bottom 5%",
         "afrr_capacity_price_high_tail_top5": "High tail top 5%",
         "afrr_activation_price_abs_tail_top5": "Abs. tail top 5%",
         "afrr_activation_rate_high_tail_top5": "High activation-rate tail top 5%",
         "activation_nonzero": "Activation nonzero",
-        "activation_zero_or_nearzero": "Activation zero / near-zero",
+        "activation_zero_or_nearzero": "Activation (near-)zero",
         "high_volatility_week": "High-volatility week",
         "spike_week": "Spike week",
     }
@@ -1267,6 +1304,17 @@ def _write_tail_spike_relative_tex(
 
     def _clean_regime_label(regime: Any) -> str:
         return regime_labels.get(str(regime), _tex_label(regime))
+
+    def _compact_target_label_tex(target_label: Any) -> str:
+        label = str(target_label)
+        labels = {
+            "DA price": r"\shortstack{DA\\price}",
+            "aFRR capacity price +": r"\shortstack{aFRR capacity\\price +}",
+            "aFRR capacity price -": r"\shortstack{aFRR capacity\\price $-$}",
+            "aFRR activation price": r"\shortstack{aFRR activation\\price}",
+            "aFRR activation rate": r"\shortstack{aFRR activation\\rate}",
+        }
+        return labels.get(label, _latex_escape(label))
 
     def _write_native_relative_file(
         filename: str,
@@ -1371,22 +1419,25 @@ def _write_tail_spike_relative_tex(
         if not rows:
             return None
 
+        use_all_target_compact_layout = filename == "tail_spike_relative_pinball_by_regime_all_targets.tex"
         labels = [str(row["label"]) for row in rows]
-        y_symbols = [_tex_symbol(f"row_{idx}_{label}") for idx, label in enumerate(labels)]
-        y_symbol_list = ",".join(y_symbols)
+        y_indices = list(range(len(rows)))
+        y_tick_values = ",".join(str(idx) for idx in y_indices)
+        section_ranges: list[tuple[int, int, str]] = []
         if compact_target_sections:
             tick_label_parts: list[str] = []
-            starts = set(section_starts)
             for idx, row in enumerate(rows):
-                regime_label = _latex_escape(row.get("regime_label", row["label"]))
-                if idx in starts:
-                    tick_label_parts.append(r"\textbf{" + _latex_escape(row.get("target_label", "")) + r"}\\" + regime_label)
-                else:
-                    tick_label_parts.append(regime_label)
+                tick_label_parts.append(_latex_escape(row.get("regime_label", row["label"])))
+            for pos, start_idx in enumerate(section_starts):
+                next_start = section_starts[pos + 1] if pos + 1 < len(section_starts) else len(rows)
+                section_ranges.append((start_idx, next_start - 1, str(rows[start_idx].get("target_label", ""))))
             y_tick_labels = ",".join(tick_label_parts)
         else:
             y_tick_labels = ",".join(_latex_escape(label) for label in labels)
-        height_cm = max(7.8, min(29.0 if compact_target_sections else 16.0, 0.62 * len(labels) + 2.0))
+        y_tick_labels = ",".join("{" + part + "}" for part in y_tick_labels.split(","))
+        height_scale = 0.74 if use_all_target_compact_layout else 0.62
+        height_padding = 2.6 if use_all_target_compact_layout else 2.0
+        height_cm = max(7.8, min(29.0 if compact_target_sections else 16.0, height_scale * len(labels) + height_padding))
         max_x = max(
             [1.0]
             + [
@@ -1397,20 +1448,70 @@ def _write_tail_spike_relative_tex(
             ]
         )
         xmax = max(1.25, min(max_x * 1.12, max_x + 0.35))
+        break_start = 2.0
+        break_end = 3.5
+        break_width = break_end - break_start
+        values_for_break = [
+            float(row[model])
+            for row in rows
+            for model in ["XGB", "TFT"]
+            if model in row and np.isfinite(float(row[model]))
+        ]
+        compress_x_axis = (
+            use_all_target_compact_layout
+            and max_x > break_end
+            and not any(break_start < value < break_end for value in values_for_break)
+        )
+
+        def _plot_x_value(value: Any) -> float:
+            x = float(value)
+            if compress_x_axis and x > break_end:
+                return x - break_width
+            return x
+
+        plot_xmax = _plot_x_value(xmax) if compress_x_axis else xmax
+        if compress_x_axis:
+            tick_originals = [0.0, 1.0, 2.0]
+            tick_originals.extend(float(tick) for tick in range(4, int(np.ceil(xmax)) + 1))
+            tick_originals = [tick for tick in tick_originals if tick <= xmax + 1e-9]
+            xtick_values = ",".join(_tex_num(_plot_x_value(tick)) for tick in tick_originals)
+            xtick_labels = ",".join("{" + _tex_num(tick) + "}" for tick in tick_originals)
+            ellipsis_tick = break_start + 0.25
+        else:
+            xtick_values = ""
+            xtick_labels = ""
+            ellipsis_tick = None
+        table_names = {"XGB": r"\tailSpikeXGBTable", "TFT": r"\tailSpikeTFTTable"}
+        model_table_lines: list[str] = []
+        model_has_data: dict[str, bool] = {}
+        for model in ["XGB", "TFT"]:
+            table_rows = ["row,value\\\\"]
+            for row_idx, row in enumerate(rows):
+                value = row.get(model)
+                if value is not None and np.isfinite(float(value)):
+                    table_rows.append(f"{row_idx},{_tex_num(_plot_x_value(value))}\\\\")
+            model_has_data[model] = len(table_rows) > 1
+            if model_has_data[model]:
+                model_table_lines.append(r"            \pgfplotstableread[col sep=comma, row sep=\\]{")
+                model_table_lines.extend(f"                {line}" for line in table_rows)
+                model_table_lines.append(rf"            }}{table_names[model]}")
 
         lines = [
             r"% Requires: \usepackage{pgfplots}",
+            r"% Requires: \usepackage{pgfplotstable}",
             r"% Requires: \usepackage{xcolor}",
+            r"% Requires: \usetikzlibrary{decorations.pathreplacing}",
             r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
             *_latex_color_defs(),
             rf"\begin{{figure}}[{placement}]",
             r"    \centering",
             r"    \resizebox{\linewidth}{!}{%",
             r"        \begin{tikzpicture}",
+            *model_table_lines,
             r"            \begin{axis}[",
             r"                xbar,",
             r"                bar width=7pt,",
-            r"                width=0.98\textwidth,",
+            rf"                width={'0.74' if use_all_target_compact_layout else '0.98'}\textwidth,",
             rf"                height={_tex_num(height_cm)}cm,",
             r"                xlabel={Mean pinball loss relative to RLQR},",
             r"                legend style={at={(0.5,1.12)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
@@ -1418,36 +1519,65 @@ def _write_tail_spike_relative_tex(
             r"                area legend,",
             r"                axis lines*=left,",
             r"                xmin=0,",
-            rf"                xmax={_tex_num(xmax)},",
+            rf"                xmax={_tex_num(plot_xmax)},",
             r"                grid=major,",
-            rf"                symbolic y coords={{{y_symbol_list}}},",
-            rf"                ytick={{{y_symbol_list}}},",
+            r"                clip=false,",
+            r"                ymin=0,",
+            rf"                ymax={len(rows) - 1},",
+            rf"                ytick={{{y_tick_values}}},",
             rf"                yticklabels={{{y_tick_labels}}},",
-            r"                yticklabel style={font=\scriptsize, text width=4.9cm, align=right},",
-            r"                enlarge y limits={abs=0.08},",
+            rf"                yticklabel style={{font=\{'small' if use_all_target_compact_layout else 'scriptsize'}, align=right}},",
+            rf"                enlarge y limits={{abs={'0.45' if compact_target_sections else '0.28'}}},",
             r"                y dir=reverse,",
             r"            ]",
-            rf"                \draw[color=secondary, densely dotted, line width=1.2pt, shorten <=-8mm, shorten >=-8mm] (axis cs:1,{y_symbols[0]}) -- (axis cs:1,{y_symbols[-1]});",
+            rf"                \draw[color=secondary, densely dotted, line width=1.2pt, shorten <=-8mm, shorten >=-8mm] (axis cs:1,0) -- (axis cs:1,{len(rows) - 1});",
             r"                \addlegendimage{color=secondary, densely dotted, line width=1.2pt}",
             r"                \addlegendentry{RLQR}",
         ]
+        if compress_x_axis:
+            axis_option_insert_at = lines.index(r"                y dir=reverse,")
+            lines[axis_option_insert_at:axis_option_insert_at] = [
+                rf"                xtick={{{xtick_values}}},",
+                rf"                xticklabels={{{xtick_labels}}},",
+                rf"                extra x ticks={{{_tex_num(ellipsis_tick)}}},",
+                r"                extra x tick labels={{$\cdots$}},",
+                r"                extra x tick style={grid=none, tick style={draw=none}, xticklabel style={font=\small, yshift=-0.4ex}},",
+            ]
+            lines.append(
+                rf"                \node[anchor=south, font=\scriptsize, text=neutraldark] at (axis cs:{_tex_num(ellipsis_tick)},-0.55) {{axis break: {_tex_num(break_start)}--{_tex_num(break_end)}}};"
+            )
+            lines.append(
+                rf"                \draw[color=neutraldark, line width=0.55pt] ([xshift=-3pt,yshift=-3pt]axis cs:{_tex_num(ellipsis_tick)},{len(rows) - 1}) -- ([xshift=1pt,yshift=3pt]axis cs:{_tex_num(ellipsis_tick)},{len(rows) - 1});"
+            )
+            lines.append(
+                rf"                \draw[color=neutraldark, line width=0.55pt] ([xshift=2pt,yshift=-3pt]axis cs:{_tex_num(ellipsis_tick)},{len(rows) - 1}) -- ([xshift=6pt,yshift=3pt]axis cs:{_tex_num(ellipsis_tick)},{len(rows) - 1});"
+            )
         if compact_target_sections:
-            for start_idx in section_starts[1:]:
-                sep_symbol = y_symbols[start_idx]
+            use_compact_target_labels = use_all_target_compact_layout
+            target_label_xshift = "-4.55cm"
+            brace_xshift = "-4.02cm" if use_compact_target_labels else "-1.05cm"
+            target_label_font = r"\small" if use_compact_target_labels else r"\scriptsize"
+            for start_idx, end_idx, target_label in section_ranges:
+                y_min = start_idx - 0.38
+                y_max = end_idx + 0.38
+                y_mid = (start_idx + end_idx) / 2.0
+                target_label_tex = _compact_target_label_tex(target_label) if use_compact_target_labels else _latex_escape(target_label)
                 lines.append(
-                    rf"                \draw[color=naive, dashed, line width=0.6pt] ([yshift=-0.24cm]axis cs:0,{sep_symbol}) -- ([yshift=-0.24cm]axis cs:{_tex_num(xmax)},{sep_symbol});"
+                    rf"                \draw[decorate, decoration={{brace, amplitude=4pt, mirror}}, color=neutraldark, line width=0.55pt] ([xshift={brace_xshift}]axis cs:0,{_tex_num(y_min)}) -- ([xshift={brace_xshift}]axis cs:0,{_tex_num(y_max)});"
+                )
+                lines.append(
+                    rf"                \node[rotate=90, anchor=center, text=neutraldark, font={target_label_font}] at ([xshift={target_label_xshift}]axis cs:0,{_tex_num(y_mid)}) {{{target_label_tex}}};"
+                )
+            for start_idx in section_starts[1:]:
+                lines.append(
+                    rf"                \draw[color=naive, dashed, line width=0.6pt] ([xshift=-1.2cm]axis cs:0,{_tex_num(start_idx - 0.5)}) -- (axis cs:{_tex_num(plot_xmax)},{_tex_num(start_idx - 0.5)});"
                 )
         bar_shift_by_model = {"XGB": "-1.75pt", "TFT": "1.75pt"}
         for model in ["XGB", "TFT"]:
-            coords: list[str] = []
-            for row, y_symbol in zip(rows, y_symbols):
-                value = row.get(model)
-                if value is not None and np.isfinite(float(value)):
-                    coords.append(f"({_tex_num(value)},{y_symbol})")
-            if coords:
+            if model_has_data.get(model, False):
                 color = _model_color_role(model)
                 bar_shift = bar_shift_by_model.get(model, "0pt")
-                lines.append(rf"                \addplot[xbar, bar shift={bar_shift}, fill={color}, draw={color}, fill opacity=1, draw opacity=1, area legend] coordinates {{{' '.join(coords)}}};")
+                lines.append(rf"                \addplot[xbar, bar shift={bar_shift}, fill={color}, draw={color}, fill opacity=1, draw opacity=1, area legend] table[x=value, y=row] {{{table_names[model]}}};")
                 lines.append(rf"                \addlegendentry{{{model}}}")
         lines.extend(
             [

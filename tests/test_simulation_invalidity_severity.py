@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.build_simulation_invalidity_severity import build_outputs, parse_bool, parse_scenario_folder
+import scripts.summarize_rq2_invalidity_severity as summarizer
 
 
 def _make_scenario(root: Path, folder: str = "xgb_p30") -> Path:
@@ -51,12 +52,43 @@ def _make_scenario(root: Path, folder: str = "xgb_p30") -> Path:
     ).to_csv(scenario / "da_precommit_debug.csv", index=False)
     pd.DataFrame(
         {
+            "timestamp_utc": ["2025-01-01T00:00:00Z"],
+            "da_hourly_lock_infeasible_buy_mwh": [0.2],
+            "da_hourly_lock_infeasible_sell_mwh": [0.0],
+        }
+    ).to_csv(root / folder / "multi" / "da_precommit_debug.csv", index=False)
+    pd.DataFrame(
+        {
             "da_bid_abs_mwh_total": [0.0],
             "bem_bid_abs_mwh_total": [0.0],
             "id_abs_mwh_total": [0.0],
             "bcm_bid_abs_mwh_total": [0.0],
         }
     ).to_csv(scenario / "performance_metrics.csv", index=False)
+    return scenario
+
+
+def _make_scenario_level_fallback_only(root: Path, folder: str = "tft_p90") -> Path:
+    scenario = root / folder / "multi" / "p90_p90"
+    scenario.mkdir(parents=True)
+    (scenario / "backtest_summary.json").write_text(
+        json.dumps(
+            {
+                "simulation_valid": False,
+                "thesis_reportable": False,
+                "invalid_reason": "fallback_used",
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "timestamp_utc": [
+                "2025-01-01T00:00:00Z",
+                "2025-01-01T01:00:00Z",
+            ],
+        }
+    ).to_csv(scenario / "backtest_hourly.csv", index=False)
     return scenario
 
 
@@ -101,6 +133,7 @@ def test_invalidity_severity_direct_extraction(tmp_path: Path) -> None:
     hourly = pd.read_csv(paths["hourly"])
     warnings = pd.read_csv(paths["warnings"])
     metric_sources = pd.read_csv(paths["metric_sources"])
+    inventory = pd.read_csv(paths["inventory"])
 
     row = summary.iloc[0]
     assert row["scenario"] == "xgb_p30"
@@ -133,6 +166,27 @@ def test_invalidity_severity_direct_extraction(tmp_path: Path) -> None:
     first_hour = hourly.sort_values("timestamp_utc").iloc[0]
     assert first_hour["combined_infeasibility_flag"] == 1
     assert {"total_hours", "da_lockbook_infeasible_mwh", "soc_violation_mwh"}.issubset(set(metric_sources["metric_name"]))
+    assert {
+        "supports_metric",
+        "selected_for_extraction",
+        "metrics_supported",
+        "metrics_selected",
+        "reason_if_not_used",
+    }.issubset(set(inventory.columns))
+    hourly_inventory = inventory.loc[
+        inventory["candidate_file"].astype(str).str.endswith("backtest_hourly.csv")
+        & inventory["exists"].map(parse_bool).fillna(False)
+    ].iloc[0]
+    assert parse_bool(hourly_inventory["supports_metric"]) is True
+    assert parse_bool(hourly_inventory["selected_for_extraction"]) is True
+    assert "total_hours" in str(hourly_inventory["metrics_supported"])
+    assert "total_hours" in str(hourly_inventory["metrics_selected"])
+    supported_not_selected = inventory.loc[
+        inventory["supports_metric"].map(parse_bool).fillna(False)
+        & ~inventory["selected_for_extraction"].map(parse_bool).fillna(False)
+    ]
+    assert not supported_not_selected.empty
+    assert "supported_file_exists_but_not_selected_for_extraction" in set(supported_not_selected["reason_if_not_used"])
     soc_source = metric_sources.loc[metric_sources["metric_name"].eq("soc_violation_mwh"), "source_column"].iloc[0]
     assert "real_soc_mwh" in soc_source
     assert "planned_soc_mwh" not in soc_source
@@ -144,3 +198,37 @@ def test_invalidity_severity_direct_extraction(tmp_path: Path) -> None:
     assert "Severity class" in tex
     assert "diagnostic backtest evidence" in txt
     assert "fully validated physically feasible" in txt
+
+
+def test_summarizer_reads_generic_outputs(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    out_root = tmp_path / "out"
+    _make_scenario(run_root)
+    build_outputs(run_root, out_root, label="rq2")
+
+    assert summarizer.DEFAULT_RQ2_ROOT == Path("artifacts/final_benchmark/rq2/thesis_final_multi_2m_20260620T091938Z")
+    paths = summarizer.build_outputs(out_root)
+    assert paths["latex"].exists()
+    assert paths["compact"].exists()
+    assert "Severity class" in paths["latex"].read_text(encoding="utf-8")
+    warnings_text = paths["summary"].read_text(encoding="utf-8")
+    assert "legacy_filename_used" not in warnings_text
+
+
+def test_scenario_level_fallback_does_not_become_count(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    out_root = tmp_path / "out"
+    _make_scenario_level_fallback_only(run_root)
+
+    paths = build_outputs(run_root, out_root, label="rq2")
+    summary = pd.read_csv(paths["summary"])
+    warnings = pd.read_csv(paths["warnings"])
+    metric_sources = pd.read_csv(paths["metric_sources"])
+    row = summary.iloc[0]
+    assert parse_bool(row["fallback_present_scenario_flag"]) is True
+    assert np.isnan(row["fallback_optimization_count"])
+    assert np.isnan(row["fallback_optimization_share"])
+    assert "count_unavailable_from_scenario_flag_only" in set(warnings["warning"])
+    source_row = metric_sources.loc[metric_sources["metric_name"].eq("fallback_optimization_count")].iloc[0]
+    assert source_row["metric_status"] == "unavailable"
+    assert "scenario-level invalid reason" in str(source_row["source_semantics"])

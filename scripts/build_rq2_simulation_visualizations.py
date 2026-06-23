@@ -1051,7 +1051,7 @@ def write_primary_table(path: Path, table: pd.DataFrame, simulation_days: float)
 
 
 def write_appendix_table(path: Path, summary: pd.DataFrame) -> None:
-    cols = ["folder", "model", "quantile", "realized_profit_eur", "annualized_profit_eur_per_year", "simulation_valid", "thesis_reportable", "invalid_reason"]
+    cols = ["model", "quantile", "realized_profit_eur", "annualized_profit_eur_per_year", "simulation_valid", "thesis_reportable", "invalid_reason"]
     data = summary[cols].copy()
     lines = [
         r"\begin{table}[htbp]",
@@ -1059,26 +1059,120 @@ def write_appendix_table(path: Path, summary: pd.DataFrame) -> None:
         r"\scriptsize",
         r"\caption{RQ2 profit and validity diagnostics by simulation folder.}",
         r"\label{tab:rq2_profit_and_validity_detailed}",
-        r"\begin{tabular}{@{}lllrrr p{0.30\linewidth}@{}}",
+        r"\begin{tabular}{@{}llrrc p{0.42\linewidth}@{}}",
         r"\toprule",
-        r"\textbf{Scenario} & \textbf{Model} & \textbf{Quantile} & \textbf{Profit} & \textbf{Annualized profit} & \textbf{Valid} & \textbf{Invalid reason} \\",
+        r"\textbf{Model} & \textbf{Quantile} & \textbf{Profit} & \textbf{Annualized profit} & \textbf{Valid} & \textbf{Invalid reason} \\",
         r"\midrule",
     ]
     for _, row in data.iterrows():
         reason = str(row.get("invalid_reason", "") or "")
         if reason == "none":
             reason = ""
+        reason_tex = _latex_escape(reason).replace(",", r",\allowbreak{}")
         cells = [
-            _latex_escape(row["folder"]),
             _latex_escape(row["model"]),
             _latex_escape(row["quantile"]),
             _format_eur(row["realized_profit_eur"]),
             _format_eur(row["annualized_profit_eur_per_year"]),
             "yes" if _safe_float(row["simulation_valid"]) >= 0.5 and _safe_float(row["thesis_reportable"]) >= 0.5 else "no",
-            _latex_escape(reason),
+            reason_tex,
         ]
         lines.append(" & ".join(cells) + r" \\")
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _format_k_eur_table(value: Any, digits: int = 1) -> str:
+    val = _safe_float(value)
+    if not math.isfinite(val):
+        return r"--"
+    return f"{val:,.{digits}f}"
+
+
+def _revenue_cost_table_component_label(component: str) -> str:
+    labels = {
+        "DA net": "DA net revenue",
+        "ID net": "ID net revenue",
+        "BCM capacity": "BCM capacity revenue",
+        "BCM activation": "BCM activation revenue",
+        "BEM activation": "BEM activation revenue",
+        "Degradation cost": "Degradation cost",
+        "Auxiliary cost": "Auxiliary cost",
+        "Transaction cost": "Transaction cost",
+        "Penalty cost": "Penalty cost",
+        "Terminal SoC repair": "Terminal SoC repair",
+    }
+    return labels.get(str(component), str(component))
+
+
+def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame) -> None:
+    models = [m for m in MODEL_ORDER if not component_data.empty and m in set(component_data["model"])]
+    component_order = [label for _col, label in COMPONENT_COLUMNS if not component_data.empty and label in set(component_data["component"])]
+    cost_labels = {display for col, display in COMPONENT_COLUMNS if col in COMPONENT_COST_COLUMNS}
+    quantile_by_model = (
+        component_data[["model", "quantile"]]
+        .dropna()
+        .drop_duplicates("model")
+        .set_index("model")["quantile"]
+        .astype(str)
+        .to_dict()
+        if not component_data.empty
+        else {}
+    )
+    pivot = (
+        component_data.pivot_table(
+            index="component",
+            columns="model",
+            values="annualized_component_value_eur_per_year",
+            aggfunc="sum",
+        ).reindex(index=component_order, columns=MODEL_ORDER)
+        if not component_data.empty and component_order
+        else pd.DataFrame(index=component_order, columns=MODEL_ORDER)
+    )
+    header_cells = [r"\textbf{Component}"]
+    for model in models:
+        q = quantile_by_model.get(model, "")
+        q_line = r"\\" + _latex_escape(q) if q else ""
+        header_cells.append(r"\textbf{\begin{tabular}[c]{@{}r@{}}" + _latex_escape(model) + q_line + r"\end{tabular}}")
+
+    def _row(component: str, *, cost: bool) -> str:
+        cells = [_latex_escape(_revenue_cost_table_component_label(component))]
+        for model in models:
+            value = _safe_float(pivot.loc[component, model]) / 1000.0 if component in pivot.index and model in pivot.columns else math.nan
+            if cost and math.isfinite(value):
+                value = abs(value)
+            cells.append(_format_k_eur_table(value, 1))
+        return " & ".join(cells) + r" \\"
+
+    revenue_components = [c for c in component_order if c not in cost_labels]
+    cost_components = [c for c in component_order if c in cost_labels]
+    n_cols = len(models) + 1
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\small",
+        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Values are annualized and reported in kEUR per year. Cost rows are reported as positive cost magnitudes.}",
+        r"\label{tab:3_revenue_cost_components_best_quantile}",
+        r"\begin{tabular}{@{}l" + "r" * len(models) + r"@{}}",
+        r"\toprule",
+        " & ".join(header_cells) + r" \\",
+        r"\midrule",
+        rf"\multicolumn{{{n_cols}}}{{@{{}}l}}{{\textbf{{Revenue}}}} \\",
+    ]
+    lines.extend(_row(component, cost=False) for component in revenue_components)
+    lines.extend(
+        [
+            r"\addlinespace",
+            rf"\multicolumn{{{n_cols}}}{{@{{}}l}}{{\textbf{{Costs}}}} \\",
+        ]
+    )
+    lines.extend(_row(component, cost=True) for component in cost_components)
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+        "",
+    ]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1252,7 +1346,7 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
     ax.set_xticklabels(quantiles)
     ax.set_ylabel("Annualized Net Profit (EUR/year)")
     ax.set_xlabel("Quantile policy")
-    ax.set_title("Quantile Sweep: Net Profit by Model", pad=14)
+    ax.set_title("Net Profit by Model and Quantile", pad=14)
     ax.legend(ncol=5, loc="upper center", bbox_to_anchor=(0.5, -0.16), frameon=True)
     fig.tight_layout(rect=(0, 0.12, 1, 1))
     written = _save_figure(fig, out_base, formats)
@@ -1876,6 +1970,13 @@ def _tex_k_eur(value: Any, digits: int = 1) -> str:
     return f"{number / 1000.0:.{digits}f}"
 
 
+def _tex_k_eur_label(value: Any) -> str:
+    number = _safe_float(value)
+    if not math.isfinite(number):
+        return "--"
+    return f"{number:,.0f}"
+
+
 def _write_native_latex(path: Path, lines: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -1960,6 +2061,28 @@ def write_latex_profit_heatmap(path: Path, table: pd.DataFrame) -> None:
 
 def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: list[str]) -> None:
     x_by_q = {q: i for i, q in enumerate(quantiles)}
+    plotted_values: list[float] = []
+    if not sweep_data.empty and "annualized_net_profit_eur_per_year" in sweep_data.columns:
+        plotted_values = [
+            _safe_float(v) / 1000.0
+            for v in sweep_data["annualized_net_profit_eur_per_year"]
+            if math.isfinite(_safe_float(v))
+        ]
+    y_min = min([0.0] + plotted_values) if plotted_values else 0.0
+    y_max = max(plotted_values) if plotted_values else 1.0
+    y_pad = max(60.0, 0.12 * (y_max - y_min))
+    y_max_plot = y_max + y_pad
+    label_offsets = {
+        ("RLQR", "p50"): ("south", "0pt", "-12pt"),
+        ("XGB", "p90"): ("south", "0pt", "-12pt"),
+        ("TFT", "p90"): ("south west", "2pt", "-8pt"),
+        ("TFT", "p10"): ("north west", "2pt", "4pt"),
+    }
+    model_plot_options = {
+        "RLQR": r"color=rqTwoRLQR, mark=diamond, mark options={solid, draw=rqTwoRLQR, fill=white}, line width=1.8pt",
+        "XGB": r"color=rqTwoXGB, mark=square*, mark options={solid, draw=rqTwoXGB, fill=rqTwoXGB}, line width=1.8pt",
+        "TFT": r"color=rqTwoTFT, mark=triangle*, mark options={solid, draw=rqTwoTFT, fill=rqTwoTFT}, line width=1.8pt",
+    }
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -1971,13 +2094,16 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
         *_axis_common_options(),
         r"width=\linewidth,",
         r"height=0.56\linewidth,",
-        r"title={Quantile Sweep: Net Profit by Model},",
+        r"title={Net Profit by Model and Quantile},",
         r"xlabel={Quantile policy},",
         r"ylabel={Annualized Net Profit (kEUR)},",
+        r"ymin=" + _tex_float(y_min, 2) + ",",
+        r"ymax=" + _tex_float(y_max_plot, 2) + ",",
+        r"clip=false,",
         r"xtick={" + ",".join(str(i) for i in range(len(quantiles))) + "},",
         r"xticklabels={" + ",".join(_latex_escape(q) for q in quantiles) + "},",
         r"legend columns=5,",
-        r"legend pos=north west,",
+        r"legend style={at={(0.5,-0.20)}, anchor=north, legend columns=5, draw=none, fill=none, font=\small},",
         r"]",
     ]
     for model in ["Naive", "RHPF"]:
@@ -1995,11 +2121,18 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
             rf"\addplot+[color={_tex_model_color(model)}, mark=none, line width=1.6pt] coordinates {{(0,{_tex_float(value, 2)}) ({len(quantiles)-1},{_tex_float(value, 2)})}};",
             rf"\addlegendentry{{{model}}}",
         ]
+        anchor = "north east" if model == "RHPF" else "south east"
+        yshift = "-3pt" if model == "RHPF" else "3pt"
+        lines.append(
+            rf"\node[font=\scriptsize, fill=white, fill opacity=0.85, text opacity=1, inner sep=1pt, anchor={anchor}, yshift={yshift}] "
+            rf"at (axis cs:{len(quantiles)-1},{_tex_float(value, 2)}) {{{model} {_tex_k_eur_label(value)}}};"
+        )
     for model in MODEL_ORDER:
         g = sweep_data.loc[sweep_data["series"].astype(str).eq(model)].copy() if not sweep_data.empty else pd.DataFrame()
         if g.empty:
             continue
         coords = []
+        labels: list[tuple[str, float, float]] = []
         for q in quantiles:
             match = g.loc[g["quantile"].astype(str).eq(q)]
             if match.empty:
@@ -2007,13 +2140,19 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
             value = _safe_float(match["annualized_net_profit_eur_per_year"].iloc[0]) / 1000.0
             if math.isfinite(value):
                 coords.append(f"({x_by_q[q]},{_tex_float(value, 2)})")
+                labels.append((q, float(x_by_q[q]), value))
         if not coords:
             continue
-        marker = {"RLQR": "*", "XGB": "square*", "TFT": "triangle*"}.get(model, "*")
         lines += [
-            rf"\addplot+[color={_tex_model_color(model)}, mark={marker}, line width=1.8pt] coordinates {{{' '.join(coords)}}};",
+            rf"\addplot+[{model_plot_options.get(model, 'color=rqTwoNeutral, mark=*, line width=1.8pt')}] coordinates {{{' '.join(coords)}}};",
             rf"\addlegendentry{{{model}}}",
         ]
+        for q, x_pos, value in labels:
+            anchor, xshift, yshift = label_offsets.get((model, q), ("south", "0pt", "5pt"))
+            lines.append(
+                rf"\node[font=\scriptsize, text=rqTwoNeutral, fill=white, fill opacity=0.85, text opacity=1, inner sep=1pt, anchor={anchor}, xshift={xshift}, yshift={yshift}] "
+                rf"at (axis cs:{_tex_float(x_pos, 1)},{_tex_float(value, 2)}) {{{_tex_k_eur_label(value)}}};"
+            )
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
@@ -2028,6 +2167,21 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
     models = list(MODEL_ORDER) if not component_data.empty else []
     component_order = [label for _col, label in COMPONENT_COLUMNS if not component_data.empty and label in set(component_data["component"])]
     cost_labels = {display for col, display in COMPONENT_COLUMNS if col in COMPONENT_COST_COLUMNS}
+    x_positions = {model: (2 * idx, 2 * idx + 1) for idx, model in enumerate(models)}
+    x_ticks = ",".join(str(i) for i in range(2 * len(models)))
+    x_tick_labels = ",".join(["Revenue", "Cost"] * len(models))
+    extra_x_ticks = ",".join(_tex_float(2 * idx + 0.5, 1) for idx in range(len(models)))
+    quantile_by_model = (
+        component_data[["model", "quantile"]]
+        .dropna()
+        .drop_duplicates("model")
+        .set_index("model")["quantile"]
+        .astype(str)
+        .to_dict()
+        if not component_data.empty
+        else {}
+    )
+    extra_x_tick_labels = ",".join(_latex_escape(f"{model} {quantile_by_model.get(model, '')}".strip()) for model in models)
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -2038,16 +2192,21 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
         r"\begin{axis}[",
         *_axis_common_options(),
         r"width=\linewidth,",
-        r"height=0.58\linewidth,",
+        r"height=0.64\linewidth,",
         r"ybar stacked,",
-        r"bar width=22pt,",
+        r"bar width=15pt,",
         r"title={Revenue and Cost Components at Best Quantile},",
-        r"xlabel={Model and best quantile},",
+        r"xlabel={Model, selected quantile and component type},",
         r"ylabel={Annualized component value (kEUR/year)},",
-        r"symbolic x coords={" + ",".join(_latex_escape(m) for m in models) + "},",
-        r"xtick=data,",
-        r"legend columns=2,",
-        r"legend style={at={(1.02,1)}, anchor=north west, font=\scriptsize, draw=none, fill=none},",
+        r"ymin=0,",
+        r"enlarge x limits=0.08,",
+        r"xtick={" + x_ticks + "},",
+        r"xticklabels={" + x_tick_labels + "},",
+        r"extra x ticks={" + extra_x_ticks + "},",
+        r"extra x tick labels={" + extra_x_tick_labels + "},",
+        r"extra x tick style={tick label style={yshift=-1.6em, font=\small}, tick style={draw=none}},",
+        r"legend columns=3,",
+        r"legend style={at={(0.5,-0.24)}, anchor=north, font=\scriptsize, draw=none, fill=none},",
         r"]",
     ]
     if not component_data.empty and models and component_order:
@@ -2059,14 +2218,25 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
         ).reindex(index=MODEL_ORDER, columns=component_order).fillna(0.0)
         ordered = [c for c in component_order if c not in cost_labels] + [c for c in component_order if c in cost_labels]
         for component in ordered:
-            coords_parts = [
-                f"({_latex_escape(model)},{_tex_float(_safe_float(pivot.loc[model, component]) / 1000.0, 2)})"
-                for model in models
-            ]
-            if len(coords_parts) != len(models):
+            coords_parts: list[str] = []
+            for model in models:
+                profit_x, cost_x = x_positions[model]
+                raw_value = _safe_float(pivot.loc[model, component]) / 1000.0
+                if component in cost_labels:
+                    profit_value = 0.0
+                    cost_value = abs(raw_value) if math.isfinite(raw_value) else 0.0
+                elif math.isfinite(raw_value) and raw_value < 0.0:
+                    profit_value = 0.0
+                    cost_value = abs(raw_value)
+                else:
+                    profit_value = raw_value if math.isfinite(raw_value) else 0.0
+                    cost_value = 0.0
+                coords_parts.append(f"({profit_x},{_tex_float(profit_value, 2)})")
+                coords_parts.append(f"({cost_x},{_tex_float(cost_value, 2)})")
+            if len(coords_parts) != 2 * len(models):
                 raise ValueError(
-                    f"Stacked revenue/cost LaTeX component {component!r} has {len(coords_parts)} coordinates "
-                    f"but expected {len(models)} model coordinates."
+                    f"Grouped stacked revenue/cost LaTeX component {component!r} has {len(coords_parts)} coordinates "
+                    f"but expected {2 * len(models)} coordinates."
                 )
             coords = " ".join(coords_parts)
             lines += [
@@ -2076,7 +2246,7 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Values are annualized and reported in kEUR per year.}",
+        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Profit components and cost/loss components are shown as adjacent stacked bars. Values are annualized and reported in kEUR per year.}",
         r"\label{fig:3_revenue_cost_components_best_quantile}",
         r"\end{figure}",
     ]
@@ -2410,6 +2580,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     dispatch_soc_warnings.to_csv(warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", index=False)
 
     write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
+    write_revenue_cost_component_table(tables_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
     write_appendix_table(appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", summary)
 
     result_figure_paths: list[Path] = []
@@ -2456,6 +2627,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for path, tier, artifact_type, metric_family, thesis_use in [
         (tables_dir / "1_net_profit_by_model_and_quantile.tex", "result_section", "latex_table", "annualized realized net profit", "primary RQ2 result table"),
+        (tables_dir / "3_revenue_cost_components_best_quantile.tex", "result_section", "latex_table", "revenue and cost components", "best-quantile revenue/cost component table"),
         (appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", "appendix", "latex_table", "profit and validity", "validity audit table"),
         (csv_dir / "rq2_scenario_summary_long.csv", "backup", "csv", "scenario summary", "reproducibility backup"),
         (csv_dir / "1_net_profit_by_model_and_quantile.csv", "backup", "csv", "annualized realized net profit", "source data for primary table"),
