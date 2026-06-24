@@ -8,6 +8,8 @@ Target design (next-hour shift, canonical names without suffix):
 - `target_afrr_activation_rate_neg`: next-hour negative aFRR activation-rate target.
 - `target_afrr_capacity_price_pos`: next-hour positive aFRR capacity-price target.
 - `target_afrr_capacity_price_neg`: next-hour negative aFRR capacity-price target.
+- `afrr_capacity_price_pos` / `afrr_capacity_price_neg`: unshifted aFRR
+  capacity-price truth kept for settlement and audit only.
 
 Rationale:
 - Targets are explicitly prefixed with `target_` to avoid ambiguity in ML flows.
@@ -485,6 +487,14 @@ def add_explicit_targets(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("__target_source_afrr_rate_neg").shift(-1).alias("target_afrr_activation_rate_neg"),
         pl.col("__target_source_afrr_capacity_price_pos").shift(-1).alias("target_afrr_capacity_price_pos"),
         pl.col("__target_source_afrr_capacity_price_neg").shift(-1).alias("target_afrr_capacity_price_neg"),
+    ])
+
+    # Preserve unshifted capacity-price truth for settlement/forensics. Capacity
+    # products are 4h blocks; the shifted target columns are ML labels and must
+    # not be used as BCM settlement cutoffs.
+    out = out.with_columns([
+        pl.col("__target_source_afrr_capacity_price_pos").cast(pl.Float64).alias("afrr_capacity_price_pos"),
+        pl.col("__target_source_afrr_capacity_price_neg").cast(pl.Float64).alias("afrr_capacity_price_neg"),
     ])
 
     # Preserve raw (non-imputed) activation-price targets for settlement/forensics.
@@ -2041,9 +2051,10 @@ def build_features(input_path: Path, output_path: Path) -> None:
 
     # Enforce audit naming contract:
     # hide unsuffixed PiT-shifted base columns and keep only explicit *_lag_Xh names.
+    audit_truth_cols = {"afrr_capacity_price_pos", "afrr_capacity_price_neg"}
     shifted_base_cols = []
     for c in df.columns:
-        if c.startswith("target_") or LAG_SUFFIX_RE.search(c):
+        if c in audit_truth_cols or c.startswith("target_") or LAG_SUFFIX_RE.search(c):
             continue
         lag_h = _lag_hours_for_column(c)
         if lag_h > 0 and f"{c}_lag_{lag_h}h" in df.columns:
@@ -2055,7 +2066,7 @@ def build_features(input_path: Path, output_path: Path) -> None:
     # market outcomes). Backfilling is methodically acceptable to avoid
     # artificial data scarcity from late publication starts; intraday dynamics
     # are captured by actual generation/activation features.
-    capacity_cols = [c for c in df.columns if "capacity" in c.lower()]
+    capacity_cols = [c for c in df.columns if "capacity" in c.lower() and c not in audit_truth_cols]
     if capacity_cols:
         cap_exprs = []
         for c in capacity_cols:

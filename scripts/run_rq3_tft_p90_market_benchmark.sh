@@ -10,7 +10,7 @@ set -Eeuo pipefail
 #   3) run that fixed policy for the RQ3 market strategies:
 #      multi, DA, BEM, BCM and aFRR.
 #
-# Time window is intentionally copied from run_final_thesis_multi_3m.sh:
+# Time window is intentionally copied from rq2_run_final_thesis_multi_2m.sh:
 #   2025-05-31T22:00:00Z inclusive -> 2025-07-31T22:00:00Z exclusive
 #
 # This script starts simulations. It does not modify artifacts/simulation_runs

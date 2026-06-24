@@ -62,8 +62,8 @@ if str(SRC_DIR) not in sys.path:
 from energy_trading.config import MARKET_SPECS, MODEL_SPECS
 from energy_trading.simulation.battery_backtest import (
     AFRR_QUANTILE_BINS, BacktestColumnMap, BatteryBacktester,
-    OK_OPTIMIZATION_ERROR_CODES, PhaseTimeoutError, _write_checkpoint_run_status, canonicalize_market_frame,
-    load_and_align_market_data, load_prediction_warehouse_long,
+    OK_OPTIMIZATION_ERROR_CODES, PhaseTimeoutError, _write_checkpoint_run_status, assign_bcm_capacity_block,
+    canonicalize_market_frame, load_and_align_market_data, load_prediction_warehouse_long,
     normalize_predicted_pnl_aliases, resolve_benchmark_paths)
 from energy_trading.visualization.style import (apply_geo_style,
                                                 get_backtest_line_style)
@@ -72,6 +72,10 @@ INPUT_CACHE_SCHEMA_VERSION = "simulation_input_cache_v1"
 SIMULATION_EVAL_START_UTC = pd.Timestamp("2025-01-14T00:00:00Z")
 SIMULATION_EVAL_END_UTC = pd.Timestamp("2026-01-14T00:00:00Z")
 FORECAST_COVERAGE_SCHEMA_VERSION = "forecast_coverage_preflight_v1"
+FORBIDDEN_BCM_CAPACITY_TRUTH_COLUMNS = {
+    "target_afrr_capacity_price_pos",
+    "target_afrr_capacity_price_neg",
+}
 
 
 def _get_pyplot():
@@ -2345,6 +2349,97 @@ def _write_performance_metric_definitions(path: Path) -> None:
     path.write_text(json.dumps(defs, indent=2), encoding="utf-8")
 
 
+def _validate_bcm_capacity_truth_block_consistency(
+    *,
+    df: pd.DataFrame,
+    timestamp_col: str,
+    pos_col: str,
+    neg_col: str,
+    tolerance: float = 1e-9,
+) -> pd.DataFrame:
+    """Validate that unshifted BCM capacity settlement truth is block-constant.
+
+    The aFRR capacity market is represented as local Europe/Berlin 4h products.
+    Shifted forecast targets are intentionally not valid settlement truth.
+    """
+    forbidden = FORBIDDEN_BCM_CAPACITY_TRUTH_COLUMNS.intersection({str(pos_col), str(neg_col)})
+    if forbidden:
+        raise ValueError(
+            "Invalid BCM capacity settlement truth column(s): "
+            f"{sorted(forbidden)}. Use unshifted afrr_capacity_price_pos/neg, "
+            "not shifted target_afrr_capacity_price_pos/neg."
+        )
+    missing = [c for c in (timestamp_col, pos_col, neg_col) if c not in df.columns]
+    if missing:
+        raise KeyError(
+            "Missing required BCM capacity settlement truth column(s): "
+            f"{missing}. Rebuild data/features/all_data_features.parquet so it "
+            "contains unshifted afrr_capacity_price_pos and afrr_capacity_price_neg."
+        )
+
+    work = df[[timestamp_col, pos_col, neg_col]].copy()
+    work[timestamp_col] = pd.to_datetime(work[timestamp_col], utc=True, errors="coerce")
+    work = work.dropna(subset=[timestamp_col]).sort_values(timestamp_col).reset_index(drop=True)
+    if work.empty:
+        raise ValueError("Cannot validate BCM capacity truth: no valid timestamps.")
+
+    block_info = assign_bcm_capacity_block(work[timestamp_col]).reset_index(drop=True)
+    work = pd.concat([work.reset_index(drop=True), block_info], axis=1)
+    step = _infer_timestamp_step_utc(work[timestamp_col])
+    ts_min = pd.Timestamp(work[timestamp_col].min())
+    ts_end_exclusive = pd.Timestamp(work[timestamp_col].max()) + step
+    work["_partial_block"] = (
+        (pd.to_datetime(work["bcm_capacity_block_start_utc"], utc=True, errors="coerce") < ts_min)
+        | (pd.to_datetime(work["bcm_capacity_block_end_utc"], utc=True, errors="coerce") > ts_end_exclusive)
+    )
+
+    rows: list[dict[str, object]] = []
+    for block_id, g in work.groupby("bcm_capacity_block_id", dropna=False, sort=True):
+        if bool(g["_partial_block"].max()):
+            continue
+        for side, col in (("pos", pos_col), ("neg", neg_col)):
+            s = pd.to_numeric(g[col], errors="coerce")
+            if s.isna().any():
+                rows.append(
+                    {
+                        "bcm_capacity_block_id": block_id,
+                        "side": side,
+                        "column": col,
+                        "issue": "missing_capacity_price",
+                        "n_rows": int(len(s)),
+                        "n_missing": int(s.isna().sum()),
+                        "block_min": np.nan,
+                        "block_max": np.nan,
+                        "spread": np.nan,
+                    }
+                )
+                continue
+            spread = float(s.max() - s.min())
+            if spread > tolerance:
+                rows.append(
+                    {
+                        "bcm_capacity_block_id": block_id,
+                        "side": side,
+                        "column": col,
+                        "issue": "intra_block_price_variation",
+                        "n_rows": int(len(s)),
+                        "n_missing": 0,
+                        "block_min": float(s.min()),
+                        "block_max": float(s.max()),
+                        "spread": spread,
+                    }
+                )
+    issues = pd.DataFrame(rows)
+    if not issues.empty:
+        sample = issues.head(5).to_dict(orient="records")
+        raise ValueError(
+            "BCM capacity settlement truth is not constant within local 4h product blocks. "
+            "This usually means shifted target_afrr_capacity_price_* columns are being used "
+            f"as settlement cutoffs. First issues: {sample}"
+        )
+    return issues
+
+
 def _build_bcm_block_consistency_violations(
     *,
     hourly: pd.DataFrame,
@@ -3865,6 +3960,21 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
                 return c
         raise KeyError(f"Missing required column. Tried: {[primary, *candidates]}")
 
+    def pick_bcm_capacity_truth(frame: pd.DataFrame, primary: str, side: str) -> str:
+        if primary in FORBIDDEN_BCM_CAPACITY_TRUTH_COLUMNS:
+            raise ValueError(
+                f"Invalid --true-cap-{side}-col={primary!r}: shifted target columns are ML labels, "
+                "not BCM capacity settlement truth. Use unshifted afrr_capacity_price_pos/neg."
+            )
+        if primary in frame.columns:
+            return primary
+        raise KeyError(
+            f"Missing unshifted BCM capacity settlement truth column {primary!r}. "
+            "Do not fall back to target_afrr_capacity_price_pos/neg; rebuild "
+            "data/features/all_data_features.parquet so it preserves afrr_capacity_price_pos "
+            "and afrr_capacity_price_neg."
+        )
+
     def pick_pred(frame: pd.DataFrame, primary: str, candidates: list[str]) -> str:
         # In long-warehouse mode pred preview can be empty. Keep configured names.
         if frame.empty:
@@ -3899,8 +4009,8 @@ def _apply_fallback_column_map(pred: pd.DataFrame, truth: pd.DataFrame, colmap: 
         ),
 
         true_da_price=pick(truth, colmap.true_da_price, ["da_price_actual", "target_da_price"]),
-        true_afrr_capacity_price_pos=pick(truth, colmap.true_afrr_capacity_price_pos, ["target_afrr_capacity_price_pos"]),
-        true_afrr_capacity_price_neg=pick(truth, colmap.true_afrr_capacity_price_neg, ["target_afrr_capacity_price_neg"]),
+        true_afrr_capacity_price_pos=pick_bcm_capacity_truth(truth, colmap.true_afrr_capacity_price_pos, "pos"),
+        true_afrr_capacity_price_neg=pick_bcm_capacity_truth(truth, colmap.true_afrr_capacity_price_neg, "neg"),
         true_afrr_activation_price_pos=pick(
             truth,
             colmap.true_afrr_activation_price_pos,
@@ -4643,6 +4753,12 @@ def main() -> None:
     df = df[df[colmap.timestamp] < effective_end_utc].copy()
     if df.empty:
         raise ValueError("No rows after timestamp filtering.")
+    _validate_bcm_capacity_truth_block_consistency(
+        df=df,
+        timestamp_col=colmap.timestamp,
+        pos_col=colmap.true_afrr_capacity_price_pos,
+        neg_col=colmap.true_afrr_capacity_price_neg,
+    )
     scenarios: list[tuple[str, dict[str, pd.DataFrame] | None, list[str]]] = [
         ("default", forecast_warehouse, list(AFRR_QUANTILE_BINS))
     ]

@@ -36,6 +36,8 @@ def test_feature_column_builder_filters_target_raw_and_forbidden_bid_columns() -
             "da_price_AT": [50.0, 51.0, 52.0],
             "da_price_AT_lag_24h": [30.0, 31.0, 32.0],
             "afrr_activation_price_vwap_neg_lag_24h": [1.0, 2.0, 3.0],
+            "afrr_capacity_price_pos": [10.0, 11.0, 12.0],
+            "afrr_capacity_price_neg": [20.0, 21.0, 22.0],
             "wind_forecast": [5.0, 6.0, 7.0],
         }
     )
@@ -46,6 +48,8 @@ def test_feature_column_builder_filters_target_raw_and_forbidden_bid_columns() -
     assert "wind_forecast" in cols
     assert "target_da_price" not in cols
     assert "target_afrr_activation_price_vwap_neg_raw" not in cols
+    assert "afrr_capacity_price_pos" not in cols
+    assert "afrr_capacity_price_neg" not in cols
     assert "afrr_bid_avg_activation_price_neg" not in cols
     assert "bid_signed_vwap_eur_mwh_neg" not in cols
     assert "bid_alloc_mw_pos" not in cols
@@ -56,6 +60,8 @@ def test_feature_column_builder_filters_target_raw_and_forbidden_bid_columns() -
 def test_leakage_name_guard_rules() -> None:
     assert MLDataFactory._is_leaky_feature_name("target_da_price")
     assert MLDataFactory._is_leaky_feature_name("target_afrr_activation_price_vwap_neg_raw")
+    assert MLDataFactory._is_leaky_feature_name("afrr_capacity_price_pos")
+    assert MLDataFactory._is_leaky_feature_name("afrr_capacity_price_neg")
     assert MLDataFactory._is_leaky_feature_name("afrr_bid_vwap_activation_price_pos")
     assert MLDataFactory._is_leaky_feature_name("bid_alloc_mw_pos")
     assert MLDataFactory._is_leaky_feature_name("bid_signed_vwap_eur_mwh_neg")

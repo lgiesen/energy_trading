@@ -180,6 +180,10 @@ class MLDataFactory:
     HARD_LEAKAGE_PREFIX_EXCLUDE = ("target_",)
     HARD_LEAKAGE_SUFFIX_EXCLUDE = ("_raw",)
     HARD_LEAKAGE_EXACT_EXCLUDE = {
+        # Unshifted settlement/audit truth retained in feature artifacts for
+        # simulation. These columns must never enter ML feature matrices.
+        "afrr_capacity_price_pos",
+        "afrr_capacity_price_neg",
         "afrr_bid_avg_activation_price_neg",
         "afrr_bid_avg_activation_price_pos",
         "afrr_bid_vwap_activation_price_neg",

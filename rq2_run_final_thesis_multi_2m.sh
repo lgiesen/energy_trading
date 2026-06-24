@@ -24,14 +24,14 @@ set -Eeuo pipefail
 #   rerun from scratch.
 #
 # Server usage:
-#   chmod +x run_final_thesis_multi_3m.sh
-#   nohup ./run_final_thesis_multi_3m.sh \
+#   chmod +x rq2_run_final_thesis_multi_2m.sh
+#   nohup ./rq2_run_final_thesis_multi_2m.sh \
 #     > artifacts/simulation_runs/final_thesis_multi_2m_launcher.out 2>&1 &
 #   tail -f artifacts/simulation_runs/final_thesis_multi_2m_launcher.out
 #
 # Resume a specific existing launcher root:
 #   RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_2m_YYYYmmddTHHMMSSZ \
-#   ./run_final_thesis_multi_3m.sh
+#   ./rq2_run_final_thesis_multi_2m.sh
 #
 # Resume controls:
 #   SKIP_COMPLETED=1 skips jobs with .done markers and complete aggregate files.

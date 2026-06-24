@@ -121,16 +121,16 @@ This replaces fragile shell-level JSON parsing and ensures deterministic, audita
 For the final thesis multi-market benchmark on the server, use:
 
 ```bash
-chmod +x run_final_thesis_multi_3m.sh
-nohup ./run_final_thesis_multi_3m.sh \
-  > artifacts/simulation_runs/final_thesis_multi_3m_launcher.out 2>&1 &
+chmod +x rq2_run_final_thesis_multi_2m.sh
+nohup ./rq2_run_final_thesis_multi_2m.sh \
+  > artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out 2>&1 &
 ```
 
 This script runs:
 
 - Models: `xgb`, `tft`, `linear`
 - Strategy: `multi`
-- Horizon: `2025-03-01T00:00:00Z` to `2025-06-01T00:00:00Z`
+- Horizon: `2025-05-31T22:00:00Z` to `2025-07-31T22:00:00Z`
 - Quantiles: `p30-p30`, `p50-p50`, `p70-p70` first, then `p90-p90`, `p10-p10`
 - Strict final SoC: `--final-soc-mode hard`
 - Strict validity: `--strict-simulation-validity`
@@ -141,7 +141,7 @@ The script uses dedicated output folders for every model/quantile run, so aggreg
 Default output layout:
 
 ```text
-artifacts/simulation_runs/thesis_final_multi_3m_<UTC_TIMESTAMP>/
+artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>/
   xgb_p30/
   xgb_p50/
   ...
@@ -158,19 +158,19 @@ artifacts/simulation_runs/thesis_final_multi_3m_<UTC_TIMESTAMP>/
 Logs are saved inside the simulation run root under:
 
 ```text
-artifacts/simulation_runs/thesis_final_multi_3m_<UTC_TIMESTAMP>/logs/
+artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>/logs/
 ```
 
 Monitor the launcher:
 
 ```bash
-tail -f artifacts/simulation_runs/final_thesis_multi_3m_launcher.out
+tail -f artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out
 ```
 
 Monitor a specific simulation:
 
 ```bash
-RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_3m_<UTC_TIMESTAMP>
+RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>
 tail -f "$RUN_ROOT/logs/xgb_p30/stdout.log"
 tail -f "$RUN_ROOT/logs/xgb_p30/stderr.log"
 ```
@@ -178,7 +178,7 @@ tail -f "$RUN_ROOT/logs/xgb_p30/stderr.log"
 The script runs up to 4 simulations concurrently by default. Override this if needed:
 
 ```bash
-MAX_PARALLEL_JOBS=4 ./run_final_thesis_multi_3m.sh
+MAX_PARALLEL_JOBS=4 ./rq2_run_final_thesis_multi_2m.sh
 ```
 
 Naive and RHPF benchmarks are run once each in separate dedicated folders and can be merged into model/quantile analysis later through their ledger and path outputs. GHPF is intentionally never run in this script.

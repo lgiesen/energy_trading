@@ -24307,7 +24307,11 @@ def test_benchmark_mode_model_only_masks_disabled_benchmarks() -> None:
         {
             "realized_total_pnl_eur": 12.0,
             "naive_total_pnl_eur": 0.0,
+            "naive_invalid_reason": "missing_path_soc",
             "rolling_perfect_foresight_same_rules_total_pnl_eur": 0.0,
+            "rhpf_invalid_reason": "path_not_executed,missing_path_soc",
+            "rolling_pf_solver_invalid_reason": "benchmark_disabled",
+            "rolling_pf_reported_invalid_reason": "benchmark_disabled",
         },
         benchmark_mode=mode,
         benchmark_paths=paths,
@@ -24320,6 +24324,39 @@ def test_benchmark_mode_model_only_masks_disabled_benchmarks() -> None:
     assert summary["model_total_pnl_eur"] == pytest.approx(12.0)
     assert np.isnan(float(summary["naive_total_pnl_eur"]))
     assert np.isnan(float(summary["rolling_perfect_foresight_same_rules_total_pnl_eur"]))
+    assert str(summary["naive_invalid_reason"]) == ""
+    assert str(summary["rhpf_invalid_reason"]) == ""
+    assert str(summary["rolling_pf_solver_invalid_reason"]) == ""
+    assert str(summary["rolling_pf_reported_invalid_reason"]) == ""
+
+
+def test_model_only_run_does_not_emit_disabled_benchmark_invalid_reasons() -> None:
+    bt = _mk_backtester()
+    df, col = _tiny_backtest_df(hours=4)
+
+    out = bt.run(
+        df,
+        col,
+        use_rolling_horizon=True,
+        horizon_hours=2,
+        reopt_step_hours=1,
+        allowed_markets=("DA", "aFRR"),
+        benchmark_mode="model_only",
+        strict_simulation_validity=False,
+    )
+    summary = out.summary
+
+    assert str(summary.get("benchmark_mode")) == "model_only"
+    assert str(summary.get("enabled_paths")) == "model"
+    assert str(summary.get("disabled_paths")) == "naive,rhpf"
+    assert float(summary.get("naive_path_executed", 1.0)) == pytest.approx(0.0)
+    assert float(summary.get("rhpf_path_executed", 1.0)) == pytest.approx(0.0)
+    assert float(summary.get("naive_simulation_valid", 1.0)) == pytest.approx(0.0)
+    assert float(summary.get("rhpf_simulation_valid", 1.0)) == pytest.approx(0.0)
+    assert str(summary.get("naive_invalid_reason", "")).strip() == ""
+    assert str(summary.get("rhpf_invalid_reason", "")).strip() == ""
+    assert str(summary.get("rolling_pf_solver_invalid_reason", "")).strip() == ""
+    assert str(summary.get("rolling_pf_reported_invalid_reason", "")).strip() == ""
 
 
 def test_disabled_rolling_pf_does_not_report_solver_failed() -> None:

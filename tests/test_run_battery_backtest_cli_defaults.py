@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from scripts.run_battery_backtest import (  # noqa: E402
     SIMULATION_EVAL_END_UTC,
     SIMULATION_EVAL_START_UTC,
+    _apply_fallback_column_map,
     _forecast_coverage_report,
     _manifest_can_resolve_long_predictions,
     _matches_model_key,
@@ -24,8 +25,10 @@ from scripts.run_battery_backtest import (  # noqa: E402
     _resolve_simulation_eval_window,
     _resolve_long_prediction_path,
     _resolve_model_manifest,
+    _validate_bcm_capacity_truth_block_consistency,
     parse_args,
 )
+from energy_trading.simulation.battery_backtest import BacktestColumnMap  # noqa: E402
 from energy_trading.visualization.style import THESIS_PALETTE, get_backtest_line_style  # noqa: E402
 
 
@@ -116,6 +119,80 @@ def test_common_eval_window_is_model_independent() -> None:
     }
     assert {v["effective_start_utc"] for v in bounds.values()} == {SIMULATION_EVAL_START_UTC.isoformat()}
     assert {v["effective_end_utc"] for v in bounds.values()} == {SIMULATION_EVAL_END_UTC.isoformat()}
+
+
+def _minimal_truth_frame(*, include_unshifted_capacity_truth: bool = True) -> pd.DataFrame:
+    data: dict[str, object] = {
+        "timestamp_utc": pd.date_range("2025-07-01T06:00:00Z", periods=4, freq="h", tz="UTC"),
+        "da_price": [1.0, 2.0, 3.0, 4.0],
+        "afrr_activation_price_vwap_pos": [10.0, 10.0, 10.0, 10.0],
+        "afrr_activation_price_vwap_neg": [11.0, 11.0, 11.0, 11.0],
+        "activation_rate_phys_pos": [0.0, 0.0, 0.0, 0.0],
+        "activation_rate_phys_neg": [0.0, 0.0, 0.0, 0.0],
+        "target_afrr_capacity_price_pos": [50.0, 50.0, 50.0, 60.0],
+        "target_afrr_capacity_price_neg": [70.0, 70.0, 70.0, 80.0],
+    }
+    if include_unshifted_capacity_truth:
+        data["afrr_capacity_price_pos"] = [50.0, 50.0, 50.0, 50.0]
+        data["afrr_capacity_price_neg"] = [70.0, 70.0, 70.0, 70.0]
+    return pd.DataFrame(data)
+
+
+def test_bcm_capacity_truth_mapping_rejects_shifted_target_fallback() -> None:
+    truth = _minimal_truth_frame(include_unshifted_capacity_truth=False)
+
+    with pytest.raises(KeyError, match="Missing unshifted BCM capacity settlement truth column"):
+        _apply_fallback_column_map(pd.DataFrame(), truth, BacktestColumnMap())
+
+
+def test_bcm_capacity_truth_mapping_rejects_explicit_shifted_target_column() -> None:
+    truth = _minimal_truth_frame(include_unshifted_capacity_truth=True)
+    colmap = BacktestColumnMap(
+        true_afrr_capacity_price_pos="target_afrr_capacity_price_pos",
+        true_afrr_capacity_price_neg="target_afrr_capacity_price_neg",
+    )
+
+    with pytest.raises(ValueError, match="shifted target columns are ML labels"):
+        _apply_fallback_column_map(pd.DataFrame(), truth, colmap)
+
+
+def test_bcm_capacity_truth_block_guard_accepts_unshifted_block_prices() -> None:
+    truth = _minimal_truth_frame(include_unshifted_capacity_truth=True)
+
+    issues = _validate_bcm_capacity_truth_block_consistency(
+        df=truth,
+        timestamp_col="timestamp_utc",
+        pos_col="afrr_capacity_price_pos",
+        neg_col="afrr_capacity_price_neg",
+    )
+
+    assert issues.empty
+
+
+def test_bcm_capacity_truth_block_guard_rejects_shifted_target_pattern() -> None:
+    truth = _minimal_truth_frame(include_unshifted_capacity_truth=True)
+
+    with pytest.raises(ValueError, match="Invalid BCM capacity settlement truth column"):
+        _validate_bcm_capacity_truth_block_consistency(
+            df=truth,
+            timestamp_col="timestamp_utc",
+            pos_col="target_afrr_capacity_price_pos",
+            neg_col="target_afrr_capacity_price_neg",
+        )
+
+
+def test_bcm_capacity_truth_block_guard_rejects_intra_block_variation() -> None:
+    truth = _minimal_truth_frame(include_unshifted_capacity_truth=True)
+    truth["capacity_truth_pos_bad"] = [50.0, 50.0, 50.0, 60.0]
+    truth["capacity_truth_neg_bad"] = [70.0, 70.0, 70.0, 80.0]
+
+    with pytest.raises(ValueError, match="not constant within local 4h product blocks"):
+        _validate_bcm_capacity_truth_block_consistency(
+            df=truth,
+            timestamp_col="timestamp_utc",
+            pos_col="capacity_truth_pos_bad",
+            neg_col="capacity_truth_neg_bad",
+        )
 
 
 def test_forecast_coverage_ignores_missing_snapshots_before_clamped_window() -> None:
