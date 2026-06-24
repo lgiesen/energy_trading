@@ -1044,6 +1044,26 @@ SETTLEMENT_NUMERIC_COLS = (
     "protected_recovery_actual_violation_mwh",
     "protected_recovery_obligation_active",
     "protected_soc_recovery_invalid_without_violation",
+    "da_lockbook_id_repair_allowed",
+    "da_lockbook_id_repair_applied",
+    "da_lockbook_id_repair_buy_mwh",
+    "da_lockbook_id_repair_sell_mwh",
+    "da_lockbook_id_repair_total_mwh",
+    "da_lockbook_id_repair_blocked_mwh",
+    "bem_expected_activation_guard_allowed",
+    "bem_expected_activation_guard_expected_pos_rate",
+    "bem_expected_activation_guard_expected_neg_rate",
+    "bem_expected_activation_guard_expected_pos_mwh",
+    "bem_expected_activation_guard_expected_neg_mwh",
+    "bem_expected_activation_id_repair_attempted",
+    "bem_expected_activation_id_repair_applied",
+    "bem_expected_activation_id_repair_buy_mwh",
+    "bem_expected_activation_id_repair_sell_mwh",
+    "bem_expected_activation_id_repair_total_mwh",
+    "bem_expected_activation_id_repair_blocked_mwh",
+    "bem_expected_activation_unprotected_pos_mwh",
+    "bem_expected_activation_unprotected_neg_mwh",
+    "bem_expected_activation_guard_expected_aux_mwh",
     "settlement_auto_id_repair_applied",
     "settlement_auto_id_repair_blocked_no_obligation",
     "settlement_reserve_safety_active_pos",
@@ -1152,6 +1172,7 @@ SETTLEMENT_METADATA_COLS = (
     "bcm_activation_price_source",
     "bem_only_headroom_guard_reason",
     "bem_activation_energy_guard_reason",
+    "bem_expected_activation_guard_reason",
     "bem_guard_zero_reason_neg",
     "bem_guard_zero_reason_pos",
     "fixed_obligation_driver",
@@ -12064,6 +12085,8 @@ class BatteryBacktester:
                     bem_available_neg_mw=float(bem_neg_mw),
                     bem_submitted_pos_mw=float(bem_pos_mw),
                     bem_submitted_neg_mw=float(bem_neg_mw),
+                    expected_act_pos_rate=float(rate_pos),
+                    expected_act_neg_rate=float(rate_neg),
                 )
                 settlement_max_buy_mwh = max(
                     0.0,
@@ -20541,6 +20564,8 @@ class BatteryBacktester:
         bem_available_neg_mw: float = 0.0,
         bem_submitted_pos_mw: float = 0.0,
         bem_submitted_neg_mw: float = 0.0,
+        expected_act_pos_rate: float | None = None,
+        expected_act_neg_rate: float | None = None,
     ) -> tuple[float, dict[str, float]]:
         """
         3-Layer ID Rescue settlement:
@@ -20611,9 +20636,10 @@ class BatteryBacktester:
             * self.eta_in
             - (float(self.reserve_headroom_safety_mwh) if reserve_neg_active_for_safety > 0.5 else 0.0)
         )
-        # Settlement is intentionally passive: it executes explicit DA, reserve,
-        # activation and ID setpoints but does not invent new ID repairs. Technical
-        # recovery must be scheduled before settlement by _plan_id_rescue_for_next_hour.
+        # Settlement is passive for speculative ID. A narrow exception is technical
+        # ID recourse for already locked DA energy: the DA lockbook is mandatory, so
+        # minimal ID counter-trades may be added and explicitly charged to keep the
+        # locked DA delivery physically executable.
         settlement_auto_id_repair_applied = 0.0
         settlement_auto_id_repair_blocked_no_obligation = float(
             self._strategy_permissions.allow_id
@@ -20626,6 +20652,18 @@ class BatteryBacktester:
         act_neg_capacity_basis_mw = float(reserve_neg) if float(reserve_neg) > 1e-12 else float(bem_available_neg)
         act_pos_grid_req = max(0.0, act_pos_rate) * act_pos_capacity_basis_mw * self.dt_h
         act_neg_grid_req = max(0.0, act_neg_rate) * act_neg_capacity_basis_mw * self.dt_h
+        def _optional_expected_rate(value: float | None) -> tuple[float, float]:
+            try:
+                if value is not None and np.isfinite(float(value)):
+                    return max(0.0, min(1.0, float(value))), 1.0
+            except Exception:
+                pass
+            return 0.0, 0.0
+
+        expected_act_pos_rate_used, expected_act_pos_rate_supplied = _optional_expected_rate(expected_act_pos_rate)
+        expected_act_neg_rate_used, expected_act_neg_rate_supplied = _optional_expected_rate(expected_act_neg_rate)
+        expected_act_pos_grid_req = expected_act_pos_rate_used * act_pos_capacity_basis_mw * self.dt_h
+        expected_act_neg_grid_req = expected_act_neg_rate_used * act_neg_capacity_basis_mw * self.dt_h
         act_pos_grid = float(act_pos_grid_req)
         act_neg_grid = float(act_neg_grid_req)
         act_pos_internal = act_pos_grid / max(self.eta_out, 1e-12)
@@ -20679,10 +20717,148 @@ class BatteryBacktester:
         da_optional_id_derated_to_preserve_da_mwh = 0.0
         da_optional_activation_derated_to_preserve_da_mwh = 0.0
         da_mandatory_delivery_infeasible_after_optional_derate = 0.0
+        da_lockbook_id_repair_applied = 0.0
+        da_lockbook_id_repair_buy_mwh = 0.0
+        da_lockbook_id_repair_sell_mwh = 0.0
+        da_lockbook_id_repair_blocked_mwh = 0.0
+        da_lockbook_id_repair_allowed = float(
+            str(getattr(self, "_id_recourse_mode", "common")).strip().lower() != "disabled"
+            and bool(self._strategy_permissions.allow_id_technical_repair)
+        )
+        bem_expected_activation_id_repair_allowed = float(da_lockbook_id_repair_allowed)
+        bem_expected_activation_id_repair_attempted = 0.0
+        bem_expected_activation_id_repair_applied = 0.0
+        bem_expected_activation_id_repair_buy_mwh = 0.0
+        bem_expected_activation_id_repair_sell_mwh = 0.0
+        bem_expected_activation_id_repair_blocked_mwh = 0.0
+        bem_expected_activation_unprotected_pos_mwh = 0.0
+        bem_expected_activation_unprotected_neg_mwh = 0.0
+        bem_expected_activation_guard_reason = "none"
+        bem_expected_activation_guard_expected_aux_mwh = 0.0
+
+        def _current_power_stack() -> dict[str, float | dict[str, float]]:
+            return self._compute_canonical_power_stack(
+                da_charge_mw=da_ch_internal / max(float(self.dt_h), 1e-12),
+                da_discharge_mw=da_dis_internal / max(float(self.dt_h), 1e-12),
+                id_buy_mw=id_ch_internal / max(float(self.dt_h), 1e-12),
+                id_sell_mw=id_dis_internal / max(float(self.dt_h), 1e-12),
+                bcm_neg_obligation_mw=reserve_neg,
+                bcm_pos_obligation_mw=reserve_pos,
+            )
+
+        def _recompute_delta() -> float:
+            recalculated, _ = self._calculate_soc_delta(
+                charge_mw=da_ch_internal / max(self.dt_h, 1e-12),
+                discharge_mw=da_dis_internal / max(self.dt_h, 1e-12),
+                id_charge_mw=id_ch_internal / max(self.dt_h, 1e-12),
+                id_discharge_mw=id_dis_internal / max(self.dt_h, 1e-12),
+                act_pos_mwh=act_pos_grid,
+                act_neg_mwh=act_neg_grid,
+                aux_mwh=aux_mwh,
+                battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
+                dt_h=self.dt_h,
+            )
+            return float(recalculated)
+
+        def _expected_activation_aux_mwh() -> float:
+            aux_power_expected_mw, _ = self._state_aux_power_mw(
+                charge_mw=da_ch_internal / max(float(self.dt_h), 1e-12),
+                discharge_mw=da_dis_internal / max(float(self.dt_h), 1e-12),
+                reserve_pos_mw=reserve_pos + bem_available_pos,
+                reserve_neg_mw=reserve_neg + bem_available_neg,
+                act_pos_rate=expected_act_pos_rate_used,
+                act_neg_rate=expected_act_neg_rate_used,
+                id_charge_mw=id_ch_internal / max(float(self.dt_h), 1e-12),
+                id_discharge_mw=id_dis_internal / max(float(self.dt_h), 1e-12),
+            )
+            return max(0.0, float(aux_power_expected_mw) * float(self.dt_h))
+
+        def _expected_activation_delta() -> float:
+            nonlocal bem_expected_activation_guard_expected_aux_mwh
+            bem_expected_activation_guard_expected_aux_mwh = _expected_activation_aux_mwh()
+            return float(
+                (da_ch_internal + id_ch_internal) * max(float(self.eta_in), 0.0)
+                + expected_act_neg_grid_req * max(float(self.eta_in), 0.0)
+                - (da_dis_internal + id_dis_internal) / max(float(self.eta_out), 1e-12)
+                - expected_act_pos_grid_req / max(float(self.eta_out), 1e-12)
+                - bem_expected_activation_guard_expected_aux_mwh
+            )
+
+        expected_activation_requested = bool(
+            (expected_act_pos_rate_supplied > 0.5 and act_pos_capacity_basis_mw > 1e-12)
+            or (expected_act_neg_rate_supplied > 0.5 and act_neg_capacity_basis_mw > 1e-12)
+        )
+        if (
+            expected_activation_requested
+            and bem_expected_activation_id_repair_allowed > 0.5
+            and (expected_act_pos_grid_req > 1e-12 or expected_act_neg_grid_req > 1e-12)
+        ):
+            expected_delta = _expected_activation_delta()
+            if expected_delta < min_delta - 1e-12:
+                internal_shortfall = float(min_delta - expected_delta)
+                needed_id_buy_grid = internal_shortfall / max(float(self.eta_in), 1e-12)
+                stack = _current_power_stack()
+                max_id_buy_grid = max(0.0, float(stack["charge_residual_mw"])) * float(self.dt_h)
+                id_buy_add_grid = min(float(needed_id_buy_grid), float(max_id_buy_grid))
+                bem_expected_activation_id_repair_attempted = 1.0
+                if id_buy_add_grid > 1e-12:
+                    id_ch_internal += float(id_buy_add_grid)
+                    bem_expected_activation_id_repair_buy_mwh += float(id_buy_add_grid)
+                    bem_expected_activation_id_repair_applied = 1.0
+                    settlement_auto_id_repair_applied = 1.0
+                    bem_expected_activation_guard_reason = "expected_positive_activation_id_buy"
+                unresolved_internal = max(
+                    0.0,
+                    internal_shortfall - id_buy_add_grid * max(float(self.eta_in), 0.0),
+                )
+                bem_expected_activation_id_repair_blocked_mwh += max(
+                    0.0,
+                    float(needed_id_buy_grid) - float(id_buy_add_grid),
+                )
+                bem_expected_activation_unprotected_pos_mwh += (
+                    unresolved_internal * max(float(self.eta_out), 0.0)
+                )
+                if unresolved_internal > 1e-12:
+                    bem_expected_activation_guard_reason = "expected_positive_activation_repair_power_limited"
+            expected_delta = _expected_activation_delta()
+            if expected_delta > max_delta + 1e-12:
+                internal_overflow = float(expected_delta - max_delta)
+                needed_id_sell_grid = internal_overflow * max(float(self.eta_out), 0.0)
+                stack = _current_power_stack()
+                max_id_sell_grid = max(0.0, float(stack["discharge_residual_mw"])) * float(self.dt_h)
+                id_sell_add_grid = min(float(needed_id_sell_grid), float(max_id_sell_grid))
+                bem_expected_activation_id_repair_attempted = 1.0
+                if id_sell_add_grid > 1e-12:
+                    id_dis_internal += float(id_sell_add_grid)
+                    bem_expected_activation_id_repair_sell_mwh += float(id_sell_add_grid)
+                    bem_expected_activation_id_repair_applied = 1.0
+                    settlement_auto_id_repair_applied = 1.0
+                    if bem_expected_activation_guard_reason == "none":
+                        bem_expected_activation_guard_reason = "expected_negative_activation_id_sell"
+                    elif not bem_expected_activation_guard_reason.endswith("_power_limited"):
+                        bem_expected_activation_guard_reason = "expected_pos_neg_activation_id_repair"
+                unresolved_internal = max(
+                    0.0,
+                    internal_overflow - id_sell_add_grid / max(float(self.eta_out), 1e-12),
+                )
+                bem_expected_activation_id_repair_blocked_mwh += max(
+                    0.0,
+                    float(needed_id_sell_grid) - float(id_sell_add_grid),
+                )
+                bem_expected_activation_unprotected_neg_mwh += (
+                    unresolved_internal / max(float(self.eta_in), 1e-12)
+                )
+                if unresolved_internal > 1e-12:
+                    bem_expected_activation_guard_reason = "expected_negative_activation_repair_power_limited"
+            delta = _recompute_delta()
+            in_internal = (da_ch_internal + id_ch_internal) * self.eta_in + act_neg_internal
+            out_internal = (da_dis_internal + id_dis_internal) / max(self.eta_out, 1e-12) + act_pos_internal
+
         # Emergency physical fallback: DA lockbook delivery is mandatory in
         # priority order, but impossible DA energy must not be counted while
         # clipping SoC. Derate optional ID/activation first; if DA itself is
-        # still infeasible, execute only feasible DA MWh and export the miss.
+        # still infeasible, use charged technical ID recourse if possible. Only
+        # the remaining unresolved volume is reported as unexecuted DA.
         if delta < min_delta and out_internal > 0:
             excess = float(min_delta - delta)
             id_dis_reduce_grid = min(float(id_dis_internal), excess * max(float(self.eta_out), 1e-12))
@@ -20696,22 +20872,29 @@ class BatteryBacktester:
                 act_pos_internal = act_pos_grid / max(self.eta_out, 1e-12)
                 da_optional_activation_derated_to_preserve_da_mwh += float(act_pos_reduce_grid)
                 excess -= act_pos_reduce_grid / max(float(self.eta_out), 1e-12)
+            if excess > 1e-12 and da_dis_internal > 1e-12 and da_lockbook_id_repair_allowed > 0.5:
+                stack = _current_power_stack()
+                max_id_buy_grid = max(0.0, float(stack["charge_residual_mw"])) * float(self.dt_h)
+                needed_id_buy_grid = max(0.0, excess / max(float(self.eta_in), 1e-12))
+                id_buy_add_grid = min(float(needed_id_buy_grid), float(max_id_buy_grid))
+                if id_buy_add_grid > 1e-12:
+                    id_ch_internal += float(id_buy_add_grid)
+                    da_lockbook_id_repair_buy_mwh += float(id_buy_add_grid)
+                    da_lockbook_id_repair_applied = 1.0
+                    settlement_auto_id_repair_applied = 1.0
+                    excess -= float(id_buy_add_grid) * max(float(self.eta_in), 0.0)
+                da_lockbook_id_repair_blocked_mwh += max(
+                    0.0,
+                    float(needed_id_buy_grid) - float(id_buy_add_grid),
+                )
             da_dis_reduce_grid = min(float(da_dis_internal), max(0.0, excess) * max(float(self.eta_out), 1e-12))
             if da_dis_reduce_grid > 0.0:
                 da_dis_internal -= da_dis_reduce_grid
                 da_unexecuted_sell_mwh += float(da_dis_reduce_grid)
                 da_mandatory_delivery_infeasible_after_optional_derate = 1.0
-            delta, _soc_delta_components = self._calculate_soc_delta(
-                charge_mw=da_ch_internal / max(self.dt_h, 1e-12),
-                discharge_mw=da_dis_internal / max(self.dt_h, 1e-12),
-                id_charge_mw=id_ch_internal / max(self.dt_h, 1e-12),
-                id_discharge_mw=id_dis_internal / max(self.dt_h, 1e-12),
-                act_pos_mwh=act_pos_grid,
-                act_neg_mwh=act_neg_grid,
-                aux_mwh=aux_mwh,
-                battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
-                dt_h=self.dt_h,
-            )
+            delta = _recompute_delta()
+            in_internal = (da_ch_internal + id_ch_internal) * self.eta_in + act_neg_internal
+            out_internal = (da_dis_internal + id_dis_internal) / max(self.eta_out, 1e-12) + act_pos_internal
         if delta > max_delta and in_internal > 0:
             excess = float(delta - max_delta)
             id_ch_reduce_grid = min(float(id_ch_internal), excess / max(float(self.eta_in), 1e-12))
@@ -20725,22 +20908,27 @@ class BatteryBacktester:
                 act_neg_internal = act_neg_grid * self.eta_in
                 da_optional_activation_derated_to_preserve_da_mwh += float(act_neg_reduce_grid)
                 excess -= act_neg_reduce_grid * max(float(self.eta_in), 0.0)
+            if excess > 1e-12 and da_ch_internal > 1e-12 and da_lockbook_id_repair_allowed > 0.5:
+                stack = _current_power_stack()
+                max_id_sell_grid = max(0.0, float(stack["discharge_residual_mw"])) * float(self.dt_h)
+                needed_id_sell_grid = max(0.0, excess * max(float(self.eta_out), 0.0))
+                id_sell_add_grid = min(float(needed_id_sell_grid), float(max_id_sell_grid))
+                if id_sell_add_grid > 1e-12:
+                    id_dis_internal += float(id_sell_add_grid)
+                    da_lockbook_id_repair_sell_mwh += float(id_sell_add_grid)
+                    da_lockbook_id_repair_applied = 1.0
+                    settlement_auto_id_repair_applied = 1.0
+                    excess -= float(id_sell_add_grid) / max(float(self.eta_out), 1e-12)
+                da_lockbook_id_repair_blocked_mwh += max(
+                    0.0,
+                    float(needed_id_sell_grid) - float(id_sell_add_grid),
+                )
             da_ch_reduce_grid = min(float(da_ch_internal), max(0.0, excess) / max(float(self.eta_in), 1e-12))
             if da_ch_reduce_grid > 0.0:
                 da_ch_internal -= da_ch_reduce_grid
                 da_unexecuted_buy_mwh += float(da_ch_reduce_grid)
                 da_mandatory_delivery_infeasible_after_optional_derate = 1.0
-            delta, _soc_delta_components = self._calculate_soc_delta(
-                charge_mw=da_ch_internal / max(self.dt_h, 1e-12),
-                discharge_mw=da_dis_internal / max(self.dt_h, 1e-12),
-                id_charge_mw=id_ch_internal / max(self.dt_h, 1e-12),
-                id_discharge_mw=id_dis_internal / max(self.dt_h, 1e-12),
-                act_pos_mwh=act_pos_grid,
-                act_neg_mwh=act_neg_grid,
-                aux_mwh=aux_mwh,
-                battery_specs={"eta_in": self.eta_in, "eta_out": self.eta_out},
-                dt_h=self.dt_h,
-            )
+            delta = _recompute_delta()
 
         soc_next = float(soc + delta)
         if soc_next < self.soc_min - 1e-9 or soc_next > self.soc_max + 1e-9:
@@ -20812,6 +21000,10 @@ class BatteryBacktester:
         id_slippage_cost_eur = id_trade_mwh * self.id_rescue_spread_eur_mwh
         id_repair_reason = "none"
         id_trade_type = "none"
+        if bem_expected_activation_id_repair_applied > 0.5:
+            id_reason_hint_norm = "bem_expected_activation_repair"
+        if da_lockbook_id_repair_applied > 0.5:
+            id_reason_hint_norm = "da_lockbook_physical_repair"
         protected_recovery_physical_violation_mwh = max(0.0, float(self.soc_min) - float(soc))
         protected_recovery_reserve_gap_mwh = max(0.0, float(req_soc_min_for_pos) - float(soc))
         protected_recovery_obligation_active = float(max(0.0, reserve_pos) > 1e-12 or max(0.0, reserve_neg) > 1e-12)
@@ -20829,10 +21021,18 @@ class BatteryBacktester:
                 # Current ID implementation is reserve/SoC rescue logic.
                 # Keep explicit tagging to avoid silent baseline contamination.
                 id_trade_type = "technical_repair"
-                id_repair_reason = "soc_or_obligation_repair"
+                id_repair_reason = (
+                    "da_lockbook_physical_repair"
+                    if da_lockbook_id_repair_applied > 0.5
+                    else (
+                        "bem_expected_activation_repair"
+                        if bem_expected_activation_id_repair_applied > 0.5
+                        else "soc_or_obligation_repair"
+                    )
+                )
             elif self._strategy_permissions.id_mode == "technical_repair":
                 id_trade_type = "technical_repair"
-                id_repair_reason = str(id_recourse_reason_hint or "soc_or_obligation_repair").strip().lower()
+                id_repair_reason = str(id_reason_hint_norm or "soc_or_obligation_repair").strip().lower()
                 if id_repair_reason in {"", "nan", "none"}:
                     if id_buy_mwh > 1e-12 and id_sell_mwh <= 1e-12:
                         if protected_recovery_actual_violation_mwh > 1e-9:
@@ -21073,6 +21273,48 @@ class BatteryBacktester:
             "da_optional_id_derated_to_preserve_da_mwh": float(da_optional_id_derated_to_preserve_da_mwh),
             "da_optional_activation_derated_to_preserve_da_mwh": float(
                 da_optional_activation_derated_to_preserve_da_mwh
+            ),
+            "da_lockbook_id_repair_allowed": float(da_lockbook_id_repair_allowed),
+            "da_lockbook_id_repair_applied": float(da_lockbook_id_repair_applied),
+            "da_lockbook_id_repair_buy_mwh": float(da_lockbook_id_repair_buy_mwh),
+            "da_lockbook_id_repair_sell_mwh": float(da_lockbook_id_repair_sell_mwh),
+            "da_lockbook_id_repair_total_mwh": float(
+                da_lockbook_id_repair_buy_mwh + da_lockbook_id_repair_sell_mwh
+            ),
+            "da_lockbook_id_repair_blocked_mwh": float(da_lockbook_id_repair_blocked_mwh),
+            "bem_expected_activation_guard_allowed": float(bem_expected_activation_id_repair_allowed),
+            "bem_expected_activation_guard_expected_pos_rate": float(expected_act_pos_rate_used),
+            "bem_expected_activation_guard_expected_neg_rate": float(expected_act_neg_rate_used),
+            "bem_expected_activation_guard_expected_pos_mwh": float(expected_act_pos_grid_req),
+            "bem_expected_activation_guard_expected_neg_mwh": float(expected_act_neg_grid_req),
+            "bem_expected_activation_id_repair_attempted": float(
+                bem_expected_activation_id_repair_attempted
+            ),
+            "bem_expected_activation_id_repair_applied": float(
+                bem_expected_activation_id_repair_applied
+            ),
+            "bem_expected_activation_id_repair_buy_mwh": float(
+                bem_expected_activation_id_repair_buy_mwh
+            ),
+            "bem_expected_activation_id_repair_sell_mwh": float(
+                bem_expected_activation_id_repair_sell_mwh
+            ),
+            "bem_expected_activation_id_repair_total_mwh": float(
+                bem_expected_activation_id_repair_buy_mwh
+                + bem_expected_activation_id_repair_sell_mwh
+            ),
+            "bem_expected_activation_id_repair_blocked_mwh": float(
+                bem_expected_activation_id_repair_blocked_mwh
+            ),
+            "bem_expected_activation_unprotected_pos_mwh": float(
+                bem_expected_activation_unprotected_pos_mwh
+            ),
+            "bem_expected_activation_unprotected_neg_mwh": float(
+                bem_expected_activation_unprotected_neg_mwh
+            ),
+            "bem_expected_activation_guard_reason": str(bem_expected_activation_guard_reason),
+            "bem_expected_activation_guard_expected_aux_mwh": float(
+                bem_expected_activation_guard_expected_aux_mwh
             ),
             "revenue_da_eur": rev_da,
             "cost_da_eur": cost_da,
@@ -34962,6 +35204,8 @@ class BatteryBacktester:
                     act_neg_price=act_neg_price_plan,
                     act_pos_rate=act_pos_rate_plan,
                     act_neg_rate=act_neg_rate_plan,
+                    expected_act_pos_rate=act_pos_rate_plan,
+                    expected_act_neg_rate=act_neg_rate_plan,
                     bem_available_pos_mw=float(bem_only_pos_plan),
                     bem_available_neg_mw=float(bem_only_neg_plan),
                     bem_submitted_pos_mw=float(bem_only_pos_plan),
@@ -35089,6 +35333,16 @@ class BatteryBacktester:
                     act_neg_price=_sf(src, colmap.true_afrr_activation_price_neg, 0.0),
                     act_pos_rate=float(cleared["executed_rate_pos"]),
                     act_neg_rate=float(cleared["executed_rate_neg"]),
+                    expected_act_pos_rate=(
+                        float(critical_inputs["true_rate_pos"])
+                        if bool(is_perfect_foresight)
+                        else float(critical_inputs["pred_rate_pos"])
+                    ),
+                    expected_act_neg_rate=(
+                        float(critical_inputs["true_rate_neg"])
+                        if bool(is_perfect_foresight)
+                        else float(critical_inputs["pred_rate_neg"])
+                    ),
                     cap_bid_pos=float(cleared.get("settlement_cap_bid_price_pos_eur_mw", 0.0) or 0.0),
                     cap_bid_neg=float(cleared.get("settlement_cap_bid_price_neg_eur_mw", 0.0) or 0.0),
                     id_recourse_reason_hint=str(executing_id_reason_for_soc_feedback),
@@ -36023,6 +36277,16 @@ class BatteryBacktester:
             id_discharge = _g("id_discharge_mw", _g("pending_id_discharge_mw", 0.0))
             rate_pos = float(getattr(r, rate_pos_col))
             rate_neg = float(getattr(r, rate_neg_col))
+            expected_rate_pos_for_guard = (
+                float(rate_pos)
+                if bool(predicted_settlement or perfect_foresight_mode)
+                else _g(colmap.pred_afrr_activation_rate_pos, np.nan)
+            )
+            expected_rate_neg_for_guard = (
+                float(rate_neg)
+                if bool(predicted_settlement or perfect_foresight_mode)
+                else _g(colmap.pred_afrr_activation_rate_neg, np.nan)
+            )
             da_lockbook_trace_available = "da_is_locked_delivery_hour" in merged.columns
             da_is_locked_delivery = (
                 float(_g("da_is_locked_delivery_hour", 0.0))
@@ -36276,6 +36540,8 @@ class BatteryBacktester:
                 act_neg_price=float(getattr(r, act_neg_col)),
                 act_pos_rate=rate_pos,
                 act_neg_rate=rate_neg,
+                expected_act_pos_rate=expected_rate_pos_for_guard,
+                expected_act_neg_rate=expected_rate_neg_for_guard,
                 cap_bid_pos=cap_bid_pos_settlement,
                 cap_bid_neg=cap_bid_neg_settlement,
                 id_recourse_reason_hint=str(getattr(r, "id_recourse_reason", "none")),

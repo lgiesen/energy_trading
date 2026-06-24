@@ -17926,6 +17926,8 @@ def test_da_prelock_guard_derates_terminal_sell_when_id_recovery_disabled() -> N
 def test_da_settlement_reports_unexecuted_locked_buy_without_soc_clipping() -> None:
     bt = _mk_backtester()
     _configure_zero_aux_unit_efficiency(bt)
+    bt._id_recourse_mode = "disabled"
+    bt._strategy_permissions = StrategyPermissions(True, "none", False, False, False)
 
     soc_next, metrics = bt._settle_one_hour(
         soc=17.8,
@@ -17948,6 +17950,173 @@ def test_da_settlement_reports_unexecuted_locked_buy_without_soc_clipping() -> N
     assert float(metrics["da_buy_mwh"]) == pytest.approx(0.2)
     assert float(metrics["da_unexecuted_buy_mwh"]) == pytest.approx(0.8)
     assert float(metrics["da_execution_lockbook_physical_infeasible"]) == pytest.approx(1.0)
+    assert float(metrics["da_lockbook_id_repair_applied"]) == pytest.approx(0.0)
+
+
+def test_da_lockbook_id_repair_sells_id_to_preserve_locked_da_buy() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt._id_recourse_mode = "common"
+    bt._strategy_permissions = StrategyPermissions(True, "technical_repair", True, True, True)
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=17.8,
+        charge=1.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        da_charge_mw=1.0,
+        da_discharge_mw=0.0,
+    )
+
+    assert soc_next == pytest.approx(18.0)
+    assert float(metrics["da_buy_mwh"]) == pytest.approx(1.0)
+    assert float(metrics["da_unexecuted_buy_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["da_execution_lockbook_physical_infeasible"]) == pytest.approx(0.0)
+    assert float(metrics["id_sell_mwh"]) == pytest.approx(0.8)
+    assert float(metrics["da_lockbook_id_repair_sell_mwh"]) == pytest.approx(0.8)
+    assert float(metrics["da_lockbook_id_repair_applied"]) == pytest.approx(1.0)
+    assert str(metrics["id_repair_reason"]) == "da_lockbook_physical_repair"
+
+
+def test_da_lockbook_id_repair_buys_id_to_preserve_locked_da_sell() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt._id_recourse_mode = "common"
+    bt._strategy_permissions = StrategyPermissions(True, "technical_repair", True, True, True)
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=2.2,
+        charge=0.0,
+        discharge=1.0,
+        reserve_pos=0.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.0,
+        da_charge_mw=0.0,
+        da_discharge_mw=1.0,
+    )
+
+    assert soc_next == pytest.approx(2.0)
+    assert float(metrics["da_sell_mwh"]) == pytest.approx(1.0)
+    assert float(metrics["da_unexecuted_sell_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["da_execution_lockbook_physical_infeasible"]) == pytest.approx(0.0)
+    assert float(metrics["id_buy_mwh"]) == pytest.approx(0.8)
+    assert float(metrics["da_lockbook_id_repair_buy_mwh"]) == pytest.approx(0.8)
+    assert float(metrics["da_lockbook_id_repair_applied"]) == pytest.approx(1.0)
+    assert str(metrics["id_repair_reason"]) == "da_lockbook_physical_repair"
+
+
+def test_expected_positive_bem_activation_repair_buys_id_before_delivery() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt._id_recourse_mode = "common"
+    bt._strategy_permissions = StrategyPermissions(True, "technical_repair", True, True, True)
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=2.1,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=1.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=200.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.2,
+        act_neg_rate=0.0,
+        da_charge_mw=0.0,
+        da_discharge_mw=0.0,
+        expected_act_pos_rate=0.2,
+        expected_act_neg_rate=0.0,
+    )
+
+    assert soc_next == pytest.approx(2.0)
+    assert float(metrics["act_pos_mwh"]) == pytest.approx(0.2)
+    assert float(metrics["missed_activation_pos_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["id_buy_mwh"]) == pytest.approx(0.1)
+    assert float(metrics["bem_expected_activation_id_repair_buy_mwh"]) == pytest.approx(0.1)
+    assert float(metrics["bem_expected_activation_id_repair_applied"]) == pytest.approx(1.0)
+    assert str(metrics["id_repair_reason"]) == "bem_expected_activation_repair"
+
+
+def test_expected_negative_bem_activation_repair_sells_id_before_delivery() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt._id_recourse_mode = "common"
+    bt._strategy_permissions = StrategyPermissions(True, "technical_repair", True, True, True)
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=17.9,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=0.0,
+        reserve_neg=1.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=0.0,
+        act_neg_price=-50.0,
+        act_pos_rate=0.0,
+        act_neg_rate=0.2,
+        da_charge_mw=0.0,
+        da_discharge_mw=0.0,
+        expected_act_pos_rate=0.0,
+        expected_act_neg_rate=0.2,
+    )
+
+    assert soc_next == pytest.approx(18.0)
+    assert float(metrics["act_neg_mwh"]) == pytest.approx(0.2)
+    assert float(metrics["missed_activation_neg_mwh"]) == pytest.approx(0.0)
+    assert float(metrics["id_sell_mwh"]) == pytest.approx(0.1)
+    assert float(metrics["bem_expected_activation_id_repair_sell_mwh"]) == pytest.approx(0.1)
+    assert float(metrics["bem_expected_activation_id_repair_applied"]) == pytest.approx(1.0)
+    assert str(metrics["id_repair_reason"]) == "bem_expected_activation_repair"
+
+
+def test_realized_activation_above_expected_remains_missed_activation_surprise() -> None:
+    bt = _mk_backtester()
+    _configure_zero_aux_unit_efficiency(bt)
+    bt._id_recourse_mode = "common"
+    bt._strategy_permissions = StrategyPermissions(True, "technical_repair", True, True, True)
+
+    soc_next, metrics = bt._settle_one_hour(
+        soc=2.1,
+        charge=0.0,
+        discharge=0.0,
+        reserve_pos=1.0,
+        reserve_neg=0.0,
+        da_price=100.0,
+        cap_pos=0.0,
+        cap_neg=0.0,
+        act_pos_price=200.0,
+        act_neg_price=0.0,
+        act_pos_rate=0.5,
+        act_neg_rate=0.0,
+        da_charge_mw=0.0,
+        da_discharge_mw=0.0,
+        expected_act_pos_rate=0.2,
+        expected_act_neg_rate=0.0,
+    )
+
+    assert soc_next == pytest.approx(2.0)
+    assert float(metrics["bem_expected_activation_id_repair_buy_mwh"]) == pytest.approx(0.1)
+    assert float(metrics["delivered_activation_pos_mwh"]) == pytest.approx(0.2)
+    assert float(metrics["missed_activation_pos_mwh"]) == pytest.approx(0.3)
+    assert float(metrics["requested_activation_pos_mwh"]) == pytest.approx(0.5)
 
 
 def test_da_lockbook_infeasible_flag_ignores_generic_no_lockbook_physical_pressure() -> None:
