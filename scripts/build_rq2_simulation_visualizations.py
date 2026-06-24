@@ -113,12 +113,83 @@ ALL_OUTPUT_DIRS = [
     "result_section/figures",
     "result_section/tables",
     "result_section/latex_figures",
+    "result_section/csv",
     "appendix/figures",
     "appendix/tables",
     "appendix/latex_figures",
     "backup/csv",
     "backup/diagnostics",
     "backup/warnings",
+]
+
+BIDDING_ACTIVITY_MARKETS = [
+    (
+        "DA",
+        "DA",
+        [
+            ("buy", "real_submitted_da_buy_mw", "submitted"),
+            ("sell", "real_submitted_da_sell_mw", "submitted"),
+        ],
+    ),
+    (
+        "BCM",
+        "aFRR capacity",
+        [
+            ("positive", "real_submitted_bcm_capacity_pos_mw", "submitted"),
+            ("negative", "real_submitted_bcm_capacity_neg_mw", "submitted"),
+        ],
+    ),
+    (
+        "BEM",
+        "aFRR activation",
+        [
+            ("positive", "real_bem_only_submitted_pos_mw", "submitted"),
+            ("negative", "real_bem_only_submitted_neg_mw", "submitted"),
+        ],
+    ),
+    (
+        "ID",
+        "ID",
+        [
+            ("buy", "real_executed_id_charge_mw_for_soc_feedback", "realized_fallback"),
+            ("sell", "real_executed_id_discharge_mw_for_soc_feedback", "realized_fallback"),
+        ],
+    ),
+]
+
+BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS = [
+    {
+        "market": "DA",
+        "market_label": "DA",
+        "submitted_groups": [[("real_submitted_da_buy_mw", "mw"), ("real_submitted_da_sell_mw", "mw")]],
+        "cleared_groups": [
+            [("real_da_auction_accepted_buy_mwh", "mwh"), ("real_da_auction_accepted_sell_mwh", "mwh")],
+            [("da_executed_buy_mwh", "mwh"), ("da_executed_sell_mwh", "mwh")],
+            [("real_executed_charge_mw", "mw"), ("real_executed_discharge_mw", "mw")],
+        ],
+        "metric_semantics": "submitted_and_cleared",
+    },
+    {
+        "market": "BCM",
+        "market_label": "aFRR capacity",
+        "submitted_groups": [[("real_submitted_bcm_capacity_pos_mw", "mw"), ("real_submitted_bcm_capacity_neg_mw", "mw")]],
+        "cleared_groups": [[("real_executed_bcm_capacity_pos_mw", "mw"), ("real_executed_bcm_capacity_neg_mw", "mw")]],
+        "metric_semantics": "submitted_and_cleared",
+    },
+    {
+        "market": "BEM",
+        "market_label": "aFRR activation",
+        "submitted_groups": [[("real_bem_only_submitted_pos_mw", "mw"), ("real_bem_only_submitted_neg_mw", "mw")]],
+        "cleared_groups": [[("real_bem_only_executed_pos_mw", "mw"), ("real_bem_only_executed_neg_mw", "mw")]],
+        "metric_semantics": "submitted_and_cleared",
+    },
+    {
+        "market": "ID",
+        "market_label": "ID",
+        "submitted_groups": [[("real_executed_id_charge_mw_for_soc_feedback", "mw"), ("real_executed_id_discharge_mw_for_soc_feedback", "mw")]],
+        "cleared_groups": [[("real_executed_id_charge_mw_for_soc_feedback", "mw"), ("real_executed_id_discharge_mw_for_soc_feedback", "mw")]],
+        "metric_semantics": "realized_only_fallback",
+    },
 ]
 
 
@@ -645,6 +716,266 @@ def _find_backtest_hourly_path(scenario_dir: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _find_model_hourly_path(scenario_dir: Path) -> Path | None:
+    candidates = sorted(scenario_dir.rglob("model_hourly.parquet"))
+    return candidates[0] if candidates else None
+
+
+def _infer_timestep_hours(timestamps: pd.Series) -> float:
+    ts = pd.to_datetime(timestamps, errors="coerce", utc=True).dropna().sort_values()
+    if len(ts) < 2:
+        return 1.0
+    diffs = ts.diff().dropna().dt.total_seconds() / 3600.0
+    diffs = diffs.loc[(diffs > 0) & np.isfinite(diffs)]
+    if diffs.empty:
+        return 1.0
+    return float(diffs.median())
+
+
+def _infer_time_coverage(timestamps: pd.Series) -> tuple[pd.Timestamp | pd.NaT, pd.Timestamp | pd.NaT, float, float, float, int]:
+    ts = pd.to_datetime(timestamps, errors="coerce", utc=True).dropna().sort_values()
+    if ts.empty:
+        return pd.NaT, pd.NaT, math.nan, math.nan, math.nan, 0
+    timestep_hours = _infer_timestep_hours(ts)
+    start = ts.min()
+    end = ts.max()
+    observed = int(ts.nunique())
+    if not math.isfinite(timestep_hours) or timestep_hours <= 0.0:
+        timestep_hours = 1.0
+    total_hours = ((end - start).total_seconds() / 3600.0) + timestep_hours
+    test_period_days = total_hours / 24.0 if total_hours > 0.0 else math.nan
+    expected = int(round(total_hours / timestep_hours)) if total_hours > 0.0 else observed
+    missing = max(expected - observed, 0)
+    coverage_share = observed / expected if expected > 0 else math.nan
+    return start, end, test_period_days, coverage_share, timestep_hours, missing
+
+
+def _selected_model_strategy_rows(summary: pd.DataFrame) -> pd.DataFrame:
+    model_rows = summary.loc[~summary["is_benchmark"].astype(bool)].copy()
+    model_rows["annualized_profit_eur_per_year"] = pd.to_numeric(model_rows.get("annualized_profit_eur_per_year", np.nan), errors="coerce")
+    model_rows = model_rows.dropna(subset=["annualized_profit_eur_per_year"]).copy()
+    if model_rows.empty:
+        return pd.DataFrame()
+    best = (
+        model_rows.sort_values(["model", "annualized_profit_eur_per_year"], ascending=[True, False])
+        .groupby("model", as_index=False)
+        .head(1)
+        .copy()
+    )
+    order = {model: idx for idx, model in enumerate(MODEL_ORDER)}
+    best["_order"] = best["model"].map(order).fillna(999)
+    return best.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+
+
+def _choose_bidding_source_group(df: pd.DataFrame, groups: list[list[tuple[str, str]]]) -> list[tuple[str, str]]:
+    for group in groups:
+        if all(column in df.columns for column, _unit in group):
+            return group
+    return []
+
+
+def _bidding_count_and_volume(df: pd.DataFrame, source_group: list[tuple[str, str]], timestep_hours: float) -> tuple[int, float]:
+    count = 0
+    volume = 0.0
+    for column, unit in source_group:
+        values = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+        count += int((values.abs() > 1e-9).sum())
+        multiplier = timestep_hours if unit == "mw" else 1.0
+        volume += float(values.abs().sum() * multiplier)
+    return count, volume
+
+
+def _difference_or_nan(submitted: float, cleared: float, *, tolerance: float = 1e-6) -> tuple[float, bool]:
+    diff = submitted - cleared
+    if diff < -tolerance:
+        return math.nan, True
+    return max(diff, 0.0), False
+
+
+def build_bidding_activity_by_market_model(
+    summary: pd.DataFrame,
+    *,
+    run_root: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    columns = [
+        "run_root",
+        "scenario",
+        "model",
+        "quantile",
+        "strategy_label",
+        "market",
+        "market_label",
+        "test_period_start_utc",
+        "test_period_end_utc",
+        "test_period_days",
+        "annualization_factor",
+        "submitted_bid_count_total",
+        "cleared_bid_count_total",
+        "not_cleared_bid_count_total",
+        "submitted_bid_volume_mwh_total",
+        "cleared_bid_volume_mwh_total",
+        "not_cleared_bid_volume_mwh_total",
+        "submitted_bid_count_annualized",
+        "cleared_bid_count_annualized",
+        "not_cleared_bid_count_annualized",
+        "submitted_bid_volume_mwh_annualized",
+        "cleared_bid_volume_mwh_annualized",
+        "not_cleared_bid_volume_mwh_annualized",
+        "submitted_source",
+        "cleared_source",
+        "volume_unit_source",
+        "count_semantics",
+        "volume_semantics",
+        "metric_semantics",
+        "coverage_share",
+        "missing_hours_count",
+        "warnings",
+    ]
+    warning_rows: list[dict[str, Any]] = []
+    inventory_rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    selected = _selected_model_strategy_rows(summary)
+    if selected.empty:
+        warning_rows.append({"severity": "warning", "scenario": "", "market": "", "message": "No selected model strategies available for bidding-activity aggregation."})
+        return pd.DataFrame(columns=columns), pd.DataFrame(warning_rows), pd.DataFrame(inventory_rows)
+
+    for _, scenario_row in selected.iterrows():
+        scenario = str(scenario_row.get("folder", ""))
+        model = str(scenario_row.get("model", ""))
+        quantile = str(scenario_row.get("quantile", ""))
+        strategy_label = f"{model} {quantile}".strip()
+        scenario_dir = run_root / scenario
+        model_hourly_path = _find_model_hourly_path(scenario_dir)
+        if model_hourly_path is None:
+            warning_rows.append({"severity": "warning", "scenario": scenario, "market": "", "message": "Missing model_hourly.parquet; scenario omitted from bidding-activity figure."})
+            inventory_rows.append(
+                {
+                    "scenario": scenario,
+                    "candidate_file": str(scenario_dir / "multi" / f"{quantile}_{quantile}" / "model_hourly.parquet"),
+                    "exists": False,
+                    "used": False,
+                    "row_count": 0,
+                    "available_columns": "",
+                    "metrics_supported": "",
+                    "reason_if_not_used": "missing_model_hourly",
+                }
+            )
+            continue
+        df = pd.read_parquet(model_hourly_path).copy()
+        if "timestamp_utc" in df.columns:
+            start, end, test_period_days, coverage_share, timestep_hours, missing_hours = _infer_time_coverage(df["timestamp_utc"])
+        else:
+            start, end, test_period_days, coverage_share, timestep_hours, missing_hours = pd.NaT, pd.NaT, math.nan, math.nan, 1.0, 0
+            warning_rows.append({"severity": "warning", "scenario": scenario, "market": "", "message": "Missing timestamp_utc; annualization uses NaN test-period days."})
+        annualization_factor = 365.0 / test_period_days if math.isfinite(test_period_days) and test_period_days > 0.0 else math.nan
+        coverage_warning = ""
+        if math.isfinite(coverage_share) and coverage_share < 0.999:
+            coverage_warning = f"incomplete timestamp coverage: coverage_share={coverage_share:.4f}, missing_hours={missing_hours}"
+            warning_rows.append({"severity": "warning", "scenario": scenario, "market": "", "message": coverage_warning})
+        inventory_rows.append(
+            {
+                "scenario": scenario,
+                "candidate_file": str(model_hourly_path),
+                "exists": True,
+                "used": True,
+                "row_count": len(df),
+                "available_columns": ",".join(str(c) for c in df.columns),
+                "metrics_supported": "submitted_DA,submitted_BCM,submitted_BEM,realized_ID_fallback",
+                "reason_if_not_used": "",
+            }
+        )
+        for spec in BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS:
+            market = str(spec["market"])
+            market_label = str(spec["market_label"])
+            submitted_group = _choose_bidding_source_group(df, spec["submitted_groups"])  # type: ignore[arg-type]
+            cleared_group = _choose_bidding_source_group(df, spec["cleared_groups"])  # type: ignore[arg-type]
+            row_warnings: list[str] = []
+            if not submitted_group:
+                row_warnings.append("missing submitted bid source columns")
+                warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "Missing submitted bid source columns."})
+            if not cleared_group:
+                row_warnings.append("missing cleared/realized source columns")
+                warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "Missing cleared/realized source columns."})
+            if market == "ID":
+                row_warnings.append("submitted ID bid data unavailable; using realized ID recourse activity as submitted=cleared fallback")
+                warning_rows.append(
+                    {
+                        "severity": "warning",
+                        "scenario": scenario,
+                        "market": market,
+                        "message": "Submitted ID bid data unavailable; using realized ID recourse activity as submitted=cleared fallback.",
+                    }
+                )
+            if not submitted_group or not cleared_group:
+                row_warnings.append("market omitted: no usable bid/activity columns")
+                warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "No usable bid/activity columns for market."})
+            submitted_count, submitted_volume = _bidding_count_and_volume(df, submitted_group, timestep_hours) if submitted_group else (math.nan, math.nan)
+            cleared_count, cleared_volume = _bidding_count_and_volume(df, cleared_group, timestep_hours) if cleared_group else (math.nan, math.nan)
+            not_cleared_count, neg_count = _difference_or_nan(float(submitted_count), float(cleared_count)) if math.isfinite(float(submitted_count)) and math.isfinite(float(cleared_count)) else (math.nan, False)
+            not_cleared_volume, neg_volume = _difference_or_nan(float(submitted_volume), float(cleared_volume)) if math.isfinite(float(submitted_volume)) and math.isfinite(float(cleared_volume)) else (math.nan, False)
+            if neg_count:
+                row_warnings.append("negative not-cleared bid count; source values inconsistent")
+                warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "Negative not-cleared bid count; set to NaN."})
+            if neg_volume:
+                row_warnings.append("negative not-cleared bid volume; source values inconsistent")
+                warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "Negative not-cleared bid volume; set to NaN."})
+            if math.isfinite(float(submitted_volume)) and abs(float(submitted_volume)) <= 1e-12:
+                row_warnings.append("zero submitted activity volume")
+                warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "Zero submitted activity volume."})
+
+            if coverage_warning:
+                row_warnings.append(coverage_warning)
+            metric_semantics = str(spec["metric_semantics"])
+            count_semantics = "nonzero submitted and cleared/realized directional source rows"
+            volume_semantics = "absolute source volumes; MW source columns converted to MWh using inferred timestep"
+            def annualize(value: float) -> float:
+                return value * annualization_factor if math.isfinite(value) and math.isfinite(annualization_factor) else math.nan
+            rows.append(
+                {
+                    "run_root": str(run_root),
+                    "scenario": scenario,
+                    "model": model,
+                    "quantile": quantile,
+                    "strategy_label": strategy_label,
+                    "market": market,
+                    "market_label": market_label,
+                    "test_period_start_utc": start.isoformat() if pd.notna(start) else "",
+                    "test_period_end_utc": end.isoformat() if pd.notna(end) else "",
+                    "test_period_days": test_period_days,
+                    "annualization_factor": annualization_factor,
+                    "submitted_bid_count_total": submitted_count,
+                    "cleared_bid_count_total": cleared_count,
+                    "not_cleared_bid_count_total": not_cleared_count,
+                    "submitted_bid_volume_mwh_total": submitted_volume,
+                    "cleared_bid_volume_mwh_total": cleared_volume,
+                    "not_cleared_bid_volume_mwh_total": not_cleared_volume,
+                    "submitted_bid_count_annualized": annualize(float(submitted_count)),
+                    "cleared_bid_count_annualized": annualize(float(cleared_count)),
+                    "not_cleared_bid_count_annualized": annualize(float(not_cleared_count)),
+                    "submitted_bid_volume_mwh_annualized": annualize(float(submitted_volume)),
+                    "cleared_bid_volume_mwh_annualized": annualize(float(cleared_volume)),
+                    "not_cleared_bid_volume_mwh_annualized": annualize(float(not_cleared_volume)),
+                    "submitted_source": ";".join(f"{col}:{unit}" for col, unit in submitted_group),
+                    "cleared_source": ";".join(f"{col}:{unit}" for col, unit in cleared_group),
+                    "volume_unit_source": f"MW columns multiplied by inferred timestep {timestep_hours:.6g}h; MWh columns used directly",
+                    "count_semantics": count_semantics,
+                    "volume_semantics": volume_semantics,
+                    "metric_semantics": metric_semantics,
+                    "coverage_share": coverage_share,
+                    "missing_hours_count": missing_hours,
+                    "warnings": " | ".join(row_warnings),
+                }
+            )
+    out = pd.DataFrame(rows, columns=columns)
+    market_order = {str(spec["market"]): idx for idx, spec in enumerate(BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS)}
+    model_order = {model: idx for idx, model in enumerate(MODEL_ORDER)}
+    if not out.empty:
+        out["_market_order"] = out["market"].map(market_order).fillna(999)
+        out["_model_order"] = out["model"].map(model_order).fillna(999)
+        out = out.sort_values(["_market_order", "_model_order"]).drop(columns=["_market_order", "_model_order"]).reset_index(drop=True)
+    return out, pd.DataFrame(warning_rows), pd.DataFrame(inventory_rows)
+
+
 def _first_full_week_dates(timestamps: pd.Series) -> set[Any]:
     ts = pd.to_datetime(timestamps, errors="coerce", utc=True).dropna()
     if ts.empty:
@@ -1096,6 +1427,12 @@ def _format_k_eur_table(value: Any, digits: int = 1) -> str:
     return f"{val:,.{digits}f}"
 
 
+def _bold_latex_cell(value: str) -> str:
+    if value == r"--":
+        return value
+    return r"\textbf{" + value + "}"
+
+
 def _revenue_cost_table_component_label(component: str) -> str:
     labels = {
         "DA net": "DA net revenue",
@@ -1144,11 +1481,20 @@ def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame)
 
     def _row(component: str, *, cost: bool) -> str:
         cells = [_latex_escape(_revenue_cost_table_component_label(component))]
+        values: dict[str, float] = {}
         for model in models:
             value = _safe_float(pivot.loc[component, model]) / 1000.0 if component in pivot.index and model in pivot.columns else math.nan
             if cost and math.isfinite(value):
                 value = abs(value)
-            cells.append(_format_k_eur_table(value, 1))
+            values[model] = value
+        finite_values = [v for v in values.values() if math.isfinite(v)]
+        best_value = (min(finite_values) if cost else max(finite_values)) if finite_values else math.nan
+        for model in models:
+            value = values.get(model, math.nan)
+            formatted = _format_k_eur_table(value, 1)
+            if math.isfinite(value) and math.isfinite(best_value) and math.isclose(value, best_value, rel_tol=1e-9, abs_tol=1e-9):
+                formatted = _bold_latex_cell(formatted)
+            cells.append(formatted)
         return " & ".join(cells) + r" \\"
 
     revenue_components = [c for c in component_order if c not in cost_labels]
@@ -1158,8 +1504,6 @@ def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame)
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
-        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Values are annualized and reported in kEUR per year. Cost rows are reported as positive cost magnitudes.}",
-        r"\label{tab:3_revenue_cost_components_best_quantile}",
         r"\begin{tabular}{@{}l" + "r" * len(models) + r"@{}}",
         r"\toprule",
         " & ".join(header_cells) + r" \\",
@@ -1177,6 +1521,8 @@ def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame)
     lines += [
         r"\bottomrule",
         r"\end{tabular}",
+        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Values are annualized and reported in kEUR per year. Cost rows are reported as positive cost magnitudes.}",
+        r"\label{tab:3_revenue_cost_components_best_quantile}",
         r"\end{table}",
         "",
     ]
@@ -1442,6 +1788,83 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     return written
 
 
+def plot_bidding_activity_submitted_cleared(
+    activity: pd.DataFrame,
+    out_base: Path,
+    formats: list[str],
+    *,
+    metric: str,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    apply_geo_style()
+    is_volume = metric == "volume"
+    cleared_col = "cleared_bid_volume_mwh_annualized" if is_volume else "cleared_bid_count_annualized"
+    not_cleared_col = "not_cleared_bid_volume_mwh_annualized" if is_volume else "not_cleared_bid_count_annualized"
+    scale = 1000.0
+    title = "Annualized Bid Volume by Market and Model Strategy" if is_volume else "Annualized Bid Count by Market and Model Strategy"
+    ylabel = "Submitted bid volume (1,000 MWh/year)" if is_volume else "Submitted bids (1,000/year)"
+    fig, ax = plt.subplots(figsize=(10.8, 5.4))
+    if activity.empty:
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+            "No bidding-activity data available for selected model strategies.",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color=THESIS_PALETTE["neutral_dark"],
+            wrap=True,
+        )
+        ax.set_title(title)
+        fig.tight_layout()
+        written = _save_figure(fig, out_base, formats)
+        plt.close(fig)
+        return written
+
+    market_labels = [str(spec["market_label"]) for spec in BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS]
+    models = [m for m in MODEL_ORDER if m in set(activity["model"].astype(str))]
+    x = np.arange(len(market_labels))
+    width = 0.22
+    offsets = {model: (idx - (len(models) - 1) / 2) * width for idx, model in enumerate(models)}
+    color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
+    for model in models:
+        cleared = (
+            activity.pivot_table(index="market_label", columns="model", values=cleared_col, aggfunc="sum")
+            .reindex(index=market_labels, columns=models)
+            .get(model, pd.Series(index=market_labels, dtype=float))
+        )
+        not_cleared = (
+            activity.pivot_table(index="market_label", columns="model", values=not_cleared_col, aggfunc="sum")
+            .reindex(index=market_labels, columns=models)
+            .get(model, pd.Series(index=market_labels, dtype=float))
+        )
+        cleared_values = pd.to_numeric(cleared, errors="coerce").to_numpy(dtype=float) / scale
+        not_cleared_values = pd.to_numeric(not_cleared, errors="coerce").to_numpy(dtype=float) / scale
+        color = color_map.get(model, THESIS_PALETTE["neutral_dark"])
+        label = f"{model} {str(activity.loc[activity['model'].astype(str).eq(model), 'quantile'].iloc[0])}"
+        ax.bar(x + offsets[model], cleared_values, width=width, label=label, color=color, edgecolor="white", linewidth=0.6, alpha=1.0)
+        ax.bar(x + offsets[model], not_cleared_values, width=width, bottom=cleared_values, color=color, edgecolor="white", linewidth=0.6, alpha=0.35)
+    ax.set_xticks(x)
+    ax.set_xticklabels(market_labels)
+    ax.set_xlabel("Market")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.35)
+    model_handles = [Patch(facecolor=color_map[m], edgecolor="white", label=f"{m} {str(activity.loc[activity['model'].astype(str).eq(m), 'quantile'].iloc[0])}") for m in models]
+    status_handles = [
+        Patch(facecolor=THESIS_PALETTE["neutral_dark"], alpha=1.0, edgecolor="white", label="Cleared/realized"),
+        Patch(facecolor=THESIS_PALETTE["neutral_dark"], alpha=0.35, edgecolor="white", label="Submitted but not cleared"),
+    ]
+    ax.legend(handles=[*model_handles, *status_handles], ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.16), frameon=True)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
+    return written
+
+
 def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
 
@@ -1523,6 +1946,12 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
             pos_bottom = pos_bottom + values
         else:
             neg_bottom = neg_bottom + values
+    raw_min = min(0.0, float(np.nanmin(neg_bottom)) if len(neg_bottom) else 0.0)
+    raw_max = max(0.0, float(np.nanmax(pos_bottom)) if len(pos_bottom) else 0.0)
+    span = max(raw_max - raw_min, 1.0)
+    pad = max(0.25, 0.08 * span)
+    power_ymin = math.floor((raw_min - pad) * 2.0) / 2.0
+    power_ymax = math.ceil((raw_max + pad) * 2.0) / 2.0
 
     soc = (
         data[["timestamp_utc", "soc_mwh"]]
@@ -1563,17 +1992,17 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     ax2.grid(False)
     ax3.grid(False)
     ax.set_axisbelow(True)
-    ax.set_ylim(-10, 10)
+    ax.set_ylim(power_ymin, power_ymax)
     if len(x) > 0:
         ax.set_xlim(0, len(x) - 1)
-    ax.set_ylabel("Power (MW): charge (+), discharge (-)")
+    ax.set_ylabel("Battery dispatch power (MW)")
     selected_date = pd.Timestamp(times[0]).date() if times else None
     selected_date_label = f"{selected_date.day} {MONTH_ABBR_FULL[selected_date.month]} {selected_date.year}" if selected_date is not None else ""
     ax.set_xlabel(f"Time ({selected_date_label})" if selected_date_label else "Time")
     labels = [pd.Timestamp(ts).strftime("%H:%M") for ts in times]
     ax.set_xticks(x[:: max(1, len(x) // 8)])
     ax.set_xticklabels(labels[:: max(1, len(x) // 8)])
-    fig.suptitle("Exemplary Trading Day with TFT p90 and a Multi-Market Strategy", y=0.98)
+    fig.suptitle("Exemplary BESS Dispatch Under the TFT P90 Multi-Market Strategy", y=0.98)
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
@@ -1598,7 +2027,6 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
 
 def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[str], run_name: str) -> list[Path]:
     import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
 
     apply_geo_style()
     fig, ax = plt.subplots(figsize=(11.2, 5.8))
@@ -1614,7 +2042,7 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
             color=THESIS_PALETTE["neutral_dark"],
             wrap=True,
         )
-        ax.set_title("Cumulative Net Profit: Model Comparison Over Test Period")
+        ax.set_title("Cumulative Net Profit Across Model Strategies")
         fig.tight_layout()
         written = _save_figure(fig, out_base, formats)
         plt.close(fig)
@@ -1644,12 +2072,15 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
             linestyle=line_style.get(model, "-"),
             linewidth=2.2 if model not in BENCHMARK_ORDER else 1.9,
         )
-    locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    plot_dates = pd.Series(cumulative["timestamp_utc"]).dropna().dt.date.sort_values().unique().tolist()
+    tick_positions = _select_spaced_tick_positions(len(plot_dates), max_ticks=7, min_gap=5)
+    if tick_positions:
+        tick_dates = [pd.Timestamp(plot_dates[i]) for i in tick_positions]
+        ax.set_xticks(tick_dates)
+        ax.set_xticklabels([d.strftime("%d %b") for d in tick_dates])
     ax.set_ylabel("Cumulative Net Profit (kEUR)")
     ax.set_xlabel("Time (2025)")
-    ax.set_title("Cumulative Net Profit: Model Comparison Over Test Period")
+    ax.set_title("Cumulative Net Profit Across Model Strategies")
     ax.legend(ncol=3, loc="best")
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
@@ -1984,6 +2415,28 @@ def _tex_k_eur_label(value: Any) -> str:
     return f"{number:,.0f}"
 
 
+def _select_spaced_tick_positions(n_items: int, *, max_ticks: int = 7, min_gap: int = 5) -> list[int]:
+    """Select readable tick positions while keeping the final date if possible."""
+    if n_items <= 0:
+        return []
+    if n_items <= max_ticks:
+        return list(range(n_items))
+    positions = sorted({int(round(x)) for x in np.linspace(0, n_items - 1, max_ticks)})
+    if positions[0] != 0:
+        positions.insert(0, 0)
+    if positions[-1] != n_items - 1:
+        positions.append(n_items - 1)
+
+    cleaned: list[int] = []
+    for pos in positions:
+        if cleaned and pos - cleaned[-1] < min_gap:
+            if pos == n_items - 1:
+                cleaned[-1] = pos
+            continue
+        cleaned.append(pos)
+    return cleaned
+
+
 def _write_native_latex(path: Path, lines: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -1996,7 +2449,7 @@ def _axis_common_options() -> list[str]:
         "tick style={rqTwoNeutral},",
         "label style={font=\\small},",
         "tick label style={font=\\small},",
-        "title style={font=\\bfseries\\small},",
+        "title style={font=\\normalfont\\small},",
         "legend style={font=\\small, draw=none, fill=none},",
         "grid=major,",
         "grid style={rqTwoGrid!55, line width=0.2pt},",
@@ -2082,11 +2535,11 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
     label_offsets = {
         ("RLQR", "p50"): ("south", "0pt", "-12pt"),
         ("XGB", "p90"): ("south", "0pt", "-12pt"),
-        ("TFT", "p90"): ("south west", "2pt", "-8pt"),
+        ("TFT", "p90"): ("south", "0pt", "5pt"),
         ("TFT", "p10"): ("north west", "2pt", "4pt"),
     }
     model_plot_options = {
-        "RLQR": r"color=rqTwoRLQR, mark=diamond, mark options={solid, draw=rqTwoRLQR, fill=white}, line width=1.8pt",
+        "RLQR": r"color=rqTwoRLQR, mark=*, mark options={solid, draw=rqTwoRLQR, fill=white}, line width=1.8pt",
         "XGB": r"color=rqTwoXGB, mark=square*, mark options={solid, draw=rqTwoXGB, fill=rqTwoXGB}, line width=1.8pt",
         "TFT": r"color=rqTwoTFT, mark=triangle*, mark options={solid, draw=rqTwoTFT, fill=rqTwoTFT}, line width=1.8pt",
     }
@@ -2174,10 +2627,13 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
     models = list(MODEL_ORDER) if not component_data.empty else []
     component_order = [label for _col, label in COMPONENT_COLUMNS if not component_data.empty and label in set(component_data["component"])]
     cost_labels = {display for col, display in COMPONENT_COLUMNS if col in COMPONENT_COST_COLUMNS}
-    x_positions = {model: (2 * idx, 2 * idx + 1) for idx, model in enumerate(models)}
-    x_ticks = ",".join(str(i) for i in range(2 * len(models)))
+    group_gap = 1.75
+    pair_gap = 0.55
+    x_positions = {model: (group_gap * idx, group_gap * idx + pair_gap) for idx, model in enumerate(models)}
+    tick_positions = [pos for model in models for pos in x_positions[model]]
+    x_ticks = ",".join(_tex_float(i, 2) for i in tick_positions)
     x_tick_labels = ",".join(["Revenue", "Cost"] * len(models))
-    extra_x_ticks = ",".join(_tex_float(2 * idx + 0.5, 1) for idx in range(len(models)))
+    extra_x_ticks = ",".join(_tex_float(sum(x_positions[model]) / 2.0, 2) for model in models)
     quantile_by_model = (
         component_data[["model", "quantile"]]
         .dropna()
@@ -2199,21 +2655,22 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
         r"\begin{axis}[",
         *_axis_common_options(),
         r"width=\linewidth,",
-        r"height=0.64\linewidth,",
+        r"height=0.58\linewidth,",
         r"ybar stacked,",
-        r"bar width=15pt,",
+        r"bar width=18pt,",
+        r"title style={font=\normalfont\small},",
         r"title={Revenue and Cost Components at Best Quantile},",
-        r"xlabel={Model, selected quantile and component type},",
         r"ylabel={Annualized component value (kEUR/year)},",
         r"ymin=0,",
-        r"enlarge x limits=0.08,",
+        r"enlarge x limits=0.12,",
         r"xtick={" + x_ticks + "},",
         r"xticklabels={" + x_tick_labels + "},",
         r"extra x ticks={" + extra_x_ticks + "},",
         r"extra x tick labels={" + extra_x_tick_labels + "},",
         r"extra x tick style={tick label style={yshift=-1.6em, font=\small}, tick style={draw=none}},",
-        r"legend columns=3,",
-        r"legend style={at={(0.5,-0.24)}, anchor=north, font=\scriptsize, draw=none, fill=none},",
+        r"legend columns=2,",
+        r"legend cell align=left,",
+        r"legend style={at={(0.5,-0.24)}, anchor=north, font=\scriptsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=1.0cm}},",
         r"]",
     ]
     if not component_data.empty and models and component_order:
@@ -2223,7 +2680,9 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
             values="annualized_component_value_eur_per_year",
             aggfunc="sum",
         ).reindex(index=MODEL_ORDER, columns=component_order).fillna(0.0)
-        ordered = [c for c in component_order if c not in cost_labels] + [c for c in component_order if c in cost_labels]
+        revenue_components = [c for c in component_order if c not in cost_labels]
+        cost_components = [c for c in component_order if c in cost_labels]
+        ordered = revenue_components + cost_components
         for component in ordered:
             coords_parts: list[str] = []
             for model in models:
@@ -2238,8 +2697,8 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
                 else:
                     profit_value = raw_value if math.isfinite(raw_value) else 0.0
                     cost_value = 0.0
-                coords_parts.append(f"({profit_x},{_tex_float(profit_value, 2)})")
-                coords_parts.append(f"({cost_x},{_tex_float(cost_value, 2)})")
+                coords_parts.append(f"({_tex_float(profit_x, 2)},{_tex_float(profit_value, 2)})")
+                coords_parts.append(f"({_tex_float(cost_x, 2)},{_tex_float(cost_value, 2)})")
             if len(coords_parts) != 2 * len(models):
                 raise ValueError(
                     f"Grouped stacked revenue/cost LaTeX component {component!r} has {len(coords_parts)} coordinates "
@@ -2247,9 +2706,37 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
                 )
             coords = " ".join(coords_parts)
             lines += [
-                rf"\addplot+[fill={_tex_component_color(component)}, draw=white] coordinates {{{coords}}};",
-                rf"\addlegendentry{{{_latex_escape(component)}}}",
+                rf"\addplot+[fill={_tex_component_color(component)}, draw=white, forget plot] coordinates {{{coords}}};",
             ]
+        lines += [
+            r"\addlegendimage{empty legend}",
+            r"\addlegendentry{Revenue}",
+            r"\addlegendimage{empty legend}",
+            r"\addlegendentry{Costs}",
+        ]
+        for idx in range(max(len(revenue_components), len(cost_components))):
+            if idx < len(revenue_components):
+                component = revenue_components[idx]
+                lines += [
+                    rf"\addlegendimage{{area legend, fill={_tex_component_color(component)}, draw=white}}",
+                    rf"\addlegendentry{{{_latex_escape(component)}}}",
+                ]
+            else:
+                lines += [
+                    r"\addlegendimage{empty legend}",
+                    r"\addlegendentry{}",
+                ]
+            if idx < len(cost_components):
+                component = cost_components[idx]
+                lines += [
+                    rf"\addlegendimage{{area legend, fill={_tex_component_color(component)}, draw=white}}",
+                    rf"\addlegendentry{{{_latex_escape(component)}}}",
+                ]
+            else:
+                lines += [
+                    r"\addlegendimage{empty legend}",
+                    r"\addlegendentry{}",
+                ]
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
@@ -2272,10 +2759,7 @@ def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
         daily = pd.DataFrame()
         dates = []
     date_index = {d: i for i, d in enumerate(dates)}
-    tick_step = max(1, len(dates) // 6) if dates else 1
-    tick_positions = list(range(0, len(dates), tick_step))
-    if dates and tick_positions[-1] != len(dates) - 1:
-        tick_positions.append(len(dates) - 1)
+    tick_positions = _select_spaced_tick_positions(len(dates), max_ticks=7, min_gap=5)
     tick_labels = [pd.Timestamp(dates[i]).strftime("%d %b") for i in tick_positions] if dates else []
     lines = [
         r"% Requires \usepackage{pgfplots}",
@@ -2288,7 +2772,7 @@ def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
         *_axis_common_options(),
         r"width=\linewidth,",
         r"height=0.56\linewidth,",
-        r"title={Cumulative Net Profit: Model Comparison Over Test Period},",
+        r"title={Cumulative Net Profit Across Model Strategies},",
         r"xlabel={Date},",
         r"ylabel={Cumulative Net Profit (kEUR)},",
         r"xmin=0,",
@@ -2352,17 +2836,24 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         if g.empty:
             continue
         marker = {"RLQR": "*", "XGB": "square*", "TFT": "triangle*"}.get(model, "*")
+        model_color = _tex_model_color(model)
         coords = " ".join(
             f"({_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)})"
             for _, row in g.iterrows()
         )
         lines += [
-            rf"\addplot+[only marks, color={_tex_model_color(model)}, mark={marker}, mark size=2.4pt] coordinates {{{coords}}};",
+            rf"\addplot+[only marks, color={model_color}, mark={marker}, mark size=2.4pt, mark options={{draw={model_color}, fill={model_color}}}] coordinates {{{coords}}};",
             rf"\addlegendentry{{{model}}}",
         ]
         for _, row in g.iterrows():
+            quantile = str(row["quantile"])
+            node_options = "font=\\scriptsize, anchor=west, text=rqTwoNeutral"
+            if model == "XGB" and quantile == "p90":
+                node_options = "font=\\scriptsize, anchor=north, yshift=-2pt, text=rqTwoNeutral"
+            elif model == "RLQR" and quantile == "p50":
+                node_options = "font=\\scriptsize, anchor=east, xshift=-2pt, text=rqTwoNeutral"
             lines.append(
-                rf"\node[font=\scriptsize, anchor=west, text=rqTwoNeutral] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(row['quantile'])}}};"
+                rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(quantile)}}};"
             )
     lines += [
         r"\end{axis}",
@@ -2396,6 +2887,22 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
     if times and tick_positions[-1] != len(times) - 1:
         tick_positions.append(len(times) - 1)
     tick_labels = [pd.Timestamp(times[i]).strftime("%H:%M") for i in tick_positions] if times else []
+    power_ymin = -1.0
+    power_ymax = 1.0
+    if not data.empty and times:
+        stack = (
+            data.pivot_table(index="timestamp_utc", columns="component", values="mw_signed", aggfunc="sum")
+            .reindex(times)
+            .fillna(0.0)
+        )
+        positive_stack = stack.clip(lower=0.0).sum(axis=1)
+        negative_stack = stack.clip(upper=0.0).sum(axis=1)
+        raw_min = min(0.0, _safe_float(negative_stack.min()))
+        raw_max = max(0.0, _safe_float(positive_stack.max()))
+        span = max(raw_max - raw_min, 1.0)
+        pad = max(0.25, 0.08 * span)
+        power_ymin = math.floor((raw_min - pad) * 2.0) / 2.0
+        power_ymax = math.ceil((raw_max + pad) * 2.0) / 2.0
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -2410,10 +2917,10 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"height=0.56\linewidth,",
         r"ybar stacked,",
         r"bar width=7pt,",
-        r"title={Exemplary Trading Day with TFT p90 and a Multi-Market Strategy},",
+        r"title={Exemplary BESS Dispatch Under the TFT P90 Multi-Market Strategy},",
         rf"xlabel={{Time ({_latex_escape(selected_date_label)})}},",
-        r"ylabel={Power (MW): charge (+), discharge (-)},",
-        r"ymin=-10, ymax=10,",
+        r"ylabel={Battery dispatch power (MW)},",
+        rf"ymin={_tex_float(power_ymin, 2)}, ymax={_tex_float(power_ymax, 2)},",
         r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
         r"xtick={" + ",".join(str(i) for i in tick_positions) + "},",
         r"xticklabels={" + ",".join(_latex_escape(x) for x in tick_labels) + "},",
@@ -2428,30 +2935,35 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         by_x = {x_by_time[row["timestamp_utc"]]: _safe_float(row["mw_signed"]) for _, row in g.iterrows() if row["timestamp_utc"] in x_by_time}
         for i in range(len(times)):
             coords.append(f"({i},{_tex_float(by_x.get(i, 0.0), 3)})")
-        lines.append(rf"\addplot+[fill={color}, draw=white] coordinates {{{' '.join(coords)}}};")
+        plot_options = f"fill={color}, draw=white"
+        if label in legend_seen:
+            plot_options += ", forget plot"
+        lines.append(rf"\addplot+[{plot_options}] coordinates {{{' '.join(coords)}}};")
         if label not in legend_seen:
             lines.append(rf"\addlegendentry{{{_latex_escape(label)}}}")
             legend_seen.add(label)
-        else:
-            lines.append(r"\addlegendentry{}")
     lines += [
-        r"\addplot+[black, mark=none, line width=0.8pt] coordinates {(0,0) (" + str(max(len(times) - 1, 0)) + r",0)};",
-        r"\addlegendentry{}",
+        r"\addplot+[black, mark=none, line width=0.8pt, forget plot] coordinates {(0,0) (" + str(max(len(times) - 1, 0)) + r",0)};",
+        r"\addlegendimage{color=rqTwoSoC, mark=none, line width=2.0pt}",
+        r"\addlegendentry{Charge}",
+        r"\addlegendimage{color=rqTwoPNL, mark=none, dashed, line width=1.8pt}",
+        r"\addlegendentry{Cumulative Net Profit}",
         r"\end{axis}",
         r"\begin{axis}[",
-        r"name=lineaxis,",
+        r"name=socaxis,",
         r"at={(dispatchaxis.south west)},",
         r"anchor=south west,",
         r"width=\linewidth,",
         r"height=0.56\linewidth,",
         r"axis x line=none,",
         r"axis y line*=right,",
-        r"ylabel={SoC / cumulative Net Profit (kEUR)},",
-        r"ylabel style={font=\small},",
-        r"tick label style={font=\small},",
+        r"ylabel={Charge (MWh)},",
+        r"ylabel style={font=\small, text=rqTwoSoC},",
+        r"yticklabel style={font=\small, text=rqTwoSoC},",
+        r"tick style={rqTwoSoC},",
+        r"axis line style={rqTwoSoC},",
+        r"ymin=2, ymax=18,",
         r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
-        r"legend columns=1,",
-        r"legend style={at={(1.0,-0.20)}, anchor=north east, font=\scriptsize, draw=none, fill=none},",
         r"grid=none,",
         r"]",
     ]
@@ -2462,15 +2974,104 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         pnl_coords = " ".join(f"({i},{_tex_float(v, 3)})" for i, v in enumerate(pnl.to_numpy(dtype=float)) if math.isfinite(_safe_float(v)))
         lines += [
             rf"\addplot+[color=rqTwoSoC, mark=none, line width=2.0pt] coordinates {{{soc_coords}}};",
-            r"\addlegendentry{SoC}",
+            r"\end{axis}",
+            r"\begin{axis}[",
+            r"name=pnlaxis,",
+            r"at={(dispatchaxis.south west)},",
+            r"anchor=south west,",
+            r"width=\linewidth,",
+            r"height=0.56\linewidth,",
+            r"axis x line=none,",
+            r"axis y line*=right,",
+            r"ylabel={Cumulative Net Profit (kEUR)},",
+            r"ylabel style={font=\small, text=rqTwoPNL, xshift=4.4em},",
+            r"yticklabel style={font=\small, text=rqTwoPNL, xshift=2.6em},",
+            r"tick style={rqTwoPNL, xshift=2.2em},",
+            r"axis line style={rqTwoPNL, xshift=2.2em},",
+            r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
+            r"grid=none,",
+            r"]",
             rf"\addplot+[color=rqTwoPNL, mark=none, dashed, line width=1.8pt] coordinates {{{pnl_coords}}};",
-            r"\addlegendentry{Cumulative Net Profit}",
         ]
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
         r"\caption{Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero and discharging actions below zero.}",
         r"\label{fig:6_market_dispatch_soc_selected_day}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.DataFrame, *, metric: str) -> None:
+    is_volume = metric == "volume"
+    market_labels = [str(spec["market_label"]) for spec in BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS]
+    models = [m for m in MODEL_ORDER if not activity.empty and m in set(activity["model"].astype(str))]
+    model_labels = {
+        model: f"{model} {str(activity.loc[activity['model'].astype(str).eq(model), 'quantile'].iloc[0])}"
+        for model in models
+    }
+    shifts = {"RLQR": "-8pt", "XGB": "0pt", "TFT": "8pt"}
+    cleared_col = "cleared_bid_volume_mwh_annualized" if is_volume else "cleared_bid_count_annualized"
+    not_cleared_col = "not_cleared_bid_volume_mwh_annualized" if is_volume else "not_cleared_bid_count_annualized"
+    title = "Annualized Bid Volume by Market and Model Strategy" if is_volume else "Annualized Bid Count by Market and Model Strategy"
+    ylabel = "Submitted bid volume (1,000 MWh/year)" if is_volume else "Submitted bids (1,000/year)"
+    caption = (
+        "Annualized submitted bid volume by market and model strategy. Bars show total submitted bid volume, split into cleared volume and submitted but not-cleared volume. Fully opaque segments indicate cleared or realized volume, while transparent segments indicate submitted volume that did not clear. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
+        if is_volume
+        else "Annualized submitted bid count by market and model strategy. Bars show total submitted bids per year, split into cleared bids and submitted but not-cleared bids. Fully opaque segments indicate cleared or realized bids, while transparent segments indicate submitted bids that did not clear. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
+    )
+    label = "fig:annualized_bid_volume_by_market_model" if is_volume else "fig:annualized_bid_count_by_market_model"
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=\linewidth,",
+        r"height=0.54\linewidth,",
+        r"ybar stacked,",
+        r"bar width=7pt,",
+        rf"title={{{title}}},",
+        rf"ylabel={{{ylabel}}},",
+        r"xlabel={Market},",
+        r"xmin=-0.5, xmax=" + _tex_float(max(len(market_labels) - 0.5, 0.5), 1) + ",",
+        r"xtick={" + ",".join(str(i) for i in range(len(market_labels))) + "},",
+        r"xticklabels={" + ",".join(_latex_escape(label) for label in market_labels) + "},",
+        r"legend columns=3,",
+        r"legend cell align=left,",
+        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
+        r"]",
+    ]
+    for model in models:
+        coords = []
+        for xi, label in enumerate(market_labels):
+            match = activity.loc[activity["market_label"].astype(str).eq(label) & activity["model"].astype(str).eq(model)]
+            value = _safe_float(match[cleared_col].iloc[0]) / 1000.0 if not match.empty else math.nan
+            coords.append(f"({xi},{_tex_float(value, 3)})")
+        lines += [
+            rf"\addplot+[fill={_tex_model_color(model)}, draw=white, bar shift={shifts.get(model, '0pt')}] coordinates {{{' '.join(coords)}}};",
+            rf"\addlegendentry{{{_latex_escape(model_labels.get(model, model))}}}",
+        ]
+    for model in models:
+        coords = []
+        for xi, label in enumerate(market_labels):
+            match = activity.loc[activity["market_label"].astype(str).eq(label) & activity["model"].astype(str).eq(model)]
+            value = _safe_float(match[not_cleared_col].iloc[0]) / 1000.0 if not match.empty else math.nan
+            coords.append(f"({xi},{_tex_float(value, 3)})")
+        lines.append(rf"\addplot+[fill={_tex_model_color(model)}, draw=white, fill opacity=0.35, bar shift={shifts.get(model, '0pt')}, forget plot] coordinates {{{' '.join(coords)}}};")
+    lines += [
+        r"\addlegendimage{area legend, fill=rqTwoNeutral, draw=white}",
+        r"\addlegendentry{Cleared/realized}",
+        r"\addlegendimage{area legend, fill=rqTwoNeutral, fill opacity=0.35, draw=white}",
+        r"\addlegendentry{Submitted but not cleared}",
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        rf"\caption{{{caption}}}",
+        rf"\label{{{label}}}",
         r"\end{figure}",
     ]
     _write_native_latex(path, lines)
@@ -2485,6 +3086,7 @@ def write_result_section_native_latex_figures(
     cumulative_data: pd.DataFrame,
     normalized_total_scatter_data: pd.DataFrame,
     dispatch_soc_data: pd.DataFrame,
+    bidding_activity_data: pd.DataFrame,
     quantiles: list[str],
 ) -> None:
     write_latex_profit_heatmap(latex_figures_dir / "1_profit_heatmap.tex", heatmap_table)
@@ -2493,6 +3095,8 @@ def write_result_section_native_latex_figures(
     write_latex_cumulative_pnl(latex_figures_dir / "4_cumulative_net_profit_model_comparison_test_period.tex", cumulative_data)
     write_latex_normalized_pinball_profit(latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex", normalized_total_scatter_data)
     write_latex_market_dispatch_soc(latex_figures_dir / "6_market_dispatch_soc_selected_day.tex", dispatch_soc_data)
+    write_latex_bidding_activity_submitted_cleared(latex_figures_dir / "annualized_bid_volume_by_market_model.tex", bidding_activity_data, metric="volume")
+    write_latex_bidding_activity_submitted_cleared(latex_figures_dir / "annualized_bid_count_by_market_model.tex", bidding_activity_data, metric="count")
 
 
 def _thesis_figure_rel(out_root: Path, figure_name: str) -> str:
@@ -2558,8 +3162,10 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     total_scatter_data = build_total_pinball_net_profit_scatter_data(scatter_data)
     normalized_total_scatter_data = build_normalized_total_pinball_profit_data(total_scatter_data)
     dispatch_soc_data, dispatch_soc_warnings = build_market_dispatch_soc_day(summary, run_root=run_root)
+    bidding_activity_data, bidding_activity_warnings, bidding_activity_inventory = build_bidding_activity_by_market_model(summary, run_root=run_root)
 
     csv_dir = out_root / "backup/csv"
+    result_csv_dir = out_root / "result_section/csv"
     diag_dir = out_root / "backup/diagnostics"
     warn_dir = out_root / "backup/warnings"
     figures_dir = out_root / "result_section/figures"
@@ -2579,12 +3185,16 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", index=False)
     normalized_total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", index=False)
     dispatch_soc_data.to_csv(csv_dir / "6_market_dispatch_soc_selected_day.csv", index=False)
+    bidding_activity_data.to_csv(csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", index=False)
+    bidding_activity_data.to_csv(result_csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", index=False)
     bench.to_csv(csv_dir / "rq2_benchmark_values.csv", index=False)
     inventory.to_csv(diag_dir / "rq2_input_file_inventory.csv", index=False)
+    bidding_activity_inventory.to_csv(diag_dir / "bidding_activity_submitted_cleared_source_inventory.csv", index=False)
     validity.to_csv(diag_dir / "rq2_validity_diagnostics.csv", index=False)
-    warning_df = pd.concat([warning_df, dispatch_soc_warnings], ignore_index=True, sort=False)
+    warning_df = pd.concat([warning_df, dispatch_soc_warnings, bidding_activity_warnings], ignore_index=True, sort=False)
     warning_df.to_csv(warn_dir / "rq2_warnings.csv", index=False)
     dispatch_soc_warnings.to_csv(warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", index=False)
+    bidding_activity_warnings.to_csv(warn_dir / "bidding_activity_submitted_cleared_warnings.csv", index=False)
 
     write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
     write_revenue_cost_component_table(tables_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
@@ -2600,6 +3210,8 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         result_figure_paths += plot_normalized_total_pinball_profit_scatter(normalized_total_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_total_normalized", formats)
         appendix_figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, appendix_figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
         result_figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
+        result_figure_paths += plot_bidding_activity_submitted_cleared(bidding_activity_data, figures_dir / "annualized_bid_volume_by_market_model", formats, metric="volume")
+        result_figure_paths += plot_bidding_activity_submitted_cleared(bidding_activity_data, figures_dir / "annualized_bid_count_by_market_model", formats, metric="count")
         result_figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
         write_result_section_native_latex_figures(
             latex_figures_dir=latex_figures_dir,
@@ -2609,6 +3221,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
             cumulative_data=cumulative_data,
             normalized_total_scatter_data=normalized_total_scatter_data,
             dispatch_soc_data=dispatch_soc_data,
+            bidding_activity_data=bidding_activity_data,
             quantiles=quantiles,
         )
         for target, label in TARGET_LABELS.items():
@@ -2646,11 +3259,15 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for total pinball-loss scatter figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total pinball-loss scatter figure"),
         (csv_dir / "6_market_dispatch_soc_selected_day.csv", "backup", "csv", "market dispatch and SoC", "source data for selected-day stacked dispatch/SOC figure"),
+        (csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", "backup", "csv", "bidding activity", "backup source data for submitted/cleared bidding-activity figures"),
+        (result_csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", "result_section", "csv", "bidding activity", "source data for submitted/cleared bidding-activity figures"),
         (csv_dir / "rq2_benchmark_values.csv", "backup", "csv", "benchmark values", "Naive/RHPF benchmark source"),
         (diag_dir / "rq2_input_file_inventory.csv", "backup", "diagnostics", "input inventory", "reproducibility audit"),
+        (diag_dir / "bidding_activity_submitted_cleared_source_inventory.csv", "backup", "diagnostics", "bidding activity", "source inventory for submitted/cleared bidding-activity aggregation"),
         (diag_dir / "rq2_validity_diagnostics.csv", "backup", "diagnostics", "validity diagnostics", "invalid-row audit"),
         (warn_dir / "rq2_warnings.csv", "backup", "warnings", "warnings", "generation warnings"),
         (warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", "backup", "warnings", "market dispatch and SoC", "selected-day invalidity and direct violation checks"),
+        (warn_dir / "bidding_activity_submitted_cleared_warnings.csv", "backup", "warnings", "bidding activity", "submitted/cleared bidding-activity aggregation warnings"),
     ]:
         entries.append(_manifest_entry(path, out_root, tier, artifact_type, metric_family, thesis_use, run_root, created, days, factor))
     for fig in result_figure_paths:

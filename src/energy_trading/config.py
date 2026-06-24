@@ -131,6 +131,10 @@ MARKET_SPECS = {
     "da_limit_clearing_policy": "accepted_independent_limit_replay",
     "da_arbitrage_mode": "limit",  # mode for non-hedging DA volumes
     "da_link_to_awarded_afrr": True,  # cancel hedges if aFRR capacity was not awarded
+    # BCM/aFRR capacity clearing for realized settlement:
+    # - expost_price_threshold: awarded iff own capacity bid price <= realized capacity price
+    # - full_award_legacy: historical approximation where feasible submitted capacity always clears
+    "bcm_capacity_clearing_mode": "expost_price_threshold",
     "afrr_capacity_bid_risk_lambda": 0.2,
     "afrr_activation_bid_risk_lambda": 0.2,
     # Activation-rate policy used for physical reserve/BEM headroom guards.

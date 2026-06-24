@@ -788,6 +788,17 @@ SETTLEMENT_NUMERIC_COLS = (
     "submitted_afrr_neg_mw",
     "submitted_bcm_capacity_pos_mw",
     "submitted_bcm_capacity_neg_mw",
+    "bcm_capacity_submitted_pos_mw",
+    "bcm_capacity_submitted_neg_mw",
+    "bcm_capacity_awarded_pos_mw",
+    "bcm_capacity_awarded_neg_mw",
+    "bcm_capacity_rejected_pos_mw",
+    "bcm_capacity_rejected_neg_mw",
+    "bcm_capacity_cleared_pos",
+    "bcm_capacity_cleared_neg",
+    "bcm_capacity_clearing_checked",
+    "bcm_capacity_clearing_price_pos_eur_per_mw_h",
+    "bcm_capacity_clearing_price_neg_eur_per_mw_h",
     "locked_bcm_capacity_pos_mw",
     "locked_bcm_capacity_neg_mw",
     "bcm_allowed",
@@ -1119,6 +1130,10 @@ SETTLEMENT_METADATA_COLS = (
     "da_buy_reason",
     "da_sell_reason",
     "bcm_zero_reason",
+    "bcm_capacity_clearing_mode",
+    "bcm_capacity_rejection_reason_pos",
+    "bcm_capacity_rejection_reason_neg",
+    "bcm_capacity_settlement_rule",
     "bcm_precommit_zero_reason",
     "bcm_capacity_price_source",
     "bcm_activation_price_source",
@@ -1178,6 +1193,38 @@ def _phase_timeout_seconds(phase: str) -> float:
     if key in os.environ:
         return float(os.environ[key])
     return float(os.environ.get("BACKTEST_PHASE_TIMEOUT_S", "0"))
+
+
+def clear_bcm_capacity_bid(
+    submitted_mw: float,
+    bid_price_eur_per_mw_h: float,
+    realized_capacity_price_eur_per_mw_h: float,
+) -> tuple[float, float, str]:
+    """Clear one BCM capacity bid against the realized capacity price threshold."""
+    try:
+        submitted = max(0.0, float(submitted_mw))
+    except (TypeError, ValueError):
+        submitted = 0.0
+    if submitted <= 1e-12:
+        return 0.0, 0.0, "no_bid"
+
+    try:
+        bid_price = float(bid_price_eur_per_mw_h)
+    except (TypeError, ValueError):
+        bid_price = float("nan")
+    if not np.isfinite(bid_price):
+        return 0.0, float(submitted), "missing_bid_price"
+
+    try:
+        clearing_price = float(realized_capacity_price_eur_per_mw_h)
+    except (TypeError, ValueError):
+        clearing_price = float("nan")
+    if not np.isfinite(clearing_price):
+        return 0.0, float(submitted), "missing_clearing_price"
+
+    if bid_price <= clearing_price:
+        return float(submitted), 0.0, "cleared"
+    return 0.0, float(submitted), "price_rejected"
 
 
 @contextmanager
@@ -3091,6 +3138,15 @@ class BatteryBacktester:
             da_mode_default=self.da_execution_mode,
             forecast_value_mode=self.forecast_value_mode,
         )
+        self.bcm_capacity_clearing_mode = str(
+            MARKET_SPECS.get("bcm_capacity_clearing_mode", "expost_price_threshold")
+        ).strip().lower()
+        if self.bcm_capacity_clearing_mode not in {"expost_price_threshold", "full_award_legacy"}:
+            raise ValueError(
+                "Invalid MARKET_SPECS['bcm_capacity_clearing_mode'] "
+                f"{self.bcm_capacity_clearing_mode!r}. Allowed: "
+                "expost_price_threshold, full_award_legacy"
+            )
         self.id_rescue_spread_eur_mwh = float(MARKET_SPECS.get("id_rescue_spread_eur_mwh", 30.0))
         self.id_buy_price_cap_eur_mwh = float(MARKET_SPECS.get("id_buy_price_cap_eur_mwh", 3000.0))
         self.id_sell_price_floor_eur_mwh = float(MARKET_SPECS.get("id_sell_price_floor_eur_mwh", -500.0))
@@ -23809,6 +23865,33 @@ class BatteryBacktester:
         # a missing obligation price must stay auditable as missing.
         obligation_capacity_price_pos_resolved = _finite_nonzero(obligation_capacity_price_pos)
         obligation_capacity_price_neg_resolved = _finite_nonzero(obligation_capacity_price_neg)
+        bcm_submitted_pos_mw = float(ob_pos)
+        bcm_submitted_neg_mw = float(ob_neg)
+        has_bcm_submission_hour = bool(bcm_submitted_pos_mw > 1e-12 or bcm_submitted_neg_mw > 1e-12)
+
+        if self.bcm_capacity_clearing_mode == "full_award_legacy":
+            bcm_awarded_pos_mw = float(bcm_submitted_pos_mw)
+            bcm_awarded_neg_mw = float(bcm_submitted_neg_mw)
+            bcm_rejected_pos_mw = 0.0
+            bcm_rejected_neg_mw = 0.0
+            bcm_rejection_reason_pos = "legacy_full_award" if bcm_submitted_pos_mw > 1e-12 else "no_bid"
+            bcm_rejection_reason_neg = "legacy_full_award" if bcm_submitted_neg_mw > 1e-12 else "no_bid"
+        else:
+            bcm_awarded_pos_mw, bcm_rejected_pos_mw, bcm_rejection_reason_pos = clear_bcm_capacity_bid(
+                bcm_submitted_pos_mw,
+                obligation_capacity_price_pos_resolved,
+                true_cap_pos,
+            )
+            bcm_awarded_neg_mw, bcm_rejected_neg_mw, bcm_rejection_reason_neg = clear_bcm_capacity_bid(
+                bcm_submitted_neg_mw,
+                obligation_capacity_price_neg_resolved,
+                true_cap_neg,
+            )
+        # From here on, ob_* means actual awarded BCM capacity obligation.
+        # Submitted-but-rejected capacity remains visible in submitted/rejected diagnostics.
+        ob_pos = float(bcm_awarded_pos_mw)
+        ob_neg = float(bcm_awarded_neg_mw)
+        has_bcm_award_hour = bool(ob_pos > 1e-12 or ob_neg > 1e-12)
 
         if self.da_bid_fail_fast_debug:
             # Debug-mode hard guard: DA limit bids must not be built from missing or
@@ -23910,12 +23993,12 @@ class BatteryBacktester:
             bin_payload[f"executed_afrr_act_neg_bin_{b}_price_eur_mwh"] = 0.0
         free_bem_from_unawarded_reserve_pos = (
             max(0.0, float(res_pos_plan))
-            if bool(allow_bem) and not (ob_pos > 0.0 or ob_neg > 0.0)
+            if bool(allow_bem) and not has_bcm_submission_hour
             else 0.0
         )
         free_bem_from_unawarded_reserve_neg = (
             max(0.0, float(res_neg_plan))
-            if bool(allow_bem) and not (ob_pos > 0.0 or ob_neg > 0.0)
+            if bool(allow_bem) and not has_bcm_submission_hour
             else 0.0
         )
         # In multi/BEM mode, current-hour reserve variables without a BCM
@@ -23971,8 +24054,9 @@ class BatteryBacktester:
                 min_mw=self.afrr_min_bid_size_mw,
             )
 
-        if ob_pos > 0.0 or ob_neg > 0.0:
-            # Capacity already cleared in aFRR BCM: use mandatory obligation.
+        if has_bcm_submission_hour:
+            # Clear submitted aFRR BCM capacity against realized capacity prices.
+            # Only awarded capacity creates a mandatory activation obligation.
             cap_bids = []
             if ob_pos > 0.0:
                 bcm_cap_bids.append(
@@ -24023,30 +24107,24 @@ class BatteryBacktester:
                     )
                 )
             cap_bids.extend(bcm_cap_bids)
-            cap_res = self.market_clearing_engine.clear_afrr_capacity(
-                bcm_cap_bids,
-                true_cap_pos=float(true_cap_pos),
-                true_cap_neg=float(true_cap_neg),
-            )
-            # Enforce already-awarded obligations independently of spot capacity check.
-            cap_res = type(cap_res)(
-                submitted_pos_mw=ob_pos,
-                submitted_neg_mw=ob_neg,
+            cap_res = AFRRCapacityClearingResult(
+                submitted_pos_mw=bcm_submitted_pos_mw,
+                submitted_neg_mw=bcm_submitted_neg_mw,
                 awarded_pos_mw=ob_pos,
                 awarded_neg_mw=ob_neg,
                 pos_awarded=ob_pos > 0.0,
                 neg_awarded=ob_neg > 0.0,
             )
-            bin_payload["submitted_afrr_pos_bin_0_mw"] = float(ob_pos)
-            bin_payload["submitted_afrr_neg_bin_0_mw"] = float(ob_neg)
+            bin_payload["submitted_afrr_pos_bin_0_mw"] = float(bcm_submitted_pos_mw)
+            bin_payload["submitted_afrr_neg_bin_0_mw"] = float(bcm_submitted_neg_mw)
             bin_payload["submitted_afrr_pos_bin_0_price_eur_mw"] = float(
                 obligation_capacity_price_pos_resolved
-                if ob_pos > 1e-12 and np.isfinite(obligation_capacity_price_pos_resolved)
+                if bcm_submitted_pos_mw > 1e-12 and np.isfinite(obligation_capacity_price_pos_resolved)
                 else 0.0
             )
             bin_payload["submitted_afrr_neg_bin_0_price_eur_mw"] = float(
                 obligation_capacity_price_neg_resolved
-                if ob_neg > 1e-12 and np.isfinite(obligation_capacity_price_neg_resolved)
+                if bcm_submitted_neg_mw > 1e-12 and np.isfinite(obligation_capacity_price_neg_resolved)
                 else 0.0
             )
             bin_payload["executed_afrr_cap_pos_bin_0_mw"] = float(ob_pos)
@@ -24128,7 +24206,7 @@ class BatteryBacktester:
                 for b in cap_bids
             ]
             bem_cap_bids = list(cap_bids)
-        if ob_pos > 0.0 or ob_neg > 0.0:
+        if has_bcm_submission_hour:
             if bem_q_pos > 0.0:
                 bem_cap_bids.append(
                     AFRRCapacityBid(
@@ -24364,7 +24442,7 @@ class BatteryBacktester:
             s_neg = float(bin_payload.get(f"submitted_afrr_neg_bin_{b}_mw", 0.0))
             p_pos = float(bin_payload.get(f"submitted_afrr_pos_bin_{b}_price_eur_mw", 0.0))
             p_neg = float(bin_payload.get(f"submitted_afrr_neg_bin_{b}_price_eur_mw", 0.0))
-            if ob_pos > 0.0 or ob_neg > 0.0:
+            if has_bcm_submission_hour:
                 aw_pos = s_pos if (s_pos > 0.0 and bool(cap_res.pos_awarded)) else 0.0
                 aw_neg = s_neg if (s_neg > 0.0 and bool(cap_res.neg_awarded)) else 0.0
             else:
@@ -24374,7 +24452,7 @@ class BatteryBacktester:
             bin_payload[f"executed_afrr_cap_neg_bin_{b}_mw"] = float(aw_neg)
             bin_payload[f"executed_afrr_cap_pos_bin_{b}_price_eur_mw"] = float(p_pos if aw_pos > 0.0 else 0.0)
             bin_payload[f"executed_afrr_cap_neg_bin_{b}_price_eur_mw"] = float(p_neg if aw_neg > 0.0 else 0.0)
-            if ob_pos > 0.0 or ob_neg > 0.0:
+            if has_bcm_submission_hour:
                 act_base_pos = aw_pos
                 act_base_neg = aw_neg
             else:
@@ -24450,12 +24528,36 @@ class BatteryBacktester:
         bem_activation_bid_price_neg = float(
             np.mean([float(b.energy_price_eur_mwh) for b in bem_activation_bids if b.side == "neg"])
         ) if any(b.side == "neg" for b in bem_activation_bids) else 0.0
-        bcm_capacity_bid_price_pos = _mean_bcm_capacity_bid_price("pos", ob_pos)
-        bcm_capacity_bid_price_neg = _mean_bcm_capacity_bid_price("neg", ob_neg)
+        bcm_capacity_bid_price_pos = (
+            float(obligation_capacity_price_pos_resolved)
+            if bcm_submitted_pos_mw > 1e-12 and np.isfinite(obligation_capacity_price_pos_resolved)
+            else (float("nan") if bcm_submitted_pos_mw > 1e-12 else 0.0)
+        )
+        bcm_capacity_bid_price_neg = (
+            float(obligation_capacity_price_neg_resolved)
+            if bcm_submitted_neg_mw > 1e-12 and np.isfinite(obligation_capacity_price_neg_resolved)
+            else (float("nan") if bcm_submitted_neg_mw > 1e-12 else 0.0)
+        )
+        capacity_rejection_reasons = [
+            str(reason)
+            for reason in (bcm_rejection_reason_pos, bcm_rejection_reason_neg)
+            if str(reason) not in {"no_bid", "cleared", "legacy_full_award"}
+        ]
+        bcm_capacity_rejection_reason = (
+            ",".join(dict.fromkeys(capacity_rejection_reasons))
+            if capacity_rejection_reasons
+            else "none"
+        )
         if not allow_bcm:
             bcm_zero_reason = "bcm_disabled"
-        elif (ob_pos > 1e-12 or ob_neg > 1e-12) and (bcm_source_pos_mw <= 1e-12 and bcm_source_neg_mw <= 1e-12):
-            bcm_zero_reason = "clearing_failed"
+        elif has_bcm_submission_hour and not has_bcm_award_hour:
+            bcm_zero_reason = (
+                f"capacity_{bcm_capacity_rejection_reason}"
+                if bcm_capacity_rejection_reason != "none"
+                else "capacity_not_awarded"
+            )
+        elif has_bcm_award_hour and (bcm_source_pos_mw <= 1e-12 and bcm_source_neg_mw <= 1e-12):
+            bcm_zero_reason = "activation_clearing_failed"
         elif ob_pos <= 1e-12 and ob_neg <= 1e-12 and res_pos_plan <= 1e-12 and res_neg_plan <= 1e-12:
             bcm_zero_reason = "no_bcm_candidate"
         elif ob_pos <= 1e-12 and ob_neg <= 1e-12:
@@ -24773,19 +24875,36 @@ class BatteryBacktester:
             "bem_only_bcm_contamination_raw_fixed_reserve_neg_mw": float(raw_ob_neg),
             "bem_only_bcm_contamination_locked_bcm_capacity_pos_mw": float(ob_pos),
             "bem_only_bcm_contamination_locked_bcm_capacity_neg_mw": float(ob_neg),
-            "submitted_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
-            "submitted_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "submitted_bcm_capacity_pos_mw": float(bcm_submitted_pos_mw),
+            "submitted_bcm_capacity_neg_mw": float(bcm_submitted_neg_mw),
+            "bcm_capacity_submitted_pos_mw": float(bcm_submitted_pos_mw),
+            "bcm_capacity_submitted_neg_mw": float(bcm_submitted_neg_mw),
+            "bcm_capacity_awarded_pos_mw": float(ob_pos),
+            "bcm_capacity_awarded_neg_mw": float(ob_neg),
+            "bcm_capacity_rejected_pos_mw": float(bcm_rejected_pos_mw),
+            "bcm_capacity_rejected_neg_mw": float(bcm_rejected_neg_mw),
+            "bcm_capacity_cleared_pos": float(ob_pos > 1e-12),
+            "bcm_capacity_cleared_neg": float(ob_neg > 1e-12),
+            "bcm_capacity_clearing_checked": float(bool(has_bcm_submission_hour)),
+            "bcm_capacity_clearing_mode": str(self.bcm_capacity_clearing_mode),
+            "bcm_capacity_rejection_reason_pos": str(bcm_rejection_reason_pos),
+            "bcm_capacity_rejection_reason_neg": str(bcm_rejection_reason_neg),
+            "bcm_capacity_settlement_rule": "pay_as_bid",
+            "bcm_capacity_clearing_price_pos_eur_per_mw_h": float(true_cap_pos),
+            "bcm_capacity_clearing_price_neg_eur_per_mw_h": float(true_cap_neg),
             "bcm_product_block_id": bcm_product_block_id,
             "bcm_direction": bcm_direction,
-            "bcm_submitted_capacity_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
+            "bcm_submitted_capacity_mw": float(max(bcm_submitted_pos_mw, bcm_submitted_neg_mw)),
             "bcm_capacity_cutoff_price_pos_eur_per_mw_h": float(true_cap_pos),
             "bcm_capacity_cutoff_price_neg_eur_per_mw_h": float(true_cap_neg),
             "bcm_capacity_cutoff_price_eur_per_mw_h": float(
-                true_cap_pos if ob_pos > 1e-12 else (true_cap_neg if ob_neg > 1e-12 else 0.0)
+                true_cap_pos
+                if bcm_submitted_pos_mw > 1e-12
+                else (true_cap_neg if bcm_submitted_neg_mw > 1e-12 else 0.0)
             ),
             "bcm_capacity_price_unit": "eur_per_mw_h",
-            "locked_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
-            "locked_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "locked_bcm_capacity_pos_mw": float(ob_pos),
+            "locked_bcm_capacity_neg_mw": float(ob_neg),
             "bcm_allowed": float(allow_bcm),
             "bcm_activation_bid_price_pos": float(bcm_activation_bid_price_pos),
             "bcm_activation_bid_price_neg": float(bcm_activation_bid_price_neg),
@@ -24853,15 +24972,23 @@ class BatteryBacktester:
             "bcm_capacity_bid_price_neg_eur_per_mw_h": float(bcm_capacity_bid_price_neg),
             "bcm_capacity_price_source": (
                 "none"
-                if not is_bcm_obligation_hour
+                if not has_bcm_submission_hour
                 else (
                     "missing_obligation_capacity_price"
-                    if bcm_capacity_price_missing_with_awarded_mw > 0.5
-                    else "obligation_lockbook_price"
+                    if (
+                        bcm_capacity_price_missing_with_awarded_mw > 0.5
+                        or bcm_rejection_reason_pos == "missing_bid_price"
+                        or bcm_rejection_reason_neg == "missing_bid_price"
+                    )
+                    else (
+                        "rejected_by_capacity_price"
+                        if not has_bcm_award_hour
+                        else "obligation_lockbook_price"
+                    )
                 )
             ),
-            "bcm_lockbook_capacity_bid_price_pos_eur_per_mw_h": float(cap_bid_pos_settlement),
-            "bcm_lockbook_capacity_bid_price_neg_eur_per_mw_h": float(cap_bid_neg_settlement),
+            "bcm_lockbook_capacity_bid_price_pos_eur_per_mw_h": float(bcm_capacity_bid_price_pos),
+            "bcm_lockbook_capacity_bid_price_neg_eur_per_mw_h": float(bcm_capacity_bid_price_neg),
             "bcm_obligation_capacity_bid_price_pos_eur_per_mw_h": float(cap_bid_pos_settlement),
             "bcm_obligation_capacity_bid_price_neg_eur_per_mw_h": float(cap_bid_neg_settlement),
             "bcm_settlement_capacity_price_resolved_pos_eur_per_mw_h": float(cap_bid_pos_settlement),
@@ -24873,25 +25000,25 @@ class BatteryBacktester:
                 bcm_capacity_price_lost_before_settlement
             ),
             "bcm_pay_as_bid_settlement_price_eur_per_mw_h": float(
-                bcm_capacity_bid_price_pos if ob_pos > 1e-12 else (bcm_capacity_bid_price_neg if ob_neg > 1e-12 else 0.0)
+                cap_bid_pos_settlement if ob_pos > 1e-12 else (cap_bid_neg_settlement if ob_neg > 1e-12 else 0.0)
             ),
             "true_activation_price_pos": float(true_act_pos),
             "true_activation_price_neg": float(true_act_neg),
             "bcm_true_activation_price_pos": float(true_act_pos),
             "bcm_true_activation_price_neg": float(true_act_neg),
-            "bcm_cleared_pos": float(bcm_source_pos_mw > 1e-12),
-            "bcm_cleared_neg": float(bcm_source_neg_mw > 1e-12),
+            "bcm_cleared_pos": float(ob_pos > 1e-12),
+            "bcm_cleared_neg": float(ob_neg > 1e-12),
             "bcm_locked_pos_mw": float(ob_pos),
             "bcm_locked_neg_mw": float(ob_neg),
-            "bcm_awarded_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
-            "bcm_awarded_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
-            "bcm_capacity_accepted_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
-            "bcm_available_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
-            "bcm_available_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
-            "bcm_capacity_available_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
-            "bcm_to_bem_energy_obligation_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
-            "bcm_to_bem_energy_obligation_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
-            "bcm_to_bem_mandatory_volume_mw": float(max(ob_pos, ob_neg) if is_bcm_obligation_hour else 0.0),
+            "bcm_awarded_capacity_pos_mw": float(ob_pos),
+            "bcm_awarded_capacity_neg_mw": float(ob_neg),
+            "bcm_capacity_accepted_mw": float(max(ob_pos, ob_neg)),
+            "bcm_available_capacity_pos_mw": float(ob_pos),
+            "bcm_available_capacity_neg_mw": float(ob_neg),
+            "bcm_capacity_available_mw": float(max(ob_pos, ob_neg)),
+            "bcm_to_bem_energy_obligation_pos_mw": float(ob_pos),
+            "bcm_to_bem_energy_obligation_neg_mw": float(ob_neg),
+            "bcm_to_bem_mandatory_volume_mw": float(max(ob_pos, ob_neg)),
             "bcm_capacity_bid_has_activation_price": 0.0,
             "bcm_clearing_uses_activation_price": 0.0,
             "bcm_to_bem_activation_price_transferred": 0.0,
@@ -24940,8 +25067,8 @@ class BatteryBacktester:
             # BCM capacity MW is the already locked/awarded product capacity.
             # Activation clearing belongs in *_activation_mwh/revenue fields and
             # must not create varying capacity-MW values within a 4h block.
-            "executed_bcm_capacity_pos_mw": float(ob_pos if is_bcm_obligation_hour else 0.0),
-            "executed_bcm_capacity_neg_mw": float(ob_neg if is_bcm_obligation_hour else 0.0),
+            "executed_bcm_capacity_pos_mw": float(ob_pos),
+            "executed_bcm_capacity_neg_mw": float(ob_neg),
             "settlement_cap_bid_price_pos_eur_mw": float(cap_bid_pos_settlement),
             "settlement_cap_bid_price_neg_eur_mw": float(cap_bid_neg_settlement),
             "executed_rate_pos": rate_pos_exec,
@@ -24955,6 +25082,8 @@ class BatteryBacktester:
             "da_price_taker_mode": float(da_execution_policy == "price_taker"),
             "da_buy_reason": str(da_res.reason_buy) if da_res.reason_buy else "none",
             "da_sell_reason": str(da_res.reason_sell) if da_res.reason_sell else "none",
+            "aFRR_Capacity_Won_Pos_MW": float(ob_pos),
+            "aFRR_Capacity_Won_Neg_MW": float(ob_neg),
             "aFRR_Capacity_Won_MW": float(max(ob_pos, ob_neg, res_pos_exec, res_neg_exec)),
             "DA_Energy_Sold_MW": float(dis_exec),
             "aFRR_Energy_Price_EUR_MWh": mean_energy_price,
