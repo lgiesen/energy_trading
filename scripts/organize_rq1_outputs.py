@@ -2404,6 +2404,7 @@ def _write_line_tex(
     axis_height: str | None = None,
     axis_title: str | None = None,
     legend_y: float = 1.08,
+    show_legend: bool = True,
     titlecase_caption: bool = True,
 ) -> Path | None:
     if data.empty:
@@ -2421,8 +2422,14 @@ def _write_line_tex(
             *([rf"                title={{{_latex_escape(axis_title)}}},"] if axis_title else []),
             rf"                xlabel={{{_latex_escape(xlabel)}}},",
             rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
-            rf"                legend style={{at={{(0.5,{_tex_num(legend_y)})}}, anchor=south, legend columns=-1, draw=none, fill=none, text=black}},",
-            r"                legend cell align={left},",
+            *(
+                [
+                    rf"                legend style={{at={{(0.5,{_tex_num(legend_y)})}}, anchor=south, legend columns=-1, draw=none, fill=none, text=black}},",
+                    r"                legend cell align={left},",
+                ]
+                if show_legend
+                else []
+            ),
             r"                axis lines*=left,",
             r"                grid=major,",
             *((
@@ -2473,7 +2480,7 @@ def _write_line_tex(
         hi = min(float(xmax), float(ymax))
         lines.append(rf"                \addplot[color=neutraldark, dashed, mark=none, line width=1pt] coordinates {{({_tex_num(lo)},{_tex_num(lo)}) ({_tex_num(hi)},{_tex_num(hi)})}};")
         legends.append("Ideal")
-    if legends:
+    if legends and show_legend:
         lines.append("                \\legend{" + ",".join(legends) + "}")
     if fragment_only:
         lines.extend([r"            \end{axis}", r"\end{tikzpicture}", ""])
@@ -2923,6 +2930,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             group = df[df["target_label"].eq(target_label)].copy()
             target_slug = _tex_symbol(str(group["target"].iloc[0]).replace("pred_", ""))
             out = root / "result_section" / "latex_figures" / f"calibration_reliability_{target_slug}.tex"
+            show_legend = target_slug not in {"afrr_capacity_price_pos", "afrr_capacity_price_neg"}
             path = _write_line_tex(
                 out,
                 data=group,
@@ -2938,6 +2946,8 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 ylim=(0.0, 1.0),
                 percent_axes=True,
                 fragment_only=True,
+                axis_height="6.2cm",
+                show_legend=show_legend,
             )
             if path:
                 _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="calibration", description=f"Native pgfplots quantile reliability for {target_label}.")
@@ -2962,6 +2972,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 ylim=(0.0, 1.0),
                 percent_axes=True,
                 fragment_only=True,
+                axis_height="6.2cm",
             )
             if path:
                 _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="calibration", description=f"Native pgfplots aggregate quantile reliability for {aggregate_label}.")

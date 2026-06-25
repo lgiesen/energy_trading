@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_ROOT="${RUN_ROOT:-artifacts/simulation_runs/thesis_final_multi_2m_20260620T091938Z}"
+RUN_ROOT="${RUN_ROOT:-artifacts/simulation_runs/thesis_final_multi_2m_20260624T141002Z}"
 OUT_ROOT="${OUT_ROOT:-artifacts/benchmark/rq2_simulation_benchmark}"
 FORECAST_BENCHMARK_DIR="${FORECAST_BENCHMARK_DIR:-artifacts/benchmark/rq1_ml_model_benchmark}"
 PYTHON_BIN="${PYTHON_BIN:-./.venv/bin/python}"
