@@ -4,8 +4,8 @@ set -Eeuo pipefail
 # RQ3 market benchmark launcher.
 #
 # Purpose:
-#   1) determine the best model/quantile combination from the RQ2 numeric
-#      Net Profit heatmap;
+#   1) determine the best model/quantile combination from the RQ2 simulation
+#      metrics, falling back to the numeric Net Profit heatmap if needed;
 #   2) assert that the best combination is XGB p50 by default;
 #   3) run that fixed policy for the RQ3 market strategies:
 #      multi, DA, BEM, BCM and aFRR.
@@ -40,6 +40,7 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 RQ2_HEATMAP_CSV="${RQ2_HEATMAP_CSV:-artifacts/benchmark/rq2_simulation_benchmark/backup/csv/1_profit_heatmap.csv}"
+RQ2_SIM_RUN_ROOT="${RQ2_SIM_RUN_ROOT:-}"
 
 read -r -a STRATEGIES <<< "${STRATEGIES:-multi da bem bcm afrr}"
 
@@ -102,13 +103,7 @@ job_complete() {
 }
 
 assert_best_model_quantile() {
-  if [[ ! -s "$RQ2_HEATMAP_CSV" ]]; then
-    echo "[ERROR] Missing RQ2 heatmap CSV: $RQ2_HEATMAP_CSV" >&2
-    echo "Run the RQ2 visualization generation first, or set RQ2_HEATMAP_CSV=..." >&2
-    exit 1
-  fi
-
-  "$PYTHON_BIN" - "$RQ2_HEATMAP_CSV" "$EXPECTED_BEST_MODEL" "$EXPECTED_BEST_QUANTILE" "$BEST_ASSERTION_CSV" "$BEST_ASSERTION_JSON" <<'PY'
+  "$PYTHON_BIN" - "$RQ2_HEATMAP_CSV" "$RQ2_SIM_RUN_ROOT" "$EXPECTED_BEST_MODEL" "$EXPECTED_BEST_QUANTILE" "$BEST_ASSERTION_CSV" "$BEST_ASSERTION_JSON" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -116,29 +111,112 @@ from pathlib import Path
 import pandas as pd
 
 heatmap_csv = Path(sys.argv[1])
-expected_model = sys.argv[2]
-expected_quantile = sys.argv[3]
-out_csv = Path(sys.argv[4])
-out_json = Path(sys.argv[5])
+sim_run_root_arg = sys.argv[2].strip()
+expected_model = sys.argv[3]
+expected_quantile = sys.argv[4]
+out_csv = Path(sys.argv[5])
+out_json = Path(sys.argv[6])
 
-df = pd.read_csv(heatmap_csv)
-required = {"quantile", "RLQR", "XGB", "TFT"}
-missing = required.difference(df.columns)
-if missing:
-    raise SystemExit(f"Missing required columns in {heatmap_csv}: {sorted(missing)}")
 
-long = df.melt(
-    id_vars=["quantile"],
-    value_vars=["RLQR", "XGB", "TFT"],
-    var_name="model",
-    value_name="annualized_net_profit_eur_per_year",
-)
-long["annualized_net_profit_eur_per_year"] = pd.to_numeric(
-    long["annualized_net_profit_eur_per_year"], errors="coerce"
-)
-long = long.dropna(subset=["annualized_net_profit_eur_per_year"]).copy()
+def _scenario_model_label(folder: str, model_key: object) -> str:
+    if folder == "benchmarks_naive":
+        return "Naive"
+    if folder == "benchmarks_rhpf":
+        return "RHPF"
+    key = str(model_key).lower()
+    if key == "linear" or folder.startswith("linear"):
+        return "RLQR"
+    if key in {"xgboost", "xgb"} or folder.startswith("xgb"):
+        return "XGB"
+    if key == "tft" or folder.startswith("tft"):
+        return "TFT"
+    return str(model_key)
+
+
+def _latest_rq2_run_root() -> Path | None:
+    candidates = sorted(
+        Path("artifacts/simulation_runs").glob("thesis_final_multi_2m_*"),
+        key=lambda p: p.name,
+    )
+    candidates = [
+        p for p in candidates
+        if any(p.glob("*/multi/*/performance_metrics.csv"))
+    ]
+    return candidates[-1] if candidates else None
+
+
+def _load_from_sim_run(root: Path) -> pd.DataFrame:
+    rows = []
+    for path in sorted(root.glob("*/multi/*/performance_metrics.csv")):
+        folder = path.relative_to(root).parts[0]
+        if folder.startswith("benchmarks_"):
+            continue
+        df = pd.read_csv(path)
+        if df.empty:
+            continue
+        row = df.iloc[0].to_dict()
+        model = _scenario_model_label(folder, row.get("model_key", folder))
+        quantile = pd.Series([folder]).str.extract(r"(p\d+)").iloc[0, 0]
+        if pd.isna(quantile):
+            quantile = str(row.get("quantile_pair", "p50")).split("-")[0].split("_")[0]
+        value = row.get("annualized_realized_net_revenue_eur", row.get("realized_net_revenue_eur"))
+        rows.append(
+            {
+                "quantile": quantile,
+                "model": model,
+                "annualized_net_profit_eur_per_year": value,
+                "source": "simulation_run_performance_metrics",
+                "source_path": str(path),
+                "simulation_valid": row.get("simulation_valid"),
+                "thesis_reportable": row.get("thesis_reportable"),
+                "invalid_reason": row.get("invalid_reason"),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["annualized_net_profit_eur_per_year"] = pd.to_numeric(
+        out["annualized_net_profit_eur_per_year"], errors="coerce"
+    )
+    return out.dropna(subset=["annualized_net_profit_eur_per_year"]).copy()
+
+
+def _load_from_heatmap(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = {"quantile", "RLQR", "XGB", "TFT"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise SystemExit(f"Missing required columns in {path}: {sorted(missing)}")
+    out = df.melt(
+        id_vars=["quantile"],
+        value_vars=["RLQR", "XGB", "TFT"],
+        var_name="model",
+        value_name="annualized_net_profit_eur_per_year",
+    )
+    out["annualized_net_profit_eur_per_year"] = pd.to_numeric(
+        out["annualized_net_profit_eur_per_year"], errors="coerce"
+    )
+    out = out.dropna(subset=["annualized_net_profit_eur_per_year"]).copy()
+    out["source"] = "rq2_profit_heatmap"
+    out["source_path"] = str(path)
+    return out
+
+
+source_run_root = Path(sim_run_root_arg) if sim_run_root_arg else _latest_rq2_run_root()
+long = pd.DataFrame()
+if source_run_root is not None and source_run_root.exists():
+    long = _load_from_sim_run(source_run_root)
+
 if long.empty:
-    raise SystemExit(f"No numeric model/quantile values found in {heatmap_csv}")
+    if not heatmap_csv.exists() or heatmap_csv.stat().st_size == 0:
+        raise SystemExit(
+            "No usable RQ2 simulation metrics found and missing RQ2 heatmap CSV: "
+            f"{heatmap_csv}. Set RQ2_SIM_RUN_ROOT=... or regenerate RQ2 outputs."
+        )
+    long = _load_from_heatmap(heatmap_csv)
+
+if long.empty:
+    raise SystemExit("No numeric model/quantile values found for RQ3 best-combo assertion.")
 
 long = long.sort_values(
     ["annualized_net_profit_eur_per_year", "model", "quantile"],
@@ -146,6 +224,7 @@ long = long.sort_values(
 ).reset_index(drop=True)
 best = long.iloc[0].to_dict()
 best["source_csv"] = str(heatmap_csv)
+best["source_run_root"] = str(source_run_root) if source_run_root is not None else ""
 best["expected_model"] = expected_model
 best["expected_quantile"] = expected_quantile
 best["assertion_passed"] = (
@@ -156,6 +235,7 @@ best["assertion_passed"] = (
 out_csv.parent.mkdir(parents=True, exist_ok=True)
 long.assign(
     source_csv=str(heatmap_csv),
+    source_run_root=str(source_run_root) if source_run_root is not None else "",
     selected_as_best=False,
 ).to_csv(out_csv, index=False)
 out_json.write_text(json.dumps(best, indent=2), encoding="utf-8")
@@ -273,6 +353,7 @@ run_strategy_job() {
   echo "EXPECTED_BEST_MODEL=$EXPECTED_BEST_MODEL"
   echo "EXPECTED_BEST_QUANTILE=$EXPECTED_BEST_QUANTILE"
   echo "RQ2_HEATMAP_CSV=$RQ2_HEATMAP_CSV"
+  echo "RQ2_SIM_RUN_ROOT=$RQ2_SIM_RUN_ROOT"
   echo "STRATEGIES=${STRATEGIES[*]}"
   echo "MAX_PARALLEL_JOBS=$MAX_PARALLEL_JOBS"
   echo "FINAL_SOC_MODE=$FINAL_SOC_MODE"
