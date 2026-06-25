@@ -135,8 +135,8 @@ BIDDING_ACTIVITY_MARKETS = [
         "BCM",
         "aFRR capacity",
         [
-            ("positive", "real_submitted_bcm_capacity_pos_mw", "submitted"),
-            ("negative", "real_submitted_bcm_capacity_neg_mw", "submitted"),
+            ("positive", "real_bcm_precommit_candidate_pos_mw", "submitted"),
+            ("negative", "real_bcm_precommit_candidate_neg_mw", "submitted"),
         ],
     ),
     (
@@ -172,9 +172,47 @@ BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS = [
     {
         "market": "BCM",
         "market_label": "aFRR capacity",
-        "submitted_groups": [[("real_submitted_bcm_capacity_pos_mw", "mw"), ("real_submitted_bcm_capacity_neg_mw", "mw")]],
-        "cleared_groups": [[("real_executed_bcm_capacity_pos_mw", "mw"), ("real_executed_bcm_capacity_neg_mw", "mw")]],
-        "metric_semantics": "submitted_and_cleared",
+        "submitted_groups": [
+            [("reserve_submitted_pos_mw", "mw"), ("reserve_submitted_neg_mw", "mw")],
+            [("real_bcm_precommit_candidate_pos_mw", "mw"), ("real_bcm_precommit_candidate_neg_mw", "mw")],
+            [("real_submitted_bcm_capacity_pos_mw", "mw"), ("real_submitted_bcm_capacity_neg_mw", "mw")],
+        ],
+        "cleared_groups": [
+            [("reserve_awarded_pos_mw", "mw"), ("reserve_awarded_neg_mw", "mw")],
+            [("real_bcm_precommit_locked_pos_mw", "mw"), ("real_bcm_precommit_locked_neg_mw", "mw")],
+            [("bcm_precommit_written_pos_mw", "mw"), ("bcm_precommit_written_neg_mw", "mw")],
+            [("real_bcm_capacity_awarded_pos_mw", "mw"), ("real_bcm_capacity_awarded_neg_mw", "mw")],
+            [("real_executed_bcm_capacity_pos_mw", "mw"), ("real_executed_bcm_capacity_neg_mw", "mw")],
+        ],
+        "bid_price_groups": [
+            [
+                ("real_bcm_precommit_candidate_pos_mw", "real_ev_bcm_capacity_bid_price_pos_bin_0_eur_per_mw_h"),
+                ("real_bcm_precommit_candidate_neg_mw", "real_ev_bcm_capacity_bid_price_neg_bin_0_eur_per_mw_h"),
+            ],
+            [
+                ("reserve_submitted_pos_mw", "real_ev_bcm_capacity_bid_price_pos_bin_0_eur_per_mw_h"),
+                ("reserve_submitted_neg_mw", "real_ev_bcm_capacity_bid_price_neg_bin_0_eur_per_mw_h"),
+            ],
+            [
+                ("real_submitted_bcm_capacity_pos_mw", "real_bcm_capacity_bid_price_pos_eur_per_mw_h"),
+                ("real_submitted_bcm_capacity_neg_mw", "real_bcm_capacity_bid_price_neg_eur_per_mw_h"),
+            ],
+        ],
+        "clearing_price_groups": [
+            [
+                ("real_bcm_precommit_candidate_pos_mw", "real_bcm_capacity_clearing_price_pos_eur_per_mw_h"),
+                ("real_bcm_precommit_candidate_neg_mw", "real_bcm_capacity_clearing_price_neg_eur_per_mw_h"),
+            ],
+            [
+                ("reserve_submitted_pos_mw", "real_bcm_capacity_clearing_price_pos_eur_per_mw_h"),
+                ("reserve_submitted_neg_mw", "real_bcm_capacity_clearing_price_neg_eur_per_mw_h"),
+            ],
+            [
+                ("real_submitted_bcm_capacity_pos_mw", "real_bcm_capacity_clearing_price_pos_eur_per_mw_h"),
+                ("real_submitted_bcm_capacity_neg_mw", "real_bcm_capacity_clearing_price_neg_eur_per_mw_h"),
+            ],
+        ],
+        "metric_semantics": "precommit_submitted_and_awarded",
     },
     {
         "market": "BEM",
@@ -767,6 +805,18 @@ def _selected_model_strategy_rows(summary: pd.DataFrame) -> pd.DataFrame:
     return best.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
 
 
+def _all_model_strategy_rows(summary: pd.DataFrame) -> pd.DataFrame:
+    model_rows = summary.loc[~summary["is_benchmark"].astype(bool)].copy()
+    model_rows = model_rows.loc[model_rows["model"].astype(str).isin(MODEL_ORDER)].copy()
+    if model_rows.empty:
+        return pd.DataFrame()
+    order = {model: idx for idx, model in enumerate(MODEL_ORDER)}
+    q_order = {q: idx for idx, q in enumerate(DEFAULT_QUANTILES)}
+    model_rows["_model_order"] = model_rows["model"].map(order).fillna(999)
+    model_rows["_quantile_order"] = model_rows["quantile"].astype(str).map(q_order).fillna(999)
+    return model_rows.sort_values(["_model_order", "_quantile_order"]).drop(columns=["_model_order", "_quantile_order"]).reset_index(drop=True)
+
+
 def _choose_bidding_source_group(df: pd.DataFrame, groups: list[list[tuple[str, str]]]) -> list[tuple[str, str]]:
     for group in groups:
         if all(column in df.columns for column, _unit in group):
@@ -785,6 +835,31 @@ def _bidding_count_and_volume(df: pd.DataFrame, source_group: list[tuple[str, st
     return count, volume
 
 
+def _choose_price_source_group(
+    df: pd.DataFrame,
+    groups: list[list[tuple[str, str]]],
+) -> list[tuple[str, str]]:
+    for group in groups:
+        if all(volume_col in df.columns and price_col in df.columns for volume_col, price_col in group):
+            return group
+    return []
+
+
+def _weighted_average_price(df: pd.DataFrame, source_group: list[tuple[str, str]]) -> float:
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for volume_col, price_col in source_group:
+        volume = pd.to_numeric(df[volume_col], errors="coerce")
+        price = pd.to_numeric(df[price_col], errors="coerce")
+        mask = volume.abs().gt(1e-9) & price.notna() & np.isfinite(price)
+        if not bool(mask.any()):
+            continue
+        weights = volume.loc[mask].abs()
+        weighted_sum += float((weights * price.loc[mask]).sum())
+        weight_sum += float(weights.sum())
+    return float(weighted_sum / weight_sum) if weight_sum > 1e-12 else math.nan
+
+
 def _difference_or_nan(submitted: float, cleared: float, *, tolerance: float = 1e-6) -> tuple[float, bool]:
     diff = submitted - cleared
     if diff < -tolerance:
@@ -792,10 +867,128 @@ def _difference_or_nan(submitted: float, cleared: float, *, tolerance: float = 1
     return max(diff, 0.0), False
 
 
+def _bcm_precommit_price_rejection_adjusted_activity(
+    df: pd.DataFrame,
+    *,
+    timestep_hours: float,
+) -> dict[str, float | str] | None:
+    required = [
+        "real_bcm_precommit_candidate_pos_mw",
+        "real_bcm_precommit_candidate_neg_mw",
+        "real_bcm_precommit_locked_pos_mw",
+        "real_bcm_precommit_locked_neg_mw",
+        "real_ev_bcm_capacity_bid_price_pos_bin_0_eur_per_mw_h",
+        "real_ev_bcm_capacity_bid_price_neg_bin_0_eur_per_mw_h",
+        "real_bcm_capacity_clearing_price_pos_eur_per_mw_h",
+        "real_bcm_capacity_clearing_price_neg_eur_per_mw_h",
+    ]
+    if not all(c in df.columns for c in required):
+        return None
+
+    cleared_count = 0
+    cleared_volume = 0.0
+    price_rejected_count = 0
+    price_rejected_volume = 0.0
+    excluded_count = 0
+    excluded_volume = 0.0
+    excluded_missing_or_zero_price_count = 0
+    excluded_missing_or_zero_price_volume = 0.0
+    excluded_physical_count = 0
+    excluded_physical_volume = 0.0
+    excluded_ev_count = 0
+    excluded_ev_volume = 0.0
+    excluded_optimizer_count = 0
+    excluded_optimizer_volume = 0.0
+    bid_weighted_sum = 0.0
+    bid_weight = 0.0
+    clearing_weighted_sum = 0.0
+    clearing_weight = 0.0
+
+    reason = (
+        df["real_bcm_precommit_zero_reason"].fillna("").astype(str).str.lower()
+        if "real_bcm_precommit_zero_reason" in df.columns
+        else pd.Series("", index=df.index)
+    )
+
+    for side in ("pos", "neg"):
+        cand = pd.to_numeric(df[f"real_bcm_precommit_candidate_{side}_mw"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        locked = pd.to_numeric(df[f"real_bcm_precommit_locked_{side}_mw"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        bid = pd.to_numeric(df[f"real_ev_bcm_capacity_bid_price_{side}_bin_0_eur_per_mw_h"], errors="coerce")
+        clearing = pd.to_numeric(df[f"real_bcm_capacity_clearing_price_{side}_eur_per_mw_h"], errors="coerce")
+        rejected_mw = (cand - locked).clip(lower=0.0)
+        cleared_mask = locked.gt(1e-9)
+        rejected_mask = rejected_mw.gt(1e-9)
+        finite_positive_price = bid.notna() & np.isfinite(bid) & bid.gt(1e-12)
+        finite_clearing = clearing.notna() & np.isfinite(clearing)
+        price_rejected_mask = rejected_mask & finite_positive_price & finite_clearing & bid.gt(clearing)
+        missing_or_zero_price_mask = rejected_mask & (~finite_positive_price | ~finite_clearing)
+        physical_mask = rejected_mask & reason.str.contains(
+            "headroom|physical|protected_soc|reserve_infeasible|power_infeasible|soc_infeasible|id_recovery|terminal",
+            regex=True,
+        )
+        ev_mask = rejected_mask & reason.str.contains("candidate_incremental_ev_negative|negative_ev|ev_nan", regex=True)
+        optimizer_mask = rejected_mask & reason.str.contains("optimizer_validation", regex=True)
+        excluded_mask = rejected_mask & ~price_rejected_mask
+
+        cleared_count += int(cleared_mask.sum())
+        cleared_volume += float(locked.abs().sum() * timestep_hours)
+        price_rejected_count += int(price_rejected_mask.sum())
+        price_rejected_volume += float(rejected_mw.where(price_rejected_mask, 0.0).abs().sum() * timestep_hours)
+        excluded_count += int(excluded_mask.sum())
+        excluded_volume += float(rejected_mw.where(excluded_mask, 0.0).abs().sum() * timestep_hours)
+        excluded_missing_or_zero_price_count += int(missing_or_zero_price_mask.sum())
+        excluded_missing_or_zero_price_volume += float(
+            rejected_mw.where(missing_or_zero_price_mask, 0.0).abs().sum() * timestep_hours
+        )
+        excluded_physical_count += int((excluded_mask & physical_mask).sum())
+        excluded_physical_volume += float(rejected_mw.where(excluded_mask & physical_mask, 0.0).abs().sum() * timestep_hours)
+        excluded_ev_count += int((excluded_mask & ev_mask).sum())
+        excluded_ev_volume += float(rejected_mw.where(excluded_mask & ev_mask, 0.0).abs().sum() * timestep_hours)
+        excluded_optimizer_count += int((excluded_mask & optimizer_mask).sum())
+        excluded_optimizer_volume += float(rejected_mw.where(excluded_mask & optimizer_mask, 0.0).abs().sum() * timestep_hours)
+
+        auction_mw = locked + rejected_mw.where(price_rejected_mask, 0.0)
+        bid_mask = auction_mw.gt(1e-9) & bid.notna() & np.isfinite(bid)
+        clearing_mask = auction_mw.gt(1e-9) & clearing.notna() & np.isfinite(clearing)
+        if bool(bid_mask.any()):
+            weights = auction_mw.loc[bid_mask].abs()
+            bid_weighted_sum += float((weights * bid.loc[bid_mask]).sum())
+            bid_weight += float(weights.sum())
+        if bool(clearing_mask.any()):
+            weights = auction_mw.loc[clearing_mask].abs()
+            clearing_weighted_sum += float((weights * clearing.loc[clearing_mask]).sum())
+            clearing_weight += float(weights.sum())
+
+    submitted_count = cleared_count + price_rejected_count
+    submitted_volume = cleared_volume + price_rejected_volume
+    return {
+        "submitted_count": float(submitted_count),
+        "cleared_count": float(cleared_count),
+        "not_cleared_count": float(price_rejected_count),
+        "submitted_volume": float(submitted_volume),
+        "cleared_volume": float(cleared_volume),
+        "not_cleared_volume": float(price_rejected_volume),
+        "excluded_count": float(excluded_count),
+        "excluded_volume": float(excluded_volume),
+        "excluded_missing_or_zero_price_count": float(excluded_missing_or_zero_price_count),
+        "excluded_missing_or_zero_price_volume": float(excluded_missing_or_zero_price_volume),
+        "excluded_physical_count": float(excluded_physical_count),
+        "excluded_physical_volume": float(excluded_physical_volume),
+        "excluded_ev_count": float(excluded_ev_count),
+        "excluded_ev_volume": float(excluded_ev_volume),
+        "excluded_optimizer_count": float(excluded_optimizer_count),
+        "excluded_optimizer_volume": float(excluded_optimizer_volume),
+        "submitted_bid_price_avg": float(bid_weighted_sum / bid_weight) if bid_weight > 1e-12 else math.nan,
+        "clearing_price_avg": float(clearing_weighted_sum / clearing_weight) if clearing_weight > 1e-12 else math.nan,
+        "semantics": "BCM precommit auction-adjusted: submitted=awarded plus price-rejected; feasibility/EV/optimizer/missing-price filtered candidates excluded",
+    }
+
+
 def build_bidding_activity_by_market_model(
     summary: pd.DataFrame,
     *,
     run_root: Path,
+    selected_only: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     columns = [
         "run_root",
@@ -821,6 +1014,21 @@ def build_bidding_activity_by_market_model(
         "submitted_bid_volume_mwh_annualized",
         "cleared_bid_volume_mwh_annualized",
         "not_cleared_bid_volume_mwh_annualized",
+        "submitted_bid_price_eur_per_mw_h_weighted_avg",
+        "clearing_price_eur_per_mw_h_weighted_avg",
+        "excluded_filtered_bid_count_total",
+        "excluded_filtered_bid_volume_mwh_total",
+        "excluded_physical_bid_count_total",
+        "excluded_physical_bid_volume_mwh_total",
+        "excluded_candidate_ev_bid_count_total",
+        "excluded_candidate_ev_bid_volume_mwh_total",
+        "excluded_optimizer_bid_count_total",
+        "excluded_optimizer_bid_volume_mwh_total",
+        "excluded_missing_or_zero_price_bid_count_total",
+        "excluded_missing_or_zero_price_bid_volume_mwh_total",
+        "excluded_filtering_semantics",
+        "bid_price_source",
+        "clearing_price_source",
         "submitted_source",
         "cleared_source",
         "volume_unit_source",
@@ -834,9 +1042,10 @@ def build_bidding_activity_by_market_model(
     warning_rows: list[dict[str, Any]] = []
     inventory_rows: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
-    selected = _selected_model_strategy_rows(summary)
+    selected = _selected_model_strategy_rows(summary) if selected_only else _all_model_strategy_rows(summary)
     if selected.empty:
-        warning_rows.append({"severity": "warning", "scenario": "", "market": "", "message": "No selected model strategies available for bidding-activity aggregation."})
+        scope = "selected model strategies" if selected_only else "model-quantile strategies"
+        warning_rows.append({"severity": "warning", "scenario": "", "market": "", "message": f"No {scope} available for bidding-activity aggregation."})
         return pd.DataFrame(columns=columns), pd.DataFrame(warning_rows), pd.DataFrame(inventory_rows)
 
     for _, scenario_row in selected.iterrows():
@@ -889,6 +1098,8 @@ def build_bidding_activity_by_market_model(
             market_label = str(spec["market_label"])
             submitted_group = _choose_bidding_source_group(df, spec["submitted_groups"])  # type: ignore[arg-type]
             cleared_group = _choose_bidding_source_group(df, spec["cleared_groups"])  # type: ignore[arg-type]
+            bid_price_group = _choose_price_source_group(df, spec.get("bid_price_groups", []))  # type: ignore[arg-type]
+            clearing_price_group = _choose_price_source_group(df, spec.get("clearing_price_groups", []))  # type: ignore[arg-type]
             row_warnings: list[str] = []
             if not submitted_group:
                 row_warnings.append("missing submitted bid source columns")
@@ -911,8 +1122,54 @@ def build_bidding_activity_by_market_model(
                 warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "No usable bid/activity columns for market."})
             submitted_count, submitted_volume = _bidding_count_and_volume(df, submitted_group, timestep_hours) if submitted_group else (math.nan, math.nan)
             cleared_count, cleared_volume = _bidding_count_and_volume(df, cleared_group, timestep_hours) if cleared_group else (math.nan, math.nan)
+            submitted_bid_price_avg = _weighted_average_price(df, bid_price_group) if bid_price_group else math.nan
+            clearing_price_avg = _weighted_average_price(df, clearing_price_group) if clearing_price_group else math.nan
             not_cleared_count, neg_count = _difference_or_nan(float(submitted_count), float(cleared_count)) if math.isfinite(float(submitted_count)) and math.isfinite(float(cleared_count)) else (math.nan, False)
             not_cleared_volume, neg_volume = _difference_or_nan(float(submitted_volume), float(cleared_volume)) if math.isfinite(float(submitted_volume)) and math.isfinite(float(cleared_volume)) else (math.nan, False)
+            excluded_filtered_count = math.nan
+            excluded_filtered_volume = math.nan
+            excluded_physical_count = math.nan
+            excluded_physical_volume = math.nan
+            excluded_ev_count = math.nan
+            excluded_ev_volume = math.nan
+            excluded_optimizer_count = math.nan
+            excluded_optimizer_volume = math.nan
+            excluded_missing_or_zero_price_count = math.nan
+            excluded_missing_or_zero_price_volume = math.nan
+            excluded_filtering_semantics = ""
+            if market == "BCM":
+                adjusted = _bcm_precommit_price_rejection_adjusted_activity(df, timestep_hours=timestep_hours)
+                if adjusted is not None:
+                    submitted_count = float(adjusted["submitted_count"])
+                    cleared_count = float(adjusted["cleared_count"])
+                    not_cleared_count = float(adjusted["not_cleared_count"])
+                    submitted_volume = float(adjusted["submitted_volume"])
+                    cleared_volume = float(adjusted["cleared_volume"])
+                    not_cleared_volume = float(adjusted["not_cleared_volume"])
+                    submitted_bid_price_avg = float(adjusted["submitted_bid_price_avg"])
+                    clearing_price_avg = float(adjusted["clearing_price_avg"])
+                    excluded_filtered_count = float(adjusted["excluded_count"])
+                    excluded_filtered_volume = float(adjusted["excluded_volume"])
+                    excluded_physical_count = float(adjusted["excluded_physical_count"])
+                    excluded_physical_volume = float(adjusted["excluded_physical_volume"])
+                    excluded_ev_count = float(adjusted["excluded_ev_count"])
+                    excluded_ev_volume = float(adjusted["excluded_ev_volume"])
+                    excluded_optimizer_count = float(adjusted["excluded_optimizer_count"])
+                    excluded_optimizer_volume = float(adjusted["excluded_optimizer_volume"])
+                    excluded_missing_or_zero_price_count = float(adjusted["excluded_missing_or_zero_price_count"])
+                    excluded_missing_or_zero_price_volume = float(adjusted["excluded_missing_or_zero_price_volume"])
+                    excluded_filtering_semantics = str(adjusted["semantics"])
+                    row_warnings.append("BCM graph excludes feasibility/EV/optimizer/missing-price filtered candidates from submitted/not-cleared segments")
+                    warning_rows.append(
+                        {
+                            "severity": "info",
+                            "scenario": scenario,
+                            "market": market,
+                            "message": "BCM bidding graph adjusted to awarded plus price-rejected candidates; non-auction filters are excluded and reported in CSV columns.",
+                        }
+                    )
+                    neg_count = False
+                    neg_volume = False
             if neg_count:
                 row_warnings.append("negative not-cleared bid count; source values inconsistent")
                 warning_rows.append({"severity": "warning", "scenario": scenario, "market": market, "message": "Negative not-cleared bid count; set to NaN."})
@@ -955,6 +1212,21 @@ def build_bidding_activity_by_market_model(
                     "submitted_bid_volume_mwh_annualized": annualize(float(submitted_volume)),
                     "cleared_bid_volume_mwh_annualized": annualize(float(cleared_volume)),
                     "not_cleared_bid_volume_mwh_annualized": annualize(float(not_cleared_volume)),
+                    "submitted_bid_price_eur_per_mw_h_weighted_avg": submitted_bid_price_avg,
+                    "clearing_price_eur_per_mw_h_weighted_avg": clearing_price_avg,
+                    "excluded_filtered_bid_count_total": excluded_filtered_count,
+                    "excluded_filtered_bid_volume_mwh_total": excluded_filtered_volume,
+                    "excluded_physical_bid_count_total": excluded_physical_count,
+                    "excluded_physical_bid_volume_mwh_total": excluded_physical_volume,
+                    "excluded_candidate_ev_bid_count_total": excluded_ev_count,
+                    "excluded_candidate_ev_bid_volume_mwh_total": excluded_ev_volume,
+                    "excluded_optimizer_bid_count_total": excluded_optimizer_count,
+                    "excluded_optimizer_bid_volume_mwh_total": excluded_optimizer_volume,
+                    "excluded_missing_or_zero_price_bid_count_total": excluded_missing_or_zero_price_count,
+                    "excluded_missing_or_zero_price_bid_volume_mwh_total": excluded_missing_or_zero_price_volume,
+                    "excluded_filtering_semantics": excluded_filtering_semantics,
+                    "bid_price_source": ";".join(f"{volume_col}->{price_col}" for volume_col, price_col in bid_price_group),
+                    "clearing_price_source": ";".join(f"{volume_col}->{price_col}" for volume_col, price_col in clearing_price_group),
                     "submitted_source": ";".join(f"{col}:{unit}" for col, unit in submitted_group),
                     "cleared_source": ";".join(f"{col}:{unit}" for col, unit in cleared_group),
                     "volume_unit_source": f"MW columns multiplied by inferred timestep {timestep_hours:.6g}h; MWh columns used directly",
@@ -1265,6 +1537,14 @@ def build_pinball_net_profit_scatter_data(
                         "model": MODEL_LABELS.get(model_key, model_key.upper()),
                         "quantile": q,
                         "mean_pinball_loss": float(loss.mean()),
+                        "mean_absolute_error": float(
+                            np.mean(
+                                np.abs(
+                                    pd.to_numeric(d["y_true"], errors="coerce")
+                                    - pd.to_numeric(d[q], errors="coerce")
+                                )
+                            )
+                        ),
                         "n_obs": int(loss.notna().sum()),
                     }
                 )
@@ -1289,6 +1569,7 @@ def build_total_pinball_net_profit_scatter_data(scatter_data: pd.DataFrame) -> p
         "model",
         "quantile",
         "mean_pinball_loss",
+        "mean_absolute_error",
         "n_obs",
         "n_targets",
         "realized_profit_eur",
@@ -1303,8 +1584,9 @@ def build_total_pinball_net_profit_scatter_data(scatter_data: pd.DataFrame) -> p
 
     d = scatter_data.copy()
     d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+    d["mean_absolute_error"] = pd.to_numeric(d.get("mean_absolute_error", np.nan), errors="coerce")
     d["n_obs"] = pd.to_numeric(d["n_obs"], errors="coerce")
-    d = d.dropna(subset=["mean_pinball_loss", "n_obs"])
+    d = d.dropna(subset=["mean_pinball_loss", "mean_absolute_error", "n_obs"])
     d = d.loc[d["n_obs"] > 0].copy()
     if d.empty:
         return pd.DataFrame(columns=columns)
@@ -1322,6 +1604,7 @@ def build_total_pinball_net_profit_scatter_data(scatter_data: pd.DataFrame) -> p
     for keys, group in d.groupby(group_cols, dropna=False, observed=True):
         weights = group["n_obs"].to_numpy(dtype=float)
         losses = group["mean_pinball_loss"].to_numpy(dtype=float)
+        absolute_errors = group["mean_absolute_error"].to_numpy(dtype=float)
         base = dict(zip(group_cols, keys))
         first = group.iloc[0]
         rec: dict[str, Any] = {
@@ -1329,6 +1612,7 @@ def build_total_pinball_net_profit_scatter_data(scatter_data: pd.DataFrame) -> p
             "target": "all_targets",
             "target_label": "All Target Variables",
             "mean_pinball_loss": float(np.average(losses, weights=weights)),
+            "mean_absolute_error": float(np.average(absolute_errors, weights=weights)),
             "n_obs": int(np.sum(weights)),
             "n_targets": int(group["target"].nunique()),
         }
@@ -1608,6 +1892,132 @@ def plot_heatmap(table: pd.DataFrame, out_base: Path, formats: list[str]) -> lis
     cbar.ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
     cbar.set_label("Annualized Net Profit (kEUR/year)")
     fig.tight_layout()
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
+    return written
+
+
+def plot_mean_pinball_loss_heatmap(total_scatter_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(8.8, 3.6))
+    rows = list(MODEL_ORDER)
+    quantiles = list(DEFAULT_QUANTILES)
+    if not total_scatter_data.empty and "quantile" in total_scatter_data.columns:
+        quantiles = [q for q in DEFAULT_QUANTILES if q in set(total_scatter_data["quantile"].astype(str))]
+    pivot = (
+        total_scatter_data.pivot_table(
+            index="model",
+            columns="quantile",
+            values="mean_pinball_loss",
+            aggfunc="mean",
+        ).reindex(index=rows, columns=quantiles)
+        if not total_scatter_data.empty
+        else pd.DataFrame(index=rows, columns=quantiles)
+    )
+    arr = pivot.to_numpy(dtype=float)
+    masked = np.ma.masked_invalid(arr)
+    cmap = LinearSegmentedColormap.from_list(
+        "geo_sequential_blue",
+        [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)],
+    )
+    cmap.set_bad("#F2F2F2")
+    im = ax.imshow(masked, aspect="auto", cmap=cmap)
+    ax.grid(False)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.set_xticks(np.arange(len(quantiles)))
+    ax.set_xticklabels(quantiles)
+    ax.set_yticks(np.arange(len(rows)))
+    ax.set_yticklabels(rows)
+    ax.set_xlabel("Quantile policy")
+    ax.set_ylabel("Model")
+    ax.set_title("Mean Pinball Loss by Model and Quantile")
+    finite = arr[np.isfinite(arr)]
+    midpoint = float(np.nanmedian(finite)) if finite.size else math.nan
+    for i, model in enumerate(rows):
+        for j, q in enumerate(quantiles):
+            val = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
+            txt = "n/a" if not math.isfinite(val) else f"{val:.2f}"
+            text_color = "white" if math.isfinite(val) and math.isfinite(midpoint) and val >= midpoint else THESIS_PALETTE["neutral_dark"]
+            ax.text(j, i, txt, ha="center", va="center", color=text_color, fontsize=9)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.ax.grid(False)
+    cbar.set_label("Mean pinball loss")
+    fig.tight_layout()
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
+    return written
+
+
+def plot_bid_volume_heatmap(activity: pd.DataFrame, out_base: Path, formats: list[str], *, metric: str) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    apply_geo_style()
+    if metric not in {"submitted", "cleared"}:
+        raise ValueError(f"Unsupported bid-volume heatmap metric: {metric}")
+    value_col = f"{metric}_bid_volume_mwh_annualized"
+    metric_label = "Submitted" if metric == "submitted" else "Cleared"
+    models = list(MODEL_ORDER)
+    quantiles = list(DEFAULT_QUANTILES)
+    markets = [str(spec["market_label"]) for spec in BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS]
+    fig, axes_arr = plt.subplots(2, 2, figsize=(9.8, 6.8), sharey=True)
+    axes = axes_arr.ravel()
+    cmap = LinearSegmentedColormap.from_list(
+        "geo_sequential_blue",
+        [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)],
+    )
+    cmap.set_bad("#F2F2F2")
+    all_values: list[float] = []
+    pivots: dict[str, pd.DataFrame] = {}
+    for market in markets:
+        d = activity.loc[activity["market_label"].astype(str).eq(market)].copy() if not activity.empty else pd.DataFrame()
+        pivot = (
+            d.pivot_table(
+                index="model",
+                columns="quantile",
+                values=value_col,
+                aggfunc="sum",
+            ).reindex(index=models, columns=quantiles) / 1000.0
+            if not d.empty
+            else pd.DataFrame(index=models, columns=quantiles)
+        )
+        pivots[market] = pivot
+        all_values.extend([float(v) for v in pivot.to_numpy(dtype=float).ravel() if math.isfinite(float(v))])
+    vmax = max(all_values) if all_values else 1.0
+    vmin = 0.0
+    last_im = None
+    for ax, market in zip(axes, markets):
+        pivot = pivots[market]
+        arr = pivot.to_numpy(dtype=float)
+        masked = np.ma.masked_invalid(arr)
+        last_im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.grid(False)
+        ax.tick_params(which="minor", bottom=False, left=False)
+        ax.set_title(market)
+        ax.set_xticks(np.arange(len(quantiles)))
+        ax.set_xticklabels(quantiles, rotation=0)
+        ax.set_yticks(np.arange(len(models)))
+        ax.set_yticklabels(models)
+        ax.set_xlabel("Quantile")
+        for i, model in enumerate(models):
+            for j, q in enumerate(quantiles):
+                val = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
+                txt = "n/a" if not math.isfinite(val) else f"{val:,.0f}"
+                text_color = "white" if math.isfinite(val) and vmax > 0 and val >= 0.55 * vmax else THESIS_PALETTE["neutral_dark"]
+                ax.text(j, i, txt, ha="center", va="center", color=text_color, fontsize=8)
+    for ax in axes[len(markets):]:
+        ax.axis("off")
+    axes[0].set_ylabel("Model")
+    axes[2].set_ylabel("Model")
+    fig.suptitle(f"{metric_label} Bid Volume by Market, Model and Quantile")
+    if last_im is not None:
+        cbar = fig.colorbar(last_im, ax=list(axes), shrink=0.88)
+        cbar.ax.grid(False)
+        cbar.set_label(f"{metric_label} bid volume (1,000 MWh/year)")
+    fig.tight_layout(rect=(0, 0, 0.94, 0.94))
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
     return written
@@ -2184,6 +2594,32 @@ def build_normalized_total_pinball_profit_data(total_scatter_data: pd.DataFrame)
     return df
 
 
+def build_normalized_total_mae_profit_data(total_scatter_data: pd.DataFrame) -> pd.DataFrame:
+    """Normalize total selected-quantile MAE and profit to [0, 1]."""
+    if total_scatter_data.empty or "mean_absolute_error" not in total_scatter_data.columns:
+        return pd.DataFrame()
+    df = total_scatter_data.copy()
+    df["mean_absolute_error"] = pd.to_numeric(df["mean_absolute_error"], errors="coerce")
+    df["annualized_profit_eur_per_year"] = pd.to_numeric(df["annualized_profit_eur_per_year"], errors="coerce")
+    df = df.dropna(subset=["mean_absolute_error", "annualized_profit_eur_per_year"]).copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    loss_min = float(df["mean_absolute_error"].min())
+    loss_max = float(df["mean_absolute_error"].max())
+    profit_min = float(df["annualized_profit_eur_per_year"].min())
+    profit_max = float(df["annualized_profit_eur_per_year"].max())
+    loss_range = loss_max - loss_min
+    profit_range = profit_max - profit_min
+    df["normalized_forecast_loss"] = 0.0 if math.isclose(loss_range, 0.0) else (df["mean_absolute_error"] - loss_min) / loss_range
+    df["normalized_annualized_net_profit"] = 0.0 if math.isclose(profit_range, 0.0) else (df["annualized_profit_eur_per_year"] - profit_min) / profit_range
+    df["loss_min_observed"] = loss_min
+    df["loss_max_observed"] = loss_max
+    df["profit_min_observed_eur_per_year"] = profit_min
+    df["profit_max_observed_eur_per_year"] = profit_max
+    return df
+
+
 def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
 
@@ -2195,8 +2631,14 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
     def _label_position(model: str, quantile: str) -> tuple[int, int, str, str]:
         if model == "XGB" and quantile == "p70":
             return (-8, 0, "right", "center")
+        if model == "XGB" and quantile == "p90":
+            return (8, 0, "left", "center")
+        if model == "RLQR" and quantile == "p30":
+            return (-8, 0, "right", "center")
         if model == "RLQR" and quantile == "p50":
-            return (-6, 6, "right", "bottom")
+            return (0, 8, "center", "bottom")
+        if model == "TFT" and quantile == "p90":
+            return (0, -8, "center", "top")
         return (4, 3, "left", "bottom")
 
     if normalized_data.empty:
@@ -2253,6 +2695,84 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
         ax.set_xlim(-0.04, 1.04)
         ax.set_ylim(-0.04, 1.04)
         ax.set_xlabel("Normalized total mean pinball loss")
+        ax.set_ylabel("Normalized annualized net profit")
+        ax.legend(title="Series", loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=4, fontsize=8, frameon=True)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
+    return written
+
+
+def plot_normalized_total_mae_profit_scatter(normalized_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(8.2, 5.6))
+    color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
+    marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
+    if normalized_data.empty:
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+            "No normalized total MAE / Net Profit data available.",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color=THESIS_PALETTE["neutral_dark"],
+            wrap=True,
+        )
+    else:
+        ax.plot(
+            [0.0, 1.0],
+            [1.0, 0.0],
+            color=THESIS_PALETTE["naive"],
+            linestyle="--",
+            linewidth=1.3,
+            alpha=0.8,
+            label="VoF reference line",
+            zorder=1,
+        )
+
+        def _mae_label_position(model: str, quantile: str) -> tuple[int, int, str, str]:
+            key = (str(model), str(quantile).lower())
+            if key in {("XGB", "p70"), ("XGB", "p10")}:
+                return 0, 5, "center", "bottom"
+            if key in {("TFT", "p90"), ("TFT", "p50")}:
+                return 0, -5, "center", "top"
+            return 4, 3, "left", "bottom"
+
+        for model in MODEL_ORDER:
+            g = normalized_data.loc[normalized_data["model"].eq(model)].copy()
+            if g.empty:
+                continue
+            ax.scatter(
+                g["normalized_forecast_loss"],
+                g["normalized_annualized_net_profit"],
+                label=model,
+                color=color_map[model],
+                marker=marker_map[model],
+                s=62,
+                edgecolor="black",
+                linewidth=0.45,
+                alpha=0.92,
+                zorder=3,
+            )
+            for _, row in g.iterrows():
+                dx, dy, ha, va = _mae_label_position(model, str(row["quantile"]))
+                ax.annotate(
+                    str(row["quantile"]),
+                    (row["normalized_forecast_loss"], row["normalized_annualized_net_profit"]),
+                    textcoords="offset points",
+                    xytext=(dx, dy),
+                    ha=ha,
+                    va=va,
+                    fontsize=8,
+                    color=THESIS_PALETTE["neutral_dark"],
+                )
+        ax.set_xlim(-0.04, 1.04)
+        ax.set_ylim(-0.04, 1.04)
+        ax.set_xlabel("Normalized total MAE")
         ax.set_ylabel("Normalized annualized net profit")
         ax.legend(title="Series", loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=4, fontsize=8, frameon=True)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
@@ -2535,6 +3055,201 @@ def write_latex_profit_heatmap(path: Path, table: pd.DataFrame) -> None:
         r"\end{tikzpicture}",
         r"\caption{Net Profit by strategy and quantile policy. Cell values are annualized Net Profit in kEUR per year; validity flags are reported in the source CSV.}",
         r"\label{fig:1_profit_heatmap}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_mean_pinball_loss_heatmap(path: Path, total_scatter_data: pd.DataFrame, quantiles: list[str]) -> None:
+    rows = list(MODEL_ORDER)
+    quantile_order = [q for q in quantiles if total_scatter_data.empty or q in set(total_scatter_data["quantile"].astype(str))]
+    if not quantile_order:
+        quantile_order = list(quantiles)
+    pivot = (
+        total_scatter_data.pivot_table(
+            index="model",
+            columns="quantile",
+            values="mean_pinball_loss",
+            aggfunc="mean",
+        ).reindex(index=rows, columns=quantile_order)
+        if not total_scatter_data.empty
+        else pd.DataFrame(index=rows, columns=quantile_order)
+    )
+    points: list[tuple[int, int, float, str, str]] = []
+    vals: list[float] = []
+    palette = [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)]
+    for yi, model in enumerate(rows):
+        for xi, q in enumerate(quantile_order):
+            value = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
+            if math.isfinite(value):
+                vals.append(value)
+            txt = "n/a" if not math.isfinite(value) else f"{value:.2f}"
+            points.append((xi, yi, value, txt, "rqTwoNeutral"))
+    meta_min = min(vals) if vals else 0.0
+    meta_max = max(vals) if vals else 1.0
+    midpoint = float(np.nanmedian(vals)) if vals else math.nan
+
+    def _cell_color(meta: float) -> str:
+        if not math.isfinite(meta):
+            return "#F2F2F2"
+        if meta_max <= meta_min:
+            idx = 3
+        else:
+            idx = int(round((meta - meta_min) / (meta_max - meta_min) * (len(palette) - 1)))
+        idx = max(0, min(len(palette) - 1, idx))
+        return palette[idx]
+
+    cells: list[str] = []
+    for xi, yi, meta, txt, tc in points:
+        color = _cell_color(meta)
+        text_color = "white" if math.isfinite(meta) and math.isfinite(midpoint) and meta >= midpoint else tc
+        cells.extend(
+            [
+                rf"\definecolor{{rqTwoHeatCell{xi}{yi}}}{{HTML}}{{{color.lstrip('#')}}}",
+                rf"\filldraw[fill=rqTwoHeatCell{xi}{yi}, draw=white, line width=0.6pt] (axis cs:{xi - 0.5},{yi - 0.5}) rectangle (axis cs:{xi + 0.5},{yi + 0.5});",
+                rf"\node[text={text_color}, font=\scriptsize] at (axis cs:{xi},{yi}) {{{_latex_escape(txt)}}};",
+            ]
+        )
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=0.78\linewidth,",
+        r"height=0.32\linewidth,",
+        r"xlabel={Quantile policy},",
+        r"ylabel={Model},",
+        "xmin=-0.5, xmax=" + _tex_float(len(quantile_order) - 0.5, 1) + ",",
+        "ymin=-0.5, ymax=" + _tex_float(len(rows) - 0.5, 1) + ",",
+        "xtick={" + ",".join(str(i) for i in range(len(quantile_order))) + "},",
+        "xticklabels={" + ",".join(_latex_escape(q) for q in quantile_order) + "},",
+        "ytick={" + ",".join(str(i) for i in range(len(rows))) + "},",
+        "yticklabels={" + ",".join(_latex_escape(r) for r in rows) + "},",
+        r"y dir=reverse,",
+        r"point meta min=" + _tex_float(meta_min, 2) + ",",
+        r"point meta max=" + _tex_float(meta_max, 2) + ",",
+        r"colormap={rq2blue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
+        r"colorbar,",
+        r"colorbar style={ylabel={Mean pinball loss}, tick label style={font=\small}},",
+        r"]",
+        r"\addplot[scatter, only marks, mark=none, draw=none, opacity=0, scatter/use mapped color={draw opacity=0, fill opacity=0}] coordinates {",
+        rf"(0,0) [{_tex_float(meta_min, 3)}]",
+        rf"(0,0) [{_tex_float(meta_max, 3)}]",
+        r"};",
+        *cells,
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Total mean pinball loss by model and quantile policy. Values are observation-weighted averages across all forecast targets; lower values indicate lower forecast loss.}",
+        r"\label{fig:7_mean_pinball_loss_heatmap}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_bid_volume_heatmap(path: Path, activity: pd.DataFrame, quantiles: list[str], *, metric: str) -> None:
+    if metric not in {"submitted", "cleared"}:
+        raise ValueError(f"Unsupported bid-volume heatmap metric: {metric}")
+    value_col = f"{metric}_bid_volume_mwh_annualized"
+    metric_label = "Submitted" if metric == "submitted" else "Cleared"
+    rows = list(MODEL_ORDER)
+    markets = [str(spec["market_label"]) for spec in BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS]
+    quantile_order = [q for q in quantiles if q in set(activity["quantile"].astype(str))] if not activity.empty else list(quantiles)
+    if not quantile_order:
+        quantile_order = list(quantiles)
+    panels: list[tuple[str, pd.DataFrame]] = []
+    vals: list[float] = []
+    for market in markets:
+        d = activity.loc[activity["market_label"].astype(str).eq(market)].copy() if not activity.empty else pd.DataFrame()
+        pivot = (
+            d.pivot_table(
+                index="model",
+                columns="quantile",
+                values=value_col,
+                aggfunc="sum",
+            ).reindex(index=rows, columns=quantile_order) / 1000.0
+            if not d.empty
+            else pd.DataFrame(index=rows, columns=quantile_order)
+        )
+        panels.append((market, pivot))
+        vals.extend([float(v) for v in pivot.to_numpy(dtype=float).ravel() if math.isfinite(float(v))])
+    meta_min = 0.0
+    meta_max = max(vals) if vals else 1.0
+    palette = [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)]
+
+    def _cell_color(value: float) -> str:
+        if not math.isfinite(value):
+            return "#F2F2F2"
+        if meta_max <= meta_min:
+            idx = 3
+        else:
+            idx = int(round((value - meta_min) / (meta_max - meta_min) * (len(palette) - 1)))
+        idx = max(0, min(len(palette) - 1, idx))
+        return palette[idx]
+
+    panel_blocks: list[str] = []
+    positions = [(0, 0), (7.1, 0), (0, -4.0), (7.1, -4.0)]
+    for panel_idx, (market, pivot) in enumerate(panels):
+        x0, y0 = positions[panel_idx]
+        block: list[str] = [
+            rf"\begin{{scope}}[shift={{({x0:.2f},{y0:.2f})}}]",
+            rf"\node[font=\small] at (2.50,0.45) {{{_latex_escape(market)}}};",
+            r"\draw[rqTwoNeutral, line width=0.35pt] (-0.05,-0.05) rectangle (5.05,-3.05);",
+        ]
+        if panel_idx in {0, 2}:
+            block.append(r"\node[rotate=90, font=\small] at (-1.10,-1.55) {Model};")
+        for xi, q in enumerate(quantile_order):
+            block.append(rf"\node[font=\scriptsize] at ({xi + 0.5:.2f},-3.35) {{{_latex_escape(q)}}};")
+        block.append(r"\node[font=\small] at (2.50,-3.85) {Quantile};")
+        if panel_idx in {0, 2}:
+            for yi, model in enumerate(rows):
+                block.append(rf"\node[anchor=east, font=\scriptsize] at (-0.18,{-yi - 0.5:.2f}) {{{_latex_escape(model)}}};")
+        for yi, model in enumerate(rows):
+            for xi, q in enumerate(quantile_order):
+                value = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
+                txt = "n/a" if not math.isfinite(value) else f"{value:,.0f}"
+                color = _cell_color(value)
+                text_color = "white" if math.isfinite(value) and meta_max > 0 and value >= 0.55 * meta_max else "rqTwoNeutral"
+                cname = f"rqTwoBidCell{metric}{panel_idx}{xi}{yi}"
+                block.extend(
+                    [
+                        rf"\definecolor{{{cname}}}{{HTML}}{{{color.lstrip('#')}}}",
+                        rf"\filldraw[fill={cname}, draw=white, line width=0.45pt] ({xi:.2f},{-yi:.2f}) rectangle ({xi + 1:.2f},{-yi - 1:.2f});",
+                        rf"\node[text={text_color}, font=\tiny] at ({xi + 0.5:.2f},{-yi - 0.5:.2f}) {{{_latex_escape(txt)}}};",
+                    ]
+                )
+        block.append(r"\end{scope}")
+        panel_blocks.extend(block)
+
+    lines = [
+        r"% Requires \usepackage{tikz}",
+        r"% Requires \usepackage{pgfplots}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}[x=0.72cm,y=0.72cm]",
+        *_rq2_latex_color_defs(),
+        *panel_blocks,
+        r"\begin{scope}[shift={(14.90,-0.10)}]",
+        r"\begin{axis}[",
+        r"hide axis, scale only axis, height=7.0cm, width=0.20cm,",
+        r"point meta min=" + _tex_float(meta_min, 2) + ",",
+        r"point meta max=" + _tex_float(meta_max, 2) + ",",
+        r"colormap={rq2blue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
+        r"colorbar,",
+        rf"colorbar style={{ylabel={{{metric_label} bid volume (1,000 MWh/year)}}, tick label style={{font=\scriptsize}}}},",
+        r"]",
+        r"\addplot[scatter, only marks, mark=none, draw=none, opacity=0, scatter/use mapped color={draw opacity=0, fill opacity=0}] coordinates {",
+        rf"(0,0) [{_tex_float(meta_min, 3)}]",
+        rf"(0,0) [{_tex_float(meta_max, 3)}]",
+        r"};",
+        r"\end{axis}",
+        r"\end{scope}",
+        r"\end{tikzpicture}",
+        rf"\caption{{{metric_label} bid volume by market, model and quantile policy. Cell values are annualized {metric.lower()} bid volumes in 1,000 MWh per year.}}",
+        rf"\label{{fig:8_{metric}_bid_volume_heatmap_by_market_model_quantile}}",
         r"\end{figure}",
     ]
     _write_native_latex(path, lines)
@@ -2867,9 +3582,13 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
             if model == "XGB" and quantile == "p70":
                 node_options = "font=\\scriptsize, anchor=east, xshift=-3pt, text=rqTwoNeutral"
             elif model == "XGB" and quantile == "p90":
-                node_options = "font=\\scriptsize, anchor=north, yshift=-2pt, text=rqTwoNeutral"
+                node_options = "font=\\scriptsize, anchor=west, xshift=3pt, text=rqTwoNeutral"
+            elif model == "RLQR" and quantile == "p30":
+                node_options = "font=\\scriptsize, anchor=east, xshift=-3pt, text=rqTwoNeutral"
             elif model == "RLQR" and quantile == "p50":
-                node_options = "font=\\scriptsize, anchor=south east, xshift=-2pt, yshift=2pt, text=rqTwoNeutral"
+                node_options = "font=\\scriptsize, anchor=south, yshift=3pt, text=rqTwoNeutral"
+            elif model == "TFT" and quantile == "p90":
+                node_options = "font=\\scriptsize, anchor=north, yshift=-3pt, text=rqTwoNeutral"
             lines.append(
                 rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(quantile)}}};"
             )
@@ -2878,6 +3597,65 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         r"\end{tikzpicture}",
         r"\caption{Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line is the VoF reference line.}",
         r"\label{fig:5_pinball_loss_vs_net_profit_total_normalized}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame) -> None:
+    def _mae_node_options(model: str, quantile: str) -> str:
+        key = (str(model), str(quantile).lower())
+        if key in {("XGB", "p70"), ("XGB", "p10")}:
+            return "font=\\scriptsize, anchor=south, yshift=3pt, text=rqTwoNeutral"
+        if key in {("TFT", "p90"), ("TFT", "p50")}:
+            return "font=\\scriptsize, anchor=north, yshift=-3pt, text=rqTwoNeutral"
+        return "font=\\scriptsize, anchor=west, xshift=2pt, text=rqTwoNeutral"
+
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=0.82\linewidth,",
+        r"height=0.62\linewidth,",
+        r"xlabel={Normalized total MAE},",
+        r"ylabel={Normalized annualized net profit},",
+        r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
+        r"legend columns=4,",
+        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
+        r"]",
+        r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
+        r"\addlegendentry{VoF reference line}",
+    ]
+    for model in MODEL_ORDER:
+        g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
+        if g.empty:
+            continue
+        marker = {"RLQR": "*", "XGB": "square*", "TFT": "triangle*"}.get(model, "*")
+        model_color = _tex_model_color(model)
+        coords = " ".join(
+            f"({_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)})"
+            for _, row in g.iterrows()
+        )
+        lines += [
+            rf"\addplot+[only marks, color={model_color}, mark={marker}, mark size=2.4pt, mark options={{draw={model_color}, fill={model_color}}}] coordinates {{{coords}}};",
+            rf"\addlegendentry{{{model}}}",
+        ]
+        for _, row in g.iterrows():
+            quantile = str(row["quantile"])
+            node_options = _mae_node_options(model, quantile)
+            lines.append(
+                rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(quantile)}}};"
+            )
+    lines += [
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Normalized total MAE and annualized Net Profit by model and quantile policy. The grey dashed line is the VoF reference line.}",
+        r"\label{fig:5_mae_vs_net_profit_total_normalized}",
         r"\end{figure}",
     ]
     _write_native_latex(path, lines)
@@ -2907,7 +3685,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
     tick_labels = [pd.Timestamp(times[i]).strftime("%H:%M") for i in tick_positions] if times else []
     power_ymin = -1.0
     power_ymax = 1.0
-    axis_width = r"0.88\linewidth"
+    axis_width = r"0.84\linewidth"
     if not data.empty and times:
         stack = (
             data.pivot_table(index="timestamp_utc", columns="component", values="mw_signed", aggfunc="sum")
@@ -3002,7 +3780,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
             r"axis x line=none,",
             r"axis y line*=right,",
             r"ylabel={Cumulative Net Profit (kEUR)},",
-            r"ylabel style={font=\small, text=rqTwoPNL, xshift=6.4em, yshift=-0.25cm},",
+            r"ylabel style={font=\small, text=rqTwoPNL, xshift=6.4em, yshift=-0.80cm},",
             r"yticklabel style={font=\small, text=rqTwoPNL, xshift=4.2em},",
             r"tick style={rqTwoPNL, xshift=3.8em},",
             r"axis line style={rqTwoPNL, xshift=3.8em},",
@@ -3032,7 +3810,6 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     shifts = {"RLQR": "-8pt", "XGB": "0pt", "TFT": "8pt"}
     cleared_col = "cleared_bid_volume_mwh_annualized" if is_volume else "cleared_bid_count_annualized"
     not_cleared_col = "not_cleared_bid_volume_mwh_annualized" if is_volume else "not_cleared_bid_count_annualized"
-    title = "Annualized Bid Volume by Market and Model Strategy" if is_volume else "Annualized Bid Count by Market and Model Strategy"
     ylabel = "Submitted bid volume (1,000 MWh/year)" if is_volume else "Submitted bids (1,000/year)"
     caption = (
         "Annualized submitted bid volume by market and model strategy. Bars show total submitted bid volume, split into cleared volume and submitted but not-cleared volume. Fully opaque segments indicate cleared or realized volume, while transparent segments indicate submitted volume that did not clear. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
@@ -3040,6 +3817,34 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
         else "Annualized submitted bid count by market and model strategy. Bars show total submitted bids per year, split into cleared bids and submitted but not-cleared bids. Fully opaque segments indicate cleared or realized bids, while transparent segments indicate submitted bids that did not clear. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
     )
     label = "fig:annualized_bid_volume_by_market_model" if is_volume else "fig:annualized_bid_count_by_market_model"
+    bar_shift = {"RLQR": -0.16, "XGB": 0.0, "TFT": 0.16}
+    bar_half_width = 0.055
+    max_total = 0.0
+    bar_draws: list[str] = []
+    for model in models:
+        for xi, market_label in enumerate(market_labels):
+            match = activity.loc[activity["market_label"].astype(str).eq(market_label) & activity["model"].astype(str).eq(model)]
+            cleared = _safe_float(match[cleared_col].iloc[0]) / 1000.0 if not match.empty else 0.0
+            not_cleared = _safe_float(match[not_cleared_col].iloc[0]) / 1000.0 if not match.empty else 0.0
+            if not math.isfinite(cleared):
+                cleared = 0.0
+            if not math.isfinite(not_cleared):
+                not_cleared = 0.0
+            total = max(0.0, cleared + not_cleared)
+            max_total = max(max_total, total)
+            x_mid = xi + bar_shift.get(model, 0.0)
+            x_left = x_mid - bar_half_width
+            x_right = x_mid + bar_half_width
+            color = _tex_model_color(model)
+            if cleared > 0:
+                bar_draws.append(
+                    rf"\filldraw[fill={color}, draw=white, line width=0.4pt] (axis cs:{_tex_float(x_left, 3)},0) rectangle (axis cs:{_tex_float(x_right, 3)},{_tex_float(cleared, 3)});"
+                )
+            if not_cleared > 0:
+                bar_draws.append(
+                    rf"\filldraw[fill={color}, fill opacity=0.35, draw=white, line width=0.4pt] (axis cs:{_tex_float(x_left, 3)},{_tex_float(cleared, 3)}) rectangle (axis cs:{_tex_float(x_right, 3)},{_tex_float(total, 3)});"
+                )
+    y_max = max(1.0, max_total * 1.12)
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -3051,12 +3856,10 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
         *_axis_common_options(),
         r"width=\linewidth,",
         r"height=0.54\linewidth,",
-        r"ybar stacked,",
-        r"bar width=7pt,",
-        rf"title={{{title}}},",
         rf"ylabel={{{ylabel}}},",
         r"xlabel={Market},",
         r"xmin=-0.5, xmax=" + _tex_float(max(len(market_labels) - 0.5, 0.5), 1) + ",",
+        r"ymin=0, ymax=" + _tex_float(y_max, 3) + ",",
         r"xtick={" + ",".join(str(i) for i in range(len(market_labels))) + "},",
         r"xticklabels={" + ",".join(_latex_escape(label) for label in market_labels) + "},",
         r"legend columns=3,",
@@ -3065,22 +3868,9 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
         r"]",
     ]
     for model in models:
-        coords = []
-        for xi, label in enumerate(market_labels):
-            match = activity.loc[activity["market_label"].astype(str).eq(label) & activity["model"].astype(str).eq(model)]
-            value = _safe_float(match[cleared_col].iloc[0]) / 1000.0 if not match.empty else math.nan
-            coords.append(f"({xi},{_tex_float(value, 3)})")
-        lines += [
-            rf"\addplot+[fill={_tex_model_color(model)}, draw=white, bar shift={shifts.get(model, '0pt')}] coordinates {{{' '.join(coords)}}};",
-            rf"\addlegendentry{{{_latex_escape(model_labels.get(model, model))}}}",
-        ]
-    for model in models:
-        coords = []
-        for xi, label in enumerate(market_labels):
-            match = activity.loc[activity["market_label"].astype(str).eq(label) & activity["model"].astype(str).eq(model)]
-            value = _safe_float(match[not_cleared_col].iloc[0]) / 1000.0 if not match.empty else math.nan
-            coords.append(f"({xi},{_tex_float(value, 3)})")
-        lines.append(rf"\addplot+[fill={_tex_model_color(model)}, draw=white, fill opacity=0.35, bar shift={shifts.get(model, '0pt')}, forget plot] coordinates {{{' '.join(coords)}}};")
+        lines.append(rf"\addlegendimage{{area legend, fill={_tex_model_color(model)}, draw=white}}")
+        lines.append(rf"\addlegendentry{{{_latex_escape(model_labels.get(model, model))}}}")
+    lines.extend(bar_draws)
     lines += [
         r"\addlegendimage{area legend, fill=rqTwoNeutral, draw=white}",
         r"\addlegendentry{Cleared/realized}",
@@ -3102,9 +3892,12 @@ def write_result_section_native_latex_figures(
     sweep_data: pd.DataFrame,
     component_data: pd.DataFrame,
     cumulative_data: pd.DataFrame,
+    total_scatter_data: pd.DataFrame,
     normalized_total_scatter_data: pd.DataFrame,
+    normalized_total_mae_data: pd.DataFrame,
     dispatch_soc_data: pd.DataFrame,
     bidding_activity_data: pd.DataFrame,
+    bidding_heatmap_data: pd.DataFrame,
     quantiles: list[str],
 ) -> None:
     write_latex_profit_heatmap(latex_figures_dir / "1_profit_heatmap.tex", heatmap_table)
@@ -3112,7 +3905,11 @@ def write_result_section_native_latex_figures(
     write_latex_revenue_cost_components(latex_figures_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
     write_latex_cumulative_pnl(latex_figures_dir / "4_cumulative_net_profit_model_comparison_test_period.tex", cumulative_data)
     write_latex_normalized_pinball_profit(latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex", normalized_total_scatter_data)
+    write_latex_normalized_mae_profit(latex_figures_dir / "5_mae_vs_net_profit_total_normalized.tex", normalized_total_mae_data)
     write_latex_market_dispatch_soc(latex_figures_dir / "6_market_dispatch_soc_selected_day.tex", dispatch_soc_data)
+    write_latex_mean_pinball_loss_heatmap(latex_figures_dir / "7_mean_pinball_loss_heatmap.tex", total_scatter_data, quantiles)
+    write_latex_bid_volume_heatmap(latex_figures_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile.tex", bidding_heatmap_data, quantiles, metric="submitted")
+    write_latex_bid_volume_heatmap(latex_figures_dir / "8_cleared_bid_volume_heatmap_by_market_model_quantile.tex", bidding_heatmap_data, quantiles, metric="cleared")
     write_latex_bidding_activity_submitted_cleared(latex_figures_dir / "annualized_bid_volume_by_market_model.tex", bidding_activity_data, metric="volume")
     write_latex_bidding_activity_submitted_cleared(latex_figures_dir / "annualized_bid_count_by_market_model.tex", bidding_activity_data, metric="count")
 
@@ -3179,8 +3976,10 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     )
     total_scatter_data = build_total_pinball_net_profit_scatter_data(scatter_data)
     normalized_total_scatter_data = build_normalized_total_pinball_profit_data(total_scatter_data)
+    normalized_total_mae_data = build_normalized_total_mae_profit_data(total_scatter_data)
     dispatch_soc_data, dispatch_soc_warnings = build_market_dispatch_soc_day(summary, run_root=run_root)
-    bidding_activity_data, bidding_activity_warnings, bidding_activity_inventory = build_bidding_activity_by_market_model(summary, run_root=run_root)
+    bidding_activity_data, bidding_activity_warnings, bidding_activity_inventory = build_bidding_activity_by_market_model(summary, run_root=run_root, selected_only=True)
+    bidding_heatmap_data, bidding_heatmap_warnings, bidding_heatmap_inventory = build_bidding_activity_by_market_model(summary, run_root=run_root, selected_only=False)
 
     csv_dir = out_root / "backup/csv"
     result_csv_dir = out_root / "result_section/csv"
@@ -3202,17 +4001,24 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", index=False)
     total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", index=False)
     normalized_total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", index=False)
+    normalized_total_mae_data.to_csv(csv_dir / "5_mae_vs_net_profit_total_normalized.csv", index=False)
     dispatch_soc_data.to_csv(csv_dir / "6_market_dispatch_soc_selected_day.csv", index=False)
     bidding_activity_data.to_csv(csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", index=False)
     bidding_activity_data.to_csv(result_csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", index=False)
+    bidding_heatmap_data.to_csv(csv_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile.csv", index=False)
+    bidding_heatmap_data.to_csv(result_csv_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile.csv", index=False)
+    bidding_heatmap_data.to_csv(csv_dir / "8_cleared_bid_volume_heatmap_by_market_model_quantile.csv", index=False)
+    bidding_heatmap_data.to_csv(result_csv_dir / "8_cleared_bid_volume_heatmap_by_market_model_quantile.csv", index=False)
     bench.to_csv(csv_dir / "rq2_benchmark_values.csv", index=False)
     inventory.to_csv(diag_dir / "rq2_input_file_inventory.csv", index=False)
     bidding_activity_inventory.to_csv(diag_dir / "bidding_activity_submitted_cleared_source_inventory.csv", index=False)
+    bidding_heatmap_inventory.to_csv(diag_dir / "8_submitted_bid_volume_heatmap_source_inventory.csv", index=False)
     validity.to_csv(diag_dir / "rq2_validity_diagnostics.csv", index=False)
-    warning_df = pd.concat([warning_df, dispatch_soc_warnings, bidding_activity_warnings], ignore_index=True, sort=False)
+    warning_df = pd.concat([warning_df, dispatch_soc_warnings, bidding_activity_warnings, bidding_heatmap_warnings], ignore_index=True, sort=False)
     warning_df.to_csv(warn_dir / "rq2_warnings.csv", index=False)
     dispatch_soc_warnings.to_csv(warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", index=False)
     bidding_activity_warnings.to_csv(warn_dir / "bidding_activity_submitted_cleared_warnings.csv", index=False)
+    bidding_heatmap_warnings.to_csv(warn_dir / "8_submitted_bid_volume_heatmap_warnings.csv", index=False)
 
     write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
     write_revenue_cost_component_table(tables_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
@@ -3226,10 +4032,14 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         result_figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "4_cumulative_net_profit_model_comparison_test_period", formats, run_root.name)
         appendix_figure_paths += plot_pinball_net_profit_scatter(scatter_data, appendix_figures_dir, formats)
         result_figure_paths += plot_normalized_total_pinball_profit_scatter(normalized_total_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_total_normalized", formats)
+        result_figure_paths += plot_normalized_total_mae_profit_scatter(normalized_total_mae_data, figures_dir / "5_mae_vs_net_profit_total_normalized", formats)
         appendix_figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, appendix_figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
         result_figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
+        result_figure_paths += plot_mean_pinball_loss_heatmap(total_scatter_data, figures_dir / "7_mean_pinball_loss_heatmap", formats)
         result_figure_paths += plot_bidding_activity_submitted_cleared(bidding_activity_data, figures_dir / "annualized_bid_volume_by_market_model", formats, metric="volume")
         result_figure_paths += plot_bidding_activity_submitted_cleared(bidding_activity_data, figures_dir / "annualized_bid_count_by_market_model", formats, metric="count")
+        result_figure_paths += plot_bid_volume_heatmap(bidding_heatmap_data, figures_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile", formats, metric="submitted")
+        result_figure_paths += plot_bid_volume_heatmap(bidding_heatmap_data, figures_dir / "8_cleared_bid_volume_heatmap_by_market_model_quantile", formats, metric="cleared")
         result_figure_paths += plot_heatmap(heatmap_table, figures_dir / "1_profit_heatmap", formats)
         write_result_section_native_latex_figures(
             latex_figures_dir=latex_figures_dir,
@@ -3237,9 +4047,12 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
             sweep_data=sweep_data,
             component_data=component_data,
             cumulative_data=cumulative_data,
+            total_scatter_data=total_scatter_data,
             normalized_total_scatter_data=normalized_total_scatter_data,
+            normalized_total_mae_data=normalized_total_mae_data,
             dispatch_soc_data=dispatch_soc_data,
             bidding_activity_data=bidding_activity_data,
+            bidding_heatmap_data=bidding_heatmap_data,
             quantiles=quantiles,
         )
         for target, label in TARGET_LABELS.items():
@@ -3276,9 +4089,14 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for target-specific pinball-loss scatter figures"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for total pinball-loss scatter figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total pinball-loss scatter figure"),
+        (csv_dir / "5_mae_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total MAE scatter figure"),
         (csv_dir / "6_market_dispatch_soc_selected_day.csv", "backup", "csv", "market dispatch and SoC", "source data for selected-day stacked dispatch/SOC figure"),
         (csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", "backup", "csv", "bidding activity", "backup source data for submitted/cleared bidding-activity figures"),
         (result_csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", "result_section", "csv", "bidding activity", "source data for submitted/cleared bidding-activity figures"),
+        (csv_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile.csv", "backup", "csv", "bidding activity", "source data for submitted bid-size heatmap"),
+        (result_csv_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile.csv", "result_section", "csv", "bidding activity", "source data for submitted bid-size heatmap"),
+        (csv_dir / "8_cleared_bid_volume_heatmap_by_market_model_quantile.csv", "backup", "csv", "bidding activity", "source data for cleared bid-size heatmap"),
+        (result_csv_dir / "8_cleared_bid_volume_heatmap_by_market_model_quantile.csv", "result_section", "csv", "bidding activity", "source data for cleared bid-size heatmap"),
         (csv_dir / "rq2_benchmark_values.csv", "backup", "csv", "benchmark values", "Naive/RHPF benchmark source"),
         (diag_dir / "rq2_input_file_inventory.csv", "backup", "diagnostics", "input inventory", "reproducibility audit"),
         (diag_dir / "bidding_activity_submitted_cleared_source_inventory.csv", "backup", "diagnostics", "bidding activity", "source inventory for submitted/cleared bidding-activity aggregation"),

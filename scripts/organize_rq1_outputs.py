@@ -1094,6 +1094,10 @@ def _with_combined_per_lead_layout(lines: list[str], filename: str) -> list[str]
         if is_afrr_panel:
             line = line.replace("horizontal sep=1.25cm", "horizontal sep=2.05cm")
             line = line.replace("horizontal sep=1.65cm", "horizontal sep=2.05cm")
+        if "ylabel style={" in line:
+            line = line.replace("ylabel style={", "ylabel style={xshift=-0.25cm, ")
+        elif "ylabel={" in line:
+            out.append("                ylabel style={xshift=-0.25cm},")
         out.append(line)
     return out
 
@@ -2470,7 +2474,16 @@ def _write_line_tex(
         group = group.sort_values(x_col)
         coords = " ".join(f"({_tex_num(x)},{_tex_num(y)})" for x, y in zip(group[x_col], pd.to_numeric(group[y_col], errors="coerce")))
         color = colors.get(str(series), "neutraldark")
-        marker_style = rf"mark=*, mark options={{fill={color}, draw={color}}}" if show_markers else "mark=none"
+        marker_by_series = {
+            "XGB": "square*",
+            "xgb": "square*",
+            "TFT": "triangle*",
+            "tft": "triangle*",
+            "RFT": "triangle*",
+            "rft": "triangle*",
+        }
+        marker = marker_by_series.get(str(series), "*")
+        marker_style = rf"mark={marker}, mark options={{fill={color}, draw={color}}}" if show_markers else "mark=none"
         lines.append(rf"                \addplot[color={color}, {marker_style}, line width=1pt] coordinates {{{coords}}};")
         legends.append(_latex_escape(_tex_label(series)))
     if ideal_diagonal:
@@ -2673,10 +2686,10 @@ def _write_combined_per_lead_pinball_tex(root: Path) -> Path | None:
         r"    \begin{tikzpicture}",
         r"        \draw[color=secondary, line width=1pt] (0.00,0) -- (0.70,0);",
         r"        \node[anchor=west, text=black] at (0.90,0) {RLQR};",
-        r"        \draw[color=primary, line width=1pt] (3.25,0) -- (3.95,0);",
-        r"        \node[anchor=west, text=black] at (4.15,0) {XGB};",
-        r"        \draw[color=tertiary, line width=1pt] (6.25,0) -- (6.95,0);",
-        r"        \node[anchor=west, text=black] at (7.15,0) {TFT};",
+        r"        \draw[color=primary, line width=1pt] (2.55,0) -- (3.25,0);",
+        r"        \node[anchor=west, text=black] at (3.45,0) {XGB};",
+        r"        \draw[color=tertiary, line width=1pt] (5.10,0) -- (5.80,0);",
+        r"        \node[anchor=west, text=black] at (6.00,0) {TFT};",
         r"    \end{tikzpicture}",
         r"    \vspace{0.15em}",
     ]
