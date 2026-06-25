@@ -1090,16 +1090,10 @@ def _without_embedded_legend(lines: list[str]) -> list[str]:
 def _with_combined_per_lead_layout(lines: list[str], filename: str) -> list[str]:
     out: list[str] = []
     is_afrr_panel = filename.startswith("per_lead_pinball_afrr_")
-    needs_y_label_shift = filename in {
-        "per_lead_pinball_afrr_activation_price.tex",
-        "per_lead_pinball_afrr_activation_rate.tex",
-    }
     for line in lines:
         if is_afrr_panel:
             line = line.replace("horizontal sep=1.25cm", "horizontal sep=2.05cm")
             line = line.replace("horizontal sep=1.65cm", "horizontal sep=2.05cm")
-        if needs_y_label_shift and "y label style={at={" in line:
-            line = re.sub(r"y label style=\{at=\{\(-?\d+(?:\.\d+)?,0\.5\)\}\}", r"y label style={at={(-0.22,0.5)}}", line)
         out.append(line)
     return out
 
@@ -2665,6 +2659,7 @@ def _write_combined_per_lead_pinball_tex(root: Path) -> Path | None:
         r"% Requires: \usepgfplotslibrary{groupplots}",
         r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
         *_latex_color_defs(),
+        r"\clearpage",
         r"\begin{figure}[p]",
         r"    \centering",
         r"    \captionsetup[subfigure]{font=small,skip=0.2em}",

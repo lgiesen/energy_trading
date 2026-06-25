@@ -1711,7 +1711,7 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     import matplotlib.pyplot as plt
 
     apply_geo_style()
-    fig, ax = plt.subplots(figsize=(10.5, 5.8))
+    fig, ax = plt.subplots(figsize=(10.5, 5.0))
     if component_data.empty:
         ax.axis("off")
         ax.text(
@@ -1724,7 +1724,6 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
             color=THESIS_PALETTE["neutral_dark"],
             wrap=True,
         )
-        ax.set_title("RQ2 Revenue and Cost Components at Best Quantile")
         fig.tight_layout()
         written = _save_figure(fig, out_base, formats)
         plt.close(fig)
@@ -1732,7 +1731,7 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
 
     models = [m for m in MODEL_ORDER if m in set(component_data["model"])]
     x = np.arange(len(models))
-    width = 0.62
+    width = 0.72
     component_order = [label for _col, label in COMPONENT_COLUMNS if label in set(component_data["component"])]
     pivot = component_data.pivot_table(
         index="model",
@@ -1771,18 +1770,25 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
     ax.set_xticklabels([f"{m}\n{q}" if q else m for m, q in zip(models, best_quantiles)])
     ax.set_ylabel("Annualized component value (kEUR/year)")
     ax.set_xlabel("Model and best quantile")
-    ax.set_title("RQ2 Revenue and Cost Components at Best Quantile", pad=12)
     handles, labels = ax.get_legend_handles_labels()
     handle_by_label = dict(zip(labels, handles))
     revenue_labels = [label for label in component_order if label not in {display for _col, display in COMPONENT_COLUMNS if _col in COMPONENT_COST_COLUMNS}]
     cost_labels = [label for _col, label in COMPONENT_COLUMNS if _col in COMPONENT_COST_COLUMNS and label in handle_by_label]
     from matplotlib.patches import Patch
 
-    spacer_count = max(0, len(cost_labels) - len(revenue_labels))
-    legend_labels = revenue_labels + [" "] * spacer_count + cost_labels
-    legend_handles = [handle_by_label[label] if label in handle_by_label else Patch(facecolor="none", edgecolor="none") for label in legend_labels]
-    ax.legend(legend_handles, legend_labels, ncol=2, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
-    fig.tight_layout()
+    empty = Patch(facecolor="none", edgecolor="none")
+    legend_handles = [empty, empty, empty, empty]
+    legend_labels = ["Revenue", " ", "Costs", " "]
+    legend_rows = max(math.ceil(len(revenue_labels) / 2), math.ceil(len(cost_labels) / 2))
+    for row_idx in range(legend_rows):
+        for group in (revenue_labels, cost_labels):
+            row_labels = group[2 * row_idx : 2 * row_idx + 2]
+            legend_handles.extend([handle_by_label[label] for label in row_labels])
+            legend_labels.extend(row_labels)
+            legend_handles.extend([empty] * (2 - len(row_labels)))
+            legend_labels.extend([" "] * (2 - len(row_labels)))
+    ax.legend(legend_handles, legend_labels, ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.18), frameon=False)
+    fig.tight_layout(rect=(0, 0.18, 1, 1))
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
     return written
@@ -2002,7 +2008,6 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
     labels = [pd.Timestamp(ts).strftime("%H:%M") for ts in times]
     ax.set_xticks(x[:: max(1, len(x) // 8)])
     ax.set_xticklabels(labels[:: max(1, len(x) // 8)])
-    fig.suptitle("Exemplary BESS Dispatch Under the TFT P90 Multi-Market Strategy", y=0.98)
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
@@ -2042,7 +2047,6 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
             color=THESIS_PALETTE["neutral_dark"],
             wrap=True,
         )
-        ax.set_title("Cumulative Net Profit Across Model Strategies")
         fig.tight_layout()
         written = _save_figure(fig, out_base, formats)
         plt.close(fig)
@@ -2080,7 +2084,6 @@ def plot_cumulative_pnl(cumulative: pd.DataFrame, out_base: Path, formats: list[
         ax.set_xticklabels([d.strftime("%d %b") for d in tick_dates])
     ax.set_ylabel("Cumulative Net Profit (kEUR)")
     ax.set_xlabel("Time (2025)")
-    ax.set_title("Cumulative Net Profit Across Model Strategies")
     ax.legend(ncol=3, loc="best")
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
@@ -2233,7 +2236,6 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
         ax.set_xlabel("Normalized total mean pinball loss")
         ax.set_ylabel("Normalized annualized net profit")
         ax.legend(title="Series", loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=4, fontsize=8, frameon=True)
-    ax.set_title("Normalized Total Forecast Loss vs Net Profit")
     fig.tight_layout(rect=(0, 0.08, 1, 1))
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
@@ -2539,7 +2541,7 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
         ("TFT", "p10"): ("north west", "2pt", "4pt"),
     }
     model_plot_options = {
-        "RLQR": r"color=rqTwoRLQR, mark=*, mark options={solid, draw=rqTwoRLQR, fill=white}, line width=1.8pt",
+        "RLQR": r"color=rqTwoRLQR, mark=*, mark options={solid, draw=rqTwoRLQR, fill=rqTwoRLQR}, line width=1.8pt",
         "XGB": r"color=rqTwoXGB, mark=square*, mark options={solid, draw=rqTwoXGB, fill=rqTwoXGB}, line width=1.8pt",
         "TFT": r"color=rqTwoTFT, mark=triangle*, mark options={solid, draw=rqTwoTFT, fill=rqTwoTFT}, line width=1.8pt",
     }
@@ -2554,7 +2556,6 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
         *_axis_common_options(),
         r"width=\linewidth,",
         r"height=0.56\linewidth,",
-        r"title={Net Profit by Model and Quantile},",
         r"xlabel={Quantile policy},",
         r"ylabel={Annualized Net Profit (kEUR)},",
         r"ymin=" + _tex_float(y_min, 2) + ",",
@@ -2563,7 +2564,7 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
         r"xtick={" + ",".join(str(i) for i in range(len(quantiles))) + "},",
         r"xticklabels={" + ",".join(_latex_escape(q) for q in quantiles) + "},",
         r"legend columns=5,",
-        r"legend style={at={(0.5,-0.20)}, anchor=north, legend columns=5, draw=none, fill=none, font=\small},",
+        r"legend style={at={(0.5,1.04)}, anchor=south, legend columns=5, draw=none, fill=none, font=\small},",
         r"]",
     ]
     for model in ["Naive", "RHPF"]:
@@ -2655,11 +2656,9 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
         r"\begin{axis}[",
         *_axis_common_options(),
         r"width=\linewidth,",
-        r"height=0.58\linewidth,",
+        r"height=0.50\linewidth,",
         r"ybar stacked,",
-        r"bar width=18pt,",
-        r"title style={font=\normalfont\small},",
-        r"title={Revenue and Cost Components at Best Quantile},",
+        r"bar width=22pt,",
         r"ylabel={Annualized component value (kEUR/year)},",
         r"ymin=0,",
         r"enlarge x limits=0.12,",
@@ -2668,9 +2667,9 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
         r"extra x ticks={" + extra_x_ticks + "},",
         r"extra x tick labels={" + extra_x_tick_labels + "},",
         r"extra x tick style={tick label style={yshift=-1.6em, font=\small}, tick style={draw=none}},",
-        r"legend columns=2,",
+        r"legend columns=4,",
         r"legend cell align=left,",
-        r"legend style={at={(0.5,-0.24)}, anchor=north, font=\scriptsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=1.0cm}},",
+        r"legend style={at={(0.5,-0.24)}, anchor=north, font=\scriptsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.45cm}},",
         r"]",
     ]
     if not component_data.empty and models and component_order:
@@ -2712,31 +2711,26 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
             r"\addlegendimage{empty legend}",
             r"\addlegendentry{Revenue}",
             r"\addlegendimage{empty legend}",
+            r"\addlegendentry{}",
+            r"\addlegendimage{empty legend}",
             r"\addlegendentry{Costs}",
+            r"\addlegendimage{empty legend}",
+            r"\addlegendentry{}",
         ]
-        for idx in range(max(len(revenue_components), len(cost_components))):
-            if idx < len(revenue_components):
-                component = revenue_components[idx]
-                lines += [
-                    rf"\addlegendimage{{area legend, fill={_tex_component_color(component)}, draw=white}}",
-                    rf"\addlegendentry{{{_latex_escape(component)}}}",
-                ]
-            else:
-                lines += [
-                    r"\addlegendimage{empty legend}",
-                    r"\addlegendentry{}",
-                ]
-            if idx < len(cost_components):
-                component = cost_components[idx]
-                lines += [
-                    rf"\addlegendimage{{area legend, fill={_tex_component_color(component)}, draw=white}}",
-                    rf"\addlegendentry{{{_latex_escape(component)}}}",
-                ]
-            else:
-                lines += [
-                    r"\addlegendimage{empty legend}",
-                    r"\addlegendentry{}",
-                ]
+        legend_rows = max(math.ceil(len(revenue_components) / 2), math.ceil(len(cost_components) / 2))
+        for row_idx in range(legend_rows):
+            for components in (revenue_components, cost_components):
+                row_components = components[2 * row_idx : 2 * row_idx + 2]
+                for component in row_components:
+                    lines += [
+                        rf"\addlegendimage{{area legend, fill={_tex_component_color(component)}, draw=white}}",
+                        rf"\addlegendentry{{{_latex_escape(component)}}}",
+                    ]
+                for _ in range(2 - len(row_components)):
+                    lines += [
+                        r"\addlegendimage{empty legend}",
+                        r"\addlegendentry{}",
+                    ]
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
@@ -2772,7 +2766,6 @@ def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
         *_axis_common_options(),
         r"width=\linewidth,",
         r"height=0.56\linewidth,",
-        r"title={Cumulative Net Profit Across Model Strategies},",
         r"xlabel={Date},",
         r"ylabel={Cumulative Net Profit (kEUR)},",
         r"xmin=0,",
@@ -2821,7 +2814,6 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         *_axis_common_options(),
         r"width=0.82\linewidth,",
         r"height=0.62\linewidth,",
-        r"title={Normalized Total Forecast Loss vs Net Profit},",
         r"xlabel={Normalized total mean pinball loss},",
         r"ylabel={Normalized annualized net profit},",
         r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
@@ -2917,7 +2909,6 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"height=0.56\linewidth,",
         r"ybar stacked,",
         r"bar width=7pt,",
-        r"title={Exemplary BESS Dispatch Under the TFT P90 Multi-Market Strategy},",
         rf"xlabel={{Time ({_latex_escape(selected_date_label)})}},",
         r"ylabel={Battery dispatch power (MW)},",
         rf"ymin={_tex_float(power_ymin, 2)}, ymax={_tex_float(power_ymax, 2)},",
