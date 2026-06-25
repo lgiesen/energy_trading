@@ -1476,8 +1476,8 @@ def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame)
     header_cells = [r"\textbf{Component}"]
     for model in models:
         q = quantile_by_model.get(model, "")
-        q_line = r"\\" + _latex_escape(q) if q else ""
-        header_cells.append(r"\textbf{\begin{tabular}[c]{@{}r@{}}" + _latex_escape(model) + q_line + r"\end{tabular}}")
+        label = (_latex_escape(model) + (r"~" + _latex_escape(q) if q else ""))
+        header_cells.append(r"\textbf{" + label + r"}")
 
     def _row(component: str, *, cost: bool) -> str:
         cells = [_latex_escape(_revenue_cost_table_component_label(component))]
@@ -1630,16 +1630,22 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
     }
     linestyle_by_model = {"RLQR": "-", "XGB": "-", "TFT": "-"}
 
-    def _label_offset(model: str, quantile: str) -> int:
+    def _label_position(model: str, quantile: str) -> tuple[int, int, str]:
+        if model == "RLQR" and quantile in {"p10", "p30", "p70", "p90"}:
+            return (0, -16, "center")
         if model == "RLQR" and quantile == "p50":
-            return -16
+            return (0, -16, "center")
         if model == "XGB" and quantile == "p90":
-            return -16
+            return (0, 8, "center")
+        if model == "TFT" and quantile == "p10":
+            return (0, 8, "center")
+        if model == "TFT" and quantile == "p90":
+            return (8, 0, "left")
         if model == "Naive":
-            return -14
+            return (0, -14, "center")
         if model == "RHPF":
-            return 8
-        return 8
+            return (0, 8, "center")
+        return (0, 8, "center")
 
     for model in ["Naive", "RHPF", *MODEL_ORDER]:
         g = sweep_data.loc[sweep_data["series"].astype(str).eq(model)].copy()
@@ -1686,12 +1692,14 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
         for xi, yi, q in zip(plot_x, values_arr, plot_quantiles):
             if not math.isfinite(float(yi)):
                 continue
+            dx, dy, ha = _label_position(model, q)
             ax.annotate(
                 f"{yi/1000:,.0f} kEUR",
                 (xi, yi),
                 textcoords="offset points",
-                xytext=(0, _label_offset(model, q)),
-                ha="center",
+                xytext=(dx, dy),
+                ha=ha,
+                va="center",
                 fontsize=8,
                 color=THESIS_PALETTE["neutral_dark"],
             )
@@ -2183,6 +2191,14 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
     fig, ax = plt.subplots(figsize=(8.2, 5.6))
     color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
     marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
+
+    def _label_position(model: str, quantile: str) -> tuple[int, int, str, str]:
+        if model == "XGB" and quantile == "p70":
+            return (-8, 0, "right", "center")
+        if model == "RLQR" and quantile == "p50":
+            return (-6, 6, "right", "bottom")
+        return (4, 3, "left", "bottom")
+
     if normalized_data.empty:
             ax.axis("off")
             ax.text(
@@ -2223,11 +2239,14 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
                 zorder=3,
             )
             for _, row in g.iterrows():
+                dx, dy, ha, va = _label_position(model, str(row["quantile"]))
                 ax.annotate(
                     str(row["quantile"]),
                     (row["normalized_forecast_loss"], row["normalized_annualized_net_profit"]),
                     textcoords="offset points",
-                    xytext=(4, 3),
+                    xytext=(dx, dy),
+                    ha=ha,
+                    va=va,
                     fontsize=8,
                     color=THESIS_PALETTE["neutral_dark"],
                 )
@@ -2534,11 +2553,16 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
     y_max = max(plotted_values) if plotted_values else 1.0
     y_pad = max(60.0, 0.12 * (y_max - y_min))
     y_max_plot = y_max + y_pad
+    below_point = ("north", "0pt", "-6pt")
     label_offsets = {
-        ("RLQR", "p50"): ("south", "0pt", "-12pt"),
-        ("XGB", "p90"): ("south", "0pt", "-12pt"),
-        ("TFT", "p90"): ("south", "0pt", "5pt"),
-        ("TFT", "p10"): ("north west", "2pt", "4pt"),
+        ("RLQR", "p10"): below_point,
+        ("RLQR", "p30"): below_point,
+        ("RLQR", "p50"): below_point,
+        ("RLQR", "p70"): below_point,
+        ("RLQR", "p90"): below_point,
+        ("XGB", "p90"): ("south", "0pt", "5pt"),
+        ("TFT", "p10"): ("south", "0pt", "5pt"),
+        ("TFT", "p90"): ("west", "6pt", "0pt"),
     }
     model_plot_options = {
         "RLQR": r"color=rqTwoRLQR, mark=*, mark options={solid, draw=rqTwoRLQR, fill=rqTwoRLQR}, line width=1.8pt",
@@ -2840,10 +2864,12 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         for _, row in g.iterrows():
             quantile = str(row["quantile"])
             node_options = "font=\\scriptsize, anchor=west, text=rqTwoNeutral"
-            if model == "XGB" and quantile == "p90":
+            if model == "XGB" and quantile == "p70":
+                node_options = "font=\\scriptsize, anchor=east, xshift=-3pt, text=rqTwoNeutral"
+            elif model == "XGB" and quantile == "p90":
                 node_options = "font=\\scriptsize, anchor=north, yshift=-2pt, text=rqTwoNeutral"
             elif model == "RLQR" and quantile == "p50":
-                node_options = "font=\\scriptsize, anchor=east, xshift=-2pt, text=rqTwoNeutral"
+                node_options = "font=\\scriptsize, anchor=south east, xshift=-2pt, yshift=2pt, text=rqTwoNeutral"
             lines.append(
                 rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(quantile)}}};"
             )
@@ -2881,6 +2907,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
     tick_labels = [pd.Timestamp(times[i]).strftime("%H:%M") for i in tick_positions] if times else []
     power_ymin = -1.0
     power_ymax = 1.0
+    axis_width = r"0.88\linewidth"
     if not data.empty and times:
         stack = (
             data.pivot_table(index="timestamp_utc", columns="component", values="mw_signed", aggfunc="sum")
@@ -2905,7 +2932,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"\begin{axis}[",
         *_axis_common_options(),
         r"name=dispatchaxis,",
-        r"width=\linewidth,",
+        rf"width={axis_width},",
         r"height=0.56\linewidth,",
         r"ybar stacked,",
         r"bar width=7pt,",
@@ -2944,7 +2971,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"name=socaxis,",
         r"at={(dispatchaxis.south west)},",
         r"anchor=south west,",
-        r"width=\linewidth,",
+        rf"width={axis_width},",
         r"height=0.56\linewidth,",
         r"axis x line=none,",
         r"axis y line*=right,",
@@ -2970,15 +2997,15 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
             r"name=pnlaxis,",
             r"at={(dispatchaxis.south west)},",
             r"anchor=south west,",
-            r"width=\linewidth,",
+            rf"width={axis_width},",
             r"height=0.56\linewidth,",
             r"axis x line=none,",
             r"axis y line*=right,",
             r"ylabel={Cumulative Net Profit (kEUR)},",
-            r"ylabel style={font=\small, text=rqTwoPNL, xshift=4.4em},",
-            r"yticklabel style={font=\small, text=rqTwoPNL, xshift=2.6em},",
-            r"tick style={rqTwoPNL, xshift=2.2em},",
-            r"axis line style={rqTwoPNL, xshift=2.2em},",
+            r"ylabel style={font=\small, text=rqTwoPNL, xshift=6.4em, yshift=-0.25cm},",
+            r"yticklabel style={font=\small, text=rqTwoPNL, xshift=4.2em},",
+            r"tick style={rqTwoPNL, xshift=3.8em},",
+            r"axis line style={rqTwoPNL, xshift=3.8em},",
             r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
             r"grid=none,",
             r"]",

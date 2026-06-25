@@ -32,6 +32,7 @@ ALLOW_INVALID_OUTPUT="${ALLOW_INVALID_OUTPUT:-1}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-0}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 if [[ -z "${PYTHON_BIN:-}" ]]; then
   if [[ -x "./.venv/bin/python" ]]; then
     PYTHON_BIN="./.venv/bin/python"
@@ -133,7 +134,7 @@ def _scenario_model_label(folder: str, model_key: object) -> str:
     return str(model_key)
 
 
-def _latest_rq2_run_root() -> Path | None:
+def _latest_rq2_run_root():
     candidates = sorted(
         Path("artifacts/simulation_runs").glob("thesis_final_multi_2m_*"),
         key=lambda p: p.name,
@@ -304,6 +305,8 @@ run_strategy_job() {
   fi
   if truthy "$CLEAN_OUTPUT"; then
     cmd+=(--clean-output)
+  else
+    cmd+=(--no-clean-output)
   fi
 
   {
@@ -362,11 +365,20 @@ run_strategy_job() {
   echo "SKIP_COMPLETED=$SKIP_COMPLETED"
   echo "FORCE_RERUN=$FORCE_RERUN"
   echo "CLEAN_OUTPUT=$CLEAN_OUTPUT"
+  echo "PREFLIGHT_ONLY=$PREFLIGHT_ONLY"
   echo "PYTHON_BIN=$PYTHON_BIN"
   echo "CREATED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } | tee "$LOG_ROOT/run_meta.env"
 
 assert_best_model_quantile
+
+if truthy "$PREFLIGHT_ONLY"; then
+  echo "[PREFLIGHT_ONLY] best model/quantile assertion passed; no simulations started."
+  echo "RUN_ROOT=$RUN_ROOT"
+  echo "LOG_ROOT=$LOG_ROOT"
+  echo "BEST_ASSERTION_JSON=$BEST_ASSERTION_JSON"
+  exit 0
+fi
 
 for strategy in "${STRATEGIES[@]}"; do
   wait_for_slot
