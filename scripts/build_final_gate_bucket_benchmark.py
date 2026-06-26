@@ -156,6 +156,17 @@ def _actionable_label(bucket: Any, target_group: Any) -> str:
     return _bucket_label(bucket)
 
 
+def _actionable_label_multiline(label: Any) -> str:
+    text = str(label)
+    replacements = {
+        "DA price D+1 at 11:00": "DA price\nD+1 at 11:00",
+        "BCM capacity price D+1 at 08:00": "BCM capacity price\nD+1 at 08:00",
+        "BEM activation price h1-h8": "BEM activation price\nh1-h8",
+        "BEM activation rate h1-h8": "BEM activation rate\nh1-h8",
+    }
+    return replacements.get(text, text)
+
+
 def _parse_models(raw: str) -> list[ModelSpec]:
     out: list[ModelSpec] = []
     seen: set[str] = set()
@@ -733,6 +744,8 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
             [
                 r"\begin{table}[ht]",
                 r"    \centering",
+                rf"    \caption{{Gate-specific and horizon-bucket mean pinball loss relative to RLQR for {caption_label} on the test split. RLQR is fixed at 1. Values below 1 indicate lower mean pinball loss than RLQR.}}",
+                rf"    \label{{tab:gate_bucket_metrics_{split}_{slug}}}",
                 r"    \begin{tabular}{@{}lrrrrr@{}}",
                 r"        \toprule",
                 "        " + " & ".join(r"\textbf{" + _latex_header(h) + "}" for h in headers) + r" \\",
@@ -753,8 +766,6 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
             [
                 r"        \bottomrule",
                 r"    \end{tabular}",
-                rf"    \caption{{Gate-specific and horizon-bucket mean pinball loss relative to RLQR for {caption_label} on the test split. RLQR is fixed at 1. Values below 1 indicate lower mean pinball loss than RLQR.}}",
-                rf"    \label{{tab:gate_bucket_metrics_{split}_{slug}}}",
                 r"\end{table}",
                 "",
             ]
@@ -838,7 +849,7 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str, 
     pivot = pivot.sort_values(["_order", "label"]).reset_index(drop=True)
     y = np.arange(len(pivot), dtype=float)
     height = 0.34
-    fig, ax = plt.subplots(figsize=(10.5, max(3.2, 0.72 * len(pivot) + 1.6)))
+    fig, ax = plt.subplots(figsize=(10.5, max(3.4, 0.80 * len(pivot) + 1.8)))
     ax.axvline(1.0, color=get_model_color("linear"), linewidth=1.4, linestyle=":", label="RLQR")
     for idx, (label, model_key) in enumerate([("XGB", "xgb"), ("TFT", "tft")]):
         if label not in pivot.columns:
@@ -850,7 +861,7 @@ def _plot_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str, 
             vals.append(value / denom if np.isfinite(denom) and abs(denom) > 1e-12 else float("nan"))
         ax.barh(y + (idx - 0.5) * height, vals, height=height, label=label, color=get_model_color(model_key))
     ax.set_yticks(y)
-    ax.set_yticklabels(pivot["label"].astype(str).tolist())
+    ax.set_yticklabels([_actionable_label_multiline(label) for label in pivot["label"].astype(str)], fontsize=11)
     ax.invert_yaxis()
     ax.set_xlabel("Mean pinball loss relative to RLQR")
     ax.set_title(thesis_titlecase("Actionable Forecast Performance by Market Gate Relative to RLQR"))
@@ -894,7 +905,15 @@ def _plot_observed_leads(observed: pd.DataFrame, *, out_dir: Path, split: str) -
     return path
 
 
-def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str, structured_out_dir: Path | None = None) -> list[Path]:
+def write_outputs(
+    outputs: dict[str, pd.DataFrame],
+    *,
+    out_dir: Path,
+    split: str,
+    structured_out_dir: Path | None = None,
+    skip_csv: bool = False,
+    skip_json: bool = False,
+) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "latex").mkdir(parents=True, exist_ok=True)
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
@@ -907,10 +926,11 @@ def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str
         ("gate_bucket_observed_leads.csv", outputs["observed_leads"]),
         ("gate_bucket_warnings.csv", outputs["warnings"]),
     ]
-    for name, df in csvs:
-        path = out_dir / name
-        df.to_csv(path, index=False)
-        paths.append(path)
+    if not skip_csv:
+        for name, df in csvs:
+            path = out_dir / name
+            df.to_csv(path, index=False)
+            paths.append(path)
     tex = write_latex_table(outputs["metrics"], out_dir=out_dir, split=split)
     if tex is not None:
         paths.append(tex)
@@ -931,8 +951,9 @@ def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str
         "outputs": [str(p) for p in paths],
     }
     manifest_path = out_dir / "gate_bucket_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    paths.append(manifest_path)
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        paths.append(manifest_path)
     if structured_out_dir is not None:
         paths.extend(_mirror_structured(paths, root_out_dir=out_dir, structured_out_dir=structured_out_dir))
     return paths
@@ -971,6 +992,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
     p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--no-structured-copy", action="store_true")
+    p.add_argument("--skip-csv", action="store_true", help="Do not write CSV backup/diagnostic outputs.")
+    p.add_argument("--skip-json", action="store_true", help="Do not write the gate-bucket JSON manifest.")
     return p.parse_args()
 
 
@@ -993,7 +1016,14 @@ def main() -> int:
         eval_origin_end=_parse_utc_bound(args.eval_origin_end),
     )
     structured_out_dir = None if args.no_structured_copy else Path(args.structured_out_dir)
-    paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, structured_out_dir=structured_out_dir)
+    paths = write_outputs(
+        outputs,
+        out_dir=Path(args.out_dir),
+        split=args.split,
+        structured_out_dir=structured_out_dir,
+        skip_csv=bool(args.skip_csv),
+        skip_json=bool(args.skip_json),
+    )
     print("[OK] Built RQ1 gate-specific bucket outputs.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     for path in paths:

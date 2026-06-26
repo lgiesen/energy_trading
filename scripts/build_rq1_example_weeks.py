@@ -1229,6 +1229,8 @@ def build_market_actionable_examples(
     initial_warnings: pd.DataFrame | None = None,
     eval_origin_start: pd.Timestamp | None = None,
     eval_origin_end: pd.Timestamp | None = None,
+    skip_csv: bool = False,
+    skip_json: bool = False,
 ) -> list[Path]:
     outputs: list[Path] = []
     plot_value_rows: list[pd.DataFrame] = []
@@ -1514,47 +1516,48 @@ def build_market_actionable_examples(
     for col in selected_cols:
         if col not in selected_out.columns:
             selected_out[col] = np.nan
-    selected_out[selected_cols].to_csv(selected_weeks_path, index=False)
-    if plot_value_rows:
-        pd.concat(plot_value_rows, ignore_index=True).to_csv(plot_values_path, index=False)
-    else:
-        pd.DataFrame(
-            columns=[
-                "selection_mode",
-                "selection_type",
-                "market_context",
-                "market_context_label",
-                "forecast_snapshot_rule",
-                "split",
-                "target",
-                "target_display",
-                "target_group",
-                "y_axis_label",
-                "figure_title",
-                "figure_subtitle",
-                "caption",
-                "short_caption",
-                "week_start_utc",
-                "week_end_utc",
-                *SELECTION_METADATA_COLUMNS,
-                "target_time_utc",
-                "target_time_local",
-                "forecast_time_utc",
-                "forecast_time_local",
-                "lead_time_h",
-                "model",
-                "model_label",
-                "y_true",
-                "p10",
-                "p50",
-                "p90",
-                "residual_p50",
-                "abs_error_p50",
-                "figure_path",
-            ]
-        ).to_csv(plot_values_path, index=False)
-    pd.DataFrame(metric_rows).to_csv(metrics_path, index=False)
-    pd.DataFrame(warning_rows).to_csv(warn_path, index=False)
+    if not skip_csv:
+        selected_out[selected_cols].to_csv(selected_weeks_path, index=False)
+        if plot_value_rows:
+            pd.concat(plot_value_rows, ignore_index=True).to_csv(plot_values_path, index=False)
+        else:
+            pd.DataFrame(
+                columns=[
+                    "selection_mode",
+                    "selection_type",
+                    "market_context",
+                    "market_context_label",
+                    "forecast_snapshot_rule",
+                    "split",
+                    "target",
+                    "target_display",
+                    "target_group",
+                    "y_axis_label",
+                    "figure_title",
+                    "figure_subtitle",
+                    "caption",
+                    "short_caption",
+                    "week_start_utc",
+                    "week_end_utc",
+                    *SELECTION_METADATA_COLUMNS,
+                    "target_time_utc",
+                    "target_time_local",
+                    "forecast_time_utc",
+                    "forecast_time_local",
+                    "lead_time_h",
+                    "model",
+                    "model_label",
+                    "y_true",
+                    "p10",
+                    "p50",
+                    "p90",
+                    "residual_p50",
+                    "abs_error_p50",
+                    "figure_path",
+                ]
+            ).to_csv(plot_values_path, index=False)
+        pd.DataFrame(metric_rows).to_csv(metrics_path, index=False)
+        pd.DataFrame(warning_rows).to_csv(warn_path, index=False)
     manifest = {
         "description": "RQ1 market-actionable example-week figures.",
         "selection_mode": selection_mode,
@@ -1572,8 +1575,11 @@ def build_market_actionable_examples(
         ],
     }
     manifest_path = out_dir / "example_week_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
-    outputs.extend([selected_weeks_path, plot_values_path, metrics_path, warn_path, manifest_path])
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+        outputs.append(manifest_path)
+    if not skip_csv:
+        outputs.extend([selected_weeks_path, plot_values_path, metrics_path, warn_path])
     _prune_example_week_includegraphics_wrappers(out_dir)
     _prune_legacy_week_aliases(out_dir)
     return outputs
@@ -1928,6 +1934,8 @@ def build_example_weeks(
     window_hours: int,
     eval_origin_start: pd.Timestamp | None = None,
     eval_origin_end: pd.Timestamp | None = None,
+    skip_csv: bool = False,
+    skip_json: bool = False,
 ) -> tuple[pd.DataFrame, list[Path]]:
     rows: list[dict[str, Any]] = []
     outputs: list[Path] = []
@@ -1995,8 +2003,9 @@ def build_example_weeks(
     summary = sort_target_frame(pd.DataFrame(rows), target_col="target", extra_cols=["week"])
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "example_week_metrics.csv"
-    summary.to_csv(summary_path, index=False)
-    outputs.append(summary_path)
+    if not skip_csv:
+        summary.to_csv(summary_path, index=False)
+        outputs.append(summary_path)
     manifest_path = out_dir / "example_week_manifest.json"
     manifest = {
         "description": "RQ1 example-week truth-vs-forecast figures for all prediction targets.",
@@ -2014,8 +2023,9 @@ def build_example_weeks(
         "targets": targets,
         "outputs": [str(p) for p in outputs],
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    outputs.append(manifest_path)
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        outputs.append(manifest_path)
     return summary, outputs
 
 
@@ -2212,6 +2222,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound. Empty string disables the lower bound.")
     p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound. Empty string disables the upper bound.")
     p.add_argument("--window-hours", type=int, default=DEFAULT_WINDOW_HOURS)
+    p.add_argument("--skip-csv", action="store_true", help="Do not write CSV backup/diagnostic outputs.")
+    p.add_argument("--skip-json", action="store_true", help="Do not write the example-week JSON manifest.")
     return p.parse_args()
 
 
@@ -2244,6 +2256,8 @@ def main() -> int:
             window_hours=int(args.window_hours),
             eval_origin_start=eval_origin_start,
             eval_origin_end=eval_origin_end,
+            skip_csv=bool(args.skip_csv),
+            skip_json=bool(args.skip_json),
         )
         outputs.extend(
             build_market_actionable_examples(
@@ -2256,6 +2270,8 @@ def main() -> int:
                 selection_mode="legacy",
                 eval_origin_start=eval_origin_start,
                 eval_origin_end=eval_origin_end,
+                skip_csv=bool(args.skip_csv),
+                skip_json=bool(args.skip_json),
             )
         )
     else:
@@ -2296,9 +2312,12 @@ def main() -> int:
                 initial_warnings=selection_warnings,
                 eval_origin_start=eval_origin_start,
                 eval_origin_end=eval_origin_end,
+                skip_csv=bool(args.skip_csv),
+                skip_json=bool(args.skip_json),
             )
         )
-        validate_algorithmic_outputs(out_dir=out_dir, split=args.split)
+        if not (args.skip_csv or args.skip_json):
+            validate_algorithmic_outputs(out_dir=out_dir, split=args.split)
     print("[OK] Built RQ1 example-week figures.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     print(f"[OK] selection_mode={args.selection_mode}")

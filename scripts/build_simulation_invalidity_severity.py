@@ -1134,6 +1134,8 @@ def write_invalidity_context_latex(table: pd.DataFrame, path: Path, label: str) 
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
+        rf"\caption{{Aggregate simulation invalidity context for {label.upper()} model scenarios. The first row counts unique scenario-hours with at least one infeasibility flag; multiple infeasibilities in the same scenario-hour are counted once. SoC and reserve rows report magnitude together with affected-hour shares because no physical maximum-denominator column is available in the extracted diagnostics.}}",
+        rf"\label{{tab:{label}_simulation_invalidity_context}}",
         r"\begin{tabular}{@{}p{0.30\linewidth}p{0.20\linewidth}p{0.40\linewidth}@{}}",
         r"\toprule",
         r"\textbf{Invalid reason} & \textbf{Occurrence} & \textbf{Share compared to total possible occurrences} \\",
@@ -1156,8 +1158,6 @@ def write_invalidity_context_latex(table: pd.DataFrame, path: Path, label: str) 
     rows += [
         r"\bottomrule",
         r"\end{tabular}",
-        rf"\caption{{Aggregate simulation invalidity context for {label.upper()} model scenarios. The first row counts unique scenario-hours with at least one infeasibility flag; multiple infeasibilities in the same scenario-hour are counted once. SoC and reserve rows report magnitude together with affected-hour shares because no physical maximum-denominator column is available in the extracted diagnostics.}}",
-        rf"\label{{tab:{label}_simulation_invalidity_context}}",
         r"\end{table}",
         "",
     ]
@@ -1258,6 +1258,8 @@ def write_invalidity_reason_matrix_latex(table: pd.DataFrame, path: Path, label:
         r"\begin{table}[htbp]",
         r"\centering",
         r"\scriptsize",
+        rf"\caption{{Invalidity reason occurrence matrix for {label.upper()} model scenarios. Cells report the observed occurrence magnitude per run. The final row reports the denominator used for contextualization: simulated scenario-hours for hour-based diagnostics, total planned traded MWh for DA lockbook infeasibility, total optimizations for fallback optimizations, and total activation events or MWh for missed activations. SoC and reserve shortfall cells report magnitude followed by affected hours.}}",
+        rf"\label{{tab:{label}_simulation_invalidity_reason_matrix}}",
         r"\setlength{\tabcolsep}{3pt}",
         r"\resizebox{\linewidth}{!}{%",
         r"\begin{tabular}{@{}lrrrrrrr@{}}",
@@ -1280,8 +1282,6 @@ def write_invalidity_reason_matrix_latex(table: pd.DataFrame, path: Path, label:
         r"\bottomrule",
         r"\end{tabular}%",
         r"}",
-        rf"\caption{{Invalidity reason occurrence matrix for {label.upper()} model scenarios. Cells report the observed occurrence magnitude per run. The final row reports the denominator used for contextualization: simulated scenario-hours for hour-based diagnostics, total planned traded MWh for DA lockbook infeasibility, total optimizations for fallback optimizations, and total activation events or MWh for missed activations. SoC and reserve shortfall cells report magnitude followed by affected hours.}}",
-        rf"\label{{tab:{label}_simulation_invalidity_reason_matrix}}",
         r"\end{table}",
         "",
     ]
@@ -1460,6 +1460,8 @@ def write_latex_table(summary: pd.DataFrame, path: Path, label: str) -> None:
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
+        rf"\caption{{Simulation invalidity severity diagnostics for {label.upper()}. Unavailable metrics are shown as --. Ratios are calculated using the available recorded denominator; unavailable denominators are reported as missing rather than zero.}}",
+        rf"\label{{tab:{label}_simulation_invalidity_severity}}",
         r"\begin{tabular}{llrrrrrr}",
         r"\toprule",
         r"Scenario & Severity class & Invalid hours (\%) & DA infeas. / trade (\%) & Fallback opt. (\%) & Missed act. volume (\%) & Max SoC viol. & Max reserve short. \\",
@@ -1488,8 +1490,6 @@ def write_latex_table(summary: pd.DataFrame, path: Path, label: str) -> None:
     rows += [
         r"\bottomrule",
         r"\end{tabular}",
-        rf"\caption{{Simulation invalidity severity diagnostics for {label.upper()}. Unavailable metrics are shown as --. Ratios are calculated using the available recorded denominator; unavailable denominators are reported as missing rather than zero.}}",
-        rf"\label{{tab:{label}_simulation_invalidity_severity}}",
         r"\end{table}",
         "",
     ]

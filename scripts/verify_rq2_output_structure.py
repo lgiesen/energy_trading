@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -73,6 +74,17 @@ INVALIDITY_SEVERITY_FILES = [
 ]
 
 
+def _check_latex_float_labels(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    for env in ("table", "figure"):
+        pattern = re.compile(rf"\\begin\{{{env}\}}.*?\\end\{{{env}\}}", flags=re.S)
+        for idx, match in enumerate(pattern.finditer(text), start=1):
+            if r"\label{" not in match.group(0):
+                errors.append(f"{path} {env} environment {idx} is missing \\label{{...}}.")
+    return errors
+
+
 def verify(out_root: Path, *, require_invalidity_severity: bool = False) -> list[str]:
     errors: list[str] = []
     required = list(REQUIRED_FILES)
@@ -81,6 +93,8 @@ def verify(out_root: Path, *, require_invalidity_severity: bool = False) -> list
     for rel in required:
         if not (out_root / rel).exists():
             errors.append(f"Missing required file: {out_root / rel}")
+        elif rel.endswith(".tex"):
+            errors.extend(_check_latex_float_labels(out_root / rel))
 
     manifest_path = out_root / "rq2_output_manifest.json"
     if manifest_path.exists():

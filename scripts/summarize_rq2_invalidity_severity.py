@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from scripts.build_simulation_invalidity_severity import parse_bool
+try:
+    from scripts.build_simulation_invalidity_severity import build_invalidity_context_table, parse_bool, write_invalidity_context_latex
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from build_simulation_invalidity_severity import build_invalidity_context_table, parse_bool, write_invalidity_context_latex
 
 
 DEFAULT_RQ2_ROOT = Path("artifacts/final_benchmark/rq2/thesis_final_multi_2m_20260620T091938Z")
@@ -306,12 +311,18 @@ def build_outputs(root: Path) -> dict[str, Path]:
     compact_path = root / "backup" / "csv" / "rq2_invalidity_severity_compact.csv"
     latex_path = root / "appendix" / "tables" / "rq2_invalidity_severity_summary.tex"
     text_path = root / "backup" / "diagnostics" / "rq2_invalidity_limitation_summary.txt"
+    context_csv_path = root / "backup" / "diagnostics" / "simulation_invalidity_context_table.csv"
+    context_latex_path = root / "appendix" / "tables" / "simulation_invalidity_context_table.tex"
     compact_path.parent.mkdir(parents=True, exist_ok=True)
     compact.to_csv(compact_path, index=False)
     write_latex_table(compact, latex_path)
     write_text_summary(summary, warnings_df, text_path)
+    context_table = build_invalidity_context_table(summary, include_benchmarks=False)
+    context_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    context_table.to_csv(context_csv_path, index=False)
+    write_invalidity_context_latex(context_table, context_latex_path, "rq2")
     update_manifest(root, {"compact": compact_path, "latex": latex_path, "text": text_path})
-    return {"latex": latex_path, "compact": compact_path, "summary": text_path}
+    return {"latex": latex_path, "compact": compact_path, "summary": text_path, "context_table": context_latex_path}
 
 
 def parse_args() -> argparse.Namespace:

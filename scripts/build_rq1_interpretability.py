@@ -145,6 +145,8 @@ def _write_latex_table(path: Path, headers: list[str], rows: list[list[Any]], ca
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        f"    \\caption{{{_latex_escape(caption)}}}",
+        f"    \\label{{{label}}}",
         rf"    \begin{{tabular}}{{@{{}}{align}@{{}}}}",
         r"        \toprule",
         "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
@@ -157,8 +159,6 @@ def _write_latex_table(path: Path, headers: list[str], rows: list[list[Any]], ca
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            f"    \\caption{{{_latex_escape(caption)}}}",
-            f"    \\label{{{label}}}",
             r"\end{table}",
             "",
         ]

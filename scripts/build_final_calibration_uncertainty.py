@@ -651,6 +651,8 @@ def write_latex_summary(summary: pd.DataFrame, *, out_dir: Path, split: str) -> 
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        r"    \caption{MACE and p10-p90 coverage in percentage points for each target variable.}",
+        r"    \label{tab:calibration_summary_test}",
         r"    \begin{tabular}{@{}lrrrlr@{}}",
         r"        \toprule",
         "        " + " & ".join(_stacked_header(h) for h in headers) + r" \\",
@@ -704,8 +706,6 @@ def write_latex_summary(summary: pd.DataFrame, *, out_dir: Path, split: str) -> 
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{MACE and p10-p90 coverage in percentage points for each target variable.}",
-            r"    \label{tab:calibration_summary_test}",
             r"\end{table}",
             "",
         ]
@@ -752,6 +752,8 @@ def write_latex_quantile_coverage_appendix(coverage: pd.DataFrame, *, out_dir: P
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        r"    \caption{Detailed empirical quantile coverage on the test split.}",
+        r"    \label{tab:calibration_quantile_coverage_test_appendix}",
         r"    \begin{tabular}{@{}lrrrrrl@{}}",
         r"        \toprule",
         "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
@@ -773,8 +775,6 @@ def write_latex_quantile_coverage_appendix(coverage: pd.DataFrame, *, out_dir: P
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{Detailed empirical quantile coverage on the test split.}",
-            r"    \label{tab:calibration_quantile_coverage_test_appendix}",
             r"\end{table}",
             "",
         ]
@@ -794,6 +794,8 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        r"    \caption{Detailed interval coverage and sharpness diagnostics on the test split.}",
+        r"    \label{tab:calibration_interval_quality_test_appendix}",
         r"    \begin{tabular}{@{}lllrrrrrr@{}}",
         r"        \toprule",
         "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
@@ -816,8 +818,6 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{Detailed interval coverage and sharpness diagnostics on the test split.}",
-            r"    \label{tab:calibration_interval_quality_test_appendix}",
             r"\end{table}",
             "",
         ]
@@ -837,6 +837,8 @@ def write_latex_crossing_appendix(crossing: pd.DataFrame, *, out_dir: Path, spli
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        r"    \caption{Quantile crossing diagnostics on the test split.}",
+        r"    \label{tab:calibration_quantile_crossing_test_appendix}",
         r"    \begin{tabular}{@{}llrrr@{}}",
         r"        \toprule",
         "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
@@ -855,8 +857,6 @@ def write_latex_crossing_appendix(crossing: pd.DataFrame, *, out_dir: Path, spli
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{Quantile crossing diagnostics on the test split.}",
-            r"    \label{tab:calibration_quantile_crossing_test_appendix}",
             r"\end{table}",
             "",
         ]
@@ -1165,7 +1165,15 @@ def _split_frame(df: pd.DataFrame, split: str) -> pd.DataFrame:
     return df.loc[df["split"] == split].copy()
 
 
-def write_legacy_flat_aliases(outputs: dict[str, pd.DataFrame], *, out_dir: Path, source_dir: Path, split: str) -> list[Path]:
+def write_legacy_flat_aliases(
+    outputs: dict[str, pd.DataFrame],
+    *,
+    out_dir: Path,
+    source_dir: Path,
+    split: str,
+    skip_csv: bool = False,
+    skip_json: bool = False,
+) -> list[Path]:
     """Mirror current structured outputs to thesis-facing flat calibration paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -1175,19 +1183,20 @@ def write_legacy_flat_aliases(outputs: dict[str, pd.DataFrame], *, out_dir: Path
         "quantile_crossing": "calibration_quantile_crossing",
         "summary": "calibration_summary",
     }
-    for key, stem in csv_aliases.items():
-        df = outputs[key]
-        path = out_dir / f"{stem}.csv"
-        df.to_csv(path, index=False)
-        paths.append(path)
-        path_split = out_dir / f"{stem}_{split}.csv"
-        _split_frame(df, split).to_csv(path_split, index=False)
-        paths.append(path_split)
+    if not skip_csv:
+        for key, stem in csv_aliases.items():
+            df = outputs[key]
+            path = out_dir / f"{stem}.csv"
+            df.to_csv(path, index=False)
+            paths.append(path)
+            path_split = out_dir / f"{stem}_{split}.csv"
+            _split_frame(df, split).to_csv(path_split, index=False)
+            paths.append(path_split)
 
-    for key, name in [("row_counts", "calibration_row_counts.csv"), ("warnings", "calibration_warnings.csv")]:
-        path = out_dir / name
-        outputs[key].to_csv(path, index=False)
-        paths.append(path)
+        for key, name in [("row_counts", "calibration_row_counts.csv"), ("warnings", "calibration_warnings.csv")]:
+            path = out_dir / name
+            outputs[key].to_csv(path, index=False)
+            paths.append(path)
 
     copy_aliases = {
         source_dir / "latex" / f"rq1_4_1_2_calibration_summary_{split}.tex": out_dir / "latex" / f"calibration_summary_{split}.tex",
@@ -1215,8 +1224,9 @@ def write_legacy_flat_aliases(outputs: dict[str, pd.DataFrame], *, out_dir: Path
         "outputs": [str(p) for p in paths],
     }
     manifest_path = out_dir / "calibration_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    paths.append(manifest_path)
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        paths.append(manifest_path)
     return paths
 
 
@@ -1226,6 +1236,8 @@ def write_outputs(
     out_dir: Path,
     split: str,
     legacy_flat_out_dir: Path | None = None,
+    skip_csv: bool = False,
+    skip_json: bool = False,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_dir = out_dir / "csv"
@@ -1237,18 +1249,19 @@ def write_outputs(
         "quantile_crossing": "rq1_4_1_2_calibration_quantile_crossing",
         "summary": "rq1_4_1_2_calibration_summary",
     }
-    for key, stem in name_map.items():
-        df = outputs[key]
-        path = csv_dir / f"{stem}.csv"
-        df.to_csv(path, index=False)
-        paths.append(path)
-        path_split = csv_dir / f"{stem}_{split}.csv"
-        df.loc[df["split"] == split].to_csv(path_split, index=False)
-        paths.append(path_split)
-    for key, stem in [("row_counts", "rq1_4_1_2_calibration_row_counts"), ("warnings", "rq1_4_1_2_calibration_warnings")]:
-        path = csv_dir / f"{stem}.csv"
-        outputs[key].to_csv(path, index=False)
-        paths.append(path)
+    if not skip_csv:
+        for key, stem in name_map.items():
+            df = outputs[key]
+            path = csv_dir / f"{stem}.csv"
+            df.to_csv(path, index=False)
+            paths.append(path)
+            path_split = csv_dir / f"{stem}_{split}.csv"
+            df.loc[df["split"] == split].to_csv(path_split, index=False)
+            paths.append(path_split)
+        for key, stem in [("row_counts", "rq1_4_1_2_calibration_row_counts"), ("warnings", "rq1_4_1_2_calibration_warnings")]:
+            path = csv_dir / f"{stem}.csv"
+            outputs[key].to_csv(path, index=False)
+            paths.append(path)
 
     latex = write_latex_summary(outputs["summary"], out_dir=out_dir, split=split)
     if latex is not None:
@@ -1290,10 +1303,20 @@ def write_outputs(
         "outputs": [str(p) for p in paths],
     }
     manifest_path = out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    paths.append(manifest_path)
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        paths.append(manifest_path)
     if legacy_flat_out_dir is not None:
-        paths.extend(write_legacy_flat_aliases(outputs, out_dir=legacy_flat_out_dir, source_dir=out_dir, split=split))
+        paths.extend(
+            write_legacy_flat_aliases(
+                outputs,
+                out_dir=legacy_flat_out_dir,
+                source_dir=out_dir,
+                split=split,
+                skip_csv=skip_csv,
+                skip_json=skip_json,
+            )
+        )
     return paths
 
 
@@ -1313,6 +1336,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--legacy-flat-out-dir", default="artifacts/benchmark/rq1_ml_model_benchmark/_raw_outputs/calibration")
     p.add_argument("--no-legacy-flat-aliases", action="store_true")
+    p.add_argument("--skip-csv", action="store_true", help="Do not write CSV backup/diagnostic outputs.")
+    p.add_argument("--skip-json", action="store_true", help="Do not write calibration JSON manifests.")
     return p.parse_args()
 
 
@@ -1334,7 +1359,14 @@ def main() -> int:
         eval_origin_end=_parse_utc_bound(args.eval_origin_end),
     )
     legacy_flat_out_dir = None if args.no_legacy_flat_aliases else Path(args.legacy_flat_out_dir)
-    paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, legacy_flat_out_dir=legacy_flat_out_dir)
+    paths = write_outputs(
+        outputs,
+        out_dir=Path(args.out_dir),
+        split=args.split,
+        legacy_flat_out_dir=legacy_flat_out_dir,
+        skip_csv=bool(args.skip_csv),
+        skip_json=bool(args.skip_json),
+    )
     print("[OK] Built RQ1 calibration and uncertainty-quality outputs.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     for path in paths:

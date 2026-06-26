@@ -52,6 +52,17 @@ THESIS_PALETTE: Dict[str, str] = {
     "neutral_dark": "#333333",  # 51, 51, 51
 }
 
+# Signed-bias diverging palette. Blue indicates negative bias / underprediction,
+# white indicates near-zero average bias, and purple indicates positive bias /
+# overprediction.
+BIAS_DIVERGING = [
+    THESIS_PALETTE["primary"],
+    "#E4F1F7",
+    "#FFFFFF",
+    "#F2E3CC",
+    THESIS_PALETTE["tertiary"],
+]
+
 # Fixed semantic mapping for thesis figures.
 MODEL_COLOR_MAP: Dict[str, str] = {
     "truth": THESIS_PALETTE["perfect_foresight"],
@@ -186,6 +197,23 @@ def get_backtest_line_style(series_name: str) -> Dict[str, object]:
     """Return fixed thesis style kwargs for cumulative backtest lines."""
     key = str(series_name).strip().lower()
     return dict(BACKTEST_LINE_STYLES.get(key, {"color": THESIS_PALETTE["neutral_dark"], "linestyle": "-"}))
+
+
+def get_bias_diverging_cmap():
+    """Return the thesis diverging colormap for signed forecast bias."""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    return LinearSegmentedColormap.from_list("bias_diverging", BIAS_DIVERGING)
+
+
+def get_geo_sequential_blue_cmap():
+    """Return the thesis sequential blue colormap for nonnegative magnitude metrics."""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    return LinearSegmentedColormap.from_list(
+        "geo_sequential_blue",
+        [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)],
+    )
 
 
 def apply_geo_style() -> None:

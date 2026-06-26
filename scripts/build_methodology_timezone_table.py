@@ -196,6 +196,8 @@ def _write_latex(rows: tuple[TimeZoneRow, ...], path: Path) -> None:
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
+        r"\caption{Time-zone harmonization by data source. All source-specific timestamp conventions are converted to a canonical UTC timestamp before merging and model feature construction.}",
+        r"\label{tab:data-source-time-zones}",
         r"\begin{tabularx}{\linewidth}{p{0.18\linewidth} p{0.22\linewidth} p{0.27\linewidth} p{0.16\linewidth} X}",
         r"\toprule",
         r"\textbf{Data source} & \textbf{Raw timestamp convention} & \textbf{Pipeline conversion} & \textbf{Final time basis} & \textbf{Implementation reference} \\",
@@ -214,8 +216,6 @@ def _write_latex(rows: tuple[TimeZoneRow, ...], path: Path) -> None:
         [
             r"\bottomrule",
             r"\end{tabularx}",
-            r"\caption{Time-zone harmonization by data source. All source-specific timestamp conventions are converted to a canonical UTC timestamp before merging and model feature construction.}",
-            r"\label{tab:data-source-time-zones}",
             r"\end{table}",
             "",
         ]

@@ -1,0 +1,2108 @@
+#!/usr/bin/env python3
+"""Generate RQ3 market-strategy comparison outputs.
+
+Figure 1: annualized net profit by market participation strategy.
+Figure 2: revenue and cost decomposition by market participation strategy.
+Figure 3: cumulative net profit over time by market participation strategy.
+Figure 4: operational intensity by market participation strategy.
+
+This script reads existing simulation outputs only. It does not run simulations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+import re
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.ticker import StrMethodFormatter
+import matplotlib.dates as mdates
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from energy_trading.evaluation.style import MARKET_COLOR_MAP, THESIS_PALETTE, apply_geo_style, thesis_titlecase
+
+
+DEFAULT_OUT_ROOT = Path("artifacts/benchmark/rq3_market_comparison")
+DEFAULT_EXPORT_DIR = (
+    "/Users/leori/Desktop/ uni/3 Master IS/25 MA/"
+    "MA___Elevated_Energy_Trading__Forecasting_Expected_Profit_From_Participating_in_the_Day_Ahead_and_Balancing_Markets/"
+    "figures/4-results/rq3_market_comparison"
+)
+DEFAULT_INPUT_ROOTS = [
+    Path("artifacts/benchmark/rq3_market_comparison"),
+    Path("artifacts/benchmark/rq3_simulation_benchmark"),
+    Path("artifacts/simulation_runs"),
+]
+STRATEGY_ORDER = ["Multi", "DA-only", "BCM-only", "BEM-only"]
+STRATEGY_COLOR = {
+    "Multi": THESIS_PALETTE["primary"],
+    "DA-only": THESIS_PALETTE["neutral_dark"],
+    "BCM-only": MARKET_COLOR_MAP["BCM capacity"],
+    "BEM-only": MARKET_COLOR_MAP["BEM"],
+}
+STRATEGY_GAMUT = {
+    "multi": "Multi",
+    "multi-market": "Multi",
+    "multimarket": "Multi",
+    "multi_market": "Multi",
+    "da": "DA-only",
+    "da_only": "DA-only",
+    "da-only": "DA-only",
+    "day-ahead": "DA-only",
+    "dayahead": "DA-only",
+    "bcm": "BCM-only",
+    "bcm_only": "BCM-only",
+    "bcm-only": "BCM-only",
+    "afrr": "BCM-only",
+    "afrr-only": "BCM-only",
+    "bem": "BEM-only",
+    "bem_only": "BEM-only",
+    "bem-only": "BEM-only",
+}
+PROFIT_COLS = [
+    "annualized_realized_net_revenue_eur",
+    "annualized_realized_net_profit_eur",
+    "annualized_net_profit_eur_per_year",
+    "annualized_profit_eur_per_year",
+    "annualized_realized_pnl_eur",
+]
+NET_PROFIT_COLS = [
+    "realized_net_revenue_eur",
+    "realized_net_profit_eur",
+    "realized_total_pnl_eur",
+    "pnl_real_eur",
+]
+REVENUE_COMPONENT_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "DA revenue",
+        (
+            "annualized_da_revenue_eur",
+            "annualized_da_net_revenue_eur",
+            "annualized_da_pnl_eur",
+            "da_revenue_eur",
+            "da_net_revenue_eur",
+            "da_pnl_eur",
+            "real_revenue_da_eur",
+            "realized_da_revenue_eur",
+            "realized_da_net_revenue_eur",
+        ),
+    ),
+    (
+        "ID revenue",
+        (
+            "annualized_id_revenue_eur",
+            "annualized_id_net_revenue_eur",
+            "id_net_revenue_eur",
+            "id_revenue_eur",
+        ),
+    ),
+    (
+        "BCM capacity revenue",
+        (
+            "annualized_bcm_capacity_revenue_eur",
+            "bcm_capacity_revenue_eur",
+            "afrr_capacity_revenue_eur",
+        ),
+    ),
+    (
+        "BCM activation revenue",
+        (
+            "annualized_bcm_activation_revenue_eur",
+            "bcm_linked_activation_revenue_eur",
+            "bcm_activation_revenue_eur",
+        ),
+    ),
+    (
+        "BEM activation revenue",
+        (
+            "annualized_bem_activation_revenue_eur",
+            "annualized_afrr_activation_revenue_eur",
+            "bem_activation_revenue_eur",
+            "afrr_activation_revenue_eur",
+        ),
+    ),
+)
+COST_DETAIL_COMPONENT_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "Degradation cost",
+        (
+            "annualized_realized_degradation_cost_eur",
+            "annualized_degradation_cost_eur",
+            "realized_degradation_cost_eur",
+        ),
+    ),
+    (
+        "Auxiliary cost",
+        (
+            "annualized_realized_aux_cost_eur",
+            "annualized_aux_cost_eur",
+            "realized_aux_cost_eur",
+            "aux_cost_eur",
+        ),
+    ),
+    ("Transaction cost", ("annualized_transaction_cost_eur", "transaction_cost_eur")),
+    (
+        "Activation penalty",
+        (
+            "annualized_penalty_cost_eur",
+            "penalty_cost_eur",
+            "annualized_bem_penalty_cost_eur",
+            "annualized_bem_activation_cost_eur",
+            "bem_penalty_cost_eur",
+            "bem_activation_cost_eur",
+        ),
+    ),
+    ("Other penalties", ("annualized_other_penalty_cost_eur", "other_penalty_cost_eur")),
+    ("ID recourse cost", ("annualized_id_recourse_cost_eur", "id_recourse_cost_eur")),
+    ("Terminal SoC repair", ("annualized_terminal_soc_repair_cost_eur", "terminal_soc_repair_cost_eur")),
+)
+COST_TOTAL_CANDIDATES = ("annualized_total_costs_eur", "total_costs_eur")
+STRUCTURALLY_ZERO_COMPONENTS = {
+    "DA-only": ("BCM capacity revenue", "BEM activation revenue", "BCM activation revenue"),
+    "BCM-only": ("DA revenue", "BEM activation revenue", "ID revenue"),
+    "BEM-only": ("DA revenue", "BCM capacity revenue", "ID revenue"),
+}
+REVENUE_LABEL = "Revenue"
+COST_LABEL = "Costs"
+REVENUE_COMPONENT_COLOR = {
+    "DA revenue": MARKET_COLOR_MAP.get("DA", THESIS_PALETTE["primary"]),
+    "BCM capacity revenue": MARKET_COLOR_MAP.get("BCM capacity", THESIS_PALETTE["secondary"]),
+    "BCM activation revenue": MARKET_COLOR_MAP.get("BCM activation", THESIS_PALETTE["secondary"]),
+    "BEM activation revenue": MARKET_COLOR_MAP.get("BEM", THESIS_PALETTE["tertiary"]),
+    "ID revenue": MARKET_COLOR_MAP.get("ID", THESIS_PALETTE["neutral_dark"]),
+}
+COST_COMPONENT_COLOR = {
+    "Degradation cost": "#F0746E",
+    "Auxiliary cost": "#DC3977",
+    "Transaction cost": "#7A7A7A",
+    "Activation penalty": "#333333",
+    "Offer cost": "#2E7D32",
+    "ID recourse cost": "#5B4B8A",
+    "Activation cost": "#0D4A70",
+    "Terminal SoC repair": "#045275",
+    "Total costs": "#666666",
+}
+REVENUE_COMPONENTS = tuple(name for name, _ in REVENUE_COMPONENT_SPECS)
+COST_COMPONENTS = tuple(name for name, _ in COST_DETAIL_COMPONENT_SPECS) + ("Total costs",)
+OPERATIONAL_METRIC_SPECS: tuple[dict[str, Any], ...] = (
+    {
+        "metric": "Avg daily throughput",
+        "unit": "MWh/day",
+        "candidates": ("throughput_mwh_per_day", "throughput_mwh_mean_per_day", "average_daily_throughput_mwh"),
+    },
+    {
+        "metric": "Total throughput",
+        "unit": "MWh",
+        "candidates": ("throughput_mwh_total", "total_throughput_mwh"),
+    },
+    {
+        "metric": "Equivalent full cycles",
+        "unit": "cycles",
+        "candidates": ("equivalent_full_cycles_total", "total_equivalent_full_cycles", "equivalent_full_cycles"),
+    },
+    {
+        "metric": "Avg daily cycles",
+        "unit": "cycles/day",
+        "candidates": ("equivalent_full_cycles_per_day", "average_daily_cycles"),
+    },
+    {
+        "metric": "Mean SoC",
+        "unit": "MWh",
+        "candidates": ("mean_soc_mwh", "realized_mean_soc_mwh", "soc_mwh_mean"),
+    },
+    {
+        "metric": "Auxiliary cost",
+        "unit": "EUR",
+        "candidates": ("realized_aux_cost_eur", "aux_cost_eur", "annualized_realized_aux_cost_eur", "annualized_aux_cost_eur"),
+    },
+    {
+        "metric": "Degradation cost",
+        "unit": "EUR",
+        "candidates": (
+            "realized_degradation_cost_eur",
+            "degradation_cost_eur",
+            "annualized_realized_degradation_cost_eur",
+            "annualized_degradation_cost_eur",
+        ),
+    },
+    {
+        "metric": "ID recourse volume",
+        "unit": "MWh",
+        "candidates": ("id_abs_mwh_total", "id_recourse_mwh_total", "id_buy_mwh_total+id_sell_mwh_total"),
+    },
+    {
+        "metric": "Fallback count",
+        "unit": "count",
+        "candidates": ("fallback_optimization_count", "optimizer_fallback_count", "fallback_used"),
+    },
+    {
+        "metric": "Fallback share",
+        "unit": "%",
+        "candidates": ("fallback_optimization_share", "fallback_share"),
+    },
+    {
+        "metric": "Infeasibility count",
+        "unit": "count",
+        "candidates": ("combined_infeasibility_hours", "infeasibility_count", "optimization_infeasible_count"),
+    },
+    {
+        "metric": "Infeasibility share",
+        "unit": "%",
+        "candidates": ("combined_infeasibility_hours_share", "infeasibility_share"),
+    },
+    {
+        "metric": "Missed activations",
+        "unit": "count",
+        "candidates": ("missed_activation_count", "missed_activation_events"),
+    },
+    {
+        "metric": "SoC violation count",
+        "unit": "count",
+        "candidates": ("soc_violation_hours", "protected_soc_violation_count", "physical_soc_violation_count"),
+    },
+    {
+        "metric": "Reserve-headroom violations",
+        "unit": "count",
+        "candidates": ("reserve_headroom_shortfall_hours", "reserve_headroom_shortfall_count"),
+    },
+)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    root: Path
+    source_files: tuple[Path, ...]
+    rows: pd.DataFrame
+    score: tuple[int, int, float]
+
+
+_QUANTILE_PATTERN = re.compile(r"(p\d+)", re.IGNORECASE)
+TS_TIMESTAMP_CANDIDATES: tuple[str, ...] = (
+    "timestamp_utc",
+    "timestamp",
+    "time_utc",
+    "time",
+    "delivery_utc",
+    "delivery_start_utc",
+    "delivery_start",
+    "date",
+    "datetime",
+)
+TS_STRATEGY_CANDIDATES: tuple[str, ...] = ("trading_strategy", "strategy", "market_strategy", "strategy_name")
+TS_MODEL_CANDIDATES: tuple[str, ...] = ("model", "model_key", "model_name")
+TS_QUANTILE_CANDIDATES: tuple[str, ...] = (
+    "quantile_pair",
+    "quantile",
+    "quantile_low",
+    "quantile_high",
+    "scenario",
+)
+TS_CUMULATIVE_PNL_CANDS: tuple[str, ...] = (
+    "cumulative_net_profit_eur",
+    "cumulative_realized_net_profit_eur",
+    "cumulative_pnl_eur",
+    "cumulative_realized_pnl_eur",
+    "cumulative_net_revenue_eur",
+    "cumulative_profit_eur",
+)
+TS_PERIOD_PNL_CANDS: tuple[str, ...] = (
+    "realized_net_profit_eur",
+    "realized_pnl_eur",
+    "net_profit_eur",
+    "pnl_eur",
+    "net_revenue_eur",
+    "profit_eur",
+)
+
+
+def _safe_float(value: Any) -> float:
+    x = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(x) if pd.notna(x) and math.isfinite(float(x)) else math.nan
+
+
+def _normalize_for_matching(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text).strip().lower())
+
+
+def _resolve_matching_column(columns: list[str], candidates: tuple[str, ...], prefer_prefix: str | None = None) -> str | None:
+    normalized_columns = {_normalize_for_matching(c): c for c in columns}
+    norm_candidates = [_normalize_for_matching(c) for c in candidates]
+    preferred: str | None = None
+    for c in columns:
+        norm = _normalize_for_matching(c)
+        if prefer_prefix is not None and norm.startswith(_normalize_for_matching(prefer_prefix)):
+            preferred = c
+            break
+        if norm in norm_candidates:
+            return c
+    # Fuzzy fallback: token match.
+    for cand_norm, raw in zip(norm_candidates, candidates):
+        for col_norm, col_raw in normalized_columns.items():
+            if cand_norm and (cand_norm in col_norm or col_norm in cand_norm):
+                if preferred is None:
+                    preferred = col_raw
+                if prefer_prefix is None:
+                    return col_raw
+    return preferred
+
+
+def _latex_escape(value: Any) -> str:
+    s = str(value)
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+    return s
+
+
+def _tex_float(value: float, digits: int = 3) -> str:
+    if not math.isfinite(float(value)):
+        return "nan"
+    return f"{float(value):.{digits}f}"
+
+
+def _tex_color_def(name: str, hex_color: str) -> str:
+    hex_color = str(hex_color).lstrip("#")
+    red = int(hex_color[0:2], 16) / 255.0
+    green = int(hex_color[2:4], 16) / 255.0
+    blue = int(hex_color[4:6], 16) / 255.0
+    return rf"\definecolor{{{name}}}{{rgb}}{{{red:.4f},{green:.4f},{blue:.4f}}}"
+
+
+def normalize_strategy(value: Any, source_path: Path | None = None) -> str | None:
+    candidates = [str(value or "")]
+    if source_path is not None:
+        candidates.extend(source_path.parts)
+    joined = " ".join(candidates).lower().replace("_", "-")
+    tokens = {part.lower().replace("_", "-") for part in candidates if str(part).strip()}
+    if any(token in {"multi", "multi-market", "multimarket"} for token in tokens) or "multi" in joined:
+        return "Multi"
+    if any(token in {"da", "da-only", "day-ahead"} for token in tokens) or "da-only" in joined:
+        return "DA-only"
+    if any(token in {"bcm", "bcm-only", "afrr", "afrr-only"} for token in tokens) or "bcm-only" in joined:
+        return "BCM-only"
+    if any(token in {"bem", "bem-only"} for token in tokens) or "bem-only" in joined:
+        return "BEM-only"
+    return None
+
+
+def _format_value(value_eur: float) -> str:
+    return "n/a" if not math.isfinite(value_eur) else f"{value_eur / 1000.0:,.0f}"
+
+
+def _candidate_files(root: Path) -> list[Path]:
+    if root.is_file():
+        return [root]
+    if not root.exists():
+        return []
+    names = {
+        "performance_metrics.csv",
+        "performance_metrics_all_scenarios.csv",
+        "strategy_overview.csv",
+        "strategy_overview_valid_only.csv",
+        "rq3_market_strategy_summary.csv",
+        "annualized_net_profit_by_market_strategy.csv",
+        "performance_metric_reconciliation_debug_all.csv",
+        "backtest_summary.json",
+        "quantile_sweep_summary.csv",
+        "quantile_sweep_summary.json",
+    }
+    return sorted(p for p in root.rglob("*") if p.is_file() and p.name in names and p.suffix.lower() in {".csv", ".json"})
+
+
+def _collect_ts_candidates(root: Path) -> list[Path]:
+    if root.is_file():
+        return [root] if root.suffix.lower() in {".csv", ".parquet"} else []
+    if not root.exists():
+        return []
+    names = {
+        "cumulative_net_profit_by_market_strategy.csv",
+        "net_profit_by_market_strategy.csv",
+        "cumulative_net_profit.csv",
+        "net_profit.csv",
+        "market_strategy_timeseries.csv",
+        "daily_performance_metrics.csv",
+        "daily_performance_metrics_all_scenarios.csv",
+        "market_strategy_backtest_hourly.csv",
+        "market_strategy_backtest_hourly.parquet",
+        "backtest_hourly.csv",
+        "backtest_hourly.parquet",
+        "hourly_pnl.csv",
+        "hourly_pnl.parquet",
+        "hourly_results.csv",
+        "hourly_results.parquet",
+    }
+    candidates = [p for p in root.rglob("*.csv") if p.name in names]
+    candidates.extend(p for p in root.rglob("*.parquet") if p.name in names)
+    if not candidates:
+        # Fallback: all known parquet/csv files in result sections and per-strategy folders.
+        candidates = sorted(
+            p
+            for p in root.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in {".csv", ".parquet"}
+            and any(
+                key in p.name.lower()
+                for key in (
+                    "hourly",
+                    "daily",
+                    "profit",
+                    "cumulative",
+                    "net",
+                    "pnl",
+                    "strategy",
+                    "strategy_summary",
+                )
+            )
+        )
+    return sorted(candidates)
+
+
+def _ts_source_priority(path: Path) -> tuple[int, int, str]:
+    name = path.name.lower()
+    # Prefer daily period PnL; it matches the thesis cumulative comparison best
+    # and avoids excessive hourly tick density.
+    if name == "daily_performance_metrics.csv":
+        return (0, len(path.parts), str(path))
+    if name == "daily_performance_metrics_all_scenarios.csv":
+        return (1, len(path.parts), str(path))
+    if name == "performance_paths_long.csv":
+        return (2, len(path.parts), str(path))
+    if "hourly" in name or name.endswith(".parquet"):
+        return (3, len(path.parts), str(path))
+    return (4, len(path.parts), str(path))
+
+
+def _duration_days(row: pd.Series) -> tuple[float, str]:
+    for col in ["analysis_days", "n_days", "test_period_days", "duration_days"]:
+        if col in row.index:
+            value = _safe_float(row[col])
+            if value > 0:
+                return value, col
+    for start_col, end_col in [("start_utc", "end_utc"), ("start", "end")]:
+        if start_col in row.index and end_col in row.index:
+            start = pd.to_datetime(row[start_col], errors="coerce", utc=True)
+            end = pd.to_datetime(row[end_col], errors="coerce", utc=True)
+            if pd.notna(start) and pd.notna(end) and end > start:
+                return float((end - start).total_seconds() / 86400.0), f"{start_col}/{end_col}"
+    return math.nan, ""
+
+
+def _normalize_strategy_from_file(path: Path) -> str | None:
+    for part in path.parents:
+        candidate = normalize_strategy(part.name)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _extract_model_quantile_hint(path: Path, row: pd.Series | None = None) -> tuple[str | None, str | None]:
+    candidate_model = None
+    candidate_quantile = None
+    text = " ".join(part.lower() for part in path.parts)
+    if "xgb" in text or "xgboost" in text:
+        candidate_model = "xgb"
+    elif "tft" in text:
+        candidate_model = "tft"
+    elif "linear" in text:
+        candidate_model = "linear"
+    elif "rlqr" in text:
+        candidate_model = "rlqr"
+    elif row is not None:
+        raw_model = row.get("model", row.get("model_key", row.get("model_name")))
+        if pd.notna(raw_model):
+            raw_model = str(raw_model).lower()
+            if "xgb" in raw_model or "xgboost" in raw_model:
+                candidate_model = "xgb"
+            elif "tft" in raw_model:
+                candidate_model = "tft"
+            elif "linear" in raw_model:
+                candidate_model = "linear"
+            elif "rlqr" in raw_model:
+                candidate_model = "rlqr"
+    for part in [path.name] + list(path.parts):
+        for token in re.findall(_QUANTILE_PATTERN, part.lower()):
+            if token:
+                candidate_quantile = token.lower()
+                break
+        if candidate_quantile:
+            break
+    if row is not None:
+        raw_quantile = (
+            row.get("quantile_pair")
+            or row.get("quantile")
+            or row.get("quantile_low")
+            or row.get("quantile_high")
+            or row.get("scenario")
+        )
+        if pd.notna(raw_quantile):
+            match = _QUANTILE_PATTERN.search(str(raw_quantile))
+            if match:
+                candidate_quantile = match.group(1).lower()
+    return candidate_model, candidate_quantile
+
+
+def _to_strat_series(
+    raw_series: Any,
+    strategy_hint: str | None,
+) -> str | None:
+    if pd.isna(raw_series):
+        return strategy_hint
+    candidate = str(raw_series).strip()
+    normalized = normalize_strategy(candidate)
+    if normalized is None:
+        normalized = STRATEGY_GAMUT.get(candidate.lower().replace("_", "-"), None)
+    return normalized or strategy_hint
+
+
+def _canonicalize_strategy(value: Any) -> str | None:
+    if pd.isna(value):
+        return None
+    candidate = str(value).strip()
+    normalized = _normalize_for_matching(candidate)
+    if candidate in STRATEGY_ORDER:
+        return candidate
+    canonical = STRATEGY_GAMUT.get(candidate.lower(), None)
+    if canonical is not None:
+        return canonical
+    for key, target in STRATEGY_GAMUT.items():
+        if normalized == _normalize_for_matching(key):
+            return target
+    return None
+
+
+def _read_ts_candidate(path: Path, require_model: str | None = "xgb", require_quantile: str | None = "p50") -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:
+            raise ValueError(f"Could not read candidate RQ3 TS file {path}: {exc}") from exc
+    else:
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:
+            raise ValueError(f"Could not read candidate RQ3 TS file {path}: {exc}") from exc
+    if df.empty:
+        return pd.DataFrame()
+    columns = list(df.columns)
+    time_col = _resolve_matching_column(columns, TS_TIMESTAMP_CANDIDATES)
+    if time_col is None:
+        return pd.DataFrame()
+    model_hint, quantile_hint = _extract_model_quantile_hint(path)
+    model_filter = model_hint
+    quantile_filter = quantile_hint
+    cumulative_col = _resolve_matching_column(columns, TS_CUMULATIVE_PNL_CANDS)
+    if cumulative_col is not None:
+        cumulative_norm = _normalize_for_matching(cumulative_col)
+        if "cumulative" not in cumulative_norm:
+            cumulative_col = None
+    period_col = _resolve_matching_column(columns, TS_PERIOD_PNL_CANDS)
+    strategy_hint = _normalize_strategy_from_file(path)
+    strategy_col = _resolve_matching_column(columns, TS_STRATEGY_CANDIDATES)
+    quantile_col = _resolve_matching_column(columns, TS_QUANTILE_CANDIDATES)
+    model_col = _resolve_matching_column(columns, TS_MODEL_CANDIDATES)
+    if cumulative_col is None and period_col is None:
+        # Candidate has no direct pnl column; interpret wide columns as strategy rows only if they are numeric and strategy-like.
+        wide_value_cols = [
+            col
+            for col in columns
+            if col != time_col and col != strategy_col and col != model_col and col != quantile_col and pd.api.types.is_numeric_dtype(df[col].dtype)
+            and any(token in _normalize_for_matching(col) for token in ("multi", "da", "bcm", "afrr", "bem"))
+        ]
+        if not wide_value_cols:
+            return pd.DataFrame()
+        value_cols = wide_value_cols
+        value_source = "wide"
+    else:
+        value_cols = [cumulative_col or period_col]
+        value_source = "narrow"
+    rows: list[dict[str, Any]] = []
+    if strategy_col is not None:
+        for _, row in df.iterrows():
+            model, quantile = _extract_model_quantile_hint(path, row)
+            if require_model and model and require_model not in model:
+                continue
+            if require_quantile and quantile and quantile != require_quantile:
+                continue
+            strategy = _to_strat_series(row.get(strategy_col), strategy_hint)
+            if strategy is None:
+                continue
+            timestamp = pd.to_datetime(row[time_col], errors="coerce", utc=True)
+            if pd.isna(timestamp):
+                continue
+            for pnl_col in value_cols:
+                pnl_value = _safe_float(row.get(pnl_col))
+                if not math.isfinite(pnl_value):
+                    continue
+                rows.append(
+                    {
+                        "timestamp_utc": timestamp,
+                        "strategy": strategy,
+                        "raw_pnl_eur": pnl_value,
+                        "is_cumulative_input": cumulative_col is not None,
+                        "source_file": str(path),
+                        "model": model or model_filter or "",
+                        "quantile": quantile or quantile_filter or "",
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    # Wide-format fallback: one column per strategy in each row.
+    for _, row in df.iterrows():
+        model, quantile = _extract_model_quantile_hint(path, row)
+        if require_model and model and require_model not in model:
+            continue
+        if require_quantile and quantile and quantile != require_quantile:
+            continue
+        timestamp = pd.to_datetime(row[time_col], errors="coerce", utc=True)
+        if pd.isna(timestamp):
+            continue
+        for col in value_cols:
+            strategy = _to_strat_series(col, strategy_hint)
+            if strategy is None:
+                continue
+            pnl_value = _safe_float(row[col])
+            if not math.isfinite(pnl_value):
+                continue
+            rows.append(
+                {
+                    "timestamp_utc": timestamp,
+                    "strategy": strategy,
+                    "raw_pnl_eur": pnl_value,
+                    "is_cumulative_input": value_source == "narrow" and cumulative_col is not None,
+                    "source_file": str(path),
+                    "model": model or model_filter or "",
+                    "quantile": quantile or quantile_filter or "",
+                }
+            )
+    return pd.DataFrame(rows)
+def _extract_quantile_tag(*raw_values: Any) -> str:
+    for value in raw_values:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            continue
+        candidate = str(value)
+        match = _QUANTILE_PATTERN.search(candidate)
+        if match:
+            return match.group(1).lower()
+        cleaned = candidate.strip().replace("_", "-").replace(" ", "-")
+        if cleaned:
+            return cleaned.lower()
+    return ""
+
+
+def _annualized_profit(row: pd.Series) -> tuple[float, str, str]:
+    for col in PROFIT_COLS:
+        if col in row.index:
+            value = _safe_float(row[col])
+            if math.isfinite(value):
+                return value, col, "direct"
+    for col in NET_PROFIT_COLS:
+        if col not in row.index:
+            continue
+        net_profit = _safe_float(row[col])
+        days, source = _duration_days(row)
+        if math.isfinite(net_profit) and days > 0:
+            return net_profit * 365.0 / days, f"{col};{source}", "annualized_from_duration"
+    return math.nan, "", ""
+
+
+def _resolve_component(row: pd.Series, candidates: tuple[str, ...]) -> tuple[float, str, str, bool]:
+    """Return first available component value from candidates.
+
+    Returns (value, col_used, method, annualized).
+    method is one of {"annualized", "annualized_from_duration", "raw", "missing"}.
+    annualized indicates whether value already is annualized.
+    """
+    available: list[str] = []
+    for col in candidates:
+        if col in row.index:
+            available.append(col)
+    # Prefer explicitly annualized columns when present.
+    for col in available:
+        if col.startswith("annualized_"):
+            value = _safe_float(row[col])
+            if math.isfinite(value):
+                return value, col, "annualized", True
+    # Raw totals / annualize per duration if needed.
+    for col in available:
+        if col.startswith("annualized_"):
+            continue
+        value = _safe_float(row[col])
+        if not math.isfinite(value):
+            continue
+        if col in {"n_days", "test_period_days", "duration_days", "duration_days_in_year", "hours", "n_hours"}:
+            continue
+        days, source = _duration_days(row)
+        if days > 0:
+            annualized = value * 365.0 / days
+            return annualized, col, f"annualized_from_duration:{source}", False
+        return math.nan, col, "missing_duration", False
+    # If both explicit annualized and raw candidates are missing, this component is unavailable.
+    # Keep a single warning path for clarity.
+    return math.nan, ",".join(candidates[:3]) if candidates else "", "missing", False
+
+
+def _to_plot_value(value: float, scale: str = "kEUR") -> float:
+    if not math.isfinite(value):
+        return math.nan
+    if scale == "kEUR":
+        return value / 1000.0
+    return value
+
+
+def _choose_scale(values: list[float]) -> tuple[str, float]:
+    finite = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    if not finite:
+        return "EUR", 1.0
+    mx = max(abs(v) for v in finite)
+    if mx >= 50_000:
+        return "kEUR", 1.0 / 1000.0
+    return "EUR", 1.0
+
+
+def _parse_formats(raw: str) -> set[str]:
+    allowed = {"csv", "json", "png", "pdf", "tex"}
+    formats = {item.strip().lower() for item in str(raw).split(",") if item.strip()}
+    unknown = formats - allowed
+    if unknown:
+        raise ValueError(f"Unknown output format(s): {', '.join(sorted(unknown))}. Supported: {', '.join(sorted(allowed))}")
+    if not formats:
+        raise ValueError("At least one output format is required.")
+    return formats
+
+
+def _export_output_tree(source: Path, destination: Path) -> None:
+    if not source.is_dir():
+        raise FileNotFoundError(f"Cannot export missing RQ3 output directory: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        if destination.is_dir() and not destination.is_symlink():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
+    shutil.copytree(source, destination)
+
+
+def _prune_unselected_formats(root: Path, formats: set[str]) -> dict[str, int]:
+    suffix_by_format = {
+        "csv": ".csv",
+        "json": ".json",
+        "png": ".png",
+        "pdf": ".pdf",
+        "tex": ".tex",
+    }
+    prune_suffixes = {suffix for fmt, suffix in suffix_by_format.items() if fmt not in formats}
+    counts = {suffix: 0 for suffix in sorted(prune_suffixes)}
+    if not root.exists():
+        return counts
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in prune_suffixes:
+            continue
+        path.unlink()
+        counts[suffix] += 1
+    return counts
+
+
+def _read_rows_from_file(path: Path) -> pd.DataFrame:
+    try:
+        if path.suffix.lower() == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                df = pd.DataFrame(data)
+            elif isinstance(data, dict):
+                # Quantile-sweep manifests can wrap rows in a top-level list.
+                row_list = next(
+                    (data[key] for key in ("rows", "records", "scenarios", "summary") if isinstance(data.get(key), list)),
+                    None,
+                )
+                df = pd.DataFrame(row_list) if row_list is not None else pd.DataFrame([data])
+            else:
+                return pd.DataFrame()
+        else:
+            df = pd.read_csv(path)
+    except Exception as exc:
+        raise ValueError(f"Could not read candidate RQ3 summary file {path}: {exc}") from exc
+    if df.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        strategy_raw = row.get("trading_strategy", row.get("strategy", row.get("market_strategy", "")))
+        strategy = normalize_strategy(strategy_raw, path)
+        if strategy is None:
+            strategy = _normalize_strategy_from_file(path)
+        if strategy is None:
+            continue
+        annualized, value_col, method = _annualized_profit(row)
+        if not math.isfinite(annualized):
+            continue
+        model_hint, quantile_hint = _extract_model_quantile_hint(path, row)
+        model = str(row.get("model_key", row.get("model", row.get("model_name", model_hint or "")))).lower()
+        quantile = _extract_quantile_tag(
+            row.get("quantile_pair"),
+            row.get("quantile_policy"),
+            row.get("scenario"),
+            row.get("quantile", row.get("quantile_low")),
+            quantile_hint,
+        )
+        revenue_components: dict[str, tuple[float, str, str, bool]] = {}
+        cost_components: dict[str, tuple[float, str, str, bool]] = {}
+
+        for comp_name, candidates in REVENUE_COMPONENT_SPECS:
+            comp_value = _resolve_component(row, candidates)
+            revenue_components[comp_name] = comp_value
+
+        for comp_name, candidates in COST_DETAIL_COMPONENT_SPECS:
+            comp_value = _resolve_component(row, candidates)
+            cost_components[comp_name] = comp_value
+
+        total_cost = _resolve_component(row, COST_TOTAL_CANDIDATES)
+
+        duration_days, duration_source = _duration_days(row)
+        missing_duration_components = [
+            comp_name for comp_name, (_, col, method, _) in {
+                **revenue_components,
+                **cost_components,
+                "total_cost": total_cost,
+            }.items()
+            if method == "missing_duration"
+        ]
+        if missing_duration_components:
+            raise ValueError(
+                "Cannot annualize raw component(s) without a valid duration for decomposition rows. "
+                f"File={path}, strategy={strategy}, model={model}, quantile={quantile}, "
+                f"components={missing_duration_components}, duration_columns_tried=analysis_days,n_days,test_period_days,duration_days,start_utc_end_utc,start_end"
+            )
+
+        output_row = row.to_dict()
+        output_row.update(
+            {
+                "strategy": strategy,
+                "strategy_raw": strategy_raw,
+                "annualized_net_profit_eur_per_year": annualized,
+                "value_column_used": value_col,
+                "annualization_method": method,
+                "model": model,
+                "quantile": quantile,
+                "simulation_valid": row.get("simulation_valid", np.nan),
+                "thesis_reportable": row.get("thesis_reportable", np.nan),
+                "invalid_reason": row.get("invalid_reason", ""),
+                "duration_days": duration_days,
+                "duration_source": duration_source,
+                "start_utc": row.get("start_utc", row.get("start", np.nan)),
+                "end_utc": row.get("end_utc", row.get("end", np.nan)),
+                "source_file": str(path),
+                "revenue_components": revenue_components,
+                "cost_components": cost_components,
+                "total_cost_component": total_cost,
+            }
+        )
+        rows.append(output_row)
+    return pd.DataFrame(rows)
+
+
+def _load_candidate(root: Path) -> Candidate | None:
+    files = _candidate_files(root)
+    if not files:
+        return None
+    frames = [_read_rows_from_file(path) for path in files]
+    rows = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(not f.empty for f in frames) else pd.DataFrame()
+    if rows.empty:
+        return None
+    detected = len(set(rows["strategy"].astype(str)) & set(STRATEGY_ORDER))
+    xgb_p50 = rows["model"].astype(str).str.contains("xgb", case=False, na=False) & rows["quantile"].astype(str).str.contains("p50", case=False, na=False)
+    mtime = max(path.stat().st_mtime for path in files)
+    return Candidate(root=root, source_files=tuple(files), rows=rows, score=(detected, int(xgb_p50.sum()), float(mtime)))
+
+
+def _load_cumulative_series_candidate(root: Path) -> tuple[pd.DataFrame, Path] | None:
+    paths = _collect_ts_candidates(root)
+    if not paths:
+        return None
+    required = set(STRATEGY_ORDER)
+    best_partial: tuple[pd.DataFrame, Path] | None = None
+    for priority in sorted({_ts_source_priority(path)[0] for path in paths}):
+        frames: list[pd.DataFrame] = []
+        used_sources: list[Path] = []
+        for path in sorted(paths, key=_ts_source_priority):
+            if _ts_source_priority(path)[0] != priority:
+                continue
+            try:
+                frame = _read_ts_candidate(path)
+            except ValueError:
+                continue
+            if frame.empty:
+                continue
+            frame["source_file"] = str(path)
+            frames.append(frame)
+            used_sources.append(path)
+        if not frames:
+            continue
+        data = pd.concat(frames, ignore_index=True)
+        data["strategy"] = data["strategy"].map(_canonicalize_strategy)
+        data = data[data["strategy"].notna()].copy()
+        if data.empty:
+            continue
+        xgb_p50 = (data["model"].astype(str).str.contains("xgb", case=False, na=False)) & (
+            data["quantile"].astype(str).str.contains("p50", case=False, na=False)
+        )
+        if xgb_p50.any():
+            data = data.loc[xgb_p50].copy()
+        else:
+            data["model"] = "xgb"
+            data["quantile"] = "p50"
+        data["timestamp_utc"] = pd.to_datetime(data["timestamp_utc"], utc=True, errors="coerce")
+        data = data.dropna(subset=["timestamp_utc", "strategy", "raw_pnl_eur"])
+        data = data.loc[data["strategy"].isin(STRATEGY_ORDER)].copy()
+        if data.empty:
+            continue
+        selected = data["source_file"].dropna()
+        selected_path = Path(selected.iloc[0]) if not selected.empty else used_sources[0]
+        detected = set(data["strategy"])
+        if required.issubset(detected):
+            return data, selected_path
+        if best_partial is None or len(detected & required) > len(set(best_partial[0]["strategy"]) & required):
+            best_partial = (data, selected_path)
+    return best_partial
+
+
+def _fallback_run_roots_for_missing_explicit(path: Path) -> list[Path]:
+    """Return newest plausible run roots when a timestamped explicit path is stale.
+
+    RQ3 simulation folders are timestamped, so thesis commands often become stale
+    after a rerun. If the caller gives a missing timestamped folder, prefer the
+    newest folder with the same run-name prefix instead of failing immediately.
+    """
+    parent = path.parent
+    if not parent.exists():
+        return []
+    name = path.name
+    patterns: list[str] = []
+    timestamp_match = re.match(r"^(?P<prefix>.+)_\d{8}T\d{6}Z$", name)
+    if timestamp_match:
+        patterns.append(f"{timestamp_match.group('prefix')}_*")
+    if name.startswith("rq3_xgb_p50_market_benchmark"):
+        patterns.append("rq3_xgb_p50_market_benchmark_*")
+    if not patterns:
+        return []
+    matches: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for candidate in parent.glob(pattern):
+            if candidate.is_dir() and candidate not in seen:
+                seen.add(candidate)
+                matches.append(candidate)
+    return sorted(matches, key=lambda p: (p.name, p.stat().st_mtime), reverse=True)
+
+
+def discover_input(explicit_run_root: Path | None = None, search_roots: list[Path] | None = None) -> Candidate:
+    roots: list[Path] = []
+    if explicit_run_root is not None:
+        if not explicit_run_root.exists():
+            fallback_roots = _fallback_run_roots_for_missing_explicit(explicit_run_root)
+            if not fallback_roots:
+                raise FileNotFoundError(
+                    f"Explicit RQ3 run root does not exist: {explicit_run_root}\n"
+                    "Check the timestamped folder name on this machine, for example:\n"
+                    "find artifacts/simulation_runs -maxdepth 1 -type d -name 'rq3_xgb_p50_market_benchmark_*' | sort"
+                )
+            print(
+                "[WARN] Explicit RQ3 run root is missing; using newest matching run root instead: "
+                f"{fallback_roots[0]}"
+            )
+            roots.append(fallback_roots[0])
+        else:
+            roots.append(explicit_run_root)
+    else:
+        for root in search_roots or DEFAULT_INPUT_ROOTS:
+            if not root.exists():
+                continue
+            if root.name == "simulation_runs":
+                roots.extend(sorted(root.glob("rq3_*"), key=lambda p: p.name, reverse=True))
+            else:
+                roots.append(root)
+    candidates = [c for c in (_load_candidate(root) for root in roots) if c is not None]
+    if not candidates:
+        searched = "\n".join(f"  - {p}" for p in roots) or "  - <none>"
+        raise FileNotFoundError(
+            "No suitable RQ3 market-comparison input was found. Provide --run-root pointing to the completed "
+            f"rq3_xgb_p50_market_benchmark_* folder. Expected files include performance_metrics_all_scenarios.csv, "
+            f"performance_metrics.csv, backtest_summary.json, or quantile_sweep_summary.csv/json.\nSearched:\n{searched}"
+        )
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    best = candidates[0]
+    if len(set(best.rows["strategy"]) & set(STRATEGY_ORDER)) < len(STRATEGY_ORDER):
+        detected = sorted(set(best.rows["strategy"]))
+        raise ValueError(
+            "Selected RQ3 input does not contain all required strategies. "
+            f"Required={STRATEGY_ORDER}; detected={detected}; root={best.root}"
+        )
+    return best
+
+
+def select_strategy_rows(candidate: Candidate) -> pd.DataFrame:
+    data = candidate.rows.copy()
+    data = data.loc[data["strategy"].isin(STRATEGY_ORDER)].copy()
+    if data.empty:
+        raise ValueError(f"No required RQ3 strategies found in selected input: {candidate.root}")
+    xgb_p50 = data["model"].astype(str).str.contains("xgb", case=False, na=False) & data["quantile"].astype(str).str.contains("p50", case=False, na=False)
+    if xgb_p50.any():
+        data = data.loc[xgb_p50].copy()
+    data["_strategy_order"] = data["strategy"].map({name: idx for idx, name in enumerate(STRATEGY_ORDER)})
+    data["_source_rank"] = data["source_file"].astype(str).map(lambda s: 0 if s.endswith("performance_metrics.csv") else 1)
+    data = data.sort_values(["_strategy_order", "_source_rank"]).drop_duplicates("strategy", keep="first")
+    missing = [s for s in STRATEGY_ORDER if s not in set(data["strategy"])]
+    if missing:
+        raise ValueError(f"Missing required RQ3 strategies after filtering to XGB p50: {missing}")
+    data = data.sort_values("_strategy_order").drop(columns=["_strategy_order", "_source_rank"])
+    return data
+
+
+def extract_decomposition_rows(data: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[str]], str, str]:
+    """Build strategy-level annualized revenue/cost components.
+
+    Returns:
+      (component_frame, component_summary, scale, scale_label)
+    """
+    decomposition_rows: list[dict[str, Any]] = []
+    component_status: dict[str, list[str]] = {"revenue": [], "cost": []}
+    annualization_methods: set[str] = set()
+    for _, row in data.iterrows():
+        strategy = str(row["strategy"])
+        row_out: dict[str, Any] = {"strategy": strategy}
+        available_revenue_cols: list[str] = []
+        available_cost_cols: list[str] = []
+        # Revenue components
+        for comp_name in REVENUE_COMPONENTS:
+            value, col, method, is_annualized = row["revenue_components"][comp_name]
+            annualization_methods.add(method)
+            if not math.isfinite(value):
+                is_structural = comp_name in STRUCTURALLY_ZERO_COMPONENTS.get(strategy, ())
+                if is_structural:
+                    component_status["revenue"].append(f"{strategy}: {comp_name} set to 0 (structural)")
+                    value = 0.0
+                else:
+                    component_status["revenue"].append(f"{strategy}: {comp_name} unavailable (missing {col})")
+                    value = math.nan
+            row_out[f"revenue::{comp_name}"] = value
+            if math.isfinite(value) and (value != 0 or is_annualized):
+                available_revenue_cols.append(f"{comp_name}:{col}:{method}")
+
+        detailed_cost_used = False
+        for comp_name in COST_COMPONENTS:
+            if comp_name == "Total costs":
+                continue
+            value, col, method, is_annualized = row["cost_components"][comp_name]
+            annualization_methods.add(method)
+            if math.isfinite(value):
+                detailed_cost_used = True
+                row_out[f"cost::{comp_name}"] = value
+                available_cost_cols.append(f"{comp_name}:{col}:{method}")
+            else:
+                is_structural = False
+                if strategy == "BCM-only" and comp_name in {"ID recourse cost", "Activation penalty", "Activation cost", "Auxiliary cost", "Degradation cost", "Transaction cost", "Offer cost", "Terminal SoC repair"}:
+                    is_structural = True
+                if is_structural:
+                    component_status["cost"].append(f"{strategy}: {comp_name} set to 0 (structural)")
+                    row_out[f"cost::{comp_name}"] = 0.0
+                else:
+                    component_status["cost"].append(f"{strategy}: {comp_name} unavailable (missing {col})")
+                    row_out[f"cost::{comp_name}"] = math.nan
+
+        if any(math.isfinite(v[0]) for v in row["cost_components"].values()):
+            # If any detailed cost component available, omit total costs.
+            row_out["cost::Total costs"] = 0.0
+            row_out["cost_component_mode"] = "detailed"
+        else:
+            total_cost_value, total_col, total_method, _ = row["total_cost_component"]
+            annualization_methods.add(total_method)
+            if not math.isfinite(total_cost_value):
+                total_cost_value = 0.0
+                component_status["cost"].append(f"{strategy}: Total costs unavailable (missing {total_col})")
+                row_out["cost_component_mode"] = "missing"
+            else:
+                row_out["cost_component_mode"] = "total"
+            row_out["cost::Total costs"] = total_cost_value
+            if total_cost_value != 0:
+                available_cost_cols.append(f"Total costs:{total_col}:{total_method}")
+
+        row_out["available_revenue_components"] = "; ".join(sorted(available_revenue_cols))
+        row_out["available_cost_components"] = "; ".join(sorted(available_cost_cols))
+        row_out["annualized_from"] = str(row["value_column_used"])
+        row_out["annualization_method"] = row["annualization_method"]
+        row_out["cost_component_mode"] = row_out["cost_component_mode"]
+        row_out["duration_days"] = _safe_float(row["duration_days"])
+        decomposition_rows.append(row_out)
+
+    if not decomposition_rows:
+        raise ValueError("No strategy rows available for decomposition after filtering.")
+    decomposition = pd.DataFrame(decomposition_rows)
+    # Determine unit based on finite components.
+    all_values: list[float] = []
+    for col in decomposition.columns:
+        if col.startswith("revenue::") or col.startswith("cost::"):
+            all_values.extend([float(v) for v in decomposition[col].tolist() if pd.notna(v) and math.isfinite(float(v))])
+    unit, _ = _choose_scale(all_values)
+    scale_label = f"Annualized {unit}/year"
+    return decomposition, component_status, unit, scale_label
+
+
+def plot_annualized_net_profit(data: pd.DataFrame, png_path: Path, pdf_path: Path, *, formats: set[str]) -> list[Path]:
+    apply_geo_style()
+    values_k = data["annualized_net_profit_eur_per_year"].to_numpy(dtype=float) / 1000.0
+    labels = data["strategy"].tolist()
+    colors = [STRATEGY_COLOR.get(label, THESIS_PALETTE["neutral_dark"]) for label in labels]
+    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    x = np.arange(len(labels))
+    bars = ax.bar(x, values_k, color=colors, edgecolor="white", linewidth=0.8)
+    ax.axhline(0.0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.8)
+    ax.set_xticks(x, labels=labels)
+    ax.set_xlabel("Market strategy")
+    ax.set_ylabel("Annualized net profit (kEUR/year)")
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ymax = float(np.nanmax(values_k)) if len(values_k) else 0.0
+    ymin = float(np.nanmin(values_k)) if len(values_k) else 0.0
+    span = max(1.0, ymax - ymin)
+    ax.set_ylim(min(0.0, ymin) - 0.12 * span, max(0.0, ymax) + 0.18 * span)
+    for bar, value in zip(bars, values_k):
+        offset = 0.035 * span
+        va = "bottom" if value >= 0 else "top"
+        y = value + offset if value >= 0 else value - offset
+        ax.text(bar.get_x() + bar.get_width() / 2, y, f"{value:,.0f}", ha="center", va=va, fontsize=9)
+    fig.tight_layout()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    if "png" in formats:
+        fig.savefig(png_path, dpi=220)
+        paths.append(png_path)
+    if "pdf" in formats:
+        fig.savefig(pdf_path)
+        paths.append(pdf_path)
+    plt.close(fig)
+    return paths
+
+
+def write_latex_annualized_net_profit(data: pd.DataFrame, path: Path) -> Path:
+    values_k = data["annualized_net_profit_eur_per_year"].to_numpy(dtype=float) / 1000.0
+    labels = data["strategy"].tolist()
+    ymax = float(np.nanmax(values_k)) if len(values_k) else 0.0
+    ymin = float(np.nanmin(values_k)) if len(values_k) else 0.0
+    span = max(1.0, ymax - ymin)
+    y_min = min(0.0, ymin) - 0.12 * span
+    y_max = max(0.0, ymax) + 0.18 * span
+    color_names = {label: f"rqThree{label.replace('-', '').replace('only', 'Only')}" for label in labels}
+    nodes = []
+    bars = []
+    for idx, (label, value) in enumerate(zip(labels, values_k)):
+        y0 = min(0.0, float(value))
+        y1 = max(0.0, float(value))
+        bars.append(
+            rf"\filldraw[fill={color_names[label]}, draw=white, line width=0.6pt] "
+            rf"(axis cs:{_tex_float(idx - 0.32, 3)},{_tex_float(y0, 4)}) rectangle "
+            rf"(axis cs:{_tex_float(idx + 0.32, 3)},{_tex_float(y1, 4)});"
+        )
+        offset = 0.035 * span
+        y = value + offset if value >= 0 else value - offset
+        anchor = "south" if value >= 0 else "north"
+        nodes.append(rf"\node[font=\scriptsize, anchor={anchor}] at (axis cs:{idx},{_tex_float(y, 4)}) {{{_latex_escape(f'{value:,.0f}')}}};")
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        _tex_color_def("rqThreeNeutral", THESIS_PALETTE["neutral_dark"]),
+        _tex_color_def("rqThreeGrid", "#D8D8D8"),
+        *[_tex_color_def(color_names[label], STRATEGY_COLOR.get(label, THESIS_PALETTE["neutral_dark"])) for label in labels],
+        r"\begin{axis}[",
+        r"tick align=outside,",
+        r"axis line style={rqThreeNeutral},",
+        r"tick style={rqThreeNeutral},",
+        r"label style={font=\small},",
+        r"tick label style={font=\small},",
+        r"grid=major,",
+        r"grid style={rqThreeGrid!55, line width=0.2pt},",
+        r"width=0.78\linewidth,",
+        r"height=0.48\linewidth,",
+        r"xlabel={Market strategy},",
+        r"ylabel={Annualized net profit (kEUR/year)},",
+        "xmin=-0.5, xmax=" + _tex_float(len(labels) - 0.5, 1) + ",",
+        "xtick={" + ",".join(str(i) for i in range(len(labels))) + "},",
+        "xticklabels={" + ",".join(_latex_escape(label) for label in labels) + "},",
+        rf"ymin={_tex_float(y_min, 4)}, ymax={_tex_float(y_max, 4)},",
+        r"axis y line*=left,",
+        r"axis x line*=bottom,",
+        r"]",
+        *bars,
+    ]
+    lines.extend(
+        [
+            rf"\draw[rqThreeNeutral, line width=0.7pt] (axis cs:-0.5,0) -- (axis cs:{_tex_float(len(labels) - 0.5, 1)},0);",
+            *nodes,
+            r"\end{axis}",
+            r"\end{tikzpicture}",
+            r"\caption{Annualized net profit by market participation strategy. The figure compares the XGB p50 multi-market strategy with DA-only, BCM-only and BEM-only baselines to evaluate whether revenue stacking improves BESS profitability.}",
+            r"\label{fig:rq3-annualized-net-profit-by-market-strategy}",
+            r"\end{figure}",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _revenue_components_for_plot(decomp: pd.DataFrame) -> list[str]:
+    out: list[str] = []
+    available = decomp.get("available_revenue_components", pd.Series(dtype=str)).astype(str)
+    for name in REVENUE_COMPONENTS:
+        col = f"revenue::{name}"
+        if col not in decomp.columns:
+            continue
+        values = pd.to_numeric(decomp[col], errors="coerce")
+        if values.abs().gt(1e-12).any() or available.str.contains(name, regex=False).any():
+            out.append(name)
+    return out
+
+
+def _cost_components_for_plot(decomp: pd.DataFrame) -> list[str]:
+    detailed_components = [name for name in COST_COMPONENTS if name != "Total costs" and f"cost::{name}" in decomp.columns]
+    if decomp.empty:
+        return []
+    if all(decomp.get("cost_component_mode", "") == "total") and "cost::Total costs" in decomp.columns:
+        return ["Total costs"]
+    available = decomp.get("available_cost_components", pd.Series(dtype=str)).astype(str)
+    out: list[str] = []
+    for name in detailed_components:
+        values = pd.to_numeric(decomp[f"cost::{name}"], errors="coerce")
+        if values.abs().gt(1e-12).any() or available.str.contains(name, regex=False).any():
+            out.append(name)
+    if out:
+        return out
+    if "cost::Total costs" in decomp.columns:
+        return ["Total costs"]
+    return out
+
+
+def _decomposition_long(decomp: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    revenue_components = _revenue_components_for_plot(decomp)
+    cost_components = _cost_components_for_plot(decomp)
+    for _, row in decomp.iterrows():
+        strategy = str(row["strategy"])
+        for name in revenue_components:
+            col = f"revenue::{name}"
+            rows.append(
+                {
+                    "strategy": strategy,
+                    "component_type": "revenue",
+                    "component": name,
+                    "annualized_component_eur_per_year": _safe_float(row[col]),
+                    "cost_component_mode": row.get("cost_component_mode", ""),
+                    "available_revenue_components": row.get("available_revenue_components", ""),
+                    "available_cost_components": row.get("available_cost_components", ""),
+                    "annualization_method": row.get("annualization_method", ""),
+                    "source_duration_days": row.get("duration_days", np.nan),
+                }
+            )
+        for name in cost_components:
+            col = f"cost::{name}"
+            rows.append(
+                {
+                    "strategy": strategy,
+                    "component_type": "cost",
+                    "component": name,
+                    "annualized_component_eur_per_year": -abs(_safe_float(row[col])),
+                    "cost_component_mode": row.get("cost_component_mode", ""),
+                    "available_revenue_components": row.get("available_revenue_components", ""),
+                    "available_cost_components": row.get("available_cost_components", ""),
+                    "annualization_method": row.get("annualization_method", ""),
+                    "source_duration_days": row.get("duration_days", np.nan),
+                }
+            )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["_strategy_order"] = out["strategy"].map({name: idx for idx, name in enumerate(STRATEGY_ORDER)})
+    component_order = {name: idx for idx, name in enumerate(list(REVENUE_COMPONENTS) + list(COST_COMPONENTS))}
+    out["_component_order"] = out["component"].map(component_order)
+    out["_component_type_order"] = out["component_type"].map({"revenue": 0, "cost": 1})
+    return out.sort_values(["_strategy_order", "_component_type_order", "_component_order"]).drop(
+        columns=["_strategy_order", "_component_type_order", "_component_order"]
+    )
+
+
+def _plot_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit_scale: float, out_path: Path, pdf_path: Path, *, formats: set[str]) -> list[Path]:
+    apply_geo_style()
+    strategies = decomp["strategy"].tolist()
+    x = np.arange(len(strategies))
+    revenue_components = _revenue_components_for_plot(decomp)
+    cost_components = _cost_components_for_plot(decomp)
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    rev_bottom = np.zeros(len(strategies), dtype=float)
+    cost_bottom = np.zeros(len(strategies), dtype=float)
+    for name in revenue_components:
+        y = np.nan_to_num(decomp[f"revenue::{name}"].to_numpy(dtype=float) * unit_scale, nan=0.0)
+        bottom = np.where(y >= 0.0, rev_bottom, cost_bottom)
+        ax.bar(
+            x,
+            y,
+            bottom=bottom,
+            width=0.78,
+            color=REVENUE_COMPONENT_COLOR.get(name, THESIS_PALETTE["primary"]),
+            edgecolor="white",
+            linewidth=0.6,
+            label=f"{REVENUE_LABEL}: {name}",
+        )
+        rev_bottom = rev_bottom + np.maximum(y, 0.0)
+        cost_bottom = cost_bottom + np.minimum(y, 0.0)
+
+    for name in cost_components:
+        raw = decomp[f"cost::{name}"].to_numpy(dtype=float) * unit_scale
+        y = -np.abs(np.nan_to_num(raw, nan=0.0))
+        ax.bar(
+            x,
+            y,
+            bottom=cost_bottom,
+            width=0.78,
+            color=COST_COMPONENT_COLOR.get(name, THESIS_PALETTE["neutral_dark"]),
+            edgecolor="white",
+            linewidth=0.6,
+            label=f"{COST_LABEL}: {name}",
+        )
+        cost_bottom = cost_bottom + y
+
+    ymin = min(0.0, float(np.nanmin(cost_bottom))) if len(cost_bottom) else -1.0
+    ymax = max(0.0, float(np.nanmax(rev_bottom))) if len(rev_bottom) else 1.0
+    span = max(1.0, ymax - ymin)
+
+    ax.axhline(0.0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.8)
+    ax.set_xticks(x, labels=strategies)
+    ax.set_xlabel("Market strategy")
+    ax.set_ylabel(f"Annualized value ({unit}/year)")
+    ax.set_ylim(ymin - 0.16 * span, ymax + 0.16 * span)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(
+            handles=handles,
+            labels=labels,
+            loc="upper center",
+            ncol=2,
+            frameon=False,
+            fontsize=8,
+            alignment="left",
+        )
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    if "png" in formats:
+        fig.savefig(out_path, dpi=220)
+        paths.append(out_path)
+    if "pdf" in formats:
+        fig.savefig(pdf_path)
+        paths.append(pdf_path)
+    plt.close(fig)
+    return paths
+
+
+def write_latex_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit_scale: float, path: Path) -> Path:
+    strategies = decomp["strategy"].tolist()
+    revenue_components = _revenue_components_for_plot(decomp)
+    cost_components = _cost_components_for_plot(decomp)
+
+    rev_color_names: dict[str, str] = {
+        name: f"rqThreeRev{''.join(ch for ch in name if ch.isalnum())}" for name in revenue_components
+    }
+    cost_color_names: dict[str, str] = {
+        name: f"rqThreeCost{''.join(ch for ch in name if ch.isalnum())}" for name in cost_components
+    }
+
+    lines: list[str] = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+    ]
+    for name, color_name in rev_color_names.items():
+        lines.append(_tex_color_def(color_name, REVENUE_COMPONENT_COLOR.get(name, THESIS_PALETTE["primary"])))
+    for name, color_name in cost_color_names.items():
+        lines.append(_tex_color_def(color_name, COST_COMPONENT_COLOR.get(name, THESIS_PALETTE["neutral_dark"])))
+
+    lines.extend(
+        [
+            r"\begin{axis}[",
+            r"ybar stacked,",
+            r"bar width=18pt,",
+            r"width=0.82\linewidth,",
+            r"height=0.50\linewidth,",
+            r"tick align=outside,",
+            r"axis line style={black},",
+            r"tick style={black},",
+            f"xtick={{{','.join(str(i) for i in range(len(strategies)))}}},",
+            f"xticklabels={{{','.join(_latex_escape(s) for s in strategies)}}},",
+            f"ylabel={{Annualized value ({_latex_escape(unit)}/year)}},",
+            r"xlabel={Market strategy},",
+            r"legend cell align=left,",
+            r"legend style={at={(0.5,-0.20)}, anchor=north, font=\scriptsize, draw=none, fill=none},",
+            r"legend columns=2,",
+            r"]",
+        ]
+    )
+
+    for name in revenue_components:
+        vals = np.nan_to_num(decomp[f"revenue::{name}"].to_numpy(dtype=float) * unit_scale, nan=0.0)
+        coords = " ".join(f"({idx},{_tex_float(float(v), 4)})" for idx, v in enumerate(vals))
+        color = rev_color_names[name]
+        lines.append(rf"\addplot+[draw=white, fill={color}, area legend] coordinates {{{coords}}};")
+
+    for name in cost_components:
+        vals = -np.abs(np.nan_to_num(decomp[f"cost::{name}"].to_numpy(dtype=float), nan=0.0) * unit_scale)
+        coords = " ".join(f"({idx},{_tex_float(float(v), 4)})" for idx, v in enumerate(vals))
+        color = cost_color_names[name]
+        lines.append(rf"\addplot+[draw=white, fill={color}, area legend] coordinates {{{coords}}};")
+
+    legend_items = [f"{REVENUE_LABEL}: {name}" for name in revenue_components] + [f"{COST_LABEL}: {name}" for name in cost_components]
+    lines.append(rf"\legend{{{','.join(_latex_escape(i) for i in legend_items)}}}")
+    if strategies:
+        lines.append(rf"\draw[black, line width=0.45pt] (axis cs:-0.5,0) -- (axis cs:{len(strategies) - 0.5},0);")
+    lines.extend(
+        [
+            r"\end{axis}",
+            r"\end{tikzpicture}",
+            r"\caption{Revenue and cost decomposition by market participation strategy. Positive components show annualized market revenues, while negative components show costs and penalties. The decomposition explains whether the multi-market strategy outperforms single-market baselines through additional revenue streams or through cost interactions.}",
+            r"\label{fig:rq3-revenue-cost-decomposition}",
+            r"\end{figure}",
+        ]
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_revenue_cost_decomposition_by_strategy(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> list[Path]:
+    decomposition, component_status, unit, scale_label = extract_decomposition_rows(data)
+    csv_dir = out_root / "result_section" / "csv"
+    figures_dir = out_root / "result_section" / "figures"
+    latex_dir = out_root / "result_section" / "latex_figures"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = csv_dir / "revenue_cost_decomposition_by_market_strategy.csv"
+    png_path = figures_dir / "revenue_cost_decomposition_by_market_strategy.png"
+    pdf_path = figures_dir / "revenue_cost_decomposition_by_market_strategy.pdf"
+    tex_path = latex_dir / "revenue_cost_decomposition_by_market_strategy.tex"
+
+    outputs: list[Path] = []
+    if "csv" in formats:
+        _decomposition_long(decomposition).to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+
+    unit_scale = 1.0 / 1000.0 if unit == "kEUR" else 1.0
+    outputs.extend(_plot_revenue_cost_decomposition(decomposition, unit, unit_scale, png_path, pdf_path, formats=formats))
+    if "tex" in formats:
+        outputs.append(write_latex_revenue_cost_decomposition(decomposition, unit, unit_scale, tex_path))
+
+    status_path = csv_dir / "revenue_cost_component_status.json"
+    status_payload = {
+        "component_status": component_status,
+        "scale": scale_label,
+    }
+    if "json" in formats:
+        status_path.write_text(json.dumps(status_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        outputs.append(status_path)
+
+    for message in component_status.get("revenue", []):
+        print(f"[INFO] revenue decomposition: {message}")
+    for message in component_status.get("cost", []):
+        print(f"[INFO] cost decomposition: {message}")
+
+    return outputs
+
+
+def generate_annualized_net_profit_by_strategy(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> list[Path]:
+    csv_dir = out_root / "result_section" / "csv"
+    figures_dir = out_root / "result_section" / "figures"
+    latex_dir = out_root / "result_section" / "latex_figures"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "annualized_net_profit_by_market_strategy.csv"
+    png_path = figures_dir / "annualized_net_profit_by_market_strategy.png"
+    pdf_path = figures_dir / "annualized_net_profit_by_market_strategy.pdf"
+    tex_path = latex_dir / "annualized_net_profit_by_market_strategy.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        data.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    outputs.extend(plot_annualized_net_profit(data, png_path, pdf_path, formats=formats))
+    if "tex" in formats:
+        outputs.append(write_latex_annualized_net_profit(data, tex_path))
+    return outputs
+
+
+def build_cumulative_net_profit_by_strategy(run_root: Path) -> tuple[pd.DataFrame, Path, str]:
+    loaded = _load_cumulative_series_candidate(run_root)
+    if loaded is None:
+        raise FileNotFoundError(
+            "No suitable timestamp-level RQ3 net-profit source was found for Figure 3. "
+            f"Looked under {run_root} for daily/hourly/path PnL files."
+        )
+    raw, selected_path = loaded
+    raw = raw.copy()
+    raw["date"] = pd.to_datetime(raw["timestamp_utc"], utc=True, errors="coerce").dt.floor("D")
+    raw["raw_pnl_eur"] = pd.to_numeric(raw["raw_pnl_eur"], errors="coerce")
+    raw = raw.dropna(subset=["date", "strategy", "raw_pnl_eur"]).copy()
+    if raw.empty:
+        raise ValueError(f"Selected cumulative source has no usable timestamp/PnL rows: {selected_path}")
+
+    if raw["is_cumulative_input"].astype(bool).all():
+        daily = (
+            raw.sort_values("timestamp_utc")
+            .groupby(["strategy", "date"], as_index=False)
+            .agg(
+                cumulative_net_profit_eur=("raw_pnl_eur", "last"),
+                source_file=("source_file", "first"),
+            )
+        )
+        daily["daily_net_profit_eur"] = daily.groupby("strategy")["cumulative_net_profit_eur"].diff()
+        first_mask = daily.groupby("strategy").cumcount().eq(0)
+        daily.loc[first_mask, "daily_net_profit_eur"] = daily.loc[first_mask, "cumulative_net_profit_eur"]
+        resolution = "daily from cumulative source"
+    else:
+        daily = (
+            raw.groupby(["strategy", "date"], as_index=False)
+            .agg(
+                daily_net_profit_eur=("raw_pnl_eur", "sum"),
+                source_file=("source_file", "first"),
+            )
+            .sort_values(["strategy", "date"])
+        )
+        daily["cumulative_net_profit_eur"] = daily.groupby("strategy")["daily_net_profit_eur"].cumsum()
+        resolution = "daily aggregated from period net profit"
+
+    daily = daily.loc[daily["strategy"].isin(STRATEGY_ORDER)].copy()
+    missing = [strategy for strategy in STRATEGY_ORDER if strategy not in set(daily["strategy"])]
+    if missing:
+        detected = sorted(set(daily["strategy"]))
+        raise ValueError(
+            "Cumulative RQ3 series does not contain all required strategies. "
+            f"Missing={missing}; detected={detected}; selected_source={selected_path}"
+        )
+    daily["_strategy_order"] = daily["strategy"].map({name: idx for idx, name in enumerate(STRATEGY_ORDER)})
+    daily = daily.sort_values(["_strategy_order", "date"]).drop(columns=["_strategy_order"])
+    daily["date"] = pd.to_datetime(daily["date"], utc=True).dt.date.astype(str)
+    return daily, selected_path, resolution
+
+
+def plot_cumulative_net_profit_by_strategy(data: pd.DataFrame, unit: str, unit_scale: float, png_path: Path, pdf_path: Path, *, formats: set[str]) -> list[Path]:
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
+    for strategy in STRATEGY_ORDER:
+        d = data.loc[data["strategy"].eq(strategy)].copy()
+        if d.empty:
+            continue
+        dates = pd.to_datetime(d["date"], errors="coerce")
+        values = pd.to_numeric(d["cumulative_net_profit_eur"], errors="coerce") * unit_scale
+        ax.plot(
+            dates,
+            values,
+            label=strategy,
+            color=STRATEGY_COLOR.get(strategy, THESIS_PALETTE["neutral_dark"]),
+            linewidth=2.0,
+        )
+    ax.axhline(0.0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.8)
+    ax.set_xlabel("Date")
+    ax.set_ylabel(f"Cumulative net profit ({unit})")
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=7))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.legend(loc="upper left", frameon=False, ncol=2)
+    fig.autofmt_xdate(rotation=0, ha="center")
+    fig.tight_layout()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    if "png" in formats:
+        fig.savefig(png_path, dpi=220)
+        paths.append(png_path)
+    if "pdf" in formats:
+        fig.savefig(pdf_path)
+        paths.append(pdf_path)
+    plt.close(fig)
+    return paths
+
+
+def write_latex_cumulative_net_profit_by_strategy(data: pd.DataFrame, unit: str, unit_scale: float, path: Path) -> Path:
+    dates = sorted(pd.to_datetime(data["date"], errors="coerce").dropna().unique())
+    if not dates:
+        raise ValueError("Cannot write cumulative RQ3 LaTeX figure without dates.")
+    date_index = {pd.Timestamp(date).date().isoformat(): idx for idx, date in enumerate(dates)}
+    x_tick_step = max(1, math.ceil(len(dates) / 6))
+    x_ticks = list(range(0, len(dates), x_tick_step))
+    if x_ticks[-1] != len(dates) - 1:
+        x_ticks.append(len(dates) - 1)
+    x_tick_labels = [pd.Timestamp(dates[idx]).strftime("%d %b") for idx in x_ticks]
+    values = pd.to_numeric(data["cumulative_net_profit_eur"], errors="coerce") * unit_scale
+    ymin = min(0.0, float(values.min())) if values.notna().any() else -1.0
+    ymax = max(0.0, float(values.max())) if values.notna().any() else 1.0
+    span = max(1.0, ymax - ymin)
+
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        _tex_color_def("rqThreeNeutral", THESIS_PALETTE["neutral_dark"]),
+        *[
+            _tex_color_def(f"rqThreeLine{strategy.replace('-', '').replace('only', 'Only')}", STRATEGY_COLOR.get(strategy, THESIS_PALETTE["neutral_dark"]))
+            for strategy in STRATEGY_ORDER
+        ],
+        r"\begin{axis}[",
+        r"tick align=outside,",
+        r"axis line style={rqThreeNeutral},",
+        r"tick style={rqThreeNeutral},",
+        r"label style={font=\small},",
+        r"tick label style={font=\small},",
+        r"grid=major,",
+        r"grid style={black!12, line width=0.2pt},",
+        r"width=0.88\linewidth,",
+        r"height=0.48\linewidth,",
+        r"xlabel={Date},",
+        rf"ylabel={{Cumulative net profit ({_latex_escape(unit)})}},",
+        f"xmin=0, xmax={len(dates) - 1},",
+        f"xtick={{{','.join(str(i) for i in x_ticks)}}},",
+        f"xticklabels={{{','.join(_latex_escape(label) for label in x_tick_labels)}}},",
+        rf"ymin={_tex_float(ymin - 0.08 * span, 4)}, ymax={_tex_float(ymax + 0.10 * span, 4)},",
+        r"legend columns=2,",
+        r"legend cell align=left,",
+        r"legend style={at={(0.02,0.98)}, anchor=north west, font=\scriptsize, draw=none, fill=none},",
+        r"]",
+    ]
+    for strategy in STRATEGY_ORDER:
+        d = data.loc[data["strategy"].eq(strategy)].copy()
+        coords: list[str] = []
+        for _, row in d.iterrows():
+            date_key = str(row["date"])
+            if date_key not in date_index:
+                continue
+            y = _safe_float(row["cumulative_net_profit_eur"]) * unit_scale
+            if math.isfinite(y):
+                coords.append(f"({date_index[date_key]},{_tex_float(y, 4)})")
+        color_name = f"rqThreeLine{strategy.replace('-', '').replace('only', 'Only')}"
+        lines.extend(
+            [
+                rf"\addplot+[mark=none, line width=1.2pt, color={color_name}] coordinates {{{' '.join(coords)}}};",
+                rf"\addlegendentry{{{_latex_escape(strategy)}}}",
+            ]
+        )
+    lines.extend(
+        [
+            rf"\draw[rqThreeNeutral, line width=0.6pt] (axis cs:0,0) -- (axis cs:{len(dates) - 1},0);",
+            r"\end{axis}",
+            r"\end{tikzpicture}",
+            r"\caption{Cumulative net profit by market participation strategy over the test period. The figure compares the XGB p50 multi-market strategy with DA-only, BCM-only and BEM-only baselines and shows whether profitability differences develop persistently or are driven by individual high-revenue periods.}",
+            r"\label{fig:rq3-cumulative-net-profit-by-market-strategy}",
+            r"\end{figure}",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_cumulative_net_profit_by_strategy(run_root: Path, out_root: Path, *, formats: set[str]) -> tuple[list[Path], pd.DataFrame, Path, str]:
+    cumulative, source_path, resolution = build_cumulative_net_profit_by_strategy(run_root)
+    csv_dir = out_root / "result_section" / "csv"
+    figures_dir = out_root / "result_section" / "figures"
+    latex_dir = out_root / "result_section" / "latex_figures"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "cumulative_net_profit_by_market_strategy.csv"
+    png_path = figures_dir / "cumulative_net_profit_by_market_strategy.png"
+    pdf_path = figures_dir / "cumulative_net_profit_by_market_strategy.pdf"
+    tex_path = latex_dir / "cumulative_net_profit_by_market_strategy.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        cumulative.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    unit, unit_scale = _choose_scale(cumulative["cumulative_net_profit_eur"].tolist())
+    outputs.extend(plot_cumulative_net_profit_by_strategy(cumulative, unit, unit_scale, png_path, pdf_path, formats=formats))
+    if "tex" in formats:
+        outputs.append(write_latex_cumulative_net_profit_by_strategy(cumulative, unit, unit_scale, tex_path))
+    return outputs, cumulative, source_path, resolution
+
+
+def _operational_metric_value(row: pd.Series, spec: dict[str, Any]) -> tuple[float, str, str]:
+    columns = list(row.index)
+    for candidate in spec["candidates"]:
+        if "+" in candidate:
+            parts = tuple(p.strip() for p in str(candidate).split("+"))
+            if all(part in row.index for part in parts):
+                values = [_safe_float(row[part]) for part in parts]
+                if all(math.isfinite(v) for v in values):
+                    return sum(abs(v) for v in values), "+".join(parts), "sum_abs_components"
+            continue
+        col = _resolve_matching_column(columns, (str(candidate),))
+        if col is None:
+            continue
+        value = _safe_float(row[col])
+        if math.isfinite(value):
+            if str(candidate).startswith("annualized_") and spec["unit"] == "EUR":
+                return value, col, "annualized_value"
+            return value, col, "direct"
+    return math.nan, ",".join(str(c) for c in spec["candidates"][:3]), "missing"
+
+
+def _format_operational_annotation(value: float, unit: str) -> str:
+    if not math.isfinite(value):
+        return "--"
+    if unit == "%":
+        pct = value * 100.0 if abs(value) <= 1.0 else value
+        return f"{pct:.1f}%"
+    if unit == "EUR":
+        if abs(value) >= 1000.0:
+            return f"{value / 1000.0:,.0f}k"
+        return f"{value:,.0f}"
+    if unit in {"MWh", "MWh/day", "cycles", "cycles/day"}:
+        if abs(value) >= 100.0:
+            return f"{value:,.0f}"
+        if abs(value) >= 10.0:
+            return f"{value:,.1f}"
+        return f"{value:,.2f}"
+    return f"{value:,.1f}"
+
+
+def build_operational_intensity_by_strategy(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    rows: list[dict[str, Any]] = []
+    omitted: list[str] = []
+    for spec in OPERATIONAL_METRIC_SPECS:
+        metric_rows: list[dict[str, Any]] = []
+        missing_by_strategy: list[str] = []
+        for _, row in data.iterrows():
+            strategy = str(row["strategy"])
+            value, source_col, method = _operational_metric_value(row, spec)
+            if math.isfinite(value):
+                metric_rows.append(
+                    {
+                        "strategy": strategy,
+                        "metric": spec["metric"],
+                        "value": value,
+                        "unit": spec["unit"],
+                        "source_column": source_col,
+                        "method": method,
+                    }
+                )
+            else:
+                missing_by_strategy.append(strategy)
+        if metric_rows:
+            rows.extend(metric_rows)
+            if missing_by_strategy:
+                omitted.append(
+                    f"{spec['metric']}: missing for {', '.join(missing_by_strategy)} "
+                    f"(candidates: {', '.join(spec['candidates'])})"
+                )
+        else:
+            omitted.append(f"{spec['metric']}: omitted; no candidate columns found ({', '.join(spec['candidates'])})")
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise ValueError(
+            "No operational-intensity metrics were found in the selected RQ3 summary rows. "
+            "Expected columns include throughput_mwh_per_day, equivalent_full_cycles_total, "
+            "mean_soc_mwh, realized_aux_cost_eur, realized_degradation_cost_eur or id_abs_mwh_total."
+        )
+    out["_strategy_order"] = out["strategy"].map({name: idx for idx, name in enumerate(STRATEGY_ORDER)})
+    out["_metric_order"] = out["metric"].map({spec["metric"]: idx for idx, spec in enumerate(OPERATIONAL_METRIC_SPECS)})
+    out = out.sort_values(["_strategy_order", "_metric_order"]).drop(columns=["_strategy_order", "_metric_order"])
+
+    norm_values = pd.Series(np.nan, index=out.index, dtype=float)
+    for metric, group in out.groupby("metric", sort=False):
+        values = pd.to_numeric(group["value"], errors="coerce")
+        finite = values[np.isfinite(values)]
+        if finite.empty:
+            norm = pd.Series(np.nan, index=group.index)
+        else:
+            min_v = float(finite.min())
+            max_v = float(finite.max())
+            if math.isclose(max_v, min_v):
+                fill = 1.0 if max_v > 0 else 0.0
+                norm = pd.Series(fill, index=group.index)
+            else:
+                norm = (values - min_v) / (max_v - min_v)
+        norm_values.loc[group.index] = norm
+    out["normalized_value"] = norm_values
+    out["display_value"] = [_format_operational_annotation(v, u) for v, u in zip(out["value"], out["unit"])]
+    return out, omitted
+
+
+def _operational_matrix(data: pd.DataFrame) -> tuple[list[str], list[str], np.ndarray, list[list[str]]]:
+    metrics = [spec["metric"] for spec in OPERATIONAL_METRIC_SPECS if spec["metric"] in set(data["metric"])]
+    matrix = np.full((len(STRATEGY_ORDER), len(metrics)), np.nan, dtype=float)
+    annotations = [["" for _ in metrics] for _ in STRATEGY_ORDER]
+    for i, strategy in enumerate(STRATEGY_ORDER):
+        for j, metric in enumerate(metrics):
+            d = data.loc[data["strategy"].eq(strategy) & data["metric"].eq(metric)]
+            if d.empty:
+                continue
+            row = d.iloc[0]
+            matrix[i, j] = _safe_float(row["normalized_value"])
+            annotations[i][j] = str(row["display_value"])
+    return STRATEGY_ORDER, metrics, matrix, annotations
+
+
+def plot_operational_intensity_by_strategy(data: pd.DataFrame, png_path: Path, pdf_path: Path, *, formats: set[str]) -> list[Path]:
+    apply_geo_style()
+    strategies, metrics, matrix, annotations = _operational_matrix(data)
+    cmap = LinearSegmentedColormap.from_list(
+        "rq3_operational_intensity",
+        ["#FFFFFF", "#E4F1F7", THESIS_PALETTE["primary"]],
+    )
+    fig_width = max(8.2, 0.78 * len(metrics) + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.6))
+    image = ax.imshow(matrix, aspect="auto", cmap=cmap, vmin=0.0, vmax=1.0)
+    ax.set_xticks(np.arange(len(metrics)), labels=metrics, rotation=25, ha="right")
+    ax.set_yticks(np.arange(len(strategies)), labels=strategies)
+    ax.set_title("Operational Intensity by Market Strategy")
+    ax.tick_params(axis="both", length=0)
+    ax.set_xticks(np.arange(-0.5, len(metrics), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(strategies), 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1.2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    for i in range(len(strategies)):
+        for j in range(len(metrics)):
+            if not math.isfinite(matrix[i, j]):
+                continue
+            color = "white" if matrix[i, j] >= 0.62 else THESIS_PALETTE["neutral_dark"]
+            ax.text(j, i, annotations[i][j], ha="center", va="center", fontsize=8, color=color)
+    cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02)
+    cbar.set_label("Relative operational intensity")
+    fig.tight_layout()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    if "png" in formats:
+        fig.savefig(png_path, dpi=220)
+        paths.append(png_path)
+    if "pdf" in formats:
+        fig.savefig(pdf_path)
+        paths.append(pdf_path)
+    plt.close(fig)
+    return paths
+
+
+def write_latex_operational_intensity_by_strategy(data: pd.DataFrame, path: Path) -> Path:
+    strategies, metrics, matrix, annotations = _operational_matrix(data)
+    cell_lines: list[str] = []
+    for i, _strategy in enumerate(strategies):
+        for j, _metric in enumerate(metrics):
+            value = float(matrix[i, j]) if math.isfinite(matrix[i, j]) else math.nan
+            if not math.isfinite(value):
+                continue
+            fill_pct = int(round(max(0.0, min(1.0, value)) * 100.0))
+            text_color = "white" if value >= 0.62 else "rqThreeNeutral"
+            cell_lines.append(
+                rf"\filldraw[fill=rqThreeIntensity!{fill_pct}!white, draw=white, line width=0.4pt] "
+                rf"(axis cs:{_tex_float(j - 0.5, 3)},{_tex_float(i - 0.5, 3)}) rectangle "
+                rf"(axis cs:{_tex_float(j + 0.5, 3)},{_tex_float(i + 0.5, 3)});"
+            )
+            cell_lines.append(
+                rf"\node[font=\scriptsize, text={text_color}] at (axis cs:{j},{i}) "
+                rf"{{{_latex_escape(annotations[i][j])}}};"
+            )
+
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        _tex_color_def("rqThreeNeutral", THESIS_PALETTE["neutral_dark"]),
+        _tex_color_def("rqThreeIntensity", THESIS_PALETTE["primary"]),
+        r"\begin{axis}[",
+        r"tick align=outside,",
+        r"axis line style={draw=none},",
+        r"tick style={draw=none},",
+        r"label style={font=\small},",
+        r"tick label style={font=\scriptsize},",
+        r"title style={font=\normalfont\small},",
+        r"title={Operational Intensity by Market Strategy},",
+        r"width=0.96\linewidth,",
+        r"height=0.44\linewidth,",
+        rf"xmin=-0.5, xmax={_tex_float(len(metrics) - 0.5, 3)},",
+        rf"ymin={_tex_float(len(strategies) - 0.5, 3)}, ymax=-0.5,",
+        "xtick={" + ",".join(str(i) for i in range(len(metrics))) + "},",
+        "xticklabels={" + ",".join(_latex_escape(m) for m in metrics) + "},",
+        r"xticklabel style={rotate=28, anchor=east},",
+        "ytick={" + ",".join(str(i) for i in range(len(strategies))) + "},",
+        "yticklabels={" + ",".join(_latex_escape(s) for s in strategies) + "},",
+        r"]",
+        *cell_lines,
+        r"\end{axis}",
+        r"\node[anchor=west, font=\scriptsize] at (7.05,0.15) {Relative operational intensity};",
+        r"\shade[left color=white,right color=rqThreeIntensity] (7.05,-0.15) rectangle (9.15,0.00);",
+        r"\node[anchor=north, font=\scriptsize] at (7.05,-0.18) {0};",
+        r"\node[anchor=north, font=\scriptsize] at (9.15,-0.18) {1};",
+        r"\end{tikzpicture}",
+        r"\caption{Operational intensity by market participation strategy. The figure compares battery usage and operational burden across the XGB p50 multi-market strategy and the DA-only, BCM-only and BEM-only baselines. The metrics indicate whether higher profitability is associated with higher throughput, cycling, recourse use, degradation, auxiliary demand or feasibility exposure.}",
+        r"\label{fig:rq3-operational-intensity-by-market-strategy}",
+        r"\end{figure}",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_operational_intensity_by_strategy(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> tuple[list[Path], pd.DataFrame, list[str]]:
+    operational, omitted = build_operational_intensity_by_strategy(data)
+    csv_dir = out_root / "result_section" / "csv"
+    figures_dir = out_root / "result_section" / "figures"
+    latex_dir = out_root / "result_section" / "latex_figures"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "operational_intensity_by_market_strategy.csv"
+    png_path = figures_dir / "operational_intensity_by_market_strategy.png"
+    pdf_path = figures_dir / "operational_intensity_by_market_strategy.pdf"
+    tex_path = latex_dir / "operational_intensity_by_market_strategy.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        operational.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    outputs.extend(plot_operational_intensity_by_strategy(operational, png_path, pdf_path, formats=formats))
+    if "tex" in formats:
+        outputs.append(write_latex_operational_intensity_by_strategy(operational, tex_path))
+    return outputs, operational, omitted
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-root", type=Path, default=None, help="Explicit RQ3 simulation output root.")
+    parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT, help="RQ3 benchmark output root.")
+    parser.add_argument(
+        "--formats",
+        default="csv,json,png,pdf,tex",
+        help="Comma-separated output formats to write. Use 'png,tex' for fast thesis-figure regeneration.",
+    )
+    parser.add_argument("--skip-pdf", action="store_true", help="Do not write PDF figures.")
+    parser.add_argument("--skip-csv", action="store_true", help="Do not write CSV outputs.")
+    parser.add_argument("--skip-json", action="store_true", help="Do not write JSON diagnostics/status outputs.")
+    parser.add_argument("--skip-png", action="store_true", help="Do not write PNG figures.")
+    parser.add_argument("--skip-tex", action="store_true", help="Do not write LaTeX figure files.")
+    parser.add_argument("--export-dir", type=Path, default=Path(DEFAULT_EXPORT_DIR), help="Thesis export destination.")
+    parser.add_argument("--skip-export", action="store_true", help="Do not export the generated RQ3 folder to the thesis figures directory.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    formats = _parse_formats(args.formats)
+    if args.skip_pdf:
+        formats.discard("pdf")
+    if args.skip_csv:
+        formats.discard("csv")
+    if args.skip_json:
+        formats.discard("json")
+    if args.skip_png:
+        formats.discard("png")
+    if args.skip_tex:
+        formats.discard("tex")
+    if not formats:
+        raise ValueError("No output formats remain after applying skip flags.")
+    candidate = discover_input(args.run_root)
+    data = select_strategy_rows(candidate)
+    decomp_data, component_status, unit, scale_label = extract_decomposition_rows(data)
+    outputs = []
+    outputs.extend(generate_annualized_net_profit_by_strategy(data, args.out_root, formats=formats))
+    outputs.extend(generate_revenue_cost_decomposition_by_strategy(data, args.out_root, formats=formats))
+    cumulative_outputs, cumulative_data, cumulative_source, cumulative_resolution = generate_cumulative_net_profit_by_strategy(candidate.root, args.out_root, formats=formats)
+    outputs.extend(cumulative_outputs)
+    operational_outputs, operational_data, operational_omitted = generate_operational_intensity_by_strategy(data, args.out_root, formats=formats)
+    outputs.extend(operational_outputs)
+
+    print(f"[OK] selected input root: {candidate.root}")
+    print(f"[OK] selected cumulative input file: {cumulative_source}")
+    print("[OK] selected source files:")
+    for path in candidate.source_files:
+        print(f"  - {path}")
+    detected_strategies = [s for s in STRATEGY_ORDER if s in set(data["strategy"])]
+    revenue_components = _revenue_components_for_plot(decomp_data)
+    cost_components = _cost_components_for_plot(decomp_data)
+    print(f"[OK] detected strategies: {', '.join(detected_strategies)}")
+    print(
+        f"[OK] detected revenue components: {', '.join(revenue_components) if revenue_components else 'none'}"
+    )
+    print(f"[OK] detected cost components: {', '.join(cost_components) if cost_components else 'none'}")
+    detected_operational_metrics = [m for m in [spec["metric"] for spec in OPERATIONAL_METRIC_SPECS] if m in set(operational_data["metric"])]
+    print(
+        f"[OK] detected operational metrics: "
+        f"{', '.join(detected_operational_metrics) if detected_operational_metrics else 'none'}"
+    )
+    if operational_omitted:
+        print("[OK] omitted operational metrics:")
+        for message in operational_omitted:
+            print(f"  - {message}")
+    print(f"[OK] annualization method: {decomp_data['annualization_method'].iloc[0] if not decomp_data.empty else 'n/a'}")
+    print(f"[OK] output decomposition unit: {scale_label}")
+    print(f"[OK] cumulative time resolution: {cumulative_resolution}")
+    if not cumulative_data.empty:
+        print(f"[OK] cumulative date range: {cumulative_data['date'].min()} -> {cumulative_data['date'].max()}")
+    print("[OK] annualized net profit by strategy:")
+    for _, row in data.iterrows():
+        print(f"  - {row['strategy']}: {row['annualized_net_profit_eur_per_year']:,.2f} EUR/year")
+    print("[OK] final cumulative net profit:")
+    for strategy in STRATEGY_ORDER:
+        d = cumulative_data.loc[cumulative_data["strategy"].eq(strategy)].copy()
+        if d.empty:
+            continue
+        final_value = pd.to_numeric(d.sort_values("date")["cumulative_net_profit_eur"], errors="coerce").dropna().iloc[-1]
+        print(f"  - {strategy}: {final_value:,.2f} EUR")
+    if component_status["revenue"] or component_status["cost"]:
+        print("[OK] component availability notes:")
+        for message in component_status["revenue"] + component_status["cost"]:
+            print(f"  - {message}")
+    print(f"[OK] outputs under: {args.out_root / 'result_section'}")
+    for path in outputs:
+        print(f"[OK] generated: {path}")
+    prune_counts = _prune_unselected_formats(args.out_root, formats)
+    pruned = {suffix: count for suffix, count in prune_counts.items() if count}
+    if pruned:
+        print("[OK] pruned unselected RQ3 output formats: " + ", ".join(f"{suffix}={count}" for suffix, count in sorted(pruned.items())))
+    if not args.skip_export:
+        _export_output_tree(args.out_root, args.export_dir)
+        print(f"[OK] exported RQ3 benchmark folder: {args.export_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

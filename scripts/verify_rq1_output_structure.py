@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 
@@ -30,14 +31,25 @@ TIERS = [
 ]
 
 
+def _check_latex_float_labels(path: Path, text: str) -> list[str]:
+    errors: list[str] = []
+    for env in ("table", "figure"):
+        pattern = re.compile(rf"\\begin\{{{env}\}}.*?\\end\{{{env}\}}", flags=re.S)
+        for idx, match in enumerate(pattern.finditer(text), start=1):
+            if r"\label{" not in match.group(0):
+                errors.append(f"{path} {env} environment {idx} is missing \\label{{...}}.")
+    return errors
+
+
 def _check_latex_table(path: Path) -> list[str]:
     errors: list[str] = []
     text = path.read_text(encoding="utf-8").strip()
+    errors.extend(_check_latex_float_labels(path, text))
     if not text.startswith(r"\begin{table}"):
         errors.append(f"{path} does not start with a LaTeX table environment.")
     if not text.endswith(r"\end{table}"):
         errors.append(f"{path} does not end with a LaTeX table environment.")
-    for token in [r"\toprule", r"\midrule", r"\bottomrule"]:
+    for token in [r"\toprule", r"\midrule", r"\bottomrule", r"\caption", r"\label"]:
         if token not in text:
             errors.append(f"{path} is missing {token}.")
     return errors
@@ -46,6 +58,7 @@ def _check_latex_table(path: Path) -> list[str]:
 def _check_latex_figure(path: Path) -> list[str]:
     errors: list[str] = []
     text = path.read_text(encoding="utf-8")
+    errors.extend(_check_latex_float_labels(path, text))
     if path.name == "tail_spike_relative_pinball_by_regime.tex":
         for token in [
             "tail_spike_relative_pinball_by_regime_price_capacity.tex",

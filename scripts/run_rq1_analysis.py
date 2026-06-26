@@ -87,6 +87,11 @@ def _export_output_tree(source: Path, destination: Path) -> None:
     if not source.is_dir():
         raise FileNotFoundError(f"Cannot export missing RQ1 output directory: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        if destination.is_dir() and not destination.is_symlink():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
     destination.mkdir(parents=True, exist_ok=True)
     excluded_top_level = {
         "_raw_outputs",
@@ -112,15 +117,14 @@ def _export_output_tree(source: Path, destination: Path) -> None:
         else:
             shutil.copy2(child, target)
         exported_names.add(child.name)
-    for stale in excluded_top_level:
-        target = destination / stale
-        if target.exists() or target.is_symlink():
-            if target.is_dir() and not target.is_symlink():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
     if not exported_names:
         raise FileNotFoundError(f"No thesis-facing RQ1 output folders were available for export from {source}")
+
+
+def _latex_file_has_label(path: Path, label: str) -> bool:
+    if not path.exists():
+        return False
+    return rf"\label{{{label}}}" in path.read_text(encoding="utf-8", errors="ignore")
 
 
 def _prune_extensions(root: Path, suffixes: set[str]) -> dict[str, int]:
@@ -143,6 +147,7 @@ def _prune_subsection_extensions(root: Path, suffixes: set[str]) -> dict[str, in
         return {}
     counts = {suffix: 0 for suffix in sorted(suffixes)}
     subsection_dirs = [
+        root / "result_section",
         root / "4_1_1_full_unweighted",
         root / "4_1_2_calibration_uncertainty",
         root / "4_1_3_per_lead",
@@ -199,6 +204,35 @@ def _remove_pruned_manifest_entries(root: Path, suffixes: set[str]) -> int:
     return removed
 
 
+POINT_ERROR_LEGACY_STEMS = [
+    "mae_p50_by_target_model",
+    "bias_p50_by_target_model",
+    "mae_bias_p50_by_target_model",
+    "mae_p50_price_targets_by_model",
+    "mae_p50_activation_rate_targets_by_model",
+    "bias_p50_price_targets_by_model",
+    "bias_p50_activation_rate_targets_by_model",
+]
+
+
+def _remove_legacy_point_error_outputs(out_dir: Path) -> int:
+    removed = 0
+    subdirs = {
+        "result_section/csv": [".csv"],
+        "result_section/figures": [".png", ".pdf", ".svg"],
+        "result_section/latex_figures": [".tex"],
+        "result_section/latex_tables": [".tex"],
+    }
+    for subdir, suffixes in subdirs.items():
+        for stem in POINT_ERROR_LEGACY_STEMS:
+            for suffix in suffixes:
+                path = out_dir / subdir / f"{stem}{suffix}"
+                if path.exists():
+                    path.unlink()
+                    removed += 1
+    return removed
+
+
 def _canonical_model_keys(raw: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -240,7 +274,7 @@ def _validate_joined_predictions(*, benchmark_dir: Path, splits: list[str], mode
     )
 
 
-def _prepare_benchmark_snapshot(*, benchmark_dir: Path, snapshot_dir: Path) -> Path:
+def _prepare_benchmark_snapshot(*, benchmark_dir: Path, snapshot_dir: Path, skip_json: bool = False) -> Path:
     joined_src = benchmark_dir / "diagnostics" / "joined_predictions"
     if not joined_src.is_dir():
         raise FileNotFoundError(f"Missing joined predictions directory: {joined_src}")
@@ -249,7 +283,8 @@ def _prepare_benchmark_snapshot(*, benchmark_dir: Path, snapshot_dir: Path) -> P
     joined_dst = snapshot_dir / "diagnostics" / "joined_predictions"
     joined_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(joined_src, joined_dst)
-    for name in ["input_manifest.json", "benchmark_config_resolved.yaml", "benchmark_manifest.json"]:
+    names = ["benchmark_config_resolved.yaml"] if skip_json else ["input_manifest.json", "benchmark_config_resolved.yaml", "benchmark_manifest.json"]
+    for name in names:
         src = benchmark_dir / name
         if src.exists():
             dst = snapshot_dir / name
@@ -283,6 +318,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--high-volatility-start", default="2025-10-05T22:00:00Z")
     p.add_argument("--window-hours", type=int, default=168)
     p.add_argument("--skip-full-metrics", action="store_true")
+    p.add_argument("--skip-point-error-heatmaps", action="store_true", help="Skip MAE p50 / MBE p50 target-model heatmap generation.")
     p.add_argument("--skip-calibration", action="store_true")
     p.add_argument("--skip-per-lead", action="store_true")
     p.add_argument("--skip-gate-buckets", action="store_true")
@@ -307,8 +343,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--include-pdf", dest="skip_pdf", action="store_false", help="Keep PDF outputs.")
     p.add_argument("--skip-svg", action=argparse.BooleanOptionalAction, default=True, help="Do not keep SVG outputs. Defaults to true; use --no-skip-svg or --include-svg to keep SVG outputs.")
     p.add_argument("--include-svg", dest="skip_svg", action="store_false", help="Keep SVG outputs.")
+    p.add_argument("--skip-png", action="store_true", help="Prune PNG files from the final organized output tree after LaTeX/table generation.")
     p.add_argument("--skip-csv", action="store_true", help="Prune CSV files from the final organized output tree after derived tables and LaTeX figures are generated.")
     p.add_argument("--skip-json", action="store_true", help="Prune JSON files from the final organized output tree after generation.")
+    p.add_argument(
+        "--latex-only",
+        action="store_true",
+        help=(
+            "Fast mode for frequent thesis updates: reuse existing _raw_outputs, regenerate organized LaTeX/table "
+            "outputs, and prune PNG/PDF/SVG/CSV/JSON from the final exported tree."
+        ),
+    )
     p.add_argument("--export-dir", default=DEFAULT_EXPORT_DIR, help="Destination thesis folder for the organized rq1_ml_model_benchmark output.")
     p.add_argument("--skip-export", action="store_true", help="Do not copy rq1_ml_model_benchmark to the thesis figures folder.")
     return p.parse_args()
@@ -316,6 +361,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.latex_only:
+        args.skip_raw_generation = True
+        args.skip_pdf = True
+        args.skip_svg = True
+        args.skip_png = True
+        args.skip_csv = True
+        args.skip_json = True
     if args.skip_raw_generation:
         args.skip_full_metrics = True
         args.skip_calibration = True
@@ -357,6 +409,7 @@ def main() -> int:
         benchmark_dir = _prepare_benchmark_snapshot(
             benchmark_dir=source_benchmark_dir,
             snapshot_dir=out_dir / "_rq1_benchmark_inputs",
+            skip_json=bool(args.skip_json),
         )
 
     benchmark_args: list[str] = ["--benchmark-root", args.benchmark_root]
@@ -382,9 +435,15 @@ def main() -> int:
             "--models",
             str(args.models),
             *eval_window_args,
+            "--point-error-out-root",
+            str(out_dir),
         ]
         if args.skip_pdf:
             cmd.append("--skip-pdf")
+        if args.skip_csv:
+            cmd.append("--skip-csv")
+        if args.skip_json:
+            cmd.append("--skip-json")
         steps.append(_run_step("rq1_4_1_1_full_unweighted_metrics", cmd, log_dir=log_dir))
 
     if not args.skip_calibration:
@@ -404,6 +463,10 @@ def main() -> int:
             str(args.models),
             *eval_window_args,
         ]
+        if args.skip_csv:
+            cmd.append("--skip-csv")
+        if args.skip_json:
+            cmd.append("--skip-json")
         steps.append(_run_step("rq1_4_1_2_calibration_uncertainty", cmd, log_dir=log_dir))
 
     if not args.skip_per_lead:
@@ -425,6 +488,10 @@ def main() -> int:
         ]
         if args.skip_pdf:
             cmd.append("--skip-pdf")
+        if args.skip_csv:
+            cmd.append("--skip-csv")
+        if args.skip_json:
+            cmd.append("--skip-json")
         steps.append(_run_step("rq1_4_1_3_per_lead_hour", cmd, log_dir=log_dir))
 
     if not args.skip_gate_buckets:
@@ -444,6 +511,10 @@ def main() -> int:
             str(args.models),
             *eval_window_args,
         ]
+        if args.skip_csv:
+            cmd.append("--skip-csv")
+        if args.skip_json:
+            cmd.append("--skip-json")
         steps.append(_run_step("rq1_4_1_4_gate_actionable", cmd, log_dir=log_dir))
 
     if not args.skip_tail_spike:
@@ -463,6 +534,10 @@ def main() -> int:
             str(args.models),
             *eval_window_args,
         ]
+        if args.skip_csv:
+            cmd.append("--skip-csv")
+        if args.skip_json:
+            cmd.append("--skip-json")
         steps.append(_run_step("rq1_4_1_5_tail_spike", cmd, log_dir=log_dir))
 
     if not args.skip_example_weeks:
@@ -495,6 +570,10 @@ def main() -> int:
             cmd.extend(["--targets", ",".join(targets)])
         if args.date:
             cmd.extend(["--date", str(args.date)])
+        if args.skip_csv:
+            cmd.append("--skip-csv")
+        if args.skip_json:
+            cmd.append("--skip-json")
         steps.append(_run_step("rq1_4_1_6_example_weeks", cmd, log_dir=log_dir))
 
     if not args.skip_organize:
@@ -509,7 +588,74 @@ def main() -> int:
             str(args.split),
             "--prune-legacy",
         ]
+        if args.skip_csv:
+            cmd.append("--skip-csv")
+        if args.skip_json:
+            cmd.append("--skip-json")
         steps.append(_run_step("rq1_output_organization", cmd, log_dir=log_dir))
+
+    if not args.skip_point_error_heatmaps:
+        removed_legacy_point_errors = _remove_legacy_point_error_outputs(out_dir)
+        if removed_legacy_point_errors:
+            print(f"[OK] Removed deprecated RQ1 point-error outputs: {removed_legacy_point_errors}")
+        point_error_csv_dir = work_dir / "4_1_1_full_unweighted" / "csv"
+        point_error_candidates = [
+            point_error_csv_dir / f"rq1_4_1_1_forecast_metrics_full_detailed_{args.split}.csv",
+            point_error_csv_dir / "rq1_4_1_1_forecast_metrics_full_long.csv",
+            ROOT
+            / "artifacts"
+            / "rq1_ml_model_benchmark"
+            / "_raw_outputs"
+            / "4_1_1_full_unweighted"
+            / "csv"
+            / f"rq1_4_1_1_forecast_metrics_full_detailed_{args.split}.csv",
+            ROOT
+            / "artifacts"
+            / "rq1_ml_model_benchmark"
+            / "_raw_outputs"
+            / "4_1_1_full_unweighted"
+            / "csv"
+            / "rq1_4_1_1_forecast_metrics_full_long.csv",
+        ]
+        point_error_input = next((p for p in point_error_candidates if p.exists()), point_error_candidates[0])
+        if not point_error_input.exists():
+            existing_relative_mae_latex = out_dir / "result_section" / "latex_figures" / "mae_p50_relative_to_rlqr_by_target_model.tex"
+            existing_mbe_table = out_dir / "result_section" / "latex_tables" / "mbe_p50_raw_by_target_model.tex"
+            existing_point_error_outputs = [existing_relative_mae_latex, existing_mbe_table]
+            existing_outputs_valid = all(path.exists() for path in existing_point_error_outputs) and _latex_file_has_label(
+                existing_mbe_table, "tab:mbe_p50_raw_by_target_model"
+            ) and _latex_file_has_label(existing_relative_mae_latex, "fig:mae_p50_relative_to_rlqr_by_target_model")
+            if args.skip_full_metrics:
+                if existing_outputs_valid:
+                    print(
+                        "[OK] Reusing existing RQ1 relative MAE p50 heatmap and raw MBE p50 table; "
+                        "the internal 4.1.1 metric CSV has already been pruned."
+                    )
+                else:
+                    raise FileNotFoundError(
+                        "Cannot reuse RQ1 relative MAE p50 heatmap and raw MBE p50 table because the detailed "
+                        "4.1.1 metric CSV and long metric CSV are missing, or existing LaTeX outputs are stale. "
+                        f"Checked: {', '.join(str(p) for p in point_error_candidates)}. "
+                        "Run RQ1 once without --skip-raw-generation to rebuild that intermediate."
+                    )
+            else:
+                raise FileNotFoundError(f"Missing detailed 4.1.1 metric CSV for point-error heatmaps: {point_error_input}")
+        else:
+            cmd = [
+                py,
+                "scripts/generate_rq1_point_error_heatmaps.py",
+                "--input",
+                str(point_error_input),
+                "--out-root",
+                str(out_dir),
+            ]
+            if args.skip_csv:
+                cmd.append("--skip-csv")
+            if args.skip_png:
+                cmd.append("--skip-png")
+            if args.skip_pdf:
+                cmd.append("--skip-pdf")
+            steps.append(_run_step("rq1_4_1_1_point_error_heatmaps", cmd, log_dir=log_dir))
 
     manifest = {
         "description": "RQ1 wrapper manifest for implemented thesis analysis scripts.",
@@ -526,6 +672,12 @@ def main() -> int:
                 "name": "Full unweighted forecast metrics",
                 "status": "skipped" if args.skip_full_metrics else "implemented",
                 "output_dir": str(full_dir),
+                "additional_outputs": {
+                    "point_error_heatmaps": "skipped" if args.skip_point_error_heatmaps else "implemented",
+                    "relative_mae_heatmap": str(out_dir / "result_section" / "figures" / "mae_p50_relative_to_rlqr_by_target_model.png"),
+                    "relative_mae_latex": str(out_dir / "result_section" / "latex_figures" / "mae_p50_relative_to_rlqr_by_target_model.tex"),
+                    "mbe_table": str(out_dir / "result_section" / "latex_tables" / "mbe_p50_raw_by_target_model.tex"),
+                },
             },
             {
                 "section": "4.1.2",
@@ -575,6 +727,7 @@ def main() -> int:
         "prune_requested": {
             "pdf": bool(args.skip_pdf),
             "svg": bool(args.skip_svg),
+            "png": bool(args.skip_png),
             "csv": bool(args.skip_csv),
             "json": bool(args.skip_json),
         },
@@ -585,18 +738,26 @@ def main() -> int:
         Path(str(subsection["output_dir"])).mkdir(parents=True, exist_ok=True)
     example_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "diagnostics" / "rq1_wrapper_manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if not args.skip_json:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     prune_suffixes: set[str] = set()
     if args.skip_pdf:
         prune_suffixes.add(".pdf")
     if args.skip_svg:
         prune_suffixes.add(".svg")
+    if args.skip_png:
+        prune_suffixes.add(".png")
     if args.skip_csv:
         prune_suffixes.add(".csv")
     if args.skip_json:
         prune_suffixes.add(".json")
-    prune_counts = _prune_subsection_extensions(out_dir, prune_suffixes)
+    # Apply format pruning to the complete RQ1 output tree, not only the
+    # organized thesis-facing subsection folders. Several subsection builders
+    # still need intermediate CSV/JSON files during generation, but when the
+    # user requests skipped formats those files must not remain in the final
+    # benchmark directory or be exported to the thesis repository.
+    prune_counts = _prune_extensions(out_dir, prune_suffixes)
     if prune_counts:
         manifest_removed = _remove_pruned_manifest_entries(out_dir, prune_suffixes)
         print("[OK] Pruned final RQ1 output files: " + ", ".join(f"{k}={v}" for k, v in sorted(prune_counts.items())))

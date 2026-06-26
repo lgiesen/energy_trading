@@ -550,6 +550,8 @@ def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        r"    \caption{Per-lead range mean pinball loss on the test split. Values are unweighted and computed on the common valid row intersection. Lower values indicate better probabilistic forecast performance.}",
+        r"    \label{tab:per_lead_range_summary}",
         r"    \begin{tabular}{@{}llrrrl@{}}",
         r"        \toprule",
         "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
@@ -572,8 +574,6 @@ def write_latex_range_table(table: pd.DataFrame, *, out_dir: Path, split: str) -
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{Per-lead range mean pinball loss on the test split. Values are unweighted and computed on the common valid row intersection. Lower values indicate better probabilistic forecast performance.}",
-            r"    \label{tab:per_lead_range_summary}",
             r"\end{table}",
             "",
         ]
@@ -706,7 +706,16 @@ def _figure_relative_pinball(metrics: pd.DataFrame, *, out_dir: Path, split: str
     return paths
 
 
-def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str, structured_out_dir: Path | None = None, skip_pdf: bool = False) -> list[Path]:
+def write_outputs(
+    outputs: dict[str, pd.DataFrame],
+    *,
+    out_dir: Path,
+    split: str,
+    structured_out_dir: Path | None = None,
+    skip_pdf: bool = False,
+    skip_csv: bool = False,
+    skip_json: bool = False,
+) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "latex").mkdir(parents=True, exist_ok=True)
@@ -717,16 +726,17 @@ def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str
     warnings = outputs["warnings"]
     table = build_thesis_range_table(range_summary, split=split)
 
-    for path, df in [
-        (out_dir / "per_lead_metrics.csv", metrics),
-        (out_dir / f"per_lead_metrics_{split}.csv", metrics.loc[metrics["split"] == split]),
-        (out_dir / f"per_lead_range_summary_{split}.csv", table),
-        (out_dir / f"per_lead_range_summary_detail_{split}.csv", range_summary.loc[range_summary["split"] == split]),
-        (out_dir / f"per_lead_row_counts_{split}.csv", row_counts.loc[row_counts["split"] == split]),
-        (out_dir / "per_lead_warnings.csv", warnings),
-    ]:
-        df.to_csv(path, index=False)
-        paths.append(path)
+    if not skip_csv:
+        for path, df in [
+            (out_dir / "per_lead_metrics.csv", metrics),
+            (out_dir / f"per_lead_metrics_{split}.csv", metrics.loc[metrics["split"] == split]),
+            (out_dir / f"per_lead_range_summary_{split}.csv", table),
+            (out_dir / f"per_lead_range_summary_detail_{split}.csv", range_summary.loc[range_summary["split"] == split]),
+            (out_dir / f"per_lead_row_counts_{split}.csv", row_counts.loc[row_counts["split"] == split]),
+            (out_dir / "per_lead_warnings.csv", warnings),
+        ]:
+            df.to_csv(path, index=False)
+            paths.append(path)
 
     tex = write_latex_range_table(table, out_dir=out_dir, split=split)
     if tex is not None:
@@ -748,8 +758,9 @@ def write_outputs(outputs: dict[str, pd.DataFrame], *, out_dir: Path, split: str
         "outputs": [str(p) for p in paths],
     }
     manifest_path = out_dir / "per_lead_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    paths.append(manifest_path)
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        paths.append(manifest_path)
 
     if structured_out_dir is not None:
         paths.extend(_mirror_structured(paths, root_out_dir=out_dir, structured_out_dir=structured_out_dir))
@@ -790,6 +801,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--no-structured-copy", action="store_true")
     p.add_argument("--skip-pdf", action="store_true", help="Do not render PDF figures; PNG and LaTeX outputs are still generated.")
+    p.add_argument("--skip-csv", action="store_true", help="Do not write CSV backup/diagnostic outputs.")
+    p.add_argument("--skip-json", action="store_true", help="Do not write the per-lead JSON manifest.")
     return p.parse_args()
 
 
@@ -812,7 +825,15 @@ def main() -> int:
         eval_origin_end=_parse_utc_bound(args.eval_origin_end),
     )
     structured_out_dir = None if args.no_structured_copy else Path(args.structured_out_dir)
-    paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, structured_out_dir=structured_out_dir, skip_pdf=bool(args.skip_pdf))
+    paths = write_outputs(
+        outputs,
+        out_dir=Path(args.out_dir),
+        split=args.split,
+        structured_out_dir=structured_out_dir,
+        skip_pdf=bool(args.skip_pdf),
+        skip_csv=bool(args.skip_csv),
+        skip_json=bool(args.skip_json),
+    )
     print("[OK] Built RQ1 4.1.3 per-lead-hour outputs.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     for path in paths:

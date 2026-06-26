@@ -124,7 +124,7 @@ def build_routes(split: str) -> list[Route]:
         _route("4.1.3", "backup", "csv", f"csv/per_lead_range_summary_{split}.csv", _sub_sources("4.1.3", f"per_lead_range_summary_{split}.csv") + [f"per_lead_range_summary_{split}.csv"], "mean_pinball_loss", "backup data", "Per-lead range summary CSV."),
         _route("4.1.3", "backup", "diagnostics", f"diagnostics/per_lead_row_counts_{split}.csv", _sub_sources("4.1.3", f"per_lead_row_counts_{split}.csv") + [f"per_lead_row_counts_{split}.csv"], "row_counts", "diagnostics", "Per-lead row counts."),
         _route("4.1.3", "backup", "warnings", "warnings/per_lead_warnings.csv", _sub_sources("4.1.3", "per_lead_warnings.csv") + ["per_lead_warnings.csv"], "warnings", "warnings", "Per-lead warnings."),
-        _route("4.1.4", "result_section", "figure", "figures/gate_bucket_pinball_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_pinball_by_target_group.png") + ["figures/gate_bucket_pinball_by_target_group.png"], "relative_mean_pinball_loss", "main thesis figure", "Actionable forecast performance by market gate relative to RLQR."),
+        _route("4.1.4", "result_section", "figure", "figures/gate_bucket_pinball_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_pinball_by_target_group.png") + ["figures/gate_bucket_pinball_by_target_group.png"], "relative_mean_pinball_loss", "main thesis figure", "Actionable forecast performance by market gate relative to RLQR; values below 1 indicate lower mean pinball loss than RLQR."),
         _route("4.1.4", "result_section", "latex_table", f"tables/gate_bucket_metrics_{split}.tex", _sub_sources("4.1.4", f"latex/gate_bucket_metrics_{split}.tex") + [f"latex/gate_bucket_metrics_{split}.tex"], "mean_pinball_loss", "main thesis table", "Gate bucket mean pinball table."),
         _route("4.1.4", "appendix", "figure", "figures/gate_bucket_coverage_p10_p90_by_target_group.png", _sub_sources("4.1.4", "figures/gate_bucket_coverage_p10_p90_by_target_group.png") + ["figures/gate_bucket_coverage_p10_p90_by_target_group.png"], "interval_coverage", "appendix figure", "Gate bucket p10-p90 coverage."),
         _route("4.1.4", "appendix", "figure", "figures/gate_bucket_observed_leads.png", _sub_sources("4.1.4", "figures/gate_bucket_observed_leads.png") + ["figures/gate_bucket_observed_leads.png"], "observed_leads", "appendix figure", "Observed leads by gate bucket."),
@@ -252,6 +252,8 @@ def _write_table(path: Path, headers: list[str], rows: list[list[Any]], caption:
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        f"    \\caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
+        f"    \\label{{{_latex_escape(label)}}}",
         rf"    \begin{{tabular}}{{@{{}}{align}@{{}}}}",
         r"        \toprule",
         "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
@@ -259,7 +261,7 @@ def _write_table(path: Path, headers: list[str], rows: list[list[Any]], caption:
     ]
     for row in rows:
         lines.append("        " + " & ".join(_latex_escape(v) if not isinstance(v, (float, int, np.floating, np.integer)) else _fmt(v) for v in row) + r" \\")
-    lines.extend([r"        \bottomrule", r"    \end{tabular}", f"    \\caption{{{_latex_escape(_ensure_caption_period(caption))}}}", f"    \\label{{{_latex_escape(label)}}}", r"\end{table}", ""])
+    lines.extend([r"        \bottomrule", r"    \end{tabular}", r"\end{table}", ""])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -927,6 +929,20 @@ def _actionable_label(bucket: Any, target_group: Any) -> str:
     return _bucket_label(bucket)
 
 
+def _actionable_label_latex_multiline(label: Any) -> str:
+    text = str(label)
+    replacements = {
+        "DA price D+1 at 11:00": ("DA price", "D+1 at 11:00"),
+        "BCM capacity price D+1 at 08:00": ("BCM capacity price", "D+1 at 08:00"),
+        "BEM activation price h1-h8": ("BEM activation price", "h1-h8"),
+        "BEM activation rate h1-h8": ("BEM activation rate", "h1-h8"),
+    }
+    parts = replacements.get(text)
+    if parts is None:
+        return _latex_escape(text)
+    return r"\shortstack[r]{" + r"\\".join(_latex_escape(part) for part in parts) + "}"
+
+
 TAIL_SPIKE_REGIME_LABELS = {
     "normal": "Non-stress regime",
     "da_positive_spike_top5": "Positive spike top 5%",
@@ -1233,7 +1249,7 @@ def _write_gate_bucket_relative_tex(
     labels = pivot["label"].astype(str).tolist()
     y_symbols = [_tex_symbol(label) for label in labels]
     y_symbol_list = ",".join(y_symbols)
-    y_tick_labels = ",".join(_latex_escape(label) for label in labels)
+    y_tick_labels = ",".join(_actionable_label_latex_multiline(label) for label in labels)
 
     lines = [
         r"% Requires: \usepackage{pgfplots}",
@@ -1248,12 +1264,13 @@ def _write_gate_bucket_relative_tex(
         r"                xbar,",
         r"                bar width=10pt,",
         r"                width=0.96\textwidth,",
-        r"                height=5.8cm,",
+        r"                height=6.1cm,",
         r"                xlabel={Mean pinball loss relative to RLQR},",
         r"                legend style={at={(0.5,1.16)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         r"                legend cell align={left},",
         r"                area legend,",
         r"                axis lines*=left,",
+        r"                yticklabel style={font=\small, align=right},",
         r"                xmin=0,",
         r"                grid=major,",
         rf"                symbolic y coords={{{y_symbol_list}}},",
@@ -1282,7 +1299,7 @@ def _write_gate_bucket_relative_tex(
         [
             r"            \end{axis}",
             r"        \end{tikzpicture}}",
-            f"    \\caption{{{_latex_escape(_ensure_caption_period(thesis_titlecase(caption)))}}}",
+            f"    \\caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
             f"    \\label{{{label}}}",
             r"\end{figure}",
             "",
@@ -2358,8 +2375,8 @@ def _write_p50_tolerance_curve_tex(
         if 0.0 <= threshold_f <= xmax:
             lines.append(rf"                \addplot[color=neutraldark, dashed, mark=none, line width=0.8pt, forget plot] coordinates {{({_tex_num(threshold_f)},0) ({_tex_num(threshold_f)},1)}};")
             x_rel = threshold_f / x_den
-            threshold_label = _latex_escape(f"{threshold_f:g} {unit}")
-            lines.append(rf"                \node[font=\scriptsize, anchor=south, fill=white, fill opacity=0.9, text opacity=1, inner sep=1pt] at (rel axis cs:{_tex_num(x_rel)},1.03) {{{threshold_label}}};")
+            threshold_label = _latex_escape(f"{threshold_f:g}")
+            lines.append(rf"                \node[font=\scriptsize, anchor=north, fill=white, fill opacity=0.9, text opacity=1, inner sep=1pt, yshift=-1pt] at (rel axis cs:{_tex_num(x_rel)},0) {{{threshold_label}}};")
     legends: list[str] = []
     for model in MODEL_LABELS:
         part = d[d["model"].astype(str).eq(model)].sort_values("threshold")
@@ -3151,7 +3168,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             path = _write_gate_bucket_relative_tex(
                 out,
                 data=d,
-                caption="Actionable Forecast Performance by Market Gate Relative to RLQR.",
+                caption="Actionable forecast performance by market gate relative to RLQR; bars show XGB and TFT mean pinball loss relative to RLQR, so values below 1 indicate lower loss than RLQR.",
                 label="fig:rq1-4-1-4-gate-bucket-pinball",
             )
             if path:
@@ -3247,7 +3264,15 @@ def _add_latex_figure_snippets(entries: list[dict[str, Any]], *, rq1_root: Path,
     _generate_latex_figures(entries, rq1_root=rq1_root, split=split)
 
 
-def organize(*, final_root: Path, rq1_root: Path, split: str, prune_legacy: bool = False) -> dict[str, Any]:
+def organize(
+    *,
+    final_root: Path,
+    rq1_root: Path,
+    split: str,
+    prune_legacy: bool = False,
+    skip_csv: bool = False,
+    skip_json: bool = False,
+) -> dict[str, Any]:
     if not final_root.exists():
         raise FileNotFoundError(f"Missing RQ1 raw output source directory: {final_root}")
     if not any(final_root.rglob("*")):
@@ -3274,9 +3299,10 @@ def organize(*, final_root: Path, rq1_root: Path, split: str, prune_legacy: bool
         "removed_legacy_outputs": removed,
     }
     manifest_path = rq1_root / "rq1_output_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     missing_path = rq1_root / "rq1_output_missing.csv"
-    if missing:
+    if missing and not skip_csv:
         pd.DataFrame(missing).to_csv(missing_path, index=False)
     elif missing_path.exists():
         missing_path.unlink()
@@ -3289,13 +3315,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rq1-root", default="artifacts/benchmark/rq1_ml_model_benchmark")
     p.add_argument("--split", default="test")
     p.add_argument("--prune-legacy", action="store_true", help="Remove known generated legacy/unstructured copies after organizing.")
+    p.add_argument("--skip-csv", action="store_true", help="Do not write organizer CSV reports.")
+    p.add_argument("--skip-json", action="store_true", help="Do not write the organizer JSON manifest.")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    manifest = organize(final_root=Path(args.final_root), rq1_root=Path(args.rq1_root), split=str(args.split), prune_legacy=bool(args.prune_legacy))
-    print(f"[OK] Organized RQ1 outputs: {Path(args.rq1_root) / 'rq1_output_manifest.json'}")
+    manifest = organize(
+        final_root=Path(args.final_root),
+        rq1_root=Path(args.rq1_root),
+        split=str(args.split),
+        prune_legacy=bool(args.prune_legacy),
+        skip_csv=bool(args.skip_csv),
+        skip_json=bool(args.skip_json),
+    )
+    if not args.skip_json:
+        print(f"[OK] Organized RQ1 outputs: {Path(args.rq1_root) / 'rq1_output_manifest.json'}")
+    else:
+        print(f"[OK] Organized RQ1 outputs without writing JSON manifest: {Path(args.rq1_root)}")
     print(f"[OK] outputs={len(manifest['outputs'])} missing={len(manifest['missing_outputs'])}")
     return 0
 

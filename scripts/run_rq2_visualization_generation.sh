@@ -14,6 +14,8 @@ REGRET_MODELS="${REGRET_MODELS:-xgb,tft,linear}"
 REGRET_QUANTILES="${REGRET_QUANTILES:-p10,p30,p50,p70,p90}"
 REGRET_STRICT="${REGRET_STRICT:-1}"
 RUN_INVALIDITY_SEVERITY="${RUN_INVALIDITY_SEVERITY:-1}"
+RUN_RISK_DIAGNOSTICS="${RUN_RISK_DIAGNOSTICS:-1}"
+RUN_RELATIVE_VALUE_OF_FORECAST="${RUN_RELATIVE_VALUE_OF_FORECAST:-1}"
 
 "${PYTHON_BIN}" scripts/build_rq2_simulation_visualizations.py \
   --run-root "${RUN_ROOT}" \
@@ -45,6 +47,17 @@ if [[ "${RUN_INVALIDITY_SEVERITY}" != "0" ]]; then
     --run-root "${RUN_ROOT}" \
     --out-root "${OUT_ROOT}" \
     --label rq2
+fi
+
+if [[ "${RUN_RISK_DIAGNOSTICS}" != "0" ]]; then
+  "${PYTHON_BIN}" scripts/generate_rq2_risk_diagnostics.py \
+    --rq2-root "${OUT_ROOT}" \
+    --run-root "${RUN_ROOT}"
+fi
+
+if [[ "${RUN_RELATIVE_VALUE_OF_FORECAST}" != "0" ]]; then
+  "${PYTHON_BIN}" scripts/generate_rq2_relative_value_of_forecast.py \
+    --rq2-root "${OUT_ROOT}"
 fi
 
 VERIFY_CMD=(

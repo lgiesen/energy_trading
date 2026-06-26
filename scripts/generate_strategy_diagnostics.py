@@ -543,6 +543,8 @@ def _latex_table(df: pd.DataFrame, caption: str, label: str, float_format: str =
     lines = [
         "\\begin{table}[ht]",
         "\\centering",
+        f"\\caption{{{caption}}}",
+        f"\\label{{{label}}}",
         "\\begin{tabular}{@{}" + "l" * len(cols) + "@{}}",
         "\\toprule",
         " & ".join(_latex_escape(c) for c in cols) + " \\\\",
@@ -564,8 +566,6 @@ def _latex_table(df: pd.DataFrame, caption: str, label: str, float_format: str =
     lines += [
         "\\bottomrule",
         "\\end{tabular}",
-        f"\\caption{{{caption}}}",
-        f"\\label{{{label}}}",
         "\\end{table}",
     ]
     return "\n".join(lines)

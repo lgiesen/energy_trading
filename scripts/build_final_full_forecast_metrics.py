@@ -926,6 +926,8 @@ def _latex_table(
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        rf"    \caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
+        rf"    \label{{{label}}}",
         rf"    \begin{{tabular}}{{{colspec}}}",
         r"        \toprule",
         "        " + " & ".join(_latex_header(c) for c in headers) + r" \\",
@@ -969,8 +971,6 @@ def _latex_table(
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            rf"    \caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
-            rf"    \label{{{label}}}",
             r"\end{table}",
             "",
         ]
@@ -1420,6 +1420,8 @@ def write_p50_error_tolerance_summary_latex(summary: pd.DataFrame, *, out_dir: P
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
+        r"    \caption{DA price p50 absolute error tolerance summary on the test split. Threshold columns report the share of forecasts with absolute p50 error within the stated tolerance.}",
+        r"    \label{tab:da_price_p50_error_tolerance_summary_test}",
         r"    \begin{tabular}{@{}lrrrrrr@{}}",
         r"        \toprule",
         r"        \textbf{Model} & \textbf{$\leq$1 EUR/MWh} & \textbf{$\leq$5 EUR/MWh} & \textbf{$\leq$10 EUR/MWh} & \textbf{Median absolute error} & \textbf{MAE p50} & \textbf{N} \\",
@@ -1440,8 +1442,6 @@ def write_p50_error_tolerance_summary_latex(summary: pd.DataFrame, *, out_dir: P
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{DA price p50 absolute error tolerance summary on the test split. Threshold columns report the share of forecasts with absolute p50 error within the stated tolerance.}",
-            r"    \label{tab:da_price_p50_error_tolerance_summary_test}",
             r"\end{table}",
             "",
         ]
@@ -1496,6 +1496,9 @@ def write_outputs(
     out_dir: Path,
     split: str,
     skip_pdf: bool = False,
+    skip_csv: bool = False,
+    skip_json: bool = False,
+    point_error_out_root: Path | None = None,
     p50_tolerance_curve: pd.DataFrame | None = None,
     p50_tolerance_summary: pd.DataFrame | None = None,
     p50_tolerance_performance: pd.DataFrame | None = None,
@@ -1506,8 +1509,9 @@ def write_outputs(
     outputs: list[Path] = []
 
     long_path = csv_dir / "rq1_4_1_1_forecast_metrics_full_long.csv"
-    metrics.to_csv(long_path, index=False)
-    outputs.append(long_path)
+    if not skip_csv:
+        metrics.to_csv(long_path, index=False)
+        outputs.append(long_path)
 
     primary = build_primary_table(metrics, split=split)
     detailed = build_detailed_table(metrics, split=split)
@@ -1516,40 +1520,57 @@ def write_outputs(
     primary_path = csv_dir / f"rq1_4_1_1_forecast_metrics_full_primary_{split}.csv"
     detailed_path = csv_dir / f"rq1_4_1_1_forecast_metrics_full_detailed_{split}.csv"
     align_path = csv_dir / f"rq1_4_1_1_forecast_metrics_full_alignment_diagnostics_{split}.csv"
-    primary_with_average.to_csv(primary_path, index=False)
-    detailed.to_csv(detailed_path, index=False)
-    diagnostics.loc[diagnostics["split"] == split].to_csv(align_path, index=False)
-    outputs.extend([primary_path, detailed_path, align_path])
+    if not skip_csv:
+        primary_with_average.to_csv(primary_path, index=False)
+        detailed.to_csv(detailed_path, index=False)
+        diagnostics.loc[diagnostics["split"] == split].to_csv(align_path, index=False)
+        outputs.extend([primary_path, detailed_path, align_path])
 
     outputs.extend(write_latex_tables(primary_with_average, detailed, out_dir=out_dir, split=split))
     outputs.extend(write_relative_pinball_figure(primary, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
     outputs.extend(write_relative_mae_figure(detailed, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
+    if point_error_out_root is not None:
+        from scripts.generate_rq1_point_error_heatmaps import build_outputs_from_metric_frames
+
+        point_error_summary = build_outputs_from_metric_frames(
+            mae=detailed.loc[detailed["metric"].eq("mae_p50")].copy(),
+            mbe=detailed.loc[detailed["metric"].eq("bias_p50")].copy(),
+            out_root=point_error_out_root,
+            skip_csv=skip_csv,
+            skip_png=False,
+            skip_pdf=skip_pdf,
+        )
+        outputs.extend(Path(p) for p in point_error_summary.get("outputs", []))
 
     if p50_tolerance_curve is not None and not p50_tolerance_curve.empty:
         tolerance_curve_path = csv_dir / "rq1_4_1_1_price_p50_absolute_error_tolerance_curve.csv"
-        p50_tolerance_curve.loc[
-            (p50_tolerance_curve["split"].eq(split)) & (p50_tolerance_curve["target"].isin(PRICE_P50_TOLERANCE_TARGETS))
-        ].to_csv(tolerance_curve_path, index=False)
-        outputs.append(tolerance_curve_path)
+        if not skip_csv:
+            p50_tolerance_curve.loc[
+                (p50_tolerance_curve["split"].eq(split)) & (p50_tolerance_curve["target"].isin(PRICE_P50_TOLERANCE_TARGETS))
+            ].to_csv(tolerance_curve_path, index=False)
+            outputs.append(tolerance_curve_path)
         outputs.extend(write_p50_error_tolerance_figure(p50_tolerance_curve, out_dir=out_dir, split=split, skip_pdf=skip_pdf))
         outputs.extend(write_p50_error_tolerance_latex_figures(out_dir=out_dir, split=split))
     if p50_tolerance_summary is not None and not p50_tolerance_summary.empty:
         tolerance_summary_path = csv_dir / f"rq1_4_1_1_price_p50_error_tolerance_summary_{split}.csv"
-        p50_tolerance_summary.loc[
-            (p50_tolerance_summary["split"].eq(split)) & (p50_tolerance_summary["target"].isin(PRICE_P50_TOLERANCE_TARGETS))
-        ].to_csv(tolerance_summary_path, index=False)
-        outputs.append(tolerance_summary_path)
+        if not skip_csv:
+            p50_tolerance_summary.loc[
+                (p50_tolerance_summary["split"].eq(split)) & (p50_tolerance_summary["target"].isin(PRICE_P50_TOLERANCE_TARGETS))
+            ].to_csv(tolerance_summary_path, index=False)
+            outputs.append(tolerance_summary_path)
         tolerance_summary_tex = write_p50_error_tolerance_summary_latex(p50_tolerance_summary, out_dir=out_dir, split=split)
         if tolerance_summary_tex is not None:
             outputs.append(tolerance_summary_tex)
     if p50_tolerance_performance is not None and not p50_tolerance_performance.empty:
-        outputs.extend(write_p50_error_tolerance_performance_values(p50_tolerance_performance, out_dir=out_dir, split=split))
+        if not skip_csv:
+            outputs.extend(write_p50_error_tolerance_performance_values(p50_tolerance_performance, out_dir=out_dir, split=split))
 
     costs = build_computational_cost_table(benchmark_dir)
     if not costs.empty:
         cost_csv = csv_dir / "rq1_4_1_1_computational_cost_365d.csv"
-        costs.to_csv(cost_csv, index=False)
-        outputs.append(cost_csv)
+        if not skip_csv:
+            costs.to_csv(cost_csv, index=False)
+            outputs.append(cost_csv)
         cost_table = write_computational_cost_latex_table(costs, out_dir=out_dir)
         if cost_table is not None:
             outputs.append(cost_table)
@@ -1565,10 +1586,12 @@ def write_outputs(
         "computational_cost_note": "Thesis-facing computational-cost table and figure report final-training wall-clock only. HPO timing fields remain in the backup CSV for provenance where available.",
         "excluded_from_4_1_1": ["winkler_score", "picp", "pinaw", "coverage", "interval_width", "lead_weighting", "gate_weighting", "tail_weighting"],
         "outputs": [str(p) for p in outputs],
+        "internal_outputs": [],
     }
     manifest_path = out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    outputs.append(manifest_path)
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        outputs.append(manifest_path)
     return outputs
 
 
@@ -1587,6 +1610,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
     p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--skip-pdf", action="store_true", help="Do not render PDF figures; PNG and LaTeX outputs are still generated.")
+    p.add_argument("--skip-csv", action="store_true", help="Do not write CSV backup/diagnostic outputs.")
+    p.add_argument("--skip-json", action="store_true", help="Do not write the 4.1.1 JSON manifest.")
+    p.add_argument("--point-error-out-root", default="", help="Optional RQ1 root where relative MAE/MBE point-error outputs are written directly from in-memory metrics.")
     return p.parse_args()
 
 
@@ -1621,6 +1647,9 @@ def main() -> int:
         out_dir=Path(args.out_dir),
         split=args.split,
         skip_pdf=bool(args.skip_pdf),
+        skip_csv=bool(args.skip_csv),
+        skip_json=bool(args.skip_json),
+        point_error_out_root=Path(args.point_error_out_root) if str(args.point_error_out_root).strip() else None,
         p50_tolerance_curve=tolerance_curve,
         p50_tolerance_summary=tolerance_summary,
         p50_tolerance_performance=tolerance_performance,

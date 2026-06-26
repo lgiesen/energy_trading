@@ -1623,6 +1623,213 @@ def build_total_pinball_net_profit_scatter_data(scatter_data: pd.DataFrame) -> p
     return out[columns].sort_values(["model", "quantile"]).reset_index(drop=True)
 
 
+def build_target_normalized_mean_pinball_loss_heatmap_data(scatter_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Aggregate target-level pinball losses after scaling each target to RLQR.
+
+    For each forecast target and quantile policy, the model loss is divided by
+    the RLQR loss for the same target and quantile. The resulting relative
+    losses are then aggregated across targets.
+    """
+    columns = [
+        "split",
+        "model_key",
+        "model",
+        "quantile",
+        "target_normalized_mean_pinball_loss",
+        "n_targets",
+        "n_obs",
+        "aggregation_weighting",
+    ]
+    omitted_columns = ["split", "target", "target_label", "quantile", "reason", "rlqr_mean_pinball_loss"]
+    if scatter_data.empty:
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=omitted_columns), "unavailable_empty_input"
+
+    required = {"split", "target", "target_label", "model_key", "model", "quantile", "mean_pinball_loss"}
+    missing = sorted(required - set(scatter_data.columns))
+    if missing:
+        raise ValueError(
+            "Cannot build target-normalized mean pinball heatmap; missing required columns: "
+            + ", ".join(missing)
+        )
+
+    d = scatter_data.copy()
+    d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+    if "n_obs" in d.columns:
+        d["n_obs"] = pd.to_numeric(d["n_obs"], errors="coerce")
+        has_weights = d["n_obs"].notna().any() and (d["n_obs"] > 0).any()
+    else:
+        d["n_obs"] = np.nan
+        has_weights = False
+    weighting = "observation_weighted" if has_weights else "simple_target_average"
+
+    rlqr = (
+        d.loc[d["model"].astype(str).eq("RLQR"), ["split", "target", "target_label", "quantile", "mean_pinball_loss"]]
+        .rename(columns={"mean_pinball_loss": "rlqr_mean_pinball_loss"})
+        .drop_duplicates(["split", "target", "quantile"])
+    )
+    merged = d.merge(rlqr, on=["split", "target", "target_label", "quantile"], how="left")
+    bad = merged["rlqr_mean_pinball_loss"].isna() | ~np.isfinite(merged["rlqr_mean_pinball_loss"]) | (merged["rlqr_mean_pinball_loss"].abs() <= 1e-12)
+    omitted = (
+        merged.loc[bad, ["split", "target", "target_label", "quantile", "rlqr_mean_pinball_loss"]]
+        .drop_duplicates(["split", "target", "quantile"])
+        .copy()
+    )
+    if not omitted.empty:
+        omitted["reason"] = np.where(
+            omitted["rlqr_mean_pinball_loss"].isna(),
+            "missing_rlqr_denominator",
+            "zero_or_nonfinite_rlqr_denominator",
+        )
+        omitted = omitted[omitted_columns]
+    else:
+        omitted = pd.DataFrame(columns=omitted_columns)
+
+    valid = merged.loc[~bad].copy()
+    valid["relative_pinball_loss"] = valid["mean_pinball_loss"] / valid["rlqr_mean_pinball_loss"]
+    valid = valid.replace([np.inf, -np.inf], np.nan).dropna(subset=["relative_pinball_loss"])
+    if valid.empty:
+        return pd.DataFrame(columns=columns), omitted, weighting
+
+    rows: list[dict[str, Any]] = []
+    group_cols = ["split", "model_key", "model", "quantile"]
+    for keys, group in valid.groupby(group_cols, dropna=False, observed=True):
+        rel = group["relative_pinball_loss"].to_numpy(dtype=float)
+        if has_weights:
+            weights = pd.to_numeric(group["n_obs"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            if float(np.sum(weights)) <= 0:
+                value = float(np.nanmean(rel))
+                n_obs = math.nan
+            else:
+                value = float(np.average(rel, weights=weights))
+                n_obs = int(np.sum(weights))
+        else:
+            value = float(np.nanmean(rel))
+            n_obs = math.nan
+        rows.append(
+            {
+                **dict(zip(group_cols, keys)),
+                "target_normalized_mean_pinball_loss": value,
+                "n_targets": int(group["target"].nunique()),
+                "n_obs": n_obs,
+                "aggregation_weighting": weighting,
+            }
+        )
+    out = pd.DataFrame(rows)
+    return out[columns].sort_values(["model", "quantile"]).reset_index(drop=True), omitted.reset_index(drop=True), weighting
+
+
+def build_rlqr_relative_mean_pinball_loss_heatmap_data(scatter_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Build Figure 7 from target-level losses normalized to RLQR first."""
+    detail_columns = [
+        "split",
+        "target",
+        "target_label",
+        "model_key",
+        "model",
+        "quantile_policy",
+        "raw_mean_pinball_loss",
+        "rlqr_mean_pinball_loss",
+        "relative_mean_pinball_loss",
+        "n_obs",
+        "aggregation_level",
+    ]
+    aggregate_columns = [
+        "split",
+        "target",
+        "target_label",
+        "model_key",
+        "model",
+        "quantile_policy",
+        "raw_mean_pinball_loss",
+        "rlqr_mean_pinball_loss",
+        "relative_mean_pinball_loss",
+        "n_obs",
+        "n_targets",
+        "aggregation_weighting",
+        "aggregation_level",
+    ]
+    if scatter_data.empty:
+        return pd.DataFrame(columns=aggregate_columns), pd.DataFrame(columns=detail_columns), "unavailable_empty_input"
+
+    required = {"split", "target", "target_label", "model_key", "model", "quantile", "mean_pinball_loss", "n_obs"}
+    missing = sorted(required - set(scatter_data.columns))
+    if missing:
+        raise ValueError(
+            "Cannot build RLQR-relative mean pinball heatmap; missing required columns: "
+            + ", ".join(missing)
+        )
+
+    d = scatter_data.copy()
+    d["mean_pinball_loss"] = pd.to_numeric(d["mean_pinball_loss"], errors="coerce")
+    d["n_obs"] = pd.to_numeric(d["n_obs"], errors="coerce")
+    rlqr = (
+        d.loc[d["model"].astype(str).eq("RLQR"), ["split", "target", "target_label", "quantile", "mean_pinball_loss"]]
+        .rename(columns={"mean_pinball_loss": "rlqr_mean_pinball_loss"})
+        .drop_duplicates(["split", "target", "quantile"])
+    )
+    merged = d.merge(rlqr, on=["split", "target", "target_label", "quantile"], how="left")
+    bad = merged["rlqr_mean_pinball_loss"].isna() | ~np.isfinite(merged["rlqr_mean_pinball_loss"]) | (merged["rlqr_mean_pinball_loss"].abs() <= 1e-12)
+    if bad.any():
+        bad_keys = (
+            merged.loc[bad, ["split", "target", "target_label", "quantile", "rlqr_mean_pinball_loss"]]
+            .drop_duplicates(["split", "target", "quantile"])
+            .sort_values(["split", "target", "quantile"])
+        )
+        details = "; ".join(
+            f"{row.split}/{row.target}/{row.quantile}: {row.rlqr_mean_pinball_loss}"
+            for row in bad_keys.itertuples(index=False)
+        )
+        raise ValueError(
+            "Cannot build RLQR-relative mean pinball heatmap because RLQR denominators are missing, "
+            f"zero, NaN or non-finite for target/quantile combinations: {details}"
+        )
+
+    merged["relative_mean_pinball_loss"] = merged["mean_pinball_loss"] / merged["rlqr_mean_pinball_loss"]
+    rel_bad = merged["relative_mean_pinball_loss"].isna() | ~np.isfinite(merged["relative_mean_pinball_loss"])
+    if rel_bad.any():
+        bad_keys = merged.loc[rel_bad, ["split", "target", "target_label", "model", "quantile"]].drop_duplicates()
+        details = "; ".join(f"{row.split}/{row.target}/{row.model}/{row.quantile}" for row in bad_keys.itertuples(index=False))
+        raise ValueError(f"Cannot build RLQR-relative mean pinball heatmap because relative losses are invalid for: {details}")
+
+    detail = merged.rename(
+        columns={
+            "quantile": "quantile_policy",
+            "mean_pinball_loss": "raw_mean_pinball_loss",
+        }
+    ).copy()
+    detail["aggregation_level"] = "target"
+    detail = detail[detail_columns]
+
+    rows: list[dict[str, Any]] = []
+    group_cols = ["split", "model_key", "model", "quantile_policy"]
+    weighting = "observation_weighted"
+    for keys, group in detail.groupby(group_cols, dropna=False, observed=True):
+        weights = pd.to_numeric(group["n_obs"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if float(np.sum(weights)) <= 0:
+            raise ValueError(
+                "Cannot aggregate RLQR-relative mean pinball heatmap because n_obs weights are missing or non-positive for "
+                + "/".join(str(x) for x in keys)
+            )
+        rows.append(
+            {
+                **dict(zip(group_cols, keys)),
+                "target": "all_targets",
+                "target_label": "All Target Variables",
+                "raw_mean_pinball_loss": float(np.average(group["raw_mean_pinball_loss"].to_numpy(dtype=float), weights=weights)),
+                "rlqr_mean_pinball_loss": float(np.average(group["rlqr_mean_pinball_loss"].to_numpy(dtype=float), weights=weights)),
+                "relative_mean_pinball_loss": float(np.average(group["relative_mean_pinball_loss"].to_numpy(dtype=float), weights=weights)),
+                "n_obs": int(np.sum(weights)),
+                "n_targets": int(group["target"].nunique()),
+                "aggregation_weighting": weighting,
+                "aggregation_level": "all_targets_after_normalization",
+            }
+        )
+    aggregate = pd.DataFrame(rows)
+    aggregate = aggregate[aggregate_columns].sort_values(["model", "quantile_policy"]).reset_index(drop=True)
+    detail = detail.sort_values(["target", "model", "quantile_policy"]).reset_index(drop=True)
+    return aggregate, detail, weighting
+
+
 def _format_eur(value: Any) -> str:
     val = _safe_float(value)
     if not math.isfinite(val):
@@ -1788,6 +1995,8 @@ def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame)
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
+        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Values are annualized and reported in kEUR per year. Cost rows are reported as positive cost magnitudes.}",
+        r"\label{tab:3_revenue_cost_components_best_quantile}",
         r"\begin{tabular}{@{}l" + "r" * len(models) + r"@{}}",
         r"\toprule",
         " & ".join(header_cells) + r" \\",
@@ -1805,8 +2014,6 @@ def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame)
     lines += [
         r"\bottomrule",
         r"\end{tabular}",
-        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Values are annualized and reported in kEUR per year. Cost rows are reported as positive cost magnitudes.}",
-        r"\label{tab:3_revenue_cost_components_best_quantile}",
         r"\end{table}",
         "",
     ]
@@ -1897,7 +2104,7 @@ def plot_heatmap(table: pd.DataFrame, out_base: Path, formats: list[str]) -> lis
     return written
 
 
-def plot_mean_pinball_loss_heatmap(total_scatter_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+def plot_mean_pinball_loss_heatmap(relative_pinball_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
 
@@ -1905,16 +2112,16 @@ def plot_mean_pinball_loss_heatmap(total_scatter_data: pd.DataFrame, out_base: P
     fig, ax = plt.subplots(figsize=(8.8, 3.6))
     rows = list(MODEL_ORDER)
     quantiles = list(DEFAULT_QUANTILES)
-    if not total_scatter_data.empty and "quantile" in total_scatter_data.columns:
-        quantiles = [q for q in DEFAULT_QUANTILES if q in set(total_scatter_data["quantile"].astype(str))]
+    if not relative_pinball_data.empty and "quantile_policy" in relative_pinball_data.columns:
+        quantiles = [q for q in DEFAULT_QUANTILES if q in set(relative_pinball_data["quantile_policy"].astype(str))]
     pivot = (
-        total_scatter_data.pivot_table(
+        relative_pinball_data.pivot_table(
             index="model",
-            columns="quantile",
-            values="mean_pinball_loss",
+            columns="quantile_policy",
+            values="relative_mean_pinball_loss",
             aggfunc="mean",
         ).reindex(index=rows, columns=quantiles)
-        if not total_scatter_data.empty
+        if not relative_pinball_data.empty
         else pd.DataFrame(index=rows, columns=quantiles)
     )
     arr = pivot.to_numpy(dtype=float)
@@ -1933,7 +2140,7 @@ def plot_mean_pinball_loss_heatmap(total_scatter_data: pd.DataFrame, out_base: P
     ax.set_yticklabels(rows)
     ax.set_xlabel("Quantile policy")
     ax.set_ylabel("Model")
-    ax.set_title("Mean Pinball Loss by Model and Quantile")
+    ax.set_title("Mean Pinball Loss Relative to RLQR")
     finite = arr[np.isfinite(arr)]
     midpoint = float(np.nanmedian(finite)) if finite.size else math.nan
     for i, model in enumerate(rows):
@@ -1944,7 +2151,61 @@ def plot_mean_pinball_loss_heatmap(total_scatter_data: pd.DataFrame, out_base: P
             ax.text(j, i, txt, ha="center", va="center", color=text_color, fontsize=9)
     cbar = fig.colorbar(im, ax=ax)
     cbar.ax.grid(False)
-    cbar.set_label("Mean pinball loss")
+    cbar.set_label("Relative mean pinball loss")
+    fig.tight_layout()
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
+    return written
+
+
+def plot_target_normalized_mean_pinball_loss_heatmap(data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(8.8, 3.6))
+    rows = list(MODEL_ORDER)
+    quantiles = list(DEFAULT_QUANTILES)
+    if not data.empty and "quantile" in data.columns:
+        quantiles = [q for q in DEFAULT_QUANTILES if q in set(data["quantile"].astype(str))]
+    pivot = (
+        data.pivot_table(
+            index="model",
+            columns="quantile",
+            values="target_normalized_mean_pinball_loss",
+            aggfunc="mean",
+        ).reindex(index=rows, columns=quantiles)
+        if not data.empty
+        else pd.DataFrame(index=rows, columns=quantiles)
+    )
+    arr = pivot.to_numpy(dtype=float)
+    finite = arr[np.isfinite(arr)]
+    span = max(float(np.max(np.abs(finite - 1.0))), 0.10) if finite.size else 0.10
+    norm = TwoSlopeNorm(vmin=1.0 - span, vcenter=1.0, vmax=1.0 + span)
+    cmap = LinearSegmentedColormap.from_list(
+        "rq2_relative_pinball",
+        [THESIS_PALETTE["primary"], "#FFFFFF", THESIS_PALETTE["tertiary"]],
+    )
+    cmap.set_bad("#F2F2F2")
+    im = ax.imshow(np.ma.masked_invalid(arr), aspect="auto", cmap=cmap, norm=norm)
+    ax.grid(False)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.set_xticks(np.arange(len(quantiles)))
+    ax.set_xticklabels(quantiles)
+    ax.set_yticks(np.arange(len(rows)))
+    ax.set_yticklabels(rows)
+    ax.set_xlabel("Quantile policy")
+    ax.set_ylabel("Model")
+    ax.set_title("Target-Normalized Mean Pinball Loss")
+    for i, model in enumerate(rows):
+        for j, q in enumerate(quantiles):
+            val = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
+            txt = "n/a" if not math.isfinite(val) else f"{val:.2f}"
+            text_color = "white" if math.isfinite(val) and abs(val - 1.0) >= 0.55 * span else THESIS_PALETTE["neutral_dark"]
+            ax.text(j, i, txt, ha="center", va="center", color=text_color, fontsize=9)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.ax.grid(False)
+    cbar.set_label("Mean pinball loss relative to RLQR")
     fig.tight_layout()
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
@@ -2016,7 +2277,7 @@ def plot_bid_volume_heatmap(activity: pd.DataFrame, out_base: Path, formats: lis
     if last_im is not None:
         cbar = fig.colorbar(last_im, ax=list(axes), shrink=0.88)
         cbar.ax.grid(False)
-        cbar.set_label(f"{metric_label} bid volume (1,000 MWh/year)")
+        cbar.set_label(f"{metric_label} bid volume (GWh/year)")
     fig.tight_layout(rect=(0, 0, 0.94, 0.94))
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
@@ -2228,7 +2489,7 @@ def plot_bidding_activity_submitted_cleared(
     not_cleared_col = "not_cleared_bid_volume_mwh_annualized" if is_volume else "not_cleared_bid_count_annualized"
     scale = 1000.0
     title = "Annualized Bid Volume by Market and Model Strategy" if is_volume else "Annualized Bid Count by Market and Model Strategy"
-    ylabel = "Submitted bid volume (1,000 MWh/year)" if is_volume else "Submitted bids (1,000/year)"
+    ylabel = "Submitted bid volume (GWh/year)" if is_volume else "Submitted bids (1,000/year)"
     fig, ax = plt.subplots(figsize=(10.8, 5.4))
     if activity.empty:
         ax.axis("off")
@@ -2661,7 +2922,7 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
             linestyle="--",
             linewidth=1.3,
             alpha=0.8,
-            label="VoF reference line",
+            label="loss-profit reference line",
             zorder=1,
         )
         for model in MODEL_ORDER:
@@ -2730,7 +2991,7 @@ def plot_normalized_total_mae_profit_scatter(normalized_data: pd.DataFrame, out_
             linestyle="--",
             linewidth=1.3,
             alpha=0.8,
-            label="VoF reference line",
+            label="loss-profit reference line",
             zorder=1,
         )
 
@@ -3060,19 +3321,19 @@ def write_latex_profit_heatmap(path: Path, table: pd.DataFrame) -> None:
     _write_native_latex(path, lines)
 
 
-def write_latex_mean_pinball_loss_heatmap(path: Path, total_scatter_data: pd.DataFrame, quantiles: list[str]) -> None:
+def write_latex_mean_pinball_loss_heatmap(path: Path, relative_pinball_data: pd.DataFrame, quantiles: list[str]) -> None:
     rows = list(MODEL_ORDER)
-    quantile_order = [q for q in quantiles if total_scatter_data.empty or q in set(total_scatter_data["quantile"].astype(str))]
+    quantile_order = [q for q in quantiles if relative_pinball_data.empty or q in set(relative_pinball_data["quantile_policy"].astype(str))]
     if not quantile_order:
         quantile_order = list(quantiles)
     pivot = (
-        total_scatter_data.pivot_table(
+        relative_pinball_data.pivot_table(
             index="model",
-            columns="quantile",
-            values="mean_pinball_loss",
+            columns="quantile_policy",
+            values="relative_mean_pinball_loss",
             aggfunc="mean",
         ).reindex(index=rows, columns=quantile_order)
-        if not total_scatter_data.empty
+        if not relative_pinball_data.empty
         else pd.DataFrame(index=rows, columns=quantile_order)
     )
     points: list[tuple[int, int, float, str, str]] = []
@@ -3121,6 +3382,7 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, total_scatter_data: pd.Dat
         *_axis_common_options(),
         r"width=0.78\linewidth,",
         r"height=0.32\linewidth,",
+        r"title={Mean Pinball Loss Relative to RLQR},",
         r"xlabel={Quantile policy},",
         r"ylabel={Model},",
         "xmin=-0.5, xmax=" + _tex_float(len(quantile_order) - 0.5, 1) + ",",
@@ -3134,7 +3396,7 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, total_scatter_data: pd.Dat
         r"point meta max=" + _tex_float(meta_max, 2) + ",",
         r"colormap={rq2blue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
         r"colorbar,",
-        r"colorbar style={ylabel={Mean pinball loss}, tick label style={font=\small}},",
+        r"colorbar style={ylabel={Relative mean pinball loss}, tick label style={font=\small}},",
         r"]",
         r"\addplot[scatter, only marks, mark=none, draw=none, opacity=0, scatter/use mapped color={draw opacity=0, fill opacity=0}] coordinates {",
         rf"(0,0) [{_tex_float(meta_min, 3)}]",
@@ -3143,8 +3405,95 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, total_scatter_data: pd.Dat
         *cells,
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Total mean pinball loss by model and quantile policy. Values are observation-weighted averages across all forecast targets; lower values indicate lower forecast loss.}",
+        r"\caption{Heatmap of mean pinball loss normalized relative to the RLQR benchmark. For each target and quantile policy, the raw mean pinball loss of each model is divided by the corresponding RLQR loss before aggregation. Values below 1 indicate lower pinball loss than RLQR, values above 1 indicate higher pinball loss. This normalization avoids misleading comparisons across targets with different numerical scales, particularly price targets and activation-rate targets.}",
         r"\label{fig:7_mean_pinball_loss_heatmap}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_target_normalized_mean_pinball_loss_heatmap(path: Path, data: pd.DataFrame, quantiles: list[str]) -> None:
+    rows = list(MODEL_ORDER)
+    quantile_order = [q for q in quantiles if data.empty or q in set(data["quantile"].astype(str))]
+    if not quantile_order:
+        quantile_order = list(quantiles)
+    pivot = (
+        data.pivot_table(
+            index="model",
+            columns="quantile",
+            values="target_normalized_mean_pinball_loss",
+            aggfunc="mean",
+        ).reindex(index=rows, columns=quantile_order)
+        if not data.empty
+        else pd.DataFrame(index=rows, columns=quantile_order)
+    )
+    arr = pivot.to_numpy(dtype=float)
+    finite = arr[np.isfinite(arr)]
+    span = max(float(np.max(np.abs(finite - 1.0))), 0.10) if finite.size else 0.10
+    vmin = 1.0 - span
+    vmax = 1.0 + span
+    cells: list[str] = []
+    for yi, model in enumerate(rows):
+        for xi, q in enumerate(quantile_order):
+            value = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
+            if not math.isfinite(value):
+                fill = "rqTwoMissing"
+                text_color = "rqTwoNeutral"
+                intensity = 0
+                txt = "n/a"
+            else:
+                intensity = int(round(min(100.0, abs(value - 1.0) / max(span, 1e-12) * 100.0)))
+                fill = f"rqTwoBetter!{intensity}!white" if value < 1.0 else f"rqTwoWorse!{intensity}!white"
+                text_color = "white" if intensity >= 62 else "rqTwoNeutral"
+                txt = f"{value:.2f}"
+            cells.extend(
+                [
+                    rf"\filldraw[fill={fill}, draw=white, line width=0.6pt] (axis cs:{xi - 0.5},{yi - 0.5}) rectangle (axis cs:{xi + 0.5},{yi + 0.5});",
+                    rf"\node[text={text_color}, font=\scriptsize] at (axis cs:{xi},{yi}) {{{_latex_escape(txt)}}};",
+                ]
+            )
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\definecolor{rqTwoBetter}{HTML}{226E9C}",
+        r"\definecolor{rqTwoWorse}{HTML}{7C1D6F}",
+        r"\definecolor{rqTwoMissing}{HTML}{F2F2F2}",
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"width=0.78\linewidth,",
+        r"height=0.32\linewidth,",
+        r"title={Target-Normalized Mean Pinball Loss},",
+        r"xlabel={Quantile policy},",
+        r"ylabel={Model},",
+        "xmin=-0.5, xmax=" + _tex_float(len(quantile_order) - 0.5, 1) + ",",
+        "ymin=-0.5, ymax=" + _tex_float(len(rows) - 0.5, 1) + ",",
+        "xtick={" + ",".join(str(i) for i in range(len(quantile_order))) + "},",
+        "xticklabels={" + ",".join(_latex_escape(q) for q in quantile_order) + "},",
+        "ytick={" + ",".join(str(i) for i in range(len(rows))) + "},",
+        "yticklabels={" + ",".join(_latex_escape(r) for r in rows) + "},",
+        r"y dir=reverse,",
+        "point meta min=" + _tex_float(vmin, 3) + ",",
+        "point meta max=" + _tex_float(vmax, 3) + ",",
+        (
+            r"colormap={rq2relpinball}{rgb255(0cm)=(34,110,156); "
+            r"rgb255(1cm)=(255,255,255); rgb255(2cm)=(124,29,111)},"
+        ),
+        r"colorbar,",
+        r"colorbar style={ylabel={Mean pinball loss relative to RLQR}, tick label style={font=\small}},",
+        r"]",
+        r"\addplot[scatter, only marks, mark=none, draw=none, opacity=0, scatter/use mapped color={draw opacity=0, fill opacity=0}] coordinates {",
+        rf"(0,0) [{_tex_float(vmin, 3)}]",
+        rf"(0,0) [{_tex_float(vmax, 3)}]",
+        r"};",
+        *cells,
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Target-normalized mean pinball loss by model and quantile policy. Pinball loss is first scaled relative to the RLQR baseline within each forecast target and quantile policy and is then averaged across targets. Values below 1 indicate lower pinball loss than RLQR, while values above 1 indicate higher pinball loss.}",
+        r"\label{fig:8_target_normalized_mean_pinball_loss_heatmap}",
         r"\end{figure}",
     ]
     _write_native_latex(path, lines)
@@ -3176,6 +3525,10 @@ def write_latex_bid_volume_heatmap(path: Path, activity: pd.DataFrame, quantiles
         )
         panels.append((market, pivot))
         vals.extend([float(v) for v in pivot.to_numpy(dtype=float).ravel() if math.isfinite(float(v))])
+    panels_by_market = {market: pivot for market, pivot in panels}
+    panel_order = [m for m in ["DA", "aFRR capacity", "ID", "aFRR activation"] if m in panels_by_market]
+    panel_order.extend([m for m in markets if m in panels_by_market and m not in panel_order])
+    panels = [(market, panels_by_market[market]) for market in panel_order]
     meta_min = 0.0
     meta_max = max(vals) if vals else 1.0
     palette = [GEO_SEQUENTIAL_BLUE[f"seq_{i}"] for i in range(1, 8)]
@@ -3191,22 +3544,20 @@ def write_latex_bid_volume_heatmap(path: Path, activity: pd.DataFrame, quantiles
         return palette[idx]
 
     panel_blocks: list[str] = []
-    positions = [(0, 0), (7.1, 0), (0, -4.0), (7.1, -4.0)]
+    positions = [(0, 0), (6.35, 0), (0, -5.25), (6.35, -5.25)]
     for panel_idx, (market, pivot) in enumerate(panels):
         x0, y0 = positions[panel_idx]
         block: list[str] = [
             rf"\begin{{scope}}[shift={{({x0:.2f},{y0:.2f})}}]",
-            rf"\node[font=\small] at (2.50,0.45) {{{_latex_escape(market)}}};",
+            rf"\node[font=\normalsize] at (2.50,0.55) {{{_latex_escape(market)}}};",
             r"\draw[rqTwoNeutral, line width=0.35pt] (-0.05,-0.05) rectangle (5.05,-3.05);",
         ]
-        if panel_idx in {0, 2}:
-            block.append(r"\node[rotate=90, font=\small] at (-1.10,-1.55) {Model};")
         for xi, q in enumerate(quantile_order):
-            block.append(rf"\node[font=\scriptsize] at ({xi + 0.5:.2f},-3.35) {{{_latex_escape(q)}}};")
+            block.append(rf"\node[font=\small] at ({xi + 0.5:.2f},-3.38) {{{_latex_escape(q)}}};")
         block.append(r"\node[font=\small] at (2.50,-3.85) {Quantile};")
         if panel_idx in {0, 2}:
             for yi, model in enumerate(rows):
-                block.append(rf"\node[anchor=east, font=\scriptsize] at (-0.18,{-yi - 0.5:.2f}) {{{_latex_escape(model)}}};")
+                block.append(rf"\node[anchor=east, font=\small] at (-0.20,{-yi - 0.5:.2f}) {{{_latex_escape(model)}}};")
         for yi, model in enumerate(rows):
             for xi, q in enumerate(quantile_order):
                 value = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
@@ -3218,37 +3569,56 @@ def write_latex_bid_volume_heatmap(path: Path, activity: pd.DataFrame, quantiles
                     [
                         rf"\definecolor{{{cname}}}{{HTML}}{{{color.lstrip('#')}}}",
                         rf"\filldraw[fill={cname}, draw=white, line width=0.45pt] ({xi:.2f},{-yi:.2f}) rectangle ({xi + 1:.2f},{-yi - 1:.2f});",
-                        rf"\node[text={text_color}, font=\tiny] at ({xi + 0.5:.2f},{-yi - 0.5:.2f}) {{{_latex_escape(txt)}}};",
+                        rf"\node[text={text_color}, font=\scriptsize] at ({xi + 0.5:.2f},{-yi - 0.5:.2f}) {{{_latex_escape(txt)}}};",
                     ]
                 )
         block.append(r"\end{scope}")
         panel_blocks.extend(block)
+
+    colorbar_x = 12.25
+    colorbar_y_top = 0.0
+    colorbar_height = 8.25
+    colorbar_width = 0.34
+    colorbar_lines: list[str] = []
+    for idx, color in enumerate(palette):
+        y1 = colorbar_y_top - colorbar_height * idx / len(palette)
+        y2 = colorbar_y_top - colorbar_height * (idx + 1) / len(palette)
+        cname = f"rqTwoBidColorbar{metric}{idx}"
+        colorbar_lines.extend(
+            [
+                rf"\definecolor{{{cname}}}{{HTML}}{{{color.lstrip('#')}}}",
+                rf"\filldraw[fill={cname}, draw=none] ({colorbar_x:.2f},{y1:.3f}) rectangle ({colorbar_x + colorbar_width:.2f},{y2:.3f});",
+            ]
+        )
+    colorbar_lines.append(
+        rf"\draw[rqTwoNeutral, line width=0.35pt] ({colorbar_x:.2f},{colorbar_y_top:.3f}) rectangle ({colorbar_x + colorbar_width:.2f},{colorbar_y_top - colorbar_height:.3f});"
+    )
+    tick_values = np.linspace(meta_min, meta_max, 5)
+    for tick in tick_values:
+        frac = 0.0 if meta_max <= meta_min else (float(tick) - meta_min) / (meta_max - meta_min)
+        y = colorbar_y_top - colorbar_height * frac
+        tick_label = f"{float(tick):.0f}"
+        colorbar_lines.extend(
+            [
+                rf"\draw[rqTwoNeutral, line width=0.25pt] ({colorbar_x + colorbar_width:.2f},{y:.3f}) -- ({colorbar_x + colorbar_width + 0.12:.2f},{y:.3f});",
+                rf"\node[anchor=west, font=\scriptsize] at ({colorbar_x + colorbar_width + 0.18:.2f},{y:.3f}) {{{_latex_escape(tick_label)}}};",
+            ]
+        )
+    colorbar_lines.append(
+        rf"\node[rotate=90, anchor=center, font=\small] at ({colorbar_x + colorbar_width + 1.05:.2f},{colorbar_y_top - colorbar_height / 2:.3f}) {{{metric_label} bid volume (GWh/year)}};"
+    )
 
     lines = [
         r"% Requires \usepackage{tikz}",
         r"% Requires \usepackage{pgfplots}",
         r"\begin{figure}[htbp]",
         r"\centering",
-        r"\begin{tikzpicture}[x=0.72cm,y=0.72cm]",
+        r"\begin{tikzpicture}[x=0.96cm,y=0.88cm]",
         *_rq2_latex_color_defs(),
         *panel_blocks,
-        r"\begin{scope}[shift={(14.90,-0.10)}]",
-        r"\begin{axis}[",
-        r"hide axis, scale only axis, height=7.0cm, width=0.20cm,",
-        r"point meta min=" + _tex_float(meta_min, 2) + ",",
-        r"point meta max=" + _tex_float(meta_max, 2) + ",",
-        r"colormap={rq2blue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
-        r"colorbar,",
-        rf"colorbar style={{ylabel={{{metric_label} bid volume (1,000 MWh/year)}}, tick label style={{font=\scriptsize}}}},",
-        r"]",
-        r"\addplot[scatter, only marks, mark=none, draw=none, opacity=0, scatter/use mapped color={draw opacity=0, fill opacity=0}] coordinates {",
-        rf"(0,0) [{_tex_float(meta_min, 3)}]",
-        rf"(0,0) [{_tex_float(meta_max, 3)}]",
-        r"};",
-        r"\end{axis}",
-        r"\end{scope}",
+        *colorbar_lines,
         r"\end{tikzpicture}",
-        rf"\caption{{{metric_label} bid volume by market, model and quantile policy. Cell values are annualized {metric.lower()} bid volumes in 1,000 MWh per year.}}",
+        rf"\caption{{{metric_label} bid volume by market, model and quantile policy. Cell values are annualized {metric.lower()} bid volumes in GWh/year.}}",
         rf"\label{{fig:8_{metric}_bid_volume_heatmap_by_market_model_quantile}}",
         r"\end{figure}",
     ]
@@ -3356,7 +3726,7 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Quantile sweep of annualized Net Profit by model and benchmark. Naive and RHPF are shown as benchmark reference lines.}",
+        r"\caption{Quantile sweep of annualized net profit by model and benchmark. Naive and RHPF are shown as benchmark reference lines.}",
         r"\label{fig:2_quantile_sweep_net_profit_by_model}",
         r"\end{figure}",
     ]
@@ -3560,7 +3930,7 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
         r"]",
         r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
-        r"\addlegendentry{VoF reference line}",
+        r"\addlegendentry{loss-profit reference line}",
     ]
     for model in MODEL_ORDER:
         g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
@@ -3595,7 +3965,7 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line is the VoF reference line.}",
+        r"\caption{Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line is the loss-profit reference line.}",
         r"\label{fig:5_pinball_loss_vs_net_profit_total_normalized}",
         r"\end{figure}",
     ]
@@ -3607,6 +3977,8 @@ def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame)
         key = (str(model), str(quantile).lower())
         if key in {("XGB", "p70"), ("XGB", "p10")}:
             return "font=\\scriptsize, anchor=south, yshift=3pt, text=rqTwoNeutral"
+        if key == ("RLQR", "p50"):
+            return "font=\\scriptsize, anchor=east, xshift=-2pt, text=rqTwoNeutral"
         if key in {("TFT", "p90"), ("TFT", "p50")}:
             return "font=\\scriptsize, anchor=north, yshift=-3pt, text=rqTwoNeutral"
         return "font=\\scriptsize, anchor=west, xshift=2pt, text=rqTwoNeutral"
@@ -3629,7 +4001,7 @@ def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame)
         r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
         r"]",
         r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
-        r"\addlegendentry{VoF reference line}",
+        r"\addlegendentry{loss-profit reference line}",
     ]
     for model in MODEL_ORDER:
         g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
@@ -3654,7 +4026,7 @@ def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame)
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Normalized total MAE and annualized Net Profit by model and quantile policy. The grey dashed line is the VoF reference line.}",
+        r"\caption{Normalized total MAE and annualized Net Profit by model and quantile policy. The grey dashed line is the loss-profit reference line.}",
         r"\label{fig:5_mae_vs_net_profit_total_normalized}",
         r"\end{figure}",
     ]
@@ -3685,7 +4057,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
     tick_labels = [pd.Timestamp(times[i]).strftime("%H:%M") for i in tick_positions] if times else []
     power_ymin = -1.0
     power_ymax = 1.0
-    axis_width = r"0.84\linewidth"
+    axis_width = r"0.82\linewidth"
     if not data.empty and times:
         stack = (
             data.pivot_table(index="timestamp_utc", columns="component", values="mw_signed", aggfunc="sum")
@@ -3754,7 +4126,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"axis x line=none,",
         r"axis y line*=right,",
         r"ylabel={Charge (MWh)},",
-        r"ylabel style={font=\small, text=rqTwoSoC},",
+        r"ylabel style={font=\small, text=rqTwoSoC, at={(axis description cs:1.10,0.50)}, anchor=center},",
         r"yticklabel style={font=\small, text=rqTwoSoC},",
         r"tick style={rqTwoSoC},",
         r"axis line style={rqTwoSoC},",
@@ -3780,10 +4152,10 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
             r"axis x line=none,",
             r"axis y line*=right,",
             r"ylabel={Cumulative Net Profit (kEUR)},",
-            r"ylabel style={font=\small, text=rqTwoPNL, xshift=6.4em, yshift=-0.80cm},",
-            r"yticklabel style={font=\small, text=rqTwoPNL, xshift=4.2em},",
-            r"tick style={rqTwoPNL, xshift=3.8em},",
-            r"axis line style={rqTwoPNL, xshift=3.8em},",
+            r"ylabel style={font=\small, text=rqTwoPNL, at={(axis description cs:1.24,0.50)}, anchor=center},",
+            r"yticklabel style={font=\small, text=rqTwoPNL, xshift=3.8em},",
+            r"tick style={rqTwoPNL, xshift=3.5em},",
+            r"axis line style={rqTwoPNL, xshift=3.5em},",
             r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
             r"grid=none,",
             r"]",
@@ -3810,9 +4182,9 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     shifts = {"RLQR": "-8pt", "XGB": "0pt", "TFT": "8pt"}
     cleared_col = "cleared_bid_volume_mwh_annualized" if is_volume else "cleared_bid_count_annualized"
     not_cleared_col = "not_cleared_bid_volume_mwh_annualized" if is_volume else "not_cleared_bid_count_annualized"
-    ylabel = "Submitted bid volume (1,000 MWh/year)" if is_volume else "Submitted bids (1,000/year)"
+    ylabel = "Submitted bid volume (GWh/year)" if is_volume else "Submitted bids (1,000/year)"
     caption = (
-        "Annualized submitted bid volume by market and model strategy. Bars show total submitted bid volume, split into cleared volume and submitted but not-cleared volume. Fully opaque segments indicate cleared or realized volume, while transparent segments indicate submitted volume that did not clear. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
+        "Annualized submitted bid volume by market and model strategy. Bars show total submitted bid volume, split into cleared volume and semi-transparent submitted but not-cleared volume. The clearing ratio is shown above each bar. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
         if is_volume
         else "Annualized submitted bid count by market and model strategy. Bars show total submitted bids per year, split into cleared bids and submitted but not-cleared bids. Fully opaque segments indicate cleared or realized bids, while transparent segments indicate submitted bids that did not clear. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
     )
@@ -3821,6 +4193,14 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     bar_half_width = 0.055
     max_total = 0.0
     bar_draws: list[str] = []
+    ratio_labels: list[tuple[float, float, str]] = []
+    full_clearing_by_market: dict[str, list[tuple[float, float, float, float]]] = {label: [] for label in market_labels}
+    ratio_label_x_offsets = {
+        ("DA", "RLQR"): -0.055,
+        ("DA", "TFT"): 0.055,
+        ("ID", "RLQR"): -0.055,
+        ("ID", "TFT"): 0.055,
+    }
     for model in models:
         for xi, market_label in enumerate(market_labels):
             match = activity.loc[activity["market_label"].astype(str).eq(market_label) & activity["model"].astype(str).eq(model)]
@@ -3836,6 +4216,14 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
             x_left = x_mid - bar_half_width
             x_right = x_mid + bar_half_width
             color = _tex_model_color(model)
+            if is_volume and total > 0:
+                clearing_ratio = cleared / total
+                if math.isfinite(clearing_ratio):
+                    if abs(clearing_ratio - 1.0) <= 1e-9:
+                        full_clearing_by_market.setdefault(market_label, []).append((x_left, x_right, total, clearing_ratio))
+                    else:
+                        label_x = x_mid + ratio_label_x_offsets.get((market_label, model), 0.0)
+                        ratio_labels.append((label_x, total, f"{clearing_ratio * 100.0:.0f}\\%"))
             if cleared > 0:
                 bar_draws.append(
                     rf"\filldraw[fill={color}, draw=white, line width=0.4pt] (axis cs:{_tex_float(x_left, 3)},0) rectangle (axis cs:{_tex_float(x_right, 3)},{_tex_float(cleared, 3)});"
@@ -3844,7 +4232,26 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
                 bar_draws.append(
                     rf"\filldraw[fill={color}, fill opacity=0.35, draw=white, line width=0.4pt] (axis cs:{_tex_float(x_left, 3)},{_tex_float(cleared, 3)}) rectangle (axis cs:{_tex_float(x_right, 3)},{_tex_float(total, 3)});"
                 )
-    y_max = max(1.0, max_total * 1.12)
+    y_max = max(1.0, max_total * (1.24 if is_volume else 1.12))
+    label_offset = max(y_max * 0.015, 0.08)
+    ratio_label_draws = [
+        rf"\node[anchor=south, font=\scriptsize, text=rqTwoNeutral] at (axis cs:{_tex_float(x_mid, 3)},{_tex_float(min(y_max * 0.985, total + label_offset), 3)}) {{{label}}};"
+        for x_mid, total, label in ratio_labels
+    ]
+    full_clearing_braces: list[str] = []
+    if is_volume:
+        for market_label, entries in full_clearing_by_market.items():
+            if len(entries) < len(models) or not entries:
+                continue
+            x_left = min(row[0] for row in entries)
+            x_right = max(row[1] for row in entries)
+            group_top = max(row[2] for row in entries)
+            y = min(y_max * 0.945, group_top + max(y_max * 0.040, 0.18))
+            x_mid = 0.5 * (x_left + x_right)
+            full_clearing_braces.append(
+                rf"\node[anchor=south, font=\scriptsize, text=rqTwoNeutral] "
+                rf"at (axis cs:{_tex_float(x_mid, 3)},{_tex_float(y, 3)}) {{$\overbrace{{\hspace{{1.05cm}}}}^{{100\%}}$}};"
+            )
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -3871,6 +4278,8 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
         lines.append(rf"\addlegendimage{{area legend, fill={_tex_model_color(model)}, draw=white}}")
         lines.append(rf"\addlegendentry{{{_latex_escape(model_labels.get(model, model))}}}")
     lines.extend(bar_draws)
+    lines.extend(ratio_label_draws)
+    lines.extend(full_clearing_braces)
     lines += [
         r"\addlegendimage{area legend, fill=rqTwoNeutral, draw=white}",
         r"\addlegendentry{Cleared/realized}",
@@ -3892,7 +4301,8 @@ def write_result_section_native_latex_figures(
     sweep_data: pd.DataFrame,
     component_data: pd.DataFrame,
     cumulative_data: pd.DataFrame,
-    total_scatter_data: pd.DataFrame,
+    relative_pinball_heatmap_data: pd.DataFrame,
+    target_normalized_pinball_data: pd.DataFrame,
     normalized_total_scatter_data: pd.DataFrame,
     normalized_total_mae_data: pd.DataFrame,
     dispatch_soc_data: pd.DataFrame,
@@ -3907,7 +4317,8 @@ def write_result_section_native_latex_figures(
     write_latex_normalized_pinball_profit(latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex", normalized_total_scatter_data)
     write_latex_normalized_mae_profit(latex_figures_dir / "5_mae_vs_net_profit_total_normalized.tex", normalized_total_mae_data)
     write_latex_market_dispatch_soc(latex_figures_dir / "6_market_dispatch_soc_selected_day.tex", dispatch_soc_data)
-    write_latex_mean_pinball_loss_heatmap(latex_figures_dir / "7_mean_pinball_loss_heatmap.tex", total_scatter_data, quantiles)
+    write_latex_mean_pinball_loss_heatmap(latex_figures_dir / "7_mean_pinball_loss_heatmap.tex", relative_pinball_heatmap_data, quantiles)
+    write_latex_target_normalized_mean_pinball_loss_heatmap(latex_figures_dir / "8_target_normalized_mean_pinball_loss_heatmap.tex", target_normalized_pinball_data, quantiles)
     write_latex_bid_volume_heatmap(latex_figures_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile.tex", bidding_heatmap_data, quantiles, metric="submitted")
     write_latex_bid_volume_heatmap(latex_figures_dir / "8_cleared_bid_volume_heatmap_by_market_model_quantile.tex", bidding_heatmap_data, quantiles, metric="cleared")
     write_latex_bidding_activity_submitted_cleared(latex_figures_dir / "annualized_bid_volume_by_market_model.tex", bidding_activity_data, metric="volume")
@@ -3975,6 +4386,12 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         quantiles=quantiles,
     )
     total_scatter_data = build_total_pinball_net_profit_scatter_data(scatter_data)
+    relative_pinball_heatmap_data, relative_pinball_heatmap_detail, relative_pinball_heatmap_weighting = (
+        build_rlqr_relative_mean_pinball_loss_heatmap_data(scatter_data)
+    )
+    target_normalized_pinball_data, target_normalized_pinball_omissions, target_normalized_pinball_weighting = (
+        build_target_normalized_mean_pinball_loss_heatmap_data(scatter_data)
+    )
     normalized_total_scatter_data = build_normalized_total_pinball_profit_data(total_scatter_data)
     normalized_total_mae_data = build_normalized_total_mae_profit_data(total_scatter_data)
     dispatch_soc_data, dispatch_soc_warnings = build_market_dispatch_soc_day(summary, run_root=run_root)
@@ -4000,6 +4417,12 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     cumulative_data.to_csv(csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", index=False)
     scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", index=False)
     total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", index=False)
+    pd.concat([relative_pinball_heatmap_detail, relative_pinball_heatmap_data], ignore_index=True, sort=False).to_csv(
+        result_csv_dir / "7_mean_pinball_loss_heatmap.csv",
+        index=False,
+    )
+    target_normalized_pinball_data.to_csv(result_csv_dir / "8_target_normalized_mean_pinball_loss_heatmap.csv", index=False)
+    target_normalized_pinball_omissions.to_csv(diag_dir / "8_target_normalized_mean_pinball_loss_omitted_target_quantiles.csv", index=False)
     normalized_total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", index=False)
     normalized_total_mae_data.to_csv(csv_dir / "5_mae_vs_net_profit_total_normalized.csv", index=False)
     dispatch_soc_data.to_csv(csv_dir / "6_market_dispatch_soc_selected_day.csv", index=False)
@@ -4015,6 +4438,18 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     bidding_heatmap_inventory.to_csv(diag_dir / "8_submitted_bid_volume_heatmap_source_inventory.csv", index=False)
     validity.to_csv(diag_dir / "rq2_validity_diagnostics.csv", index=False)
     warning_df = pd.concat([warning_df, dispatch_soc_warnings, bidding_activity_warnings, bidding_heatmap_warnings], ignore_index=True, sort=False)
+    if not target_normalized_pinball_omissions.empty:
+        warning_df = pd.concat(
+            [
+                warning_df,
+                target_normalized_pinball_omissions.assign(
+                    severity="warning",
+                    message="Omitted target-quantile pair from target-normalized mean pinball aggregation because RLQR denominator was missing, non-finite or zero.",
+                ),
+            ],
+            ignore_index=True,
+            sort=False,
+        )
     warning_df.to_csv(warn_dir / "rq2_warnings.csv", index=False)
     dispatch_soc_warnings.to_csv(warn_dir / "6_market_dispatch_soc_selected_day_warnings.csv", index=False)
     bidding_activity_warnings.to_csv(warn_dir / "bidding_activity_submitted_cleared_warnings.csv", index=False)
@@ -4035,7 +4470,8 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         result_figure_paths += plot_normalized_total_mae_profit_scatter(normalized_total_mae_data, figures_dir / "5_mae_vs_net_profit_total_normalized", formats)
         appendix_figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, appendix_figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
         result_figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
-        result_figure_paths += plot_mean_pinball_loss_heatmap(total_scatter_data, figures_dir / "7_mean_pinball_loss_heatmap", formats)
+        result_figure_paths += plot_mean_pinball_loss_heatmap(relative_pinball_heatmap_data, figures_dir / "7_mean_pinball_loss_heatmap", formats)
+        result_figure_paths += plot_target_normalized_mean_pinball_loss_heatmap(target_normalized_pinball_data, figures_dir / "8_target_normalized_mean_pinball_loss_heatmap", formats)
         result_figure_paths += plot_bidding_activity_submitted_cleared(bidding_activity_data, figures_dir / "annualized_bid_volume_by_market_model", formats, metric="volume")
         result_figure_paths += plot_bidding_activity_submitted_cleared(bidding_activity_data, figures_dir / "annualized_bid_count_by_market_model", formats, metric="count")
         result_figure_paths += plot_bid_volume_heatmap(bidding_heatmap_data, figures_dir / "8_submitted_bid_volume_heatmap_by_market_model_quantile", formats, metric="submitted")
@@ -4047,7 +4483,8 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
             sweep_data=sweep_data,
             component_data=component_data,
             cumulative_data=cumulative_data,
-            total_scatter_data=total_scatter_data,
+            relative_pinball_heatmap_data=relative_pinball_heatmap_data,
+            target_normalized_pinball_data=target_normalized_pinball_data,
             normalized_total_scatter_data=normalized_total_scatter_data,
             normalized_total_mae_data=normalized_total_mae_data,
             dispatch_soc_data=dispatch_soc_data,
@@ -4088,6 +4525,9 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (csv_dir / "4_cumulative_net_profit_model_comparison_test_period.csv", "backup", "csv", "cumulative Net Profit", "source data for best-quantile cumulative Net Profit figure"),
         (csv_dir / "5_pinball_loss_vs_net_profit_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for target-specific pinball-loss scatter figures"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_scatter_data.csv", "backup", "csv", "forecast accuracy vs Net Profit", "source data for total pinball-loss scatter figure"),
+        (result_csv_dir / "7_mean_pinball_loss_heatmap.csv", "result_section", "csv", "RLQR-relative mean pinball loss", "source data for RLQR-relative mean pinball heatmap"),
+        (result_csv_dir / "8_target_normalized_mean_pinball_loss_heatmap.csv", "result_section", "csv", "target-normalized mean pinball loss", "source data for target-normalized mean pinball heatmap"),
+        (diag_dir / "8_target_normalized_mean_pinball_loss_omitted_target_quantiles.csv", "backup", "diagnostics", "target-normalized mean pinball loss", "omitted RLQR denominator diagnostics"),
         (csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total pinball-loss scatter figure"),
         (csv_dir / "5_mae_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total MAE scatter figure"),
         (csv_dir / "6_market_dispatch_soc_selected_day.csv", "backup", "csv", "market dispatch and SoC", "source data for selected-day stacked dispatch/SOC figure"),
@@ -4119,6 +4559,10 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": "rq2_output_manifest_v1",
         "source_run_root": str(run_root),
         "forecast_benchmark_dir": str(forecast_benchmark_dir),
+        "forecast_pinball_input": str(forecast_benchmark_dir / "diagnostics" / "joined_predictions"),
+        "rlqr_relative_mean_pinball_aggregation": relative_pinball_heatmap_weighting,
+        "target_normalized_mean_pinball_aggregation": target_normalized_pinball_weighting,
+        "target_normalized_mean_pinball_omitted_target_quantiles": int(len(target_normalized_pinball_omissions)),
         "output_root": str(out_root),
         "created_at_utc": created,
         "split": str(args.split),
@@ -4129,6 +4573,15 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         "outputs": entries,
     }
     (out_root / "rq2_output_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[OK] RQ2 pinball input: {forecast_benchmark_dir / 'diagnostics' / 'joined_predictions'}")
+    print("[OK] detected pinball columns: model, quantile, target, mean_pinball_loss, n_obs")
+    print(f"[OK] RLQR-relative pinball aggregation: {relative_pinball_heatmap_weighting}")
+    print(f"[OK] RLQR-relative heatmap CSV: {result_csv_dir / '7_mean_pinball_loss_heatmap.csv'}")
+    print(f"[OK] RLQR-relative heatmap LaTeX: {latex_figures_dir / '7_mean_pinball_loss_heatmap.tex'}")
+    print(f"[OK] target-normalized pinball aggregation: {target_normalized_pinball_weighting}")
+    print(f"[OK] omitted target-quantile combinations: {len(target_normalized_pinball_omissions)}")
+    print(f"[OK] target-normalized heatmap CSV: {result_csv_dir / '8_target_normalized_mean_pinball_loss_heatmap.csv'}")
+    print(f"[OK] target-normalized heatmap LaTeX: {latex_figures_dir / '8_target_normalized_mean_pinball_loss_heatmap.tex'}")
     return manifest
 
 

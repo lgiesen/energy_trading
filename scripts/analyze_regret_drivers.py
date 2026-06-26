@@ -1142,6 +1142,8 @@ def write_latex_table(df: pd.DataFrame, path: Path, *, caption: str, label: str,
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
+        rf"\caption{{{_latex_escape(caption)}}}",
+        rf"\label{{{_latex_escape(label)}}}",
         r"\begin{tabular}{" + "l" * max(1, len(view.columns)) + "}",
         r"\toprule",
         " & ".join(_latex_escape(c) for c in view.columns) + r" \\",
@@ -1155,7 +1157,7 @@ def write_latex_table(df: pd.DataFrame, path: Path, *, caption: str, label: str,
             else:
                 cells.append(_latex_escape(value))
         lines.append(" & ".join(cells) + r" \\")
-    lines.extend([r"\bottomrule", r"\end{tabular}", rf"\caption{{{_latex_escape(caption)}}}", rf"\label{{{_latex_escape(label)}}}", r"\end{table}", ""])
+    lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}", ""])
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1184,6 +1186,8 @@ def write_annualized_regret_latex(df: pd.DataFrame, path: Path) -> None:
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
+        r"\caption{Annualized net profit and regret relative to RHPF. Regret share reports the percentage of RHPF annualized profit not achieved by the model.}",
+        r"\label{tab:annualized_regret_vs_rhpf}",
         r"\begin{tabular}{llrrrrr}",
         r"\toprule",
         r"Model & Quantile & Annualized net profit & RHPF annualized profit & Regret vs RHPF & Regret share & Model/RHPF (\%) \\",
@@ -1208,8 +1212,6 @@ def write_annualized_regret_latex(df: pd.DataFrame, path: Path) -> None:
         [
             r"\bottomrule",
             r"\end{tabular}",
-            r"\caption{Annualized net profit and regret relative to RHPF. Regret share reports the percentage of RHPF annualized profit not achieved by the model.}",
-            r"\label{tab:annualized_regret_vs_rhpf}",
             r"\end{table}",
             "",
         ]

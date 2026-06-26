@@ -249,6 +249,7 @@ def test_total_pinball_net_profit_scatter_data_uses_observation_weighting() -> N
                 "model": "XGB",
                 "quantile": "p50",
                 "mean_pinball_loss": 2.0,
+                "mean_absolute_error": 4.0,
                 "n_obs": 10,
                 "realized_profit_eur": 100.0,
                 "annualized_profit_eur_per_year": 365.0,
@@ -265,6 +266,7 @@ def test_total_pinball_net_profit_scatter_data_uses_observation_weighting() -> N
                 "model": "XGB",
                 "quantile": "p50",
                 "mean_pinball_loss": 8.0,
+                "mean_absolute_error": 12.0,
                 "n_obs": 30,
                 "realized_profit_eur": 100.0,
                 "annualized_profit_eur_per_year": 365.0,
@@ -282,6 +284,40 @@ def test_total_pinball_net_profit_scatter_data_uses_observation_weighting() -> N
     assert row["n_targets"] == 2
     assert row["annualized_profit_eur_per_year"] == 365.0
     assert row["mean_pinball_loss"] == 6.5
+
+
+def test_rlqr_relative_pinball_heatmap_normalizes_before_aggregation() -> None:
+    scatter = pd.DataFrame(
+        [
+            {"split": "test", "target": "price", "target_label": "Price", "model_key": "linear", "model": "RLQR", "quantile": "p50", "mean_pinball_loss": 10.0, "n_obs": 10},
+            {"split": "test", "target": "rate", "target_label": "Rate", "model_key": "linear", "model": "RLQR", "quantile": "p50", "mean_pinball_loss": 100.0, "n_obs": 30},
+            {"split": "test", "target": "price", "target_label": "Price", "model_key": "xgb", "model": "XGB", "quantile": "p50", "mean_pinball_loss": 5.0, "n_obs": 10},
+            {"split": "test", "target": "rate", "target_label": "Rate", "model_key": "xgb", "model": "XGB", "quantile": "p50", "mean_pinball_loss": 200.0, "n_obs": 30},
+        ]
+    )
+    aggregate, detail, weighting = rq2.build_rlqr_relative_mean_pinball_loss_heatmap_data(scatter)
+    assert weighting == "observation_weighted"
+    assert set(detail["relative_mean_pinball_loss"]) == {1.0, 0.5, 2.0}
+    xgb = aggregate.loc[aggregate["model"].eq("XGB")].iloc[0]
+    assert xgb["target"] == "all_targets"
+    assert xgb["n_targets"] == 2
+    assert xgb["relative_mean_pinball_loss"] == 1.625
+
+
+def test_rlqr_relative_pinball_heatmap_fails_on_invalid_denominator() -> None:
+    scatter = pd.DataFrame(
+        [
+            {"split": "test", "target": "price", "target_label": "Price", "model_key": "linear", "model": "RLQR", "quantile": "p50", "mean_pinball_loss": 0.0, "n_obs": 10},
+            {"split": "test", "target": "price", "target_label": "Price", "model_key": "xgb", "model": "XGB", "quantile": "p50", "mean_pinball_loss": 5.0, "n_obs": 10},
+        ]
+    )
+    try:
+        rq2.build_rlqr_relative_mean_pinball_loss_heatmap_data(scatter)
+    except ValueError as exc:
+        assert "RLQR denominators" in str(exc)
+        assert "price" in str(exc)
+    else:
+        raise AssertionError("Expected invalid RLQR denominator to raise ValueError")
 
 
 def test_expected_scenarios_warn_missing_without_zero_fill(tmp_path: Path) -> None:

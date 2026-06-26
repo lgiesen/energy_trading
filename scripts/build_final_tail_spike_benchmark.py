@@ -1304,6 +1304,8 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
         r"\begin{table}[ht]",
         r"    \centering",
         r"    \small",
+        r"    \caption{Tail and spike regime mean pinball loss on the test split. Metrics are unweighted and computed on common valid forecast rows across models.}",
+        r"    \label{tab:tail_spike_metrics_test}",
         r"    \begin{tabular}{@{}llrrr@{}}",
         r"        \toprule",
         "        " + " & ".join(_latex_header(h) for h in headers) + r" \\",
@@ -1335,8 +1337,6 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
         [
             r"        \bottomrule",
             r"    \end{tabular}",
-            r"    \caption{Tail and spike regime mean pinball loss on the test split. Metrics are unweighted and computed on common valid forecast rows across models.}",
-            r"    \label{tab:tail_spike_metrics_test}",
             r"\end{table}",
             "",
         ]
@@ -1669,6 +1669,10 @@ def _plot_afrr_main_regime_relative_pinball(source: pd.DataFrame, *, out_dir: Pa
     d = source.loc[source["split"].eq(split)].copy() if not source.empty and "split" in source.columns else pd.DataFrame()
     if d.empty or "relative_pinball_loss" not in d.columns:
         return []
+    if "target_display" not in d.columns and "target_label" in d.columns:
+        d = d.rename(columns={"target_label": "target_display"})
+    if "target_display" not in d.columns:
+        return []
     d = d.loc[d["model_label"].isin(["XGB", "TFT"])].copy()
     d = d.dropna(subset=["relative_pinball_loss"])
     if d.empty:
@@ -1682,7 +1686,7 @@ def _plot_afrr_main_regime_relative_pinball(source: pd.DataFrame, *, out_dir: Pa
         "aFRR activation rate +",
         "aFRR activation rate -",
     ]
-    target_labels = [label for label in target_labels if label in set(d["target_label"])]
+    target_labels = [label for label in target_labels if label in set(d["target_display"])]
     if not target_labels:
         return []
     fig_height = max(7.6, 1.95 * len(target_labels))
@@ -2085,6 +2089,7 @@ def validate_tail_spike_outputs(
     relative_source: pd.DataFrame,
     example_selection: pd.DataFrame,
     example_values: pd.DataFrame,
+    skip_csv: bool = False,
 ) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
     if not selected_weeks.empty and not selected_weeks["split"].eq(split).all():
@@ -2097,16 +2102,17 @@ def validate_tail_spike_outputs(
         warnings.append({"split": split, "target": "", "regime": "example_week", "severity": "warning", "message": "Example-week selection exists but tail_spike_example_week_plot_values.csv is empty."})
     if not example_values.empty and example_selection.empty:
         warnings.append({"split": split, "target": "", "regime": "example_week", "severity": "warning", "message": "Example-week plot values exist but tail_spike_example_week_selection.csv is empty."})
-    for filename, frame in [
-        ("tail_spike_points_test.csv", points_test),
-        ("tail_spike_plot_source_relative_pinball.csv", relative_source),
-        ("tail_spike_example_week_plot_values.csv", example_values),
-    ]:
-        path = out_dir / filename
-        if not path.exists():
-            warnings.append({"split": split, "target": "", "regime": "output_validation", "severity": "warning", "message": f"Expected plot/source CSV was not written: {filename}."})
-        elif frame.empty:
-            warnings.append({"split": split, "target": "", "regime": "output_validation", "severity": "warning", "message": f"Plot/source CSV is empty: {filename}."})
+    if not skip_csv:
+        for filename, frame in [
+            ("tail_spike_points_test.csv", points_test),
+            ("tail_spike_plot_source_relative_pinball.csv", relative_source),
+            ("tail_spike_example_week_plot_values.csv", example_values),
+        ]:
+            path = out_dir / filename
+            if not path.exists():
+                warnings.append({"split": split, "target": "", "regime": "output_validation", "severity": "warning", "message": f"Expected plot/source CSV was not written: {filename}."})
+            elif frame.empty:
+                warnings.append({"split": split, "target": "", "regime": "output_validation", "severity": "warning", "message": f"Plot/source CSV is empty: {filename}."})
     return warnings
 
 
@@ -2116,6 +2122,8 @@ def write_outputs(
     out_dir: Path,
     split: str,
     structured_out_dir: Path | None = None,
+    skip_csv: bool = False,
+    skip_json: bool = False,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -2166,10 +2174,11 @@ def write_outputs(
         ("tail_spike_afrr_three_regime_plot_source.csv", afrr_three_regime_source),
         ("tail_spike_afrr_three_regime_warnings.csv", afrr_three_regime_warnings),
     ]
-    for name, df in csvs:
-        path = out_dir / name
-        df.to_csv(path, index=False)
-        paths.append(path)
+    if not skip_csv:
+        for name, df in csvs:
+            path = out_dir / name
+            df.to_csv(path, index=False)
+            paths.append(path)
     tex = write_latex_table(outputs["metrics"], out_dir=out_dir, split=split)
     if tex is not None:
         paths.append(tex)
@@ -2198,12 +2207,13 @@ def write_outputs(
         paths.extend(write_afrr_main_regime_latex_figure(out_dir=out_dir))
     example_path = out_dir / "tail_spike_example_week_selection.csv"
     example_selection_df = pd.DataFrame(example_week_selection)
-    example_selection_df.to_csv(example_path, index=False)
-    paths.append(example_path)
     example_values_path = out_dir / "tail_spike_example_week_plot_values.csv"
     example_values_df = pd.concat(example_week_values, ignore_index=True) if example_week_values else pd.DataFrame()
-    example_values_df.to_csv(example_values_path, index=False)
-    paths.append(example_values_path)
+    if not skip_csv:
+        example_selection_df.to_csv(example_path, index=False)
+        paths.append(example_path)
+        example_values_df.to_csv(example_values_path, index=False)
+        paths.append(example_values_path)
     validation_warnings = validate_tail_spike_outputs(
         out_dir=out_dir,
         split=split,
@@ -2212,13 +2222,15 @@ def write_outputs(
         relative_source=rel_source,
         example_selection=example_selection_df,
         example_values=example_values_df,
+        skip_csv=skip_csv,
     )
     if validation_warnings:
         plot_warnings.extend(validation_warnings)
     if plot_warnings:
         runtime_warnings = pd.concat([runtime_warnings, pd.DataFrame(plot_warnings)], ignore_index=True)
-        for warning_name in ["tail_spike_warnings.csv", "tail_spike_selection_warnings.csv"]:
-            runtime_warnings.to_csv(out_dir / warning_name, index=False)
+        if not skip_csv:
+            for warning_name in ["tail_spike_warnings.csv", "tail_spike_selection_warnings.csv"]:
+                runtime_warnings.to_csv(out_dir / warning_name, index=False)
     manifest = {
         "description": "RQ1 tail/spike behavior outputs.",
         "split": split,
@@ -2227,8 +2239,9 @@ def write_outputs(
         "outputs": [str(p) for p in paths],
     }
     manifest_path = out_dir / "tail_spike_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    paths.append(manifest_path)
+    if not skip_json:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        paths.append(manifest_path)
     if structured_out_dir is not None:
         paths.extend(_mirror_structured(paths, root_out_dir=out_dir, structured_out_dir=structured_out_dir))
     return paths
@@ -2283,6 +2296,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-origin-start", default=DEFAULT_EVAL_ORIGIN_START_UTC, help="Inclusive forecast-origin lower bound for final RQ1 evaluation. Empty string disables the lower bound.")
     p.add_argument("--eval-origin-end", default=DEFAULT_EVAL_ORIGIN_END_UTC, help="Inclusive forecast-origin upper bound for final RQ1 evaluation. Empty string disables the upper bound.")
     p.add_argument("--no-structured-copy", action="store_true")
+    p.add_argument("--skip-csv", action="store_true", help="Do not write CSV backup/diagnostic outputs.")
+    p.add_argument("--skip-json", action="store_true", help="Do not write the tail/spike JSON manifest.")
     return p.parse_args()
 
 
@@ -2305,7 +2320,14 @@ def main() -> int:
         eval_origin_end=_parse_utc_bound(args.eval_origin_end),
     )
     structured_out_dir = None if args.no_structured_copy else Path(args.structured_out_dir)
-    paths = write_outputs(outputs, out_dir=Path(args.out_dir), split=args.split, structured_out_dir=structured_out_dir)
+    paths = write_outputs(
+        outputs,
+        out_dir=Path(args.out_dir),
+        split=args.split,
+        structured_out_dir=structured_out_dir,
+        skip_csv=bool(args.skip_csv),
+        skip_json=bool(args.skip_json),
+    )
     print("[OK] Built RQ1 tail/spike outputs.")
     print(f"[OK] benchmark_dir={benchmark_dir}")
     for path in paths:
