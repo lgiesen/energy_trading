@@ -105,9 +105,8 @@ RELATIVE_MAE_CAPTION = (
     "for each forecast target to enable comparison across targets with different units."
 )
 MBE_TABLE_CAPTION = (
-    "MBE p50 by forecast target and model. Values report the mean signed error of the median forecast, computed "
-    "as prediction minus realized value; positive values indicate overprediction and negative values indicate "
-    "underprediction."
+    "MBE p50 by forecast target and model. Values are prediction minus realized value; positive values indicate "
+    "overprediction and negative values indicate underprediction."
 )
 LEGACY_STEMS = [
     "mae_p50_by_target_model",
@@ -457,7 +456,7 @@ def _write_relative_mae_latex(data: pd.DataFrame, *, path: Path) -> Path:
         r"grid=major,",
         r"grid style={rqOneGrid!55, line width=0.2pt},",
         r"title={MAE p50 Relative to RLQR},",
-        r"width=0.68\linewidth,",
+        r"width=0.60\linewidth,",
         r"height=0.46\linewidth,",
         r"xlabel={Model},",
         r"ylabel={},",

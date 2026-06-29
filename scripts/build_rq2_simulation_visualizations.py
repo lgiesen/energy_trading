@@ -171,7 +171,7 @@ BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS = [
     },
     {
         "market": "BCM",
-        "market_label": "aFRR capacity",
+        "market_label": "BCM",
         "submitted_groups": [
             [("reserve_submitted_pos_mw", "mw"), ("reserve_submitted_neg_mw", "mw")],
             [("real_bcm_precommit_candidate_pos_mw", "mw"), ("real_bcm_precommit_candidate_neg_mw", "mw")],
@@ -216,7 +216,7 @@ BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS = [
     },
     {
         "market": "BEM",
-        "market_label": "aFRR activation",
+        "market_label": "BEM",
         "submitted_groups": [[("real_bem_only_submitted_pos_mw", "mw"), ("real_bem_only_submitted_neg_mw", "mw")]],
         "cleared_groups": [[("real_bem_only_executed_pos_mw", "mw"), ("real_bem_only_executed_neg_mw", "mw")]],
         "metric_semantics": "submitted_and_cleared",
@@ -1929,7 +1929,7 @@ def _revenue_cost_table_component_label(component: str) -> str:
         "DA net": "DA net revenue",
         "ID net": "ID net revenue",
         "BCM capacity": "BCM capacity revenue",
-        "BCM activation": "BCM activation revenue",
+        "BCM activation": "BCM-linked BEM activation revenue",
         "BEM activation": "BEM activation revenue",
         "Degradation cost": "Degradation cost",
         "Auxiliary cost": "Auxiliary cost",
@@ -1938,6 +1938,12 @@ def _revenue_cost_table_component_label(component: str) -> str:
         "Terminal SoC repair": "Terminal SoC repair",
     }
     return labels.get(str(component), str(component))
+
+
+def _revenue_cost_legend_component_label(component: str) -> str:
+    if str(component) == "BCM activation":
+        return r"\shortstack[l]{BCM-linked BEM\\activation revenue}"
+    return _latex_escape(_revenue_cost_table_component_label(component))
 
 
 def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame) -> None:
@@ -2020,6 +2026,51 @@ def write_revenue_cost_component_table(path: Path, component_data: pd.DataFrame)
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_bid_activity_best_quantile_table(path: Path, bidding_activity_data: pd.DataFrame) -> None:
+    market_labels = [str(spec["market_label"]) for spec in BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS]
+    model_order = {model: idx for idx, model in enumerate(MODEL_ORDER)}
+    market_order = {market: idx for idx, market in enumerate(market_labels)}
+    data = bidding_activity_data.copy()
+    if data.empty:
+        rows = []
+    else:
+        data["_model_order"] = data["model"].map(model_order).fillna(999)
+        data["_market_order"] = data["market_label"].map(market_order).fillna(999)
+        data = data.sort_values(["_model_order", "_market_order"]).drop(columns=["_model_order", "_market_order"])
+        rows = data.to_dict("records")
+
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\small",
+        r"\caption{Submitted and cleared annualized bid volumes at the best quantile strategy of each model. Volumes are shown in kMWh/year.}",
+        r"\label{tab:4_bid_activity_best_quantile}",
+        r"\begin{tabular}{@{}llrrr@{}}",
+        r"\toprule",
+        r"\textbf{Model} & \textbf{Market} & \textbf{\shortstack{Submitted\\(kMWh)}} & \textbf{\shortstack{Cleared\\(kMWh)}} & \textbf{Clearing ratio (\%)} \\",
+        r"\midrule",
+    ]
+    for row in rows:
+        submitted = _safe_float(row.get("submitted_bid_volume_mwh_annualized")) / 1000.0
+        cleared = _safe_float(row.get("cleared_bid_volume_mwh_annualized")) / 1000.0
+        ratio = (cleared / submitted * 100.0) if math.isfinite(submitted) and submitted > 0 else math.nan
+        cells = [
+            _latex_escape(row.get("strategy_label") or f"{row.get('model', '')} {row.get('quantile', '')}".strip()),
+            _latex_escape(row.get("market_label", "")),
+            _format_k_eur_table(submitted, 1),
+            _format_k_eur_table(cleared, 1),
+            _format_k_eur_table(ratio, 1),
+        ]
+        lines.append(" & ".join(cells) + r" \\")
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _save_figure(fig: Any, path_base: Path, formats: list[str]) -> list[Path]:
     written: list[Path] = []
     for fmt in formats:
@@ -2051,7 +2102,6 @@ def plot_profit_by_quantile(table: pd.DataFrame, bench: pd.DataFrame, out_base: 
     ax.set_xticklabels(table["quantile"].astype(str).tolist())
     ax.set_ylabel("Annualized Net Profit")
     ax.set_xlabel("Quantile policy")
-    ax.set_title("Net Profit by Model and Quantile")
     ax.text(0.0, 1.02, f"Multi-market strategy, annualized from {run_name}. Higher is better.", transform=ax.transAxes, fontsize=9)
     ax.legend(ncol=3, loc="best")
     fig.tight_layout()
@@ -2087,7 +2137,6 @@ def plot_heatmap(table: pd.DataFrame, out_base: Path, formats: list[str]) -> lis
     ax.set_yticklabels(rows)
     ax.set_xlabel("Quantile policy")
     ax.set_ylabel("Strategy")
-    ax.set_title("Net Profit")
     for i, model in enumerate(rows):
         for j, q in enumerate(quantiles):
             val = pivot.loc[model, q]
@@ -2140,7 +2189,6 @@ def plot_mean_pinball_loss_heatmap(relative_pinball_data: pd.DataFrame, out_base
     ax.set_yticklabels(rows)
     ax.set_xlabel("Quantile policy")
     ax.set_ylabel("Model")
-    ax.set_title("Mean Pinball Loss Relative to RLQR")
     finite = arr[np.isfinite(arr)]
     midpoint = float(np.nanmedian(finite)) if finite.size else math.nan
     for i, model in enumerate(rows):
@@ -2196,7 +2244,6 @@ def plot_target_normalized_mean_pinball_loss_heatmap(data: pd.DataFrame, out_bas
     ax.set_yticklabels(rows)
     ax.set_xlabel("Quantile policy")
     ax.set_ylabel("Model")
-    ax.set_title("Target-Normalized Mean Pinball Loss")
     for i, model in enumerate(rows):
         for j, q in enumerate(quantiles):
             val = _safe_float(pivot.loc[model, q]) if model in pivot.index and q in pivot.columns else math.nan
@@ -2257,7 +2304,6 @@ def plot_bid_volume_heatmap(activity: pd.DataFrame, out_base: Path, formats: lis
         last_im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
         ax.grid(False)
         ax.tick_params(which="minor", bottom=False, left=False)
-        ax.set_title(market)
         ax.set_xticks(np.arange(len(quantiles)))
         ax.set_xticklabels(quantiles, rotation=0)
         ax.set_yticks(np.arange(len(models)))
@@ -2273,7 +2319,6 @@ def plot_bid_volume_heatmap(activity: pd.DataFrame, out_base: Path, formats: lis
         ax.axis("off")
     axes[0].set_ylabel("Model")
     axes[2].set_ylabel("Model")
-    fig.suptitle(f"{metric_label} Bid Volume by Market, Model and Quantile")
     if last_im is not None:
         cbar = fig.colorbar(last_im, ax=list(axes), shrink=0.88)
         cbar.ax.grid(False)
@@ -2378,7 +2423,6 @@ def plot_net_profit_lines(sweep_data: pd.DataFrame, out_base: Path, formats: lis
     ax.set_xticklabels(quantiles)
     ax.set_ylabel("Annualized Net Profit (EUR/year)")
     ax.set_xlabel("Quantile policy")
-    ax.set_title("Net Profit by Model and Quantile", pad=14)
     ax.legend(ncol=5, loc="upper center", bbox_to_anchor=(0.5, -0.16), frameon=True)
     fig.tight_layout(rect=(0, 0.12, 1, 1))
     written = _save_figure(fig, out_base, formats)
@@ -2466,7 +2510,15 @@ def plot_best_quantile_components(component_data: pd.DataFrame, out_base: Path, 
             legend_labels.extend(row_labels)
             legend_handles.extend([empty] * (2 - len(row_labels)))
             legend_labels.extend([" "] * (2 - len(row_labels)))
-    ax.legend(legend_handles, legend_labels, ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.18), frameon=False)
+    ax.legend(
+        legend_handles,
+        legend_labels,
+        ncol=4,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        frameon=False,
+        fontsize=7,
+    )
     fig.tight_layout(rect=(0, 0.18, 1, 1))
     written = _save_figure(fig, out_base, formats)
     plt.close(fig)
@@ -2503,7 +2555,6 @@ def plot_bidding_activity_submitted_cleared(
             color=THESIS_PALETTE["neutral_dark"],
             wrap=True,
         )
-        ax.set_title(title)
         fig.tight_layout()
         written = _save_figure(fig, out_base, formats)
         plt.close(fig)
@@ -2512,7 +2563,7 @@ def plot_bidding_activity_submitted_cleared(
     market_labels = [str(spec["market_label"]) for spec in BIDDING_ACTIVITY_SUBMITTED_CLEARED_SPECS]
     models = [m for m in MODEL_ORDER if m in set(activity["model"].astype(str))]
     x = np.arange(len(market_labels))
-    width = 0.22
+    width = 0.26
     offsets = {model: (idx - (len(models) - 1) / 2) * width for idx, model in enumerate(models)}
     color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
     for model in models:
@@ -2534,14 +2585,13 @@ def plot_bidding_activity_submitted_cleared(
         ax.bar(x + offsets[model], not_cleared_values, width=width, bottom=cleared_values, color=color, edgecolor="white", linewidth=0.6, alpha=0.35)
     ax.set_xticks(x)
     ax.set_xticklabels(market_labels)
-    ax.set_xlabel("Market")
+    ax.set_xlabel("")
     ax.set_ylabel(ylabel)
-    ax.set_title(title)
     ax.grid(axis="y", alpha=0.35)
     model_handles = [Patch(facecolor=color_map[m], edgecolor="white", label=f"{m} {str(activity.loc[activity['model'].astype(str).eq(m), 'quantile'].iloc[0])}") for m in models]
     status_handles = [
-        Patch(facecolor=THESIS_PALETTE["neutral_dark"], alpha=1.0, edgecolor="white", label="Cleared/realized"),
-        Patch(facecolor=THESIS_PALETTE["neutral_dark"], alpha=0.35, edgecolor="white", label="Submitted but not cleared"),
+        Patch(facecolor=THESIS_PALETTE["neutral_dark"], alpha=1.0, edgecolor="white", label="Cleared bids"),
+        Patch(facecolor=THESIS_PALETTE["neutral_dark"], alpha=0.35, edgecolor="white", label="Uncleared bids"),
     ]
     ax.legend(handles=[*model_handles, *status_handles], ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.16), frameon=True)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
@@ -2567,7 +2617,6 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
             color=THESIS_PALETTE["neutral_dark"],
             wrap=True,
         )
-        ax.set_title("Market Dispatch and SoC on Selected Day")
         fig.tight_layout()
         written = _save_figure(fig, out_base, formats)
         plt.close(fig)
@@ -2593,8 +2642,8 @@ def plot_market_dispatch_soc_day(dispatch_data: pd.DataFrame, out_base: Path, fo
         "DA sell": "DA buy/sell",
         "BEM negative activation": "BEM activation +/-",
         "BEM positive activation": "BEM activation +/-",
-        "BCM negative activation": "BCM activation +/-",
-        "BCM positive activation": "BCM activation +/-",
+        "BCM negative activation": "BCM-linked BEM activation revenue",
+        "BCM positive activation": "BCM-linked BEM activation revenue",
     }
     color_map = {
         "DA buy": MARKET_COLOR_MAP["DA"],
@@ -2822,7 +2871,6 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
             ax.set_xlabel("Mean pinball loss")
             ax.set_ylabel("Annualized Net Profit (kEUR / year)")
             ax.legend(title="Model", loc="best")
-        ax.set_title(f"RQ2 Pinball Loss vs Net Profit: {label}")
         fig.tight_layout()
         written.extend(_save_figure(fig, figures_dir / f"5_pinball_loss_vs_net_profit_{slug}", formats))
         plt.close(fig)
@@ -2922,7 +2970,7 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
             linestyle="--",
             linewidth=1.3,
             alpha=0.8,
-            label="loss-profit reference line",
+            label="Loss-profit reference line",
             zorder=1,
         )
         for model in MODEL_ORDER:
@@ -2991,7 +3039,7 @@ def plot_normalized_total_mae_profit_scatter(normalized_data: pd.DataFrame, out_
             linestyle="--",
             linewidth=1.3,
             alpha=0.8,
-            label="loss-profit reference line",
+            label="Loss-profit reference line",
             zorder=1,
         )
 
@@ -3103,7 +3151,6 @@ def plot_total_pinball_net_profit_scatter(scatter_data: pd.DataFrame, out_base: 
         ax.set_xlabel("Total mean pinball loss")
         ax.set_ylabel("Annualized Net Profit (kEUR / year)")
         ax.legend(title="Model", loc="best")
-    ax.set_title("Total Mean Pinball Loss vs Net Profit")
     ax.text(
         0.0,
         1.02,
@@ -3284,15 +3331,14 @@ def write_latex_profit_heatmap(path: Path, table: pd.DataFrame) -> None:
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
-        r"\begin{figure}[htbp]",
+        r"\begin{figure}[H]",
         r"\centering",
         r"\begin{tikzpicture}",
         *_rq2_latex_color_defs(),
         r"\begin{axis}[",
         *_axis_common_options(),
         r"width=\linewidth,",
-        r"height=0.54\linewidth,",
-        r"title={Net Profit},",
+        r"height=0.52\linewidth,",
         r"xlabel={Quantile policy},",
         r"ylabel={Strategy},",
         "xmin=-0.5, xmax=" + _tex_float(len(quantiles) - 0.5, 1) + ",",
@@ -3382,7 +3428,6 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, relative_pinball_data: pd.
         *_axis_common_options(),
         r"width=0.78\linewidth,",
         r"height=0.32\linewidth,",
-        r"title={Mean Pinball Loss Relative to RLQR},",
         r"xlabel={Quantile policy},",
         r"ylabel={Model},",
         "xmin=-0.5, xmax=" + _tex_float(len(quantile_order) - 0.5, 1) + ",",
@@ -3405,7 +3450,7 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, relative_pinball_data: pd.
         *cells,
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Heatmap of mean pinball loss normalized relative to the RLQR benchmark. For each target and quantile policy, the raw mean pinball loss of each model is divided by the corresponding RLQR loss before aggregation. Values below 1 indicate lower pinball loss than RLQR, values above 1 indicate higher pinball loss. This normalization avoids misleading comparisons across targets with different numerical scales, particularly price targets and activation-rate targets.}",
+        r"\caption{Mean pinball loss relative to RLQR by model and quantile policy. Values below 1 indicate lower pinball loss than RLQR; values above 1 indicate higher loss.}",
         r"\label{fig:7_mean_pinball_loss_heatmap}",
         r"\end{figure}",
     ]
@@ -3466,7 +3511,6 @@ def write_latex_target_normalized_mean_pinball_loss_heatmap(path: Path, data: pd
         *_axis_common_options(),
         r"width=0.78\linewidth,",
         r"height=0.32\linewidth,",
-        r"title={Target-Normalized Mean Pinball Loss},",
         r"xlabel={Quantile policy},",
         r"ylabel={Model},",
         "xmin=-0.5, xmax=" + _tex_float(len(quantile_order) - 0.5, 1) + ",",
@@ -3663,7 +3707,7 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
         *_rq2_latex_color_defs(),
         r"\begin{axis}[",
         *_axis_common_options(),
-        r"width=\linewidth,",
+        r"width=0.92\linewidth,",
         r"height=0.56\linewidth,",
         r"xlabel={Quantile policy},",
         r"ylabel={Annualized Net Profit (kEUR)},",
@@ -3764,8 +3808,8 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
         *_rq2_latex_color_defs(),
         r"\begin{axis}[",
         *_axis_common_options(),
-        r"width=\linewidth,",
-        r"height=0.50\linewidth,",
+        r"width=0.88\linewidth,",
+        r"height=0.44\linewidth,",
         r"ybar stacked,",
         r"bar width=22pt,",
         r"ylabel={Annualized component value (kEUR/year)},",
@@ -3833,7 +3877,7 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
                 for component in row_components:
                     lines += [
                         rf"\addlegendimage{{area legend, fill={_tex_component_color(component)}, draw=white}}",
-                        rf"\addlegendentry{{{_latex_escape(component)}}}",
+                        rf"\addlegendentry{{{_revenue_cost_legend_component_label(component)}}}",
                     ]
                 for _ in range(2 - len(row_components)):
                     lines += [
@@ -3882,7 +3926,8 @@ def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
         r"xtick={" + ",".join(str(i) for i in tick_positions) + "},",
         r"xticklabels={" + ",".join(_latex_escape(x) for x in tick_labels) + "},",
         r"legend columns=3,",
-        r"legend pos=north west,",
+        r"legend cell align=left,",
+        r"legend style={at={(0.02,0.98)}, anchor=north west, font=\small, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.35cm}},",
         r"]",
     ]
     for model in ["Naive", "RHPF", *MODEL_ORDER]:
@@ -3911,7 +3956,30 @@ def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
     _write_native_latex(path, lines)
 
 
+def _forecast_profit_correlation_caption(data: pd.DataFrame, *, x_col: str, label: str) -> str:
+    if data.empty or x_col not in data.columns or "normalized_annualized_net_profit" not in data.columns:
+        return ""
+    d = data[[x_col, "normalized_annualized_net_profit"]].copy()
+    d[x_col] = pd.to_numeric(d[x_col], errors="coerce")
+    d["normalized_annualized_net_profit"] = pd.to_numeric(d["normalized_annualized_net_profit"], errors="coerce")
+    d = d.dropna()
+    if len(d) < 2:
+        return ""
+    x = d[x_col].to_numpy(dtype=float)
+    y = d["normalized_annualized_net_profit"].to_numpy(dtype=float)
+    if not np.isfinite(x).all() or not np.isfinite(y).all() or math.isclose(float(np.std(x)), 0.0) or math.isclose(float(np.std(y)), 0.0):
+        return ""
+    pearson = float(pd.Series(x).corr(pd.Series(y), method="pearson"))
+    spearman = float(pd.Series(x).corr(pd.Series(y), method="spearman"))
+    return rf" Descriptive correlations for {label} versus profit are $r = {pearson:.2f}$ and $\rho = {spearman:.2f}$."
+
+
 def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFrame) -> None:
+    correlation_caption = _forecast_profit_correlation_caption(
+        normalized_data,
+        x_col="normalized_forecast_loss",
+        label="normalized total mean pinball loss",
+    )
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -3921,16 +3989,18 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         *_rq2_latex_color_defs(),
         r"\begin{axis}[",
         *_axis_common_options(),
-        r"width=0.82\linewidth,",
-        r"height=0.62\linewidth,",
+        r"label style={font=\normalsize},",
+        r"tick label style={font=\normalsize},",
+        r"width=0.76\linewidth,",
+        r"height=0.54\linewidth,",
         r"xlabel={Normalized total mean pinball loss},",
         r"ylabel={Normalized annualized net profit},",
         r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
         r"legend columns=4,",
-        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
+        r"legend style={at={(0.5,1.04)}, anchor=south, font=\normalsize, draw=none, fill=none},",
         r"]",
         r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
-        r"\addlegendentry{loss-profit reference line}",
+        r"\addlegendentry{Loss-profit reference line}",
     ]
     for model in MODEL_ORDER:
         g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
@@ -3948,24 +4018,24 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         ]
         for _, row in g.iterrows():
             quantile = str(row["quantile"])
-            node_options = "font=\\scriptsize, anchor=west, text=rqTwoNeutral"
+            node_options = "font=\\small, anchor=west, text=rqTwoNeutral"
             if model == "XGB" and quantile == "p70":
-                node_options = "font=\\scriptsize, anchor=east, xshift=-3pt, text=rqTwoNeutral"
+                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
             elif model == "XGB" and quantile == "p90":
-                node_options = "font=\\scriptsize, anchor=west, xshift=3pt, text=rqTwoNeutral"
+                node_options = "font=\\small, anchor=west, xshift=3pt, text=rqTwoNeutral"
             elif model == "RLQR" and quantile == "p30":
-                node_options = "font=\\scriptsize, anchor=east, xshift=-3pt, text=rqTwoNeutral"
+                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
             elif model == "RLQR" and quantile == "p50":
-                node_options = "font=\\scriptsize, anchor=south, yshift=3pt, text=rqTwoNeutral"
+                node_options = "font=\\small, anchor=south, yshift=3pt, text=rqTwoNeutral"
             elif model == "TFT" and quantile == "p90":
-                node_options = "font=\\scriptsize, anchor=north, yshift=-3pt, text=rqTwoNeutral"
+                node_options = "font=\\small, anchor=north, yshift=-3pt, text=rqTwoNeutral"
             lines.append(
                 rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(quantile)}}};"
             )
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Normalized total mean pinball loss and annualized Net Profit by model and quantile policy. The grey dashed line is the loss-profit reference line.}",
+        rf"\caption{{Normalized total mean pinball loss versus annualized Net Profit by model-quantile policy; the dashed line marks the loss-profit reference.{correlation_caption}}}",
         r"\label{fig:5_pinball_loss_vs_net_profit_total_normalized}",
         r"\end{figure}",
     ]
@@ -3973,15 +4043,21 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
 
 
 def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame) -> None:
+    correlation_caption = _forecast_profit_correlation_caption(
+        normalized_data,
+        x_col="normalized_forecast_loss",
+        label="normalized MAE p50",
+    )
+
     def _mae_node_options(model: str, quantile: str) -> str:
         key = (str(model), str(quantile).lower())
         if key in {("XGB", "p70"), ("XGB", "p10")}:
-            return "font=\\scriptsize, anchor=south, yshift=3pt, text=rqTwoNeutral"
+            return "font=\\small, anchor=south, yshift=3pt, text=rqTwoNeutral"
         if key == ("RLQR", "p50"):
-            return "font=\\scriptsize, anchor=east, xshift=-2pt, text=rqTwoNeutral"
+            return "font=\\small, anchor=east, xshift=-2pt, text=rqTwoNeutral"
         if key in {("TFT", "p90"), ("TFT", "p50")}:
-            return "font=\\scriptsize, anchor=north, yshift=-3pt, text=rqTwoNeutral"
-        return "font=\\scriptsize, anchor=west, xshift=2pt, text=rqTwoNeutral"
+            return "font=\\small, anchor=north, yshift=-3pt, text=rqTwoNeutral"
+        return "font=\\small, anchor=west, xshift=2pt, text=rqTwoNeutral"
 
     lines = [
         r"% Requires \usepackage{pgfplots}",
@@ -3992,16 +4068,18 @@ def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame)
         *_rq2_latex_color_defs(),
         r"\begin{axis}[",
         *_axis_common_options(),
+        r"label style={font=\normalsize},",
+        r"tick label style={font=\normalsize},",
         r"width=0.82\linewidth,",
         r"height=0.62\linewidth,",
         r"xlabel={Normalized total MAE},",
         r"ylabel={Normalized annualized net profit},",
         r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
         r"legend columns=4,",
-        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
+        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\normalsize, draw=none, fill=none},",
         r"]",
         r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
-        r"\addlegendentry{loss-profit reference line}",
+        r"\addlegendentry{Loss-profit reference line}",
     ]
     for model in MODEL_ORDER:
         g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
@@ -4026,7 +4104,7 @@ def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame)
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Normalized total MAE and annualized Net Profit by model and quantile policy. The grey dashed line is the loss-profit reference line.}",
+        rf"\caption{{Normalized total MAE versus annualized Net Profit by model-quantile policy; the dashed line marks the loss-profit reference.{correlation_caption}}}",
         r"\label{fig:5_mae_vs_net_profit_total_normalized}",
         r"\end{figure}",
     ]
@@ -4047,8 +4125,8 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         ("DA sell", "rqTwoDA", "DA buy/sell", True),
         ("BEM negative activation", "rqTwoBEM", "BEM activation +/-", False),
         ("BEM positive activation", "rqTwoBEM", "BEM activation +/-", True),
-        ("BCM negative activation", "rqTwoBCMActivation", "BCM activation +/-", False),
-        ("BCM positive activation", "rqTwoBCMActivation", "BCM activation +/-", True),
+        ("BCM negative activation", "rqTwoBCMActivation", "BCM-linked BEM activation revenue", False),
+        ("BCM positive activation", "rqTwoBCMActivation", "BCM-linked BEM activation revenue", True),
     ]
     tick_step = 4
     tick_positions = list(range(0, len(times), tick_step)) if times else []
@@ -4082,12 +4160,14 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"\begin{axis}[",
         *_axis_common_options(),
         r"name=dispatchaxis,",
+        r"xshift=-0.18cm,",
         rf"width={axis_width},",
         r"height=0.56\linewidth,",
         r"ybar stacked,",
         r"bar width=7pt,",
         rf"xlabel={{Time ({_latex_escape(selected_date_label)})}},",
         r"ylabel={Battery dispatch power (MW)},",
+        r"ylabel style={xshift=0.18cm},",
         rf"ymin={_tex_float(power_ymin, 2)}, ymax={_tex_float(power_ymax, 2)},",
         r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
         r"xtick={" + ",".join(str(i) for i in tick_positions) + "},",
@@ -4152,7 +4232,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
             r"axis x line=none,",
             r"axis y line*=right,",
             r"ylabel={Cumulative Net Profit (kEUR)},",
-            r"ylabel style={font=\small, text=rqTwoPNL, at={(axis description cs:1.24,0.50)}, anchor=center},",
+            r"ylabel style={font=\small, text=rqTwoPNL, at={(axis description cs:1.19,0.50)}, anchor=center},",
             r"yticklabel style={font=\small, text=rqTwoPNL, xshift=3.8em},",
             r"tick style={rqTwoPNL, xshift=3.5em},",
             r"axis line style={rqTwoPNL, xshift=3.5em},",
@@ -4184,13 +4264,13 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     not_cleared_col = "not_cleared_bid_volume_mwh_annualized" if is_volume else "not_cleared_bid_count_annualized"
     ylabel = "Submitted bid volume (GWh/year)" if is_volume else "Submitted bids (1,000/year)"
     caption = (
-        "Annualized submitted bid volume by market and model strategy. Bars show total submitted bid volume, split into cleared volume and semi-transparent submitted but not-cleared volume. The clearing ratio is shown above each bar. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
+        "Annualized submitted bid volume by market and model strategy, split into cleared and uncleared bids; labels show clearing ratios."
         if is_volume
-        else "Annualized submitted bid count by market and model strategy. Bars show total submitted bids per year, split into cleared bids and submitted but not-cleared bids. Fully opaque segments indicate cleared or realized bids, while transparent segments indicate submitted bids that did not clear. Values are annualized from observed test-period totals using the scenario-specific test-period duration."
+        else "Annualized submitted bid count by market and model strategy, split into cleared and uncleared bids."
     )
     label = "fig:annualized_bid_volume_by_market_model" if is_volume else "fig:annualized_bid_count_by_market_model"
     bar_shift = {"RLQR": -0.16, "XGB": 0.0, "TFT": 0.16}
-    bar_half_width = 0.055
+    bar_half_width = 0.070
     max_total = 0.0
     bar_draws: list[str] = []
     ratio_labels: list[tuple[float, float, str]] = []
@@ -4198,6 +4278,8 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     ratio_label_x_offsets = {
         ("DA", "RLQR"): -0.055,
         ("DA", "TFT"): 0.055,
+        ("BEM", "RLQR"): -0.065,
+        ("BEM", "TFT"): 0.065,
         ("ID", "RLQR"): -0.055,
         ("ID", "TFT"): 0.055,
     }
@@ -4235,7 +4317,7 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     y_max = max(1.0, max_total * (1.24 if is_volume else 1.12))
     label_offset = max(y_max * 0.015, 0.08)
     ratio_label_draws = [
-        rf"\node[anchor=south, font=\scriptsize, text=rqTwoNeutral] at (axis cs:{_tex_float(x_mid, 3)},{_tex_float(min(y_max * 0.985, total + label_offset), 3)}) {{{label}}};"
+        rf"\node[anchor=south, font=\normalsize, text=rqTwoNeutral] at (axis cs:{_tex_float(x_mid, 3)},{_tex_float(min(y_max * 0.985, total + label_offset), 3)}) {{{label}}};"
         for x_mid, total, label in ratio_labels
     ]
     full_clearing_braces: list[str] = []
@@ -4249,8 +4331,8 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
             y = min(y_max * 0.945, group_top + max(y_max * 0.040, 0.18))
             x_mid = 0.5 * (x_left + x_right)
             full_clearing_braces.append(
-                rf"\node[anchor=south, font=\scriptsize, text=rqTwoNeutral] "
-                rf"at (axis cs:{_tex_float(x_mid, 3)},{_tex_float(y, 3)}) {{$\overbrace{{\hspace{{1.05cm}}}}^{{100\%}}$}};"
+                rf"\node[anchor=south, font=\normalsize, text=rqTwoNeutral] "
+                rf"at (axis cs:{_tex_float(x_mid, 3)},{_tex_float(y, 3)}) {{$\overbrace{{\hspace{{1.55cm}}}}^{{100\%}}$}};"
             )
     lines = [
         r"% Requires \usepackage{pgfplots}",
@@ -4264,14 +4346,14 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
         r"width=\linewidth,",
         r"height=0.54\linewidth,",
         rf"ylabel={{{ylabel}}},",
-        r"xlabel={Market},",
+        r"xlabel={},",
         r"xmin=-0.5, xmax=" + _tex_float(max(len(market_labels) - 0.5, 0.5), 1) + ",",
         r"ymin=0, ymax=" + _tex_float(y_max, 3) + ",",
         r"xtick={" + ",".join(str(i) for i in range(len(market_labels))) + "},",
         r"xticklabels={" + ",".join(_latex_escape(label) for label in market_labels) + "},",
         r"legend columns=3,",
         r"legend cell align=left,",
-        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none},",
+        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\small, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.45cm}},",
         r"]",
     ]
     for model in models:
@@ -4282,9 +4364,9 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     lines.extend(full_clearing_braces)
     lines += [
         r"\addlegendimage{area legend, fill=rqTwoNeutral, draw=white}",
-        r"\addlegendentry{Cleared/realized}",
+        r"\addlegendentry{Cleared bids}",
         r"\addlegendimage{area legend, fill=rqTwoNeutral, fill opacity=0.35, draw=white}",
-        r"\addlegendentry{Submitted but not cleared}",
+        r"\addlegendentry{Uncleared bids}",
         r"\end{axis}",
         r"\end{tikzpicture}",
         rf"\caption{{{caption}}}",
@@ -4457,6 +4539,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
 
     write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
     write_revenue_cost_component_table(tables_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
+    write_bid_activity_best_quantile_table(tables_dir / "4_bid_activity_best_quantile.tex", bidding_activity_data)
     write_appendix_table(appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", summary)
 
     result_figure_paths: list[Path] = []
@@ -4516,6 +4599,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     for path, tier, artifact_type, metric_family, thesis_use in [
         (tables_dir / "1_net_profit_by_model_and_quantile.tex", "result_section", "latex_table", "annualized realized net profit", "primary RQ2 result table"),
         (tables_dir / "3_revenue_cost_components_best_quantile.tex", "result_section", "latex_table", "revenue and cost components", "best-quantile revenue/cost component table"),
+        (tables_dir / "4_bid_activity_best_quantile.tex", "result_section", "latex_table", "bidding activity", "best-quantile submitted and cleared bid volume table"),
         (appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", "appendix", "latex_table", "profit and validity", "validity audit table"),
         (csv_dir / "rq2_scenario_summary_long.csv", "backup", "csv", "scenario summary", "reproducibility backup"),
         (csv_dir / "1_net_profit_by_model_and_quantile.csv", "backup", "csv", "annualized realized net profit", "source data for primary table"),

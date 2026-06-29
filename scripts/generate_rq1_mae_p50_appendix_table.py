@@ -320,6 +320,16 @@ def _format_value(target: str, value: Any) -> str:
     return f"{x:.2f}"
 
 
+def _format_value_bold_if_best(target: str, value: Any, best: float, *, tol: float = 1e-12) -> str:
+    formatted = _format_value(target, value)
+    x = _safe_float(value)
+    if formatted == "--" or not math.isfinite(x) or not math.isfinite(best):
+        return formatted
+    if abs(x - best) <= tol:
+        return r"\textbf{" + formatted + "}"
+    return formatted
+
+
 def write_outputs(table: pd.DataFrame, out_root: Path) -> tuple[Path, Path]:
     csv_path = out_root / "appendix" / "csv" / "mae_p50_absolute_by_target_model.csv"
     tex_path = out_root / "appendix" / "tables" / "mae_p50_absolute_by_target_model.tex"
@@ -339,9 +349,12 @@ def write_outputs(table: pd.DataFrame, out_root: Path) -> tuple[Path, Path]:
         r"\midrule",
     ]
     for _, row in table.iterrows():
+        model_values = [_safe_float(row[model]) for model in MODEL_ORDER]
+        finite_values = [x for x in model_values if math.isfinite(x)]
+        best = min(finite_values) if finite_values else math.nan
         cells = [
             TARGET_LABELS_TEX.get(str(row["target"]), _latex_escape(row["target_label"])),
-            *[_format_value(str(row["target"]), row[model]) for model in MODEL_ORDER],
+            *[_format_value_bold_if_best(str(row["target"]), row[model], best) for model in MODEL_ORDER],
         ]
         lines.append(" & ".join(cells) + r" \\")
     lines.extend(

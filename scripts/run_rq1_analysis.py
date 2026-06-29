@@ -312,6 +312,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--targets", default="", help="Optional comma-separated targets for example-week plots.")
     p.add_argument("--lead", type=float, default=24.0)
     p.add_argument("--quantile", default="p50")
+    p.add_argument("--interpretability-lead", type=int, default=24, help="Lead hour used for RLQR coefficient interpretability.")
+    p.add_argument("--interpretability-quantile", default="p50", help="Quantile used for RLQR coefficient interpretability.")
+    p.add_argument("--model-runs-root", default="artifacts/model_runs", help="Model-run artifact root used by the RQ1 interpretability export.")
     p.add_argument("--selection-mode", choices=["algorithmic", "legacy"], default="algorithmic")
     p.add_argument("--date", default=None, help="Optional custom week start for example-week plots.")
     p.add_argument("--typical-start", default="2025-03-30T22:00:00Z")
@@ -324,6 +327,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-gate-buckets", action="store_true")
     p.add_argument("--skip-tail-spike", action="store_true")
     p.add_argument("--skip-example-weeks", action="store_true")
+    p.add_argument("--skip-interpretability", action="store_true", help="Skip SHAP/feature-importance interpretability export.")
     p.add_argument(
         "--skip-raw-generation",
         action="store_true",
@@ -383,6 +387,7 @@ def main() -> int:
     gate_dir = out_dir / "4_1_4_gate_specific"
     tail_dir = out_dir / "4_1_5_tail_spike"
     example_dir = out_dir / "4_1_6_example_weeks"
+    interpretability_dir = out_dir / "4_1_7_interpretability"
     log_dir = out_dir / "logs" / "rq1_wrapper"
     steps: list[dict[str, Any]] = []
     py = sys.executable
@@ -576,6 +581,21 @@ def main() -> int:
             cmd.append("--skip-json")
         steps.append(_run_step("rq1_4_1_6_example_weeks", cmd, log_dir=log_dir))
 
+    if not args.skip_interpretability:
+        cmd = [
+            py,
+            "scripts/build_rq1_interpretability.py",
+            "--model-runs-root",
+            str(args.model_runs_root),
+            "--out-dir",
+            str(interpretability_dir),
+            "--lead",
+            str(args.interpretability_lead),
+            "--quantile",
+            str(args.interpretability_quantile),
+        ]
+        steps.append(_run_step("rq1_4_1_7_interpretability", cmd, log_dir=log_dir))
+
     if not args.skip_organize:
         cmd = [
             py,
@@ -709,6 +729,12 @@ def main() -> int:
                 "status": "skipped" if args.skip_example_weeks else "implemented",
                 "output_dir": str(example_dir),
             },
+            {
+                "section": "4.1.7",
+                "name": "SHAP and feature-importance interpretability",
+                "status": "skipped" if args.skip_interpretability else "implemented",
+                "output_dir": str(interpretability_dir),
+            },
         ],
         "steps": steps,
         "canonical_output_layout": {
@@ -737,6 +763,7 @@ def main() -> int:
     for subsection in manifest["subsections"]:
         Path(str(subsection["output_dir"])).mkdir(parents=True, exist_ok=True)
     example_dir.mkdir(parents=True, exist_ok=True)
+    interpretability_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "diagnostics" / "rq1_wrapper_manifest.json"
     if not args.skip_json:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)

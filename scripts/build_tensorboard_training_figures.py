@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from energy_trading.evaluation.style import THESIS_PALETTE, apply_geo_style, thesis_titlecase
+from energy_trading.evaluation.style import GEO_SEQUENTIAL_BLUE, THESIS_PALETTE, apply_geo_style, thesis_titlecase
 
 
 TARGET_LABELS = {
@@ -30,6 +30,24 @@ TARGET_LABELS = {
     "tft_afrr_target_afrr_activation_rate_pos": "aFRR activation rate pos",
     "tft_afrr_target_afrr_activation_rate_neg": "aFRR activation rate neg",
 }
+TARGET_LABELS.update(
+    {
+        key.replace("tft_", prefix): value
+        for prefix in ("xgb_", "linear_")
+        for key, value in list(TARGET_LABELS.items())
+    }
+)
+
+TARGET_ORDER = [
+    "DA price",
+    "aFRR activation price pos",
+    "aFRR activation price neg",
+    "aFRR capacity price pos",
+    "aFRR capacity price neg",
+    "aFRR activation rate pos",
+    "aFRR activation rate neg",
+]
+MODEL_ORDER = ["TFT", "XGB", "RLQR"]
 
 TRAIN_TAG_RE = re.compile(r"(^|[/_])train(_|/)?loss($|[_/])|^train_loss", re.IGNORECASE)
 VAL_TAG_RE = re.compile(r"(^|[/_])val(idation)?(_|/)?loss($|[_/])|^val_loss", re.IGNORECASE)
@@ -275,7 +293,22 @@ def _write_native_hpo_trajectories(path: Path, selected: pd.DataFrame, trial_sum
 
 
 def _target_label(name: str) -> str:
-    return TARGET_LABELS.get(name, name.removeprefix("tft_").replace("_target_", " ").replace("_", " "))
+    for prefix in ("tft_", "xgb_", "linear_"):
+        if name.startswith(prefix):
+            fallback = name.removeprefix(prefix).replace("_target_", " ").replace("_", " ")
+            return TARGET_LABELS.get(name, fallback)
+    return TARGET_LABELS.get(name, name.replace("_target_", " ").replace("_", " "))
+
+
+def _model_label(run: str, target: str = "") -> str:
+    token = f"{run} {target}".lower()
+    if "tft" in token:
+        return "TFT"
+    if "xgb" in token or "xgboost" in token:
+        return "XGB"
+    if "linear" in token or "rlqr" in token:
+        return "RLQR"
+    return str(run).split("_", 1)[0].upper()
 
 
 def _read_scalars(log_dir: Path) -> pd.DataFrame:
@@ -357,6 +390,338 @@ def collect_tensorboard_scalars(log_root: Path, *, final_run: str, include_trial
             selected_rows.append(part)
     selected = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame()
     return scalars, selected
+
+
+def collect_final_run_scalars(log_root: Path, *, final_runs: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows: list[pd.DataFrame] = []
+    for run in final_runs:
+        run_dir = log_root / run
+        if not run_dir.exists():
+            continue
+        for target_dir in sorted(p for p in run_dir.iterdir() if p.is_dir()):
+            if not list(target_dir.glob(EVENT_GLOB)):
+                continue
+            scalar_df = _read_scalars(target_dir)
+            if scalar_df.empty:
+                continue
+            scalar_df["run"] = run_dir.name
+            scalar_df["model"] = _model_label(run_dir.name, target_dir.name)
+            scalar_df["target"] = target_dir.name
+            scalar_df["target_label"] = _target_label(target_dir.name)
+            scalar_df["is_trial"] = False
+            rows.append(scalar_df)
+    if not rows:
+        empty = pd.DataFrame(
+            columns=["run", "model", "target", "target_label", "tag", "step", "value", "wall_time", "is_trial"]
+        )
+        return empty, empty
+    scalars = pd.concat(rows, ignore_index=True)
+
+    selected_rows: list[pd.DataFrame] = []
+    for (run, target), group in scalars.groupby(["run", "target"], sort=False):
+        tags = sorted(group["tag"].dropna().unique().tolist())
+        for kind in ["train", "val"]:
+            tag = _select_tag(tags, kind)
+            if tag is None:
+                continue
+            part = group[group["tag"].eq(tag)].copy()
+            part["metric"] = kind
+            selected_rows.append(part)
+    selected = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame()
+    return scalars, selected
+
+
+def _nearest_train_value(train: pd.DataFrame, step: int) -> float:
+    if train.empty:
+        return float("nan")
+    t = train[train["step"].astype(float) <= float(step)].sort_values("step")
+    if t.empty:
+        return float("nan")
+    return float(t["value"].iloc[-1])
+
+
+def _training_fit_summary(selected: pd.DataFrame) -> pd.DataFrame:
+    if selected.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for (model, run, target), group in selected.groupby(["model", "run", "target_label"], sort=True):
+        train = group[group["metric"].eq("train")].sort_values("step")
+        val = group[group["metric"].eq("val")].sort_values("step")
+        if val.empty:
+            continue
+        best = val.loc[val["value"].idxmin()]
+        last = val.iloc[-1]
+        train_at_best = _nearest_train_value(train, int(best["step"]))
+        train_last = _nearest_train_value(train, int(last["step"]))
+        best_val = float(best["value"])
+        last_val = float(last["value"])
+        rows.append(
+            {
+                "model": model,
+                "run": run,
+                "target_label": target,
+                "best_step": int(best["step"]),
+                "best_val_loss": best_val,
+                "train_loss_at_best_step": train_at_best,
+                "last_step": int(last["step"]),
+                "last_val_loss": last_val,
+                "train_loss_last_step": train_last,
+                "validation_drift_pct": (last_val / best_val - 1.0) * 100.0 if best_val else np.nan,
+                "training_loss_drop_after_best_pct": (
+                    (1.0 - train_last / train_at_best) * 100.0
+                    if np.isfinite(train_at_best) and train_at_best
+                    else np.nan
+                ),
+                "n_validation_points": int(len(val)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _metric_json_target(path: Path) -> str | None:
+    name = path.name.lower()
+    if name == "xgboost_da_metrics.json" or "da_target_da_price" in name or "linear_da_da_price" in name:
+        return "DA price"
+    if "activation_price_vwap_pos" in name:
+        return "aFRR activation price pos"
+    if "activation_price_vwap_neg" in name:
+        return "aFRR activation price neg"
+    if "capacity_price_pos" in name:
+        return "aFRR capacity price pos"
+    if "capacity_price_neg" in name:
+        return "aFRR capacity price neg"
+    if "activation_rate_pos" in name:
+        return "aFRR activation rate pos"
+    if "activation_rate_neg" in name:
+        return "aFRR activation rate neg"
+    return None
+
+
+def _load_current_metric_summary(model_runs_root: Path) -> pd.DataFrame:
+    specs = [
+        ("TFT", "tft_20260530_150841"),
+        ("XGB", "xgb_20260530_151122"),
+        ("RLQR", "linear_20260531_092342"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for model, run_dir_name in specs:
+        metrics_dir = model_runs_root / run_dir_name / "metrics"
+        if not metrics_dir.exists():
+            continue
+        for path in sorted(metrics_dir.glob("*.json")):
+            target = _metric_json_target(path)
+            if target is None:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            val_mae = payload.get("leadtime_mae_val_weighted", payload.get("mae_val"))
+            test_mae = payload.get("leadtime_mae_test_weighted", payload.get("mae_test", payload.get("mae")))
+            r2_val = payload.get("r2_val_h1", payload.get("r2_val"))
+            r2_test = payload.get("r2_test_h1", payload.get("r2_test", payload.get("r2_h1")))
+            rows.append(
+                {
+                    "model": model,
+                    "target_label": target,
+                    "current_metric_run": run_dir_name,
+                    "validation_mae": val_mae,
+                    "test_mae": test_mae,
+                    "test_to_validation_mae_ratio": (
+                        float(test_mae) / float(val_mae)
+                        if val_mae not in (None, 0) and test_mae is not None
+                        else np.nan
+                    ),
+                    "r2_validation": r2_val,
+                    "r2_test": r2_test,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _fit_diagnosis(row: pd.Series) -> str:
+    val_drift = float(row.get("validation_drift_pct", np.nan))
+    train_drop = float(row.get("training_loss_drop_after_best_pct", np.nan))
+    ratio = float(row.get("test_to_validation_mae_ratio", np.nan))
+    r2_val = float(row.get("r2_validation", np.nan))
+    r2_test = float(row.get("r2_test", np.nan))
+    has_curve = np.isfinite(val_drift)
+    if has_curve and train_drop >= 20.0 and val_drift >= 10.0:
+        return "overfitting"
+    if np.isfinite(ratio) and ratio >= 2.0:
+        return "test-period degradation"
+    if np.isfinite(r2_val) and np.isfinite(r2_test) and r2_val < 0.0 and r2_test < 0.0:
+        return "underfitting"
+    if has_curve and train_drop < 5.0 and val_drift < 5.0 and np.isfinite(r2_test) and r2_test < 0.15:
+        return "weak learning"
+    if np.isfinite(ratio) and ratio >= 1.5:
+        return "moderate degradation"
+    return "stable"
+
+
+def _write_png_latex_wrapper(path: Path, *, image_rel: str, caption: str, label: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                r"\begin{figure}[htbp]",
+                r"    \centering",
+                rf"    \includegraphics[width=\linewidth]{{{image_rel}}}",
+                rf"    \caption{{{caption}}}",
+                rf"    \label{{{label}}}",
+                r"\end{figure}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _compact_target_label(label: str) -> str:
+    return thesis_titlecase(label).replace(" Pos", " +").replace(" Neg", " -")
+
+
+def _curve_target_label(label: str) -> str:
+    compact = _compact_target_label(label)
+    return compact.replace("aFRR Activation", "aFRR\nActivation").replace("aFRR Capacity", "aFRR\nCapacity")
+
+
+def plot_all_model_fit_overview(summary: pd.DataFrame, *, out_dir: Path) -> Path | None:
+    if summary.empty:
+        return None
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap, to_rgb
+
+    df = summary.copy()
+    df["target_order"] = df["target_label"].map({t: i for i, t in enumerate(TARGET_ORDER)})
+    df["model_order"] = df["model"].map({m: i for i, m in enumerate(MODEL_ORDER)})
+    df = df.dropna(subset=["target_order", "model_order"]).sort_values(["target_order", "model_order"])
+    if df.empty:
+        return None
+
+    diagnoses = ["stable", "weak learning", "underfitting", "moderate degradation", "test-period degradation", "overfitting"]
+    code = {name: i for i, name in enumerate(diagnoses)}
+    colors = [
+        GEO_SEQUENTIAL_BLUE["seq_1"],
+        GEO_SEQUENTIAL_BLUE["seq_2"],
+        GEO_SEQUENTIAL_BLUE["seq_3"],
+        GEO_SEQUENTIAL_BLUE["seq_5"],
+        GEO_SEQUENTIAL_BLUE["seq_6"],
+        GEO_SEQUENTIAL_BLUE["seq_7"],
+    ]
+    matrix = np.full((len(TARGET_ORDER), len(MODEL_ORDER)), np.nan)
+    labels = [["" for _ in MODEL_ORDER] for _ in TARGET_ORDER]
+    for _, row in df.iterrows():
+        y = int(row["target_order"])
+        x = int(row["model_order"])
+        diagnosis = str(row.get("fit_diagnosis", "stable"))
+        matrix[y, x] = code.get(diagnosis, 0)
+        ratio = row.get("test_to_validation_mae_ratio", np.nan)
+        drift = row.get("validation_drift_pct", np.nan)
+        text = diagnosis.replace("test-period ", "test ")
+        if np.isfinite(float(ratio)):
+            text += f"\nMAE x{float(ratio):.1f}"
+        if np.isfinite(float(drift)):
+            text += f"\nval +{float(drift):.0f}%"
+        labels[y][x] = text
+
+    rc = {
+        "font.family": "serif",
+        "font.serif": ["Latin Modern Roman", "Times New Roman", "Times", "DejaVu Serif"],
+        "axes.titlesize": 16,
+        "axes.labelsize": 15,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+    }
+    with plt.rc_context(rc):
+        fig, ax = plt.subplots(figsize=(11.6, 7.4))
+        cmap = ListedColormap(colors)
+        ax.imshow(matrix, cmap=cmap, vmin=0, vmax=len(diagnoses) - 1, aspect="auto")
+        ax.set_xticks(np.arange(len(MODEL_ORDER)))
+        ax.set_xticklabels(MODEL_ORDER)
+        ax.set_yticks(np.arange(len(TARGET_ORDER)))
+        ax.set_yticklabels([_compact_target_label(t) for t in TARGET_ORDER])
+        for y in range(len(TARGET_ORDER)):
+            for x in range(len(MODEL_ORDER)):
+                value = matrix[y, x]
+                if np.isfinite(value):
+                    r, g, b = to_rgb(colors[int(value)])
+                    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                    text_color = "#FFFFFF" if luminance < 0.58 else THESIS_PALETTE["neutral_dark"]
+                else:
+                    text_color = THESIS_PALETTE["neutral_dark"]
+                ax.text(
+                    x,
+                    y,
+                    labels[y][x],
+                    ha="center",
+                    va="center",
+                    fontsize=12.2,
+                    color=text_color,
+                    linespacing=1.08,
+                )
+        ax.set_xticks(np.arange(-0.5, len(MODEL_ORDER), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(TARGET_ORDER), 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=1.5)
+        ax.tick_params(which="minor", bottom=False, left=False)
+        ax.tick_params(axis="both", which="major", length=0, pad=7)
+        fig.tight_layout()
+        path = _savefig(fig, out_dir / "figures" / "all_models_fit_diagnostics_overview.png")
+        plt.close(fig)
+    return path
+
+
+def plot_all_model_convergence(selected: pd.DataFrame, *, out_dir: Path) -> Path | None:
+    df = selected[selected["metric"].isin(["train", "val"])].copy()
+    df = df[df["model"].isin(["TFT", "XGB"])]
+    if df.empty:
+        return None
+    import matplotlib.pyplot as plt
+
+    targets = [t for t in TARGET_ORDER if t in set(df["target_label"])]
+    models = [m for m in ["TFT", "XGB"] if m in set(df["model"])]
+    rc = {
+        "font.family": "serif",
+        "font.serif": ["Latin Modern Roman", "Times New Roman", "Times", "DejaVu Serif"],
+        "axes.titlesize": 14,
+        "axes.labelsize": 11,
+        "xtick.labelsize": 9.5,
+        "ytick.labelsize": 9.5,
+        "legend.fontsize": 13,
+    }
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(
+            nrows=len(targets),
+            ncols=len(models),
+            figsize=(11.4, max(8.0, 1.72 * len(targets))),
+            sharex=False,
+            sharey=False,
+        )
+        axes_arr = np.asarray(axes).reshape(len(targets), len(models))
+        colors = {"train": THESIS_PALETTE["naive"], "val": THESIS_PALETTE["tertiary"]}
+        for yi, target in enumerate(targets):
+            for xi, model in enumerate(models):
+                ax = axes_arr[yi, xi]
+                g = df[df["target_label"].eq(target) & df["model"].eq(model)]
+                for metric in ["train", "val"]:
+                    line = g[g["metric"].eq(metric)].sort_values("step")
+                    if line.empty:
+                        continue
+                    ax.plot(line["step"], line["value"], color=colors[metric], linewidth=1.55, label=metric)
+                    if metric == "val":
+                        best = line.loc[line["value"].idxmin()]
+                        ax.scatter([best["step"]], [best["value"]], color=THESIS_PALETTE["primary"], s=22, zorder=3)
+                if yi == 0:
+                    ax.set_title(model, pad=5)
+                if xi == 0:
+                    ax.set_ylabel(_curve_target_label(target), fontsize=11.2, rotation=0, ha="right", va="center", labelpad=52)
+                ax.tick_params(axis="both", which="major", labelsize=9.5)
+                ax.grid(True, alpha=0.25)
+        handles, labels = axes_arr[0, 0].get_legend_handles_labels()
+        legend_labels = {"train": "Training loss", "val": "Validation loss"}
+        fig.legend(handles, [legend_labels.get(x, x) for x in labels], loc="upper center", ncol=2, frameon=False)
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+        path = _savefig(fig, out_dir / "figures" / "all_models_training_convergence_by_target.png")
+        plt.close(fig)
+    return path
 
 
 def _savefig(fig, path: Path) -> Path:
@@ -524,7 +889,15 @@ def plot_hpo_trials(selected: pd.DataFrame, trial_summary: pd.DataFrame, *, out_
     return outputs
 
 
-def build_outputs(*, log_root: Path, out_dir: Path, final_run: str, include_trials: bool = True) -> dict[str, Any]:
+def build_outputs(
+    *,
+    log_root: Path,
+    out_dir: Path,
+    final_run: str,
+    include_trials: bool = True,
+    all_model_runs: list[str] | None = None,
+    model_runs_root: Path = Path("artifacts/model_runs"),
+) -> dict[str, Any]:
     apply_geo_style()
     for rel in ["figures", "latex_figures", "csv", "diagnostics"]:
         (out_dir / rel).mkdir(parents=True, exist_ok=True)
@@ -587,6 +960,58 @@ def build_outputs(*, log_root: Path, out_dir: Path, final_run: str, include_tria
             if tex is not None:
                 outputs.append(Output("latex_figure", tex, "copy-paste native pgfplots figure code", f"Native LaTeX/pgfplots code for {fig.name}."))
 
+    all_model_runs = [r for r in (all_model_runs or []) if str(r).strip()]
+    if all_model_runs:
+        all_raw, all_selected = collect_final_run_scalars(log_root, final_runs=all_model_runs)
+        all_raw_path = out_dir / "csv" / "all_models_tensorboard_scalars_long.csv"
+        all_selected_path = out_dir / "csv" / "all_models_selected_loss_curves.csv"
+        all_raw.to_csv(all_raw_path, index=False)
+        all_selected.to_csv(all_selected_path, index=False)
+        outputs.extend(
+            [
+                Output("csv", all_raw_path, "backup data", "All TensorBoard scalars for selected final model runs."),
+                Output("csv", all_selected_path, "backup data", "Selected training and validation curves for selected final model runs."),
+            ]
+        )
+        training_summary = _training_fit_summary(all_selected)
+        metric_summary = _load_current_metric_summary(model_runs_root)
+        if training_summary.empty:
+            fit_summary = metric_summary.copy()
+        elif metric_summary.empty:
+            fit_summary = training_summary.copy()
+        else:
+            fit_summary = training_summary.merge(metric_summary, on=["model", "target_label"], how="outer")
+        if not fit_summary.empty:
+            fit_summary["fit_diagnosis"] = fit_summary.apply(_fit_diagnosis, axis=1)
+            fit_summary["target_order"] = fit_summary["target_label"].map({t: i for i, t in enumerate(TARGET_ORDER)})
+            fit_summary["model_order"] = fit_summary["model"].map({m: i for i, m in enumerate(MODEL_ORDER)})
+            fit_summary = fit_summary.sort_values(["target_order", "model_order", "target_label", "model"])
+        fit_summary_path = out_dir / "csv" / "all_models_fit_diagnostics_summary.csv"
+        fit_summary.to_csv(fit_summary_path, index=False)
+        outputs.append(Output("csv", fit_summary_path, "backup data", "Compact overfitting and underfitting diagnostics by model and target."))
+
+        fig = plot_all_model_convergence(all_selected, out_dir=out_dir)
+        if fig is not None:
+            outputs.append(Output("figure", fig, "methodology or appendix figure", "Training and validation loss curves for TFT and XGB by target."))
+            tex = _write_png_latex_wrapper(
+                out_dir / "latex_figures" / "all_models_training_convergence_by_target.tex",
+                image_rel="figures/4-results/tensorboard_logs/figures/all_models_training_convergence_by_target.png",
+                caption="Training and validation loss curves for TFT and XGB by forecast target. Markers indicate the best validation point. RLQR is omitted because it does not have iterative training curves in the TensorBoard logs.",
+                label="fig:all-models-training-convergence-by-target",
+            )
+            outputs.append(Output("latex_figure", tex, "LaTeX figure wrapper", "LaTeX wrapper for all-model training convergence curves."))
+
+        fig = plot_all_model_fit_overview(fit_summary, out_dir=out_dir)
+        if fig is not None:
+            outputs.append(Output("figure", fig, "methodology or appendix figure", "Compact fit-diagnostics overview for TFT, XGB and RLQR."))
+            tex = _write_png_latex_wrapper(
+                out_dir / "latex_figures" / "all_models_fit_diagnostics_overview.tex",
+                image_rel="figures/4-results/tensorboard_logs/figures/all_models_fit_diagnostics_overview.png",
+                caption="Concise training-fit diagnostics by model and forecast target. Cell labels report the test-to-validation MAE ratio and validation-loss drift after the best validation epoch; for example, MAE x1.7 means the test MAE is 1.7 times the validation MAE, while val +0\\% indicates no meaningful validation-loss increase after the best epoch. Categories are descriptive indicators of overfitting, underfitting or test-period degradation.",
+                label="fig:all-models-fit-diagnostics-overview",
+            )
+            outputs.append(Output("latex_figure", tex, "LaTeX figure wrapper", "LaTeX wrapper for all-model fit diagnostics overview."))
+
     tag_inventory = (
         raw.groupby(["run", "target", "tag"], as_index=False)
         .agg(n_points=("value", "size"), min_step=("step", "min"), max_step=("step", "max"))
@@ -600,6 +1025,7 @@ def build_outputs(*, log_root: Path, out_dir: Path, final_run: str, include_tria
         "description": "Thesis-ready TensorBoard training diagnostics.",
         "log_root": str(log_root),
         "final_run": final_run,
+        "all_model_runs": all_model_runs,
         "outputs": [
             {
                 "artifact_type": out.artifact_type,
@@ -620,6 +1046,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-root", default="artifacts/tensorboard_logs", help="Root containing TensorBoard run folders.")
     p.add_argument("--out-dir", default="artifacts/benchmark/tensorboard_training_diagnostics", help="Output directory for PNG, LaTeX, CSV and manifest files.")
     p.add_argument("--final-run", default="tft_20260526_123034", help="Final TFT run folder to visualize by target.")
+    p.add_argument(
+        "--all-model-runs",
+        default="",
+        help="Comma-separated final run folders for compact all-model diagnostics, e.g. tft_20260526_123034,xgb_20260526_123033,linear_20260526_223836.",
+    )
+    p.add_argument("--model-runs-root", default="artifacts/model_runs", help="Root containing current model-run metric JSON files.")
     p.add_argument("--no-trials", action="store_true", help="Skip trial_XXXX HPO diagnostics.")
     return p.parse_args()
 
@@ -631,6 +1063,8 @@ def main() -> int:
         out_dir=Path(args.out_dir),
         final_run=str(args.final_run),
         include_trials=not bool(args.no_trials),
+        all_model_runs=[x.strip() for x in str(args.all_model_runs).split(",") if x.strip()],
+        model_runs_root=Path(args.model_runs_root),
     )
     print(f"[OK] TensorBoard diagnostics written: {Path(args.out_dir) / 'tensorboard_training_diagnostics_manifest.json'}")
     print(f"[OK] outputs={len(manifest['outputs'])}")

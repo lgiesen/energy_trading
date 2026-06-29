@@ -1106,14 +1106,18 @@ def _without_embedded_legend(lines: list[str]) -> list[str]:
 def _with_combined_per_lead_layout(lines: list[str], filename: str) -> list[str]:
     out: list[str] = []
     is_afrr_panel = filename.startswith("per_lead_pinball_afrr_")
+    is_activation_rate_panel = filename.startswith("per_lead_pinball_afrr_activation_rate")
+    ylabel_xshift = "-0.42cm" if is_activation_rate_panel else "-0.25cm"
     for line in lines:
         if is_afrr_panel:
             line = line.replace("horizontal sep=1.25cm", "horizontal sep=2.05cm")
             line = line.replace("horizontal sep=1.65cm", "horizontal sep=2.05cm")
+        if is_activation_rate_panel and "y label style={" in line:
+            line = re.sub(r"at=\{\(-?[\d.]+,0\.5\)\}", "at={(-0.13,0.5)}", line, count=1)
         if "ylabel style={" in line:
-            line = line.replace("ylabel style={", "ylabel style={xshift=-0.25cm, ")
+            line = line.replace("ylabel style={", f"ylabel style={{xshift={ylabel_xshift}, ")
         elif "ylabel={" in line:
-            out.append("                ylabel style={xshift=-0.25cm},")
+            out.append(f"                ylabel style={{xshift={ylabel_xshift}}},")
         out.append(line)
     return out
 
@@ -1164,6 +1168,8 @@ def _write_grouped_bar_tex(
     reference_y: float | None = None,
     reference_label: str | None = None,
     x_tick_label_col: str | None = None,
+    axis_height: str = "8cm",
+    legend_style: str | None = None,
 ) -> Path | None:
     if data.empty or not series_cols:
         return None
@@ -1178,10 +1184,10 @@ def _write_grouped_bar_tex(
             r"                ybar,",
             r"                bar width=13pt,",
             r"                width=0.96\textwidth,",
-            r"                height=8cm,",
+            rf"                height={axis_height},",
             rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
             r"                x tick label style={rotate=35, anchor=east},",
-            r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
+            legend_style or r"                legend style={at={(0.5,1.08)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
             r"                legend cell align={left},",
             r"                area legend,",
             r"                axis lines*=left,",
@@ -1901,7 +1907,7 @@ def _write_tail_spike_relative_tex(
             xtick_values = ""
             xtick_labels = ""
             ellipsis_tick = None
-        height_cm = max(7.8, min(26.0, 0.74 * len(labels) + 2.6))
+        height_cm = max(7.8, min(12.9, 0.74 * len(labels) + 2.6))
         table_names = {"XGB": r"\tailSpikeXGBTable", "TFT": r"\tailSpikeTFTTable"}
         model_table_lines: list[str] = []
         model_has_data: dict[str, bool] = {}
@@ -1933,8 +1939,6 @@ def _write_tail_spike_relative_tex(
             r"                bar width=7pt,",
             r"                width=0.74\textwidth,",
             rf"                height={_tex_num(height_cm)}cm,",
-            r"                title={Tail and Spike Performance Across Forecast Targets},",
-            r"                title style={at={(axis description cs:0.5,1.18)}, anchor=south, xshift=-1.4cm},",
             r"                xlabel={Mean pinball loss relative to RLQR},",
             r"                legend style={at={(0.5,1.07)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
             r"                legend cell align={left},",
@@ -2401,6 +2405,42 @@ def _write_p50_tolerance_curve_tex(
     return _write_lines(path, lines)
 
 
+def _write_p50_tolerance_pair_wrapper_tex(
+    path: Path,
+    *,
+    pos_target: str,
+    neg_target: str,
+    caption: str,
+    label: str,
+) -> Path:
+    pos_slug = P50_TOLERANCE_TEX_CONFIG[pos_target][0]
+    neg_slug = P50_TOLERANCE_TEX_CONFIG[neg_target][0]
+    figure_root = "figures/4-results/rq1_ml_model_benchmark/4_1_1_full_unweighted/result_section/figures"
+    pos_caption = _p50_tolerance_title_label(pos_target)
+    neg_caption = _p50_tolerance_title_label(neg_target)
+    lines = [
+        r"\begin{figure}[htbp]",
+        r"    \centering",
+        r"    \begin{subfigure}[t]{0.495\textwidth}",
+        r"        \centering",
+        rf"        \includegraphics[width=\linewidth]{{{figure_root}/{pos_slug}_p50_absolute_error_tolerance_curve.png}}",
+        rf"        \caption{{{_latex_escape(pos_caption)}.}}",
+        rf"        \label{{fig:{pos_slug}_p50_absolute_error_tolerance_curve}}",
+        r"    \end{subfigure}\hfill",
+        r"    \begin{subfigure}[t]{0.495\textwidth}",
+        r"        \centering",
+        rf"        \includegraphics[width=\linewidth]{{{figure_root}/{neg_slug}_p50_absolute_error_tolerance_curve.png}}",
+        rf"        \caption{{{_latex_escape(neg_caption)}.}}",
+        rf"        \label{{fig:{neg_slug}_p50_absolute_error_tolerance_curve}}",
+        r"    \end{subfigure}",
+        rf"    \caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
+        rf"    \label{{{label}}}",
+        r"\end{figure}",
+        "",
+    ]
+    return _write_lines(path, lines)
+
+
 def _write_line_tex(
     path: Path,
     *,
@@ -2689,59 +2729,104 @@ def _write_combined_per_lead_pinball_tex(root: Path) -> Path | None:
     if any(not path.exists() for path, _, _, _ in source_paths):
         return None
     out = latex_dir / "per_lead_pinball_combined.tex"
-    lines = [
+    da_capacity_out = latex_dir / "per_lead_pinball_da_capacity.tex"
+    activation_out = latex_dir / "per_lead_pinball_activation.tex"
+    header_lines = [
         r"% Requires: \usepackage{pgfplots}",
         r"% Requires: \usepackage{xcolor}",
         r"% Requires: \usepackage{subcaption}",
         r"% Requires: \usepgfplotslibrary{groupplots}",
         r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
         *_latex_color_defs(),
-        r"\clearpage",
-        r"\begin{figure}[p]",
-        r"    \centering",
-        r"    \captionsetup[subfigure]{font=small,skip=0.2em}",
-        r"    \begin{tikzpicture}",
-        r"        \draw[color=secondary, line width=1pt] (0.00,0) -- (0.70,0);",
-        r"        \node[anchor=west, text=black] at (0.90,0) {RLQR};",
-        r"        \draw[color=primary, line width=1pt] (2.55,0) -- (3.25,0);",
-        r"        \node[anchor=west, text=black] at (3.45,0) {XGB};",
-        r"        \draw[color=tertiary, line width=1pt] (5.10,0) -- (5.80,0);",
-        r"        \node[anchor=west, text=black] at (6.00,0) {TFT};",
-        r"    \end{tikzpicture}",
-        r"    \vspace{0.15em}",
     ]
-    for i, (path, caption, label, height) in enumerate(source_paths):
-        tikz_lines = _extract_tikzpicture_lines(path)
-        tikz_lines = _with_compact_axis_height(tikz_lines, height)
-        tikz_lines = _without_embedded_legend(tikz_lines)
-        tikz_lines = _with_combined_per_lead_layout(tikz_lines, path.name)
-        lines.extend(
+
+    def append_figure(
+        target_lines: list[str],
+        figure_specs: list[tuple[Path, str, str, str]],
+        *,
+        caption: str,
+        label: str,
+    ) -> None:
+        target_lines.extend(
             [
-                r"    \begin{subfigure}[t]{0.98\textwidth}",
-                r"        \centering",
-                r"        \resizebox{0.96\linewidth}{!}{%",
+                r"\begin{figure}[tbp]",
+                r"    \centering",
+                r"    \captionsetup[subfigure]{font=small,skip=0.2em}",
+                r"    \begin{tikzpicture}",
+                r"        \draw[color=secondary, line width=1pt] (0.00,0) -- (0.70,0);",
+                r"        \node[anchor=west, text=black] at (0.90,0) {RLQR};",
+                r"        \draw[color=primary, line width=1pt] (2.55,0) -- (3.25,0);",
+                r"        \node[anchor=west, text=black] at (3.45,0) {XGB};",
+                r"        \draw[color=tertiary, line width=1pt] (5.10,0) -- (5.80,0);",
+                r"        \node[anchor=west, text=black] at (6.00,0) {TFT};",
+                r"    \end{tikzpicture}",
+                r"    \vspace{0.15em}",
             ]
         )
-        lines.extend("        " + line for line in tikz_lines)
-        lines.extend(
+
+        for i, (path, subcaption, sublabel, height) in enumerate(figure_specs):
+            tikz_lines = _extract_tikzpicture_lines(path)
+            tikz_lines = _with_compact_axis_height(tikz_lines, height)
+            tikz_lines = _without_embedded_legend(tikz_lines)
+            tikz_lines = _with_combined_per_lead_layout(tikz_lines, path.name)
+            target_lines.extend(
+                [
+                    r"    \begin{subfigure}[t]{0.98\textwidth}",
+                    r"        \centering",
+                    r"        \resizebox{0.96\linewidth}{!}{%",
+                ]
+            )
+            target_lines.extend("        " + line for line in tikz_lines)
+            target_lines.extend(
+                [
+                    r"        }",
+                    r"        \phantomcaption",
+                    f"        \\label{{{sublabel}}}",
+                    r"    \end{subfigure}",
+                ]
+            )
+            if i < len(figure_specs) - 1:
+                target_lines.append(r"    \vspace{0.25em}")
+
+        target_lines.extend(
             [
-                r"        }",
-                r"        \phantomcaption",
-                f"        \\label{{{label}}}",
-                r"    \end{subfigure}",
+                rf"    \caption{{{_latex_escape(_ensure_caption_period(caption))}}}",
+                f"    \\label{{{label}}}",
+                r"\end{figure}",
+                "",
             ]
         )
-        if i < len(source_paths) - 1:
-            lines.append(r"    \vspace{0.25em}")
-    lines.extend(
-        [
-            rf"    \caption{{{_latex_escape(_ensure_caption_period('Mean pinball loss by lead hour across forecast targets. Grey bands mark decision-relevant lead ranges.'))}}}",
-            r"    \label{fig:rq1-4-1-3-per-lead-pinball-combined}",
-            r"\end{figure}",
-            "",
-        ]
+
+    da_capacity_lines = list(header_lines)
+    append_figure(
+        da_capacity_lines,
+        source_paths[:2],
+        caption="Mean pinball loss by lead hour for DA and aFRR capacity price targets. Grey bands mark decision-relevant lead ranges.",
+        label="fig:rq1-4-1-3-per-lead-pinball-combined",
     )
-    return _write_lines(out, lines)
+    activation_lines = list(header_lines)
+    append_figure(
+        activation_lines,
+        source_paths[2:],
+        caption="Mean pinball loss by lead hour for aFRR activation price and activation rate targets. Grey bands mark decision-relevant lead ranges.",
+        label="fig:rq1-4-1-3-per-lead-pinball-combined-activation",
+    )
+    combined_lines = list(header_lines)
+    append_figure(
+        combined_lines,
+        source_paths[:2],
+        caption="Mean pinball loss by lead hour for DA and aFRR capacity price targets. Grey bands mark decision-relevant lead ranges.",
+        label="fig:rq1-4-1-3-per-lead-pinball-combined",
+    )
+    append_figure(
+        combined_lines,
+        source_paths[2:],
+        caption="Mean pinball loss by lead hour for aFRR activation price and activation rate targets. Grey bands mark decision-relevant lead ranges.",
+        label="fig:rq1-4-1-3-per-lead-pinball-combined-activation",
+    )
+    _write_lines(da_capacity_out, da_capacity_lines)
+    _write_lines(activation_out, activation_lines)
+    return _write_lines(out, combined_lines)
 
 
 def _padded_ylim(data: pd.DataFrame, value_col: str, *, include: tuple[float, ...] = ()) -> tuple[float, float] | None:
@@ -2796,14 +2881,16 @@ def _write_heatmap_tex(
             r"                height=8cm,",
             r"                view={0}{90},",
             r"                colorbar,",
-            r"                colormap/Blues,",
+            r"                colormap={geoSequentialBlue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
+            r"                point meta min=0,",
+            r"                point meta max=1,",
             r"                x tick label style={rotate=35, anchor=east},",
             *_symbolic_axis_options(xs),
             "                symbolic y coords={" + ",".join(_tex_symbol(y) for y in ys) + "},",
             "                ytick={" + ",".join(_tex_symbol(y) for y in ys) + "},",
             "                yticklabels={" + ",".join(_latex_escape(y) for y in ys) + "},",
             r"            ]",
-            r"                \addplot[matrix plot*, point meta=explicit] coordinates {",
+            r"                \addplot[scatter, only marks, mark=square*, mark size=5.8pt, scatter src=explicit] coordinates {",
         ]
     )
     for _, row in data.iterrows():
@@ -2874,11 +2961,13 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             x_col="target",
             x_tick_label_col="target_label",
             series_cols=["XGB", "TFT"],
-            caption="Mean pinball loss by target relative to RLQR",
+            caption="Mean pinball loss by forecast target relative to RLQR. The dotted line marks the RLQR benchmark at 1. Values below 1 indicate lower loss than RLQR, while values above 1 indicate higher loss.",
             label="fig:rq1-4-1-1-forecast-metrics-full-relative-pinball",
             ylabel="Mean pinball loss relative to RLQR",
             reference_y=1.0,
             reference_label="RLQR",
+            axis_height="6.2cm",
+            legend_style=r"                legend style={at={(0.5,1.10)}, anchor=south, legend columns=-1, draw=none, fill=none, text=black},",
         )
         if path:
             _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="mean_pinball_loss", description="Native pgfplots relative full-sample pinball bar chart.")
@@ -2933,6 +3022,25 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             path = _write_p50_tolerance_curve_tex(out, data=tolerance, target=target, split=split)
             if path:
                 _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="p50 absolute error tolerance", description=f"Native pgfplots p50 absolute error tolerance curve for {slug}.")
+        for filename, pos_target, neg_target, caption, label in [
+            (
+                "afrr_capacity_price_p50_absolute_error_tolerance_curve.tex",
+                "pred_afrr_capacity_price_pos",
+                "pred_afrr_capacity_price_neg",
+                "Cumulative absolute p50 error tolerance for aFRR capacity price targets.",
+                "fig:rq1-4-1-1-absolute-error-tolerance-afrr-capacity-price",
+            ),
+            (
+                "afrr_activation_price_p50_absolute_error_tolerance_curve.tex",
+                "pred_afrr_activation_price_pos",
+                "pred_afrr_activation_price_neg",
+                "Cumulative absolute p50 error tolerance for aFRR activation price targets.",
+                "fig:rq1-4-1-1-absolute-error-tolerance-afrr-activation-price",
+            ),
+        ]:
+            out = root / "result_section" / "latex_figures" / filename
+            path = _write_p50_tolerance_pair_wrapper_tex(out, pos_target=pos_target, neg_target=neg_target, caption=caption, label=label)
+            _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="p50 absolute error tolerance", description=f"Appendix wrapper for {caption}")
 
     # 4.1.2 calibration and uncertainty.
     sec = "4.1.2"
@@ -3003,6 +3111,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                 percent_axes=True,
                 fragment_only=True,
                 axis_height="6.2cm",
+                show_legend=False,
             )
             if path:
                 _add_tikz_entry(entries, subsection=sec, tier="result_section", path=path, metric_family="calibration", description=f"Native pgfplots aggregate quantile reliability for {aggregate_label}.")
@@ -3102,7 +3211,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
                         axis_height=axis_height,
                         y_tick_precision=y_tick_precision,
                         y_scale=y_scale,
-                        y_label_x=-0.07 if target_slug == "afrr_activation_rate" and metric == "mean_pinball_loss" and tier == "result_section" else -0.11,
+                        y_label_x=-0.13 if target_slug == "afrr_activation_rate" and metric == "mean_pinball_loss" and tier == "result_section" else -0.11,
                         titlecase_caption=False,
                     )
                 else:

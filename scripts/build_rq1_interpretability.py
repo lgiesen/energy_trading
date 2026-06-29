@@ -86,32 +86,44 @@ def feature_group(feature: str) -> str:
     """Map a raw feature name to a thesis-readable feature group."""
     f = str(feature).lower()
     if any(x in f for x in ["afrr_activation_rate", "is_activated", "activation_rate"]):
-        return "activation history"
+        return "Activation history"
     if any(x in f for x in ["afrr_capacity", "capacity_price", "capacity_offered"]):
-        return "capacity market history"
+        return "Capacity market history"
     if any(x in f for x in ["afrr_marginal", "activation_price", "imbalance", "nrv", "system_stress"]):
         return "aFRR system state"
     if "price" in f or "spread" in f:
-        return "price history"
+        return "Price history"
     if "residual" in f:
-        return "residual load"
+        return "Residual load"
     if "load" in f:
-        return "load"
+        return "Load"
     if any(x in f for x in ["solar", "wind", "renewable"]):
-        return "renewable generation"
+        return "Renewable generation"
     if any(x in f for x in ["hour", "day", "week", "month", "holiday", "season", "morning", "evening", "night", "afternoon", "calendar", "payday"]):
-        return "calendar/time"
+        return "Calendar/time"
     if any(x in f for x in ["lag", "rolling", "mean_", "std_", "ewma", "diff", "ramp", "tminus"]):
-        return "lag/rolling statistics"
+        return "Lag/rolling statistics"
     if any(x in f for x in ["cross", "border", "fr_", "nl_", "be_", "at_", "ch_", "pl_", "cz_", "neighbor"]):
-        return "cross-border / neighboring markets"
+        return "Cross-border / neighboring markets"
     if any(x in f for x in ["temp", "weather", "wind_speed", "irradiance"]):
-        return "weather"
-    return "other"
+        return "Weather"
+    return "Other"
 
 
 def _target_label(target: str) -> str:
     return TARGET_LABELS.get(target, target.replace("target_", "").replace("_", " "))
+
+
+def _target_label_sentence(value: Any) -> str:
+    text = str(value)
+    text = text.replace(" pos", " +")
+    text = text.replace(" neg", " -")
+    return text
+
+
+def _target_label_tex(value: Any) -> str:
+    text = _latex_escape(_target_label_sentence(value))
+    return text.replace(" -", r" $-$")
 
 
 def _latex_escape(value: Any) -> str:
@@ -163,6 +175,81 @@ def _write_latex_table(path: Path, headers: list[str], rows: list[list[Any]], ca
             "",
         ]
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _latex_feature_cell(value: Any) -> str:
+    return _latex_escape(value).replace(r"\_", r"\_\allowbreak{}")
+
+
+def _write_xgb_top_feature_table(path: Path, top_features: pd.DataFrame) -> Path:
+    if top_features.empty:
+        rows = pd.DataFrame()
+    else:
+        rows = top_features[
+            top_features["model"].eq("XGB")
+            & top_features["importance_type"].eq("existing_xgb_mean_abs_shap")
+            & top_features["rank"].le(5)
+        ].copy()
+        target_order = {_target_label(target): idx for idx, target in enumerate(TARGET_STEMS)}
+        rows["_target_order"] = rows["target"].map(target_order).fillna(len(target_order))
+        rows = rows.sort_values(["_target_order", "rank"])
+
+    lines = [
+        r"\begin{table}[ht]",
+        r"    \centering",
+        r"    \small",
+        r"    \caption{Top feature-level interpretability diagnostics for the RQ1 ML benchmark.}",
+        r"    \label{tab:rq1_interpretability_top_features_test}",
+        r"    \begin{tabularx}{\linewidth}{@{}ll>{\raggedright\arraybackslash}p{0.25\linewidth}llr>{\raggedright\arraybackslash}X@{}}",
+        r"        \toprule",
+        r"        \textbf{Target} & \textbf{Rank} & \textbf{Feature} & \textbf{Feature group} & \textbf{Importance type} & \textbf{Importance value} & \textbf{Caveat} \\",
+        r"        \midrule",
+    ]
+    for _, row in rows.iterrows():
+        vals = [
+            _target_label_tex(row["target"]),
+            str(int(row["rank"])),
+            _latex_feature_cell(row["feature"]),
+            _latex_escape(row["feature_group"]),
+            "SHAP",
+            _fmt(row["importance_value"]),
+            _latex_escape(row["caveat"]),
+        ]
+        lines.append("        " + " & ".join(vals) + r" \\")
+    lines.extend(
+        [
+            r"        \bottomrule",
+            r"    \end{tabularx}",
+            r"\end{table}",
+            "",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _thesis_relative_path(path: Path) -> str:
+    parts = list(path.parts)
+    if "rq1_ml_model_benchmark" in parts:
+        idx = parts.index("rq1_ml_model_benchmark")
+        return str(Path("figures/4-results").joinpath(*parts[idx:]))
+    return str(path)
+
+
+def _write_image_figure(path: Path, *, image_path: Path, caption: str, label: str, placement: str = "p", width: str = r"\linewidth") -> Path:
+    lines = [
+        rf"\begin{{figure}}[{placement}]",
+        r"    \centering",
+        rf"    \includegraphics[width={width}]{{{_thesis_relative_path(image_path)}}}",
+        f"    \\caption{{{_latex_escape(caption)}}}",
+        f"    \\label{{{label}}}",
+        r"\end{figure}",
+        "",
+    ]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -255,10 +342,10 @@ def _write_native_bar_figure(
 def _write_group_heatmap_figure(path: Path, *, group_df: pd.DataFrame, caption: str, label: str) -> Path | None:
     if group_df.empty:
         return None
-    top = group_df[group_df["group_rank"].le(5)].copy()
+    top = group_df[group_df["group_rank"].le(5) & group_df["model"].eq("XGB")].copy()
     if top.empty:
         return None
-    top["panel"] = top["target"].astype(str) + " | " + top["model"].astype(str)
+    top["panel"] = top["target"].astype(str)
     x_labels = top["panel"].drop_duplicates().tolist()
     y_labels = sorted(top["feature_group"].drop_duplicates().tolist())
     lines = [
@@ -275,16 +362,18 @@ def _write_group_heatmap_figure(path: Path, *, group_df: pd.DataFrame, caption: 
         r"                height=8cm,",
         r"                view={0}{90},",
         r"                colorbar,",
-        r"                colormap/Blues,",
+        r"                colormap={geoSequentialBlue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
+        r"                point meta min=0,",
+        r"                point meta max=1,",
         r"                x tick label style={rotate=55, anchor=east, font=\scriptsize},",
         "                symbolic x coords={" + ",".join(_tex_symbol(x) for x in x_labels) + "},",
         "                xtick={" + ",".join(_tex_symbol(x) for x in x_labels) + "},",
-        "                xticklabels={" + ",".join(_latex_escape(x) for x in x_labels) + "},",
+        "                xticklabels={" + ",".join(_target_label_tex(x) for x in x_labels) + "},",
         "                symbolic y coords={" + ",".join(_tex_symbol(y) for y in y_labels) + "},",
         "                ytick={" + ",".join(_tex_symbol(y) for y in y_labels) + "},",
         "                yticklabels={" + ",".join(_latex_escape(y) for y in y_labels) + "},",
         r"            ]",
-        r"                \addplot[matrix plot*, point meta=explicit] coordinates {",
+        r"                \addplot[scatter, only marks, mark=square*, mark size=5.8pt, scatter src=explicit] coordinates {",
     ]
     for _, row in top.iterrows():
         lines.append(f"                    ({_tex_symbol(row['panel'])},{_tex_symbol(row['feature_group'])}) [{_tex_num(row['importance_share'])}]")
@@ -293,7 +382,7 @@ def _write_group_heatmap_figure(path: Path, *, group_df: pd.DataFrame, caption: 
             r"                };",
             r"            \end{axis}",
             r"        \end{tikzpicture}}",
-            f"    \\caption{{{_latex_escape(thesis_titlecase(caption))}}}",
+            f"    \\caption{{{_latex_escape(caption)}}}",
             f"    \\label{{{label}}}",
             r"\end{figure}",
             "",
@@ -318,6 +407,10 @@ def _copy_if_exists(src: Path, dst: Path) -> bool:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     return True
+
+
+def _target_slug(target: str) -> str:
+    return target.removeprefix("target_").replace("_", "-")
 
 
 def _inventory_row(target: str, model: str, artifact_type: str, path: Path, exists: bool, used: bool, reason: str = "") -> dict[str, Any]:
@@ -385,6 +478,13 @@ def _collect_xgb(run_dir: Path, section_root: Path, inventory: list[dict[str, An
         shap_dst = section_root / "appendix" / "figures" / f"xgb_shap_summary_{target.removeprefix('target_')}.png"
         used = _copy_if_exists(shap_png, shap_dst)
         inventory.append(_inventory_row(target, "xgb", "xgb_shap_summary_png", shap_png, shap_png.exists(), used, "" if used else "SHAP plot unavailable."))
+        if used:
+            _write_image_figure(
+                section_root / "appendix" / "latex_figures" / f"xgb_shap_summary_{target.removeprefix('target_')}.tex",
+                image_path=shap_dst,
+                caption=f"XGB SHAP summary for {_target_label(target)}. Values are reused from the existing model-run artifact and are interpretable within the XGB model only.",
+                label=f"fig:rq1-interpretability-xgb-shap-{_target_slug(target)}",
+            )
         if not used:
             warnings_out.append(WarningRow(_target_label(target), "XGB", "shap_unavailable", f"Missing existing SHAP plot: {shap_png}"))
 
@@ -392,6 +492,13 @@ def _collect_xgb(run_dir: Path, section_root: Path, inventory: list[dict[str, An
         imp_dst = section_root / "appendix" / "figures" / f"xgb_feature_importance_{target.removeprefix('target_')}.png"
         used = _copy_if_exists(imp_png, imp_dst)
         inventory.append(_inventory_row(target, "xgb", "xgb_feature_importance_png", imp_png, imp_png.exists(), used, "" if used else "Native XGB feature-importance plot unavailable."))
+        if used:
+            _write_image_figure(
+                section_root / "appendix" / "latex_figures" / f"xgb_feature_importance_{target.removeprefix('target_')}.tex",
+                image_path=imp_dst,
+                caption=f"Native XGB feature importance for {_target_label(target)}. Importance values are model-specific and not directly comparable to TFT attention or RLQR coefficients.",
+                label=f"fig:rq1-interpretability-xgb-feature-importance-{_target_slug(target)}",
+            )
     return pd.DataFrame(rows)
 
 
@@ -409,6 +516,14 @@ def _collect_tft(run_dir: Path, section_root: Path, inventory: list[dict[str, An
             used = _copy_if_exists(src, dst)
             copied_any = copied_any or used
             inventory.append(_inventory_row(target, "tft", kind, src, src.exists(), used, "" if used else "TFT visual interpretation artifact unavailable."))
+            if used:
+                readable = suffix.replace("_", " ")
+                _write_image_figure(
+                    section_root / "appendix" / "latex_figures" / f"tft_attention_or_feature_importance_{target.removeprefix('target_')}_{suffix}.tex",
+                    image_path=dst,
+                    caption=f"TFT {readable} diagnostic for {_target_label(target)}. This visual diagnostic is not a SHAP explanation.",
+                    label=f"fig:rq1-interpretability-tft-{readable.replace(' ', '-')}-{_target_slug(target)}",
+                )
         if copied_any:
             warnings_out.append(WarningRow(_target_label(target), "TFT", "tft_not_shap", "TFT attention/feature-relevance plots are used as visual diagnostics only; they are not SHAP values."))
         else:
@@ -588,10 +703,10 @@ def _overlap_table(top_features: pd.DataFrame) -> pd.DataFrame:
 def _plot_group_importance(group_df: pd.DataFrame, path: Path) -> None:
     import matplotlib.pyplot as plt
 
-    top = group_df[group_df["group_rank"].le(5)].copy()
+    top = group_df[group_df["group_rank"].le(5) & group_df["model"].eq("XGB")].copy()
     if top.empty:
         return
-    top["panel"] = top["target"] + " | " + top["model"]
+    top["panel"] = top["target"].map(_target_label_sentence)
     panels = top["panel"].drop_duplicates().tolist()
     groups = sorted(top["feature_group"].drop_duplicates().tolist())
     matrix = pd.DataFrame(0.0, index=groups, columns=panels)
@@ -604,7 +719,6 @@ def _plot_group_importance(group_df: pd.DataFrame, path: Path) -> None:
     ax.set_xticklabels(panels, rotation=55, ha="right")
     ax.set_yticks(np.arange(len(groups)))
     ax.set_yticklabels(groups)
-    ax.set_title(thesis_titlecase("Top feature-group relevance by target and model"))
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("Within-model importance share")
     fig.tight_layout()
@@ -702,7 +816,7 @@ def build_interpretability_outputs(
     _write_group_heatmap_figure(
         out_dir / "result_section" / "latex_figures" / "rq1_interpretability_top_feature_groups.tex",
         group_df=group_df,
-        caption="Top feature groups by target and model for the RQ1 interpretability add-on. Shares are normalized within each model and target; magnitudes are not comparable across model classes.",
+        caption="Feature importance for XGB. Shares are normalized within each model and target and magnitudes are not comparable across model classes.",
         label="fig:rq1-interpretability-top-feature-groups",
     )
 
@@ -714,14 +828,9 @@ def build_interpretability_outputs(
         "tab:rq1_interpretability_summary",
     )
 
-    appendix_tex = _write_latex_table(
+    appendix_tex = _write_xgb_top_feature_table(
         out_dir / "appendix" / "tables" / "feature_importance_top_features_test.tex",
-        ["Target", "Model", "Rank", "Feature", "Feature group", "Importance type", "Importance value", "Caveat"],
-        top_features[["target", "model", "rank", "feature", "feature_group", "importance_type", "importance_value", "caveat"]].head(180).values.tolist()
-        if not top_features.empty
-        else [],
-        "Top feature-level interpretability diagnostics for the RQ1 ML benchmark.",
-        "tab:rq1_interpretability_top_features_test",
+        top_features,
     )
 
     manifest = {

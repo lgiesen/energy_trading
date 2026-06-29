@@ -240,10 +240,6 @@ def _select_best_quantiles(risk: pd.DataFrame) -> pd.DataFrame:
         g = g.dropna(subset=["annualized_net_profit_eur"])
         if not g.empty:
             rows.append(g.sort_values("annualized_net_profit_eur", ascending=False).head(1))
-    for benchmark in BENCHMARK_ORDER:
-        g = risk.loc[risk["is_benchmark"].astype(bool) & risk["model"].astype(str).eq(benchmark)].copy()
-        if not g.empty:
-            rows.append(g.head(1))
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
@@ -312,7 +308,7 @@ def _write_best_table(best: pd.DataFrame, csv_path: Path, tex_path: Path) -> Non
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
-        r"\caption{Downside and operational risk diagnostics for the best-performing quantile of each model and available benchmark strategies. Financial values are reported in thousand EUR.}",
+        r"\caption{Downside and operational risk diagnostics for the best-performing quantile of each model. Financial values are reported in thousand EUR.}",
         r"\label{tab:risk_diagnostics_best_quantile}",
         r"\begin{tabular}{" + align + r"}",
         r"\toprule",

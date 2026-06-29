@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Patch
 from matplotlib.ticker import StrMethodFormatter
 import matplotlib.dates as mdates
 
@@ -53,6 +54,17 @@ STRATEGY_COLOR = {
     "DA-only": THESIS_PALETTE["neutral_dark"],
     "BCM-only": MARKET_COLOR_MAP["BCM capacity"],
     "BEM-only": MARKET_COLOR_MAP["BEM"],
+}
+RQ3_MARKET_ORDER = ["DA", "BCM", "BEM"]
+RQ3_MARKET_COLOR = {
+    "DA": MARKET_COLOR_MAP.get("DA", THESIS_PALETTE["primary"]),
+    "BCM": MARKET_COLOR_MAP.get("BCM capacity", THESIS_PALETTE["secondary"]),
+    "BEM": MARKET_COLOR_MAP.get("BEM", THESIS_PALETTE["tertiary"]),
+}
+RQ3_SINGLE_MARKET_STRATEGY = {
+    "DA": "DA-only",
+    "BCM": "BCM-only",
+    "BEM": "BEM-only",
 }
 STRATEGY_GAMUT = {
     "multi": "Multi",
@@ -119,7 +131,7 @@ REVENUE_COMPONENT_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "BCM activation revenue",
+        "BCM-linked BEM activation revenue",
         (
             "annualized_bcm_activation_revenue_eur",
             "bcm_linked_activation_revenue_eur",
@@ -172,7 +184,7 @@ COST_DETAIL_COMPONENT_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 COST_TOTAL_CANDIDATES = ("annualized_total_costs_eur", "total_costs_eur")
 STRUCTURALLY_ZERO_COMPONENTS = {
-    "DA-only": ("BCM capacity revenue", "BEM activation revenue", "BCM activation revenue"),
+    "DA-only": ("BCM capacity revenue", "BEM activation revenue", "BCM-linked BEM activation revenue"),
     "BCM-only": ("DA revenue", "BEM activation revenue", "ID revenue"),
     "BEM-only": ("DA revenue", "BCM capacity revenue", "ID revenue"),
 }
@@ -181,7 +193,7 @@ COST_LABEL = "Costs"
 REVENUE_COMPONENT_COLOR = {
     "DA revenue": MARKET_COLOR_MAP.get("DA", THESIS_PALETTE["primary"]),
     "BCM capacity revenue": MARKET_COLOR_MAP.get("BCM capacity", THESIS_PALETTE["secondary"]),
-    "BCM activation revenue": MARKET_COLOR_MAP.get("BCM activation", THESIS_PALETTE["secondary"]),
+    "BCM-linked BEM activation revenue": MARKET_COLOR_MAP.get("BCM activation", THESIS_PALETTE["secondary"]),
     "BEM activation revenue": MARKET_COLOR_MAP.get("BEM", THESIS_PALETTE["tertiary"]),
     "ID revenue": MARKET_COLOR_MAP.get("ID", THESIS_PALETTE["neutral_dark"]),
 }
@@ -200,14 +212,12 @@ REVENUE_COMPONENTS = tuple(name for name, _ in REVENUE_COMPONENT_SPECS)
 COST_COMPONENTS = tuple(name for name, _ in COST_DETAIL_COMPONENT_SPECS) + ("Total costs",)
 OPERATIONAL_METRIC_SPECS: tuple[dict[str, Any], ...] = (
     {
-        "metric": "Avg daily throughput",
-        "unit": "MWh/day",
-        "candidates": ("throughput_mwh_per_day", "throughput_mwh_mean_per_day", "average_daily_throughput_mwh"),
-    },
-    {
-        "metric": "Total throughput",
-        "unit": "MWh",
+        "metric": "Throughput",
+        "display_metric": "Throughput in GWh",
+        "unit": "GWh/year",
         "candidates": ("throughput_mwh_total", "total_throughput_mwh"),
+        "annualize": True,
+        "scale": 1.0 / 1000.0,
     },
     {
         "metric": "Equivalent full cycles",
@@ -221,28 +231,35 @@ OPERATIONAL_METRIC_SPECS: tuple[dict[str, Any], ...] = (
     },
     {
         "metric": "Mean SoC",
+        "display_metric": "Mean SoC in MWh",
         "unit": "MWh",
         "candidates": ("mean_soc_mwh", "realized_mean_soc_mwh", "soc_mwh_mean"),
     },
     {
         "metric": "Auxiliary cost",
-        "unit": "EUR",
-        "candidates": ("realized_aux_cost_eur", "aux_cost_eur", "annualized_realized_aux_cost_eur", "annualized_aux_cost_eur"),
+        "display_metric": "Auxiliary cost in kEUR",
+        "unit": "kEUR/year",
+        "candidates": ("realized_aux_cost_eur", "aux_cost_eur"),
+        "annualize": True,
+        "scale": 1.0 / 1000.0,
     },
     {
         "metric": "Degradation cost",
-        "unit": "EUR",
+        "display_metric": "Degra-\ndation cost\nin kEUR",
+        "unit": "kEUR/year",
         "candidates": (
             "realized_degradation_cost_eur",
             "degradation_cost_eur",
-            "annualized_realized_degradation_cost_eur",
-            "annualized_degradation_cost_eur",
         ),
+        "annualize": True,
+        "scale": 1.0 / 1000.0,
     },
     {
         "metric": "ID recourse volume",
-        "unit": "MWh",
+        "display_metric": "ID recourse volume in MWh",
+        "unit": "MWh/year",
         "candidates": ("id_abs_mwh_total", "id_recourse_mwh_total", "id_buy_mwh_total+id_sell_mwh_total"),
+        "annualize": True,
     },
     {
         "metric": "Fallback count",
@@ -358,6 +375,15 @@ def _resolve_matching_column(columns: list[str], candidates: tuple[str, ...], pr
                 if prefer_prefix is None:
                     return col_raw
     return preferred
+
+
+def _resolve_exact_matching_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    normalized_columns = {_normalize_for_matching(c): c for c in columns}
+    for candidate in candidates:
+        col = normalized_columns.get(_normalize_for_matching(candidate))
+        if col is not None:
+            return col
+    return None
 
 
 def _latex_escape(value: Any) -> str:
@@ -774,6 +800,43 @@ def _to_plot_value(value: float, scale: str = "kEUR") -> float:
     return value
 
 
+def _revenue_cost_legend_label(component: str) -> str:
+    labels = {
+        "DA revenue": "DA revenue",
+        "ID revenue": "ID revenue",
+        "BCM capacity revenue": "BCM capacity revenue",
+        "BCM-linked BEM activation revenue": "BCM-linked BEM activation revenue",
+        "BEM activation revenue": "BEM activation revenue",
+        "Degradation cost": "Degradation cost",
+        "Auxiliary cost": "Auxiliary cost",
+        "Transaction cost": "Transaction cost",
+        "Activation penalty": "Activation penalty",
+        "Terminal SoC repair": "Terminal SoC repair",
+        "Total costs": "Total costs",
+    }
+    return labels.get(component, component)
+
+
+def _revenue_cost_legend_label_wrapped(component: str) -> str:
+    labels = {
+        "BCM-linked BEM activation revenue": "BCM-linked BEM\nactivation revenue",
+        "BCM capacity revenue": "BCM capacity\nrevenue",
+        "BEM activation revenue": "BEM activation\nrevenue",
+        "Terminal SoC repair": "Terminal SoC\nrepair",
+    }
+    return labels.get(component, _revenue_cost_legend_label(component))
+
+
+def _revenue_cost_legend_label_tex(component: str) -> str:
+    labels = {
+        "BCM-linked BEM activation revenue": r"\shortstack[l]{BCM-linked BEM\\activation revenue}",
+        "BCM capacity revenue": r"\shortstack[l]{BCM capacity\\revenue}",
+        "BEM activation revenue": r"\shortstack[l]{BEM activation\\revenue}",
+        "Terminal SoC repair": r"\shortstack[l]{Terminal SoC\\repair}",
+    }
+    return labels.get(component, _latex_escape(_revenue_cost_legend_label(component)))
+
+
 def _choose_scale(values: list[float]) -> tuple[str, float]:
     finite = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
     if not finite:
@@ -1183,7 +1246,7 @@ def plot_annualized_net_profit(data: pd.DataFrame, png_path: Path, pdf_path: Pat
     bars = ax.bar(x, values_k, color=colors, edgecolor="white", linewidth=0.8)
     ax.axhline(0.0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.8)
     ax.set_xticks(x, labels=labels)
-    ax.set_xlabel("Market strategy")
+    ax.set_xlabel("")
     ax.set_ylabel("Annualized net profit (kEUR/year)")
     ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
     ymax = float(np.nanmax(values_k)) if len(values_k) else 0.0
@@ -1195,7 +1258,7 @@ def plot_annualized_net_profit(data: pd.DataFrame, png_path: Path, pdf_path: Pat
         va = "bottom" if value >= 0 else "top"
         y = value + offset if value >= 0 else value - offset
         ax.text(bar.get_x() + bar.get_width() / 2, y, f"{value:,.0f}", ha="center", va=va, fontsize=9)
-    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.32)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     if "png" in formats:
@@ -1230,7 +1293,7 @@ def write_latex_annualized_net_profit(data: pd.DataFrame, path: Path) -> Path:
         offset = 0.035 * span
         y = value + offset if value >= 0 else value - offset
         anchor = "south" if value >= 0 else "north"
-        nodes.append(rf"\node[font=\scriptsize, anchor={anchor}] at (axis cs:{idx},{_tex_float(y, 4)}) {{{_latex_escape(f'{value:,.0f}')}}};")
+        nodes.append(rf"\node[font=\small, anchor={anchor}] at (axis cs:{idx},{_tex_float(y, 4)}) {{{_latex_escape(f'{value:,.0f}')}}};")
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -1244,8 +1307,8 @@ def write_latex_annualized_net_profit(data: pd.DataFrame, path: Path) -> Path:
         r"tick align=outside,",
         r"axis line style={rqThreeNeutral},",
         r"tick style={rqThreeNeutral},",
-        r"label style={font=\small},",
-        r"tick label style={font=\small},",
+        r"label style={font=\normalsize},",
+        r"tick label style={font=\normalsize},",
         r"grid=major,",
         r"grid style={rqThreeGrid!55, line width=0.2pt},",
         r"width=0.78\linewidth,",
@@ -1275,6 +1338,415 @@ def write_latex_annualized_net_profit(data: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def build_cleared_bid_volume_market_comparison(data: pd.DataFrame) -> pd.DataFrame:
+    if data.empty:
+        raise ValueError("Cannot build RQ3 cleared bid-volume comparison from empty strategy data.")
+    by_strategy = {str(row["strategy"]): row for _, row in data.iterrows()}
+    missing = [strategy for strategy in ["Multi", *RQ3_SINGLE_MARKET_STRATEGY.values()] if strategy not in by_strategy]
+    if missing:
+        raise ValueError(f"Missing strategy rows for RQ3 cleared bid-volume comparison: {', '.join(missing)}")
+
+    def _metric(strategy: str, metric: str) -> float:
+        value = _safe_float(by_strategy[strategy].get(metric, math.nan))
+        if not math.isfinite(value):
+            raise ValueError(f"Missing or invalid {metric!r} for {strategy} in RQ3 cleared bid-volume comparison.")
+        return value
+
+    def _annualization(strategy: str) -> float:
+        factor = _safe_float(by_strategy[strategy].get("annualization_factor", math.nan))
+        if not math.isfinite(factor) or factor <= 0:
+            raise ValueError(f"Missing or invalid annualization_factor for {strategy} in RQ3 cleared bid-volume comparison.")
+        return factor
+
+    def _executed_ledger_volume(strategy: str, columns: tuple[str, ...]) -> float:
+        source_file = str(by_strategy[strategy].get("source_file", "") or "")
+        if not source_file:
+            raise ValueError(f"Missing source_file for {strategy} in RQ3 cleared bid-volume comparison.")
+        ledger_path = Path(source_file).parent / "executed_ledger.parquet"
+        if not ledger_path.exists():
+            raise FileNotFoundError(f"Missing executed ledger for {strategy} cleared bid-volume comparison: {ledger_path}")
+        ledger = pd.read_parquet(ledger_path)
+        missing_cols = [col for col in columns if col not in ledger.columns]
+        if missing_cols:
+            raise ValueError(f"Missing cleared volume columns for {strategy}: {', '.join(missing_cols)} in {ledger_path}")
+        total = 0.0
+        for col in columns:
+            values = pd.to_numeric(ledger[col], errors="coerce").fillna(0.0)
+            total += float(values.abs().sum())
+        return total
+
+    rows: list[dict[str, Any]] = []
+    for market in RQ3_MARKET_ORDER:
+        single_strategy = RQ3_SINGLE_MARKET_STRATEGY[market]
+        if market == "DA":
+            metric = "da_realized_abs_mwh_total"
+            unit = "MWh"
+        elif market == "BCM":
+            metric = "executed_ledger:real_executed_bcm_capacity_pos_mw+real_executed_bcm_capacity_neg_mw"
+            unit = "MW-h"
+        else:
+            metric = "bem_realized_abs_mwh_total"
+            unit = "MWh"
+        for strategy_group, strategy in (("Single-market strategy", single_strategy), ("Multi-market strategy", "Multi")):
+            if market == "BCM":
+                raw_value = _executed_ledger_volume(
+                    strategy,
+                    ("real_executed_bcm_capacity_pos_mw", "real_executed_bcm_capacity_neg_mw"),
+                )
+            else:
+                raw_value = _metric(strategy, metric)
+            annualized = raw_value * _annualization(strategy)
+            rows.append(
+                {
+                    "market": market,
+                    "strategy_group": strategy_group,
+                    "strategy": strategy,
+                    "source_metric": metric,
+                    "cleared_volume_total": raw_value,
+                    "cleared_volume_unit": unit,
+                    "annualization_factor": _annualization(strategy),
+                    "cleared_volume_annualized_mwh_equivalent": annualized,
+                    "cleared_volume_annualized_gwh_equivalent": annualized / 1000.0,
+                }
+            )
+    out = pd.DataFrame(rows)
+    out["_market_order"] = out["market"].map({market: idx for idx, market in enumerate(RQ3_MARKET_ORDER)})
+    out["_group_order"] = out["strategy_group"].map({"Single-market strategy": 0, "Multi-market strategy": 1})
+    return out.sort_values(["_market_order", "_group_order"]).drop(columns=["_market_order", "_group_order"])
+
+
+def plot_cleared_bid_volume_market_comparison(data: pd.DataFrame, png_path: Path, pdf_path: Path, *, formats: set[str]) -> list[Path]:
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(7.0, 4.1))
+    x = np.arange(len(RQ3_MARKET_ORDER), dtype=float)
+    width = 0.34
+    groups = ["Single-market strategy", "Multi-market strategy"]
+    offsets = {"Single-market strategy": -width / 2, "Multi-market strategy": width / 2}
+    hatches = {"Single-market strategy": "", "Multi-market strategy": "//"}
+    max_value = 0.0
+    for group in groups:
+        values = []
+        colors = []
+        for market in RQ3_MARKET_ORDER:
+            match = data.loc[data["market"].eq(market) & data["strategy_group"].eq(group)]
+            value = _safe_float(match["cleared_volume_annualized_gwh_equivalent"].iloc[0]) if not match.empty else 0.0
+            values.append(value if math.isfinite(value) else 0.0)
+            colors.append(RQ3_MARKET_COLOR.get(market, THESIS_PALETTE["neutral_dark"]))
+        max_value = max(max_value, max(values) if values else 0.0)
+        bars = ax.bar(
+            x + offsets[group],
+            values,
+            width=width,
+            color=colors,
+            edgecolor="white",
+            linewidth=0.8,
+            hatch=hatches[group],
+            label=group,
+        )
+        for bar, value in zip(bars, values):
+            if value <= 0:
+                continue
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                value + max(0.02 * max_value, 0.03),
+                f"{value:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=11,
+            )
+    ax.set_xticks(x, labels=RQ3_MARKET_ORDER)
+    ax.set_xlabel("Market")
+    ax.set_ylabel("Annualized cleared bid volume (GWh/year)")
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.set_ylim(0.0, max(1.0, max_value * 1.22))
+    ax.legend(loc="upper left", frameon=False, fontsize=11)
+    fig.tight_layout()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    if "png" in formats:
+        fig.savefig(png_path, dpi=220)
+        paths.append(png_path)
+    if "pdf" in formats:
+        fig.savefig(pdf_path)
+        paths.append(pdf_path)
+    plt.close(fig)
+    return paths
+
+
+def write_latex_cleared_bid_volume_market_comparison(data: pd.DataFrame, path: Path) -> Path:
+    groups = ["Single-market strategy", "Multi-market strategy"]
+    group_colors = {"Single-market strategy": "rqThreeSingleBid", "Multi-market strategy": "rqThreeMultiBid"}
+    x_by_market = {market: idx for idx, market in enumerate(RQ3_MARKET_ORDER)}
+    width = 0.32
+    offsets = {"Single-market strategy": -0.18, "Multi-market strategy": 0.18}
+    max_value = max(1.0, float(pd.to_numeric(data["cleared_volume_annualized_gwh_equivalent"], errors="coerce").max()))
+    y_max = max_value * 1.24
+    bars: list[str] = []
+    labels: list[str] = []
+    for group in groups:
+        for market in RQ3_MARKET_ORDER:
+            match = data.loc[data["market"].eq(market) & data["strategy_group"].eq(group)]
+            value = _safe_float(match["cleared_volume_annualized_gwh_equivalent"].iloc[0]) if not match.empty else 0.0
+            if not math.isfinite(value):
+                value = 0.0
+            x = x_by_market[market] + offsets[group]
+            color = group_colors[group]
+            bars.append(
+                rf"\filldraw[fill={color}, draw=white, line width=0.5pt] "
+                rf"(axis cs:{_tex_float(x - width / 2, 3)},0) rectangle "
+                rf"(axis cs:{_tex_float(x + width / 2, 3)},{_tex_float(value, 4)});"
+            )
+            if value > 0:
+                label_offset = max(0.08, min(0.55, value * 0.08))
+                labels.append(
+                    rf"\node[font=\small, anchor=south] at (axis cs:{_tex_float(x, 3)},{_tex_float(value + label_offset, 4)}) {{{_tex_float(value, 1)}}};"
+                )
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[htbp]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        _tex_color_def("rqThreeNeutral", THESIS_PALETTE["neutral_dark"]),
+        _tex_color_def("rqThreeGrid", "#D8D8D8"),
+        _tex_color_def("rqThreeSingleBid", THESIS_PALETTE["neutral_dark"]),
+        _tex_color_def("rqThreeMultiBid", THESIS_PALETTE["primary"]),
+        r"\begin{axis}[",
+        r"tick align=outside,",
+        r"axis line style={rqThreeNeutral},",
+        r"tick style={rqThreeNeutral},",
+        r"label style={font=\small},",
+        r"tick label style={font=\small},",
+        r"grid=major,",
+        r"grid style={rqThreeGrid!55, line width=0.2pt},",
+        r"width=0.82\linewidth,",
+        r"height=0.46\linewidth,",
+        r"xlabel={Market},",
+        r"ylabel={Annualized cleared bid volume (GWh/year)},",
+        "xmin=-0.6, xmax=" + _tex_float(len(RQ3_MARKET_ORDER) - 0.4, 1) + ",",
+        "xtick={" + ",".join(str(i) for i in range(len(RQ3_MARKET_ORDER))) + "},",
+        "xticklabels={" + ",".join(RQ3_MARKET_ORDER) + "},",
+        rf"ymin=0, ymax={_tex_float(y_max, 4)},",
+        r"axis y line*=left,",
+        r"axis x line*=bottom,",
+        r"legend columns=2,",
+        r"legend cell align=left,",
+        r"legend style={at={(0.5,-0.26)}, anchor=north, font=\small, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.45cm}},",
+        r"]",
+        *bars,
+        *labels,
+        r"\addlegendimage{area legend, fill=rqThreeSingleBid, draw=white}",
+        r"\addlegendentry{Single-market strategy}",
+        r"\addlegendimage{area legend, fill=rqThreeMultiBid, draw=white}",
+        r"\addlegendentry{Multi-market strategy}",
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        r"\caption{Annualized cleared bid volume by market, comparing each single-market strategy with the corresponding market volume inside the XGB p50 multi-market strategy.}",
+        r"\label{fig:rq3-cleared-bid-volume-market-comparison}",
+        r"\end{figure}",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_cleared_bid_volume_market_comparison(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> list[Path]:
+    comparison = build_cleared_bid_volume_market_comparison(data)
+    csv_dir = out_root / "result_section" / "csv"
+    figures_dir = out_root / "result_section" / "figures"
+    latex_dir = out_root / "result_section" / "latex_figures"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "cleared_bid_volume_market_comparison.csv"
+    png_path = figures_dir / "cleared_bid_volume_market_comparison.png"
+    pdf_path = figures_dir / "cleared_bid_volume_market_comparison.pdf"
+    tex_path = latex_dir / "cleared_bid_volume_market_comparison.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        comparison.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    outputs.extend(plot_cleared_bid_volume_market_comparison(comparison, png_path, pdf_path, formats=formats))
+    if "tex" in formats:
+        outputs.append(write_latex_cleared_bid_volume_market_comparison(comparison, tex_path))
+    return outputs
+
+
+def build_bcm_revenue_mechanism_comparison(data: pd.DataFrame) -> pd.DataFrame:
+    if data.empty:
+        raise ValueError("Cannot build BCM revenue mechanism comparison from empty strategy data.")
+    by_strategy = {str(row["strategy"]): row for _, row in data.iterrows()}
+    required = ["BCM-only", "Multi"]
+    missing = [strategy for strategy in required if strategy not in by_strategy]
+    if missing:
+        raise ValueError(f"Missing strategy rows for BCM revenue mechanism comparison: {', '.join(missing)}")
+
+    def _annualization(row: pd.Series) -> float:
+        factor = _safe_float(row.get("annualization_factor", math.nan))
+        if math.isfinite(factor) and factor > 0:
+            return factor
+        days = _safe_float(row.get("duration_days", math.nan))
+        if math.isfinite(days) and days > 0:
+            return 365.0 / days
+        raise ValueError(f"Missing annualization factor for {row.get('strategy', '<unknown>')} in BCM revenue mechanism comparison.")
+
+    def _source_dir(row: pd.Series) -> Path:
+        source_file = str(row.get("source_file", "") or "")
+        if not source_file:
+            raise ValueError(f"Missing source_file for {row.get('strategy', '<unknown>')} in BCM revenue mechanism comparison.")
+        return Path(source_file).parent
+
+    def _read_planned(row: pd.Series) -> pd.DataFrame:
+        path = _source_dir(row) / "planned_ledger.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing planned ledger for BCM revenue mechanism comparison: {path}")
+        return pd.read_parquet(path)
+
+    def _read_executed(row: pd.Series) -> pd.DataFrame:
+        path = _source_dir(row) / "executed_ledger.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing executed ledger for BCM revenue mechanism comparison: {path}")
+        return pd.read_parquet(path)
+
+    def _planned_num(df: pd.DataFrame, col: str) -> pd.Series:
+        if col not in df.columns:
+            raise ValueError(f"Missing required BCM planned-ledger column: {col}")
+        return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    def _executed_num(df: pd.DataFrame, col: str) -> pd.Series:
+        if col not in df.columns:
+            raise ValueError(f"Missing required BCM executed-ledger column: {col}")
+        return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    rows: list[dict[str, Any]] = []
+    for strategy in required:
+        row = by_strategy[strategy]
+        planned = _read_planned(row)
+        executed = _read_executed(row)
+        ann = _annualization(row)
+        cand_pos = _planned_num(planned, "bcm_precommit_candidate_pos_mw").clip(lower=0.0)
+        cand_neg = _planned_num(planned, "bcm_precommit_candidate_neg_mw").clip(lower=0.0)
+        locked_pos = _planned_num(planned, "bcm_precommit_locked_pos_mw").clip(lower=0.0)
+        locked_neg = _planned_num(planned, "bcm_precommit_locked_neg_mw").clip(lower=0.0)
+        cand_abs = cand_pos + cand_neg
+        locked_abs = locked_pos + locked_neg
+        candidate_mask = cand_abs > 1e-9
+        fully_blocked_mask = candidate_mask & (locked_abs <= 1e-9)
+        partially_reduced_mask = (cand_abs - locked_abs > 1e-9) & (locked_abs > 1e-9)
+        executed_abs = (
+            _executed_num(executed, "real_executed_bcm_capacity_pos_mw").abs()
+            + _executed_num(executed, "real_executed_bcm_capacity_neg_mw").abs()
+        )
+        capacity_revenue = _safe_float(row.get("annualized_bcm_capacity_revenue_eur", math.nan))
+        activation_revenue = _safe_float(row.get("annualized_bcm_activation_revenue_eur", math.nan))
+        if not math.isfinite(capacity_revenue):
+            capacity_revenue = _safe_float(row.get("bcm_capacity_revenue_eur", math.nan)) * ann
+        if not math.isfinite(activation_revenue):
+            activation_revenue = _safe_float(row.get("bcm_linked_activation_revenue_eur", row.get("bcm_activation_revenue_eur", math.nan))) * ann
+        total_revenue = capacity_revenue + activation_revenue
+        locked_total = float(locked_abs.sum())
+        rows.append(
+            {
+                "strategy": strategy,
+                "bcm_candidate_hours": int(candidate_mask.sum()),
+                "bcm_fully_blocked_candidate_hours": int(fully_blocked_mask.sum()),
+                "bcm_partially_reduced_candidate_hours": int(partially_reduced_mask.sum()),
+                "bcm_locked_hours": int((locked_abs > 1e-9).sum()),
+                "bcm_candidate_volume_mw_h": float(cand_abs.sum()),
+                "bcm_blocked_candidate_volume_mw_h": float(cand_abs[fully_blocked_mask].sum()),
+                "bcm_locked_volume_mw_h": locked_total,
+                "bcm_executed_capacity_volume_mw_h": float(executed_abs.sum()),
+                "bcm_candidate_to_locked_share": locked_total / float(cand_abs.sum()) if float(cand_abs.sum()) > 0 else math.nan,
+                "bcm_blocked_candidate_hour_share": float(fully_blocked_mask.sum()) / float(candidate_mask.sum()) if int(candidate_mask.sum()) else math.nan,
+                "bcm_annualized_capacity_revenue_eur": capacity_revenue,
+                "bcm_annualized_linked_activation_revenue_eur": activation_revenue,
+                "bcm_annualized_total_revenue_eur": total_revenue,
+                "bcm_revenue_per_locked_mw_h_eur": total_revenue / (locked_total * ann) if locked_total > 0 and ann > 0 else math.nan,
+                "annualization_factor": ann,
+            }
+        )
+    out = pd.DataFrame(rows)
+    out["_strategy_order"] = out["strategy"].map({"BCM-only": 0, "Multi": 1})
+    return out.sort_values("_strategy_order").drop(columns="_strategy_order")
+
+
+def _fmt_table_num(value: Any, digits: int = 0) -> str:
+    x = _safe_float(value)
+    if not math.isfinite(x):
+        return "--"
+    return f"{x:,.{digits}f}"
+
+
+def _fmt_table_pct(value: Any, digits: int = 0) -> str:
+    x = _safe_float(value)
+    if not math.isfinite(x):
+        return "--"
+    return f"{100.0 * x:.{digits}f}\\%"
+
+
+def write_latex_bcm_revenue_mechanism_comparison(data: pd.DataFrame, path: Path) -> Path:
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{BCM revenue mechanism comparison for BCM-only and the BCM component of the multi-market strategy.}",
+        r"\label{tab:rq3-bcm-revenue-mechanism-comparison}",
+        r"\resizebox{\linewidth}{!}{%",
+        r"\begin{tabular}{lrrrrrrrr}",
+        r"\toprule",
+        (
+            r"Strategy & Candidate h & Blocked h & Blocked share & Locked h & "
+            r"Candidate MW-h & Locked MW-h & BCM revenue (kEUR/y) & Revenue per locked MW-h \\"
+        ),
+        r"\midrule",
+    ]
+    for _, row in data.iterrows():
+        cells = [
+            _latex_escape(row["strategy"]),
+            _fmt_table_num(row["bcm_candidate_hours"], 0),
+            _fmt_table_num(row["bcm_fully_blocked_candidate_hours"], 0),
+            _fmt_table_pct(row["bcm_blocked_candidate_hour_share"], 0),
+            _fmt_table_num(row["bcm_locked_hours"], 0),
+            _fmt_table_num(row["bcm_candidate_volume_mw_h"], 0),
+            _fmt_table_num(row["bcm_locked_volume_mw_h"], 0),
+            _fmt_table_num(row["bcm_annualized_total_revenue_eur"] / 1000.0, 0),
+            _fmt_table_num(row["bcm_revenue_per_locked_mw_h_eur"], 0),
+        ]
+        lines.append(" & ".join(cells) + r" \\")
+    lines.extend(
+        [
+            r"\bottomrule",
+            r"\end{tabular}%",
+            r"}",
+            (
+                r"\par\vspace{0.3em}\footnotesize\raggedright "
+                r"Candidate and locked volumes are test-period MW-h; revenue is annualized. "
+                r"BCM revenue combines BCM capacity revenue and BCM-linked BEM activation revenue. "
+            ),
+            r"\end{table}",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_bcm_revenue_mechanism_comparison(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> list[Path]:
+    comparison = build_bcm_revenue_mechanism_comparison(data)
+    csv_dir = out_root / "result_section" / "csv"
+    latex_dir = out_root / "result_section" / "latex_tables"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "bcm_revenue_mechanism_comparison.csv"
+    tex_path = latex_dir / "bcm_revenue_mechanism_comparison.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        comparison.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    if "tex" in formats:
+        outputs.append(write_latex_bcm_revenue_mechanism_comparison(comparison, tex_path))
+    return outputs
 
 
 def _revenue_components_for_plot(decomp: pd.DataFrame) -> list[str]:
@@ -1378,7 +1850,6 @@ def _plot_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit_scale
             color=REVENUE_COMPONENT_COLOR.get(name, THESIS_PALETTE["primary"]),
             edgecolor="white",
             linewidth=0.6,
-            label=f"{REVENUE_LABEL}: {name}",
         )
         rev_bottom = rev_bottom + np.maximum(y, 0.0)
         cost_bottom = cost_bottom + np.minimum(y, 0.0)
@@ -1394,7 +1865,6 @@ def _plot_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit_scale
             color=COST_COMPONENT_COLOR.get(name, THESIS_PALETTE["neutral_dark"]),
             edgecolor="white",
             linewidth=0.6,
-            label=f"{COST_LABEL}: {name}",
         )
         cost_bottom = cost_bottom + y
 
@@ -1408,16 +1878,34 @@ def _plot_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit_scale
     ax.set_ylabel(f"Annualized value ({unit}/year)")
     ax.set_ylim(ymin - 0.16 * span, ymax + 0.16 * span)
 
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
+    if revenue_components or cost_components:
+        empty_handle = Patch(facecolor="none", edgecolor="none", alpha=0.0)
+        handles: list[Patch] = [empty_handle, empty_handle, empty_handle, empty_handle]
+        labels: list[str] = [REVENUE_LABEL, "", COST_LABEL, ""]
+        legend_rows = max(math.ceil(len(revenue_components) / 2), math.ceil(len(cost_components) / 2))
+        for row_idx in range(legend_rows):
+            for components, color_map in (
+                (revenue_components, REVENUE_COMPONENT_COLOR),
+                (cost_components, COST_COMPONENT_COLOR),
+            ):
+                row_components = components[2 * row_idx : 2 * row_idx + 2]
+                for name in row_components:
+                    handles.append(Patch(facecolor=color_map.get(name, THESIS_PALETTE["neutral_dark"]), edgecolor="white"))
+                    labels.append(_revenue_cost_legend_label_wrapped(name))
+                for _ in range(2 - len(row_components)):
+                    handles.append(empty_handle)
+                    labels.append("")
         ax.legend(
             handles=handles,
             labels=labels,
-            loc="upper center",
-            ncol=2,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.34),
+            ncol=4,
             frameon=False,
-            fontsize=8,
+            fontsize=7,
             alignment="left",
+            columnspacing=1.0,
+            handletextpad=0.45,
         )
 
     fig.tight_layout()
@@ -1462,18 +1950,17 @@ def write_latex_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit
             r"\begin{axis}[",
             r"ybar stacked,",
             r"bar width=18pt,",
-            r"width=0.82\linewidth,",
-            r"height=0.50\linewidth,",
+            r"width=0.88\linewidth,",
+            r"height=0.44\linewidth,",
             r"tick align=outside,",
             r"axis line style={black},",
             r"tick style={black},",
             f"xtick={{{','.join(str(i) for i in range(len(strategies)))}}},",
             f"xticklabels={{{','.join(_latex_escape(s) for s in strategies)}}},",
             f"ylabel={{Annualized value ({_latex_escape(unit)}/year)}},",
-            r"xlabel={Market strategy},",
             r"legend cell align=left,",
-            r"legend style={at={(0.5,-0.20)}, anchor=north, font=\scriptsize, draw=none, fill=none},",
-            r"legend columns=2,",
+            r"legend style={at={(0.5,-0.24)}, anchor=north, font=\scriptsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.45cm}},",
+            r"legend columns=4,",
             r"]",
         ]
     )
@@ -1482,23 +1969,54 @@ def write_latex_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit
         vals = np.nan_to_num(decomp[f"revenue::{name}"].to_numpy(dtype=float) * unit_scale, nan=0.0)
         coords = " ".join(f"({idx},{_tex_float(float(v), 4)})" for idx, v in enumerate(vals))
         color = rev_color_names[name]
-        lines.append(rf"\addplot+[draw=white, fill={color}, area legend] coordinates {{{coords}}};")
+        lines.append(rf"\addplot+[draw=white, fill={color}, forget plot] coordinates {{{coords}}};")
 
     for name in cost_components:
         vals = -np.abs(np.nan_to_num(decomp[f"cost::{name}"].to_numpy(dtype=float), nan=0.0) * unit_scale)
         coords = " ".join(f"({idx},{_tex_float(float(v), 4)})" for idx, v in enumerate(vals))
         color = cost_color_names[name]
-        lines.append(rf"\addplot+[draw=white, fill={color}, area legend] coordinates {{{coords}}};")
+        lines.append(rf"\addplot+[draw=white, fill={color}, forget plot] coordinates {{{coords}}};")
 
-    legend_items = [f"{REVENUE_LABEL}: {name}" for name in revenue_components] + [f"{COST_LABEL}: {name}" for name in cost_components]
-    lines.append(rf"\legend{{{','.join(_latex_escape(i) for i in legend_items)}}}")
+    lines.extend(
+        [
+            r"\addlegendimage{empty legend}",
+            rf"\addlegendentry{{{REVENUE_LABEL}}}",
+            r"\addlegendimage{empty legend}",
+            r"\addlegendentry{}",
+            r"\addlegendimage{empty legend}",
+            rf"\addlegendentry{{{COST_LABEL}}}",
+            r"\addlegendimage{empty legend}",
+            r"\addlegendentry{}",
+        ]
+    )
+    legend_rows = max(math.ceil(len(revenue_components) / 2), math.ceil(len(cost_components) / 2))
+    for row_idx in range(legend_rows):
+        for components, color_names in (
+            (revenue_components, rev_color_names),
+            (cost_components, cost_color_names),
+        ):
+            row_components = components[2 * row_idx : 2 * row_idx + 2]
+            for component in row_components:
+                lines.extend(
+                    [
+                        rf"\addlegendimage{{area legend, fill={color_names[component]}, draw=white}}",
+                        rf"\addlegendentry{{{_revenue_cost_legend_label_tex(component)}}}",
+                    ]
+                )
+            for _ in range(2 - len(row_components)):
+                lines.extend(
+                    [
+                        r"\addlegendimage{empty legend}",
+                        r"\addlegendentry{}",
+                    ]
+                )
     if strategies:
         lines.append(rf"\draw[black, line width=0.45pt] (axis cs:-0.5,0) -- (axis cs:{len(strategies) - 0.5},0);")
     lines.extend(
         [
             r"\end{axis}",
             r"\end{tikzpicture}",
-            r"\caption{Revenue and cost decomposition by market participation strategy. Positive components show annualized market revenues, while negative components show costs and penalties. The decomposition explains whether the multi-market strategy outperforms single-market baselines through additional revenue streams or through cost interactions.}",
+            r"\caption{Revenue and cost decomposition by market participation strategy. Positive components show annualized market revenues, while negative components show costs and penalties.}",
             r"\label{fig:rq3-revenue-cost-decomposition}",
             r"\end{figure}",
         ]
@@ -1706,7 +2224,7 @@ def write_latex_cumulative_net_profit_by_strategy(data: pd.DataFrame, unit: str,
         rf"ymin={_tex_float(ymin - 0.08 * span, 4)}, ymax={_tex_float(ymax + 0.10 * span, 4)},",
         r"legend columns=2,",
         r"legend cell align=left,",
-        r"legend style={at={(0.02,0.98)}, anchor=north west, font=\scriptsize, draw=none, fill=none},",
+        r"legend style={at={(0.02,0.98)}, anchor=north west, font=\scriptsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.35cm}},",
         r"]",
     ]
     for strategy in STRATEGY_ORDER:
@@ -1767,22 +2285,41 @@ def generate_cumulative_net_profit_by_strategy(run_root: Path, out_root: Path, *
 def _operational_metric_value(row: pd.Series, spec: dict[str, Any]) -> tuple[float, str, str]:
     columns = list(row.index)
     for candidate in spec["candidates"]:
+        method_suffix = "direct"
         if "+" in candidate:
             parts = tuple(p.strip() for p in str(candidate).split("+"))
             if all(part in row.index for part in parts):
                 values = [_safe_float(row[part]) for part in parts]
                 if all(math.isfinite(v) for v in values):
-                    return sum(abs(v) for v in values), "+".join(parts), "sum_abs_components"
+                    value = sum(abs(v) for v in values)
+                    source_col = "+".join(parts)
+                    method_suffix = "sum_abs_components"
+                    break
             continue
-        col = _resolve_matching_column(columns, (str(candidate),))
-        if col is None:
-            continue
-        value = _safe_float(row[col])
-        if math.isfinite(value):
-            if str(candidate).startswith("annualized_") and spec["unit"] == "EUR":
-                return value, col, "annualized_value"
-            return value, col, "direct"
-    return math.nan, ",".join(str(c) for c in spec["candidates"][:3]), "missing"
+        else:
+            col = _resolve_exact_matching_column(columns, (str(candidate),))
+            if col is None:
+                continue
+            value = _safe_float(row[col])
+            source_col = col
+            if not math.isfinite(value):
+                continue
+            if str(candidate).startswith("annualized_"):
+                method_suffix = "annualized_value"
+            break
+    else:
+        return math.nan, ",".join(str(c) for c in spec["candidates"][:3]), "missing"
+
+    if bool(spec.get("annualize")) and method_suffix != "annualized_value":
+        annualization_factor = _safe_float(row.get("annualization_factor", math.nan))
+        if not math.isfinite(annualization_factor) or annualization_factor <= 0:
+            return math.nan, f"{source_col},annualization_factor", "missing_annualization_factor"
+        value *= annualization_factor
+        method_suffix = f"annualized_{method_suffix}"
+    scale = _safe_float(spec.get("scale", 1.0))
+    if math.isfinite(scale):
+        value *= scale
+    return value, source_col, method_suffix
 
 
 def _format_operational_annotation(value: float, unit: str) -> str:
@@ -1791,17 +2328,24 @@ def _format_operational_annotation(value: float, unit: str) -> str:
     if unit == "%":
         pct = value * 100.0 if abs(value) <= 1.0 else value
         return f"{pct:.1f}%"
-    if unit == "EUR":
+    if unit in {"EUR", "EUR/year"}:
         if abs(value) >= 1000.0:
             return f"{value / 1000.0:,.0f}k"
         return f"{value:,.0f}"
-    if unit in {"MWh", "MWh/day", "cycles", "cycles/day"}:
+    if unit in {"MWh", "MWh/day", "MWh/year", "GWh/year", "kEUR/year", "cycles", "cycles/day"}:
         if abs(value) >= 100.0:
             return f"{value:,.0f}"
         if abs(value) >= 10.0:
             return f"{value:,.1f}"
         return f"{value:,.2f}"
     return f"{value:,.1f}"
+
+
+def _operational_display_metric(metric: str) -> str:
+    for spec in OPERATIONAL_METRIC_SPECS:
+        if spec["metric"] == metric:
+            return str(spec.get("display_metric", metric))
+    return metric
 
 
 def build_operational_intensity_by_strategy(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -1885,17 +2429,17 @@ def _operational_matrix(data: pd.DataFrame) -> tuple[list[str], list[str], np.nd
 def plot_operational_intensity_by_strategy(data: pd.DataFrame, png_path: Path, pdf_path: Path, *, formats: set[str]) -> list[Path]:
     apply_geo_style()
     strategies, metrics, matrix, annotations = _operational_matrix(data)
+    metric_labels = [_operational_display_metric(metric) for metric in metrics]
     cmap = LinearSegmentedColormap.from_list(
         "rq3_operational_intensity",
         ["#FFFFFF", "#E4F1F7", THESIS_PALETTE["primary"]],
     )
-    fig_width = max(8.2, 0.78 * len(metrics) + 2.0)
-    fig, ax = plt.subplots(figsize=(fig_width, 4.6))
+    fig_width = max(9.8, 1.15 * len(metrics) + 3.2)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
     image = ax.imshow(matrix, aspect="auto", cmap=cmap, vmin=0.0, vmax=1.0)
-    ax.set_xticks(np.arange(len(metrics)), labels=metrics, rotation=25, ha="right")
+    ax.set_xticks(np.arange(len(metrics)), labels=metric_labels, rotation=15, ha="right")
     ax.set_yticks(np.arange(len(strategies)), labels=strategies)
-    ax.set_title("Operational Intensity by Market Strategy")
-    ax.tick_params(axis="both", length=0)
+    ax.tick_params(axis="both", length=0, labelsize=10)
     ax.set_xticks(np.arange(-0.5, len(metrics), 1), minor=True)
     ax.set_yticks(np.arange(-0.5, len(strategies), 1), minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=1.2)
@@ -1905,9 +2449,10 @@ def plot_operational_intensity_by_strategy(data: pd.DataFrame, png_path: Path, p
             if not math.isfinite(matrix[i, j]):
                 continue
             color = "white" if matrix[i, j] >= 0.62 else THESIS_PALETTE["neutral_dark"]
-            ax.text(j, i, annotations[i][j], ha="center", va="center", fontsize=8, color=color)
-    cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02)
-    cbar.set_label("Relative operational intensity")
+            ax.text(j, i, annotations[i][j], ha="center", va="center", fontsize=10, color=color)
+    cbar = fig.colorbar(image, ax=ax, fraction=0.038, pad=0.045)
+    cbar.set_label("Relative operational intensity", fontsize=10, labelpad=12)
+    cbar.ax.tick_params(labelsize=10)
     fig.tight_layout()
     png_path.parent.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -1923,6 +2468,14 @@ def plot_operational_intensity_by_strategy(data: pd.DataFrame, png_path: Path, p
 
 def write_latex_operational_intensity_by_strategy(data: pd.DataFrame, path: Path) -> Path:
     strategies, metrics, matrix, annotations = _operational_matrix(data)
+    metric_tick_labels = {
+        "Throughput": r"{\shortstack{Throughput\\in GWh}}",
+        "Mean SoC": r"{\shortstack{Mean SoC\\in MWh}}",
+        "Auxiliary cost": r"{\shortstack{Auxiliary\\cost\\in kEUR}}",
+        "Degradation cost": r"{\shortstack{Degra-\\dation cost\\in kEUR}}",
+        "ID recourse volume": r"{\shortstack{ID recourse\\volume\\in MWh}}",
+        "SoC violation count": r"{\shortstack{SoC violation\\count}}",
+    }
     cell_lines: list[str] = []
     for i, _strategy in enumerate(strategies):
         for j, _metric in enumerate(metrics):
@@ -1937,9 +2490,20 @@ def write_latex_operational_intensity_by_strategy(data: pd.DataFrame, path: Path
                 rf"(axis cs:{_tex_float(j + 0.5, 3)},{_tex_float(i + 0.5, 3)});"
             )
             cell_lines.append(
-                rf"\node[font=\scriptsize, text={text_color}] at (axis cs:{j},{i}) "
+                rf"\node[font=\small, text={text_color}] at (axis cs:{j},{i}) "
                 rf"{{{_latex_escape(annotations[i][j])}}};"
             )
+
+    scale_left = len(metrics) - 0.02
+    scale_right = len(metrics) + 0.14
+    scale_tick_x = len(metrics) + 0.22
+    scale_label_x = len(metrics) + 0.88
+    axis_right = len(metrics) + 1.10
+    scale_top = -0.5
+    scale_mid = (len(strategies) - 1) / 2.0
+    scale_bottom = len(strategies) - 0.5
+    scale_label_top = scale_top + 0.18
+    scale_label_bottom = scale_bottom - 0.18
 
     lines = [
         r"% Requires \usepackage{pgfplots}",
@@ -1954,27 +2518,32 @@ def write_latex_operational_intensity_by_strategy(data: pd.DataFrame, path: Path
         r"axis line style={draw=none},",
         r"tick style={draw=none},",
         r"label style={font=\small},",
-        r"tick label style={font=\scriptsize},",
-        r"title style={font=\normalfont\small},",
-        r"title={Operational Intensity by Market Strategy},",
-        r"width=0.96\linewidth,",
-        r"height=0.44\linewidth,",
-        rf"xmin=-0.5, xmax={_tex_float(len(metrics) - 0.5, 3)},",
-        rf"ymin={_tex_float(len(strategies) - 0.5, 3)}, ymax=-0.5,",
+        r"tick label style={font=\small},",
+        r"width=1.00\linewidth,",
+        r"height=0.46\linewidth,",
+        rf"xmin=-0.5, xmax={_tex_float(axis_right, 3)},",
+        rf"ymin=-0.5, ymax={_tex_float(len(strategies) - 0.5, 3)},",
+        r"y dir=reverse,",
         "xtick={" + ",".join(str(i) for i in range(len(metrics))) + "},",
-        "xticklabels={" + ",".join(_latex_escape(m) for m in metrics) + "},",
-        r"xticklabel style={rotate=28, anchor=east},",
+        "xticklabels={" + ",".join(metric_tick_labels.get(m, _latex_escape(m)) for m in metrics) + "},",
+        r"xticklabel style={font=\small, anchor=north, align=center, yshift=-0.2em},",
         "ytick={" + ",".join(str(i) for i in range(len(strategies))) + "},",
         "yticklabels={" + ",".join(_latex_escape(s) for s in strategies) + "},",
+        r"yticklabel style={font=\small, align=right},",
         r"]",
         *cell_lines,
+        rf"\shade[bottom color=white,top color=rqThreeIntensity] (axis cs:{_tex_float(scale_left, 3)},{_tex_float(scale_bottom, 3)}) rectangle (axis cs:{_tex_float(scale_right, 3)},{_tex_float(scale_top, 3)});",
+        rf"\draw[black!35, line width=0.25pt] (axis cs:{_tex_float(scale_left, 3)},{_tex_float(scale_bottom, 3)}) rectangle (axis cs:{_tex_float(scale_right, 3)},{_tex_float(scale_top, 3)});",
+        rf"\draw[black!35, line width=0.25pt] (axis cs:{_tex_float(scale_right, 3)},{_tex_float(scale_bottom, 3)}) -- (axis cs:{_tex_float(scale_right + 0.06, 3)},{_tex_float(scale_bottom, 3)});",
+        rf"\draw[black!35, line width=0.25pt] (axis cs:{_tex_float(scale_right, 3)},{_tex_float(scale_mid, 3)}) -- (axis cs:{_tex_float(scale_right + 0.07, 3)},{_tex_float(scale_mid, 3)});",
+        rf"\draw[black!35, line width=0.25pt] (axis cs:{_tex_float(scale_right, 3)},{_tex_float(scale_top, 3)}) -- (axis cs:{_tex_float(scale_right + 0.06, 3)},{_tex_float(scale_top, 3)});",
+        rf"\node[anchor=west, font=\small] at (axis cs:{_tex_float(scale_tick_x, 3)},{_tex_float(scale_label_bottom, 3)}) {{0}};",
+        rf"\node[anchor=west, font=\small] at (axis cs:{_tex_float(scale_tick_x, 3)},{_tex_float(scale_mid, 3)}) {{0.5}};",
+        rf"\node[anchor=west, font=\small] at (axis cs:{_tex_float(scale_tick_x, 3)},{_tex_float(scale_label_top, 3)}) {{1}};",
+        rf"\node[anchor=south, rotate=90, font=\small] at (axis cs:{_tex_float(scale_label_x, 3)},{_tex_float(scale_mid, 3)}) {{Relative operational intensity}};",
         r"\end{axis}",
-        r"\node[anchor=west, font=\scriptsize] at (7.05,0.15) {Relative operational intensity};",
-        r"\shade[left color=white,right color=rqThreeIntensity] (7.05,-0.15) rectangle (9.15,0.00);",
-        r"\node[anchor=north, font=\scriptsize] at (7.05,-0.18) {0};",
-        r"\node[anchor=north, font=\scriptsize] at (9.15,-0.18) {1};",
         r"\end{tikzpicture}",
-        r"\caption{Operational intensity by market participation strategy. The figure compares battery usage and operational burden across the XGB p50 multi-market strategy and the DA-only, BCM-only and BEM-only baselines. The metrics indicate whether higher profitability is associated with higher throughput, cycling, recourse use, degradation, auxiliary demand or feasibility exposure.}",
+        r"\caption{Operational intensity by market strategy, comparing normalized battery use, costs and recourse metrics for XGB p50 multi-market and single-market strategies. Throughput, auxiliary cost, degradation cost and ID recourse volume are annualized.}",
         r"\label{fig:rq3-operational-intensity-by-market-strategy}",
         r"\end{figure}",
     ]
@@ -2045,6 +2614,8 @@ def main() -> int:
     outputs = []
     outputs.extend(generate_annualized_net_profit_by_strategy(data, args.out_root, formats=formats))
     outputs.extend(generate_revenue_cost_decomposition_by_strategy(data, args.out_root, formats=formats))
+    outputs.extend(generate_cleared_bid_volume_market_comparison(data, args.out_root, formats=formats))
+    outputs.extend(generate_bcm_revenue_mechanism_comparison(data, args.out_root, formats=formats))
     cumulative_outputs, cumulative_data, cumulative_source, cumulative_resolution = generate_cumulative_net_profit_by_strategy(candidate.root, args.out_root, formats=formats)
     outputs.extend(cumulative_outputs)
     operational_outputs, operational_data, operational_omitted = generate_operational_intensity_by_strategy(data, args.out_root, formats=formats)

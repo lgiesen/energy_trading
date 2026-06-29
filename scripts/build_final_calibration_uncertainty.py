@@ -563,6 +563,16 @@ def _format_num(v: Any, digits: int = 4) -> str:
     return f"{x:.{digits}f}"
 
 
+def _format_percent(v: Any, digits: int = 1) -> str:
+    try:
+        x = float(v)
+    except Exception:
+        return "-"
+    if not np.isfinite(x):
+        return "-"
+    return f"{100.0 * x:.{digits}f}" + r"\%"
+
+
 def _format_num_bold_if_best(v: Any, best: float, digits: int = 4, tol: float = 1e-12) -> str:
     formatted = _format_num(v, digits=digits)
     if formatted == "-":
@@ -790,7 +800,17 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
     if d.empty:
         return None
     d = sort_target_frame(d, target_col="target_label", extra_cols=["interval", "model_label"])
-    headers = ["Target", "Interval", "Model", "Nominal coverage", "Empirical coverage", "Coverage error", "Mean width", "Median width", "Interval score"]
+    headers = [
+        r"\textbf{Target}",
+        r"\textbf{Interval}",
+        r"\textbf{Model}",
+        r"\shortstack{\textbf{Nominal}\\\textbf{coverage}}",
+        r"\shortstack{\textbf{Empirical}\\\textbf{coverage}}",
+        r"\shortstack{\textbf{Coverage}\\\textbf{error}}",
+        r"\shortstack{\textbf{Mean}\\\textbf{width}}",
+        r"\shortstack{\textbf{Median}\\\textbf{width}}",
+        r"\shortstack{\textbf{Interval}\\\textbf{score}}",
+    ]
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
@@ -798,7 +818,7 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
         r"    \label{tab:calibration_interval_quality_test_appendix}",
         r"    \begin{tabular}{@{}lllrrrrrr@{}}",
         r"        \toprule",
-        "        " + " & ".join(r"\textbf{" + _latex_escape(h) + "}" for h in headers) + r" \\",
+        "        " + " & ".join(headers) + r" \\",
         r"        \midrule",
     ]
     for _, row in d.iterrows():
@@ -806,9 +826,9 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
             _latex_escape(row["target_label"]),
             _latex_escape(row["interval"]),
             _latex_escape(row["model_label"]),
-            _format_num(row["nominal_interval_coverage"]),
-            _format_num(row["interval_coverage"]),
-            _format_num(row["interval_coverage_error"]),
+            _format_percent(row["nominal_interval_coverage"]),
+            _format_percent(row["interval_coverage"]),
+            _format_percent(row["interval_coverage_error"]),
             _format_num(row["interval_width_mean"]),
             _format_num(row["interval_width_median"]),
             _format_num(row["interval_score"]),
