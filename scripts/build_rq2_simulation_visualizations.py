@@ -4076,7 +4076,7 @@ def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame)
         r"ylabel={Normalized annualized net profit},",
         r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
         r"legend columns=4,",
-        r"legend style={at={(0.5,-0.18)}, anchor=north, font=\normalsize, draw=none, fill=none},",
+        r"legend style={at={(0.5,1.12)}, anchor=south, font=\normalsize, draw=none, fill=none},",
         r"]",
         r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
         r"\addlegendentry{Loss-profit reference line}",
