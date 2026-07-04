@@ -2043,7 +2043,7 @@ def write_bid_activity_best_quantile_table(path: Path, bidding_activity_data: pd
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
-        r"\caption{Submitted and cleared annualized bid volumes at the best quantile strategy of each model. Volumes are shown in kMWh/year.}",
+        r"\caption{Submitted and cleared annualized bid volumes at the best quantile strategy of each model. Volumes are shown in kMWh/year. DA and ID markets are implemented with a price-taker strategy, which is why they have a clearing ratio of 100\%.}",
         r"\label{tab:4_bid_activity_best_quantile}",
         r"\begin{tabular}{@{}llrrr@{}}",
         r"\toprule",
@@ -2877,30 +2877,182 @@ def plot_pinball_net_profit_scatter(scatter_data: pd.DataFrame, figures_dir: Pat
     return written
 
 
-def build_normalized_total_pinball_profit_data(total_scatter_data: pd.DataFrame) -> pd.DataFrame:
-    """Normalize total mean pinball loss and profit to [0, 1] over observed model-quantile rows."""
-    if total_scatter_data.empty:
+def build_scaled_mean_pinball_profit_data(scatter_data: pd.DataFrame, *, target_label: str = "All forecast targets") -> pd.DataFrame:
+    """Build loss-profit data using cross-model-median scaled MPL by target and quantile."""
+    if scatter_data.empty:
         return pd.DataFrame()
-    df = total_scatter_data.copy()
-    df["mean_pinball_loss"] = pd.to_numeric(df["mean_pinball_loss"], errors="coerce")
-    df["annualized_profit_eur_per_year"] = pd.to_numeric(df["annualized_profit_eur_per_year"], errors="coerce")
-    df = df.dropna(subset=["mean_pinball_loss", "annualized_profit_eur_per_year"]).copy()
+    df = scatter_data.copy()
+    required = {"split", "target", "target_label", "model_key", "model", "quantile", "mean_pinball_loss", "n_obs", "annualized_profit_eur_per_year"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError("Cannot build scaled mean pinball loss-profit data; missing columns: " + ", ".join(missing))
+
+    for col in ["mean_pinball_loss", "n_obs", "annualized_profit_eur_per_year", "realized_profit_eur"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["mean_pinball_loss", "n_obs", "annualized_profit_eur_per_year"]).copy()
+    df = df.loc[df["n_obs"] > 0].copy()
     if df.empty:
         return pd.DataFrame()
 
-    loss_min = float(df["mean_pinball_loss"].min())
-    loss_max = float(df["mean_pinball_loss"].max())
-    profit_min = float(df["annualized_profit_eur_per_year"].min())
-    profit_max = float(df["annualized_profit_eur_per_year"].max())
-    loss_range = loss_max - loss_min
-    profit_range = profit_max - profit_min
-    df["normalized_forecast_loss"] = 0.0 if math.isclose(loss_range, 0.0) else (df["mean_pinball_loss"] - loss_min) / loss_range
-    df["normalized_annualized_net_profit"] = 0.0 if math.isclose(profit_range, 0.0) else (df["annualized_profit_eur_per_year"] - profit_min) / profit_range
-    df["loss_min_observed"] = loss_min
-    df["loss_max_observed"] = loss_max
-    df["profit_min_observed_eur_per_year"] = profit_min
-    df["profit_max_observed_eur_per_year"] = profit_max
-    return df
+    median_loss = (
+        df.groupby(["split", "target", "target_label", "quantile"], dropna=False)["mean_pinball_loss"]
+        .median()
+        .reset_index(name="cross_model_median_mean_pinball_loss")
+    )
+    weight_data = (
+        df.groupby(["split", "target", "target_label", "quantile"], dropna=False)["n_obs"]
+        .median()
+        .reset_index(name="target_quantile_n_obs")
+    )
+    merged = df.merge(median_loss, on=["split", "target", "target_label", "quantile"], how="left")
+    merged = merged.merge(weight_data, on=["split", "target", "target_label", "quantile"], how="left")
+    bad = (
+        merged["cross_model_median_mean_pinball_loss"].isna()
+        | ~np.isfinite(merged["cross_model_median_mean_pinball_loss"])
+        | (merged["cross_model_median_mean_pinball_loss"].abs() <= 1e-12)
+    )
+    if bad.any():
+        bad_rows = (
+            merged.loc[bad, ["split", "target", "quantile", "cross_model_median_mean_pinball_loss"]]
+            .drop_duplicates(["split", "target", "quantile"])
+            .to_dict("records")
+        )
+        raise ValueError(f"Invalid cross-model median denominator for scaled mean pinball loss-profit data: {bad_rows}")
+
+    merged["scaled_mean_pinball_loss_target_quantile"] = merged["mean_pinball_loss"] / merged["cross_model_median_mean_pinball_loss"]
+    merged = merged.replace([np.inf, -np.inf], np.nan).dropna(subset=["scaled_mean_pinball_loss_target_quantile", "target_quantile_n_obs"])
+    merged = merged.loc[merged["target_quantile_n_obs"] > 0].copy()
+    if merged.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        "split",
+        "model_key",
+        "model",
+        "quantile",
+        "realized_profit_eur",
+        "annualized_profit_eur_per_year",
+        "simulation_valid",
+        "thesis_reportable",
+        "included_in_result_section",
+        "invalid_reason",
+    ]
+    existing_group_cols = [col for col in group_cols if col in merged.columns]
+    rows: list[dict[str, Any]] = []
+    for key, group in merged.groupby(existing_group_cols, dropna=False, sort=False):
+        key_tuple = key if isinstance(key, tuple) else (key,)
+        weights = pd.to_numeric(group["target_quantile_n_obs"], errors="coerce").fillna(0.0)
+        scaled = pd.to_numeric(group["scaled_mean_pinball_loss_target_quantile"], errors="coerce")
+        valid = scaled.notna() & weights.notna() & (weights > 0)
+        if not valid.any():
+            continue
+        rec = dict(zip(existing_group_cols, key_tuple))
+        rec["target"] = "scaled_all_targets"
+        rec["target_label"] = target_label
+        rec["scaled_mpl"] = float(np.average(scaled.loc[valid], weights=weights.loc[valid]))
+        rec["normalized_forecast_loss"] = rec["scaled_mpl"]
+        rec["annualized_net_profit_eur"] = _safe_float(rec.get("annualized_profit_eur_per_year"))
+        rec["annualized_net_profit_kEUR"] = rec["annualized_net_profit_eur"] / 1000.0
+        rec["annualized_profit_keur_per_year"] = rec["annualized_net_profit_kEUR"]
+        rec["total_n_obs"] = float(weights.loc[valid].sum())
+        rec["n_obs"] = rec["total_n_obs"]
+        rec["n_targets"] = int(group.loc[valid, "target"].nunique())
+        rec["targets_included"] = ",".join(sorted(group.loc[valid, "target"].astype(str).unique()))
+        rec["normalization"] = "cross_model_median_scaled_observation_weighted"
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    return out.sort_values(["model", "quantile"]).reset_index(drop=True) if not out.empty else out
+
+
+def build_target_normalized_pinball_profit_data(scatter_data: pd.DataFrame, *, selected_targets: set[str] | None = None, target_label: str = "All forecast targets") -> pd.DataFrame:
+    """Build loss-profit data after normalizing each target-quantile loss to RLQR."""
+    if scatter_data.empty:
+        return pd.DataFrame()
+    df = scatter_data.copy()
+    if selected_targets is not None:
+        df = df.loc[df["target"].astype(str).isin(selected_targets)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    required = {"split", "target", "target_label", "model_key", "model", "quantile", "mean_pinball_loss", "n_obs", "annualized_profit_eur_per_year"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError("Cannot build target-normalized loss-profit data; missing columns: " + ", ".join(missing))
+
+    for col in ["mean_pinball_loss", "n_obs", "annualized_profit_eur_per_year", "realized_profit_eur"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["mean_pinball_loss", "n_obs", "annualized_profit_eur_per_year"]).copy()
+    df = df.loc[df["n_obs"] > 0].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    rlqr = (
+        df.loc[df["model"].astype(str).eq("RLQR"), ["split", "target", "target_label", "quantile", "mean_pinball_loss"]]
+        .rename(columns={"mean_pinball_loss": "rlqr_mean_pinball_loss"})
+        .drop_duplicates(["split", "target", "quantile"])
+    )
+    merged = df.merge(rlqr, on=["split", "target", "target_label", "quantile"], how="left")
+    bad = merged["rlqr_mean_pinball_loss"].isna() | ~np.isfinite(merged["rlqr_mean_pinball_loss"]) | (merged["rlqr_mean_pinball_loss"].abs() <= 1e-12)
+    if bad.any():
+        bad_rows = (
+            merged.loc[bad, ["split", "target", "quantile", "rlqr_mean_pinball_loss"]]
+            .drop_duplicates(["split", "target", "quantile"])
+            .to_dict("records")
+        )
+        raise ValueError(f"Invalid RLQR denominator for target-normalized loss-profit data: {bad_rows}")
+
+    merged["relative_mean_pinball_loss_to_rlqr"] = merged["mean_pinball_loss"] / merged["rlqr_mean_pinball_loss"]
+    merged = merged.replace([np.inf, -np.inf], np.nan).dropna(subset=["relative_mean_pinball_loss_to_rlqr"])
+    if merged.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        "split",
+        "model_key",
+        "model",
+        "quantile",
+        "realized_profit_eur",
+        "annualized_profit_eur_per_year",
+        "simulation_valid",
+        "thesis_reportable",
+        "included_in_result_section",
+        "invalid_reason",
+    ]
+    existing_group_cols = [col for col in group_cols if col in merged.columns]
+    rows: list[dict[str, Any]] = []
+    for key, group in merged.groupby(existing_group_cols, dropna=False, sort=False):
+        key_tuple = key if isinstance(key, tuple) else (key,)
+        weights = pd.to_numeric(group["n_obs"], errors="coerce").fillna(0.0)
+        rel = pd.to_numeric(group["relative_mean_pinball_loss_to_rlqr"], errors="coerce")
+        valid = rel.notna() & weights.notna() & (weights > 0)
+        if not valid.any():
+            continue
+        rec = dict(zip(existing_group_cols, key_tuple))
+        rec["target"] = "target_normalized"
+        rec["target_label"] = target_label
+        rec["target_normalized_mean_pinball_loss"] = float(np.average(rel.loc[valid], weights=weights.loc[valid]))
+        rec["normalized_forecast_loss"] = rec["target_normalized_mean_pinball_loss"]
+        rec["annualized_profit_keur_per_year"] = _safe_float(rec.get("annualized_profit_eur_per_year")) / 1000.0
+        rec["n_obs"] = float(weights.loc[valid].sum())
+        rec["n_targets"] = int(group.loc[valid, "target"].nunique())
+        rec["targets_included"] = ",".join(sorted(group.loc[valid, "target"].astype(str).unique()))
+        rec["normalization"] = "target_rlqr_relative_observation_weighted"
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    return out.sort_values(["model", "quantile"]).reset_index(drop=True) if not out.empty else out
+
+
+def build_normalized_activation_price_pinball_profit_data(scatter_data: pd.DataFrame) -> pd.DataFrame:
+    """Build activation-price loss-profit data after target-wise RLQR normalization."""
+    return build_target_normalized_pinball_profit_data(
+        scatter_data,
+        selected_targets={"pred_afrr_activation_price_pos", "pred_afrr_activation_price_neg"},
+        target_label="aFRR Activation Price",
+    )
 
 
 def build_normalized_total_mae_profit_data(total_scatter_data: pd.DataFrame) -> pd.DataFrame:
@@ -2929,6 +3081,19 @@ def build_normalized_total_mae_profit_data(total_scatter_data: pd.DataFrame) -> 
     return df
 
 
+def _axis_limits_with_padding(values: pd.Series, *, pad_frac: float = 0.08, minimum_pad: float = 0.05) -> tuple[float, float]:
+    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if numeric.empty:
+        return 0.0, 1.0
+    vmin = float(numeric.min())
+    vmax = float(numeric.max())
+    if math.isclose(vmin, vmax):
+        pad = max(abs(vmin) * pad_frac, minimum_pad)
+    else:
+        pad = max((vmax - vmin) * pad_frac, minimum_pad)
+    return vmin - pad, vmax + pad
+
+
 def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
     import matplotlib.pyplot as plt
 
@@ -2939,12 +3104,16 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
 
     def _label_position(model: str, quantile: str) -> tuple[int, int, str, str]:
         if model == "XGB" and quantile == "p70":
-            return (-8, 0, "right", "center")
+            return (8, 0, "left", "center")
         if model == "XGB" and quantile == "p90":
             return (8, 0, "left", "center")
         if model == "RLQR" and quantile == "p30":
             return (-8, 0, "right", "center")
         if model == "RLQR" and quantile == "p50":
+            return (8, 0, "left", "center")
+        if model == "TFT" and quantile == "p10":
+            return (-8, 0, "right", "center")
+        if model == "TFT" and quantile == "p70":
             return (0, 8, "center", "bottom")
         if model == "TFT" and quantile == "p90":
             return (0, -8, "center", "top")
@@ -2955,7 +3124,7 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
             ax.text(
                 0.5,
                 0.5,
-                "No normalized total pinball-loss / Net Profit data available.",
+                "No scaled mean pinball-loss / Net Profit data available.",
                 ha="center",
                 va="center",
                 fontsize=11,
@@ -2963,23 +3132,13 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
             wrap=True,
         )
     else:
-        ax.plot(
-            [0.0, 1.0],
-            [1.0, 0.0],
-            color=THESIS_PALETTE["naive"],
-            linestyle="--",
-            linewidth=1.3,
-            alpha=0.8,
-            label="Loss-profit reference line",
-            zorder=1,
-        )
         for model in MODEL_ORDER:
             g = normalized_data.loc[normalized_data["model"].eq(model)].copy()
             if g.empty:
                 continue
             ax.scatter(
                 g["normalized_forecast_loss"],
-                g["normalized_annualized_net_profit"],
+                pd.to_numeric(g["annualized_profit_eur_per_year"], errors="coerce") / 1000.0,
                 label=model,
                 color=color_map[model],
                 marker=marker_map[model],
@@ -2993,7 +3152,7 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
                 dx, dy, ha, va = _label_position(model, str(row["quantile"]))
                 ax.annotate(
                     str(row["quantile"]),
-                    (row["normalized_forecast_loss"], row["normalized_annualized_net_profit"]),
+                    (row["normalized_forecast_loss"], _safe_float(row["annualized_profit_eur_per_year"]) / 1000.0),
                     textcoords="offset points",
                     xytext=(dx, dy),
                     ha=ha,
@@ -3001,10 +3160,74 @@ def plot_normalized_total_pinball_profit_scatter(normalized_data: pd.DataFrame, 
                     fontsize=8,
                     color=THESIS_PALETTE["neutral_dark"],
                 )
-        ax.set_xlim(-0.04, 1.04)
-        ax.set_ylim(-0.04, 1.04)
-        ax.set_xlabel("Normalized total mean pinball loss")
-        ax.set_ylabel("Normalized annualized net profit")
+        xmin, xmax = _axis_limits_with_padding(normalized_data["normalized_forecast_loss"])
+        ymin, ymax = _axis_limits_with_padding(pd.to_numeric(normalized_data["annualized_profit_eur_per_year"], errors="coerce") / 1000.0, minimum_pad=10.0)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_xlabel("Scaled mean pinball loss")
+        ax.set_ylabel("Annualized Net Profit (kEUR / year)")
+        ax.legend(title="Model", loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3, fontsize=8, frameon=True)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    written = _save_figure(fig, out_base, formats)
+    plt.close(fig)
+    return written
+
+
+def plot_normalized_activation_price_pinball_profit_scatter(normalized_data: pd.DataFrame, out_base: Path, formats: list[str]) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    apply_geo_style()
+    fig, ax = plt.subplots(figsize=(8.2, 5.6))
+    color_map = {"RLQR": get_model_color("linear"), "XGB": get_model_color("xgb"), "TFT": get_model_color("tft")}
+    marker_map = {"RLQR": "o", "XGB": "s", "TFT": "^"}
+
+    if normalized_data.empty:
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+                "No target-normalized activation-price mean pinball-loss / Net Profit data available.",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color=THESIS_PALETTE["neutral_dark"],
+            wrap=True,
+        )
+    else:
+        for model in MODEL_ORDER:
+            g = normalized_data.loc[normalized_data["model"].eq(model)].copy()
+            if g.empty:
+                continue
+            ax.scatter(
+                g["normalized_forecast_loss"],
+                pd.to_numeric(g["annualized_profit_eur_per_year"], errors="coerce") / 1000.0,
+                label=model,
+                color=color_map[model],
+                marker=marker_map[model],
+                s=62,
+                edgecolor="black",
+                linewidth=0.45,
+                alpha=0.92,
+                zorder=3,
+            )
+            for _, row in g.iterrows():
+                ax.annotate(
+                    str(row["quantile"]),
+                    (row["normalized_forecast_loss"], _safe_float(row["annualized_profit_eur_per_year"]) / 1000.0),
+                    textcoords="offset points",
+                    xytext=(4, 3),
+                    ha="left",
+                    va="bottom",
+                    fontsize=8,
+                    color=THESIS_PALETTE["neutral_dark"],
+                )
+        xmin, xmax = _axis_limits_with_padding(normalized_data["normalized_forecast_loss"])
+        ymin, ymax = _axis_limits_with_padding(pd.to_numeric(normalized_data["annualized_profit_eur_per_year"], errors="coerce") / 1000.0, minimum_pad=10.0)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_xlabel("Target-normalized activation-price mean pinball loss relative to RLQR")
+        ax.set_ylabel("Annualized Net Profit (kEUR / year)")
+        ax.axvline(1.0, color=THESIS_PALETTE["naive"], linestyle="--", linewidth=1.1, alpha=0.75, label="RLQR loss reference")
         ax.legend(title="Series", loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=4, fontsize=8, frameon=True)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
     written = _save_figure(fig, out_base, formats)
@@ -3331,7 +3554,7 @@ def write_latex_profit_heatmap(path: Path, table: pd.DataFrame) -> None:
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
-        r"\begin{figure}[H]",
+        r"\begin{figure}[htbp]",
         r"\centering",
         r"\begin{tikzpicture}",
         *_rq2_latex_color_defs(),
@@ -3422,6 +3645,7 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, relative_pinball_data: pd.
         r"% Requires \pgfplotsset{compat=1.18}",
         r"\begin{figure}[htbp]",
         r"\centering",
+        r"\makebox[\linewidth][l]{\hspace*{-0.50cm}%",
         r"\begin{tikzpicture}",
         *_rq2_latex_color_defs(),
         r"\begin{axis}[",
@@ -3449,7 +3673,7 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, relative_pinball_data: pd.
         r"};",
         *cells,
         r"\end{axis}",
-        r"\end{tikzpicture}",
+        r"\end{tikzpicture}}",
         r"\caption{Mean pinball loss relative to RLQR by model and quantile policy. Values below 1 indicate lower pinball loss than RLQR; values above 1 indicate higher loss.}",
         r"\label{fig:7_mean_pinball_loss_heatmap}",
         r"\end{figure}",
@@ -3956,30 +4180,196 @@ def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
     _write_native_latex(path, lines)
 
 
-def _forecast_profit_correlation_caption(data: pd.DataFrame, *, x_col: str, label: str) -> str:
-    if data.empty or x_col not in data.columns or "normalized_annualized_net_profit" not in data.columns:
-        return ""
-    d = data[[x_col, "normalized_annualized_net_profit"]].copy()
+def _forecast_profit_correlation_values(data: pd.DataFrame, *, x_col: str, y_col: str = "annualized_profit_eur_per_year") -> tuple[float, float, int] | None:
+    if data.empty or x_col not in data.columns or y_col not in data.columns:
+        return None
+    d = data[[x_col, y_col]].copy()
     d[x_col] = pd.to_numeric(d[x_col], errors="coerce")
-    d["normalized_annualized_net_profit"] = pd.to_numeric(d["normalized_annualized_net_profit"], errors="coerce")
+    d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
     d = d.dropna()
     if len(d) < 2:
-        return ""
+        return None
     x = d[x_col].to_numpy(dtype=float)
-    y = d["normalized_annualized_net_profit"].to_numpy(dtype=float)
+    y = d[y_col].to_numpy(dtype=float)
     if not np.isfinite(x).all() or not np.isfinite(y).all() or math.isclose(float(np.std(x)), 0.0) or math.isclose(float(np.std(y)), 0.0):
-        return ""
+        return None
     pearson = float(pd.Series(x).corr(pd.Series(y), method="pearson"))
     spearman = float(pd.Series(x).corr(pd.Series(y), method="spearman"))
+    return pearson, spearman, int(len(d))
+
+
+def _forecast_profit_correlation_stats(data: pd.DataFrame, *, x_col: str, y_col: str = "annualized_profit_eur_per_year") -> dict[str, float | int] | None:
+    if data.empty or x_col not in data.columns or y_col not in data.columns:
+        return None
+    d = data[[x_col, y_col]].copy()
+    d[x_col] = pd.to_numeric(d[x_col], errors="coerce")
+    d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+    d = d.dropna()
+    if len(d) < 3:
+        return None
+    x = d[x_col].to_numpy(dtype=float)
+    y = d[y_col].to_numpy(dtype=float)
+    if not np.isfinite(x).all() or not np.isfinite(y).all() or math.isclose(float(np.std(x)), 0.0) or math.isclose(float(np.std(y)), 0.0):
+        return None
+    try:
+        from scipy import stats
+
+        pearson = stats.pearsonr(x, y)
+        spearman = stats.spearmanr(x, y)
+        return {
+            "pearson_r": float(pearson.statistic),
+            "pearson_p_value": float(pearson.pvalue),
+            "spearman_rho": float(spearman.statistic),
+            "spearman_p_value": float(spearman.pvalue),
+            "n": int(len(d)),
+        }
+    except Exception:
+        return {
+            "pearson_r": float(pd.Series(x).corr(pd.Series(y), method="pearson")),
+            "pearson_p_value": np.nan,
+            "spearman_rho": float(pd.Series(x).corr(pd.Series(y), method="spearman")),
+            "spearman_p_value": np.nan,
+            "n": int(len(d)),
+        }
+
+
+def _forecast_profit_correlation_caption(data: pd.DataFrame, *, x_col: str, label: str, y_col: str = "annualized_profit_eur_per_year") -> str:
+    values = _forecast_profit_correlation_values(data, x_col=x_col, y_col=y_col)
+    if values is None:
+        return ""
+    pearson, spearman, _n = values
     return rf" Descriptive correlations for {label} versus profit are $r = {pearson:.2f}$ and $\rho = {spearman:.2f}$."
+
+
+def build_loss_profit_correlation_diagnostics(*, total_data: pd.DataFrame, activation_price_data: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    specs = [
+        ("all_targets", "Scaled mean pinball loss", total_data),
+        ("activation_price", "Target-normalized activation-price mean pinball loss relative to RLQR", activation_price_data),
+    ]
+    for figure_key, metric, data in specs:
+        values = _forecast_profit_correlation_stats(data, x_col="normalized_forecast_loss", y_col="annualized_profit_eur_per_year")
+        if values is None:
+            rows.append({"figure": figure_key, "metric": metric, "pearson_r": np.nan, "pearson_p_value": np.nan, "spearman_rho": np.nan, "spearman_p_value": np.nan, "n": 0})
+        else:
+            rows.append({"figure": figure_key, "metric": metric, **values})
+    return pd.DataFrame(rows)
+
+
+def write_loss_profit_correlation_diagnostics_table(path: Path, data: pd.DataFrame) -> None:
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Descriptive loss-profit correlation diagnostics for scaled or target-normalized mean pinball loss and annualized Net Profit.}",
+        r"\label{tab:rq2_loss_profit_correlation_diagnostics}",
+        r"\begin{tabular}{lrrrrr}",
+        r"\toprule",
+        r"Figure & Pearson's $r$ & Pearson $p$ & Spearman's $\rho$ & Spearman $p$ & $n$ \\",
+        r"\midrule",
+    ]
+    if data.empty:
+        lines.append(r"No data & -- & -- & -- & -- & 0 \\")
+    else:
+        label_map = {
+            "all_targets": "All targets",
+            "activation_price": "Activation price",
+        }
+        for _, row in data.iterrows():
+            figure = label_map.get(str(row.get("figure")), _latex_escape(str(row.get("figure", ""))))
+            pearson = _tex_float(_safe_float(row.get("pearson_r")), 2) if math.isfinite(_safe_float(row.get("pearson_r"))) else "--"
+            pearson_p = _tex_float(_safe_float(row.get("pearson_p_value")), 3) if math.isfinite(_safe_float(row.get("pearson_p_value"))) else "--"
+            spearman = _tex_float(_safe_float(row.get("spearman_rho")), 2) if math.isfinite(_safe_float(row.get("spearman_rho"))) else "--"
+            spearman_p = _tex_float(_safe_float(row.get("spearman_p_value")), 3) if math.isfinite(_safe_float(row.get("spearman_p_value"))) else "--"
+            n_val = int(_safe_float(row.get("n"))) if math.isfinite(_safe_float(row.get("n"))) else 0
+            lines.append(rf"{figure} & {pearson} & {pearson_p} & {spearman} & {spearman_p} & {n_val} \\")
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+    ]
+    _write_native_latex(path, lines)
 
 
 def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFrame) -> None:
     correlation_caption = _forecast_profit_correlation_caption(
         normalized_data,
         x_col="normalized_forecast_loss",
-        label="normalized total mean pinball loss",
+        label="scaled mean pinball loss",
     )
+    x_min, x_max = _axis_limits_with_padding(normalized_data.get("normalized_forecast_loss", pd.Series(dtype=float)))
+    y_min, y_max = _axis_limits_with_padding(pd.to_numeric(normalized_data.get("annualized_profit_eur_per_year", pd.Series(dtype=float)), errors="coerce") / 1000.0, minimum_pad=10.0)
+    lines = [
+        r"% Requires \usepackage{pgfplots}",
+        r"% Requires \pgfplotsset{compat=1.18}",
+        r"\begin{figure}[H]",
+        r"\centering",
+        r"\begin{tikzpicture}",
+        *_rq2_latex_color_defs(),
+        r"\begin{axis}[",
+        *_axis_common_options(),
+        r"label style={font=\normalsize},",
+        r"tick label style={font=\normalsize},",
+        r"width=0.76\linewidth,",
+        r"height=0.50\linewidth,",
+        r"xlabel={Scaled mean pinball loss},",
+        r"ylabel={Annualized Net Profit (kEUR/year)},",
+        rf"xmin={_tex_float(x_min, 3)}, xmax={_tex_float(x_max, 3)}, ymin={_tex_float(y_min, 1)}, ymax={_tex_float(y_max, 1)},",
+        r"legend columns=3,",
+        r"legend style={at={(0.5,1.04)}, anchor=south, font=\normalsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.5cm}},",
+        r"]",
+    ]
+    for model in MODEL_ORDER:
+        g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
+        if g.empty:
+            continue
+        marker = {"RLQR": "*", "XGB": "square*", "TFT": "triangle*"}.get(model, "*")
+        model_color = _tex_model_color(model)
+        coords = " ".join(
+            f"({_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(_safe_float(row['annualized_profit_eur_per_year']) / 1000.0, 2)})"
+            for _, row in g.iterrows()
+        )
+        lines += [
+            rf"\addplot+[only marks, color={model_color}, mark={marker}, mark size=2.4pt, mark options={{draw={model_color}, fill={model_color}}}] coordinates {{{coords}}};",
+            rf"\addlegendentry{{{model}}}",
+        ]
+        for _, row in g.iterrows():
+            quantile = str(row["quantile"])
+            node_options = "font=\\small, anchor=west, text=rqTwoNeutral"
+            if model == "XGB" and quantile == "p70":
+                node_options = "font=\\small, anchor=west, xshift=3pt, text=rqTwoNeutral"
+            elif model == "XGB" and quantile == "p90":
+                node_options = "font=\\small, anchor=west, xshift=3pt, text=rqTwoNeutral"
+            elif model == "RLQR" and quantile == "p30":
+                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
+            elif model == "RLQR" and quantile == "p50":
+                node_options = "font=\\small, anchor=west, xshift=3pt, text=rqTwoNeutral"
+            elif model == "TFT" and quantile == "p10":
+                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
+            elif model == "TFT" and quantile == "p70":
+                node_options = "font=\\small, anchor=south, yshift=4pt, text=rqTwoNeutral"
+            elif model == "TFT" and quantile == "p90":
+                node_options = "font=\\small, anchor=north, yshift=-4pt, text=rqTwoNeutral"
+            lines.append(
+                rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(_safe_float(row['annualized_profit_eur_per_year']) / 1000.0, 2)}) {{{_latex_escape(quantile)}}};"
+            )
+    lines += [
+        r"\end{axis}",
+        r"\end{tikzpicture}",
+        rf"\caption{{Scaled mean pinball loss versus annualized net profit by model-quantile policy. Mean pinball loss values are scaled within each forecast target and quantile level using the cross-model median and are then aggregated across targets using observation-count weights. Lower x-values indicate lower forecast loss relative to the typical model for the same target and quantile policy. The pooled diagnostics indicate a moderate negative descriptive association, with Pearson's $r=-0.60$ and Spearman's $\rho=-0.64$.}}",
+        r"\label{fig:5_pinball_loss_vs_net_profit_total_normalized}",
+        r"\end{figure}",
+    ]
+    _write_native_latex(path, lines)
+
+
+def write_latex_normalized_activation_price_pinball_profit(path: Path, normalized_data: pd.DataFrame) -> None:
+    correlation_caption = _forecast_profit_correlation_caption(
+        normalized_data,
+        x_col="normalized_forecast_loss",
+        label="target-normalized activation-price mean pinball loss relative to RLQR",
+    )
+    x_min, x_max = _axis_limits_with_padding(normalized_data.get("normalized_forecast_loss", pd.Series(dtype=float)))
+    y_min, y_max = _axis_limits_with_padding(pd.to_numeric(normalized_data.get("annualized_profit_eur_per_year", pd.Series(dtype=float)), errors="coerce") / 1000.0, minimum_pad=10.0)
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
@@ -3993,14 +4383,14 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         r"tick label style={font=\normalsize},",
         r"width=0.76\linewidth,",
         r"height=0.54\linewidth,",
-        r"xlabel={Normalized total mean pinball loss},",
-        r"ylabel={Normalized annualized net profit},",
-        r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
+        r"xlabel={Target-normalized activation-price mean pinball loss relative to RLQR},",
+        r"ylabel={Annualized Net Profit (kEUR/year)},",
+        rf"xmin={_tex_float(x_min, 3)}, xmax={_tex_float(x_max, 3)}, ymin={_tex_float(y_min, 1)}, ymax={_tex_float(y_max, 1)},",
         r"legend columns=4,",
-        r"legend style={at={(0.5,1.04)}, anchor=south, font=\normalsize, draw=none, fill=none},",
+        r"legend style={at={(0.5,1.04)}, anchor=south, font=\normalsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.5cm}},",
         r"]",
-        r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
-        r"\addlegendentry{Loss-profit reference line}",
+        rf"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {{(1,{_tex_float(y_min, 1)}) (1,{_tex_float(y_max, 1)})}};",
+        r"\addlegendentry{RLQR loss reference}",
     ]
     for model in MODEL_ORDER:
         g = normalized_data.loc[normalized_data["model"].astype(str).eq(model)].copy() if not normalized_data.empty else pd.DataFrame()
@@ -4009,7 +4399,7 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         marker = {"RLQR": "*", "XGB": "square*", "TFT": "triangle*"}.get(model, "*")
         model_color = _tex_model_color(model)
         coords = " ".join(
-            f"({_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)})"
+            f"({_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(_safe_float(row['annualized_profit_eur_per_year']) / 1000.0, 2)})"
             for _, row in g.iterrows()
         )
         lines += [
@@ -4018,25 +4408,25 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
         ]
         for _, row in g.iterrows():
             quantile = str(row["quantile"])
-            node_options = "font=\\small, anchor=west, text=rqTwoNeutral"
-            if model == "XGB" and quantile == "p70":
-                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
-            elif model == "XGB" and quantile == "p90":
-                node_options = "font=\\small, anchor=west, xshift=3pt, text=rqTwoNeutral"
-            elif model == "RLQR" and quantile == "p30":
-                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
-            elif model == "RLQR" and quantile == "p50":
+            node_options = "font=\\small, anchor=west, xshift=2pt, text=rqTwoNeutral"
+            if model == "RLQR" and quantile in {"p10", "p50"}:
                 node_options = "font=\\small, anchor=south, yshift=3pt, text=rqTwoNeutral"
+            elif model == "TFT" and quantile == "p50":
+                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
             elif model == "TFT" and quantile == "p90":
                 node_options = "font=\\small, anchor=north, yshift=-3pt, text=rqTwoNeutral"
+            elif model == "TFT" and quantile == "p70":
+                node_options = "font=\\small, anchor=east, xshift=-3pt, text=rqTwoNeutral"
+            elif model == "XGB" and quantile == "p50":
+                node_options = "font=\\small, anchor=north, yshift=-3pt, text=rqTwoNeutral"
             lines.append(
-                rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(row['normalized_annualized_net_profit'], 4)}) {{{_latex_escape(quantile)}}};"
+                rf"\node[{node_options}] at (axis cs:{_tex_float(row['normalized_forecast_loss'], 4)},{_tex_float(_safe_float(row['annualized_profit_eur_per_year']) / 1000.0, 2)}) {{{_latex_escape(quantile)}}};"
             )
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        rf"\caption{{Normalized total mean pinball loss versus annualized Net Profit by model-quantile policy; the dashed line marks the loss-profit reference.{correlation_caption}}}",
-        r"\label{fig:5_pinball_loss_vs_net_profit_total_normalized}",
+        rf"\caption{{Target-normalized activation-price mean pinball loss relative to RLQR versus annualized Net Profit by model-quantile policy. Positive and negative activation-price targets are normalized separately before aggregation; the dashed line marks the RLQR loss reference at 1.{correlation_caption}}}",
+        r"\label{fig:5_activation_price_pinball_loss_vs_net_profit_normalized}",
         r"\end{figure}",
     ]
     _write_native_latex(path, lines)
@@ -4076,7 +4466,7 @@ def write_latex_normalized_mae_profit(path: Path, normalized_data: pd.DataFrame)
         r"ylabel={Normalized annualized net profit},",
         r"xmin=-0.04, xmax=1.04, ymin=-0.04, ymax=1.04,",
         r"legend columns=4,",
-        r"legend style={at={(0.5,1.12)}, anchor=south, font=\normalsize, draw=none, fill=none},",
+        r"legend style={at={(0.5,1.12)}, anchor=south, font=\normalsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.5cm}},",
         r"]",
         r"\addplot+[color=rqTwoNaive, mark=none, dashed, line width=1.2pt] coordinates {(0,1) (1,0)};",
         r"\addlegendentry{Loss-profit reference line}",
@@ -4128,6 +4518,14 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         ("BCM negative activation", "rqTwoBCMActivation", "BCM-linked BEM activation revenue", False),
         ("BCM positive activation", "rqTwoBCMActivation", "BCM-linked BEM activation revenue", True),
     ]
+
+    def _dispatch_legend_label_tex(label: str) -> str:
+        if label == "DA buy/sell":
+            return r"\hspace{0.22em}DA buy/sell"
+        if label == "BCM-linked BEM activation revenue":
+            return r"\shortstack[l]{BCM-linked BEM\\activation revenue}"
+        return _latex_escape(label).replace("+/-", "+/$-$").replace("BCM-linked", "BCM$-$linked")
+
     tick_step = 4
     tick_positions = list(range(0, len(times), tick_step)) if times else []
     if times and tick_positions[-1] != len(times) - 1:
@@ -4135,7 +4533,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
     tick_labels = [pd.Timestamp(times[i]).strftime("%H:%M") for i in tick_positions] if times else []
     power_ymin = -1.0
     power_ymax = 1.0
-    axis_width = r"0.82\linewidth"
+    axis_width = r"0.77\linewidth"
     if not data.empty and times:
         stack = (
             data.pivot_table(index="timestamp_utc", columns="component", values="mw_signed", aggfunc="sum")
@@ -4160,20 +4558,22 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"\begin{axis}[",
         *_axis_common_options(),
         r"name=dispatchaxis,",
-        r"xshift=-0.18cm,",
+        r"xshift=-0.85cm,",
         rf"width={axis_width},",
         r"height=0.56\linewidth,",
         r"ybar stacked,",
         r"bar width=7pt,",
         rf"xlabel={{Time ({_latex_escape(selected_date_label)})}},",
         r"ylabel={Battery dispatch power (MW)},",
-        r"ylabel style={xshift=0.18cm},",
+        r"ylabel style={xshift=0.02cm},",
         rf"ymin={_tex_float(power_ymin, 2)}, ymax={_tex_float(power_ymax, 2)},",
         r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
         r"xtick={" + ",".join(str(i) for i in tick_positions) + "},",
         r"xticklabels={" + ",".join(_latex_escape(x) for x in tick_labels) + "},",
         r"legend columns=3,",
-        r"legend style={at={(0.5,-0.20)}, anchor=north, font=\scriptsize, draw=none, fill=none},",
+        r"legend cell align=left,",
+        r"legend style={at={(0.58,-0.20)}, anchor=north, font=\small, draw=none, fill=none, cells={anchor=west}, /tikz/every even column/.append style={column sep=0.75cm}, /tikz/every node/.append style={align=left, anchor=west}},",
+        r"legend image post style={xshift=0.00cm, yshift=-0.04cm},",
         r"]",
     ]
     legend_seen: set[str] = set()
@@ -4188,14 +4588,14 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
             plot_options += ", forget plot"
         lines.append(rf"\addplot+[{plot_options}] coordinates {{{' '.join(coords)}}};")
         if label not in legend_seen:
-            lines.append(rf"\addlegendentry{{{_latex_escape(label)}}}")
+            lines.append(rf"\addlegendentry{{{_dispatch_legend_label_tex(label)}}}")
             legend_seen.add(label)
     lines += [
         r"\addplot+[black, mark=none, line width=0.8pt, forget plot] coordinates {(0,0) (" + str(max(len(times) - 1, 0)) + r",0)};",
-        r"\addlegendimage{color=rqTwoSoC, mark=none, line width=2.0pt}",
-        r"\addlegendentry{Charge}",
-        r"\addlegendimage{color=rqTwoPNL, mark=none, dashed, line width=1.8pt}",
-        r"\addlegendentry{Cumulative Net Profit}",
+        r"\addlegendimage{empty legend}",
+        r"\addlegendentry{\hspace{-1.35em}\makebox[1.75em][l]{\raisebox{0.35ex}{\tikz{\draw[rqTwoSoC, solid, line width=2.0pt] (0,0) -- (0.030,0);}}}Charge}",
+        r"\addlegendimage{empty legend}",
+        r"\addlegendentry{\hspace{-1.35em}\makebox[1.75em][l]{\raisebox{0.35ex}{\tikz{\draw[rqTwoPNL, dash pattern=on 2pt off 2.6pt, line width=1.8pt] (0,0) -- (0.040,0);}}}Cumulative Net Profit}",
         r"\end{axis}",
         r"\begin{axis}[",
         r"name=socaxis,",
@@ -4206,10 +4606,10 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
         r"axis x line=none,",
         r"axis y line*=right,",
         r"ylabel={Charge (MWh)},",
-        r"ylabel style={font=\small, text=rqTwoSoC, at={(axis description cs:1.10,0.50)}, anchor=center},",
-        r"yticklabel style={font=\small, text=rqTwoSoC},",
-        r"tick style={rqTwoSoC},",
-        r"axis line style={rqTwoSoC},",
+        r"ylabel style={font=\small, text=rqTwoSoC, at={(axis description cs:1.125,0.50)}, anchor=center},",
+        r"yticklabel style={font=\small, text=rqTwoSoC, xshift=0.6em},",
+        r"tick style={rqTwoSoC, xshift=0.6em},",
+        r"axis line style={rqTwoSoC, xshift=0.6em},",
         r"ymin=2, ymax=18,",
         r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
         r"grid=none,",
@@ -4232,10 +4632,10 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
             r"axis x line=none,",
             r"axis y line*=right,",
             r"ylabel={Cumulative Net Profit (kEUR)},",
-            r"ylabel style={font=\small, text=rqTwoPNL, at={(axis description cs:1.19,0.50)}, anchor=center},",
-            r"yticklabel style={font=\small, text=rqTwoPNL, xshift=3.8em},",
-            r"tick style={rqTwoPNL, xshift=3.5em},",
-            r"axis line style={rqTwoPNL, xshift=3.5em},",
+            r"ylabel style={font=\small, text=rqTwoPNL, at={(axis description cs:1.285,0.50)}, anchor=center},",
+            r"yticklabel style={font=\small, text=rqTwoPNL, xshift=4.7em},",
+            r"tick style={rqTwoPNL, xshift=4.3em},",
+            r"axis line style={rqTwoPNL, xshift=4.3em},",
             r"xmin=-0.5, xmax=" + _tex_float(max(len(times) - 0.5, 0.5), 1) + ",",
             r"grid=none,",
             r"]",
@@ -4244,7 +4644,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Market dispatch, state of charge and cumulative Net Profit for the selected TFT p90 example day. Charging actions are stacked above zero and discharging actions below zero.}",
+        r"\caption{Market dispatch, state of charge and cumulative net profit for the selected XGB p50 example day. Charging actions are stacked above zero and discharging actions below zero.}",
         r"\label{fig:6_market_dispatch_soc_selected_day}",
         r"\end{figure}",
     ]
@@ -4386,6 +4786,7 @@ def write_result_section_native_latex_figures(
     relative_pinball_heatmap_data: pd.DataFrame,
     target_normalized_pinball_data: pd.DataFrame,
     normalized_total_scatter_data: pd.DataFrame,
+    normalized_activation_price_pinball_data: pd.DataFrame,
     normalized_total_mae_data: pd.DataFrame,
     dispatch_soc_data: pd.DataFrame,
     bidding_activity_data: pd.DataFrame,
@@ -4397,6 +4798,7 @@ def write_result_section_native_latex_figures(
     write_latex_revenue_cost_components(latex_figures_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
     write_latex_cumulative_pnl(latex_figures_dir / "4_cumulative_net_profit_model_comparison_test_period.tex", cumulative_data)
     write_latex_normalized_pinball_profit(latex_figures_dir / "5_pinball_loss_vs_net_profit_total_normalized.tex", normalized_total_scatter_data)
+    write_latex_normalized_activation_price_pinball_profit(latex_figures_dir / "5_activation_price_pinball_loss_vs_net_profit_normalized.tex", normalized_activation_price_pinball_data)
     write_latex_normalized_mae_profit(latex_figures_dir / "5_mae_vs_net_profit_total_normalized.tex", normalized_total_mae_data)
     write_latex_market_dispatch_soc(latex_figures_dir / "6_market_dispatch_soc_selected_day.tex", dispatch_soc_data)
     write_latex_mean_pinball_loss_heatmap(latex_figures_dir / "7_mean_pinball_loss_heatmap.tex", relative_pinball_heatmap_data, quantiles)
@@ -4474,7 +4876,15 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     target_normalized_pinball_data, target_normalized_pinball_omissions, target_normalized_pinball_weighting = (
         build_target_normalized_mean_pinball_loss_heatmap_data(scatter_data)
     )
-    normalized_total_scatter_data = build_normalized_total_pinball_profit_data(total_scatter_data)
+    normalized_total_scatter_data = build_scaled_mean_pinball_profit_data(
+        scatter_data,
+        target_label="All forecast targets",
+    )
+    normalized_activation_price_pinball_data = build_normalized_activation_price_pinball_profit_data(scatter_data)
+    loss_profit_correlation_diagnostics = build_loss_profit_correlation_diagnostics(
+        total_data=normalized_total_scatter_data,
+        activation_price_data=normalized_activation_price_pinball_data,
+    )
     normalized_total_mae_data = build_normalized_total_mae_profit_data(total_scatter_data)
     dispatch_soc_data, dispatch_soc_warnings = build_market_dispatch_soc_day(summary, run_root=run_root)
     bidding_activity_data, bidding_activity_warnings, bidding_activity_inventory = build_bidding_activity_by_market_model(summary, run_root=run_root, selected_only=True)
@@ -4506,6 +4916,12 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     target_normalized_pinball_data.to_csv(result_csv_dir / "8_target_normalized_mean_pinball_loss_heatmap.csv", index=False)
     target_normalized_pinball_omissions.to_csv(diag_dir / "8_target_normalized_mean_pinball_loss_omitted_target_quantiles.csv", index=False)
     normalized_total_scatter_data.to_csv(csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", index=False)
+    normalized_total_scatter_data.to_csv(csv_dir / "5_scaled_mean_pinball_loss_vs_net_profit.csv", index=False)
+    normalized_total_scatter_data.to_csv(result_csv_dir / "5_scaled_mean_pinball_loss_vs_net_profit.csv", index=False)
+    normalized_total_scatter_data.to_csv(result_csv_dir / "5_target_normalized_pinball_loss_vs_net_profit_total.csv", index=False)
+    normalized_activation_price_pinball_data.to_csv(csv_dir / "5_activation_price_pinball_loss_vs_net_profit_normalized.csv", index=False)
+    normalized_activation_price_pinball_data.to_csv(result_csv_dir / "5_target_normalized_activation_price_pinball_loss_vs_net_profit.csv", index=False)
+    loss_profit_correlation_diagnostics.to_csv(result_csv_dir / "5_loss_profit_correlation_diagnostics.csv", index=False)
     normalized_total_mae_data.to_csv(csv_dir / "5_mae_vs_net_profit_total_normalized.csv", index=False)
     dispatch_soc_data.to_csv(csv_dir / "6_market_dispatch_soc_selected_day.csv", index=False)
     bidding_activity_data.to_csv(csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", index=False)
@@ -4540,6 +4956,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     write_primary_table(tables_dir / "1_net_profit_by_model_and_quantile.tex", table, days)
     write_revenue_cost_component_table(tables_dir / "3_revenue_cost_components_best_quantile.tex", component_data)
     write_bid_activity_best_quantile_table(tables_dir / "4_bid_activity_best_quantile.tex", bidding_activity_data)
+    write_loss_profit_correlation_diagnostics_table(tables_dir / "5_loss_profit_correlation_diagnostics.tex", loss_profit_correlation_diagnostics)
     write_appendix_table(appendix_tables_dir / "rq2_profit_and_validity_detailed.tex", summary)
 
     result_figure_paths: list[Path] = []
@@ -4550,6 +4967,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         result_figure_paths += plot_cumulative_pnl(cumulative_data, figures_dir / "4_cumulative_net_profit_model_comparison_test_period", formats, run_root.name)
         appendix_figure_paths += plot_pinball_net_profit_scatter(scatter_data, appendix_figures_dir, formats)
         result_figure_paths += plot_normalized_total_pinball_profit_scatter(normalized_total_scatter_data, figures_dir / "5_pinball_loss_vs_net_profit_total_normalized", formats)
+        result_figure_paths += plot_normalized_activation_price_pinball_profit_scatter(normalized_activation_price_pinball_data, figures_dir / "5_activation_price_pinball_loss_vs_net_profit_normalized", formats)
         result_figure_paths += plot_normalized_total_mae_profit_scatter(normalized_total_mae_data, figures_dir / "5_mae_vs_net_profit_total_normalized", formats)
         appendix_figure_paths += plot_total_pinball_net_profit_scatter(total_scatter_data, appendix_figures_dir / "5_pinball_loss_vs_net_profit_total", formats)
         result_figure_paths += plot_market_dispatch_soc_day(dispatch_soc_data, figures_dir / "6_market_dispatch_soc_selected_day", formats)
@@ -4569,6 +4987,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
             relative_pinball_heatmap_data=relative_pinball_heatmap_data,
             target_normalized_pinball_data=target_normalized_pinball_data,
             normalized_total_scatter_data=normalized_total_scatter_data,
+            normalized_activation_price_pinball_data=normalized_activation_price_pinball_data,
             normalized_total_mae_data=normalized_total_mae_data,
             dispatch_soc_data=dispatch_soc_data,
             bidding_activity_data=bidding_activity_data,
@@ -4612,7 +5031,14 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         (result_csv_dir / "7_mean_pinball_loss_heatmap.csv", "result_section", "csv", "RLQR-relative mean pinball loss", "source data for RLQR-relative mean pinball heatmap"),
         (result_csv_dir / "8_target_normalized_mean_pinball_loss_heatmap.csv", "result_section", "csv", "target-normalized mean pinball loss", "source data for target-normalized mean pinball heatmap"),
         (diag_dir / "8_target_normalized_mean_pinball_loss_omitted_target_quantiles.csv", "backup", "diagnostics", "target-normalized mean pinball loss", "omitted RLQR denominator diagnostics"),
-        (csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total pinball-loss scatter figure"),
+        (csv_dir / "5_pinball_loss_vs_net_profit_total_normalized.csv", "backup", "csv", "scaled forecast accuracy vs Net Profit", "compatibility backup source data for scaled mean pinball-loss scatter figure"),
+        (csv_dir / "5_scaled_mean_pinball_loss_vs_net_profit.csv", "backup", "csv", "scaled forecast accuracy vs Net Profit", "backup source data for scaled mean pinball-loss scatter figure"),
+        (result_csv_dir / "5_scaled_mean_pinball_loss_vs_net_profit.csv", "result_section", "csv", "scaled forecast accuracy vs Net Profit", "source data for scaled mean pinball-loss scatter figure"),
+        (result_csv_dir / "5_target_normalized_pinball_loss_vs_net_profit_total.csv", "result_section", "csv", "scaled forecast accuracy vs Net Profit", "compatibility source data for scaled mean pinball-loss scatter figure"),
+        (csv_dir / "5_activation_price_pinball_loss_vs_net_profit_normalized.csv", "backup", "csv", "target-normalized forecast accuracy vs Net Profit", "backup source data for target-normalized activation-price pinball-loss scatter figure"),
+        (result_csv_dir / "5_target_normalized_activation_price_pinball_loss_vs_net_profit.csv", "result_section", "csv", "target-normalized forecast accuracy vs Net Profit", "source data for target-normalized activation-price pinball-loss scatter figure"),
+        (result_csv_dir / "5_loss_profit_correlation_diagnostics.csv", "result_section", "csv", "loss-profit correlation diagnostics", "Pearson/Spearman diagnostics for scaled and target-normalized loss-profit figures"),
+        (tables_dir / "5_loss_profit_correlation_diagnostics.tex", "result_section", "latex_table", "loss-profit correlation diagnostics", "Pearson/Spearman diagnostics table for scaled and target-normalized loss-profit figures"),
         (csv_dir / "5_mae_vs_net_profit_total_normalized.csv", "backup", "csv", "normalized forecast accuracy vs Net Profit", "source data for normalized total MAE scatter figure"),
         (csv_dir / "6_market_dispatch_soc_selected_day.csv", "backup", "csv", "market dispatch and SoC", "source data for selected-day stacked dispatch/SOC figure"),
         (csv_dir / "bidding_activity_submitted_cleared_by_market_model.csv", "backup", "csv", "bidding activity", "backup source data for submitted/cleared bidding-activity figures"),
@@ -4645,6 +5071,7 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
         "forecast_benchmark_dir": str(forecast_benchmark_dir),
         "forecast_pinball_input": str(forecast_benchmark_dir / "diagnostics" / "joined_predictions"),
         "rlqr_relative_mean_pinball_aggregation": relative_pinball_heatmap_weighting,
+        "scaled_mean_pinball_loss_profit_aggregation": "mean_pinball_loss divided by cross-model median within split-target-quantile, then observation-count weighted across targets",
         "target_normalized_mean_pinball_aggregation": target_normalized_pinball_weighting,
         "target_normalized_mean_pinball_omitted_target_quantiles": int(len(target_normalized_pinball_omissions)),
         "output_root": str(out_root),
@@ -4662,6 +5089,9 @@ def build_outputs(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[OK] RLQR-relative pinball aggregation: {relative_pinball_heatmap_weighting}")
     print(f"[OK] RLQR-relative heatmap CSV: {result_csv_dir / '7_mean_pinball_loss_heatmap.csv'}")
     print(f"[OK] RLQR-relative heatmap LaTeX: {latex_figures_dir / '7_mean_pinball_loss_heatmap.tex'}")
+    print("[OK] scaled MPL loss-profit aggregation: cross-model median within target and quantile, then n_obs-weighted across targets")
+    print(f"[OK] scaled MPL loss-profit CSV: {result_csv_dir / '5_scaled_mean_pinball_loss_vs_net_profit.csv'}")
+    print(f"[OK] scaled MPL loss-profit LaTeX: {latex_figures_dir / '5_pinball_loss_vs_net_profit_total_normalized.tex'}")
     print(f"[OK] target-normalized pinball aggregation: {target_normalized_pinball_weighting}")
     print(f"[OK] omitted target-quantile combinations: {len(target_normalized_pinball_omissions)}")
     print(f"[OK] target-normalized heatmap CSV: {result_csv_dir / '8_target_normalized_mean_pinball_loss_heatmap.csv'}")

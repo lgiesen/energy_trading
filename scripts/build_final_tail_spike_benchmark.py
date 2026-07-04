@@ -1297,6 +1297,8 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
             label = label[len("aFRR ") :]
         if label:
             label = label[0].upper() + label[1:]
+        if label.endswith(" -"):
+            label = label[:-2] + " $-$"
         return label
 
     headers = ["Regime", "Target", "RLQR", "XGB", "TFT"]
@@ -1325,7 +1327,7 @@ def write_latex_table(metrics: pd.DataFrame, *, out_dir: Path, split: str) -> Pa
             + " & ".join(
                 [
                     _latex_escape(row["regime_label"]),
-                    _latex_escape(_compact_target_label(target_label)),
+                    _compact_target_label(target_label),
                     _fmt_best(row["RLQR"], model="RLQR", best_model=row["best_model"]),
                     _fmt_best(row["XGB"], model="XGB", best_model=row["best_model"]),
                     _fmt_best(row["TFT"], model="TFT", best_model=row["best_model"]),

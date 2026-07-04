@@ -2485,7 +2485,7 @@ def _write_line_tex(
             rf"                ylabel={{{_latex_escape(_axis_label(ylabel))}}},",
             *(
                 [
-                    rf"                legend style={{at={{(0.5,{_tex_num(legend_y)})}}, anchor=south, legend columns=-1, draw=none, fill=none, text=black}},",
+                    rf"                legend style={{at={{(0.5,{_tex_num(legend_y)})}}, anchor=south, legend columns=-1, draw=none, fill=none, text=black, /tikz/every even column/.append style={{column sep=0.45cm}}}},",
                     r"                legend cell align={left},",
                 ]
                 if show_legend

@@ -802,7 +802,6 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
     d = sort_target_frame(d, target_col="target_label", extra_cols=["interval", "model_label"])
     headers = [
         r"\textbf{Target}",
-        r"\textbf{Interval}",
         r"\textbf{Model}",
         r"\shortstack{\textbf{Nominal}\\\textbf{coverage}}",
         r"\shortstack{\textbf{Empirical}\\\textbf{coverage}}",
@@ -814,9 +813,9 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
     lines = [
         r"\begin{table}[ht]",
         r"    \centering",
-        r"    \caption{Detailed interval coverage and sharpness diagnostics on the test split.}",
+        r"    \caption{Detailed interval coverage and sharpness diagnostics on the test split. Nominal coverage of 80\% refers to the p10-p90 interval, while nominal coverage of 40\% refers to the p30-p70 interval.}",
         r"    \label{tab:calibration_interval_quality_test_appendix}",
-        r"    \begin{tabular}{@{}lllrrrrrr@{}}",
+        r"    \begin{tabular}{@{}llrrrrrr@{}}",
         r"        \toprule",
         "        " + " & ".join(headers) + r" \\",
         r"        \midrule",
@@ -824,7 +823,6 @@ def write_latex_interval_quality_appendix(interval: pd.DataFrame, *, out_dir: Pa
     for _, row in d.iterrows():
         vals = [
             _latex_escape(row["target_label"]),
-            _latex_escape(row["interval"]),
             _latex_escape(row["model_label"]),
             _format_percent(row["nominal_interval_coverage"]),
             _format_percent(row["interval_coverage"]),

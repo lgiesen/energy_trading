@@ -152,6 +152,14 @@ def _fmt(value: Any) -> str:
     return f"{x:.4g}" if np.isfinite(x) else "-"
 
 
+def _fmt_percent(value: Any) -> str:
+    try:
+        x = float(value)
+    except Exception:
+        return str(value)
+    return f"{x:.1f}\\%" if np.isfinite(x) else "-"
+
+
 def _write_latex_table(path: Path, headers: list[str], rows: list[list[Any]], caption: str, label: str) -> Path:
     align = "l" * len(headers)
     lines = [
@@ -181,10 +189,19 @@ def _write_latex_table(path: Path, headers: list[str], rows: list[list[Any]], ca
 
 
 def _latex_feature_cell(value: Any) -> str:
-    return _latex_escape(value).replace(r"\_", r"\_\allowbreak{}")
+    parts = str(value).split("_")
+    formatted: list[str] = []
+    for part in parts:
+        if part == "pos":
+            formatted.append("+")
+        elif part == "neg":
+            formatted.append(r"$-$")
+        else:
+            formatted.append(_latex_escape(part))
+    return r"\_\allowbreak{}".join(formatted)
 
 
-def _write_xgb_top_feature_table(path: Path, top_features: pd.DataFrame) -> Path:
+def _write_xgb_top_feature_table(path: Path, top_features: pd.DataFrame, all_features: pd.DataFrame) -> Path:
     if top_features.empty:
         rows = pd.DataFrame()
     else:
@@ -193,37 +210,58 @@ def _write_xgb_top_feature_table(path: Path, top_features: pd.DataFrame) -> Path
             & top_features["importance_type"].eq("existing_xgb_mean_abs_shap")
             & top_features["rank"].le(5)
         ].copy()
+        denominator_source = all_features[
+            all_features["model"].eq("XGB")
+            & all_features["importance_type"].eq("existing_xgb_mean_abs_shap")
+        ].copy()
+        denominators = denominator_source.groupby("target")["importance_value"].sum(min_count=1)
+        rows["importance_share_percent"] = rows.apply(
+            lambda row: (
+                100.0 * float(row["importance_value"]) / float(denominators.get(row["target"], np.nan))
+                if np.isfinite(float(row["importance_value"]))
+                and np.isfinite(float(denominators.get(row["target"], np.nan)))
+                and float(denominators.get(row["target"], np.nan)) > 0
+                else np.nan
+            ),
+            axis=1,
+        )
         target_order = {_target_label(target): idx for idx, target in enumerate(TARGET_STEMS)}
         rows["_target_order"] = rows["target"].map(target_order).fillna(len(target_order))
         rows = rows.sort_values(["_target_order", "rank"])
 
     lines = [
-        r"\begin{table}[ht]",
-        r"    \centering",
-        r"    \small",
-        r"    \caption{Top feature-level interpretability diagnostics for the RQ1 ML benchmark.}",
-        r"    \label{tab:rq1_interpretability_top_features_test}",
-        r"    \begin{tabularx}{\linewidth}{@{}ll>{\raggedright\arraybackslash}p{0.25\linewidth}llr>{\raggedright\arraybackslash}X@{}}",
+        r"{\footnotesize",
+        r"    \setlength{\tabcolsep}{3.5pt}",
+        r"    \begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.20\linewidth}c>{\raggedright\arraybackslash}p{0.38\linewidth}>{\raggedright\arraybackslash}p{0.18\linewidth}r@{}}",
+        r"        \caption{Top XGB feature-level interpretability diagnostics for the RQ1 ML benchmark.}",
+        r"        \label{tab:rq1_interpretability_top_features_test}\\",
         r"        \toprule",
-        r"        \textbf{Target} & \textbf{Rank} & \textbf{Feature} & \textbf{Feature group} & \textbf{Importance type} & \textbf{Importance value} & \textbf{Caveat} \\",
+        r"        \textbf{Target} & \textbf{Rank} & \textbf{Feature} & \textbf{Feature group} & \textbf{Value (\%)} \\",
         r"        \midrule",
+        r"        \endfirsthead",
+        r"        \toprule",
+        r"        \textbf{Target} & \textbf{Rank} & \textbf{Feature} & \textbf{Feature group} & \textbf{Value (\%)} \\",
+        r"        \midrule",
+        r"        \endhead",
     ]
+    previous_target = None
     for _, row in rows.iterrows():
+        target = _target_label_tex(row["target"])
+        shown_target = target if target != previous_target else ""
+        previous_target = target
         vals = [
-            _target_label_tex(row["target"]),
+            shown_target,
             str(int(row["rank"])),
             _latex_feature_cell(row["feature"]),
             _latex_escape(row["feature_group"]),
-            "SHAP",
-            _fmt(row["importance_value"]),
-            _latex_escape(row["caveat"]),
+            _fmt_percent(row["importance_share_percent"]),
         ]
         lines.append("        " + " & ".join(vals) + r" \\")
     lines.extend(
         [
             r"        \bottomrule",
-            r"    \end{tabularx}",
-            r"\end{table}",
+            r"    \end{longtable}",
+            r"}",
             "",
         ]
     )
@@ -365,7 +403,7 @@ def _write_group_heatmap_figure(path: Path, *, group_df: pd.DataFrame, caption: 
         r"                colormap={geoSequentialBlue}{rgb255(0cm)=(228,241,247); rgb255(1cm)=(197,225,239); rgb255(2cm)=(158,201,226); rgb255(3cm)=(108,176,214); rgb255(4cm)=(60,147,194); rgb255(5cm)=(34,110,156); rgb255(6cm)=(13,74,112)},",
         r"                point meta min=0,",
         r"                point meta max=1,",
-        r"                x tick label style={rotate=55, anchor=east, font=\scriptsize},",
+        r"                x tick label style={rotate=55, anchor=east, font=\normalsize},",
         "                symbolic x coords={" + ",".join(_tex_symbol(x) for x in x_labels) + "},",
         "                xtick={" + ",".join(_tex_symbol(x) for x in x_labels) + "},",
         "                xticklabels={" + ",".join(_target_label_tex(x) for x in x_labels) + "},",
@@ -717,6 +755,7 @@ def _plot_group_importance(group_df: pd.DataFrame, path: Path) -> None:
     im = ax.imshow(matrix.values, aspect="auto", cmap="Blues", vmin=0.0)
     ax.set_xticks(np.arange(len(panels)))
     ax.set_xticklabels(panels, rotation=55, ha="right")
+    ax.tick_params(axis="x", labelsize=12)
     ax.set_yticks(np.arange(len(groups)))
     ax.set_yticklabels(groups)
     cbar = fig.colorbar(im, ax=ax)
@@ -820,17 +859,10 @@ def build_interpretability_outputs(
         label="fig:rq1-interpretability-top-feature-groups",
     )
 
-    summary_tex = _write_latex_table(
-        out_dir / "result_section" / "tables" / "rq1_interpretability_summary.tex",
-        ["Target", "TFT main drivers", "XGB main drivers", "RLQR main drivers", "Cross-model agreement", "Caveat"],
-        _summary_rows(top_features, overlap),
-        "Compact interpretability summary for the RQ1 ML benchmark.",
-        "tab:rq1_interpretability_summary",
-    )
-
     appendix_tex = _write_xgb_top_feature_table(
         out_dir / "appendix" / "tables" / "feature_importance_top_features_test.tex",
         top_features,
+        long_df,
     )
 
     manifest = {
@@ -842,7 +874,7 @@ def build_interpretability_outputs(
         },
         "model_run_dirs": {"xgb": str(xgb_dir), "tft": str(tft_dir), "linear": str(linear_dir)},
         "outputs": {
-            "result_section": [str(fig_path), str(summary_tex)],
+            "result_section": [str(fig_path)],
             "appendix": [str(appendix_tex)],
             "backup": [str(long_path), str(top_path), str(group_path), str(overlap_path), str(inventory_path), str(warnings_path)],
         },

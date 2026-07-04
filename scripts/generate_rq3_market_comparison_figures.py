@@ -19,7 +19,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -417,6 +417,42 @@ def _tex_color_def(name: str, hex_color: str) -> str:
     green = int(hex_color[2:4], 16) / 255.0
     blue = int(hex_color[4:6], 16) / 255.0
     return rf"\definecolor{{{name}}}{{rgb}}{{{red:.4f},{green:.4f},{blue:.4f}}}"
+
+
+def _revenue_segment_label(value: float) -> str:
+    if not math.isfinite(float(value)):
+        return ""
+    return f"{float(value):,.0f}"
+
+
+def _revenue_label_position(strategy: str, component: str) -> tuple[float, float, str, str]:
+    """Return x/y offsets and horizontal alignment for revenue value labels."""
+    if strategy == "Multi" and component == "DA revenue":
+        return 0.44, 0.0, "left", "west"
+    if strategy == "BCM-only" and component == "BCM-linked BEM activation revenue":
+        return 0.44, 64.0, "left", "west"
+    if component == "BCM-linked BEM activation revenue":
+        return 0.44, 12.0, "left", "west"
+    if strategy == "BCM-only" and component == "BCM capacity revenue":
+        return 0.44, 10.0, "left", "west"
+    return 0.0, 0.0, "center", "center"
+
+
+def _revenue_label_text_color(component: str, anchor: str) -> str:
+    if anchor == "west":
+        return "black"
+    if component in {"DA revenue", "BEM activation revenue"}:
+        return "white"
+    return "black"
+
+
+def _revenue_label_tex_xshift(anchor: str) -> str:
+    """Keep side labels close to the bar edge in PGFPlots point units."""
+    return "11pt" if anchor == "west" else "0pt"
+
+
+def _revenue_cost_strategy_axis_label(strategy: str) -> str:
+    return "Multi-market" if strategy == "Multi" else strategy
 
 
 def normalize_strategy(value: Any, source_path: Path | None = None) -> str | None:
@@ -1138,7 +1174,23 @@ def select_strategy_rows(candidate: Candidate) -> pd.DataFrame:
     if xgb_p50.any():
         data = data.loc[xgb_p50].copy()
     data["_strategy_order"] = data["strategy"].map({name: idx for idx, name in enumerate(STRATEGY_ORDER)})
-    data["_source_rank"] = data["source_file"].astype(str).map(lambda s: 0 if s.endswith("performance_metrics.csv") else 1)
+    def _source_rank(source_file: str) -> tuple[int, int]:
+        source = str(source_file)
+        strategy = _normalize_strategy_from_file(Path(source))
+        preferred_folder = {
+            "Multi": "/xgb_multi_p50/",
+            "DA-only": "/xgb_da_p50/",
+            "BCM-only": "/xgb_bcm_p50/",
+            "BEM-only": "/xgb_bem_p50/",
+        }.get(strategy, "")
+        is_preferred_strategy_run = preferred_folder and preferred_folder in source
+        is_other_xgb_strategy_run = "/xgb_" in source and "_p50/" in source
+        return (
+            0 if is_preferred_strategy_run else 1 if is_other_xgb_strategy_run else 2,
+            0 if source.endswith("performance_metrics.csv") else 1,
+        )
+
+    data["_source_rank"] = data["source_file"].astype(str).map(_source_rank)
     data = data.sort_values(["_strategy_order", "_source_rank"]).drop_duplicates("strategy", keep="first")
     missing = [s for s in STRATEGY_ORDER if s not in set(data["strategy"])]
     if missing:
@@ -1842,15 +1894,33 @@ def _plot_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit_scale
     for name in revenue_components:
         y = np.nan_to_num(decomp[f"revenue::{name}"].to_numpy(dtype=float) * unit_scale, nan=0.0)
         bottom = np.where(y >= 0.0, rev_bottom, cost_bottom)
+        color = REVENUE_COMPONENT_COLOR.get(name, THESIS_PALETTE["primary"])
         ax.bar(
             x,
             y,
             bottom=bottom,
             width=0.78,
-            color=REVENUE_COMPONENT_COLOR.get(name, THESIS_PALETTE["primary"]),
+            color=color,
             edgecolor="white",
             linewidth=0.6,
         )
+        for idx, (value, base) in enumerate(zip(y, bottom)):
+            if value <= 0.0 or value < 18.0:
+                continue
+            x_offset, y_offset, ha, _ = _revenue_label_position(strategies[idx], name)
+            text_color = _revenue_label_text_color(name, "west" if ha == "left" else "center")
+            ax.text(
+                x[idx] + x_offset,
+                base + value / 2.0 + y_offset,
+                _revenue_segment_label(value),
+                ha=ha,
+                va="center",
+                fontsize=8.5,
+                color=text_color,
+                fontweight="normal",
+                zorder=20,
+                clip_on=False,
+            )
         rev_bottom = rev_bottom + np.maximum(y, 0.0)
         cost_bottom = cost_bottom + np.minimum(y, 0.0)
 
@@ -1873,7 +1943,8 @@ def _plot_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit_scale
     span = max(1.0, ymax - ymin)
 
     ax.axhline(0.0, color=THESIS_PALETTE["neutral_dark"], linewidth=0.8)
-    ax.set_xticks(x, labels=strategies)
+    ax.set_xlim(-0.5, len(strategies) - 0.5)
+    ax.set_xticks(x, labels=[_revenue_cost_strategy_axis_label(strategy) for strategy in strategies])
     ax.set_xlabel("Market strategy")
     ax.set_ylabel(f"Annualized value ({unit}/year)")
     ax.set_ylim(ymin - 0.16 * span, ymax + 0.16 * span)
@@ -1952,11 +2023,15 @@ def write_latex_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit
             r"bar width=18pt,",
             r"width=0.88\linewidth,",
             r"height=0.44\linewidth,",
+            r"clip=false,",
             r"tick align=outside,",
             r"axis line style={black},",
             r"tick style={black},",
+            r"enlarge x limits=false,",
+            r"xmin=-0.5,",
+            rf"xmax={_tex_float(len(strategies) - 0.5, 1)},",
             f"xtick={{{','.join(str(i) for i in range(len(strategies)))}}},",
-            f"xticklabels={{{','.join(_latex_escape(s) for s in strategies)}}},",
+            f"xticklabels={{{','.join(_latex_escape(_revenue_cost_strategy_axis_label(s)) for s in strategies)}}},",
             f"ylabel={{Annualized value ({_latex_escape(unit)}/year)}},",
             r"legend cell align=left,",
             r"legend style={at={(0.5,-0.24)}, anchor=north, font=\scriptsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.45cm}},",
@@ -2010,11 +2085,36 @@ def write_latex_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit
                         r"\addlegendentry{}",
                     ]
                 )
+    label_nodes: list[str] = []
+    label_counter = 0
+    rev_positive_bottom = np.zeros(len(strategies), dtype=float)
+    for name in revenue_components:
+        vals = np.nan_to_num(decomp[f"revenue::{name}"].to_numpy(dtype=float) * unit_scale, nan=0.0)
+        for idx, value in enumerate(vals):
+            if value <= 0.0 or value < 18.0:
+                continue
+            x_offset, y_offset, _, anchor = _revenue_label_position(strategies[idx], name)
+            tex_x_offset = 0.0 if anchor == "west" else x_offset
+            tex_xshift = _revenue_label_tex_xshift(anchor)
+            y_mid = rev_positive_bottom[idx] + float(value) / 2.0 + y_offset
+            text_color = _revenue_label_text_color(name, anchor)
+            coord_name = f"rqThreeRevenueLabel{label_counter}"
+            label_counter += 1
+            lines.append(
+                rf"\coordinate ({coord_name}) at "
+                rf"(axis cs:{_tex_float(idx + tex_x_offset, 4)},{_tex_float(y_mid, 4)});"
+            )
+            label_nodes.append(
+                rf"\node[font=\small, text={text_color}, anchor={anchor}, inner sep=0pt, xshift={tex_xshift}] "
+                rf"at ({coord_name}) {{{_latex_escape(_revenue_segment_label(float(value)))}}};"
+            )
+        rev_positive_bottom = rev_positive_bottom + np.maximum(vals, 0.0)
     if strategies:
         lines.append(rf"\draw[black, line width=0.45pt] (axis cs:-0.5,0) -- (axis cs:{len(strategies) - 0.5},0);")
     lines.extend(
         [
             r"\end{axis}",
+            *label_nodes,
             r"\end{tikzpicture}",
             r"\caption{Revenue and cost decomposition by market participation strategy. Positive components show annualized market revenues, while negative components show costs and penalties.}",
             r"\label{fig:rq3-revenue-cost-decomposition}",
@@ -2089,6 +2189,424 @@ def generate_annualized_net_profit_by_strategy(data: pd.DataFrame, out_root: Pat
     return outputs
 
 
+def build_single_vs_multi_profit_uplift(data: pd.DataFrame) -> pd.DataFrame:
+    if data.empty:
+        raise ValueError("Cannot build single-vs-multi profit uplift table from empty RQ3 data.")
+    by_strategy = {str(row["strategy"]): row for _, row in data.iterrows()}
+    missing = [strategy for strategy in STRATEGY_ORDER if strategy not in by_strategy]
+    if missing:
+        raise ValueError(f"Missing strategy rows for single-vs-multi profit uplift table: {', '.join(missing)}")
+
+    multi_profit = _safe_float(by_strategy["Multi"].get("annualized_net_profit_eur_per_year", math.nan))
+    if not math.isfinite(multi_profit):
+        raise ValueError("Missing or invalid annualized net profit for Multi in single-vs-multi profit uplift table.")
+
+    rows: list[dict[str, float | str]] = []
+    for strategy in STRATEGY_ORDER:
+        profit = _safe_float(by_strategy[strategy].get("annualized_net_profit_eur_per_year", math.nan))
+        if not math.isfinite(profit):
+            raise ValueError(f"Missing or invalid annualized net profit for {strategy}.")
+        if strategy == "Multi":
+            absolute_uplift = math.nan
+            uplift_ratio = math.nan
+            uplift_percent = math.nan
+        else:
+            absolute_uplift = multi_profit - profit
+            denominator = abs(profit)
+            if denominator <= 1e-12:
+                uplift_ratio = math.nan
+                uplift_percent = math.nan
+            else:
+                uplift_ratio = absolute_uplift / denominator
+                uplift_percent = 100.0 * uplift_ratio
+        rows.append(
+            {
+                "strategy": strategy,
+                "annualized_net_profit_eur_per_year": profit,
+                "absolute_uplift_eur_per_year": absolute_uplift,
+                "uplift_ratio": uplift_ratio,
+                "uplift_percent": uplift_percent,
+                "reference_strategy": "Multi",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _format_k_eur(value: float, *, dash_nan: bool = True) -> str:
+    if not math.isfinite(float(value)):
+        return "$-$" if dash_nan else "n/a"
+    return f"{float(value) / 1000.0:,.1f}"
+
+
+def _format_percent(value: float) -> str:
+    if not math.isfinite(float(value)):
+        return "$-$"
+    return f"{float(value):,.1f}\\%"
+
+
+def _format_k_eur_component(value: float) -> str:
+    if not math.isfinite(float(value)):
+        return "$-$"
+    value_k = float(value) / 1000.0
+    if abs(value_k) < 0.05:
+        value_k = 0.0
+    return f"{value_k:,.1f}"
+
+
+def build_revenue_cost_component_table(data: pd.DataFrame) -> pd.DataFrame:
+    decomposition, _, _, _ = extract_decomposition_rows(data)
+    long = _decomposition_long(decomposition)
+    rows: list[dict[str, Any]] = []
+    for component_type, label in (("revenue", "Revenue"), ("cost", "Cost")):
+        type_rows = long.loc[long["component_type"].eq(component_type)].copy()
+        for component in type_rows["component"].drop_duplicates().tolist():
+            values = type_rows.loc[type_rows["component"].eq(component)].set_index("strategy")[
+                "annualized_component_eur_per_year"
+            ]
+            row: dict[str, Any] = {
+                "component_type": label,
+                "component": component,
+            }
+            for strategy in STRATEGY_ORDER:
+                row[strategy] = _safe_float(values.get(strategy, math.nan))
+            rows.append(row)
+    net_row: dict[str, Any] = {"component_type": "Net", "component": "Net profit"}
+    by_strategy = data.set_index("strategy")
+    for strategy in STRATEGY_ORDER:
+        net_row[strategy] = _safe_float(by_strategy.loc[strategy, "annualized_net_profit_eur_per_year"])
+    rows.append(net_row)
+    return pd.DataFrame(rows)
+
+
+def write_latex_revenue_cost_component_table(table: pd.DataFrame, path: Path) -> Path:
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\small",
+        r"\caption{Annualized revenue and cost components for the XGB p50 multi-market and single-market strategies. Positive values denote revenues and negative values denote costs or losses; values are shown in kEUR/year.}",
+        r"\label{tab:rq3-revenue-cost-components-market-strategies}",
+        r"\resizebox{\linewidth}{!}{%",
+        r"\begin{tabular}{llrrrr}",
+        r"\toprule",
+        r"\textbf{Type} & \textbf{Component} & \textbf{Multi} & \textbf{DA-only} & \textbf{BCM-only} & \textbf{BEM-only} \\",
+        r"\midrule",
+    ]
+    previous_type = ""
+    for _, row in table.iterrows():
+        component_type = str(row["component_type"])
+        if previous_type and component_type != previous_type:
+            if component_type == "Net":
+                lines.append(r"\midrule")
+            else:
+                lines.append(r"\addlinespace")
+        previous_type = component_type
+        component = _revenue_cost_legend_label(str(row["component"]))
+        if component == "Net profit":
+            component_tex = r"\textbf{Net profit}"
+            type_tex = r"\textbf{Net}"
+        else:
+            component_tex = _latex_escape(component)
+            type_tex = _latex_escape(component_type)
+        cells = [
+            type_tex,
+            component_tex,
+            *[_format_k_eur_component(_safe_float(row[strategy])) for strategy in STRATEGY_ORDER],
+        ]
+        if component == "Net profit":
+            cells = cells[:2] + [rf"\textbf{{{cell}}}" for cell in cells[2:]]
+        lines.append(" & ".join(cells) + r" \\")
+    lines.extend(
+        [
+            r"\bottomrule",
+            r"\end{tabular}%",
+            r"}",
+            r"\end{table}",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_revenue_cost_component_table(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> list[Path]:
+    table = build_revenue_cost_component_table(data)
+    csv_dir = out_root / "result_section" / "csv"
+    latex_dir = out_root / "result_section" / "latex_tables"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "revenue_cost_components_by_market_strategy.csv"
+    tex_path = latex_dir / "revenue_cost_components_by_market_strategy.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        table.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    if "tex" in formats:
+        outputs.append(write_latex_revenue_cost_component_table(table, tex_path))
+    return outputs
+
+
+def _daily_metrics_path(row: pd.Series) -> Path:
+    source = Path(str(row.get("source_file", "")))
+    if source.name == "performance_metrics.csv":
+        return source.with_name("daily_performance_metrics.csv")
+    if source.name in {"performance_metrics_all_scenarios.csv", "strategy_overview.csv", "strategy_overview_valid_only.csv"}:
+        strategy_raw = str(row.get("trading_strategy", row.get("strategy", ""))).lower().replace("_", "-")
+        strategy_dir = strategy_raw.split("-")[0] if strategy_raw else str(row.get("strategy", "")).lower().split("-")[0]
+        candidate = source.parent / strategy_dir / "p50_p50" / "daily_performance_metrics.csv"
+        if candidate.exists():
+            return candidate
+    return source.parent / "daily_performance_metrics.csv"
+
+
+def _backtest_summary_path(row: pd.Series) -> Path:
+    source = Path(str(row.get("source_file", "")))
+    if source.name == "performance_metrics.csv":
+        return source.with_name("backtest_summary.json")
+    strategy_raw = str(row.get("trading_strategy", row.get("strategy", ""))).lower().replace("_", "-")
+    strategy_dir = strategy_raw.split("-")[0] if strategy_raw else str(row.get("strategy", "")).lower().split("-")[0]
+    candidate = source.parent / strategy_dir / "p50_p50" / "backtest_summary.json"
+    if candidate.exists():
+        return candidate
+    return source.parent / "backtest_summary.json"
+
+
+def _load_backtest_summary(row: pd.Series) -> dict[str, Any]:
+    path = _backtest_summary_path(row)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _daily_risk_stats(daily: pd.DataFrame) -> dict[str, float]:
+    if "net_revenue_eur" not in daily.columns:
+        raise ValueError("daily_performance_metrics.csv is missing net_revenue_eur.")
+    pnl = pd.to_numeric(daily["net_revenue_eur"], errors="coerce").dropna()
+    if pnl.empty:
+        raise ValueError("daily_performance_metrics.csv has no finite net_revenue_eur values.")
+    cumulative = pnl.cumsum()
+    drawdown = cumulative - cumulative.cummax()
+    q05 = pnl.quantile(0.05)
+    tail = pnl.loc[pnl <= q05]
+    fallback_hours = (
+        float(pd.to_numeric(daily["fallback_hours"], errors="coerce").fillna(0.0).sum())
+        if "fallback_hours" in daily.columns
+        else math.nan
+    )
+    n_hours = (
+        float(pd.to_numeric(daily["n_hours"], errors="coerce").fillna(0.0).sum())
+        if "n_hours" in daily.columns
+        else math.nan
+    )
+    return {
+        "n_days": float(len(pnl)),
+        "loss_day_share_percent": float((pnl < 0.0).mean() * 100.0),
+        "worst_day_eur": float(pnl.min()),
+        "daily_pnl_cvar_5_eur": float(tail.mean()) if not tail.empty else math.nan,
+        "max_drawdown_eur": float(drawdown.min()),
+        "profit_volatility_eur": float(pnl.std(ddof=0)),
+        "daily_fallback_hours": fallback_hours,
+        "daily_hours": n_hours,
+        "daily_fallback_share_percent": float(100.0 * fallback_hours / n_hours) if n_hours and n_hours > 0 else math.nan,
+    }
+
+
+def build_risk_robustness_market_strategy_table(data: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for _, row in data.iterrows():
+        strategy = str(row["strategy"])
+        daily_path = _daily_metrics_path(row)
+        if not daily_path.exists():
+            raise FileNotFoundError(f"Missing daily performance metrics for {strategy}: {daily_path}")
+        daily = pd.read_csv(daily_path)
+        risk = _daily_risk_stats(daily)
+        summary = _load_backtest_summary(row)
+        fallback_share = _safe_float(summary.get("optimizer_fallback_share_pct", risk["daily_fallback_share_percent"]))
+        fallback_hours = _safe_float(summary.get("optimizer_fallback_hours", risk["daily_fallback_hours"]))
+        annualization_factor = _safe_float(row.get("annualization_factor", math.nan))
+        if not math.isfinite(annualization_factor):
+            days = _safe_float(row.get("n_days", row.get("duration_days", math.nan)))
+            annualization_factor = 365.0 / days if days > 0 else math.nan
+        penalty = _safe_float(row.get("penalty_cost_eur", summary.get("total_penalty_cost_eur", math.nan)))
+        terminal_repair = _safe_float(
+            row.get("terminal_soc_repair_cost_eur", summary.get("terminal_soc_repair_cost_eur", math.nan))
+        )
+        rows.append(
+            {
+                "strategy": strategy,
+                "annualized_net_profit_eur": _safe_float(row.get("annualized_net_profit_eur_per_year")),
+                "loss_day_share_percent": risk["loss_day_share_percent"],
+                "worst_day_eur": risk["worst_day_eur"],
+                "max_drawdown_eur": risk["max_drawdown_eur"],
+                "daily_pnl_cvar_5_eur": risk["daily_pnl_cvar_5_eur"],
+                "profit_volatility_eur": risk["profit_volatility_eur"],
+                "fallback_hours": fallback_hours,
+                "fallback_share_percent": fallback_share,
+                "annualized_penalty_cost_eur": penalty * annualization_factor if math.isfinite(penalty) and math.isfinite(annualization_factor) else math.nan,
+                "annualized_terminal_soc_repair_cost_eur": terminal_repair * annualization_factor if math.isfinite(terminal_repair) and math.isfinite(annualization_factor) else math.nan,
+                "thesis_reportable": _safe_float(row.get("thesis_reportable", math.nan)),
+                "invalid_reason": "" if pd.isna(row.get("invalid_reason", "")) else str(row.get("invalid_reason", "")),
+                "daily_metrics_path": str(daily_path),
+                "backtest_summary_path": str(_backtest_summary_path(row)),
+            }
+        )
+    out = pd.DataFrame(rows)
+    out["_strategy_order"] = out["strategy"].map({name: idx for idx, name in enumerate(STRATEGY_ORDER)})
+    return out.sort_values("_strategy_order").drop(columns="_strategy_order")
+
+
+def _format_daily_k_eur(value: Any) -> str:
+    x = _safe_float(value)
+    if not math.isfinite(x):
+        return "$-$"
+    return f"{x / 1000.0:,.2f}"
+
+
+def _format_table_percent_from_percent(value: Any, digits: int = 1) -> str:
+    x = _safe_float(value)
+    if not math.isfinite(x):
+        return "$-$"
+    return f"{x:,.{digits}f}\\%"
+
+
+def _format_yes_no(value: Any) -> str:
+    x = _safe_float(value)
+    if not math.isfinite(x):
+        return "$-$"
+    return "Yes" if x >= 0.5 else "No"
+
+
+def write_latex_risk_robustness_market_strategy_table(table: pd.DataFrame, path: Path) -> Path:
+    strategy_labels = {
+        "Multi": "Multi-market",
+        "DA-only": "DA-only",
+        "BCM-only": "BCM-only",
+        "BEM-only": "BEM-only",
+    }
+    by_strategy = {str(row["strategy"]): row for _, row in table.iterrows()}
+    strategies = [strategy for strategy in STRATEGY_ORDER if strategy in by_strategy]
+
+    metric_rows: list[tuple[str, Callable[[pd.Series], str]]] = [
+        ("Net profit (kEUR/y)", lambda row: _format_k_eur_component(_safe_float(row["annualized_net_profit_eur"]))),
+        ("Loss-day share", lambda row: _format_table_percent_from_percent(row["loss_day_share_percent"], 1)),
+        ("Worst day (kEUR)", lambda row: _format_daily_k_eur(row["worst_day_eur"])),
+        ("Max drawdown (kEUR)", lambda row: _format_daily_k_eur(row["max_drawdown_eur"])),
+        ("CVaR 5% (kEUR)", lambda row: _format_daily_k_eur(row["daily_pnl_cvar_5_eur"])),
+        ("Volatility (kEUR)", lambda row: _format_daily_k_eur(row["profit_volatility_eur"])),
+        ("Fallback share", lambda row: _format_table_percent_from_percent(row["fallback_share_percent"], 1)),
+        ("Penalty (kEUR/y)", lambda row: _format_k_eur_component(_safe_float(row["annualized_penalty_cost_eur"]))),
+        (
+            "Terminal repair (kEUR/y)",
+            lambda row: _format_k_eur_component(_safe_float(row["annualized_terminal_soc_repair_cost_eur"])),
+        ),
+        ("Reportable", lambda row: _format_yes_no(row["thesis_reportable"])),
+    ]
+
+    column_spec = "l" + ("r" * len(strategies))
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\scriptsize",
+        r"\caption{Risk and robustness diagnostics for the XGB p50 multi-market and single-market strategies. Daily risk values are computed from test-period daily net revenue; profit, penalty and terminal repair values are annualized and reported in kEUR/year.}",
+        r"\label{tab:rq3-risk-robustness-market-strategies}",
+        r"\resizebox{\linewidth}{!}{%",
+        rf"\begin{{tabular}}{{{column_spec}}}",
+        r"\toprule",
+        " & ".join([r"\textbf{Metric}", *[rf"\textbf{{{_latex_escape(strategy_labels.get(strategy, strategy))}}}" for strategy in strategies]]) + r" \\",
+        r"\midrule",
+    ]
+    for label, formatter in metric_rows:
+        cells = [_latex_escape(label), *[formatter(by_strategy[strategy]) for strategy in strategies]]
+        lines.append(" & ".join(cells) + r" \\")
+    lines.extend(
+        [
+            r"\bottomrule",
+            r"\end{tabular}%",
+            r"}",
+            (
+                r"\par\vspace{0.3em}\footnotesize\raggedright "
+                r"CVaR 5\% is the mean of days in the lower 5\% tail of daily net revenue. "
+                r"Fallback share is based on optimizer fallback hours. "
+            ),
+            r"\end{table}",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_risk_robustness_market_strategy_table(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> list[Path]:
+    table = build_risk_robustness_market_strategy_table(data)
+    csv_dir = out_root / "result_section" / "csv"
+    latex_dir = out_root / "result_section" / "latex_tables"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "risk_robustness_by_market_strategy.csv"
+    tex_path = latex_dir / "risk_robustness_by_market_strategy.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        table.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    if "tex" in formats:
+        outputs.append(write_latex_risk_robustness_market_strategy_table(table, tex_path))
+    return outputs
+
+
+def write_latex_single_vs_multi_profit_uplift(table: pd.DataFrame, path: Path) -> Path:
+    rows = []
+    for _, row in table.iterrows():
+        rows.append(
+            " & ".join(
+                [
+                    _latex_escape(str(row["strategy"])),
+                    _format_k_eur(_safe_float(row["annualized_net_profit_eur_per_year"])),
+                    _format_k_eur(_safe_float(row["absolute_uplift_eur_per_year"])),
+                    _format_percent(_safe_float(row["uplift_percent"])),
+                ]
+            )
+            + r" \\"
+        )
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\small",
+        r"\caption{Annualized net profit and profit uplift of the XGB p50 multi-market strategy relative to single-market strategies. Uplift is computed as $(\Pi_{\mathrm{multi}}-\Pi_{\mathrm{single}})/|\Pi_{\mathrm{single}}|$.}",
+        r"\label{tab:rq3-single-vs-multi-market-profit-uplift}",
+        r"\begin{tabular}{lrrr}",
+        r"\toprule",
+        r"\textbf{Strategy} & \textbf{\shortstack{Net profit\\(kEUR/year)}} & \textbf{\shortstack{Absolute uplift\\(kEUR/year)}} & \textbf{Uplift (\%)} \\",
+        r"\midrule",
+        *rows,
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_single_vs_multi_profit_uplift_table(data: pd.DataFrame, out_root: Path, *, formats: set[str]) -> list[Path]:
+    table = build_single_vs_multi_profit_uplift(data)
+    csv_dir = out_root / "result_section" / "csv"
+    latex_dir = out_root / "result_section" / "latex_tables"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / "single_vs_multi_market_profit_uplift.csv"
+    tex_path = latex_dir / "single_vs_multi_market_profit_uplift.tex"
+    outputs: list[Path] = []
+    if "csv" in formats:
+        table.to_csv(csv_path, index=False)
+        outputs.append(csv_path)
+    if "tex" in formats:
+        outputs.append(write_latex_single_vs_multi_profit_uplift(table, tex_path))
+    return outputs
+
+
 def build_cumulative_net_profit_by_strategy(run_root: Path) -> tuple[pd.DataFrame, Path, str]:
     loaded = _load_cumulative_series_candidate(run_root)
     if loaded is None:
@@ -2098,6 +2616,18 @@ def build_cumulative_net_profit_by_strategy(run_root: Path) -> tuple[pd.DataFram
         )
     raw, selected_path = loaded
     raw = raw.copy()
+    preferred_source_by_strategy = {
+        "Multi": "/xgb_multi_p50/",
+        "DA-only": "/xgb_da_p50/",
+        "BCM-only": "/xgb_bcm_p50/",
+        "BEM-only": "/xgb_bem_p50/",
+    }
+    preferred_mask = raw.apply(
+        lambda row: preferred_source_by_strategy.get(str(row.get("strategy")), "") in str(row.get("source_file", "")),
+        axis=1,
+    )
+    if preferred_mask.any():
+        raw = raw.loc[preferred_mask].copy()
     raw["date"] = pd.to_datetime(raw["timestamp_utc"], utc=True, errors="coerce").dt.floor("D")
     raw["raw_pnl_eur"] = pd.to_numeric(raw["raw_pnl_eur"], errors="coerce")
     raw = raw.dropna(subset=["date", "strategy", "raw_pnl_eur"]).copy()
@@ -2224,7 +2754,7 @@ def write_latex_cumulative_net_profit_by_strategy(data: pd.DataFrame, unit: str,
         rf"ymin={_tex_float(ymin - 0.08 * span, 4)}, ymax={_tex_float(ymax + 0.10 * span, 4)},",
         r"legend columns=2,",
         r"legend cell align=left,",
-        r"legend style={at={(0.02,0.98)}, anchor=north west, font=\scriptsize, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.35cm}},",
+        r"legend style={at={(0.02,0.98)}, anchor=north west, font=\small, draw=none, fill=none, /tikz/every even column/.append style={column sep=0.35cm}},",
         r"]",
     ]
     for strategy in STRATEGY_ORDER:
@@ -2613,7 +3143,10 @@ def main() -> int:
     decomp_data, component_status, unit, scale_label = extract_decomposition_rows(data)
     outputs = []
     outputs.extend(generate_annualized_net_profit_by_strategy(data, args.out_root, formats=formats))
+    outputs.extend(generate_single_vs_multi_profit_uplift_table(data, args.out_root, formats=formats))
     outputs.extend(generate_revenue_cost_decomposition_by_strategy(data, args.out_root, formats=formats))
+    outputs.extend(generate_revenue_cost_component_table(data, args.out_root, formats=formats))
+    outputs.extend(generate_risk_robustness_market_strategy_table(data, args.out_root, formats=formats))
     outputs.extend(generate_cleared_bid_volume_market_comparison(data, args.out_root, formats=formats))
     outputs.extend(generate_bcm_revenue_mechanism_comparison(data, args.out_root, formats=formats))
     cumulative_outputs, cumulative_data, cumulative_source, cumulative_resolution = generate_cumulative_net_profit_by_strategy(candidate.root, args.out_root, formats=formats)
