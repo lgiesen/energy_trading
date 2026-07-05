@@ -11,6 +11,7 @@ export VECLIB_MAXIMUM_THREADS := 1
 export NUMEXPR_NUM_THREADS := 1
 
 SEED ?= 42
+PYTHON ?= python3
 FORECAST_HOURS ?= 48
 SIM_HORIZON_HOURS ?= auto
 export IS_SMOKE_TEST ?= 0
@@ -363,14 +364,14 @@ $($(1)_SIM_DONE): $$($(1)_MANIFEST)
 	fi
 	SIM_HOURS=$(SIM_HORIZON_HOURS); \
 	if [ "$$$$SIM_HOURS" = "auto" ]; then \
-	  SIM_HOURS=$$$$(python3 -c "import json;from pathlib import Path;m=Path('$$($(1)_MANIFEST)');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
+	  SIM_HOURS=$$$$($(PYTHON) -c "import json;from pathlib import Path;m=Path('$$($(1)_MANIFEST)');d=json.loads(m.read_text(encoding='utf-8'));ctx=Path(d.get('training',{}).get('context_path',''));h=(str(json.loads(ctx.read_text(encoding='utf-8')).get('cli_args',{}).get('forecast_horizon_hours','')).strip() if ctx.exists() else '');print(h or '48')"); \
 	fi; \
 	case "$$$$SIM_HOURS" in ''|*[!0-9]*) echo "Resolved simulation horizon is not an integer: '$$$$SIM_HOURS' (manifest=$$($(1)_MANIFEST))"; exit 1;; esac; \
-	read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=(sim_start+pd.Timedelta(days=int('$(SIM_SMOKE_DAYS)'))) if '$(IS_SMOKE_TEST)'=='1' else test_end;print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
+	read SIM_START SIM_END < <($(PYTHON) -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));lower=pd.Timestamp('2025-01-14T00:00:00Z');sim_start=max(val_end+pd.Timedelta(hours=gap),lower);sim_end=(sim_start+pd.Timedelta(days=int('$(SIM_SMOKE_DAYS)'))) if '$(IS_SMOKE_TEST)'=='1' else test_end;print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))")
 	  for DA_ROLE in $(SIM_DA_ROLES); do \
 	    OUT_ROOT="artifacts/simulation_runs/default_$(2)_$(3)/$$$$DA_ROLE"; \
 	    echo "[SIM] model=$(2) run_id=$(3) manifest=$$($(1)_MANIFEST) horizon_hours=$$$$SIM_HOURS da_role=$$$$DA_ROLE start=$$$$SIM_START end=$$$$SIM_END out=$$$$OUT_ROOT"; \
-	    python3 scripts/run_battery_backtest.py \
+	    $(PYTHON) scripts/run_battery_backtest.py \
 	      $(SIM_BACKTEST_DEFAULT_ARGS) \
 	      --run-manifest "$$($(1)_MANIFEST)" \
 	    --split test \
@@ -509,11 +510,11 @@ sim-all-quantiles: clean-markers ## Run quantile sweep simulation for xgb, linea
 	$(MAKE) sim-tft SIM_QUANTILE_PAIRS="$(SIM_QUANTILE_SWEEP_DEFAULT)" SIM_DA_ROLES="low mid high"
 
 sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs on full test horizon
-	@read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
+	@read SIM_START SIM_END < <($(PYTHON) -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);test_end=pd.to_datetime(s['test_end_inclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));lower=pd.Timestamp('2025-01-14T00:00:00Z');sim_start=max(val_end+pd.Timedelta(hours=gap),lower);print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),test_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	for MODEL in xgboost linear tft; do \
 	  LATEST_JSON="artifacts/model_runs/latest_$${MODEL}.json"; \
 	  test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
-	  RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
+	  RUN_ID=$$($(PYTHON) -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
 	  test -n "$$RUN_ID" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
 	  MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
 	  test -f "$$MANIFEST" || (echo "Missing manifest: $$MANIFEST" && exit 1); \
@@ -522,7 +523,7 @@ sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs
 	    for STRAT in $(GRID_STRATEGIES); do \
 	      echo "[GRID] model=$$MODEL strategy=$$STRAT da_role=$$DA_ROLE out=$$OUT_ROOT"; \
 	      BACKTEST_MILP_TIME_LIMIT_S=300 BACKTEST_MILP_REL_GAP=1e-4 \
-	      ./.venv/bin/python -u scripts/run_battery_backtest.py \
+	      $(PYTHON) -u scripts/run_battery_backtest.py \
 	        $(SIM_BACKTEST_DEFAULT_ARGS) \
 	        --run-manifest "$$MANIFEST" \
 	        --split test \
@@ -538,11 +539,11 @@ sim-grid-full: ## Full grid: all models x strategies x DA roles x quantile pairs
 	done
 
 sim-grid-smoke: ## Smoke grid: all models x strategies x DA roles x quantile pairs on short window
-	@read SIM_START SIM_END < <(python3 -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));sim_start=val_end+pd.Timedelta(hours=gap);sim_end=sim_start+pd.Timedelta(hours=int('$(GRID_SMOKE_HOURS)'));print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
+	@read SIM_START SIM_END < <($(PYTHON) -c "import json,pandas as pd;from pathlib import Path;cfg=json.loads(Path('data/model_input/feature_config.json').read_text(encoding='utf-8'));s=cfg.get('splits',{});val_end=pd.to_datetime(s['val_end_exclusive'],utc=True);gap=int(s.get('purge_gap_rows',72));lower=pd.Timestamp('2025-01-14T00:00:00Z');sim_start=max(val_end+pd.Timedelta(hours=gap),lower);sim_end=sim_start+pd.Timedelta(hours=int('$(GRID_SMOKE_HOURS)'));print(sim_start.strftime('%Y-%m-%dT%H:%M:%SZ'),sim_end.strftime('%Y-%m-%dT%H:%M:%SZ'))"); \
 	for MODEL in xgboost linear tft; do \
 	  LATEST_JSON="artifacts/model_runs/latest_$${MODEL}.json"; \
 	  test -f "$$LATEST_JSON" || (echo "Missing $$LATEST_JSON" && exit 1); \
-	  RUN_ID=$$(python3 -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
+	  RUN_ID=$$($(PYTHON) -c "import json;from pathlib import Path;p=Path('$$LATEST_JSON');d=json.loads(p.read_text(encoding='utf-8'));print((d.get('run_id') or '').strip())" 2>/dev/null || true); \
 	  test -n "$$RUN_ID" || (echo "Missing run_id in $$LATEST_JSON" && exit 1); \
 	  MANIFEST="artifacts/model_runs/$${RUN_ID}/manifest.json"; \
 	  test -f "$$MANIFEST" || (echo "Missing manifest: $$MANIFEST" && exit 1); \
@@ -551,7 +552,7 @@ sim-grid-smoke: ## Smoke grid: all models x strategies x DA roles x quantile pai
 	    for STRAT in $(GRID_STRATEGIES); do \
 	      echo "[GRID-SMOKE] model=$$MODEL strategy=$$STRAT da_role=$$DA_ROLE out=$$OUT_ROOT"; \
 	      BACKTEST_MILP_TIME_LIMIT_S=120 BACKTEST_MILP_REL_GAP=1e-4 \
-	      ./.venv/bin/python -u scripts/run_battery_backtest.py \
+	      $(PYTHON) -u scripts/run_battery_backtest.py \
 	        $(SIM_BACKTEST_DEFAULT_ARGS) \
 	        --run-manifest "$$MANIFEST" \
 	        --split test \

@@ -60,10 +60,9 @@ make doctor
 
 If these commands pass, the environment has the required Python dependencies and can see the model input data.
 
-## 1. Pipeline Overview & Preflight
+### 0.6 Pipeline Overview & Preflight
 
-This repository uses a DAG-based Makefile architecture (action-model pattern) to guarantee caching, state-awareness, and strict determinism.  
-Each stage is dependency-aware, so unchanged upstream artifacts are not recomputed, while changed inputs correctly trigger downstream rebuilds.
+This repository uses a DAG-based Makefile architecture (action-model pattern) to guarantee caching, state-awareness, and deterministic rebuilds. Each stage is dependency-aware, so unchanged upstream artifacts are not recomputed, while changed inputs correctly trigger downstream rebuilds.
 
 Run preflight checks before any execution:
 
@@ -76,39 +75,54 @@ make doctor
 - Required Python dependencies are importable.
 - Raw/model input data is present in `data/model_input`.
 
+Main artifact locations:
+
+```text
+artifacts/model_runs/
+artifacts/benchmark/
+artifacts/simulation_runs/
+```
+
 ## 2. Supervisor Smoke Execution
 
-The supervisor should run the smoke workflow below. It verifies installation, data availability, model training entry points, prediction export, simulations, audit packaging, and grid backtesting without launching the full thesis workload.
+This section is organized by research question. Each subsection contains:
 
-### 2.1 Smoke Workflow
+- A smoke run: short, quick execution to verify that the code path runs.
+- A complete run: the thesis run configuration used for the final results.
 
-On a CPU-only machine, run:
+Run all commands from the repository root with the virtual environment activated.
+
+### 2.1 RQ1: Probabilistic Forecasting Benchmark
+
+RQ1 is the ML forecasting benchmark. It trains and evaluates the probabilistic forecast model families:
+
+- XGBoost
+- Linear / regularized linear quantile regression
+- TFT
+
+#### 2.1.1 Smoke Run
+
+Use the smoke run to verify the full ML model DAG without launching the full training workload:
 
 ```bash
 make doctor
 make smoke-test DEVICE=cpu
-make sim-grid-smoke GRID_SMOKE_HOURS=12
 ```
 
-On a CUDA machine, run:
+Use CUDA instead if the machine has a working NVIDIA GPU:
 
 ```bash
 make doctor
 make smoke-test DEVICE=cuda
-make sim-grid-smoke GRID_SMOKE_HOURS=12
 ```
 
-`make smoke-test` runs the reduced end-to-end DAG for all three model families:
+This smoke target runs the reduced DAG for all three model families:
 
-- Tune -> Train -> Simulate -> Audit for XGBoost.
-- Tune -> Train -> Simulate -> Audit for Linear.
-- Tune -> Train -> Simulate -> Audit for TFT.
+```text
+Tune -> Train -> Simulate -> Audit/package
+```
 
-`make sim-grid-smoke` then checks the simulation grid against the latest smoke model manifests over a short time window.
-
-### 2.2 What Makes It A Smoke Run
-
-The smoke targets call the normal DAG with reduced runtime settings:
+The smoke DAG uses reduced runtime settings, including:
 
 ```text
 IS_SMOKE_TEST=1
@@ -116,104 +130,257 @@ FORECAST_HOURS=24
 SIM_HORIZON_HOURS=24
 ```
 
-The Python training and tuning scripts read `IS_SMOKE_TEST` via `os.environ` and reduce the workload, for example by limiting HPO trials, rows, epochs, and simulation horizon.
+After the smoke model artifacts exist, verify the RQ1 benchmark entry point:
 
-The simulation grid smoke test uses:
+```bash
+./.venv/bin/python scripts/run_forecast_benchmark.py \
+  --out-dir artifacts/benchmark/rq1_ml_model_benchmark_smoke \
+  --splits test \
+  --no-make-figures \
+  --save-joined-predictions
+```
+
+Expected smoke outputs:
 
 ```text
-GRID_SMOKE_HOURS=12
+artifacts/model_runs/latest_xgboost.json
+artifacts/model_runs/latest_linear.json
+artifacts/model_runs/latest_tft.json
+artifacts/benchmark/rq1_ml_model_benchmark_smoke/
 ```
 
-This can be increased to the default 24-hour smoke window:
+#### 2.1.2 Complete Run
 
-```bash
-make sim-grid-smoke
-```
-
-### 2.3 Individual Smoke Checks
-
-If a supervisor wants to isolate one model family, run one of:
-
-```bash
-make smoke-xgb
-make smoke-linear
-make smoke-tft DEVICE=cpu
-```
-
-Use `DEVICE=cuda` for TFT only when CUDA is available.
-
-### 2.4 Expected Smoke Coverage
-
-The smoke workflow exercises:
-
-- Dependency and data preflight via `make doctor`.
-- HPO/tuning entry points.
-- Model training for XGBoost, Linear, and TFT.
-- Prediction export and latest manifest creation.
-- Battery backtest simulation over a short horizon.
-- Audit package creation.
-- Multi-model, multi-strategy, multi-DA-role grid execution.
-
-The grid smoke test covers:
-
-- Models: `xgboost`, `linear`, `tft`
-- Strategies: `multi`, `da`, `afrr`
-- DA roles: `low`, `mid`, `high`
-- Quantile pairs from `SIM_QUANTILE_SWEEP_DEFAULT`
-
-### 2.5 Success Criteria
-
-A smoke validation is successful if all three commands exit with status code `0`:
+Run the complete ML model training pipeline:
 
 ```bash
 make doctor
-make smoke-test DEVICE=cpu
-make sim-grid-smoke GRID_SMOKE_HOURS=12
+make all-xgb
+make all-linear
+make all-tft DEVICE=cuda
 ```
 
-Expected artifacts:
+If CUDA is unavailable, XGBoost and Linear can still be trained on CPU, but full TFT training should be run on a CUDA-capable machine for the final thesis results.
 
-- New smoke run folders under `artifacts/model_runs/`.
-- Latest model pointers under `artifacts/model_runs/latest_*.json`.
-- Deliverable archives matching `artifacts/model_runs/<run_id>_deliverable.zip`.
-- Smoke simulation outputs under `artifacts/simulation_runs/default_*`.
-- Smoke grid outputs under `artifacts/simulation_runs/quantile_grid_smoke_*`.
+The complete model-family DAG is:
+
+```text
+Tune -> Train -> Simulate -> Audit/package
+```
+
+Successful full training creates run folders and deliverables under:
+
+```text
+artifacts/model_runs/
+artifacts/model_runs/<run_id>/manifest.json
+artifacts/model_runs/<run_id>_deliverable.zip
+artifacts/model_runs/latest_xgboost.json
+artifacts/model_runs/latest_linear.json
+artifacts/model_runs/latest_tft.json
+```
+
+After full training, run the complete RQ1 benchmark:
+
+```bash
+./.venv/bin/python scripts/run_rq1_analysis.py \
+  --out-dir artifacts/benchmark/rq1_ml_model_benchmark \
+  --skip-export
+```
+
+Expected complete RQ1 benchmark output:
+
+```text
+artifacts/benchmark/rq1_ml_model_benchmark/
+```
+
+### 2.2 RQ2: Energy Trading Simulation Backtest
+
+RQ2 is the energy trading simulation backtest for all thesis model families and quantile policies using the multi-market strategy.
+
+It covers:
+
+- Models: `xgb`, `tft`, `linear`
+- Strategy: `multi`
+- Quantile policies: `p30-p30`, `p50-p50`, `p70-p70`, `p90-p90`, `p10-p10`
+
+#### 2.2.1 Smoke Run
+
+Use this short run to verify the RQ2 launcher and simulation code path without running the full June/July thesis window:
+
+```bash
+chmod +x rq2_run_final_thesis_multi_2m.sh
+START=2025-06-01T00:00:00Z \
+END=2025-06-02T00:00:00Z \
+MODELS="xgb tft linear" \
+MAX_PARALLEL_JOBS=2 \
+RUN_TS=smoke_rq2_multi_24h \
+./rq2_run_final_thesis_multi_2m.sh
+```
+
+This smoke run uses a 24-hour UTC window and writes to:
+
+```text
+artifacts/simulation_runs/thesis_final_multi_2m_smoke_rq2_multi_24h/
+```
+
+#### 2.2.2 Complete Run
+
+Run the complete RQ2 thesis simulation for June and July:
+
+```bash
+chmod +x rq2_run_final_thesis_multi_2m.sh
+nohup ./rq2_run_final_thesis_multi_2m.sh \
+  > artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out 2>&1 &
+```
+
+Default complete RQ2 window:
+
+```text
+2025-05-31T22:00:00Z inclusive -> 2025-07-31T22:00:00Z exclusive
+```
+
+This corresponds to:
+
+```text
+2025-06-01 00:00 Europe/Berlin -> 2025-08-01 00:00 Europe/Berlin
+```
+
+Monitor the launcher:
+
+```bash
+tail -f artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out
+```
+
+The complete RQ2 launcher writes a timestamped run root:
+
+```text
+artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>/
+```
+
+### 2.3 RQ3: Single and Multi-Market Energy Trading Strategy
+
+RQ3 compares one selected model-quantile combination across single-market and multi-market strategies.
+
+The thesis configuration uses one model-quantile policy and these strategy command values:
+
+- `multi`: multi-market strategy
+- `da`: day-ahead-only strategy
+- `bcm`: balancing capacity market only
+- `bem`: balancing energy market only
+
+The RQ3 thesis comparison excludes `afrr`.
+
+#### 2.3.1 Smoke Run
+
+Use this short run to verify the RQ3 market-strategy launcher:
+
+```bash
+chmod +x scripts/run_rq3_xgb_p50_market_benchmark.sh
+START=2025-06-01T00:00:00Z \
+END=2025-06-02T00:00:00Z \
+MODEL=xgb \
+QUANTILE_PAIR=p50-p50 \
+EXPECTED_BEST_MODEL=XGB \
+EXPECTED_BEST_QUANTILE=p50 \
+STRATEGIES="multi da bcm bem" \
+MAX_PARALLEL_JOBS=2 \
+RUN_TS=smoke_rq3_xgb_p50_24h \
+./scripts/run_rq3_xgb_p50_market_benchmark.sh
+```
+
+This smoke run writes to:
+
+```text
+artifacts/simulation_runs/rq3_xgb_p50_market_benchmark_smoke_rq3_xgb_p50_24h/
+```
+
+If the RQ3 preflight assertion should use a specific RQ2 run root, add:
+
+```bash
+RQ2_SIM_RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>
+```
+
+#### 2.3.2 Complete Run
+
+Run the complete RQ3 market-strategy comparison over the June/July thesis window:
+
+```bash
+chmod +x scripts/run_rq3_xgb_p50_market_benchmark.sh
+STRATEGIES="multi da bcm bem" \
+nohup ./scripts/run_rq3_xgb_p50_market_benchmark.sh \
+  > artifacts/simulation_runs/rq3_xgb_p50_market_benchmark_launcher.out 2>&1 &
+```
+
+Default complete RQ3 window:
+
+```text
+2025-05-31T22:00:00Z inclusive -> 2025-07-31T22:00:00Z exclusive
+```
+
+This corresponds to:
+
+```text
+2025-06-01 00:00 Europe/Berlin -> 2025-08-01 00:00 Europe/Berlin
+```
+
+Default model-quantile configuration:
+
+```text
+MODEL=xgb
+QUANTILE_PAIR=p50-p50
+EXPECTED_BEST_MODEL=XGB
+EXPECTED_BEST_QUANTILE=p50
+STRATEGIES=multi da bcm bem
+```
+
+To run a different selected model-quantile combination, override the model, quantile, and expected RQ2 assertion:
+
+```bash
+MODEL=tft \
+QUANTILE_PAIR=p70-p70 \
+EXPECTED_BEST_MODEL=TFT \
+EXPECTED_BEST_QUANTILE=p70 \
+STRATEGIES="multi da bcm bem" \
+./scripts/run_rq3_xgb_p50_market_benchmark.sh
+```
+
+Monitor the launcher:
+
+```bash
+tail -f artifacts/simulation_runs/rq3_xgb_p50_market_benchmark_launcher.out
+```
+
+The complete RQ3 launcher writes a timestamped run root:
+
+```text
+artifacts/simulation_runs/rq3_xgb_p50_market_benchmark_<UTC_TIMESTAMP>/
+```
 
 ## 3. Audit & Output Artifacts
 
-For every successful run, the pipeline automatically produces an immutable deliverable archive:
+For every successful model run, the pipeline automatically produces an immutable deliverable archive:
 
-- `artifacts/model_runs/<run_id>_deliverable.zip`
+```text
+artifacts/model_runs/<run_id>_deliverable.zip
+```
 
 Each deliverable contains, at minimum:
 
 - Trained run `manifest.json`.
 - Metrics and evaluation outputs.
 - Simulation ledgers and summaries.
-- Provenance metadata (including commit/dependency/runtime metadata and data-hash lineage) to ensure complete reproducibility and data traceability.
+- Provenance metadata, including commit, dependency, runtime, and data-hash lineage.
 
-## 4. Full Thesis Commands, Not For Smoke Testing
+Simulation launchers write their own run metadata, status files, logs, and manifests under:
 
-The commands below are intentionally not part of the supervisor smoke workflow. They run the full thesis workload and can take substantially longer.
-
-Full model DAGs:
-
-```bash
-make all-xgb
-make all-linear
-make all-tft
+```text
+artifacts/simulation_runs/<run_root>/logs/
 ```
 
-Full simulation grid:
+The most important simulation monitoring files are:
 
-```bash
-make sim-grid-full
-```
-
-Final thesis multi-market benchmark:
-
-```bash
-chmod +x rq2_run_final_thesis_multi_2m.sh
-nohup ./rq2_run_final_thesis_multi_2m.sh \
-  > artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out 2>&1 &
+```text
+artifacts/simulation_runs/<run_root>/logs/run_meta.env
+artifacts/simulation_runs/<run_root>/logs/status.csv
+artifacts/simulation_runs/<run_root>/logs/manifest.tsv
 ```
