@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite the associated master thesis."
+type: thesis
+title: "Multi-Market Revenue Optimization for Battery Energy Storage Systems using Machine Learning: A Backtesting-Based Trading Strategy for Day-Ahead, Intraday, and aFRR Markets"
+authors:
+  - family-names: Giesen
+    given-names: Leo
+year: 2026
+repository-code: "https://github.com/lgiesen/energy_trading"
+commit: "4b5a80386a5d142ca96afa02631698b6cd23dacc"
+institution:
+  name: "University of Muenster"
+department: "Chair of Machine Learning and Data Engineering"
+keywords:
+  - battery energy storage systems
+  - energy trading
+  - machine learning
+  - backtesting
+  - day-ahead market
+  - intraday market
+  - aFRR market
+abstract: "Master thesis in Information Systems. Principal supervisor: Prof. Dr. Fabian Gieseke. Supervisor: Dr. Karsten Schroedter."

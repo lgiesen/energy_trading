@@ -9,6 +9,10 @@ import pytest
 from scripts import analyze_regret_drivers as regret
 
 
+def test_default_output_dir_is_under_artifacts() -> None:
+    assert regret.DEFAULT_OUT_DIR == Path("artifacts/benchmark/rq2_simulation_benchmark/regret_drivers")
+
+
 def test_column_discovery_maps_currency_labels() -> None:
     df = pd.DataFrame({"PnL Model (€)": [100.0], "PnL RHPF (€)": [150.0]})
     assert regret.discover_column(df.columns, regret.ROLE_CANDIDATES["realized_profit"], role="realized_profit") == "PnL Model (€)"

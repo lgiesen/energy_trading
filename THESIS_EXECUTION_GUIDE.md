@@ -17,7 +17,7 @@ This project was tested with:
 
 ```bash
 git clone https://github.com/lgiesen/energy_trading.git
-cd energyTrading
+cd energy_trading
 ```
 
 ### 0.3 Create Virtual Environment
@@ -37,7 +37,7 @@ python --version
 Expected:
 
 ```text
-.../energyTrading/.venv/bin/python
+.../energy_trading/.venv/bin/python
 Python 3.10.20
 ```
 
@@ -58,7 +58,7 @@ python -m pip check
 make doctor
 ```
 
-If these commands pass, the environment is ready for full training and simulation runs.
+If these commands pass, the environment has the required Python dependencies and can see the model input data.
 
 ## 1. Pipeline Overview & Preflight
 
@@ -76,192 +76,110 @@ make doctor
 - Required Python dependencies are importable.
 - Raw/model input data is present in `data/model_input`.
 
-## 2. The Smoke Test (Fast-Fail Validation)
+## 2. Supervisor Smoke Execution
 
-Run the smoke test:
+The supervisor should run the smoke workflow below. It verifies installation, data availability, model training entry points, prediction export, simulations, audit packaging, and grid backtesting without launching the full thesis workload.
 
-```bash
-make smoke-test
-```
+### 2.1 Smoke Workflow
 
-This executes the full end-to-end pipeline for all three models:
-
-- Tune -> Train -> Simulate -> Audit for XGBoost and Linear.
-- Train -> Simulate -> Audit for TFT.
-
-During smoke runs, `IS_SMOKE_TEST=1` is injected and read by Python via `os.environ`, enabling aggressive reductions (e.g., trials/epochs/data rows) to validate codebase integrity in under ~5 minutes without running full multi-hour training loops.
-
-## 3. Step 1: Train The Forecast Models
-
-Train the three model families before running final thesis simulations:
+On a CPU-only machine, run:
 
 ```bash
-make all-xgb
-make all-linear
-make all-tft
+make doctor
+make smoke-test DEVICE=cpu
+make sim-grid-smoke GRID_SMOKE_HOURS=12
 ```
 
-These commands execute the full reproducible DAG for each model family and enforce:
-
-- Fixed random seed behavior.
-- Strictly single-threaded BLAS/OMP settings (from Makefile exports) to maximize exact mathematical reproducibility.
-
-### HPO Artifact Consumption (Implementation Note)
-
-The pipeline uses direct artifact consumption for tuned hyperparameters:
-
-- `make all-xgb` passes `artifacts/hpo/xgb_optuna_da_target_da_price.json` to training.
-- `make all-linear` passes `artifacts/hpo/linear_sgd_tuning_da_target_da_price.json` to training.
-
-`scripts/train_and_export_runs.py` reads these files via `--hpo-artifact`, extracts `best_params`, and applies them directly in Python.  
-This replaces fragile shell-level JSON parsing and ensures deterministic, auditable parameter handoff from tuning to training.
-
-## 4. Step 2: Run Final Thesis Simulations
-
-For the final thesis multi-market benchmark on the server, use:
+On a CUDA machine, run:
 
 ```bash
-chmod +x rq2_run_final_thesis_multi_2m.sh
-nohup ./rq2_run_final_thesis_multi_2m.sh \
-  > artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out 2>&1 &
+make doctor
+make smoke-test DEVICE=cuda
+make sim-grid-smoke GRID_SMOKE_HOURS=12
 ```
 
-This script runs:
+`make smoke-test` runs the reduced end-to-end DAG for all three model families:
 
-- Models: `xgb`, `tft`, `linear`
-- Strategy: `multi`
-- Horizon: `2025-05-31T22:00:00Z` to `2025-07-31T22:00:00Z`
-- Quantiles: `p30-p30`, `p50-p50`, `p70-p70` first, then `p90-p90`, `p10-p10`
-- Strict final SoC: `--final-soc-mode hard`
-- Strict validity: `--strict-simulation-validity`
-- No GHPF: `--disable-ghpf --no-enable-global-perfect-foresight`
+- Tune -> Train -> Simulate -> Audit for XGBoost.
+- Tune -> Train -> Simulate -> Audit for Linear.
+- Tune -> Train -> Simulate -> Audit for TFT.
 
-The script uses dedicated output folders for every model/quantile run, so aggregate files do not overwrite each other.
+`make sim-grid-smoke` then checks the simulation grid against the latest smoke model manifests over a short time window.
 
-Default output layout:
+### 2.2 What Makes It A Smoke Run
+
+The smoke targets call the normal DAG with reduced runtime settings:
 
 ```text
-artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>/
-  xgb_p30/
-  xgb_p50/
-  ...
-  benchmarks_naive/
-  benchmarks_rhpf/
-  logs/
-    status.csv
-    manifest.tsv
-    xgb_p30/stdout.log
-    xgb_p30/stderr.log
-    ...
+IS_SMOKE_TEST=1
+FORECAST_HOURS=24
+SIM_HORIZON_HOURS=24
 ```
 
-Logs are saved inside the simulation run root under:
+The Python training and tuning scripts read `IS_SMOKE_TEST` via `os.environ` and reduce the workload, for example by limiting HPO trials, rows, epochs, and simulation horizon.
+
+The simulation grid smoke test uses:
 
 ```text
-artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>/logs/
+GRID_SMOKE_HOURS=12
 ```
 
-Monitor the launcher:
-
-```bash
-tail -f artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out
-```
-
-Monitor a specific simulation:
-
-```bash
-RUN_ROOT=artifacts/simulation_runs/thesis_final_multi_2m_<UTC_TIMESTAMP>
-tail -f "$RUN_ROOT/logs/xgb_p30/stdout.log"
-tail -f "$RUN_ROOT/logs/xgb_p30/stderr.log"
-```
-
-The script runs up to 4 simulations concurrently by default. Override this if needed:
-
-```bash
-MAX_PARALLEL_JOBS=4 ./rq2_run_final_thesis_multi_2m.sh
-```
-
-Naive and RHPF benchmarks are run once each in separate dedicated folders and can be merged into model/quantile analysis later through their ledger and path outputs. GHPF is intentionally never run in this script.
-
-## 5. Quantile Sweep Simulation & Reporting
-
-Run the full quantile sweep simulation:
-
-```bash
-make sim-all-quantiles
-```
-
-This evaluates BESS trading performance across the following intervals:
-
-- `0.5–0.5`: Baseline median forecast.
-- `0.3–0.7`: Standard symmetric 40% prediction interval.
-- `0.1–0.9`: Wide 80% confidence interval.
-- `0.1–0.3`: Evaluated for varied profit outcomes.
-- `0.3–0.5`: Used for stable dual-market strategy analysis.
-- `0.5–0.7`: Found to be effective for capturing moderate spikes.
-- `0.7–0.9`: Identified as the most effective interval for the Balancing Market (BM) to capture extreme high-reward price values.
-
-Generate the merged thesis benchmark output:
-
-```bash
-make thesis-report
-```
-
-This aggregates sweep outputs into:
-
-- `artifacts/thesis_benchmark_report.csv`
-
-### 5.1 Full Grid (All Models × All Strategies × All DA Roles × All Quantile Pairs)
-
-Best practice for large benchmark campaigns is to run a timestamped grid to avoid accidental overwrites.
-
-Run the complete grid on the full test horizon:
-
-```bash
-make sim-grid-full
-```
-
-This executes:
-
-- Models: `xgboost`, `linear`, `tft`
-- Strategies: `multi`, `da_only`, `afrr_only`
-- DA roles: `low`, `mid`, `high`
-- Quantile pairs: `p50-p50,p30-p70,p10-p90,p10-p30,p30-p50,p50-p70,p70-p90`
-
-Outputs are written to unique timestamped roots, e.g.:
-
-- `artifacts/simulation_runs/quantile_grid_mid_<stamp>/xgboost/...`
-- `artifacts/simulation_runs/quantile_grid_high_<stamp>/tft/...`
-
-So runs do not overwrite each other unless the same `SIM_GRID_STAMP` is reused.
-
-### 5.2 Smoke Grid (Fast End-to-End Validation)
-
-Run a short-window version of the same full grid:
+This can be increased to the default 24-hour smoke window:
 
 ```bash
 make sim-grid-smoke
 ```
 
-Default smoke horizon is 24 hours and can be changed:
+### 2.3 Individual Smoke Checks
+
+If a supervisor wants to isolate one model family, run one of:
 
 ```bash
+make smoke-xgb
+make smoke-linear
+make smoke-tft DEVICE=cpu
+```
+
+Use `DEVICE=cuda` for TFT only when CUDA is available.
+
+### 2.4 Expected Smoke Coverage
+
+The smoke workflow exercises:
+
+- Dependency and data preflight via `make doctor`.
+- HPO/tuning entry points.
+- Model training for XGBoost, Linear, and TFT.
+- Prediction export and latest manifest creation.
+- Battery backtest simulation over a short horizon.
+- Audit package creation.
+- Multi-model, multi-strategy, multi-DA-role grid execution.
+
+The grid smoke test covers:
+
+- Models: `xgboost`, `linear`, `tft`
+- Strategies: `multi`, `da`, `afrr`
+- DA roles: `low`, `mid`, `high`
+- Quantile pairs from `SIM_QUANTILE_SWEEP_DEFAULT`
+
+### 2.5 Success Criteria
+
+A smoke validation is successful if all three commands exit with status code `0`:
+
+```bash
+make doctor
+make smoke-test DEVICE=cpu
 make sim-grid-smoke GRID_SMOKE_HOURS=12
 ```
 
-### 5.3 Useful Overrides
+Expected artifacts:
 
-You can customize the grid with Make variables:
+- New smoke run folders under `artifacts/model_runs/`.
+- Latest model pointers under `artifacts/model_runs/latest_*.json`.
+- Deliverable archives matching `artifacts/model_runs/<run_id>_deliverable.zip`.
+- Smoke simulation outputs under `artifacts/simulation_runs/default_*`.
+- Smoke grid outputs under `artifacts/simulation_runs/quantile_grid_smoke_*`.
 
-```bash
-make sim-grid-full \
-  GRID_DA_ROLES="low mid high" \
-  GRID_STRATEGIES="multi da_only afrr_only" \
-  GRID_QUANTILE_PAIRS="p50-p50,p30-p70,p10-p90" \
-  SIM_GRID_STAMP=$(date +%Y%m%d_%H%M%S)
-```
-
-## 6. Audit & Output Artifacts
+## 3. Audit & Output Artifacts
 
 For every successful run, the pipeline automatically produces an immutable deliverable archive:
 
@@ -273,3 +191,29 @@ Each deliverable contains, at minimum:
 - Metrics and evaluation outputs.
 - Simulation ledgers and summaries.
 - Provenance metadata (including commit/dependency/runtime metadata and data-hash lineage) to ensure complete reproducibility and data traceability.
+
+## 4. Full Thesis Commands, Not For Smoke Testing
+
+The commands below are intentionally not part of the supervisor smoke workflow. They run the full thesis workload and can take substantially longer.
+
+Full model DAGs:
+
+```bash
+make all-xgb
+make all-linear
+make all-tft
+```
+
+Full simulation grid:
+
+```bash
+make sim-grid-full
+```
+
+Final thesis multi-market benchmark:
+
+```bash
+chmod +x rq2_run_final_thesis_multi_2m.sh
+nohup ./rq2_run_final_thesis_multi_2m.sh \
+  > artifacts/simulation_runs/rq2_final_thesis_multi_2m_launcher.out 2>&1 &
+```
