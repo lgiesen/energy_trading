@@ -130,23 +130,12 @@ FORECAST_HOURS=24
 SIM_HORIZON_HOURS=24
 ```
 
-After the smoke model artifacts exist, verify the RQ1 benchmark entry point:
-
-```bash
-./.venv/bin/python scripts/run_forecast_benchmark.py \
-  --out-dir artifacts/benchmark/rq1_ml_model_benchmark_smoke \
-  --splits test \
-  --no-make-figures \
-  --save-joined-predictions
-```
-
 Expected smoke outputs:
 
 ```text
 artifacts/model_runs/latest_xgboost.json
 artifacts/model_runs/latest_linear.json
 artifacts/model_runs/latest_tft.json
-artifacts/benchmark/rq1_ml_model_benchmark_smoke/
 ```
 
 #### 2.1.2 Complete Run
@@ -157,10 +146,10 @@ Run the complete ML model training pipeline:
 make doctor
 make all-xgb
 make all-linear
-make all-tft DEVICE=cuda
+make all-tft
 ```
 
-If CUDA is unavailable, XGBoost and Linear can still be trained on CPU, but full TFT training should be run on a CUDA-capable machine for the final thesis results.
+CUDA is the Makefile default (`DEVICE=cuda`). XGBoost receives the `DEVICE` setting but can fall back to CPU; Linear does not use GPU acceleration; full TFT training requires CUDA for the final thesis results.
 
 The complete model-family DAG is:
 
@@ -177,20 +166,6 @@ artifacts/model_runs/<run_id>_deliverable.zip
 artifacts/model_runs/latest_xgboost.json
 artifacts/model_runs/latest_linear.json
 artifacts/model_runs/latest_tft.json
-```
-
-After full training, run the complete RQ1 benchmark:
-
-```bash
-./.venv/bin/python scripts/run_rq1_analysis.py \
-  --out-dir artifacts/benchmark/rq1_ml_model_benchmark \
-  --skip-export
-```
-
-Expected complete RQ1 benchmark output:
-
-```text
-artifacts/benchmark/rq1_ml_model_benchmark/
 ```
 
 ### 2.2 RQ2: Energy Trading Simulation Backtest

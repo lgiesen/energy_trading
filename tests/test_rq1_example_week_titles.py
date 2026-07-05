@@ -49,7 +49,7 @@ def test_market_actionable_caption_contains_required_context() -> None:
     assert "BEM h1 forecast" in high_vol_caption
     for caption in [typical_caption, high_vol_caption]:
         assert "realized values" in caption
-        assert "p50 forecasts" in caption
+        assert "$p50$ forecasts" in caption
         assert "RLQR, XGB and TFT" in caption
 
 

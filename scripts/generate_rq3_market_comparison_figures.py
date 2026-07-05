@@ -1382,7 +1382,7 @@ def write_latex_annualized_net_profit(data: pd.DataFrame, path: Path) -> Path:
             *nodes,
             r"\end{axis}",
             r"\end{tikzpicture}",
-            r"\caption{Annualized net profit by market participation strategy. The figure compares the XGB p50 multi-market strategy with DA-only, BCM-only and BEM-only baselines to evaluate whether revenue stacking improves BESS profitability.}",
+            r"\caption{Annualized net profit is compared across the XGB $p50$ multi-market strategy and the single-market baselines. The multi-market strategy achieves the highest profit, indicating that coordinated market participation improves BESS profitability compared with isolated DA, BCM or BEM trading.}",
             r"\label{fig:rq3-annualized-net-profit-by-market-strategy}",
             r"\end{figure}",
         ]
@@ -1595,7 +1595,7 @@ def write_latex_cleared_bid_volume_market_comparison(data: pd.DataFrame, path: P
         r"\addlegendentry{Multi-market strategy}",
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Annualized cleared bid volume by market, comparing each single-market strategy with the corresponding market volume inside the XGB p50 multi-market strategy.}",
+        r"\caption{Annualized cleared bid volumes are compared between the single-market strategies and the corresponding market volumes within the XGB $p50$ multi-market strategy. The comparison indicates that multi-market participation reallocates cleared volume from DA trading toward BCM participation, while BEM volume remains similar across both settings.}",
         r"\label{fig:rq3-cleared-bid-volume-market-comparison}",
         r"\end{figure}",
     ]
@@ -2116,7 +2116,7 @@ def write_latex_revenue_cost_decomposition(decomp: pd.DataFrame, unit: str, unit
             r"\end{axis}",
             *label_nodes,
             r"\end{tikzpicture}",
-            r"\caption{Revenue and cost decomposition by market participation strategy. Positive components show annualized market revenues, while negative components show costs and penalties.}",
+            r"\caption{Annualized revenue and cost components are decomposed by market participation strategy. Positive components report market revenues, while negative components report costs and penalties, indicating that the multi-market strategy combines BEM activation revenue with additional BCM capacity revenue and DA revenue.}",
             r"\label{fig:rq3-revenue-cost-decomposition}",
             r"\end{figure}",
         ]
@@ -2779,7 +2779,7 @@ def write_latex_cumulative_net_profit_by_strategy(data: pd.DataFrame, unit: str,
             rf"\draw[rqThreeNeutral, line width=0.6pt] (axis cs:0,0) -- (axis cs:{len(dates) - 1},0);",
             r"\end{axis}",
             r"\end{tikzpicture}",
-            r"\caption{Cumulative net profit by market participation strategy over the test period. The figure compares the XGB p50 multi-market strategy with DA-only, BCM-only and BEM-only baselines and shows whether profitability differences develop persistently or are driven by individual high-revenue periods.}",
+            r"\caption{Cumulative net profit is compared across the XGB $p50$ multi-market strategy and the single-market baselines over the trading simulation period. The trajectories indicate that the multi-market strategy remains above all single-market strategies throughout the test period, while BEM-only is the strongest individual market baseline.}",
             r"\label{fig:rq3-cumulative-net-profit-by-market-strategy}",
             r"\end{figure}",
         ]

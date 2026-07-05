@@ -3674,7 +3674,7 @@ def write_latex_mean_pinball_loss_heatmap(path: Path, relative_pinball_data: pd.
         *cells,
         r"\end{axis}",
         r"\end{tikzpicture}}",
-        r"\caption{Mean pinball loss relative to RLQR by model and quantile policy. Values below 1 indicate lower pinball loss than RLQR; values above 1 indicate higher loss.}",
+        r"\caption{The heatmap compares relative MPL across models and quantile policies using RLQR as the reference benchmark. Values below 1 indicate lower forecast loss than the corresponding RLQR quantile, while values above 1 indicate higher forecast loss.}",
         r"\label{fig:7_mean_pinball_loss_heatmap}",
         r"\end{figure}",
     ]
@@ -3994,7 +3994,7 @@ def write_latex_quantile_sweep(path: Path, sweep_data: pd.DataFrame, quantiles: 
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Quantile sweep of annualized net profit by model and benchmark. Naive and RHPF are shown as benchmark reference lines.}",
+        r"\caption{Annualized net profit is compared across model-quantile policies in the trading simulation backtest. The horizontal lines mark the naive and RHPF benchmarks, while the model-specific curves indicate that profitability is highest for near-median quantile policies in XGB and TFT.}",
         r"\label{fig:2_quantile_sweep_net_profit_by_model}",
         r"\end{figure}",
     ]
@@ -4026,14 +4026,14 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
     lines = [
         r"% Requires \usepackage{pgfplots}",
         r"% Requires \pgfplotsset{compat=1.18}",
-        r"\begin{figure}[htbp]",
+        r"\begin{figure}[!htbp]",
         r"\centering",
         r"\begin{tikzpicture}",
         *_rq2_latex_color_defs(),
         r"\begin{axis}[",
         *_axis_common_options(),
         r"width=0.88\linewidth,",
-        r"height=0.44\linewidth,",
+        r"height=0.34\linewidth,",
         r"ybar stacked,",
         r"bar width=22pt,",
         r"ylabel={Annualized component value (kEUR/year)},",
@@ -4111,7 +4111,7 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Revenue and cost components for each model at its best numeric quantile policy. Profit components and cost/loss components are shown as adjacent stacked bars. Values are annualized and reported in kEUR per year.}",
+        r"\caption{Annualized revenue and cost components are compared for the best-performing quantile policy of each model. Revenue components and cost components are displayed as adjacent stacked bars in kEUR per year, indicating that BEM activation revenue is the largest profit driver across models, while degradation and auxiliary costs form the main cost components.}",
         r"\label{fig:3_revenue_cost_components_best_quantile}",
         r"\end{figure}",
     ]
@@ -4173,7 +4173,7 @@ def write_latex_cumulative_pnl(path: Path, cumulative: pd.DataFrame) -> None:
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Cumulative Net Profit over the test period for Naive, RHPF and each model at its best numeric quantile policy.}",
+        r"\caption{Cumulative net profit is reported over the trading simulation period for the naive benchmark, RHPF and the best-performing quantile policy of each model. The trajectories indicate when profits are realized over time, with the strongest increases occurring in mid to late June during high-value market periods.}",
         r"\label{fig:4_cumulative_net_profit_model_comparison_test_period}",
         r"\end{figure}",
     ]
@@ -4355,7 +4355,7 @@ def write_latex_normalized_pinball_profit(path: Path, normalized_data: pd.DataFr
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        rf"\caption{{Scaled mean pinball loss versus annualized net profit by model-quantile policy. Mean pinball loss values are scaled within each forecast target and quantile level using the cross-model median and are then aggregated across targets using observation-count weights. Lower x-values indicate lower forecast loss relative to the typical model for the same target and quantile policy. The pooled diagnostics indicate a moderate negative descriptive association, with Pearson's $r=-0.60$ and Spearman's $\rho=-0.64$.}}",
+        rf"\caption{{Scaled MPL is plotted against annualized net profit for each model-quantile policy. Lower x-axis values indicate lower forecast loss after target- and quantile-specific scaling, while higher y-axis values indicate higher realized trading profit. The pooled diagnostics indicate a moderate negative association, with Pearson's $r=-0.60$ and Spearman's $\rho=-0.64$.}}",
         r"\label{fig:5_pinball_loss_vs_net_profit_total_normalized}",
         r"\end{figure}",
     ]
@@ -4644,7 +4644,7 @@ def write_latex_market_dispatch_soc(path: Path, dispatch_data: pd.DataFrame) -> 
     lines += [
         r"\end{axis}",
         r"\end{tikzpicture}",
-        r"\caption{Market dispatch, state of charge and cumulative net profit for the selected XGB p50 example day. Charging actions are stacked above zero and discharging actions below zero.}",
+        r"\caption{The selected XGB $p50$ example day illustrates how market dispatch, SoC and cumulative net profit evolve within one trading day. The intraday profit increase is mainly driven by activation events, while the state of charge remains within the operational range.}",
         r"\label{fig:6_market_dispatch_soc_selected_day}",
         r"\end{figure}",
     ]
@@ -4664,7 +4664,7 @@ def write_latex_bidding_activity_submitted_cleared(path: Path, activity: pd.Data
     not_cleared_col = "not_cleared_bid_volume_mwh_annualized" if is_volume else "not_cleared_bid_count_annualized"
     ylabel = "Submitted bid volume (GWh/year)" if is_volume else "Submitted bids (1,000/year)"
     caption = (
-        "Annualized submitted bid volume by market and model strategy, split into cleared and uncleared bids; labels show clearing ratios."
+        "Annualized submitted bid volume is compared across markets for the best-performing quantile policy of each model. The stacked bars distinguish cleared and uncleared bid volumes, while the labels report clearing ratios, indicating that DA and ID clear fully as price-taker markets and that BEM clears substantially more submitted volume than BCM."
         if is_volume
         else "Annualized submitted bid count by market and model strategy, split into cleared and uncleared bids."
     )

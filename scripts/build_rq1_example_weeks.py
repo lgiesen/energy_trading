@@ -933,9 +933,10 @@ def _market_actionable_short_caption(canonical_target: str) -> str:
 
 def _market_actionable_caption(week: WeekSpec, spec: dict[str, Any], canonical_target: str) -> str:
     selection_label = _week_type_label(week).lower()
+    target_label = _market_actionable_caption_target(canonical_target)
     return (
-        f"Example-week {_market_actionable_caption_target(canonical_target)} forecasts for the algorithmically selected {selection_label} using the "
-        f"{_market_snapshot_label(spec, canonical_target, latex=True)}. The figure compares realized values with p50 forecasts from RLQR, XGB and TFT."
+        f"{target_label[:1].upper()}{target_label[1:]} forecasts are compared with realized values for the algorithmically selected {selection_label} using the "
+        f"{_market_snapshot_label(spec, canonical_target, latex=True)}. Lines report realized values and $p50$ forecasts from RLQR, XGB and TFT."
     )
 
 
@@ -2126,11 +2127,12 @@ def validate_algorithmic_outputs(*, out_dir: Path, split: str) -> None:
     bad_captions: list[str] = []
     for caption in captions:
         caption_lower = caption.lower()
+        caption_search = caption_lower.replace("$", "")
         if not ("typical week" in caption_lower or "high-volatility week" in caption_lower):
             bad_captions.append(caption)
             continue
         for token in ["forecast", "realized values", "p50 forecasts", "rlqr", "xgb", "tft"]:
-            if token not in caption_lower:
+            if token not in caption_search:
                 bad_captions.append(caption)
                 break
     if bad_captions:

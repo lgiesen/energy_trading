@@ -100,13 +100,12 @@ MODEL_ALIASES = {
     "tft": "TFT",
 }
 RELATIVE_MAE_CAPTION = (
-    "MAE p50 relative to RLQR by forecast target and model. Values below 1 indicate lower median forecast "
-    "error than RLQR, while values above 1 indicate higher median forecast error. Scaling is performed separately "
-    "for each forecast target to enable comparison across targets with different units."
+    "Relative MAE $p50$ compares median forecast error across models and forecast targets using RLQR as the reference "
+    "benchmark. Cell values below 1 indicate lower MAE than RLQR for the same target, while values above 1 indicate higher MAE."
 )
 MBE_TABLE_CAPTION = (
-    "MBE p50 by forecast target and model. Values are prediction minus realized value; positive values indicate "
-    "overprediction and negative values indicate underprediction."
+    "MBE p50 compares the median-forecast bias across forecast targets and models. Positive values indicate "
+    "overprediction, while negative values indicate underprediction."
 )
 LEGACY_STEMS = [
     "mae_p50_by_target_model",

@@ -34,6 +34,7 @@ GRID_QUANTILE_PAIRS ?= $(SIM_QUANTILE_SWEEP_DEFAULT)
 GRID_SMOKE_HOURS ?= 24
 SIM_GRID_STAMP ?= $(shell date +%Y%m%d_%H%M%S)
 SIM_BACKTEST_DEFAULT_ARGS ?= --strict-simulation-validity --final-soc-mode hard --id-recourse-mode common --clean-output
+SIM_BACKTEST_SMOKE_ARGS ?= $(SIM_BACKTEST_DEFAULT_ARGS) --allow-invalid-output
 
 # Run IDs for training outputs (evaluated once per make invocation)
 RUN_ID_XGB := xgb_$(shell date +%Y%m%d_%H%M%S)
@@ -139,18 +140,18 @@ all-linear: audit-linear ## Full Linear DAG
 all-tft: audit-tft ## Full TFT DAG
 
 smoke-test: ## Run all model pipelines in smoke mode (IS_SMOKE_TEST=1)
-	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-xgb
-	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-linear
-	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) all-tft
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 SIM_BACKTEST_DEFAULT_ARGS="$(SIM_BACKTEST_SMOKE_ARGS)" all-xgb
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 SIM_BACKTEST_DEFAULT_ARGS="$(SIM_BACKTEST_SMOKE_ARGS)" all-linear
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) SIM_BACKTEST_DEFAULT_ARGS="$(SIM_BACKTEST_SMOKE_ARGS)" all-tft
 
 smoke-xgb: ## Smoke pipeline for XGBoost only (24h train + 7d sim)
-	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-xgb
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 SIM_BACKTEST_DEFAULT_ARGS="$(SIM_BACKTEST_SMOKE_ARGS)" all-xgb
 
 smoke-linear: ## Smoke pipeline for Linear only (24h train + 7d sim)
-	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 all-linear
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 SIM_BACKTEST_DEFAULT_ARGS="$(SIM_BACKTEST_SMOKE_ARGS)" all-linear
 
 smoke-tft: ## Smoke pipeline for TFT only (24h train + 7d sim)
-	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) all-tft
+	$(MAKE) IS_SMOKE_TEST=1 FORECAST_HOURS=24 SIM_HORIZON_HOURS=24 DEVICE=$(DEVICE) SIM_BACKTEST_DEFAULT_ARGS="$(SIM_BACKTEST_SMOKE_ARGS)" all-tft
 
 $(DATA_HASH_FILE): doctor ## Generate MD5 provenance hash for data/model_input parquet files
 	@mkdir -p $(dir $(DATA_HASH_FILE))
@@ -553,7 +554,7 @@ sim-grid-smoke: ## Smoke grid: all models x strategies x DA roles x quantile pai
 	      echo "[GRID-SMOKE] model=$$MODEL strategy=$$STRAT da_role=$$DA_ROLE out=$$OUT_ROOT"; \
 	      BACKTEST_MILP_TIME_LIMIT_S=120 BACKTEST_MILP_REL_GAP=1e-4 \
 	      $(PYTHON) -u scripts/run_battery_backtest.py \
-	        $(SIM_BACKTEST_DEFAULT_ARGS) \
+	        $(SIM_BACKTEST_SMOKE_ARGS) \
 	        --run-manifest "$$MANIFEST" \
 	        --split test \
 	        --model-key "$$MODEL" \

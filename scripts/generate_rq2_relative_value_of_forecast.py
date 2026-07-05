@@ -21,9 +21,9 @@ DEFAULT_RQ2_ROOT = Path("artifacts/benchmark/rq2_simulation_benchmark")
 MODEL_ORDER = ["RLQR", "XGB", "TFT"]
 QUANTILE_ORDER = ["p10", "p30", "p50", "p70", "p90"]
 CAPTION = (
-    "Relative Value of Forecast by model and quantile policy. Values indicate the share of the "
-    "Naive-to-RHPF profit gap recovered by each model-based strategy; 0\\% corresponds to the Naive "
-    "benchmark and 100\\% corresponds to the RHPF benchmark."
+    "Relative VoF reports the share of the naive-to-RHPF profit gap recovered by each model-quantile policy. "
+    "A value of 0\\% corresponds to the naive benchmark, 100\\% corresponds to RHPF, and higher values indicate "
+    "greater realized economic value from the forecast."
 )
 
 

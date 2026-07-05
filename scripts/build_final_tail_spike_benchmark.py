@@ -1740,10 +1740,9 @@ def write_afrr_main_regime_latex_figure(*, out_dir: Path) -> list[Path]:
     tex_dir = out_dir / "latex_figures"
     tex_dir.mkdir(parents=True, exist_ok=True)
     caption = (
-        r"Relative mean pinball loss across non-stress, stress and high-tail regimes for aFRR targets. "
-        r"Values are normalized to the RLQR baseline, where values below one indicate lower loss than RLQR. "
-        r"Regimes are mutually exclusive: high-tail observations are assigned to the high-tail regime, "
-        r"stress-regime observations exclude high-tail observations, and non-stress observations exclude both stress and high-tail observations."
+        r"Tail and spike performance is compared across forecast targets using MPL relative to RLQR. "
+        r"Values below 1 indicate lower forecast loss than RLQR, and the axis break prevents TFT's high relative loss for negative aFRR capacity prices from compressing the remaining values. "
+        r"Tail regimes are defined by target-specific top or bottom 5\% realized observations, while the stress regime combines the top 10\% of weeks by weekly realized standard deviation and the top 10\% of weeks by target-specific spike-event share."
     )
     specs = [
         (
@@ -1764,7 +1763,7 @@ def write_afrr_main_regime_latex_figure(*, out_dir: Path) -> list[Path]:
         lines = [
             r"\begin{figure}[htbp]",
             r"    \centering",
-            rf"    \includegraphics[width=\linewidth]{{{image_path}}}",
+            rf"    \includegraphics[width=0.84\linewidth]{{{image_path}}}",
             rf"    \caption{{{caption}}}",
             rf"    \label{{{label}}}",
             r"\end{figure}",

@@ -1907,7 +1907,7 @@ def _write_tail_spike_relative_tex(
             xtick_values = ""
             xtick_labels = ""
             ellipsis_tick = None
-        height_cm = max(7.8, min(12.9, 0.74 * len(labels) + 2.6))
+        height_cm = max(7.2, min(10.2, 0.54 * len(labels) + 1.8))
         table_names = {"XGB": r"\tailSpikeXGBTable", "TFT": r"\tailSpikeTFTTable"}
         model_table_lines: list[str] = []
         model_has_data: dict[str, bool] = {}
@@ -1929,9 +1929,9 @@ def _write_tail_spike_relative_tex(
             r"% Requires: \usetikzlibrary{decorations.pathreplacing}",
             r"% Recommended in preamble: \pgfplotsset{compat=1.18}",
             *_latex_color_defs(),
-            rf"\begin{{figure}}[{placement}]",
+            rf"\begin{{figure}}[{'!' + placement if not placement.startswith('!') else placement}]",
             r"    \centering",
-            r"    \resizebox{\linewidth}{!}{%",
+            r"    \resizebox{0.84\linewidth}{!}{%",
             r"        \begin{tikzpicture}",
             *model_table_lines,
             r"            \begin{axis}[",
@@ -2102,7 +2102,7 @@ def _write_tail_spike_relative_tex(
             "tail_spike_relative_pinball_by_regime_all_targets_da_aggregated.tex",
             rows=rows,
             section_starts=section_starts,
-            figure_caption="Tail and spike performance across forecast targets. The stress regime combines target-specific high-volatility weeks, defined as the top 10% of weeks by weekly realized standard deviation, and spike-event weeks, defined as the top 10% of weeks by target-specific spike-event share; overlapping hours are counted once.",
+            figure_caption="Tail and spike performance is compared across forecast targets using MPL relative to RLQR. Values below 1 indicate lower forecast loss than RLQR, and the axis break prevents TFT's high relative loss for negative aFRR capacity prices from compressing the remaining values. Tail regimes are defined by target-specific top or bottom 5% realized observations, while the stress regime combines the top 10% of weeks by weekly realized standard deviation and the top 10% of weeks by target-specific spike-event share.",
             short_caption="Tail and spike performance across forecast targets",
             figure_label="fig:tail_spike_relative_pinball_all_targets_da_aggregated",
         )
@@ -2138,7 +2138,7 @@ def _write_tail_spike_relative_tex(
     all_targets = _write_native_relative_file(
         path.name,
         target_key="all_targets",
-        figure_caption="Tail and spike performance across forecast targets. Bars show mean pinball loss relative to RLQR; values below 1 indicate lower loss.",
+        figure_caption="Tail and spike performance is compared across forecast targets using MPL relative to RLQR. Values below 1 indicate lower forecast loss than RLQR, and the axis break prevents TFT's high relative loss for negative aFRR capacity prices from compressing the remaining values. Tail regimes are defined by target-specific top or bottom 5% realized observations, while the stress regime combines the top 10% of weeks by weekly realized standard deviation and the top 10% of weeks by target-specific spike-event share.",
         short_caption="Tail and spike performance across forecast targets",
         figure_label="fig:tail_spike_relative_pinball_all_targets",
         compact_target_sections=True,
@@ -2148,7 +2148,7 @@ def _write_tail_spike_relative_tex(
     all_targets_copy = _write_native_relative_file(
         "tail_spike_relative_pinball_by_regime_all_targets.tex",
         target_key="all_targets",
-        figure_caption="Tail and spike performance across forecast targets. Bars show mean pinball loss relative to RLQR; values below 1 indicate lower loss.",
+        figure_caption="Tail and spike performance is compared across forecast targets using MPL relative to RLQR. Values below 1 indicate lower forecast loss than RLQR, and the axis break prevents TFT's high relative loss for negative aFRR capacity prices from compressing the remaining values. Tail regimes are defined by target-specific top or bottom 5% realized observations, while the stress regime combines the top 10% of weeks by weekly realized standard deviation and the top 10% of weeks by target-specific spike-event share.",
         short_caption="Tail and spike performance across forecast targets",
         figure_label="fig:tail_spike_relative_pinball_all_targets",
         compact_target_sections=True,
@@ -2801,27 +2801,27 @@ def _write_combined_per_lead_pinball_tex(root: Path) -> Path | None:
     append_figure(
         da_capacity_lines,
         source_paths[:2],
-        caption="Mean pinball loss by lead hour for DA and aFRR capacity price targets. Grey bands mark decision-relevant lead ranges.",
+        caption="Lead-hour MPL compares forecast performance across the prediction horizon for DA prices and aFRR capacity prices. The grey bands mark the decision-relevant lead ranges, with DA decisions based on the D-1 gate forecast and BCM capacity bids based on the corresponding D-1 forecast horizon.",
         label="fig:rq1-4-1-3-per-lead-pinball-combined",
     )
     activation_lines = list(header_lines)
     append_figure(
         activation_lines,
         source_paths[2:],
-        caption="Mean pinball loss by lead hour for aFRR activation price and activation rate targets. Grey bands mark decision-relevant lead ranges.",
+        caption="MPL is reported by lead hour for aFRR activation-price and activation-rate forecasts. The grey bands mark the decision-relevant lead ranges for BEM trading, where short-term forecast quality is most relevant for activation-energy bids.",
         label="fig:rq1-4-1-3-per-lead-pinball-combined-activation",
     )
     combined_lines = list(header_lines)
     append_figure(
         combined_lines,
         source_paths[:2],
-        caption="Mean pinball loss by lead hour for DA and aFRR capacity price targets. Grey bands mark decision-relevant lead ranges.",
+        caption="Lead-hour MPL compares forecast performance across the prediction horizon for DA prices and aFRR capacity prices. The grey bands mark the decision-relevant lead ranges, with DA decisions based on the D-1 gate forecast and BCM capacity bids based on the corresponding D-1 forecast horizon.",
         label="fig:rq1-4-1-3-per-lead-pinball-combined",
     )
     append_figure(
         combined_lines,
         source_paths[2:],
-        caption="Mean pinball loss by lead hour for aFRR activation price and activation rate targets. Grey bands mark decision-relevant lead ranges.",
+        caption="MPL is reported by lead hour for aFRR activation-price and activation-rate forecasts. The grey bands mark the decision-relevant lead ranges for BEM trading, where short-term forecast quality is most relevant for activation-energy bids.",
         label="fig:rq1-4-1-3-per-lead-pinball-combined-activation",
     )
     _write_lines(da_capacity_out, da_capacity_lines)
@@ -2961,7 +2961,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             x_col="target",
             x_tick_label_col="target_label",
             series_cols=["XGB", "TFT"],
-            caption="Mean pinball loss by forecast target relative to RLQR. The dotted line marks the RLQR benchmark at 1. Values below 1 indicate lower loss than RLQR, while values above 1 indicate higher loss.",
+            caption="Relative MPL compares XGB and TFT against the RLQR benchmark for each forecast target. The dotted line marks the RLQR reference value of 1, so values below 1 indicate lower forecast loss and values above 1 indicate higher forecast loss than RLQR.",
             label="fig:rq1-4-1-1-forecast-metrics-full-relative-pinball",
             ylabel="Mean pinball loss relative to RLQR",
             reference_y=1.0,
@@ -2988,7 +2988,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             data=df,
             x_col="target_label",
             series_cols=["XGB", "TFT"],
-            caption="Relative MAE p50 by target (RLQR = 1; lower is better).",
+            caption="Relative MAE $p50$ compares median forecast error across models and forecast targets using RLQR as the reference benchmark. Cell values below 1 indicate lower MAE than RLQR for the same target, while values above 1 indicate higher MAE.",
             label="fig:rq1-4-1-1-forecast-metrics-full-relative-mae-p50",
             ylabel="MAE p50 relative to RLQR",
             placement="p",
@@ -3277,7 +3277,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
             path = _write_gate_bucket_relative_tex(
                 out,
                 data=d,
-                caption="Actionable forecast performance by market gate relative to RLQR; bars show XGB and TFT mean pinball loss relative to RLQR, so values below 1 indicate lower loss than RLQR.",
+                caption="Decision-relevant MPL is compared across market gates and forecast horizons using RLQR as the reference benchmark. The DA and BCM values refer to the relevant D-1 gate forecasts, while the BEM values refer to the short-term h1-h8 horizon. Values below 1 indicate lower forecast loss than RLQR, and the dotted line marks the RLQR reference value.",
                 label="fig:rq1-4-1-4-gate-bucket-pinball",
             )
             if path:
@@ -3310,7 +3310,7 @@ def _generate_latex_figures(entries: list[dict[str, Any]], *, rq1_root: Path, sp
         path = _write_tail_spike_relative_tex(
             out,
             data=d,
-            caption="Tail and spike performance by regime. Values below 1 indicate lower mean pinball loss than RLQR, while values above 1 indicate worse performance.",
+            caption="Tail and spike performance is compared across forecast targets using MPL relative to RLQR. Values below 1 indicate lower forecast loss than RLQR, and the axis break prevents TFT's high relative loss for negative aFRR capacity prices from compressing the remaining values. Tail regimes are defined by target-specific top or bottom 5\\% realized observations, while the stress regime combines the top 10\\% of weeks by weekly realized standard deviation and the top 10\\% of weeks by target-specific spike-event share.",
             label="fig:rq1-4-1-5-tail-spike-relative-pinball",
         )
         if path:
