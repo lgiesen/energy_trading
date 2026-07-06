@@ -4033,7 +4033,7 @@ def write_latex_revenue_cost_components(path: Path, component_data: pd.DataFrame
         r"\begin{axis}[",
         *_axis_common_options(),
         r"width=0.88\linewidth,",
-        r"height=0.34\linewidth,",
+        r"height={\dimexpr0.34\linewidth+2cm\relax},",
         r"ybar stacked,",
         r"bar width=22pt,",
         r"ylabel={Annualized component value (kEUR/year)},",

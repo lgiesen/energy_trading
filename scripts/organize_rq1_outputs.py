@@ -1907,7 +1907,7 @@ def _write_tail_spike_relative_tex(
             xtick_values = ""
             xtick_labels = ""
             ellipsis_tick = None
-        height_cm = max(7.2, min(10.2, 0.54 * len(labels) + 1.8))
+        height_cm = max(7.2, min(9.2, 0.48 * len(labels) + 1.8))
         table_names = {"XGB": r"\tailSpikeXGBTable", "TFT": r"\tailSpikeTFTTable"}
         model_table_lines: list[str] = []
         model_has_data: dict[str, bool] = {}
