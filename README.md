@@ -1,127 +1,145 @@
-# Energy Trading: Risk-Aware Forecasting and BESS Optimization
+# Energy Trading: Probabilistic Forecasting and BESS Trading Simulation
 
-This repository implements an end-to-end energy trading pipeline designed for **risk-aware decision making** in volatile power markets.  
-The system links probabilistic forecasting to physical battery operation and financial outcomes, enabling apples-to-apples benchmarking across model families and trading strategies.
+This repository implements an end-to-end pipeline for probabilistic forecasting and battery energy storage system (BESS) trading simulation in German electricity markets. The project links forecast evaluation with realized trading performance to analyze how model choice, quantile policy and market participation design affect BESS profitability.
 
-## Project Overview & Pipeline
+The study focuses on the Day-Ahead (DA), Intraday (ID), Balancing Capacity Market (BCM) and Balancing Energy Market (BEM). The aFRR market is modeled through its two linked components. BCM represents capacity procurement, while BEM represents activation energy.
 
-The project is organized into a four-stage production workflow:
+## Project Scope
 
-1. **Data Collection & Preparation**  
-   Ingest multi-source market, system, and exogenous data; clean and align it on a unified hourly timeline; build modeling-ready datasets.
+The repository supports the empirical analysis for a master thesis on multi-market BESS trading under forecast uncertainty. It combines three elements:
 
-2. **Model Training & Calibration**  
-   Train probabilistic forecasters with tail-aware objectives, enforce quantile consistency, and calibrate prediction intervals for reliable uncertainty.
+1. **Probabilistic forecasting** of DA prices, aFRR capacity prices, aFRR activation prices and aFRR activation rates.
+2. **Rolling BESS trading simulation** across DA, ID, BCM and BEM under physical battery constraints and market rules.
+3. **Economic evaluation** of model, quantile and market-strategy performance based on realized net profit.
 
-3. **BESS Simulation**  
-   Convert forecasts into actionable charging/discharging and reserve bids under physical battery constraints and market rules.
+The core objective is not only to minimize forecast error, but to assess whether improvements in probabilistic forecast performance translate into higher realized trading value.
 
-4. **Evaluation & Analysis**  
-   Benchmark forecast skill and simulated trading PnL in a canonical metrics framework for robust model comparison.
+## Pipeline Overview
 
----
+The workflow consists of four stages.
 
-## Stage 1: Data Collection & Preparation
+### 1. Data Preparation
 
-### Sources
-The data layer integrates multiple external and local providers, including:
+The data layer collects, cleans and aligns market, system and exogenous inputs on a common hourly timeline. The resulting feature dataset is used for multi-horizon probabilistic forecasting.
 
-- **ENTSO-E Transparency Platform** for market/system fundamentals
-- **Weather providers** for wind/solar and related meteorological forecasts
-- **Local market operators** (e.g., Day-Ahead and balancing/aFRR related data)
+Main data categories include:
 
-### Feature Engineering
-Feature construction is designed to capture both market dynamics and physical drivers:
+- DA market prices
+- aFRR capacity prices by direction
+- aFRR activation prices by direction
+- aFRR activation rates by direction
+- load, renewable generation and residual-load related features
+- calendar and time features
+- additional market and system variables where available
 
-- **Historical Market Data**
-  - Past Day-Ahead prices
-  - aFRR activation prices and rates
-- **System Fundamentals**
-  - Load forecasts
-  - Scheduled generation
-  - Cross-border flow signals
-- **Exogenous Variables**
-  - Weather forecast signals (e.g., wind/solar proxies)
-  - Calendar/time encodings (hour, weekday, seasonality patterns)
+### 2. Forecasting Models
 
-The output of Stage 1 is a clean, timestamp-aligned model input layer suitable for deterministic and probabilistic model training.
+The forecasting benchmark compares three model classes with different assumptions about the data-generating process:
 
----
+- **TFT**: Temporal Fusion Transformer for sequential DL forecasting.
+- **XGB**: Gradient-boosted decision trees for nonlinear tabular feature interactions.
+- **RLQR**: Regularized Linear Quantile Regression as a transparent linear probabilistic baseline.
 
-## Stage 2: Training, Validation & Testing
+At each forecast origin, the models generate conditional quantile forecasts for lead hours \(h = 1,\dots,48\). The exported quantile levels are:
 
-### Probabilistic Model Ensemble
-The forecasting stack uses a three-pillar ensemble:
+`p01`, `p05`, `p10`, `p30`, `p50`, `p70`, `p90`, `p95`, `p99`
 
-- **TFT (Temporal Fusion Transformer)**
-  - Joint-quantile learning for nonlinear temporal dependencies and regime shifts
-- **Tail-Weighted XGBoost**
-  - Gradient boosting with asymmetric/tail emphasis to improve extreme event sensitivity
-- **Linear SGD**
-  - Regularized quantile baseline for stable, interpretable benchmarking
+Before export, raw quantile predictions are sorted row-wise to enforce monotonicity and prevent quantile crossing. This creates internally consistent prediction intervals but does not improve the underlying calibration of the forecast distribution.
 
-### Integrity Layers
-To make probabilistic outputs production-safe and comparable:
+### 3. Trading Simulation Backtest
 
-- **Monotonic Sorting**
-  - Enforces ordered quantiles (prevents quantile crossing)
-- **Split-Conformal Calibration**
-  - Adjusts predicted quantiles to improve empirical coverage on the P01–P99 grid
+The simulation converts probabilistic forecasts into sequential market decisions for a BESS. The battery participates in DA, ID, BCM and BEM depending on the selected strategy.
 
-This stage produces calibrated probabilistic forecasts with consistent schema across models.
+Market treatment:
 
----
+- **DA and ID** are modeled as price-taking energy transactions. Submitted volumes are assumed to clear and are settled at realized market prices.
+- **BCM and BEM** are modeled as limit-price decisions. The selected forecast quantile determines the bid price and realized market outcomes determine clearing.
+- **ID** is used as a short-term recourse mechanism for SoC adjustments where feasible.
 
-## Stage 3: BESS Simulation (Trading Engine)
+The simulation enforces battery constraints, including SoC limits, charge and discharge limits, reserve headroom, efficiency losses, auxiliary consumption and terminal SoC requirements.
 
-The simulation translates forecast distributions into market actions for a battery energy storage system (BESS).
+### 4. Evaluation and Analysis
 
-### Central Rules
+Forecast performance and trading performance are evaluated jointly.
 
-- **Physical Constraints**
-  - Charge/discharge efficiency losses
-  - Power-to-energy ratio limits
-  - State-of-Charge (SoC) dynamics and operational bounds
-- **Market Logic**
-  - Multi-market participation (Day-Ahead arbitrage + aFRR reserve products)
-- **Bidding Strategy**
-  - Quantile-based limit order logic
-  - Example: conservative charging from lower quantiles (e.g., P10), aggressive discharge thresholds from upper quantiles (e.g., P90)
+Forecast metrics include:
 
-This stage outputs time-resolved dispatch decisions and simulated economic outcomes under realistic constraints.
+- Mean Pinball Loss (MPL)
+- MAE of the median forecast
+- MBE of the median forecast
+- Winkler score
+- empirical quantile calibration
+- prediction interval coverage
+- lead-time and decision-window diagnostics
+- tail and spike regime diagnostics
 
----
+Trading metrics include:
 
-## Stage 4: Evaluation & Analysis
+- realized net profit
+- annualized net profit
+- revenue by market
+- cost components
+- submitted and cleared bid volumes
+- bid-clearing ratios
+- throughput and equivalent cycles
+- SoC behavior
+- fallback and feasibility diagnostics
 
-### Forecasting Metrics
-Model quality is assessed with both global and tail-sensitive diagnostics, including:
+## Market Strategies
 
-- Tail-MAE
-- Pinball Loss
-- Spike detection metrics (Recall / F1)
+The simulation supports multi-market and single-market strategy variants.
 
-### Simulation Metrics
-Trading performance is evaluated with asset-level business KPIs:
+Main strategy groups:
 
-- Total Profit (PnL)
-- ROI
-- Max Drawdown
-- Cycles per year
+- **multi**: DA, BCM, BEM and ID recourse
+- **da_only**: DA trading with ID recourse where applicable
+- **bcm_only**: BCM participation
+- **bem_only**: BEM participation
+- **afrr_only**: BCM and BEM without DA participation
 
-### Reporting Standard
-All model families are compared through canonical exports, including:
+This structure enables comparison between revenue stacking and isolated market participation.
 
-- `canonical_metrics.parquet` for unified benchmarking
-- standardized prediction artifacts for downstream simulation and diagnostics
+## Important Reproducibility Note
 
----
+The reported simulation results were generated with two code states. All simulation runs except the DA-only strategy were generated with commit:
 
-## Why This Architecture
+```text
+6a4ac6637b5ff5c9af2386b5728c6d1dc54519ba
+```
 
-This project is intentionally built as a **forecast-to-action** system:  
-probabilistic market views are calibrated, transformed into physically feasible battery decisions, and evaluated on realized financial performance.  
-The core design objective is not only predictive accuracy, but **robust risk-aware trading performance under uncertainty**.
+Afterwards, DA lockbook handling was corrected and ID recourse logic was refined to improve the DA-only simulation. The DA-only results are therefore based on the revised implementation, while the remaining strategy results remain reproducible from the documented commit. Comparisons involving DA-only results need to be interpreted with this version difference in mind.
+
+## Repository Structure
+
+Typical project components include:
+
+```text
+data/                         # input and processed data, not necessarily tracked in Git
+artifacts/                    # model outputs, forecasts and simulation runs
+src/energy_trading/           # core package
+scripts/                      # training, export, simulation and validation scripts
+tests/                        # unit and market-semantics tests
+docs/                         # additional documentation
+```
+
+Large data and model artifacts may be stored outside Git depending on the execution environment.
+
+## Key Outputs
+
+The pipeline produces:
+
+- standardized forecast exports for all models and targets
+- forecast benchmark tables and figures
+- rolling BESS simulation outputs
+- strategy-level profitability tables
+- market-specific revenue and cost decompositions
+- validity and fallback diagnostics
+
+These outputs are used to answer the thesis research questions on probabilistic forecasting performance, realized economic value and multi-market BESS strategy design.
+
+## Methodological Caveats
+
+The simulation is a backtest and does not represent guaranteed real-world trading profits. Several assumptions simplify real market participation, including price-taking treatment for DA and ID, deterministic settlement based on realized prices and simplified project-cost assumptions. In addition, some simulation runs contain fallback events or feasibility diagnostics. The results are therefore most informative for comparing model-policy behavior within the implemented backtest, while absolute profit levels need to be interpreted cautiously.
 
 ## Additional Documentation
 
